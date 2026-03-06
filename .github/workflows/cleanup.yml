@@ -1,0 +1,56 @@
+name: Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: '保留最近 N 次运行（0=全部删除）'
+        required: false
+        default: '0'
+
+jobs:
+  cleanup:
+    name: Delete old workflow runs
+    runs-on: ubuntu-24.04
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete workflow runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const keep = parseInt('${{ inputs.keep }}') || 0;
+            const workflows = await github.paginate(
+              github.rest.actions.listRepoWorkflows,
+              { owner: context.repo.owner, repo: context.repo.repo }
+            );
+            let total = 0;
+            for (const wf of workflows) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: wf.id,
+                  per_page: 100,
+                }
+              );
+              const sorted = runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              const toDelete = sorted.slice(keep);
+              for (const run of toDelete) {
+                try {
+                  await github.rest.actions.deleteWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: run.id,
+                  });
+                  total++;
+                  console.log(`Deleted ${wf.name} #${run.id} (${run.created_at})`);
+                } catch (e) {
+                  console.log(`Skip ${run.id}: ${e.message}`);
+                }
+              }
+            }
+            console.log(`\nTotal deleted: ${total}`);

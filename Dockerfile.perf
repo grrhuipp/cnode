@@ -1,0 +1,15 @@
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    linux-perf \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 cnode /usr/local/bin/cnode
+
+WORKDIR /etc/cnode
+VOLUME ["/etc/cnode"]
+
+ENTRYPOINT ["/usr/local/bin/cnode"]
+CMD ["-c", "/etc/cnode/config.json"]
