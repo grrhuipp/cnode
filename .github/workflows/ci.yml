@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, 'v*']
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'Dockerfile*'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'Dockerfile*'
+      - '.github/workflows/ci.yml'
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ \
+            ninja-build \
+            curl zip unzip tar pkg-config \
+            golang nasm
+
+      - name: Cache vcpkg tool
+        id: cache-vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tool-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-tool-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: |
+          rm -rf "$VCPKG_ROOT"
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-Release-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-installed-${{ runner.os }}-Release-
+            vcpkg-installed-${{ runner.os }}-
+
+      - name: Cache AWS-LC
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/aws_lc-src
+            build/_deps/aws_lc-build
+            build/_deps/aws_lc-subbuild
+          key: aws-lc-${{ runner.os }}-Release-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            aws-lc-${{ runner.os }}-Release-
+
+      - name: Generate build ID
+        id: buildid
+        run: echo "id=$(head -c 6 /dev/urandom | xxd -p)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-linux \
+            -DBUILD_ID=${{ steps.buildid.outputs.id }}
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Strip binary
+        run: |
+          strip build/cnode
+          cp build/cnode cnode-linux-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnode-linux-x64
+          path: build/cnode
+          if-no-files-found: error
+
+      - name: Delete old release
+        if: github.event_name == 'push'
+        run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup old workflow runs
+        if: github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ github.ref_name }}';
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: branch,
+                per_page: 100,
+              }
+            );
+            // 保留当前运行，删除该分支的所有旧运行
+            const toDelete = runs
+              .filter(r => r.id !== context.runId)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            for (const run of toDelete) {
+              try {
+                await github.rest.actions.deleteWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id,
+                });
+                console.log(`Deleted run #${run.id} (${run.created_at})`);
+              } catch (e) {
+                console.log(`Skip ${run.id}: ${e.message}`);
+              }
+            }
+            console.log(`Cleaned up ${toDelete.length} old runs for branch ${branch}`);
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        run: |
+          gh release create "${{ github.ref_name }}" cnode-linux-amd64 \
+            --title "${{ github.ref_name }}" \
+            --notes "branch: ${{ github.ref_name }}, build_id: ${{ steps.buildid.outputs.id }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

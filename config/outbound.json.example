@@ -1,0 +1,87 @@
+[
+  {
+    "tag": "direct",
+    "protocol": "freedom",
+    "settings": {
+      "domainStrategy": "AsIs",
+      "redirect": ""
+    },
+    "sendThrough": "auto"
+  },
+  {
+    "tag": "blackhole",
+    "protocol": "blackhole",
+    "settings": {
+      "response": {
+        "type": "http"
+      }
+    }
+  },
+  {
+    "tag": "proxy-vmess",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "vmess.example.com",
+          "port": 443,
+          "users": [
+            {
+              "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+              "alterId": 0,
+              "security": "auto"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws",
+      "security": "tls",
+      "wsSettings": {
+        "path": "/ws",
+        "headers": {
+          "Host": "vmess.example.com"
+        }
+      },
+      "tlsSettings": {
+        "serverName": "vmess.example.com"
+      }
+    }
+  },
+  {
+    "tag": "proxy-trojan",
+    "protocol": "trojan",
+    "settings": {
+      "servers": [
+        {
+          "address": "trojan.example.com",
+          "port": 443,
+          "password": "your-password-here"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "trojan.example.com",
+        "allowInsecure": false
+      }
+    }
+  },
+  {
+    "tag": "proxy-ss",
+    "protocol": "shadowsocks",
+    "settings": {
+      "servers": [
+        {
+          "address": "ss.example.com",
+          "port": 8388,
+          "method": "aes-256-gcm",
+          "password": "your-password-here"
+        }
+      ]
+    }
+  }
+]

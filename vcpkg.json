@@ -1,0 +1,15 @@
+{
+    "name": "cnode",
+    "version": "1.0.0",
+    "description": "High-performance C++23 proxy server",
+    "dependencies": [
+        "boost-asio",
+        "boost-beast",
+        "boost-cobalt",
+        "boost-json",
+        "boost-log",
+        "mimalloc",
+        "zlib"
+    ],
+    "builtin-baseline": "62159a45e18f3a9ac0548628dcaf74fcb60c6ff9"
+}

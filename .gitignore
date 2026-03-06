@@ -1,0 +1,47 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# vcpkg installed packages (大，由 vcpkg 自动还原)
+vcpkg_installed/
+
+# IDE
+.vscode/
+.claude/
+.idea/
+*.user
+*.suo
+.vs/
+
+# Compiler artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Config（忽略实际配置，只保留 .example）
+config/*
+!config/*.example
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+perf.data.txt

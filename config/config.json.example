@@ -1,0 +1,76 @@
+{
+  "log": {
+    "loglevel": "info",
+    "logDir": "/var/log/acppnode"
+  },
+  "workers": 0,
+  "dns": {
+    "servers": ["8.8.8.8", "1.1.1.1"],
+    "timeout": 5,
+    "cacheSize": 10000,
+    "minTTL": 60,
+    "maxTTL": 3600
+  },
+  "timeouts": {
+    "_comment": "handshake 用于握手阶段的 idle + absolute deadline；read/write 用于独立的读写 deadline，同时更短者也会作为连接 idle timer；idle 用于 UDP/会话生命周期",
+    "handshake": 10,
+    "dial": 10,
+    "read": 15,
+    "write": 30,
+    "idle": 300
+  },
+  "panels": [
+    {
+      "_comment": "VMess - TLS 由外部 nginx/caddy 处理（默认）",
+      "name": "vmess-panel",
+      "type": "V2Board",
+      "apiHost": "https://your-panel.com",
+      "apiKey": "your-api-key-here",
+      "nodeID": [1, 2, 3],
+      "nodeType": "vmess"
+    },
+    {
+      "_comment": "VMess - 程序处理 TLS，根据面板下发配置",
+      "name": "vmess-tls-panel",
+      "type": "V2Board",
+      "apiHost": "https://your-panel.com",
+      "apiKey": "your-api-key-here",
+      "nodeID": [4, 5],
+      "nodeType": "vmess",
+      "tlsEnable": true,
+      "tlsCert": "/etc/acppnode/certs/fullchain.pem",
+      "tlsKey": "/etc/acppnode/certs/privkey.pem"
+    },
+    {
+      "_comment": "Trojan - 程序处理 TLS，使用指定证书",
+      "name": "trojan-panel-with-tls",
+      "type": "V2Board",
+      "apiHost": "https://your-panel.com",
+      "apiKey": "your-api-key-here",
+      "nodeID": [10],
+      "nodeType": "trojan",
+      "tlsEnable": true,
+      "tlsCert": "/etc/acppnode/certs/fullchain.pem",
+      "tlsKey": "/etc/acppnode/certs/privkey.pem"
+    },
+    {
+      "_comment": "Trojan - 程序处理 TLS，自动生成自签名证书（仅测试用）",
+      "name": "trojan-panel-self-signed",
+      "type": "V2Board",
+      "apiHost": "https://your-panel.com",
+      "apiKey": "your-api-key-here",
+      "nodeID": [11],
+      "nodeType": "trojan",
+      "tlsEnable": true
+    },
+    {
+      "_comment": "Trojan - TLS 由外部 nginx/caddy 处理",
+      "name": "trojan-panel-no-tls",
+      "type": "V2Board",
+      "apiHost": "https://your-panel.com",
+      "apiKey": "your-api-key-here",
+      "nodeID": [12],
+      "nodeType": "trojan"
+    }
+  ]
+}
