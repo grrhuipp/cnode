@@ -7,6 +7,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -64,7 +65,7 @@ public:
     }
 
 private:
-    std::map<std::string, std::string>               domains_;
+    std::unordered_map<std::string, std::string>       domains_;
     DomainTrie                                       suffix_trie_;
     std::vector<std::pair<std::string, std::string>> keywords_;
     std::vector<std::pair<std::regex, std::string>>  regexes_;
@@ -212,7 +213,7 @@ public:
     [[nodiscard]] bool Match(
         const SessionContext& ctx,
         const geo::GeoManager* /*geo*/) const {
-        const std::string net = (ctx.network == Network::UDP) ? "udp" : "tcp";
+        const std::string_view net = (ctx.network == Network::UDP) ? "udp" : "tcp";
         for (const auto& n : networks_) {
             if (n == net || n == "tcp,udp" || n == "udp,tcp") return true;
         }

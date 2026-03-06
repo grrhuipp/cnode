@@ -14,7 +14,6 @@
 #include <array>
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <cstdint>
@@ -236,10 +235,10 @@ public:
     
     void OnAuthFail(const std::string& tag, const std::string& ip) {
         if (cfg_.auth_fail_limit == 0) return;
-        // 该 tag 未启用 ban 追踪时跳过（用户列表未同步完成）
+        // 该 tag 未启用 ban 追踪时跳过（无锁快照读取）
         {
-            std::lock_guard lock(ban_tags_mutex_);
-            if (!ban_enabled_tags_.contains(tag)) return;
+            auto tags = ban_tags_.load(std::memory_order_acquire);
+            if (!tags || !tags->contains(tag)) return;
         }
         
         // 使用 tag+ip 的组合哈希，不同节点独立计数
@@ -280,18 +279,24 @@ public:
     // 启用 Ban 追踪（per-tag：每个节点用户同步完成后独立启用）
     // ========================================================================
     void EnableBanTrackingForTag(const std::string& tag) {
-        std::lock_guard lock(ban_tags_mutex_);
-        ban_enabled_tags_.insert(tag);
+        // 写时拷贝：构造新快照，原子替换（写路径低频，60s 一次）
+        auto old = ban_tags_.load(std::memory_order_acquire);
+        auto new_tags = old
+            ? std::make_shared<const std::unordered_set<std::string>>(*old)
+            : std::make_shared<const std::unordered_set<std::string>>();
+        // const_cast 安全：new_tags 尚未发布，无并发读者
+        const_cast<std::unordered_set<std::string>&>(*new_tags).insert(tag);
+        ban_tags_.store(std::move(new_tags), std::memory_order_release);
     }
 
     bool IsBanTrackingEnabledForTag(const std::string& tag) const {
-        std::lock_guard lock(ban_tags_mutex_);
-        return ban_enabled_tags_.contains(tag);
+        auto tags = ban_tags_.load(std::memory_order_acquire);
+        return tags && tags->contains(tag);
     }
 
     bool IsBanTrackingEnabled() const {
-        std::lock_guard lock(ban_tags_mutex_);
-        return !ban_enabled_tags_.empty();
+        auto tags = ban_tags_.load(std::memory_order_acquire);
+        return tags && !tags->empty();
     }
     
     // ========================================================================
@@ -379,8 +384,8 @@ private:
     
     RateLimitConfig cfg_;
     alignas(64) std::atomic<uint32_t> total_{0};
-    mutable std::mutex ban_tags_mutex_;
-    std::unordered_set<std::string> ban_enabled_tags_;
+    // 无锁快照：写时拷贝（EnableBanTrackingForTag 低频写），读路径 lock-free
+    std::atomic<std::shared_ptr<const std::unordered_set<std::string>>> ban_tags_{};
     alignas(64) std::array<Slot, N> slots_{};
 };
 

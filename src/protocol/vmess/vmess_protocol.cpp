@@ -1084,7 +1084,7 @@ bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessReq
 // OpenSSL 实现（使用 EVP_CIPHER API）
 // 优化：预分配 EVP_CIPHER_CTX，避免每次加解密都分配/释放
 VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv)
-    : security_(security), count_(0), aead_ctx_(nullptr), ctx_initialized_(false) {
+    : security_(security), count_(0), enc_ctx_(nullptr), dec_ctx_(nullptr), ctx_initialized_(false) {
     std::memcpy(key_.data(), key, 16);
     std::memcpy(iv_.data(), iv, 16);
     
@@ -1093,24 +1093,17 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
             GenerateChaCha20Key(key_.data(), key32_.data());
         }
         
-        // 预分配加密和解密上下文
-        // aead_ctx_ 存储两个 EVP_CIPHER_CTX* : [0]=encrypt, [1]=decrypt
-        auto** ctxs = new EVP_CIPHER_CTX*[2];
-        ctxs[0] = EVP_CIPHER_CTX_new();
-        ctxs[1] = EVP_CIPHER_CTX_new();
-        aead_ctx_ = ctxs;
-        
-        ctx_initialized_ = (ctxs[0] != nullptr && ctxs[1] != nullptr);
+        // 预分配加密和解密上下文（直接成员指针，无额外堆分配）
+        enc_ctx_ = EVP_CIPHER_CTX_new();
+        dec_ctx_ = EVP_CIPHER_CTX_new();
+
+        ctx_initialized_ = (enc_ctx_ != nullptr && dec_ctx_ != nullptr);
     }
 }
 
 VMessCipher::~VMessCipher() {
-    if (aead_ctx_) {
-        auto** ctxs = static_cast<EVP_CIPHER_CTX**>(aead_ctx_);
-        if (ctxs[0]) EVP_CIPHER_CTX_free(ctxs[0]);
-        if (ctxs[1]) EVP_CIPHER_CTX_free(ctxs[1]);
-        delete[] ctxs;
-    }
+    if (enc_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(enc_ctx_));
+    if (dec_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(dec_ctx_));
 }
 
 ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext) {
@@ -1119,14 +1112,13 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
         return static_cast<ssize_t>(len);
     }
     
-    if (!ctx_initialized_ || !aead_ctx_) return -1;
-    
+    if (!ctx_initialized_) return -1;
+
     uint8_t nonce[12];
     BuildNonce(count_++, nonce);
-    
-    auto** ctxs = static_cast<EVP_CIPHER_CTX**>(aead_ctx_);
-    EVP_CIPHER_CTX* ctx = ctxs[0];
-    
+
+    EVP_CIPHER_CTX* ctx = static_cast<EVP_CIPHER_CTX*>(enc_ctx_);
+
     // 重置上下文以便复用
     EVP_CIPHER_CTX_reset(ctx);
     
@@ -1181,14 +1173,13 @@ ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* pla
     }
     
     if (len < GCM_TAG_SIZE) return -1;
-    if (!ctx_initialized_ || !aead_ctx_) return -1;
-    
+    if (!ctx_initialized_) return -1;
+
     uint8_t nonce[12];
     BuildNonce(count_++, nonce);
-    
-    auto** ctxs = static_cast<EVP_CIPHER_CTX**>(aead_ctx_);
-    EVP_CIPHER_CTX* ctx = ctxs[1];  // 使用解密上下文
-    
+
+    EVP_CIPHER_CTX* ctx = static_cast<EVP_CIPHER_CTX*>(dec_ctx_);
+
     // 重置上下文以便复用
     EVP_CIPHER_CTX_reset(ctx);
     

@@ -100,9 +100,14 @@ private:
     std::vector<std::pair<IPanel*, int>>              panel_nodes_;
     std::map<std::pair<IPanel*, int>, NodeConfig>     node_configs_;
     std::map<std::pair<IPanel*, int>, bool>           inbound_started_;
-    std::map<std::string, size_t>                     node_user_counts_;
-    std::map<std::string, size_t>                     node_online_counts_;
-    std::map<std::string, std::pair<uint64_t,uint64_t>> node_period_traffic_;
+    // 节点统计（合并 user_count/online_count/traffic 到单一 map，减少查询次数）
+    struct NodeStats {
+        size_t   user_count    = 0;
+        size_t   online_count  = 0;
+        uint64_t bytes_up      = 0;
+        uint64_t bytes_down    = 0;
+    };
+    std::map<std::string, NodeStats>                  node_stats_;
     std::vector<std::string>                          registered_tags_;
 
     bool running_ = false;

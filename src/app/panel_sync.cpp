@@ -53,13 +53,11 @@ std::vector<PanelSyncManager::NodeStatsInfo> PanelSyncManager::GetNodeStats() co
         info.network     = cfg.network;
         info.port        = cfg.port;
         std::string ukey = std::format("{}-{}", info.panel_name, info.node_id);
-        if (auto it = node_user_counts_.find(ukey); it != node_user_counts_.end())
-            info.total_users = it->second;
-        if (auto it = node_online_counts_.find(ukey); it != node_online_counts_.end())
-            info.online_users = it->second;
-        if (auto it = node_period_traffic_.find(ukey); it != node_period_traffic_.end()) {
-            info.bytes_up   = it->second.first;
-            info.bytes_down = it->second.second;
+        if (auto it = node_stats_.find(ukey); it != node_stats_.end()) {
+            info.total_users  = it->second.user_count;
+            info.online_users = it->second.online_count;
+            info.bytes_up     = it->second.bytes_up;
+            info.bytes_down   = it->second.bytes_down;
         }
         result.push_back(info);
     }
@@ -121,9 +119,7 @@ cobalt::task<void> PanelSyncManager::SyncNode(IPanel* panel, int node_id) {
                     ClearUsers(old_tag, old_protocol);
                     node_configs_.erase(cfg_it);
                     inbound_started_.erase(key);
-                    node_user_counts_.erase(stats_key);
-                    node_online_counts_.erase(stats_key);
-                    node_period_traffic_.erase(stats_key);
+                    node_stats_.erase(stats_key);
 
                     LOG_CONSOLE("Node {}/{} removed, stopped inbound {}",
                                 panel->Name(), node_id, old_tag);
@@ -202,17 +198,17 @@ cobalt::task<void> PanelSyncManager::SyncNode(IPanel* panel, int node_id) {
             auto traffic_data = co_await CollectTraffic(tag);
             {
                 std::string ukey = std::format("{}-{}", panel->Name(), node_id);
-                auto& acc = node_period_traffic_[ukey];
+                auto& ns = node_stats_[ukey];
                 for (const auto& td : traffic_data) {
-                    acc.first  += td.upload;
-                    acc.second += td.download;
+                    ns.bytes_up   += td.upload;
+                    ns.bytes_down += td.download;
                 }
             }
 
             auto online_users = co_await CollectOnlineUsers(tag, protocol);
             {
                 std::string ukey = std::format("{}-{}", panel->Name(), node_id);
-                node_online_counts_[ukey] = online_users.size();
+                node_stats_[ukey].online_count = online_users.size();
             }
 
             // ── 数据上报（各自独立 try-catch，互不阻塞）───────────────
@@ -484,7 +480,7 @@ void PanelSyncManager::UpdateUsers(const std::string& panel_name, int node_id,
     std::string tag = std::format("{}-{}-{}", panel_name, protocol, node_config.port);
 
     std::string stats_key = std::format("{}-{}", panel_name, node_id);
-    node_user_counts_[stats_key] = panel_users.size();
+    node_stats_[stats_key].user_count = panel_users.size();
 
     auto& inbound_factory = InboundFactory::Instance();
     if (!inbound_factory.Has(protocol)) {

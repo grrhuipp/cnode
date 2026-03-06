@@ -120,9 +120,6 @@ private:
     static int BioCreate(BIO* bio);
     static int BioDestroy(BIO* bio);
     
-    // 执行 SSL 操作并处理 WANT_READ/WANT_WRITE
-    cobalt::task<int> DoSslOperation(std::function<int()> op);
-    
     // 刷新待发送数据
     cobalt::task<bool> FlushWriteBio();
     

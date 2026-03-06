@@ -61,7 +61,8 @@ private:
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
-    void* aead_ctx_         = nullptr;  // EVP_AEAD_CTX*，预分配避免重复初始化
+    void* enc_ctx_          = nullptr;  // EVP_CIPHER_CTX*，加密上下文
+    void* dec_ctx_          = nullptr;  // EVP_CIPHER_CTX*，解密上下文
     bool  ctx_initialized_  = false;
 };
 
