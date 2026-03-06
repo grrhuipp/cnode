@@ -175,16 +175,24 @@ cobalt::task<RelayResult> DoRelay(
                    bytes_up, bytes_down,
                    result.client_closed_first ? "client" : "target");
 
-    try {
-        co_await client.AsyncShutdownWrite();
-    } catch (...) {}
-
-    try {
-        co_await target.AsyncShutdownWrite();
-    } catch (...) {}
-
-    client.Cancel();
-    target.Cancel();
+    // 错误路径快速关闭：跳过 TLS close_notify / VMess EOF marker，
+    // 直接 Cancel 所有挂起操作后由析构链关闭 socket。
+    // 正常关闭（双方均 EOF）才执行协议级优雅关闭。
+    if (error_up != ErrorCode::OK || error_down != ErrorCode::OK) {
+        client.Cancel();
+        target.Cancel();
+    } else {
+        // 并行发送双向 close_notify / EOF marker，减少 1 次 RTT
+        auto shutdown_client = [&]() -> cobalt::task<void> {
+            try { co_await client.AsyncShutdownWrite(); } catch (...) {}
+        };
+        auto shutdown_target = [&]() -> cobalt::task<void> {
+            try { co_await target.AsyncShutdownWrite(); } catch (...) {}
+        };
+        co_await cobalt::gather(shutdown_client(), shutdown_target());
+        client.Cancel();
+        target.Cancel();
+    }
 
     LOG_CONN_DEBUG(ctx, "Relay finished: up={} down={}", bytes_up, bytes_down);
 

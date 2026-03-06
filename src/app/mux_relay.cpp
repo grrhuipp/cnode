@@ -79,7 +79,8 @@ cobalt::task<void> TcpReceiveLoop(
     std::shared_ptr<ReplyQueue> queue,
     std::shared_ptr<std::atomic<bool>> cancel_flag)
 {
-    std::array<uint8_t, 32768> buf;
+    // 16KB：兼顾协程帧大小和高吞吐子会话的读效率（原 32KB 过大）
+    std::array<uint8_t, 16384> buf;
     while (!cancel_flag->load(std::memory_order_relaxed)) {
         try {
             auto n = co_await stream->AsyncRead(net::buffer(buf));
@@ -133,19 +134,31 @@ cobalt::task<RelayResult> DoMuxRelay(
     std::unordered_map<uint16_t, UdpSubInfo> udp_subs;
     std::unordered_map<uint16_t, TcpSubInfo> tcp_subs;
 
-    // 帧累积缓冲区（处理粘包）
+    // 帧累积缓冲区（处理粘包），使用偏移游标避免逐帧 O(n) erase
     std::vector<uint8_t> frame_buf;
     frame_buf.reserve(4096);
+    size_t frame_buf_offset = 0;
 
     RelayResult result;
     parent_ctx.bytes_up = 0;
     parent_ctx.bytes_down = 0;
-    std::array<uint8_t, 32768> read_buf;
+    std::array<uint8_t, 16384> read_buf;
 
     // 轮询定时器（100ms 打断读，回到循环排空回包队列）
     net::steady_timer timer(executor);
     const uint64_t parent_conn_id = parent_ctx.conn_id;
     AsyncStream* client_ptr = &client_stream;
+
+    // 读轮询状态（循环外分配一次，避免每 100ms 一次 make_shared）
+    struct ReadPollState {
+        std::atomic<bool> timed_out{false};
+        std::atomic<bool> active{true};
+        void Reset() noexcept {
+            timed_out.store(false, std::memory_order_relaxed);
+            active.store(true, std::memory_order_relaxed);
+        }
+    };
+    auto read_poll = std::make_shared<ReadPollState>();
 
     bool running = true;
     auto write_frame_to_client =
@@ -203,11 +216,7 @@ cobalt::task<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         // 2. 从客户端读取（100ms 轮询：超时则回到步骤 1 排空回包队列）
         // --------------------------------------------------------------------
-        struct ReadPollState {
-            std::atomic<bool> timed_out{false};
-            std::atomic<bool> active{true};
-        };
-        auto read_poll = std::make_shared<ReadPollState>();
+        read_poll->Reset();
         timer.expires_after(std::chrono::milliseconds(100));
         timer.async_wait([read_poll, client_ptr](
                               const boost::system::error_code& ec) {
@@ -269,8 +278,9 @@ cobalt::task<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         // 3. 循环解析并分发 Mux 帧
         // --------------------------------------------------------------------
-        while (!frame_buf.empty()) {
-            auto opt_hdr = mux::DecodeFrame(frame_buf.data(), frame_buf.size());
+        while (frame_buf_offset < frame_buf.size()) {
+            size_t remaining = frame_buf.size() - frame_buf_offset;
+            auto opt_hdr = mux::DecodeFrame(frame_buf.data() + frame_buf_offset, remaining);
             if (!opt_hdr) break;  // 数据不足，等待下次读取
 
             const mux::FrameHeader& hdr = *opt_hdr;
@@ -284,7 +294,7 @@ cobalt::task<RelayResult> DoMuxRelay(
             // Payload 指针（仅 has_data 时有效）
             const uint8_t* payload = nullptr;
             if (hdr.has_data && hdr.data_len > 0) {
-                payload = frame_buf.data() + (hdr.frame_size - hdr.data_len);
+                payload = frame_buf.data() + frame_buf_offset + (hdr.frame_size - hdr.data_len);
             }
 
             switch (hdr.status) {
@@ -532,10 +542,19 @@ cobalt::task<RelayResult> DoMuxRelay(
 
             }  // switch (hdr.status)
 
-            // 消耗已处理的帧字节
-            frame_buf.erase(
-                frame_buf.begin(),
-                frame_buf.begin() + static_cast<std::ptrdiff_t>(hdr.frame_size));
+            // 移动偏移游标（O(1)），代替逐帧 erase 的 O(n) memmove
+            frame_buf_offset += hdr.frame_size;
+        }
+
+        // 压缩：所有帧处理完毕后一次性移除已消费的前缀
+        if (frame_buf_offset > 0) {
+            if (frame_buf_offset >= frame_buf.size()) {
+                frame_buf.clear();
+            } else {
+                frame_buf.erase(frame_buf.begin(),
+                    frame_buf.begin() + static_cast<std::ptrdiff_t>(frame_buf_offset));
+            }
+            frame_buf_offset = 0;
         }
     }
 

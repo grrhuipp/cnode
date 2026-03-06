@@ -171,6 +171,18 @@ cobalt::task<RelayResult> DoUDPRelay(
 
     net::steady_timer read_timer(executor);
 
+    // 读轮询状态（循环外分配一次，避免每 100ms 一次 make_shared）
+    struct ReadPollState {
+        std::atomic<bool> timed_out{false};
+        std::atomic<bool> active{true};
+        void Reset() noexcept {
+            timed_out.store(false, std::memory_order_relaxed);
+            active.store(true, std::memory_order_relaxed);
+        }
+    };
+    auto read_poll = std::make_shared<ReadPollState>();
+    AsyncStream* client_ptr = &client_stream;
+
     while (state->running.load()) {
         // ── 批量处理回包（减少协程切换）────────────────────────────────────
         {
@@ -195,12 +207,7 @@ cobalt::task<RelayResult> DoUDPRelay(
         try {
             // 轮询读取（100ms 超时，以便处理回包队列）
             // 空闲检测由 TcpStream idle_timeout 统一处理，通过 ConsumeReadSideTimeout 消费
-            struct ReadPollState {
-                std::atomic<bool> timed_out{false};
-                std::atomic<bool> active{true};
-            };
-            auto read_poll = std::make_shared<ReadPollState>();
-            AsyncStream* client_ptr = &client_stream;
+            read_poll->Reset();
             read_timer.expires_after(std::chrono::milliseconds(100));
             read_timer.async_wait([read_poll, client_ptr](const boost::system::error_code& ec) {
                 if (!ec && read_poll->active.exchange(false, std::memory_order_acq_rel)) {

@@ -25,9 +25,14 @@ constexpr int kSocketBufferSizeHigh = 32 * 1024;
 constexpr uint32_t kReadGrowThreshold = Buffer::kSize / 2;
 constexpr uint8_t kReadGrowStreakRequired = 2;
 std::atomic<uint32_t> g_active_tcp_streams{0};
-struct ConnectTimeoutState {
+// 合并 socket + timeout 状态为单次分配，减少每次 Connect 的堆操作
+struct ConnectState {
+    tcp::socket socket;
     std::atomic<bool> timed_out{false};
     std::atomic<bool> active{true};
+
+    explicit ConnectState(net::any_io_executor executor)
+        : socket(std::move(executor)) {}
 };
 
 int SelectSocketBufferSize() noexcept {
@@ -65,7 +70,6 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     , last_io_time_(other.last_io_time_)
     , read_timeout_(other.read_timeout_)
     , write_timeout_(other.write_timeout_)
-    , phase_deadline_handle_(std::move(other.phase_deadline_handle_))
     , timeout_scheduler_(&TimeoutScheduler::ForExecutor(socket_.get_executor())) {
     other.CancelIdleTimer();
     other.CancelReadDeadline();
@@ -111,7 +115,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         idle_timeout_ = other.idle_timeout_;
         read_timeout_ = other.read_timeout_;
         write_timeout_ = other.write_timeout_;
-        phase_deadline_handle_ = std::move(other.phase_deadline_handle_);
         timeout_scheduler_ = &TimeoutScheduler::ForExecutor(socket_.get_executor());
         last_io_time_ = other.last_io_time_;
         other.CancelIdleTimer();
@@ -143,10 +146,7 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
 }
 
 TcpStream::~TcpStream() {
-    CancelIdleTimer();
-    CancelReadDeadline();
-    CancelWriteDeadline();
-    CancelPhaseDeadline();
+    // Close() 内部已包含所有 Cancel 调用，不重复
     Close();
 }
 
@@ -423,6 +423,15 @@ void TcpStream::Close() {
     CancelPhaseDeadline();
     if (socket_.is_open()) {
         boost::system::error_code ec;
+        // 出站连接：设置 SO_LINGER{1,0} 跳过 TIME_WAIT，
+        // 直接 RST 关闭。此时 DoRelay 已完成协议级优雅关闭
+        // （close_notify / EOF marker），无需再依赖 TCP 层的 FIN 序列。
+        // 入站连接保持正常 FIN 关闭，避免客户端收到意外 RST。
+        if (stream_label_ == "out") {
+            struct linger lg = {1, 0};
+            ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_LINGER,
+                         reinterpret_cast<const char*>(&lg), sizeof(lg));
+        }
         socket_.shutdown(tcp::socket::shutdown_both, ec);
         socket_.close(ec);
     }
@@ -484,34 +493,33 @@ cobalt::task<DialResult> TcpStream::Connect(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    auto socket = std::make_shared<tcp::socket>(executor);
-    auto timeout_state = std::make_shared<ConnectTimeoutState>();
+    auto state = std::make_shared<ConnectState>(executor);
     auto& scheduler = TimeoutScheduler::ForExecutor(executor);
     TimeoutToken token = scheduler.ScheduleAfter(
         std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [timeout_state, socket]() {
-            if (timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
-                timeout_state->timed_out.store(true, std::memory_order_release);
+        [state]() {
+            if (state->active.exchange(false, std::memory_order_acq_rel)) {
+                state->timed_out.store(true, std::memory_order_release);
                 boost::system::error_code close_ec;
-                socket->close(close_ec);
+                state->socket.close(close_ec);
             }
         });
 
     boost::system::error_code connect_ec;
 
     try {
-        co_await socket->async_connect(endpoint, cobalt::use_op);
+        co_await state->socket.async_connect(endpoint, cobalt::use_op);
     } catch (const boost::system::system_error& e) {
         connect_ec = e.code();
     }
 
-    if (timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
+    if (state->active.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Cancel(token);
     } else {
         token.Reset();
     }
 
-    if (timeout_state->timed_out.load(std::memory_order_acquire)) {
+    if (state->timed_out.load(std::memory_order_acquire)) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
@@ -520,7 +528,7 @@ cobalt::task<DialResult> TcpStream::Connect(
         co_return DialResult::Fail(err, connect_ec.message());
     }
     co_return DialResult::Success(
-        std::make_unique<TcpStream>(std::move(*socket)));
+        std::make_unique<TcpStream>(std::move(state->socket)));
 }
 
 cobalt::task<DialResult> TcpStream::ConnectWithBind(
@@ -533,49 +541,48 @@ cobalt::task<DialResult> TcpStream::ConnectWithBind(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    auto socket = std::make_shared<tcp::socket>(executor);
+    auto state = std::make_shared<ConnectState>(executor);
 
     // 打开 socket
     boost::system::error_code ec;
-    socket->open(remote_endpoint.protocol(), ec);
+    state->socket.open(remote_endpoint.protocol(), ec);
     if (ec) {
         co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
     }
 
     // 绑定本地地址
     tcp::endpoint local_endpoint(local_addr, 0);  // 端口为 0，由系统分配
-    socket->bind(local_endpoint, ec);
+    state->socket.bind(local_endpoint, ec);
     if (ec) {
         co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
     }
 
-    auto timeout_state = std::make_shared<ConnectTimeoutState>();
     auto& scheduler = TimeoutScheduler::ForExecutor(executor);
     TimeoutToken token = scheduler.ScheduleAfter(
         std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [timeout_state, socket]() {
-            if (timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
-                timeout_state->timed_out.store(true, std::memory_order_release);
+        [state]() {
+            if (state->active.exchange(false, std::memory_order_acq_rel)) {
+                state->timed_out.store(true, std::memory_order_release);
                 boost::system::error_code close_ec;
-                socket->close(close_ec);
+                state->socket.close(close_ec);
             }
         });
 
     boost::system::error_code connect_ec;
 
     try {
-        co_await socket->async_connect(remote_endpoint, cobalt::use_op);
+        co_await state->socket.async_connect(remote_endpoint, cobalt::use_op);
     } catch (const boost::system::system_error& e) {
         connect_ec = e.code();
     }
 
-    if (timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
+    if (state->active.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Cancel(token);
     } else {
         token.Reset();
     }
 
-    if (timeout_state->timed_out.load(std::memory_order_acquire)) {
+    if (state->timed_out.load(std::memory_order_acquire)) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
@@ -584,7 +591,7 @@ cobalt::task<DialResult> TcpStream::ConnectWithBind(
         co_return DialResult::Fail(err, connect_ec.message());
     }
     co_return DialResult::Success(
-        std::make_unique<TcpStream>(std::move(*socket)));
+        std::make_unique<TcpStream>(std::move(state->socket)));
 }
 
 // ============================================================================
@@ -638,22 +645,19 @@ PhaseDeadlineHandle TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) 
     }
 
     phase_deadline_timed_out_.store(false, std::memory_order_release);
-    phase_deadline_handle_ = std::make_shared<std::atomic<bool>>(false);
 
-    auto deadline_handle = phase_deadline_handle_;
     tcp::socket* sock = &socket_;
     std::atomic<bool>* timed_out = &phase_deadline_timed_out_;
 
     phase_deadline_token_ = timeout_scheduler_->ScheduleAfter(
         std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [sock, timed_out, deadline_handle]() {
+        [sock, timed_out]() {
             timed_out->store(true, std::memory_order_release);
-            deadline_handle->store(true, std::memory_order_release);
             boost::system::error_code cancel_ec;
             sock->cancel(cancel_ec);
     });
 
-    return PhaseDeadlineHandle{std::move(deadline_handle)};
+    return PhaseDeadlineHandle{timed_out};
 }
 
 void TcpStream::ClearPhaseDeadline() {
@@ -783,7 +787,6 @@ void TcpStream::CancelPhaseDeadline() noexcept {
     } else {
         phase_deadline_token_.Reset();
     }
-    phase_deadline_handle_.reset();
 }
 
 void TcpStream::ReleaseActiveCounter() noexcept {

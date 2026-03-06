@@ -117,7 +117,6 @@ private:
     std::atomic<bool> write_timed_out_{false};
 
     // 阶段性绝对 deadline：一次性触发，不随 I/O 重置（共享调度）。
-    std::shared_ptr<std::atomic<bool>> phase_deadline_handle_;
     std::atomic<bool> phase_deadline_timed_out_{false};
     TimeoutScheduler* timeout_scheduler_ = nullptr;
     TimeoutToken idle_timer_token_;
