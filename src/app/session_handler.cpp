@@ -124,11 +124,41 @@ cobalt::task<void> SessionHandler::Handle(
 
     // ----------------------------------------------------------------
     // 3. 流量嗅探（可选）
+    //    - 快速路径：Trojan/SS 等协议在 ParseStream 时已解密首包
+    //    - 延迟路径：VMess 等需要先 WrapStream 建立解密流再读首包
     // ----------------------------------------------------------------
-    if (listener.sniff_config.enabled && !action.initial_payload.empty()) {
-        auto result = Sniff(std::span<const uint8_t>(
-            action.initial_payload.data(), action.initial_payload.size()));
+    std::unique_ptr<AsyncStream> early_wrapped_in;  // 延迟嗅探时提前创建的解密流
+    std::vector<uint8_t> late_sniff_payload;        // 延迟嗅探读出的首包明文
 
+    // 确定嗅探数据源
+    std::span<const uint8_t> sniff_data;
+    if (listener.sniff_config.enabled && !action.initial_payload.empty()) {
+        // 快速路径：直接使用 initial_payload
+        sniff_data = std::span<const uint8_t>(
+            action.initial_payload.data(), action.initial_payload.size());
+    } else if (listener.sniff_config.enabled && action.initial_payload.empty()
+               && action.network == Network::TCP) {
+        // 延迟路径：VMess 等加密协议在 ParseStream 时无法解密首包
+        // WrapStream 建立解密流后读取首包明文，用于嗅探和 dest_override
+        auto wrap_result = co_await listener.inbound_handler->WrapStream(
+            std::move(stream), ctx);
+        if (wrap_result) {
+            early_wrapped_in = std::move(*wrap_result);
+            // 读取首个解密 chunk（通常包含 TLS ClientHello 或 HTTP 请求）
+            late_sniff_payload.resize(4096);
+            size_t n = co_await early_wrapped_in->AsyncRead(
+                net::buffer(late_sniff_payload.data(), late_sniff_payload.size()));
+            late_sniff_payload.resize(n);
+            if (n > 0) {
+                sniff_data = std::span<const uint8_t>(
+                    late_sniff_payload.data(), late_sniff_payload.size());
+            }
+        }
+    }
+
+    // 执行嗅探
+    if (!sniff_data.empty()) {
+        auto result = Sniff(sniff_data);
         ctx.sniff_result = result;
 
         if (result.success && !result.domain.empty()) {
@@ -389,24 +419,27 @@ cobalt::task<void> SessionHandler::Handle(
     // 8. 包装入站流（协议解密 / 帧解析）
     //    VMess: VMessServerAsyncStream（chunk 解密）
     //    Trojan: 透传
+    //    延迟嗅探路径已在步骤 3 提前完成 WrapStream
     // ----------------------------------------------------------------
-    auto wrapped_in_raw_result = co_await listener.inbound_handler->WrapStream(std::move(stream), ctx);
-    if (!wrapped_in_raw_result) {
-        ErrorCode code = wrapped_in_raw_result.error();
-        if (code == ErrorCode::OK) {
-            code = ErrorCode::PROTOCOL_DECODE_FAILED;
+    std::unique_ptr<AsyncStream> wrapped_in;
+    if (early_wrapped_in) {
+        wrapped_in = std::move(early_wrapped_in);
+    } else {
+        auto wrapped_in_raw_result = co_await listener.inbound_handler->WrapStream(std::move(stream), ctx);
+        if (!wrapped_in_raw_result) {
+            ErrorCode code = wrapped_in_raw_result.error();
+            if (code == ErrorCode::OK) {
+                code = ErrorCode::PROTOCOL_DECODE_FAILED;
+            }
+            LOG_CONN_FAIL_CTX(ctx, "INBOUND_WRAP_FAILED {} -> {} via {}: {}",
+                              ctx.client_ip, ctx.final_target.ToString(),
+                              ctx.outbound_tag, ErrorCodeToString(code));
+            ctx.SetError(code);
+            ctx.TransitionTo(ConnState::CLOSING);
+            co_return;
         }
-        LOG_CONN_FAIL_CTX(ctx, "INBOUND_WRAP_FAILED {} -> {} via {}: {}",
-                          ctx.client_ip, ctx.final_target.ToString(),
-                          ctx.outbound_tag, ErrorCodeToString(code));
-        ctx.SetError(code);
-        ctx.TransitionTo(ConnState::CLOSING);
-        co_return;
+        wrapped_in = std::move(*wrapped_in_raw_result);
     }
-    auto wrapped_in_raw = std::move(*wrapped_in_raw_result);
-
-    // TCP relay 路径在 DoRelay 内直接维护 ctx.bytes_up/down。
-    auto wrapped_in = std::move(wrapped_in_raw);
 
     // ----------------------------------------------------------------
     // 9. 双向数据转发
@@ -425,13 +458,17 @@ cobalt::task<void> SessionHandler::Handle(
     relay_cfg.downlink_only = timeouts_.DownlinkOnlyTimeout();
     relay_cfg.speed_limit   = ctx.speed_limit;
 
+    // 延迟嗅探路径：首包已从解密流预读，作为 relay 首包数据
+    auto& relay_payload = late_sniff_payload.empty()
+        ? action.initial_payload : late_sniff_payload;
+
     LOG_CONN_DEBUG(ctx, "[SessionHandler] Relay start: {} -> {} via {} payload={}B",
                    ctx.client_ip, ctx.final_target.ToString(), ctx.outbound_tag,
-                   action.initial_payload.size());
+                   relay_payload.size());
 
     auto relay_result = co_await DoRelayWithFirstPacket(
         *wrapped_in, *wrapped_out, ctx, stats_,
-        action.initial_payload, relay_cfg);
+        relay_payload, relay_cfg);
 
     if (relay_result.error != ErrorCode::OK) {
         LOG_CONN_DEBUG(ctx, "[SessionHandler] Relay end: {} up={}B down={}B closer={} target={}",
