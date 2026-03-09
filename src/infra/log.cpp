@@ -17,7 +17,10 @@
 #include <boost/make_shared.hpp>
 #include <boost/shared_ptr.hpp>
 
+#include <zlib.h>
+
 #include <filesystem>
+#include <fstream>
 #include <format>
 #include <iostream>
 #include <vector>
@@ -64,23 +67,74 @@ std::filesystem::path g_log_dir;
 uint16_t g_max_days = 15;
 
 // ============================================================================
-// 过期日志文件清理
+// gzip 压缩单个文件：src → src.gz，成功后删除原文件
+// ============================================================================
+bool GzipFile(const std::filesystem::path& src) {
+    auto dst = src;
+    dst += ".gz";
+
+    std::ifstream in(src, std::ios::binary);
+    if (!in) return false;
+
+    gzFile gz = gzopen(dst.string().c_str(), "wb6");  // 压缩级别 6（平衡速度与比率）
+    if (!gz) return false;
+
+    char buf[65536];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+        if (gzwrite(gz, buf, static_cast<unsigned>(in.gcount())) <= 0) {
+            gzclose(gz);
+            std::filesystem::remove(dst);
+            return false;
+        }
+    }
+    gzclose(gz);
+    in.close();
+
+    std::filesystem::remove(src);
+    return true;
+}
+
+// ============================================================================
+// 获取今日日期字符串（YYYY-MM-DD）
+// ============================================================================
+std::string TodayDateString() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto days = floor<std::chrono::days>(now);
+    year_month_day ymd{days};
+    return std::format("{:%Y-%m-%d}", ymd);
+}
+
+// ============================================================================
+// 过期日志清理 + 非今日日志自动压缩
 // ============================================================================
 void CleanupOldFiles() {
-    if (g_max_days == 0 || g_log_dir.empty()) return;
+    if (g_log_dir.empty()) return;
     try {
         auto now = std::filesystem::file_time_type::clock::now();
+        auto today = TodayDateString();
+
         for (const auto& entry : std::filesystem::directory_iterator(g_log_dir)) {
             if (!entry.is_regular_file()) continue;
             auto name = entry.path().filename().string();
-            if (name.rfind("app_",    0) == 0 ||
-                name.rfind("access_", 0) == 0) {
+
+            bool is_log = (name.rfind("app_", 0) == 0 || name.rfind("access_", 0) == 0);
+            if (!is_log) continue;
+
+            // 过期清理（.log 和 .log.gz 都检查）
+            if (g_max_days > 0) {
                 auto age  = now - entry.last_write_time();
                 auto days = static_cast<uint16_t>(
                     std::chrono::duration_cast<std::chrono::hours>(age).count() / 24);
                 if (days > g_max_days) {
                     std::filesystem::remove(entry.path());
+                    continue;
                 }
+            }
+
+            // 压缩非今日的 .log 文件
+            if (name.ends_with(".log") && name.find(today) == std::string::npos) {
+                GzipFile(entry.path());
             }
         }
     } catch (...) {}
@@ -105,6 +159,11 @@ boost::shared_ptr<AsyncFileSink> MakeAsyncFileSink(
     // async 前端已批量化写入（队列 → backend），auto_flush 保证每批写入后 fsync
     // 效果：批量写入减少 syscall 次数，同时 tail -f 无明显延迟
     backend->auto_flush(true);
+
+    // 日志轮转时压缩前一天的日志文件
+    backend->set_open_handler([](sinks::text_file_backend::stream_type&) {
+        CleanupOldFiles();
+    });
 
     return boost::make_shared<AsyncFileSink>(backend);
 }

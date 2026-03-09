@@ -126,10 +126,10 @@ install_cnode() {
         exit 1
     fi
 
-    # 比对本地版本，相同则跳过
+    # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
     LOCAL_ID=""
     if [ -x "$BIN_PATH" ]; then
-        LOCAL_ID=$("$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
+        LOCAL_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     fi
 
     if [ "$LOCAL_ID" = "$REMOTE_ID" ]; then
@@ -145,11 +145,13 @@ install_cnode() {
         LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64"
     fi
 
-    # 运行中的二进制无法覆盖（Text file busy），先停服务
+    # 运行中的二进制无法覆盖（Text file busy），先停服务并杀残留进程
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         echo "停止 cnode 服务..."
         systemctl stop "$SERVICE_NAME"
     fi
+    pkill -f "$BIN_PATH" 2>/dev/null || true
+    sleep 1
 
     echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_ID"
     if ! curl -sfL "$LATEST_URL" -o "$BIN_PATH"; then
@@ -159,7 +161,7 @@ install_cnode() {
     chmod +x "$BIN_PATH"
 
     # 验证下载的版本
-    NEW_ID=$("$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
+    NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     if [ "$NEW_ID" != "$REMOTE_ID" ]; then
         echo "版本校验失败: 期望 $REMOTE_ID，实际 $NEW_ID"
         exit 1
@@ -211,7 +213,7 @@ init_config() {
         cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "log": {
-    "loglevel": "error",
+    "loglevel": "info",
     "logDir": "$LOG_DIR"
   },
   "workers": 0,
