@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
 # CMP0167: CMake 4.x 移除了旧的 FindBoost 模块，使用 Boost 自带的 CMake 配置文件
-cmake_policy(SET CMP0167 NEW)
+# CMake 3.30+ 才有此策略，低版本跳过
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 
 # 抑制第三方依赖（如 aws-lc）的 cmake_minimum_required 过旧警告
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
