@@ -82,17 +82,6 @@ jobs:
             vcpkg-installed-alpine-Release-
             vcpkg-installed-alpine-
 
-      - name: Cache AWS-LC
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/_deps/aws_lc-src
-            build/_deps/aws_lc-build
-            build/_deps/aws_lc-subbuild
-          key: aws-lc-alpine-Release-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: |
-            aws-lc-alpine-Release-
-
       - name: Generate build ID
         id: buildid
         run: echo "id=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')" >> "$GITHUB_OUTPUT"
