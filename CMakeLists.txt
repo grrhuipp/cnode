@@ -339,9 +339,12 @@ target_link_options(cnode PRIVATE
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-stringop-overread -Wno-free-nonheap-object>
 )
 
-# Windows 平台链接库
+# 平台链接库
 if(WIN32)
     target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi)
+elseif(UNIX AND NOT APPLE)
+    # Linux: 静态链接时需要显式链接 pthread/dl/rt
+    target_link_libraries(cnode PRIVATE dl rt)
 endif()
 
 # ============================================================================
