@@ -40,13 +40,14 @@ jobs:
       - name: Install Alpine build tools
         run: |
           apk add --no-cache \
-            git gcc g++ musl-dev linux-headers \
-            cmake ninja-build pkgconf \
-            curl zip unzip tar \
-            go nasm perl \
-            bash coreutils \
-            nodejs \
-            github-cli
+            build-base cmake samurai git curl \
+            zip unzip tar pkgconf linux-headers musl-dev \
+            perl bash python3 \
+            autoconf automake libtool \
+            go nasm \
+            nodejs github-cli
+          # samurai 是 ninja 的轻量替代，vcpkg/cmake 需要 ninja 命令
+          ln -sf /usr/bin/samu /usr/bin/ninja
 
       - uses: actions/checkout@v4
 
@@ -102,7 +103,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DVCPKG_OVERLAY_TRIPLETS="${GITHUB_WORKSPACE}/triplets" \
+            -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ steps.buildid.outputs.id }}
 
@@ -148,7 +149,6 @@ jobs:
                 per_page: 100,
               }
             );
-            // 保留当前运行，删除该分支的所有旧运行
             const toDelete = runs
               .filter(r => r.id !== context.runId)
               .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
