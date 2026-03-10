@@ -343,8 +343,15 @@ target_link_options(cnode PRIVATE
 if(WIN32)
     target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi)
 elseif(UNIX AND NOT APPLE)
-    # Linux: 静态链接时需要显式链接 pthread/dl/rt
-    target_link_libraries(cnode PRIVATE dl rt)
+    # glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
+    find_library(LIBDL dl)
+    find_library(LIBRT rt)
+    if(LIBDL)
+        target_link_libraries(cnode PRIVATE ${LIBDL})
+    endif()
+    if(LIBRT)
+        target_link_libraries(cnode PRIVATE ${LIBRT})
+    endif()
 endif()
 
 # ============================================================================
