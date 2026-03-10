@@ -117,6 +117,10 @@ jobs:
           path: build/cnode
           if-no-files-found: error
 
+      - name: Fix git safe directory (container ownership mismatch)
+        if: github.event_name == 'push'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Delete old release
         if: github.event_name == 'push'
         run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag 2>/dev/null || true
