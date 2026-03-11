@@ -33,6 +33,7 @@ constexpr size_t kVMessHandshakeHeaderMax = 512;
 constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
+constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
 
 }  // namespace
 
@@ -719,6 +720,8 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
     if (!write_batch_buf_.empty()) {
         co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size());
+        write_batch_buf_.clear();
+        ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
     }
 }
 

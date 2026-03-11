@@ -98,6 +98,10 @@ private:
     void DoReceive();
     void AddTargetMapping(const std::string& target_key, uint64_t callback_id);
     void RemoveTargetMappings(uint64_t callback_id);
+    void MaybePruneTargetMappings(steady_clock::time_point now);
+    void RefreshTargetMapping(const std::string& target_key,
+                              uint64_t callback_id,
+                              steady_clock::time_point now);
     
     net::any_io_executor executor_;
     std::string session_id_;
@@ -115,7 +119,7 @@ private:
     struct CallbackEntry {
         std::string destination;  // 空 = Full Cone, 非空 = 精确匹配
         PacketCallback callback;
-        std::unordered_set<std::string> sent_targets;  // 发送过的目标地址
+        std::unordered_map<std::string, steady_clock::time_point> sent_targets;
     };
     
     std::unordered_map<uint64_t, CallbackEntry> registered_callbacks_;
@@ -146,9 +150,13 @@ private:
     
     std::array<uint8_t, DEFAULT_RECV_BUF_SIZE> recv_buffer_;
     udp::endpoint sender_endpoint_;
-    
+
     std::chrono::steady_clock::time_point last_active_;
+    time_point next_target_prune_at_{};
     bool running_ = false;
+
+    static constexpr auto kTargetMappingTtl = std::chrono::minutes(2);
+    static constexpr auto kTargetPruneInterval = std::chrono::seconds(30);
     
     // 统计
     uint64_t packets_sent_ = 0;

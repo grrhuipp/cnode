@@ -13,6 +13,8 @@ namespace acpp {
 
 namespace {
 
+constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
+
 void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
     if (buf.capacity() > keep_capacity) {
         std::vector<uint8_t>().swap(buf);
@@ -491,6 +493,8 @@ cobalt::task<void> SsServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
     if (!write_batch_buf_.empty()) {
         co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size());
+        write_batch_buf_.clear();
+        ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
     }
 }
 

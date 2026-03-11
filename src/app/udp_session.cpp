@@ -63,7 +63,8 @@ UDPSession::UDPSession(net::any_io_executor executor,
     , on_packet_(std::move(on_packet))
     , dns_service_(dns_service)
     , socket_(executor)
-    , last_active_(std::chrono::steady_clock::now()) {
+    , last_active_(std::chrono::steady_clock::now())
+    , next_target_prune_at_(steady_clock::now() + kTargetPruneInterval) {
 }
 
 UDPSession::~UDPSession() {
@@ -321,15 +322,17 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
     if (it != registered_callbacks_.end()) {
         // 清理反向索引
         if (!it->second.destination.empty()) {
-            auto& callbacks = target_to_callbacks_[it->second.destination];
-            callbacks.erase(callback_id);
-            if (callbacks.empty()) {
-                target_to_callbacks_.erase(it->second.destination);
+            auto callbacks_it = target_to_callbacks_.find(it->second.destination);
+            if (callbacks_it != target_to_callbacks_.end()) {
+                callbacks_it->second.erase(callback_id);
+                if (callbacks_it->second.empty()) {
+                    target_to_callbacks_.erase(callbacks_it);
+                }
             }
         }
         
         // 清理 sent_targets 对应的反向索引
-        for (const auto& target : it->second.sent_targets) {
+        for (const auto& [target, _] : it->second.sent_targets) {
             auto t_it = target_to_callbacks_.find(target);
             if (t_it != target_to_callbacks_.end()) {
                 t_it->second.erase(callback_id);
@@ -371,6 +374,8 @@ void UDPSession::DoReceive() {
             
             std::string sender_key = MakeEndpointKey(sender_endpoint_.address(), 
                                                        sender_endpoint_.port());
+            const auto now = steady_clock::now();
+            MaybePruneTargetMappings(now);
             
             LOG_ACCESS_DEBUG("UDP session {} received {} bytes from {}",
                      session_id_, bytes, sender_key);
@@ -408,6 +413,7 @@ void UDPSession::DoReceive() {
                     for (uint64_t cb_id : t_it->second) {
                         auto cb_it = registered_callbacks_.find(cb_id);
                         if (cb_it != registered_callbacks_.end()) {
+                            RefreshTargetMapping(sender_key, cb_id, now);
                             matched_callbacks.push_back(cb_it->second.callback);
                         }
                     }
@@ -458,11 +464,14 @@ void UDPSession::DoReceive() {
 }
 
 void UDPSession::AddTargetMapping(const std::string& target_key, uint64_t callback_id) {
+    const auto now = steady_clock::now();
+    MaybePruneTargetMappings(now);
+
     auto it = registered_callbacks_.find(callback_id);
     if (it != registered_callbacks_.end()) {
         if (it->second.destination.empty()) {
             // Full Cone: 添加发送目标到 sent_targets
-            it->second.sent_targets.insert(target_key);
+            it->second.sent_targets[target_key] = now;
             target_to_callbacks_[target_key].insert(callback_id);
             LOG_ACCESS_DEBUG("UDP session {} added target mapping {} -> callback {}", 
                      session_id_, target_key, callback_id);
@@ -473,7 +482,7 @@ void UDPSession::AddTargetMapping(const std::string& target_key, uint64_t callba
 void UDPSession::RemoveTargetMappings(uint64_t callback_id) {
     auto it = registered_callbacks_.find(callback_id);
     if (it != registered_callbacks_.end()) {
-        for (const auto& target : it->second.sent_targets) {
+        for (const auto& [target, _] : it->second.sent_targets) {
             auto t_it = target_to_callbacks_.find(target);
             if (t_it != target_to_callbacks_.end()) {
                 t_it->second.erase(callback_id);
@@ -483,6 +492,48 @@ void UDPSession::RemoveTargetMappings(uint64_t callback_id) {
             }
         }
         it->second.sent_targets.clear();
+    }
+}
+
+void UDPSession::MaybePruneTargetMappings(steady_clock::time_point now) {
+    if (now < next_target_prune_at_) {
+        return;
+    }
+
+    next_target_prune_at_ = now + kTargetPruneInterval;
+    const auto cutoff = now - kTargetMappingTtl;
+
+    for (auto& [callback_id, entry] : registered_callbacks_) {
+        for (auto it = entry.sent_targets.begin(); it != entry.sent_targets.end(); ) {
+            if (it->second >= cutoff) {
+                ++it;
+                continue;
+            }
+
+            auto reverse_it = target_to_callbacks_.find(it->first);
+            if (reverse_it != target_to_callbacks_.end()) {
+                reverse_it->second.erase(callback_id);
+                if (reverse_it->second.empty()) {
+                    target_to_callbacks_.erase(reverse_it);
+                }
+            }
+            it = entry.sent_targets.erase(it);
+        }
+    }
+}
+
+void UDPSession::RefreshTargetMapping(
+    const std::string& target_key,
+    uint64_t callback_id,
+    steady_clock::time_point now) {
+    auto it = registered_callbacks_.find(callback_id);
+    if (it == registered_callbacks_.end() || !it->second.destination.empty()) {
+        return;
+    }
+
+    auto sent_it = it->second.sent_targets.find(target_key);
+    if (sent_it != it->second.sent_targets.end()) {
+        sent_it->second = now;
     }
 }
 

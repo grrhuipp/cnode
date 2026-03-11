@@ -22,6 +22,18 @@ namespace acpp {
 // ============================================================================
 namespace {
 
+void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
+    if (buf.capacity() > keep_capacity) {
+        std::vector<uint8_t>().swap(buf);
+    }
+}
+
+constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
+constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
+constexpr size_t kMuxQueueEmergencyBytes = 16 * 1024 * 1024;
+constexpr size_t kMuxFrameBufKeepCap     = 64 * 1024;
+constexpr size_t kMuxReplyOverhead       = 128;
+
 // 回包元素（出站 → 客户端）
 struct MuxReply {
     uint16_t session_id = 0;
@@ -31,7 +43,58 @@ struct MuxReply {
     std::vector<uint8_t> data;
 };
 
-using ReplyQueue = std::deque<MuxReply>;
+struct ReplyQueueState {
+    std::deque<MuxReply> queue;
+    size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
+    size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
+    std::atomic<bool> tcp_overflowed{false};
+    std::atomic<uint64_t> udp_dropped{0};
+
+    size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
+
+    bool PushTcp(MuxReply&& reply) {
+        const size_t reply_bytes = reply.data.size() + kMuxReplyOverhead;
+        if (tcp_queued_bytes + reply_bytes > kMuxQueueEmergencyBytes) {
+            return false;
+        }
+        tcp_queued_bytes += reply_bytes;
+        queue.push_back(std::move(reply));
+        return true;
+    }
+
+    bool PushUdp(MuxReply&& reply) {
+        const size_t reply_bytes = reply.data.size() + kMuxReplyOverhead;
+        // 独立计数：不受 TCP 回包积压的影响
+        if (udp_queued_bytes + reply_bytes > kMuxQueueHighWaterBytes) {
+            return false;
+        }
+        udp_queued_bytes += reply_bytes;
+        queue.push_back(std::move(reply));
+        return true;
+    }
+
+    bool Pop(MuxReply& reply) {
+        if (queue.empty()) return false;
+        const size_t reply_bytes = queue.front().data.size() + kMuxReplyOverhead;
+        if (queue.front().is_udp) {
+            udp_queued_bytes -= std::min(udp_queued_bytes, reply_bytes);
+        } else {
+            tcp_queued_bytes -= std::min(tcp_queued_bytes, reply_bytes);
+        }
+        reply = std::move(queue.front());
+        queue.pop_front();
+        return true;
+    }
+
+    // TCP 背压：仅看 TCP 自身的积压量
+    bool ShouldBackpressureTcpReads() const noexcept {
+        return tcp_queued_bytes >= kMuxQueueHighWaterBytes;
+    }
+
+    bool TcpReadWindowOpen() const noexcept {
+        return tcp_queued_bytes <= kMuxQueueLowWaterBytes;
+    }
+};
 
 // 可跨 Mux 连接共享的 UDP 拨号状态（GlobalID 复用）
 struct SharedUdpDial {
@@ -76,19 +139,63 @@ void CleanupGlobalIdMap() {
 cobalt::task<void> TcpReceiveLoop(
     uint16_t session_id,
     std::shared_ptr<AsyncStream> stream,
-    std::shared_ptr<ReplyQueue> queue,
+    std::shared_ptr<ReplyQueueState> queue_state,
+    std::shared_ptr<std::atomic<bool>> mux_running,
     std::shared_ptr<std::atomic<bool>> cancel_flag)
 {
+    auto executor = co_await cobalt::this_coro::executor;
+    net::steady_timer backpressure_timer(executor);
+
+    auto wait_for_queue_window = [&]() -> cobalt::task<bool> {
+        if (!queue_state->ShouldBackpressureTcpReads()) {
+            co_return true;
+        }
+
+        while (mux_running->load(std::memory_order_acquire) &&
+               !cancel_flag->load(std::memory_order_relaxed)) {
+            if (queue_state->TcpReadWindowOpen()) {
+                co_return true;
+            }
+
+            backpressure_timer.expires_after(std::chrono::milliseconds(10));
+            auto [ec] = co_await backpressure_timer.async_wait(
+                net::as_tuple(cobalt::use_op));
+            if (ec == net::error::operation_aborted) {
+                continue;
+            }
+        }
+
+        co_return false;
+    };
+
     // 16KB：兼顾协程帧大小和高吞吐子会话的读效率（原 32KB 过大）
     std::array<uint8_t, 16384> buf;
-    while (!cancel_flag->load(std::memory_order_relaxed)) {
+    auto push_or_stop = [&](MuxReply&& reply) {
+        if (!mux_running->load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (queue_state->PushTcp(std::move(reply))) {
+            return true;
+        }
+        queue_state->tcp_overflowed.store(true, std::memory_order_release);
+        cancel_flag->store(true, std::memory_order_release);
+        stream->Cancel();
+        return false;
+    };
+
+    while (!cancel_flag->load(std::memory_order_relaxed) &&
+           mux_running->load(std::memory_order_acquire)) {
+        if (!co_await wait_for_queue_window()) {
+            break;
+        }
+
         try {
             auto n = co_await stream->AsyncRead(net::buffer(buf));
             if (n == 0) {
                 MuxReply reply;
                 reply.session_id = session_id;
                 reply.is_end     = true;
-                queue->push_back(std::move(reply));
+                (void)push_or_stop(std::move(reply));
                 break;
             }
             MuxReply reply;
@@ -96,12 +203,14 @@ cobalt::task<void> TcpReceiveLoop(
             reply.is_end     = false;
             reply.is_udp     = false;
             reply.data.assign(buf.data(), buf.data() + n);
-            queue->push_back(std::move(reply));
+            if (!push_or_stop(std::move(reply))) {
+                break;
+            }
         } catch (...) {
             MuxReply reply;
             reply.session_id = session_id;
             reply.is_end     = true;
-            queue->push_back(std::move(reply));
+            (void)push_or_stop(std::move(reply));
             break;
         }
     }
@@ -127,7 +236,7 @@ cobalt::task<RelayResult> DoMuxRelay(
 
     // 回包队列：单线程，无锁
     // mux_running 保护回调不在 DoMuxRelay 退出后继续推送
-    auto reply_queue = std::make_shared<ReplyQueue>();
+    auto reply_queue = std::make_shared<ReplyQueueState>();
     auto mux_running = std::make_shared<std::atomic<bool>>(true);
 
     // 子会话集合
@@ -186,9 +295,8 @@ cobalt::task<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         // 1. 排空回包队列 → 序列化写回客户端
         // --------------------------------------------------------------------
-        while (!reply_queue->empty()) {
-            MuxReply reply = std::move(reply_queue->front());
-            reply_queue->pop_front();
+        MuxReply reply;
+        while (reply_queue->Pop(reply)) {
 
             std::vector<uint8_t> frame;
             if (reply.is_end) {
@@ -212,6 +320,15 @@ cobalt::task<RelayResult> DoMuxRelay(
             }
         }
         if (!running) break;
+
+        if (reply_queue->tcp_overflowed.exchange(false, std::memory_order_acq_rel)) {
+            LOG_CONN_DEBUG(parent_ctx,
+                "[MuxRelay] Reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
+                reply_queue->tcp_queued_bytes, reply_queue->udp_queued_bytes,
+                reply_queue->queue.size(), kMuxQueueEmergencyBytes);
+            result.error = ErrorCode::RESOURCE_EXHAUSTED;
+            break;
+        }
 
         // --------------------------------------------------------------------
         // 2. 从客户端读取（100ms 轮询：超时则回到步骤 1 排空回包队列）
@@ -362,7 +479,15 @@ cobalt::task<RelayResult> DoMuxRelay(
                                 reply.is_udp     = true;
                                 reply.udp_src    = pkt.target;
                                 reply.data       = pkt.data;
-                                rq->push_back(std::move(reply));
+                                if (!rq->PushUdp(std::move(reply))) {
+                                    const uint64_t dropped =
+                                        rq->udp_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+                                    if (dropped % 100 == 1) {
+                                        LOG_ACCESS_DEBUG(
+                                            "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
+                                            parent_conn_id, dropped);
+                                    }
+                                }
                             });
                     }
 
@@ -440,7 +565,7 @@ cobalt::task<RelayResult> DoMuxRelay(
 
                     // 启动接收协程（值捕获 shared_ptr，保证 stream 存活到协程结束）
                     cobalt::spawn(executor,
-                        TcpReceiveLoop(sid, sub.stream, reply_queue, cancel_flag),
+                        TcpReceiveLoop(sid, sub.stream, reply_queue, mux_running, cancel_flag),
                         net::detached);
 
                     // 转发首包数据
@@ -550,9 +675,15 @@ cobalt::task<RelayResult> DoMuxRelay(
         if (frame_buf_offset > 0) {
             if (frame_buf_offset >= frame_buf.size()) {
                 frame_buf.clear();
+                ReleaseIdleBuffer(frame_buf, kMuxFrameBufKeepCap);
             } else {
                 frame_buf.erase(frame_buf.begin(),
                     frame_buf.begin() + static_cast<std::ptrdiff_t>(frame_buf_offset));
+                // 部分消费后：若 capacity 远大于实际数据量，收缩避免长期浪费
+                if (frame_buf.capacity() > kMuxFrameBufKeepCap &&
+                    frame_buf.size() < frame_buf.capacity() / 4) {
+                    frame_buf.shrink_to_fit();
+                }
             }
             frame_buf_offset = 0;
         }
@@ -576,6 +707,13 @@ cobalt::task<RelayResult> DoMuxRelay(
         tcp_sub.cancel_flag->store(true);
         tcp_sub.stream->Cancel();
     }
+
+#ifndef NDEBUG
+    const uint64_t udp_dropped = reply_queue->udp_dropped.load(std::memory_order_relaxed);
+    if (udp_dropped > 0) {
+        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] UDP replies dropped={}", udp_dropped);
+    }
+#endif
 
     co_return result;
 }
