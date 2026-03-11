@@ -99,13 +99,10 @@ jobs:
       - name: Build
         run: cmake --build build --parallel $(nproc)
 
-      - name: Verify static binary
+      - name: Verify & strip binary
         run: |
           file build/cnode
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
-
-      - name: Strip binary
-        run: |
           strip build/cnode
           cp build/cnode cnode-linux-amd64
           ls -lh cnode-linux-amd64
@@ -129,35 +126,15 @@ jobs:
 
       - name: Cleanup old workflow runs
         if: github.event_name == 'push'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const branch = '${{ github.ref_name }}';
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRunsForRepo,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                branch: branch,
-                per_page: 100,
-              }
-            );
-            const toDelete = runs
-              .filter(r => r.id !== context.runId)
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-            for (const run of toDelete) {
-              try {
-                await github.rest.actions.deleteWorkflowRun({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  run_id: run.id,
-                });
-                console.log(`Deleted run #${run.id} (${run.created_at})`);
-              } catch (e) {
-                console.log(`Skip ${run.id}: ${e.message}`);
-              }
-            }
-            console.log(`Cleaned up ${toDelete.length} old runs for branch ${branch}`);
+        run: |
+          gh run list --branch "${{ github.ref_name }}" --json databaseId \
+            --jq '.[].databaseId' \
+          | while read -r rid; do
+              [ "$rid" = "${{ github.run_id }}" ] && continue
+              gh run delete "$rid" 2>/dev/null || true
+            done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish release
         if: github.event_name == 'push'

@@ -6,6 +6,7 @@
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/panel/v2board_panel.hpp"
 
+#include "acppnode/common/buffer_util.hpp"
 #include <openssl/rand.h>
 #include <cstring>
 
@@ -14,12 +15,6 @@ namespace acpp {
 namespace {
 
 constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
-
-void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
-    if (buf.capacity() > keep_capacity) {
-        std::vector<uint8_t>().swap(buf);
-    }
-}
 
 }  // namespace
 

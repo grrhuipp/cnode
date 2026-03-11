@@ -1,4 +1,5 @@
 #include "acppnode/protocol/vmess/vmess_stream.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include <openssl/rand.h>
 
@@ -8,12 +9,6 @@ namespace vmess {
 namespace {
 
 constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
-
-void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
-    if (buf.capacity() > keep_capacity) {
-        std::vector<uint8_t>().swap(buf);
-    }
-}
 
 }  // namespace
 

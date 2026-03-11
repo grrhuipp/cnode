@@ -275,15 +275,14 @@ add_panel() {
             nodeType: $node_type
         }')
 
-    # TLS 配置
+    # TLS 配置（单次 jq 调用完成）
     if [ "$tls_enable" = "true" ]; then
-        PANEL_JSON=$(echo "$PANEL_JSON" | jq '.tlsEnable = true')
-        if [ -n "$tls_cert" ]; then
-            PANEL_JSON=$(echo "$PANEL_JSON" | jq --arg v "$tls_cert" '.tlsCert = $v')
-        fi
-        if [ -n "$tls_key" ]; then
-            PANEL_JSON=$(echo "$PANEL_JSON" | jq --arg v "$tls_key" '.tlsKey = $v')
-        fi
+        PANEL_JSON=$(echo "$PANEL_JSON" | jq \
+            --arg cert "$tls_cert" \
+            --arg key  "$tls_key" \
+            '.tlsEnable = true
+             | if $cert != "" then .tlsCert = $cert else . end
+             | if $key  != "" then .tlsKey  = $key  else . end')
     fi
 
     # 先删除同名 panel（去重），再追加

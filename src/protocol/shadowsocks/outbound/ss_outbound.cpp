@@ -8,20 +8,11 @@
 
 #include <openssl/rand.h>
 
+#include "acppnode/common/buffer_util.hpp"
 #include <algorithm>
 #include <cstring>
 
 namespace acpp {
-
-namespace {
-
-void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
-    if (buf.capacity() > keep_capacity) {
-        std::vector<uint8_t>().swap(buf);
-    }
-}
-
-}  // namespace
 
 // ============================================================================
 // SsClientAsyncStream

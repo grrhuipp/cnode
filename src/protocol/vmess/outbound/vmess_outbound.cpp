@@ -17,17 +17,12 @@
 #else
 #include <arpa/inet.h>
 #endif
+#include "acppnode/common/buffer_util.hpp"
 #include <format>
 
 namespace acpp {
 
 namespace {
-
-void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
-    if (buf.capacity() > keep_capacity) {
-        std::vector<uint8_t>().swap(buf);
-    }
-}
 
 constexpr size_t kVMessHandshakeHeaderMax = 512;
 constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;

@@ -4,6 +4,7 @@
 #include "acppnode/app/udp_types.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/transport_dialer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <unordered_map>
@@ -21,12 +22,6 @@ namespace acpp {
 // 内部类型
 // ============================================================================
 namespace {
-
-void ReleaseIdleBuffer(std::vector<uint8_t>& buf, size_t keep_capacity) {
-    if (buf.capacity() > keep_capacity) {
-        std::vector<uint8_t>().swap(buf);
-    }
-}
 
 constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
