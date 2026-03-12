@@ -285,6 +285,36 @@ add_panel() {
              | if $key  != "" then .tlsKey  = $key  else . end')
     fi
 
+    # 校验现有 config.json 是否合法
+    if ! jq empty "$CONFIG_DIR/config.json" 2>/dev/null; then
+        echo "警告: config.json 格式损坏，尝试自动修复..."
+        # 用 python/sed 尝试修复常见问题（缺逗号等），若失败则重建
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import json, re, sys
+with open('$CONFIG_DIR/config.json') as f:
+    text = f.read()
+# 修复对象/数组元素之间缺少逗号: }{ → },{  或 ]{ → ],{
+text = re.sub(r'(\})\s*(\{)', r'\1,\2', text)
+text = re.sub(r'(\])\s*(\{)', r'\1,\2', text)
+try:
+    obj = json.loads(text)
+    with open('$CONFIG_DIR/config.json', 'w') as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    print('自动修复成功')
+except Exception as e:
+    print(f'自动修复失败: {e}', file=sys.stderr)
+    sys.exit(1)
+" || {
+                echo "错误: config.json 无法自动修复，请手动检查"
+                exit 1
+            }
+        else
+            echo "错误: config.json 格式损坏且无 python3 可用，请手动修复"
+            exit 1
+        fi
+    fi
+
     # 先删除同名 panel（去重），再追加
     jq --arg name "$name" --argjson panel "$PANEL_JSON" \
         '.panels = [.panels[] | select(.name != $name)] + [$panel]' \

@@ -494,9 +494,14 @@ int main(int argc, char* argv[]) {
     // ── 主线程阻塞（运行 main_ctx：信号 + 面板同步 + 统计）────────────────────
     main_ctx.run();
 
+    // 等待 Worker 线程结束
     for (auto& t : worker_threads) {
         if (t.joinable()) t.join();
     }
+
+    // 让 main_ctx 中的 detached 协程完成退出，避免析构时 use-after-free
+    main_ctx.restart();
+    main_ctx.run_for(std::chrono::milliseconds(100));
 
     LOG_CONSOLE("=== acppnode stopped ===");
     Log::Shutdown();

@@ -605,7 +605,8 @@ static std::optional<boost::json::value> LoadJsonFile(const std::filesystem::pat
         std::string content((std::istreambuf_iterator<char>(file)),
                             std::istreambuf_iterator<char>());
         return boost::json::parse(content);
-    } catch (...) {
+    } catch (const std::exception& e) {
+        LOG_CONSOLE("  ERROR: Failed to parse {}: {}", path.filename().string(), e.what());
         return std::nullopt;
     }
 }
