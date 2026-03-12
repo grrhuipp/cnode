@@ -110,10 +110,9 @@ jobs:
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
           if [ "${{ matrix.build_type }}" = "Release" ]; then
             strip build/cnode
+            cp build/cnode cnode-linux-amd64
+            ls -lh cnode-linux-amd64
           fi
-          SUFFIX=$(echo "${{ matrix.build_type }}" | tr '[:upper:]' '[:lower:]')
-          cp build/cnode "cnode-linux-amd64-${SUFFIX}"
-          ls -lh "cnode-linux-amd64-${SUFFIX}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -148,7 +147,7 @@ jobs:
       - name: Publish release
         if: github.event_name == 'push' && matrix.build_type == 'Release'
         run: |
-          gh release create "${{ github.ref_name }}" cnode-linux-amd64-release \
+          gh release create "${{ github.ref_name }}" cnode-linux-amd64 \
             --title "${{ github.ref_name }}" \
             --notes "branch: ${{ github.ref_name }}, build_id: ${{ steps.buildid.outputs.id }}"
         env:
