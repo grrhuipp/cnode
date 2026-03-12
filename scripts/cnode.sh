@@ -34,7 +34,7 @@ usage() {
     echo "  -outbound_url <url>    远程 outbound.json 下载地址（文件已存在则跳过）"
     echo "  -route_url <url>       远程 route.json 下载地址（文件已存在则跳过）"
     echo "  -inbound_url <url>     远程 inbound.json 下载地址（文件已存在则跳过）"
-    echo "  -v <version>           指定 release 版本（默认 master，如 v0.1.0）"
+    echo "  -v <version>           指定 release 版本（默认 master）"
     exit 1
 }
 

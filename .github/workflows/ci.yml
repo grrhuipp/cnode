@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, main, 'v*']
+    branches: [master, main]
     paths:
       - 'src/**'
       - 'include/**'
@@ -23,14 +23,19 @@ env:
   VCPKG_ROOT: /root/vcpkg
 
 jobs:
-  release:
-    name: Release (musl static)
+  build:
+    name: ${{ matrix.build_type }} (musl static)
     runs-on: ubuntu-24.04
     container:
       image: alpine:3.20
 
     permissions:
       contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
 
     env:
       VCPKG_BINARY_SOURCES: "clear;files,/root/vcpkg-cache,readwrite"
@@ -77,9 +82,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/vcpkg_installed
-          key: vcpkg-installed-alpine-Release-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-installed-alpine-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-installed-alpine-Release-
+            vcpkg-installed-alpine-${{ matrix.build_type }}-
             vcpkg-installed-alpine-
 
       - name: Generate build ID
@@ -89,7 +94,7 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DBUILD_SHARED_LIBS=OFF \
@@ -103,29 +108,33 @@ jobs:
         run: |
           file build/cnode
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
-          strip build/cnode
-          cp build/cnode cnode-linux-amd64
-          ls -lh cnode-linux-amd64
+          if [ "${{ matrix.build_type }}" = "Release" ]; then
+            strip build/cnode
+          fi
+          SUFFIX=$(echo "${{ matrix.build_type }}" | tr '[:upper:]' '[:lower:]')
+          cp build/cnode "cnode-linux-amd64-${SUFFIX}"
+          ls -lh "cnode-linux-amd64-${SUFFIX}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cnode-linux-x64
+          name: cnode-linux-x64-${{ matrix.build_type }}
           path: build/cnode
           if-no-files-found: error
 
+      # 以下步骤仅 Release + push 时执行
       - name: Fix git safe directory (container ownership mismatch)
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.build_type == 'Release'
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Delete old release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.build_type == 'Release'
         run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cleanup old workflow runs
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.build_type == 'Release'
         run: |
           gh run list --branch "${{ github.ref_name }}" --json databaseId \
             --jq '.[].databaseId' \
@@ -137,9 +146,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.build_type == 'Release'
         run: |
-          gh release create "${{ github.ref_name }}" cnode-linux-amd64 \
+          gh release create "${{ github.ref_name }}" cnode-linux-amd64-release \
             --title "${{ github.ref_name }}" \
             --notes "branch: ${{ github.ref_name }}, build_id: ${{ steps.buildid.outputs.id }}"
         env:
