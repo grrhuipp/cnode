@@ -44,9 +44,16 @@ struct UDPDialResult {
 // OutboundTransportTarget - 出站传输目标（统一由 TransportDialer 执行拨号）
 // ============================================================================
 struct OutboundTransportTarget {
+    enum class BindMode : uint8_t {
+        None = 0,
+        Auto,
+        Explicit,
+    };
+
     std::string host;                               // 目标主机（可为域名或 IP）
     uint16_t port = 0;
     std::optional<net::ip::address> bind_local;    // 可选本地绑定地址
+    BindMode bind_mode = BindMode::None;
     std::string server_name;                        // TLS SNI / WS Host（可空）
     const StreamSettings* stream_settings = nullptr; // 传输层组合配置
     std::chrono::seconds timeout{defaults::kDialTimeout};

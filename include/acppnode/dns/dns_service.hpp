@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <list>
 #include <array>
+#include <mutex>
 #include <shared_mutex>
 
 namespace acpp {
@@ -163,6 +164,26 @@ public:
         const std::vector<std::string>& domains) override;
 
 private:
+    struct ResolveKey {
+        std::string domain;
+        bool prefer_ipv6 = false;
+
+        bool operator==(const ResolveKey& other) const noexcept {
+            return prefer_ipv6 == other.prefer_ipv6 && domain == other.domain;
+        }
+    };
+
+    struct ResolveKeyHash {
+        size_t operator()(const ResolveKey& key) const noexcept {
+            size_t h1 = std::hash<std::string>{}(key.domain);
+            size_t h2 = std::hash<bool>{}(key.prefer_ipv6);
+            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
+    struct InflightResolve;
+    struct SharedState;
+
     struct ParsedResponse {
         std::vector<net::ip::address> addresses;
         ErrorCode error = ErrorCode::OK;
@@ -186,6 +207,9 @@ private:
         const std::string& domain,
         bool query_aaaa);
 
+    static std::shared_ptr<SharedState> AcquireSharedState(
+        const Config& config);
+
     // 构建 DNS 查询报文
     std::vector<uint8_t> BuildQuery(const std::string& domain, 
                                      uint16_t txid, 
@@ -199,8 +223,9 @@ private:
 
     net::any_io_executor executor_;
     Config config_;
-    std::unique_ptr<DnsCache> cache_;
+    std::shared_ptr<DnsCache> cache_;
     std::vector<net::ip::udp::endpoint> servers_;
+    std::shared_ptr<SharedState> shared_state_;
 
     // 事务 ID 生成器（atomic，无锁）
     std::atomic<uint16_t> txid_counter_{1};

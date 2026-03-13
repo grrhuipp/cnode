@@ -26,16 +26,73 @@ constexpr uint8_t RCODE_NAME_ERROR = 3;  // NXDOMAIN
 
 }  // namespace dns
 
+namespace {
+
+std::string MakeSharedStateKey(const DnsService::Config& config) {
+    std::string key = std::to_string(config.cache_size)
+        + "|" + std::to_string(config.timeout_sec)
+        + "|" + std::to_string(config.min_ttl)
+        + "|" + std::to_string(config.max_ttl);
+    for (const auto& server : config.servers) {
+        key += "|" + server;
+    }
+    return key;
+}
+
+}  // namespace
+
 // ============================================================================
 // DnsService 实现
 // ============================================================================
+
+struct DnsService::InflightResolve {
+    struct Waiter {
+        net::any_io_executor executor;
+        std::shared_ptr<net::steady_timer> timer;
+    };
+
+    std::mutex lock;
+    DnsResult result;
+    bool completed = false;
+    std::vector<Waiter> waiters;
+};
+
+struct DnsService::SharedState {
+    explicit SharedState(const Config& config)
+        : cache(std::make_shared<DnsCache>(
+            config.cache_size, config.min_ttl, config.max_ttl)) {}
+
+    std::shared_ptr<DnsCache> cache;
+    std::mutex inflight_lock;
+    std::unordered_map<ResolveKey, std::shared_ptr<InflightResolve>, ResolveKeyHash>
+        inflight_resolves;
+};
+
+std::shared_ptr<DnsService::SharedState> DnsService::AcquireSharedState(
+    const Config& config) {
+    static std::mutex shared_state_mu;
+    static std::unordered_map<std::string, std::weak_ptr<SharedState>> shared_states;
+
+    const std::string key = MakeSharedStateKey(config);
+
+    std::lock_guard lock(shared_state_mu);
+    if (auto it = shared_states.find(key); it != shared_states.end()) {
+        if (auto shared_state = it->second.lock()) {
+            return shared_state;
+        }
+    }
+
+    auto shared_state = std::make_shared<SharedState>(config);
+    shared_states[key] = shared_state;
+    return shared_state;
+}
 
 DnsService::DnsService(net::any_io_executor executor, const Config& config)
     : executor_(executor), config_(config) {
     
     // 初始化缓存
-    cache_ = std::make_unique<DnsCache>(
-        config.cache_size, config.min_ttl, config.max_ttl);
+    shared_state_ = AcquireSharedState(config);
+    cache_ = shared_state_->cache;
     
     // 解析服务器地址
     for (const auto& server : config.servers) {
@@ -87,17 +144,82 @@ cobalt::task<DnsResult> DnsService::Resolve(
         result.from_cache = true;
         co_return result;
     }
-    
-    // 执行实际解析
-    auto result = co_await DoResolve(domain, prefer_ipv6);
-    
+
+    ResolveKey key{domain, prefer_ipv6};
+    std::shared_ptr<InflightResolve> inflight;
+    bool is_leader = false;
+    {
+        std::lock_guard lock(shared_state_->inflight_lock);
+        auto it = shared_state_->inflight_resolves.find(key);
+        if (it == shared_state_->inflight_resolves.end()) {
+            inflight = std::make_shared<InflightResolve>();
+            shared_state_->inflight_resolves.emplace(key, inflight);
+            is_leader = true;
+        } else {
+            inflight = it->second;
+        }
+    }
+
+    if (!is_leader) {
+        auto wait_timer = std::make_shared<net::steady_timer>(executor_);
+        wait_timer->expires_at(net::steady_timer::time_point::max());
+
+        {
+            std::lock_guard lock(inflight->lock);
+            if (inflight->completed) {
+                co_return inflight->result;
+            }
+            inflight->waiters.push_back({executor_, wait_timer});
+        }
+
+        auto [wait_ec] = co_await wait_timer->async_wait(
+            net::as_tuple(cobalt::use_op));
+        (void)wait_ec;
+
+        std::lock_guard lock(inflight->lock);
+        co_return inflight->result;
+    }
+
+    DnsResult result;
+    try {
+        result = co_await DoResolve(domain, prefer_ipv6);
+    } catch (const std::exception& e) {
+        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = e.what();
+    } catch (...) {
+        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = "DNS resolve exception";
+    }
+
     // 缓存结果（使用实际 TTL）
     if (result.Ok()) {
         cache_->Put(domain, result.addresses, result.ttl);
     } else if (result.error == ErrorCode::DNS_NO_RECORD) {
         cache_->PutNegative(domain, 60);
     }
-    
+
+    std::vector<InflightResolve::Waiter> waiters;
+    {
+        std::lock_guard lock(inflight->lock);
+        inflight->completed = true;
+        inflight->result = result;
+        waiters = std::move(inflight->waiters);
+    }
+
+    for (auto& waiter : waiters) {
+        net::post(waiter.executor, [timer = std::move(waiter.timer)]() mutable {
+            timer->expires_at(net::steady_timer::clock_type::now());
+        });
+    }
+
+    {
+        std::lock_guard lock(shared_state_->inflight_lock);
+        auto it = shared_state_->inflight_resolves.find(key);
+        if (it != shared_state_->inflight_resolves.end() && it->second == inflight) {
+            shared_state_->inflight_resolves.erase(it);
+        }
+    }
+
     co_return result;
 }
 

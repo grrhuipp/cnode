@@ -59,6 +59,8 @@ TcpStream::TcpStream(tcp::socket socket)
 
 TcpStream::TcpStream(TcpStream&& other) noexcept
     : socket_(std::move(other.socket_))
+    , stream_label_(std::move(other.stream_label_))
+    , abortive_close_(other.abortive_close_)
     , read_shutdown_(other.read_shutdown_)
     , write_shutdown_(other.write_shutdown_)
     , counted_active_(other.counted_active_)
@@ -91,6 +93,7 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     other.read_timeout_ = std::chrono::seconds{0};
     other.write_timeout_ = std::chrono::seconds{0};
     other.counted_active_ = false;
+    other.abortive_close_ = false;
     other.read_alloc_count_ = 1;
     other.read_grow_streak_ = 0;
     other.read_shutdown_ = true;
@@ -105,6 +108,8 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         CancelPhaseDeadline();
         Close();
         socket_ = std::move(other.socket_);
+        stream_label_ = std::move(other.stream_label_);
+        abortive_close_ = other.abortive_close_;
         read_shutdown_ = other.read_shutdown_;
         write_shutdown_ = other.write_shutdown_;
         counted_active_ = other.counted_active_;
@@ -137,6 +142,7 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         other.read_timeout_ = std::chrono::seconds{0};
         other.write_timeout_ = std::chrono::seconds{0};
         other.counted_active_ = false;
+        other.abortive_close_ = false;
         other.read_alloc_count_ = 1;
         other.read_grow_streak_ = 0;
         other.read_shutdown_ = true;
@@ -423,11 +429,9 @@ void TcpStream::Close() {
     CancelPhaseDeadline();
     if (socket_.is_open()) {
         boost::system::error_code ec;
-        // 出站连接：设置 SO_LINGER{1,0} 跳过 TIME_WAIT，
-        // 直接 RST 关闭。此时 DoRelay 已完成协议级优雅关闭
-        // （close_notify / EOF marker），无需再依赖 TCP 层的 FIN 序列。
-        // 入站连接保持正常 FIN 关闭，避免客户端收到意外 RST。
-        if (stream_label_ == "out") {
+        // 仅错误路径使用 abortive close；正常关闭保持 FIN 语义，
+        // 避免高并发下统一 RST 导致对端看到 connection reset。
+        if (abortive_close_) {
             struct linger lg = {1, 0};
             ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_LINGER,
                          reinterpret_cast<const char*>(&lg), sizeof(lg));

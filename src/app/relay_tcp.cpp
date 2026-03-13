@@ -2,6 +2,7 @@
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/multi_buffer.hpp"
+#include "acppnode/transport/tcp_stream.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <boost/asio/steady_timer.hpp>
@@ -9,6 +10,12 @@
 namespace acpp {
 
 namespace {
+
+void MarkAbortiveClose(AsyncStream& stream) {
+    if (auto* tcp = stream.GetBaseTcpStream()) {
+        tcp->SetAbortiveClose(true);
+    }
+}
 
 cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
     AsyncStream& from,
@@ -179,6 +186,8 @@ cobalt::task<RelayResult> DoRelay(
     // 直接 Cancel 所有挂起操作后由析构链关闭 socket。
     // 正常关闭（双方均 EOF）才执行协议级优雅关闭。
     if (error_up != ErrorCode::OK || error_down != ErrorCode::OK) {
+        MarkAbortiveClose(client);
+        MarkAbortiveClose(target);
         client.Cancel();
         target.Cancel();
     } else {
@@ -218,11 +227,15 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
 
                 if (written == 0) {
                     if (ConsumeWriteSideTimeout(target)) {
+                        MarkAbortiveClose(client);
+                        MarkAbortiveClose(target);
                         RelayResult result;
                         result.error = ErrorCode::RELAY_TIMEOUT;
                         result.error_msg = "first packet write timed out";
                         co_return result;
                     }
+                    MarkAbortiveClose(client);
+                    MarkAbortiveClose(target);
                     RelayResult result;
                     result.error = ErrorCode::RELAY_WRITE_FAILED;
                     result.error_msg = "failed to send first packet";
@@ -236,6 +249,8 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
             stats.AddBytesOut(first_packet.size());
 
         } catch (const boost::system::system_error& e) {
+            MarkAbortiveClose(client);
+            MarkAbortiveClose(target);
             RelayResult result;
             result.error = ConsumeWriteSideTimeout(target)
                 ? ErrorCode::RELAY_TIMEOUT
@@ -243,6 +258,8 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
             result.error_msg = std::string("first packet error: ") + e.what();
             co_return result;
         } catch (const std::exception& e) {
+            MarkAbortiveClose(client);
+            MarkAbortiveClose(target);
             RelayResult result;
             result.error = ErrorCode::RELAY_WRITE_FAILED;
             result.error_msg = std::string("first packet error: ") + e.what();

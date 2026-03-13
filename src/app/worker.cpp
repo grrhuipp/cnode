@@ -1,5 +1,6 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/app/connection_guard.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
@@ -7,6 +8,7 @@
 #include "acppnode/protocol/outbound.hpp"
 #include "acppnode/protocol/protocol_registry.hpp"
 #include "acppnode/router/router.hpp"
+#include "acppnode/common/error.hpp"
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -15,6 +17,13 @@
 #include <chrono>
 
 namespace acpp {
+
+namespace {
+
+constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
+constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
+
+}
 
 // ============================================================================
 // Worker 构造 / 析构
@@ -312,6 +321,12 @@ cobalt::task<void> Worker::AcceptLoop(std::string tag) {
         if (ec == net::error::operation_aborted) co_return;
         if (ec) {
             LOG_WARN("Worker[{}]: accept error tag={}: {}", id_, tag, ec.message());
+            const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
+                ? kAcceptResourceBackoff
+                : kAcceptErrorBackoff;
+            net::steady_timer timer(io_context_);
+            timer.expires_after(backoff);
+            (void)co_await timer.async_wait(net::as_tuple(cobalt::use_op));
             continue;
         }
 
@@ -360,6 +375,21 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
         ctx.client_ip = "unknown";
     }
 
+    std::optional<ConnectionLimitGuard> connection_limit;
+    if (lc_it->second.limiter) {
+        auto reject = lc_it->second.limiter->TryAcceptGlobal();
+        if (reject != ConnectionLimiter::RejectReason::NONE) {
+            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={} (pre-proxy)",
+                FormatTimestamp(ctx.accept_time_us),
+                ctx.client_ip, ctx.src_addr.port(), ctx.inbound_tag,
+                ConnectionLimiter::RejectReasonToString(reject));
+            global_stats_.GetShard(id_).OnError();
+            tcp_stream->Close();
+            co_return;
+        }
+        connection_limit.emplace(lc_it->second.limiter, ctx.client_ip);
+    }
+
     // ----------------------------------------------------------------
     // PROXY Protocol 检测（负载均衡器透传真实客户端 IP）
     //
@@ -367,6 +397,10 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     // 若数据不是 PROXY 头，全部放回 pending_data，对后续协议透明。
     // ----------------------------------------------------------------
     if (lc_it->second.proxy_protocol) {
+        const auto handshake_timeout = config_.GetTimeouts().HandshakeTimeout();
+        tcp_stream->SetIdleTimeout(handshake_timeout);
+        auto proxy_deadline = tcp_stream->StartPhaseDeadline(handshake_timeout);
+
         constexpr size_t kMaxProxyHeaderBytes = 2048;
         std::vector<uint8_t> buf;
         buf.reserve(256);
@@ -375,6 +409,15 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
             std::array<uint8_t, 256> chunk{};
             size_t n = co_await tcp_stream->AsyncRead(net::buffer(chunk));
             if (n == 0) {
+                const bool timed_out = proxy_deadline.Expired()
+                    || tcp_stream->ConsumePhaseDeadline()
+                    || tcp_stream->ConsumeIdleTimeout();
+                if (timed_out) {
+                    LOG_WARN("Worker[{}]: PROXY protocol pre-read timed out tag={} client={}",
+                             id_, tag, ctx.client_ip);
+                    tcp_stream->Close();
+                    co_return;
+                }
                 auto result = ProxyProtocolParser::Parse(buf.data(), buf.size());
                 if (result.incomplete()) {
                     LOG_WARN("Worker[{}]: truncated PROXY protocol header tag={}", id_, tag);
@@ -424,6 +467,8 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
             tcp_stream->Close();
             co_return;
         }
+
+        tcp_stream->ClearPhaseDeadline();
     }
 
     // 注册活跃会话（用于 CollectTrafficTask 实时读取流量增量）
@@ -444,7 +489,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     } session_guard{active_sessions_, ctx.conn_id};
 
     co_await session_handler_->Handle(
-        std::move(tcp_stream), ctx, lc_it->second);
+        std::move(tcp_stream), ctx, lc_it->second, std::move(connection_limit));
 
     // 写入剩余增量流量（总流量 - guard 记录的已上报部分），避免重复计数
     // guard 析构时会 erase active_sessions_ 条目并记录 last_reported

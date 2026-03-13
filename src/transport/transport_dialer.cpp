@@ -14,6 +14,21 @@ const StreamSettings kDefaultStreamSettings = [] {
     return s;
 }();
 
+bool ShouldRetryWithoutBind(const OutboundTransportTarget& target, ErrorCode error) {
+    if (!target.bind_local || target.bind_mode != OutboundTransportTarget::BindMode::Auto) {
+        return false;
+    }
+
+    switch (error) {
+        case ErrorCode::SOCKET_BIND_FAILED:
+        case ErrorCode::DIAL_NETWORK_UNREACHABLE:
+        case ErrorCode::DIAL_HOST_UNREACHABLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 cobalt::task<std::expected<tcp::endpoint, ErrorCode>> ResolveEndpoint(
     net::any_io_executor executor,
     std::string_view host,
@@ -62,6 +77,15 @@ cobalt::task<DialResult> TransportDialer::Dial(
     if (target.bind_local) {
         tcp_result = co_await TcpStream::ConnectWithBind(
             executor, *target.bind_local, endpoint, target.timeout);
+        if (!tcp_result.Ok() && ShouldRetryWithoutBind(target, tcp_result.error_code)) {
+            LOG_WARN("TransportDialer: auto bind {} -> {}:{} failed ({}), retrying with system bind",
+                     target.bind_local->to_string(),
+                     endpoint.address().to_string(),
+                     endpoint.port(),
+                     tcp_result.error_msg);
+            tcp_result = co_await TcpStream::Connect(
+                executor, endpoint, target.timeout);
+        }
     } else {
         tcp_result = co_await TcpStream::Connect(
             executor, endpoint, target.timeout);

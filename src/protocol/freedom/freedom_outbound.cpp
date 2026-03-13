@@ -58,6 +58,11 @@ FreedomOutbound::ResolveTransportTarget(SessionContext& ctx) {
     transport_target.host = remote_addr.to_string();
     transport_target.port = target.port;
     transport_target.bind_local = local_addr;
+    if (local_addr) {
+        transport_target.bind_mode = settings_.send_through == "auto"
+            ? OutboundTransportTarget::BindMode::Auto
+            : OutboundTransportTarget::BindMode::Explicit;
+    }
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 

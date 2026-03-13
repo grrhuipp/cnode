@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/app/connection_guard.hpp"
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/infra/config.hpp"
@@ -14,6 +15,8 @@
 #include "acppnode/router/router.hpp"
 #include "acppnode/dns/dns_service.hpp"
 #include "acppnode/app/relay.hpp"
+
+#include <optional>
 
 namespace acpp {
 
@@ -63,7 +66,8 @@ public:
     cobalt::task<void> Handle(
         std::unique_ptr<AsyncStream> raw_conn,
         SessionContext& ctx,
-        const ListenerContext& listener);
+        const ListenerContext& listener,
+        std::optional<ConnectionLimitGuard> connection_limit = std::nullopt);
 
 private:
     // 嗅探：尝试识别协议（不消耗数据，仅窥探）

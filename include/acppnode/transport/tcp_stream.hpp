@@ -62,6 +62,7 @@ public:
     // 流标签（调试用，标识 inbound/outbound）
     void SetStreamLabel(std::string_view label) { stream_label_.assign(label.data(), label.size()); }
     const std::string& StreamLabel() const { return stream_label_; }
+    void SetAbortiveClose(bool enable = true) noexcept { abortive_close_ = enable; }
 
     // 获取底层 socket（用于特殊操作）
     tcp::socket& Socket() { return socket_; }
@@ -91,6 +92,7 @@ public:
 private:
     tcp::socket socket_;
     std::string stream_label_;  // 调试标签："in" / "out"
+    bool abortive_close_ = false;
     bool read_shutdown_ = false;
     bool write_shutdown_ = false;
     bool counted_active_ = false;

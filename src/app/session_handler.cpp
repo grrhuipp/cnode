@@ -38,7 +38,8 @@ SessionHandler::SessionHandler(
 cobalt::task<void> SessionHandler::Handle(
     std::unique_ptr<AsyncStream> raw_conn,
     SessionContext& ctx,
-    const ListenerContext& listener)
+    const ListenerContext& listener,
+    std::optional<ConnectionLimitGuard> connection_limit)
 {
     // ----------------------------------------------------------------
     // 0. 早期 IP ban 检查（TLS 握手前，避免被封 IP 消耗 TLS 资源）
@@ -52,6 +53,22 @@ cobalt::task<void> SessionHandler::Handle(
         ctx.TransitionTo(ConnState::CLOSING);
         stats_.OnError();
         co_return;
+    }
+
+    // 全局连接数闸门要尽早执行，避免高并发直接把 FD/端口打满。
+    if (!connection_limit && listener.limiter) {
+        auto reject = listener.limiter->TryAcceptGlobal();
+        if (reject != ConnectionLimiter::RejectReason::NONE) {
+            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
+                FormatTimestamp(ctx.accept_time_us),
+                ctx.client_ip, ctx.src_addr.port(), ctx.inbound_tag,
+                ConnectionLimiter::RejectReasonToString(reject));
+            ctx.SetError(ErrorCode::RESOURCE_EXHAUSTED);
+            ctx.TransitionTo(ConnState::CLOSING);
+            stats_.OnError();
+            co_return;
+        }
+        connection_limit.emplace(listener.limiter, ctx.client_ip);
     }
 
     // ----------------------------------------------------------------
@@ -89,6 +106,25 @@ cobalt::task<void> SessionHandler::Handle(
         LOG_CONN_DEBUG(ctx, "[SessionHandler] WS real IP from header: {} -> {}",
                        ctx.client_ip, ws_real_ip);
         ctx.client_ip = std::move(ws_real_ip);
+    }
+
+    if (connection_limit && listener.limiter) {
+        connection_limit->UpdateIP(ctx.client_ip);
+        auto reject = listener.limiter->TryAcceptIP(ctx.inbound_tag, ctx.client_ip);
+        if (reject != ConnectionLimiter::RejectReason::NONE) {
+            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
+                FormatTimestamp(ctx.accept_time_us),
+                ctx.client_ip, ctx.src_addr.port(), ctx.inbound_tag,
+                ConnectionLimiter::RejectReasonToString(reject));
+            ctx.SetError(
+                reject == ConnectionLimiter::RejectReason::IP_BANNED
+                    ? ErrorCode::BLOCKED
+                    : ErrorCode::RESOURCE_EXHAUSTED);
+            ctx.TransitionTo(ConnState::CLOSING);
+            stats_.OnError();
+            co_return;
+        }
+        connection_limit->MarkIPAccepted();
     }
 
     LOG_CONN_DEBUG(ctx, "[SessionHandler] Transport ready ({}/{})",

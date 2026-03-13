@@ -143,7 +143,10 @@ int main(int argc, char* argv[]) {
 
     // ── Stats + ConnectionLimiter ────────────────────────────────────────────
     auto stats = std::make_unique<ShardedStats>(config.GetWorkers());
-    auto connection_limiter = std::make_shared<ConnectionLimiter>();
+    RateLimitConfig limiter_cfg;
+    limiter_cfg.max_connections = config.GetLimits().max_connections;
+    limiter_cfg.max_conn_per_ip = config.GetLimits().max_connections_per_ip;
+    auto connection_limiter = std::make_shared<ConnectionLimiter>(limiter_cfg);
 
     // ── main_ctx（主线程：面板同步 + 统计 + 信号）────────────────────────────
     net::io_context main_ctx;
