@@ -66,6 +66,10 @@ struct SessionContext {
     // 流量统计
     uint64_t bytes_up = 0;                   // 上行字节数
     uint64_t bytes_down = 0;                 // 下行字节数
+
+    // Worker 压力信息（用于在高并发时主动缩短 relay idle timeout）
+    uint32_t worker_active_connections = 0;
+    uint32_t pressure_idle_timeout = 0;      // 0 = 不覆盖默认 idle timeout
     
     // 限速 (bytes/s), 0 = 不限速
     uint64_t speed_limit = 0;

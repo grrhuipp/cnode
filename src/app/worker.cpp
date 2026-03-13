@@ -13,6 +13,7 @@
 #ifndef _WIN32
 #include <sys/socket.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <chrono>
 
@@ -22,6 +23,23 @@ namespace {
 
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
+
+uint32_t ComputePressureThreshold(const Config& config) {
+    uint32_t threshold = defaults::kMaxConnectionsPerWorker
+        * defaults::kPressurePercent / 100;
+
+    const uint32_t configured_max = config.GetLimits().max_connections;
+    const uint32_t workers = std::max<uint32_t>(1, config.GetWorkers());
+    if (configured_max > 0) {
+        const uint32_t per_worker_budget = std::max<uint32_t>(
+            1, (configured_max + workers - 1) / workers);
+        const uint32_t configured_threshold = std::max<uint32_t>(
+            1, per_worker_budget * defaults::kPressurePercent / 100);
+        threshold = std::min(threshold, configured_threshold);
+    }
+
+    return std::max<uint32_t>(threshold, 1);
+}
 
 }
 
@@ -373,6 +391,15 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
         ctx.inbound_local_addr = tcp_stream->LocalEndpoint();
     } catch (...) {
         ctx.client_ip = "unknown";
+    }
+    ctx.worker_active_connections = active_connections_.load(std::memory_order_relaxed);
+
+    const uint32_t pressure_threshold = ComputePressureThreshold(config_);
+    if (ctx.worker_active_connections >= pressure_threshold) {
+        const uint32_t pressure_idle = defaults::kPressureIdleTimeout;
+        if (config_.GetTimeouts().idle > pressure_idle) {
+            ctx.pressure_idle_timeout = pressure_idle;
+        }
     }
 
     std::optional<ConnectionLimitGuard> connection_limit;

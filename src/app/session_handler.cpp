@@ -6,12 +6,25 @@
 #include "acppnode/transport/transport_dialer.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
 
+#include <algorithm>
+
 namespace acpp {
 
 namespace {
 
 ErrorCode ResolvePhaseError(const PhaseDeadlineHandle& deadline, ErrorCode fallback) {
     return deadline.Expired() ? ErrorCode::TIMEOUT : fallback;
+}
+
+std::chrono::seconds ResolveRelayIdleTimeout(
+    const SessionContext& ctx,
+    const TimeoutsConfig& timeouts) {
+    auto idle_timeout = timeouts.StreamIdleTimeout();
+    if (ctx.pressure_idle_timeout > 0) {
+        idle_timeout = std::min(
+            idle_timeout, std::chrono::seconds(ctx.pressure_idle_timeout));
+    }
+    return idle_timeout;
 }
 
 }  // namespace
@@ -288,7 +301,7 @@ cobalt::task<void> SessionHandler::Handle(
         auto wrapped_in = std::move(*wrapped_in_result);
 
         // 对齐 Xray：relay 阶段只靠 connIdle
-        wrapped_in->SetIdleTimeout(timeouts_.StreamIdleTimeout());
+        wrapped_in->SetIdleTimeout(ResolveRelayIdleTimeout(ctx, timeouts_));
         wrapped_in->SetReadTimeout(std::chrono::seconds(0));
         wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
 
@@ -341,7 +354,7 @@ cobalt::task<void> SessionHandler::Handle(
         auto wrapped_in = std::move(*wrapped_in_result);
 
         // 对齐 Xray：relay 阶段只靠 connIdle
-        wrapped_in->SetIdleTimeout(timeouts_.StreamIdleTimeout());
+        wrapped_in->SetIdleTimeout(ResolveRelayIdleTimeout(ctx, timeouts_));
         wrapped_in->SetReadTimeout(std::chrono::seconds(0));
         wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
 
@@ -482,10 +495,19 @@ cobalt::task<void> SessionHandler::Handle(
     //    initial_payload: 入站首包数据，先写入出站再开始双向 relay
     // ----------------------------------------------------------------
     // 对齐 Xray：relay 阶段只靠 connIdle，禁用单次读写超时
-    wrapped_in->SetIdleTimeout(timeouts_.StreamIdleTimeout());
+    const auto relay_idle_timeout = ResolveRelayIdleTimeout(ctx, timeouts_);
+    if (ctx.pressure_idle_timeout > 0 &&
+        relay_idle_timeout < timeouts_.StreamIdleTimeout()) {
+        LOG_CONN_DEBUG(ctx,
+                       "[SessionHandler] Pressure mode: active_conns={} relay_idle={}s -> {}s",
+                       ctx.worker_active_connections,
+                       timeouts_.StreamIdleTimeout().count(),
+                       relay_idle_timeout.count());
+    }
+    wrapped_in->SetIdleTimeout(relay_idle_timeout);
     wrapped_in->SetReadTimeout(std::chrono::seconds(0));
     wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
-    wrapped_out->SetIdleTimeout(timeouts_.StreamIdleTimeout());
+    wrapped_out->SetIdleTimeout(relay_idle_timeout);
     wrapped_out->SetReadTimeout(std::chrono::seconds(0));
     wrapped_out->SetWriteTimeout(std::chrono::seconds(0));
 

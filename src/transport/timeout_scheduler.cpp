@@ -38,6 +38,31 @@ struct TimeoutScheduler::Impl {
     std::atomic<uint64_t> next_id{1};
     bool timer_armed = false;
 
+    void MaybeCompactLocked() {
+        // 惰性删除在高 churn 场景下会让大量已取消事件滞留在堆中，
+        // 长时间高并发运行会放大内存和调度开销；比值过大时重建堆。
+        constexpr size_t kMinHeapSizeForCompact = 4096;
+        constexpr size_t kCompactRatio = 4;
+
+        const size_t live = events.size();
+        const size_t heap_size = heap.size();
+        if (heap_size < kMinHeapSizeForCompact) {
+            return;
+        }
+
+        const size_t baseline = std::max<size_t>(live, 1);
+        if (heap_size <= baseline * kCompactRatio) {
+            return;
+        }
+
+        std::priority_queue<TimeoutQueueItem, std::vector<TimeoutQueueItem>, TimeoutQueueItemCmp>
+            compacted;
+        for (const auto& [id, event] : events) {
+            compacted.push(TimeoutQueueItem{event.deadline, id});
+        }
+        heap.swap(compacted);
+    }
+
     void ArmTimerLocked() {
         while (!heap.empty()) {
             const auto item = heap.top();
@@ -81,6 +106,7 @@ struct TimeoutScheduler::Impl {
             }
 
             ArmTimerLocked();
+            MaybeCompactLocked();
         }
 
         for (auto& cb : ready) {
@@ -144,6 +170,7 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) {
 
     std::lock_guard lk(impl_->mu);
     impl_->events.erase(token.id);
+    impl_->MaybeCompactLocked();
     token.Reset();
 }
 
