@@ -862,12 +862,12 @@ bool Config::Validate() const {
             LOG_ERROR("Panel {} Type must be V2Board", panel.name);
             return false;
         }
-        if (panel.node_type != "vmess" && panel.node_type != "trojan") {
-            LOG_ERROR("Panel {} NodeType must be vmess or trojan", panel.name);
+        if (panel.node_type != "vmess" && panel.node_type != "trojan" && panel.node_type != "shadowsocks") {
+            LOG_ERROR("Panel {} NodeType must be vmess, trojan or shadowsocks", panel.name);
             return false;
         }
-        // Trojan 节点 TLS 证书验证（仅当启用 TLS 且指定了证书时检查）
-        if (panel.node_type == "trojan" && panel.tls_enable) {
+        // TLS 证书验证（仅当启用 TLS 且指定了证书时检查）
+        if (panel.tls_enable) {
             if (!panel.tls_cert.empty() && !std::filesystem::exists(panel.tls_cert)) {
                 LOG_ERROR("Panel {} TlsCert not found: {}", panel.name, panel.tls_cert);
                 return false;

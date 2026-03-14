@@ -42,7 +42,7 @@ struct PanelConfig {
     std::string api_host;                    // API 地址
     std::string api_key;                     // API 密钥
     std::vector<int> node_ids;               // 节点 ID 列表
-    std::string node_type = "vmess";         // 节点类型: vmess/trojan
+    std::string node_type = "vmess";         // 节点类型: vmess/trojan/shadowsocks
     
     // TLS 配置
     // false: 强制关闭 TLS（由外部 nginx/caddy 处理）

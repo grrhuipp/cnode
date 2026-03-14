@@ -69,7 +69,7 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/
 | `-api_host` | 是 | 面板 API 地址 |
 | `-api_key` | 是 | 面板 API 密钥 |
 | `-node_id` | 是 | 节点 ID，多个用逗号分隔 |
-| `-node_type` | 是 | 节点类型：`vmess` / `trojan` |
+| `-node_type` | 是 | 节点类型：`vmess` / `trojan` / `shadowsocks` |
 | `-dns` | 否 | DNS 服务器 IP（默认 `1.1.1.1`） |
 | `-tls_enable` | 否 | 设为 `true` 启用 TLS |
 | `-tls_cert` | 否 | TLS 证书路径（不填则自动生成泛域名自签证书） |
