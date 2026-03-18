@@ -97,6 +97,25 @@ V2BoardPanel::HttpGet(const std::string& path, const std::string& etag) {
     co_return co_await HttpRequest(http::verb::get, path, std::nullopt, etag);
 }
 
+std::shared_ptr<net::ssl::context> V2BoardPanel::GetOrCreateHttpsContext() {
+    if (!url_parts_.use_ssl) {
+        return nullptr;
+    }
+    if (https_context_) {
+        return https_context_;
+    }
+
+    auto ctx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
+#ifdef _WIN32
+    LoadWindowsCACerts(*ctx);
+#else
+    ctx->set_default_verify_paths();
+#endif
+    ctx->set_verify_mode(ssl::verify_peer);
+    https_context_ = ctx;
+    return https_context_;
+}
+
 cobalt::task<HttpResponse>
 V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
                           const std::optional<boost::json::value>& body,
@@ -188,15 +207,14 @@ V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
         
         if (url_parts_.use_ssl) {
             // HTTPS
-            ssl::context ssl_ctx(ssl::context::tlsv12_client);
-#ifdef _WIN32
-            LoadWindowsCACerts(ssl_ctx);
-#else
-            ssl_ctx.set_default_verify_paths();
-#endif
-            ssl_ctx.set_verify_mode(ssl::verify_peer);
-            
-            beast::ssl_stream<beast::tcp_stream> stream(executor_, ssl_ctx);
+            auto ssl_ctx = GetOrCreateHttpsContext();
+            if (!ssl_ctx) {
+                result.status = -1;
+                result.body = "SSL context init failed";
+                co_return result;
+            }
+
+            beast::ssl_stream<beast::tcp_stream> stream(executor_, *ssl_ctx);
             stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
             
             if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {

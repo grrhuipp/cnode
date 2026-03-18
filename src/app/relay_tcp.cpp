@@ -11,10 +11,24 @@ namespace acpp {
 
 namespace {
 
+constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
+
 void MarkAbortiveClose(AsyncStream& stream) {
     if (auto* tcp = stream.GetBaseTcpStream()) {
         tcp->SetAbortiveClose(true);
     }
+}
+
+void FlushRelayStats(StatsShard* stats, LocalStatsAccumulator& acc) {
+    if (!stats) {
+        acc.Reset();
+        return;
+    }
+    if (acc.bytes_in == 0 && acc.bytes_out == 0) {
+        return;
+    }
+    stats->CommitAccumulator(acc);
+    acc.Reset();
 }
 
 cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
@@ -39,6 +53,7 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
 
     TokenBucket rate_limiter(speed_limit);
     net::steady_timer rate_timer(executor);
+    LocalStatsAccumulator stats_acc;
 
     while (true) {
         // 注意：不在这里检查 peer_eof。
@@ -103,8 +118,12 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
                 *live_bytes_counter = total_bytes;
             }
             if (stats) {
-                if (is_upload) stats->AddBytesOut(n);
-                else           stats->AddBytesIn(n);
+                if (is_upload) stats_acc.AddBytesOut(n);
+                else           stats_acc.AddBytesIn(n);
+
+                if (stats_acc.bytes_in + stats_acc.bytes_out >= kRelayStatsFlushBytes) {
+                    FlushRelayStats(stats, stats_acc);
+                }
             }
 
         } catch (const boost::system::system_error& e) {
@@ -123,6 +142,7 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
         }
     }
 
+    FlushRelayStats(stats, stats_acc);
     co_return std::make_pair(total_bytes, error);
 }
 

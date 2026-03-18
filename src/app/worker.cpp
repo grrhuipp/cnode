@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 
 namespace acpp {
 
@@ -312,6 +313,7 @@ void Worker::CleanupUdpClientSessions(const std::string& tag) {
 
 void Worker::StopUdpListening(const std::string& tag) {
     CleanupUdpClientSessions(tag);
+    udp_reply_queues_.erase(tag);
 
     auto sock_it = udp_sockets_.find(tag);
     if (sock_it != udp_sockets_.end()) {
@@ -322,6 +324,63 @@ void Worker::StopUdpListening(const std::string& tag) {
     }
 
     udp_inbound_handlers_.erase(tag);
+}
+
+void Worker::EnqueueUdpReply(const std::string& tag,
+                             std::shared_ptr<udp::socket> sock,
+                             udp::endpoint endpoint,
+                             std::vector<uint8_t> payload) {
+    if (!sock || !sock->is_open() || payload.empty()) {
+        return;
+    }
+
+    auto& queue = udp_reply_queues_[tag];
+    queue.queued_bytes += payload.size();
+    queue.pending.push_back(PendingUdpReply{std::move(endpoint), std::move(payload)});
+
+    if (!queue.write_in_progress) {
+        StartUdpReplySend(tag, sock);
+    }
+}
+
+void Worker::StartUdpReplySend(const std::string& tag,
+                               const std::shared_ptr<udp::socket>& sock) {
+    auto queue_it = udp_reply_queues_.find(tag);
+    if (queue_it == udp_reply_queues_.end() || !sock || !sock->is_open()) {
+        return;
+    }
+
+    auto& queue = queue_it->second;
+    if (queue.write_in_progress || queue.pending.empty()) {
+        return;
+    }
+
+    auto packet = std::make_shared<PendingUdpReply>(std::move(queue.pending.front()));
+    queue.queued_bytes -= packet->payload.size();
+    queue.pending.pop_front();
+    queue.write_in_progress = true;
+
+    sock->async_send_to(
+        net::buffer(packet->payload),
+        packet->endpoint,
+        [this, tag, sock, packet](boost::system::error_code ec, size_t /*bytes_sent*/) {
+            auto it = udp_reply_queues_.find(tag);
+            if (it == udp_reply_queues_.end()) {
+                return;
+            }
+
+            auto& state = it->second;
+            state.write_in_progress = false;
+
+            if (ec && ec != net::error::operation_aborted) {
+                LOG_ACCESS_DEBUG("Worker[{}]: UDP reply send failed tag={}: {}",
+                                 id_, tag, ec.message());
+            }
+
+            if (!state.pending.empty() && sock && sock->is_open()) {
+                StartUdpReplySend(tag, sock);
+            }
+        });
 }
 
 // ============================================================================
@@ -835,28 +894,26 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
             udp::endpoint ep_copy  = client_ep;
 
             uint64_t cb_id = 0;
-            auto reply_cb = [sock, ep_copy, encode_fn = std::move(encode_fn)](const UDPPacket& pkt) {
+            auto reply_cb = [this, tag, sock, ep_copy, encode_fn = std::move(encode_fn)](const UDPPacket& pkt) {
                 std::array<uint8_t, kUdpReplyStackBufSize> stack_buf;
                 size_t encoded_len = encode_fn(
                     pkt.target, pkt.data.data(), pkt.data.size(),
                     stack_buf.data(), stack_buf.size());
                 if (encoded_len == 0) return;
 
-                const uint8_t* send_data = stack_buf.data();
-                std::vector<uint8_t> heap_buf;
-                if (encoded_len > stack_buf.size()) {
-                    heap_buf.resize(encoded_len);
+                std::vector<uint8_t> payload;
+                payload.resize(encoded_len);
+
+                if (encoded_len <= stack_buf.size()) {
+                    std::memcpy(payload.data(), stack_buf.data(), encoded_len);
+                } else {
                     const size_t written = encode_fn(
                         pkt.target, pkt.data.data(), pkt.data.size(),
-                        heap_buf.data(), heap_buf.size());
+                        payload.data(), payload.size());
                     if (written != encoded_len) return;
-                    send_data = heap_buf.data();
                 }
 
-                boost::system::error_code send_ec;
-                sock->send_to(
-                    net::buffer(send_data, encoded_len),
-                    ep_copy, 0, send_ec);
+                EnqueueUdpReply(tag, sock, ep_copy, std::move(payload));
             };
 
             if (udp_result.register_callback) {

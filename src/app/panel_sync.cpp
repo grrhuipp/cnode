@@ -81,12 +81,28 @@ cobalt::task<void> PanelSyncManager::SyncLoop() {
 }
 
 cobalt::task<void> PanelSyncManager::DoSync() {
-    std::vector<cobalt::task<void>> tasks;
-    tasks.reserve(panel_nodes_.size());
-    for (const auto& [panel, node_id] : panel_nodes_) {
-        tasks.push_back(SyncNode(panel, node_id));
+    if (panel_nodes_.empty()) {
+        co_return;
     }
-    co_await cobalt::join(tasks);
+
+    // 控制冷路径并发扇出，避免大量节点在同一秒同时触发 HTTP/TLS 握手，
+    // 导致面板侧、DNS、证书校验与本进程内存出现瞬时尖峰。
+    const size_t batch_size = std::min(
+        panel_nodes_.size(),
+        std::max<size_t>(workers_.size() * 2, 1));
+
+    for (size_t offset = 0; offset < panel_nodes_.size(); offset += batch_size) {
+        std::vector<cobalt::task<void>> tasks;
+        tasks.reserve(std::min(batch_size, panel_nodes_.size() - offset));
+
+        const size_t end = std::min(panel_nodes_.size(), offset + batch_size);
+        for (size_t i = offset; i < end; ++i) {
+            const auto& [panel, node_id] = panel_nodes_[i];
+            tasks.push_back(SyncNode(panel, node_id));
+        }
+
+        co_await cobalt::join(tasks);
+    }
 }
 
 cobalt::task<void> PanelSyncManager::SyncNode(IPanel* panel, int node_id) {

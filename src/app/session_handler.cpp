@@ -54,6 +54,8 @@ cobalt::task<void> SessionHandler::Handle(
     const ListenerContext& listener,
     std::optional<ConnectionLimitGuard> connection_limit)
 {
+    ConnectionStatsGuard connection_stats(stats_);
+
     // ----------------------------------------------------------------
     // 0. 早期 IP ban 检查（TLS 握手前，避免被封 IP 消耗 TLS 资源）
     // ----------------------------------------------------------------

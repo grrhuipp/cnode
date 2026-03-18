@@ -5,6 +5,7 @@
 #include "acppnode/dns/dns_service.hpp"
 #include "acppnode/protocol/vmess/vmess_protocol.hpp"
 
+#include <boost/asio/ssl/context.hpp>
 #include <boost/json.hpp>
 #include <boost/beast/http/verb.hpp>
 
@@ -194,6 +195,8 @@ public:
     ReportOnline(int node_id, const std::vector<int64_t>& user_ids) override;
 
 private:
+    std::shared_ptr<net::ssl::context> GetOrCreateHttpsContext();
+
     // HTTP 请求（支持 ETag）
     cobalt::task<HttpResponse>
     HttpGet(const std::string& path, const std::string& etag = "");
@@ -227,6 +230,7 @@ private:
     // 缓存的数据（用于 304 时返回）
     std::unordered_map<int, NodeConfig> cached_configs_;
     std::unordered_map<int, std::vector<PanelUser>> cached_users_;
+    std::shared_ptr<net::ssl::context> https_context_;
 };
 
 // ============================================================================

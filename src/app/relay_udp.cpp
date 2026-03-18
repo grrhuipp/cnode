@@ -13,6 +13,20 @@
 
 namespace acpp {
 
+namespace {
+
+constexpr uint64_t kUdpRelayStatsFlushBytes = 64 * 1024;
+
+void FlushUdpRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
+    if (acc.bytes_in == 0 && acc.bytes_out == 0) {
+        return;
+    }
+    stats.CommitAccumulator(acc);
+    acc.Reset();
+}
+
+}  // namespace
+
 // ============================================================================
 // DoUDPRelay — 协议无关 UDP relay
 //
@@ -42,24 +56,16 @@ cobalt::task<RelayResult> DoUDPRelay(
     //   3. relay 协程 pop 队列
     // ========================================================================
 
-    constexpr size_t kMaxUdpQueuePackets = 512;
-    constexpr size_t kMaxUdpQueueBytes   = 2 * 1024 * 1024;
-
     struct SharedState {
         std::atomic<bool> running{true};
         std::deque<UDPPacket> reply_queue;
         size_t queued_bytes = 0;
-        std::atomic<uint64_t> dropped_replies{0};
         std::atomic<uint64_t> total_replies{0};
 
-        bool push(UDPPacket&& pkt) {
+        void push(UDPPacket&& pkt) {
             const size_t pkt_bytes = pkt.data.size();
-            if (reply_queue.size() >= kMaxUdpQueuePackets ||
-                queued_bytes + pkt_bytes > kMaxUdpQueueBytes)
-                return false;
             queued_bytes += pkt_bytes;
             reply_queue.push_back(std::move(pkt));
-            return true;
         }
 
         bool pop(UDPPacket& pkt) {
@@ -86,12 +92,7 @@ cobalt::task<RelayResult> DoUDPRelay(
                           conn_id, pkt.data.size(), pkt.target.host, pkt.target.port);
                 UDPPacket pkt_copy = pkt;
                 state->total_replies.fetch_add(1, std::memory_order_relaxed);
-                if (!state->push(std::move(pkt_copy))) {
-                    uint64_t dropped = state->dropped_replies.fetch_add(1) + 1;
-                    if (dropped % 100 == 1)
-                        LOG_ACCESS_DEBUG("[conn={}] UDP reply queue full, dropped {} packets so far",
-                                  conn_id, dropped);
-                }
+                state->push(std::move(pkt_copy));
             });
         LOG_CONN_DEBUG(ctx, "Registered Full Cone callback {}", callback_id);
     } else if (udp_dial.set_callback) {
@@ -99,12 +100,7 @@ cobalt::task<RelayResult> DoUDPRelay(
             if (!state->running.load()) return;
             UDPPacket pkt_copy = pkt;
             state->total_replies.fetch_add(1, std::memory_order_relaxed);
-            if (!state->push(std::move(pkt_copy))) {
-                uint64_t dropped = state->dropped_replies.fetch_add(1) + 1;
-                if (dropped % 100 == 1)
-                    LOG_ACCESS_DEBUG("[conn={}] UDP reply queue full, dropped {} packets",
-                              conn_id, dropped);
-            }
+            state->push(std::move(pkt_copy));
         });
     } else {
         LOG_CONN_DEBUG(ctx, "UDP dial result has no callback mechanism!");
@@ -114,6 +110,7 @@ cobalt::task<RelayResult> DoUDPRelay(
     TokenBucket upload_limiter(config.speed_limit);
     TokenBucket download_limiter(config.speed_limit);
     net::steady_timer rate_timer(executor);
+    LocalStatsAccumulator stats_acc;
 
     // 序列化并发送回包
     auto send_reply = [&](const UDPPacket& packet) -> cobalt::task<bool> {
@@ -152,7 +149,10 @@ cobalt::task<RelayResult> DoUDPRelay(
             if (written > 0) {
                 ctx.bytes_down += written;
                 result.bytes_down += written;
-                stats.AddBytesIn(written);
+                stats_acc.AddBytesIn(written);
+                if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
+                    FlushUdpRelayStats(stats, stats_acc);
+                }
             }
             co_return written > 0;
 
@@ -289,7 +289,10 @@ cobalt::task<RelayResult> DoUDPRelay(
 
             ctx.bytes_up += n;
             result.bytes_up += n;
-            stats.AddBytesOut(n);
+            stats_acc.AddBytesOut(n);
+            if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
+                FlushUdpRelayStats(stats, stats_acc);
+            }
 
             // 上行限速
             {
@@ -338,6 +341,7 @@ cobalt::task<RelayResult> DoUDPRelay(
     }
 
     state->running.store(false);
+    FlushUdpRelayStats(stats, stats_acc);
 
     if (callback_id != 0 && udp_dial.unregister_callback) {
         udp_dial.unregister_callback(callback_id);
@@ -346,11 +350,9 @@ cobalt::task<RelayResult> DoUDPRelay(
 
 #ifndef NDEBUG
     uint64_t total   = state->total_replies.load();
-    uint64_t dropped = state->dropped_replies.load();
     if (total > 0) {
-        double drop_rate = static_cast<double>(dropped) / total * 100.0;
-        LOG_CONN_DEBUG(ctx, "UDP relay stats: total_replies={}, dropped={} ({:.2f}%)",
-                       total, dropped, drop_rate);
+        LOG_CONN_DEBUG(ctx, "UDP relay stats: total_replies={}, queued_bytes={}",
+                       total, state->queued_bytes);
     }
     LOG_CONN_DEBUG(ctx, "UDP relay finished: up={} down={}", result.bytes_up, result.bytes_down);
 #endif

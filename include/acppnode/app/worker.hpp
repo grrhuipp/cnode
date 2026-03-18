@@ -21,6 +21,7 @@
 #include "acppnode/protocol/shadowsocks/ss_udp_inbound.hpp"
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -159,6 +160,14 @@ private:
     // 注销指定 tag 下所有 UDP 客户端会话的回调并释放状态（Worker 线程调用）
     void CleanupUdpClientSessions(const std::string& tag);
 
+    // UDP 回包异步发送队列（Worker 线程调用）
+    void EnqueueUdpReply(const std::string& tag,
+                         std::shared_ptr<udp::socket> sock,
+                         udp::endpoint endpoint,
+                         std::vector<uint8_t> payload);
+    void StartUdpReplySend(const std::string& tag,
+                           const std::shared_ptr<udp::socket>& sock);
+
     // 每个 tag 一个独立的 accept 协程
     cobalt::task<void> AcceptLoop(std::string tag);
 
@@ -191,6 +200,18 @@ private:
 
     // UDP：每个 tag 一个 UDP socket（SO_REUSEPORT）
     std::unordered_map<std::string, std::shared_ptr<udp::socket>> udp_sockets_;
+
+    struct PendingUdpReply {
+        udp::endpoint      endpoint;
+        std::vector<uint8_t> payload;
+    };
+
+    struct UdpReplyQueueState {
+        std::deque<PendingUdpReply> pending;
+        size_t queued_bytes = 0;
+        bool write_in_progress = false;
+    };
+    std::unordered_map<std::string, UdpReplyQueueState> udp_reply_queues_;
 
     // UDP：每个 tag 对应的协议处理器（直接持有具体类型，无虚调用开销）
     std::unordered_map<std::string, std::unique_ptr<ss::SsUdpInboundHandler>> udp_inbound_handlers_;
