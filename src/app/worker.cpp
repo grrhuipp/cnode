@@ -336,8 +336,10 @@ void Worker::StartListening(PortBinding binding) {
                   AcceptLoop(binding.tag),
                   [](std::exception_ptr) {});
 
-    LOG_INFO("Worker[{}]: listening {}:{} tag={} protocol={} (SO_REUSEPORT)",
-             id_, binding.listen, binding.port, binding.tag, binding.protocol);
+    LOG_INFO("Worker[{}]: listening {} tag={} protocol={} (SO_REUSEPORT)",
+             id_,
+             iputil::FormatEndpointForLog(binding.listen, binding.port),
+             binding.tag, binding.protocol);
 }
 
 void Worker::StopListening(const std::string& tag) {
@@ -796,8 +798,10 @@ void Worker::StartUdpListening(PortBinding binding,
         if (!local_ec && local_ep == ep) {
             CleanupUdpClientSessions(binding.tag);
             udp_inbound_handlers_[binding.tag] = std::move(handler);
-            LOG_INFO("Worker[{}]: reused UDP socket {}:{} tag={} protocol={}",
-                     id_, binding.listen, binding.port, binding.tag,
+            LOG_INFO("Worker[{}]: reused UDP socket {} tag={} protocol={}",
+                     id_,
+                     iputil::FormatEndpointForLog(binding.listen, binding.port),
+                     binding.tag,
                      udp_inbound_handlers_.at(binding.tag)->Protocol());
             return;
         }
@@ -877,8 +881,10 @@ void Worker::StartUdpListening(PortBinding binding,
                   UdpReceiveLoop(binding.tag),
                   [](std::exception_ptr) {});
 
-    LOG_INFO("Worker[{}]: UDP listening {}:{} tag={} protocol={} (SO_REUSEPORT)",
-             id_, binding.listen, binding.port, binding.tag,
+    LOG_INFO("Worker[{}]: UDP listening {} tag={} protocol={} (SO_REUSEPORT)",
+             id_,
+             iputil::FormatEndpointForLog(binding.listen, binding.port),
+             binding.tag,
              udp_inbound_handlers_.at(binding.tag)->Protocol());
 }
 

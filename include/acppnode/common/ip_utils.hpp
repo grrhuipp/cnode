@@ -58,4 +58,16 @@ inline std::string FormatHttpHostHeader(
     return header;
 }
 
+inline std::string FormatEndpointForLog(
+    std::string_view host,
+    uint16_t port) {
+    std::string value(host);
+    boost::system::error_code ec;
+    auto addr = boost::asio::ip::make_address(value, ec);
+    if (!ec && addr.is_v6()) {
+        return "[" + value + "]:" + std::to_string(port);
+    }
+    return value + ":" + std::to_string(port);
+}
+
 }  // namespace acpp::iputil

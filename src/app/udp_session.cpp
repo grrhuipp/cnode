@@ -92,8 +92,9 @@ ErrorCode UDPSession::Start(const std::string& bind_address) {
                 LOG_WARN("UDP session {} fallback bind {} -> {}",
                          session_id_, primary_bind, candidate);
             }
-            LOG_ACCESS_DEBUG("UDP session {} started on {}:{}",
-                             session_id_, candidate, local_port_);
+            LOG_ACCESS_DEBUG("UDP session {} started on {}",
+                             session_id_,
+                             iputil::FormatEndpointForLog(candidate, local_port_));
             return ErrorCode::SUCCESS;
 
         } catch (const boost::system::system_error& e) {
