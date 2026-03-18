@@ -1,5 +1,6 @@
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/common.hpp"
+#include "acppnode/common/ip_utils.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -11,7 +12,7 @@ std::string SessionContext::ToAccessLog() const {
     std::string timestamp = FormatTimestamp(accept_time_us);
 
     std::string src = std::format("{}:{}",
-        client_ip.empty() ? src_addr.address().to_string() : client_ip,
+        client_ip.empty() ? iputil::NormalizeAddressString(src_addr.address()) : client_ip,
         src_addr.port());
 
     std::string net_str = NetworkToString(network);
@@ -21,10 +22,12 @@ std::string SessionContext::ToAccessLog() const {
 
     std::string resolved_str;
     if (!resolved_ip.is_unspecified()) {
-        resolved_str = std::format("({})", resolved_ip.to_string());
+        resolved_str = std::format("({})", iputil::NormalizeAddressString(resolved_ip));
     }
 
-    std::string local_str = local_ip.is_unspecified() ? "-" : local_ip.to_string();
+    std::string local_str = local_ip.is_unspecified()
+        ? "-"
+        : iputil::NormalizeAddressString(local_ip);
 
     std::string user_str = user_email.empty() ?
         (user_id > 0 ? std::to_string(user_id) : "-") : user_email;

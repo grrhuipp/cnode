@@ -1,4 +1,5 @@
 #include "acppnode/protocol/freedom/freedom_outbound.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/protocol/protocol_registry.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
 #include "acppnode/app/udp_session.hpp"
@@ -7,6 +8,30 @@
 #include <format>
 
 namespace acpp {
+
+namespace {
+
+std::string SelectUdpBindAddress(
+    const FreedomSettings& settings,
+    const SessionContext& ctx) {
+    if (!settings.send_through.empty() &&
+        settings.send_through != "auto" &&
+        !iputil::IsWildcardBindAddress(settings.send_through)) {
+        return settings.send_through;
+    }
+
+    if (!ctx.local_ip.is_unspecified()) {
+        return iputil::NormalizeAddressString(ctx.local_ip);
+    }
+
+    return "::";
+}
+
+std::string MakeUdpSessionId(const std::string& bind_addr) {
+    return std::format("udp-{}", bind_addr);
+}
+
+}  // namespace
 
 FreedomOutbound::FreedomOutbound(
     const std::string& tag,
@@ -56,7 +81,7 @@ FreedomOutbound::ResolveTransportTarget(SessionContext& ctx) {
     transport_target.port = target.port;
     if (settings_.send_through == "auto") {
         transport_target.bind_mode = OutboundTransportTarget::BindMode::Auto;
-    } else if (settings_.send_through != "0.0.0.0" && !settings_.send_through.empty()) {
+    } else if (!iputil::IsWildcardBindAddress(settings_.send_through)) {
         transport_target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
     }
     transport_target.candidates.reserve(remote_addrs->size());
@@ -109,25 +134,8 @@ cobalt::task<UDPDialResult> FreedomOutbound::DialUDP(
     // Per-worker UDP session
     // 同一 worker 上的同一出口 IP 共享一个 UDP socket
     // （已经是 per-worker，不需要 worker_id）
-    std::string session_id;
-    if (!ctx.local_ip.is_unspecified()) {
-        // 多 IP 服务器：按出口 IP 区分
-        session_id = std::format("udp-{}", ctx.local_ip.to_string());
-    } else {
-        // 单 IP：使用默认
-        session_id = "udp-default";
-    }
-    
-    // 确定绑定地址
-    std::string bind_addr;
-    if (settings_.send_through != "auto" && settings_.send_through != "0.0.0.0" 
-        && !settings_.send_through.empty()) {
-        bind_addr = settings_.send_through;
-    } else if (!ctx.local_ip.is_unspecified()) {
-        bind_addr = ctx.local_ip.to_string();
-    } else {
-        bind_addr = "0.0.0.0";
-    }
+    const std::string bind_addr = SelectUdpBindAddress(settings_, ctx);
+    const std::string session_id = MakeUdpSessionId(bind_addr);
     
     try {
         if (!udp_session_manager_) {
@@ -250,7 +258,7 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
         // 使用入站连接的本地 IP 作为出站绑定地址
         // 这样可以实现「哪个 IP 进哪个 IP 出」
         
-        auto inbound_local = ctx.inbound_local_addr.address();
+        auto inbound_local = iputil::NormalizeAddress(ctx.inbound_local_addr.address());
         if (!inbound_local.is_unspecified() && !inbound_local.is_loopback()) {
             // 检查 IP 版本匹配
             if (remote_addr.is_v4() && inbound_local.is_v4()) {
@@ -264,7 +272,7 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
         return std::nullopt;
     }
     
-    if (settings_.send_through == "0.0.0.0" || settings_.send_through.empty()) {
+    if (iputil::IsWildcardBindAddress(settings_.send_through)) {
         // 系统自动选择
         return std::nullopt;
     }
@@ -275,6 +283,7 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
     if (ec) {
         return std::nullopt;
     }
+    addr = iputil::NormalizeAddress(addr);
 
     // 检查 IP 版本匹配
     if (remote_addr.is_v4() && addr.is_v6()) {

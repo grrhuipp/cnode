@@ -1,4 +1,5 @@
 #include "acppnode/panel/v2board_panel.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
 
@@ -12,8 +13,7 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
 #include <format>
-
-#include <regex>
+#include <openssl/x509_vfy.h>
 
 #ifdef _WIN32
 #include <openssl/x509.h>
@@ -66,19 +66,69 @@ V2BoardPanel::~V2BoardPanel() = default;
 
 std::optional<V2BoardPanel::UrlParts> V2BoardPanel::ParseUrl(const std::string& url) {
     UrlParts parts;
-    
-    std::regex url_regex(R"(^(https?)://([^:/]+)(?::(\d+))?(/.*)?$)");
-    std::smatch match;
-    
-    if (!std::regex_match(url, match, url_regex)) {
+
+    const std::string_view url_view(url);
+    const size_t scheme_pos = url_view.find("://");
+    if (scheme_pos == std::string_view::npos) {
         return std::nullopt;
     }
-    
-    parts.use_ssl = (match[1].str() == "https");
-    parts.host = match[2].str();
-    parts.port = match[3].matched ? match[3].str() : (parts.use_ssl ? "443" : "80");
-    parts.path_prefix = match[4].matched ? match[4].str() : "";
-    
+
+    const std::string_view scheme = url_view.substr(0, scheme_pos);
+    if (scheme != "http" && scheme != "https") {
+        return std::nullopt;
+    }
+    parts.use_ssl = (scheme == "https");
+
+    std::string_view rest = url_view.substr(scheme_pos + 3);
+    const size_t path_pos = rest.find('/');
+    const std::string_view authority = path_pos == std::string_view::npos
+        ? rest
+        : rest.substr(0, path_pos);
+    parts.path_prefix = path_pos == std::string_view::npos
+        ? ""
+        : std::string(rest.substr(path_pos));
+
+    if (authority.empty()) {
+        return std::nullopt;
+    }
+
+    if (authority.front() == '[') {
+        const size_t close_bracket = authority.find(']');
+        if (close_bracket == std::string_view::npos) {
+            return std::nullopt;
+        }
+
+        parts.host = std::string(authority.substr(1, close_bracket - 1));
+        if (close_bracket + 1 < authority.size()) {
+            if (authority[close_bracket + 1] != ':') {
+                return std::nullopt;
+            }
+            parts.port = std::string(authority.substr(close_bracket + 2));
+        }
+    } else {
+        const size_t first_colon = authority.find(':');
+        const size_t last_colon = authority.rfind(':');
+        if (first_colon != std::string_view::npos && first_colon == last_colon) {
+            parts.host = std::string(authority.substr(0, first_colon));
+            parts.port = std::string(authority.substr(last_colon + 1));
+        } else {
+            parts.host = std::string(authority);
+        }
+    }
+
+    if (parts.host.empty()) {
+        return std::nullopt;
+    }
+    if (parts.port.empty()) {
+        parts.port = parts.use_ssl ? "443" : "80";
+    }
+
+    boost::system::error_code ec;
+    auto literal = net::ip::make_address(parts.host, ec);
+    if (!ec) {
+        parts.literal_address = literal;
+    }
+
     // 移除末尾斜杠
     while (!parts.path_prefix.empty() && parts.path_prefix.back() == '/') {
         parts.path_prefix.pop_back();
@@ -133,8 +183,10 @@ V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
         // 解析主机 - 使用内置 DNS 服务
         tcp::endpoint endpoint;
         uint16_t port = static_cast<uint16_t>(std::stoi(url_parts_.port));
-        
-        if (dns_service_) {
+
+        if (url_parts_.literal_address) {
+            endpoint = tcp::endpoint(*url_parts_.literal_address, port);
+        } else if (dns_service_) {
             auto dns_result = co_await dns_service_->Resolve(url_parts_.host, false);
             if (!dns_result.Ok() || dns_result.addresses.empty()) {
                 result.status = 0;
@@ -166,7 +218,8 @@ V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
         auto do_request = [&](auto& stream) -> cobalt::task<void> {
             // 构建请求
             http::request<http::string_body> req{method, full_path, 11};
-            req.set(http::field::host, url_parts_.host);
+            req.set(http::field::host,
+                    iputil::FormatHttpHostHeader(url_parts_.host, port, url_parts_.use_ssl));
             req.set(http::field::user_agent, "acppnode/1.0");
             req.set(http::field::authorization, "Bearer " + config_.api_key);
             req.set("X-API-Key", config_.api_key);
@@ -215,12 +268,22 @@ V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
             }
 
             beast::ssl_stream<beast::tcp_stream> stream(executor_, *ssl_ctx);
-            stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
-            
-            if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
-                result.status = -1;
-                result.body = "SSL SNI error";
-                co_return result;
+            if (url_parts_.literal_address) {
+                auto* verify_param = SSL_get0_param(stream.native_handle());
+                if (!verify_param ||
+                    X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
+                    result.status = -1;
+                    result.body = "SSL IP verify param error";
+                    co_return result;
+                }
+            } else {
+                stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
+
+                if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
+                    result.status = -1;
+                    result.body = "SSL SNI error";
+                    co_return result;
+                }
             }
             
             beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(30));

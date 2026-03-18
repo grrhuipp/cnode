@@ -433,7 +433,7 @@ cobalt::task<bool> PanelSyncManager::CreateInbounds(IPanel* panel, int node_id,
     binding.port     = node_config.port;
     binding.protocol = protocol;
     binding.tag      = tag;
-    binding.listen   = "0.0.0.0";
+    binding.listen   = "::";
 
     for (const auto& worker : workers_) {
         worker->AddListenerAsync(binding);

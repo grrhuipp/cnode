@@ -215,6 +215,7 @@ private:
         std::string host;
         std::string port;
         std::string path_prefix;
+        std::optional<net::ip::address> literal_address;
     };
     static std::optional<UrlParts> ParseUrl(const std::string& url);
 

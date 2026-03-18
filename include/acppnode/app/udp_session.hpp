@@ -42,7 +42,7 @@ public:
     ~UDPSession();
     
     // 启动会话（绑定本地端口）
-    ErrorCode Start(const std::string& bind_address = "0.0.0.0");
+    ErrorCode Start(const std::string& bind_address = "::");
     
     // 发送数据包到目标（关联 callback_id 用于回包路由）
     cobalt::task<ErrorCode> Send(const UDPPacket& packet, uint64_t callback_id = 0);
@@ -180,7 +180,7 @@ public:
         const std::string& session_id,
         net::any_io_executor executor,
         UDPSession::PacketCallback on_packet,
-        const std::string& bind_address = "0.0.0.0");
+        const std::string& bind_address = "::");
     
     // 获取现有会话
     std::shared_ptr<UDPSession> GetSession(const std::string& session_id);

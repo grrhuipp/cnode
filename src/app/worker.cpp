@@ -1,4 +1,5 @@
 #include "acppnode/app/worker.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/connection_guard.hpp"
 #include "acppnode/app/relay.hpp"
@@ -17,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <format>
 
 namespace acpp {
 
@@ -24,6 +26,33 @@ namespace {
 
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
+
+std::vector<std::string> BuildListenCandidates(std::string_view listen) {
+    std::vector<std::string> candidates;
+    candidates.emplace_back(listen);
+    if (listen == "::") {
+        candidates.emplace_back("0.0.0.0");
+    }
+    return candidates;
+}
+
+template <typename SocketLike>
+void TryEnableDualStack(
+    SocketLike& socket,
+    const net::ip::address& addr,
+    uint32_t worker_id,
+    std::string_view label) {
+    if (!iputil::IsDualStackWildcardAddress(addr)) {
+        return;
+    }
+
+    boost::system::error_code ec;
+    socket.set_option(net::ip::v6_only(false), ec);
+    if (ec) {
+        LOG_WARN("Worker[{}]: {} dual-stack wildcard unavailable: {}",
+                 worker_id, label, ec.message());
+    }
+}
 
 uint32_t ComputePressureThreshold(const Config& config) {
     uint32_t threshold = defaults::kMaxConnectionsPerWorker
@@ -226,53 +255,80 @@ void Worker::InitRouter() {
 // ============================================================================
 
 void Worker::StartListening(PortBinding binding) {
-    boost::system::error_code ec;
-
     if (acceptors_.contains(binding.tag)) {
         LOG_WARN("Worker[{}]: replacing existing TCP listener tag={}", id_, binding.tag);
         StopListening(binding.tag);
     }
 
     tcp::acceptor acceptor(io_context_);
-    auto addr = net::ip::make_address(binding.listen, ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
-                  id_, binding.listen, ec.message());
-        return;
-    }
-    tcp::endpoint ep(addr, binding.port);
+    std::string actual_listen;
+    const auto listen_candidates = BuildListenCandidates(binding.listen);
 
-    acceptor.open(ep.protocol(), ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: acceptor open failed: {}", id_, ec.message());
-        return;
-    }
+    for (size_t i = 0; i < listen_candidates.size(); ++i) {
+        const auto& listen_addr = listen_candidates[i];
+        boost::system::error_code ec;
+        auto addr = net::ip::make_address(listen_addr, ec);
+        if (ec) {
+            LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
+                      id_, listen_addr, ec.message());
+            return;
+        }
 
-    acceptor.set_option(net::socket_base::reuse_address(true), ec);
+        tcp::endpoint ep(addr, binding.port);
+        tcp::acceptor candidate_acceptor(io_context_);
+
+        auto retry_or_fail = [&](std::string_view op, std::string_view msg) -> bool {
+            if (i + 1 < listen_candidates.size()) {
+                LOG_WARN("Worker[{}]: TCP {} {}:{} failed: {}, retrying {}",
+                         id_, op, listen_addr, binding.port, msg, listen_candidates[i + 1]);
+                return true;
+            }
+            LOG_ERROR("Worker[{}]: TCP {} {}:{} failed: {}",
+                      id_, op, listen_addr, binding.port, msg);
+            return false;
+        };
+
+        candidate_acceptor.open(ep.protocol(), ec);
+        if (ec) {
+            if (retry_or_fail("open", ec.message())) continue;
+            return;
+        }
+
+        candidate_acceptor.set_option(net::socket_base::reuse_address(true), ec);
+        TryEnableDualStack(candidate_acceptor, addr, id_, "TCP listener");
 
 #ifndef _WIN32
-    // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡
-    // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
-    int optval = 1;
-    if (::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                     &optval, sizeof(optval)) < 0) {
-        LOG_ERROR("Worker[{}]: SO_REUSEPORT failed: {}", id_, strerror(errno));
-        return;
-    }
+        // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡
+        // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
+        int optval = 1;
+        if (::setsockopt(candidate_acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                         &optval, sizeof(optval)) < 0) {
+            if (retry_or_fail("SO_REUSEPORT", strerror(errno))) continue;
+            return;
+        }
 #endif
 
-    acceptor.bind(ep, ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: bind {}:{} failed: {}",
-                  id_, binding.listen, binding.port, ec.message());
-        return;
+        candidate_acceptor.bind(ep, ec);
+        if (ec) {
+            if (retry_or_fail("bind", ec.message())) continue;
+            return;
+        }
+
+        candidate_acceptor.listen(net::socket_base::max_listen_connections, ec);
+        if (ec) {
+            if (retry_or_fail("listen", ec.message())) continue;
+            return;
+        }
+
+        acceptor = std::move(candidate_acceptor);
+        actual_listen = listen_addr;
+        break;
     }
 
-    acceptor.listen(net::socket_base::max_listen_connections, ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: listen failed: {}", id_, ec.message());
+    if (actual_listen.empty()) {
         return;
     }
+    binding.listen = actual_listen;
 
     acceptors_.emplace(binding.tag, std::move(acceptor));
 
@@ -445,9 +501,14 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     ctx.inbound_tags     = lc_it->second.inbound_tags;
     ctx.inbound_protocol = lc_it->second.protocol;
     try {
-        ctx.client_ip = remote_ep.address().to_string();
-        ctx.src_addr  = remote_ep;
-        ctx.inbound_local_addr = tcp_stream->LocalEndpoint();
+        const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
+        ctx.client_ip = normalized_remote.to_string();
+        ctx.src_addr  = tcp::endpoint(normalized_remote, remote_ep.port());
+
+        const auto local_ep = tcp_stream->LocalEndpoint();
+        ctx.inbound_local_addr = tcp::endpoint(
+            iputil::NormalizeAddress(local_ep.address()),
+            local_ep.port());
     } catch (...) {
         ctx.client_ip = "unknown";
     }
@@ -533,9 +594,13 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
             if (result.success()) {
                 skip = result.consumed;
                 if (!result.src_ip.empty()) {
-                    ctx.client_ip = result.src_ip;
+                    boost::system::error_code src_ec;
+                    auto src_addr = net::ip::make_address(result.src_ip, src_ec);
+                    ctx.client_ip = src_ec
+                        ? result.src_ip
+                        : iputil::NormalizeAddressString(src_addr);
                     LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
-                                  tag, remote_ep.address().to_string(),
+                                  tag, iputil::NormalizeAddressString(remote_ep.address()),
                                   ctx.client_ip, result.src_port);
                 }
             }
@@ -716,18 +781,16 @@ void Worker::AddUdpListenerAsync(PortBinding binding,
 
 void Worker::StartUdpListening(PortBinding binding,
                                std::unique_ptr<ss::SsUdpInboundHandler> handler) {
-    boost::system::error_code ec;
-    auto addr = net::ip::make_address(binding.listen, ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
-                  id_, binding.listen, ec.message());
-        return;
-    }
-
-    udp::endpoint ep(addr, binding.port);
-
     auto sock_it = udp_sockets_.find(binding.tag);
     if (sock_it != udp_sockets_.end() && sock_it->second && sock_it->second->is_open()) {
+        boost::system::error_code ec;
+        auto addr = net::ip::make_address(binding.listen, ec);
+        if (ec) {
+            LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
+                      id_, binding.listen, ec.message());
+            return;
+        }
+        udp::endpoint ep(addr, binding.port);
         boost::system::error_code local_ec;
         auto local_ep = sock_it->second->local_endpoint(local_ec);
         if (!local_ec && local_ep == ep) {
@@ -744,32 +807,68 @@ void Worker::StartUdpListening(PortBinding binding,
     }
 
     auto sock = std::make_shared<udp::socket>(io_context_);
+    std::string actual_listen;
+    const auto listen_candidates = BuildListenCandidates(binding.listen);
 
-    sock->open(ep.protocol(), ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: SS UDP socket open failed: {}", id_, ec.message());
-        return;
-    }
+    for (size_t i = 0; i < listen_candidates.size(); ++i) {
+        const auto& listen_addr = listen_candidates[i];
+        boost::system::error_code ec;
+        auto addr = net::ip::make_address(listen_addr, ec);
+        if (ec) {
+            LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
+                      id_, listen_addr, ec.message());
+            return;
+        }
 
-    sock->set_option(net::socket_base::reuse_address(true), ec);
+        udp::endpoint ep(addr, binding.port);
+        auto candidate_sock = std::make_shared<udp::socket>(io_context_);
+
+        auto retry_or_fail = [&](std::string_view op, std::string_view msg) -> bool {
+            if (i + 1 < listen_candidates.size()) {
+                LOG_WARN("Worker[{}]: UDP {} {}:{} failed: {}, retrying {}",
+                         id_, op, listen_addr, binding.port, msg, listen_candidates[i + 1]);
+                return true;
+            }
+            LOG_ERROR("Worker[{}]: UDP {} {}:{} failed: {}",
+                      id_, op, listen_addr, binding.port, msg);
+            return false;
+        };
+
+        candidate_sock->open(ep.protocol(), ec);
+        if (ec) {
+            if (retry_or_fail("open", ec.message())) continue;
+            return;
+        }
+
+        candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
+        TryEnableDualStack(*candidate_sock, addr, id_, "UDP listener");
 
 #ifndef _WIN32
-    // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡
-    // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
-    int optval = 1;
-    if (::setsockopt(sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                     &optval, sizeof(optval)) < 0) {
-        LOG_ERROR("Worker[{}]: SS UDP SO_REUSEPORT failed: {}", id_, strerror(errno));
-        return;
-    }
+        // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡
+        // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
+        int optval = 1;
+        if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                         &optval, sizeof(optval)) < 0) {
+            if (retry_or_fail("SO_REUSEPORT", strerror(errno))) continue;
+            return;
+        }
 #endif
 
-    sock->bind(ep, ec);
-    if (ec) {
-        LOG_ERROR("Worker[{}]: SS UDP bind {}:{} failed: {}",
-                  id_, binding.listen, binding.port, ec.message());
+        candidate_sock->bind(ep, ec);
+        if (ec) {
+            if (retry_or_fail("bind", ec.message())) continue;
+            return;
+        }
+
+        sock = std::move(candidate_sock);
+        actual_listen = listen_addr;
+        break;
+    }
+
+    if (actual_listen.empty()) {
         return;
     }
+    binding.listen = actual_listen;
 
     udp_sockets_[binding.tag] = sock;
     udp_inbound_handlers_[binding.tag] = std::move(handler);
@@ -840,14 +939,18 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
         const std::string fixed_outbound =
             (lc_it != listener_contexts_.end()) ? lc_it->second.fixed_outbound : "";
 
-        const std::string client_ip = client_ep.address().to_string();
+        const std::string client_ip =
+            iputil::NormalizeAddressString(client_ep.address());
+        const auto normalized_client_addr =
+            iputil::NormalizeAddress(client_ep.address());
         auto decoded = handler->Decode(tag, client_ip, recv_buf.data(), n);
         if (!decoded) continue;
 
         // ── 找到或创建客户端会话 ──────────────────────────────────────────
         const std::string client_key =
-            client_ip + ":" +
-            std::to_string(client_ep.port());
+            normalized_client_addr.is_v6()
+                ? std::format("[{}]:{}", client_ip, client_ep.port())
+                : std::format("{}:{}", client_ip, client_ep.port());
 
         auto session_it = client_sessions.find(client_key);
         bool need_new_session = (session_it == client_sessions.end()) ||
@@ -863,6 +966,7 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
             }
             ctx.inbound_protocol = std::string(handler->Protocol());
             ctx.client_ip        = client_ip;
+            ctx.src_addr         = tcp::endpoint(normalized_client_addr, client_ep.port());
             ctx.network          = Network::UDP;
             ctx.target           = decoded->target;
             ctx.final_target     = decoded->target;

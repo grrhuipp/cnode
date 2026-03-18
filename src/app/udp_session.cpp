@@ -1,48 +1,27 @@
 #include "acppnode/app/udp_session.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
 
 namespace acpp {
 
 // ============================================================================
-// 辅助函数：规范化地址字符串（IPv4-mapped IPv6 -> IPv4）
-// ============================================================================
-static std::string NormalizeAddress(const net::ip::address& addr) {
-    if (addr.is_v6()) {
-        auto v6 = addr.to_v6();
-        if (v6.is_v4_mapped()) {
-            // 转换为 IPv4
-            return net::ip::make_address_v4(net::ip::v4_mapped, v6).to_string();
-        }
-    }
-    return addr.to_string();
-}
-
-// ============================================================================
 // 辅助函数：生成 endpoint key（用于回调路由）
 // 优化：使用栈上缓冲区，避免多次堆分配
 // ============================================================================
 static std::string MakeEndpointKey(const net::ip::address& addr, uint16_t port) {
-    // IPv6 最长 45 字符 + ":" + 最长 5 字符端口 = 51，使用 64 字节栈缓冲区
+    const auto normalized = iputil::NormalizeAddress(addr);
+    // IPv6 最长 45 字符 + "[]:" + 最长 5 字符端口 = 53，使用 64 字节栈缓冲区
     char buf[64];
     int len;
     
-    if (addr.is_v6()) {
-        auto v6 = addr.to_v6();
-        if (v6.is_v4_mapped()) {
-            // IPv4-mapped IPv6 -> 直接格式化为 IPv4
-            auto v4 = net::ip::make_address_v4(net::ip::v4_mapped, v6);
-            auto bytes = v4.to_bytes();
-            len = snprintf(buf, sizeof(buf), "%u.%u.%u.%u:%u",
-                          bytes[0], bytes[1], bytes[2], bytes[3], port);
-        } else {
-            // 纯 IPv6：需要完整格式化（较少见，可容忍 to_string）
-            len = snprintf(buf, sizeof(buf), "%s:%u", 
-                          v6.to_string().c_str(), port);
-        }
+    if (normalized.is_v6()) {
+        const auto text = normalized.to_string();
+        len = snprintf(buf, sizeof(buf), "[%s]:%u",
+                       text.c_str(), port);
     } else {
         // IPv4：直接格式化字节
-        auto bytes = addr.to_v4().to_bytes();
+        auto bytes = normalized.to_v4().to_bytes();
         len = snprintf(buf, sizeof(buf), "%u.%u.%u.%u:%u",
                       bytes[0], bytes[1], bytes[2], bytes[3], port);
     }
@@ -78,24 +57,56 @@ UDPSession::~UDPSession() {
 }
 
 ErrorCode UDPSession::Start(const std::string& bind_address) {
-    try {
-        auto addr = net::ip::make_address(bind_address);
-        udp::endpoint local_ep(addr, 0);  // 端口 0 = 自动分配
-        
-        socket_.open(local_ep.protocol());
-        socket_.set_option(udp::socket::reuse_address(true));
-        socket_.bind(local_ep);
-        
-        local_port_ = socket_.local_endpoint().port();
-        running_ = true;
-        
-        LOG_ACCESS_DEBUG("UDP session {} started on port {}", session_id_, local_port_);
-        return ErrorCode::SUCCESS;
-        
-    } catch (const boost::system::system_error& e) {
-        LOG_CONN_FAIL("UDP session {} start failed: {}", session_id_, e.what());
-        return ErrorCode::NETWORK_BIND_FAILED;
+    const std::string primary_bind = bind_address.empty() ? "::" : bind_address;
+    std::vector<std::string> bind_candidates{primary_bind};
+    if (primary_bind == "::") {
+        bind_candidates.push_back("0.0.0.0");
     }
+
+    std::string last_error = "bind failed";
+
+    for (size_t i = 0; i < bind_candidates.size(); ++i) {
+        const auto& candidate = bind_candidates[i];
+        try {
+            auto addr = net::ip::make_address(candidate);
+            udp::endpoint local_ep(addr, 0);  // 端口 0 = 自动分配
+
+            udp::socket sock(executor_);
+            sock.open(local_ep.protocol());
+            if (iputil::IsDualStackWildcardAddress(addr)) {
+                boost::system::error_code v6_ec;
+                sock.set_option(net::ip::v6_only(false), v6_ec);
+                if (v6_ec) {
+                    LOG_WARN("UDP session {} dual-stack wildcard unavailable on {}: {}",
+                             session_id_, candidate, v6_ec.message());
+                }
+            }
+            sock.set_option(udp::socket::reuse_address(true));
+            sock.bind(local_ep);
+
+            socket_ = std::move(sock);
+            local_port_ = socket_.local_endpoint().port();
+            running_ = true;
+
+            if (candidate != primary_bind) {
+                LOG_WARN("UDP session {} fallback bind {} -> {}",
+                         session_id_, primary_bind, candidate);
+            }
+            LOG_ACCESS_DEBUG("UDP session {} started on {}:{}",
+                             session_id_, candidate, local_port_);
+            return ErrorCode::SUCCESS;
+
+        } catch (const boost::system::system_error& e) {
+            last_error = e.what();
+            if (i + 1 < bind_candidates.size()) {
+                LOG_WARN("UDP session {} bind {} failed: {}, retrying {}",
+                         session_id_, candidate, e.what(), bind_candidates[i + 1]);
+            }
+        }
+    }
+
+    LOG_CONN_FAIL("UDP session {} start failed: {}", session_id_, last_error);
+    return ErrorCode::NETWORK_BIND_FAILED;
 }
 
 cobalt::task<ErrorCode> UDPSession::Send(const UDPPacket& packet, uint64_t callback_id) {
@@ -387,7 +398,8 @@ void UDPSession::DoReceive() {
                 
                 // 构造回包
                 UDPPacket packet;
-                std::string normalized_addr = NormalizeAddress(sender_endpoint_.address());
+                std::string normalized_addr =
+                    iputil::NormalizeAddressString(sender_endpoint_.address());
                 
                 boost::system::error_code parse_ec;
                 auto addr = net::ip::make_address(normalized_addr, parse_ec);
@@ -436,13 +448,8 @@ void UDPSession::DoReceive() {
                 } else {
                     // 没有匹配的注册回调，尝试全局回调
                     if (receive_callback_) {
-                        net::ip::address from_addr = sender_endpoint_.address();
-                        if (from_addr.is_v6()) {
-                            auto v6 = from_addr.to_v6();
-                            if (v6.is_v4_mapped()) {
-                                from_addr = net::ip::make_address_v4(net::ip::v4_mapped, v6);
-                            }
-                        }
+                        net::ip::address from_addr =
+                            iputil::NormalizeAddress(sender_endpoint_.address());
                         
                         LOG_ACCESS_DEBUG("UDP session {} calling receive_callback for {}", 
                                  session_id_, sender_key);

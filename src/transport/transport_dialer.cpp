@@ -1,4 +1,5 @@
 #include "acppnode/transport/transport_dialer.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -326,7 +327,7 @@ cobalt::task<DialResult> TransportDialer::Dial(
         co_return std::move(connect_result.dial);
     }
     auto tcp_result = std::move(connect_result.dial);
-    ctx.resolved_ip = connect_result.endpoint.address();
+    ctx.resolved_ip = iputil::NormalizeAddress(connect_result.endpoint.address());
 
     tcp_result.stream->SetIdleTimeout(target.timeout);
     auto transport_deadline = tcp_result.stream->StartPhaseDeadline(target.timeout);
@@ -352,7 +353,7 @@ cobalt::task<DialResult> TransportDialer::Dial(
     // 后续阶段由 SessionHandler 重新设置 idle/read/write timeout
     stream->SetIdleTimeout(std::chrono::seconds(0));
     if (auto local_ep = stream->LocalEndpoint()) {
-        ctx.local_ip = local_ep->address();
+        ctx.local_ip = iputil::NormalizeAddress(local_ep->address());
     }
 
     co_return DialResult::Success(std::move(stream));

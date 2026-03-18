@@ -1,4 +1,5 @@
 #include "acppnode/app/session_handler.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/app/mux_relay.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/sniff/sniffer.hpp"
@@ -118,6 +119,11 @@ cobalt::task<void> SessionHandler::Handle(
 
     // WS CDN 真实 IP：覆盖 TCP 层地址（仅当配置了 real_ip_header 且头存在时）
     if (!ws_real_ip.empty()) {
+        boost::system::error_code real_ip_ec;
+        auto parsed_real_ip = net::ip::make_address(ws_real_ip, real_ip_ec);
+        if (!real_ip_ec) {
+            ws_real_ip = iputil::NormalizeAddressString(parsed_real_ip);
+        }
         LOG_CONN_DEBUG(ctx, "[SessionHandler] WS real IP from header: {} -> {}",
                        ctx.client_ip, ws_real_ip);
         ctx.client_ip = std::move(ws_real_ip);
