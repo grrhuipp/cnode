@@ -4,14 +4,51 @@
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/common/target_address.hpp"
 
-#include <map>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
 namespace acpp {
+
+struct TransparentStringHash {
+    using is_transparent = void;
+
+    [[nodiscard]] size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+
+    [[nodiscard]] size_t operator()(const std::string& value) const noexcept {
+        return (*this)(std::string_view(value));
+    }
+};
+
+struct TransparentStringEq {
+    using is_transparent = void;
+
+    [[nodiscard]] bool operator()(std::string_view lhs,
+                                  std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+
+    [[nodiscard]] bool operator()(const std::string& lhs,
+                                  std::string_view rhs) const noexcept {
+        return std::string_view(lhs) == rhs;
+    }
+
+    [[nodiscard]] bool operator()(std::string_view lhs,
+                                  const std::string& rhs) const noexcept {
+        return lhs == std::string_view(rhs);
+    }
+
+    [[nodiscard]] bool operator()(const std::string& lhs,
+                                  const std::string& rhs) const noexcept {
+        return lhs == rhs;
+    }
+};
 
 // ============================================================================
 // 域名匹配器 - 使用 Trie 树优化后缀匹配
@@ -27,15 +64,15 @@ public:
     DomainTrie(const DomainTrie&) = delete;
     DomainTrie& operator=(const DomainTrie&) = delete;
 
-    void AddSuffix(const std::string& suffix, const std::string& outbound);
-    std::optional<std::string> MatchSuffix(const std::string& domain) const;
+    void AddSuffix(const std::string& suffix);
+    bool MatchSuffix(std::string_view lower_domain) const;
     void Clear();
     [[nodiscard]] size_t Size() const { return rule_count_; }
 
 private:
     struct TrieNode {
-        std::map<char, std::unique_ptr<TrieNode>> children;
-        std::optional<std::string> outbound;
+        std::vector<std::pair<char, std::unique_ptr<TrieNode>>> children;
+        bool terminal = false;
     };
     std::unique_ptr<TrieNode> root_;
     size_t rule_count_ = 0;
@@ -51,12 +88,12 @@ public:
     DomainMatcher(const DomainMatcher&) = delete;
     DomainMatcher& operator=(const DomainMatcher&) = delete;
 
-    void AddDomain  (const std::string& domain,   const std::string& outbound);
-    void AddSuffix  (const std::string& suffix,   const std::string& outbound);
-    void AddKeyword (const std::string& keyword,  const std::string& outbound);
-    void AddRegex   (const std::string& pattern,  const std::string& outbound);
+    void AddDomain  (const std::string& domain);
+    void AddSuffix  (const std::string& suffix);
+    void AddKeyword (const std::string& keyword);
+    void AddRegex   (const std::string& pattern);
 
-    [[nodiscard]] std::optional<std::string> Match(const std::string& domain) const;
+    [[nodiscard]] bool Match(std::string_view domain) const;
     void Clear();
 
     [[nodiscard]] bool Empty() const {
@@ -65,10 +102,10 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, std::string>       domains_;
-    DomainTrie                                       suffix_trie_;
-    std::vector<std::pair<std::string, std::string>> keywords_;
-    std::vector<std::pair<std::regex, std::string>>  regexes_;
+    std::unordered_set<std::string, TransparentStringHash, TransparentStringEq> domains_;
+    DomainTrie suffix_trie_;
+    std::vector<std::string> keywords_;
+    std::vector<std::regex> regexes_;
 };
 
 // ============================================================================
@@ -79,13 +116,13 @@ public:
     IPMatcher();
     ~IPMatcher() noexcept;
 
-    void AddCIDR(const std::string& cidr, const std::string& outbound);
+    void AddCIDR(const std::string& cidr);
 
     // 规则加载完成后调用，构建 radix trie
     void BuildIndex();
 
-    [[nodiscard]] std::optional<std::string> Match(const std::string& ip) const;
-    [[nodiscard]] std::optional<std::string> MatchIPv4(uint32_t ip) const;
+    [[nodiscard]] bool Match(std::string_view ip) const;
+    [[nodiscard]] bool MatchIPv4(uint32_t ip) const;
     void Clear();
 
     [[nodiscard]] bool Empty() const { return rules_.empty(); }
@@ -94,7 +131,6 @@ private:
     struct CIDRRule {
         uint32_t network;
         uint32_t mask;
-        std::string outbound;
     };
     std::vector<CIDRRule> rules_;
 
@@ -130,7 +166,7 @@ public:
         const geo::GeoManager* /*geo*/) const {
         const auto& target = ctx.EffectiveTarget();
         if (!target.IsDomain()) return false;
-        return matcher_.Match(target.host).has_value();
+        return matcher_.Match(target.host);
     }
 
 private:
@@ -162,7 +198,7 @@ public:
         const geo::GeoManager* /*geo*/) const {
         const auto& target = ctx.EffectiveTarget();
         if (target.IsDomain()) return false;
-        return matcher_.Match(target.host).has_value();
+        return matcher_.Match(target.host);
     }
 
 private:
@@ -207,21 +243,27 @@ private:
 // 网络类型条件（OR within，"tcp"/"udp"）
 class NetworkCondition {
 public:
-    explicit NetworkCondition(std::vector<std::string> networks)
-        : networks_(std::move(networks)) {}
+    explicit NetworkCondition(std::vector<std::string> networks) {
+        for (const auto& net : networks) {
+            if (net == "tcp") {
+                mask_ |= 0x1;
+            } else if (net == "udp") {
+                mask_ |= 0x2;
+            } else if (net == "tcp,udp" || net == "udp,tcp") {
+                mask_ |= 0x3;
+            }
+        }
+    }
 
     [[nodiscard]] bool Match(
         const SessionContext& ctx,
         const geo::GeoManager* /*geo*/) const {
-        const std::string_view net = (ctx.network == Network::UDP) ? "udp" : "tcp";
-        for (const auto& n : networks_) {
-            if (n == net || n == "tcp,udp" || n == "udp,tcp") return true;
-        }
-        return false;
+        const uint8_t bit = (ctx.network == Network::UDP) ? 0x2 : 0x1;
+        return (mask_ & bit) != 0;
     }
 
 private:
-    std::vector<std::string> networks_;
+    uint8_t mask_ = 0;
 };
 
 // 入站标签条件（OR within）
@@ -256,7 +298,7 @@ public:
         const SessionContext& ctx,
         const geo::GeoManager* /*geo*/) const {
         if (ctx.client_ip.empty()) return false;
-        return matcher_.Match(ctx.client_ip).has_value();
+        return matcher_.Match(ctx.client_ip);
     }
 
 private:
@@ -389,7 +431,7 @@ public:
 
     // 工具函数（public 供 IPMatcher 使用）
     [[nodiscard]] static bool ParseCIDR(const std::string& cidr, uint32_t& network, uint32_t& mask);
-    [[nodiscard]] static std::optional<uint32_t> ParseIPv4(const std::string& ip);
+    [[nodiscard]] static std::optional<uint32_t> ParseIPv4(std::string_view ip);
 
 private:
     std::vector<CompoundRoutingRule> compound_rules_;

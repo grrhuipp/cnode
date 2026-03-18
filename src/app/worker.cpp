@@ -176,11 +176,54 @@ void Worker::InitRouter() {
         CompoundRoutingRule compound;
         compound.outbound_tag = rc.outbound_tag;
 
+        if (!rc.network.empty()) {
+            compound.conditions.push_back(NetworkCondition{rc.network});
+        }
+
+        if (!rc.inbound_tag.empty()) {
+            compound.conditions.push_back(InboundTagCondition{rc.inbound_tag});
+        } else {
+            // 隐式 inboundTag=node：没有显式 inboundTag 条件的规则只匹配面板入站
+            compound.conditions.push_back(InboundTagCondition{std::vector<std::string>{"node"}});
+        }
+
+        if (!rc.user.empty()) {
+            compound.conditions.push_back(UserCondition{rc.user});
+        }
+
+        if (!rc.source_port.empty()) {
+            compound.conditions.push_back(SourcePortCondition{rc.source_port});
+        }
+
+        if (!rc.port.empty()) {
+            compound.conditions.push_back(PortCondition{rc.port});
+        }
+
+        if (!rc.protocol.empty()) {
+            compound.conditions.push_back(ProtocolCondition{rc.protocol});
+        }
+
+        {
+            IPMatcher sim;
+            for (const auto& v : rc.source) { sim.AddCIDR(v); }
+            if (!sim.Empty()) {
+                sim.BuildIndex();
+                compound.conditions.push_back(SourceIPCondition{std::move(sim)});
+            }
+        }
+
+        IPMatcher im;
+        for (const auto& v : rc.ip) { im.AddCIDR(v); }
+        if (!im.Empty()) {
+            im.BuildIndex();
+            compound.conditions.push_back(IPCondition{std::move(im)});
+        }
+
         DomainMatcher dm;
-        for (const auto& v : rc.domain)         { dm.AddSuffix(v,   rc.outbound_tag); }
-        for (const auto& v : rc.domain_suffix)  { dm.AddSuffix(v,   rc.outbound_tag); }
-        for (const auto& v : rc.domain_keyword) { dm.AddKeyword(v,  rc.outbound_tag); }
-        for (const auto& v : rc.domain_full)    { dm.AddDomain(v,   rc.outbound_tag); }
+        for (const auto& v : rc.domain)         { dm.AddSuffix(v); }
+        for (const auto& v : rc.domain_suffix)  { dm.AddSuffix(v); }
+        for (const auto& v : rc.domain_keyword) { dm.AddKeyword(v); }
+        for (const auto& v : rc.domain_full)    { dm.AddDomain(v); }
         if (!dm.Empty()) {
             compound.conditions.push_back(DomainCondition{std::move(dm)});
         }
@@ -189,56 +232,8 @@ void Worker::InitRouter() {
             compound.conditions.push_back(GeoSiteCondition{rc.geosite});
         }
 
-        IPMatcher im;
-        for (const auto& v : rc.ip) { im.AddCIDR(v, rc.outbound_tag); }
-        if (!im.Empty()) {
-            im.BuildIndex();
-            compound.conditions.push_back(IPCondition{std::move(im)});
-        }
-
         if (!rc.geoip.empty()) {
             compound.conditions.push_back(GeoIPCondition{rc.geoip});
-        }
-
-        if (!rc.port.empty()) {
-            compound.conditions.push_back(PortCondition{rc.port});
-        }
-
-        if (!rc.network.empty()) {
-            compound.conditions.push_back(NetworkCondition{rc.network});
-        }
-
-        if (!rc.inbound_tag.empty()) {
-            compound.conditions.push_back(InboundTagCondition{rc.inbound_tag});
-        }
-
-        if (!rc.user.empty()) {
-            compound.conditions.push_back(UserCondition{rc.user});
-        }
-
-        // 来源 IP/CIDR
-        {
-            IPMatcher sim;
-            for (const auto& v : rc.source) { sim.AddCIDR(v, rc.outbound_tag); }
-            if (!sim.Empty()) {
-                sim.BuildIndex();
-                compound.conditions.push_back(SourceIPCondition{std::move(sim)});
-            }
-        }
-
-        if (!rc.source_port.empty()) {
-            compound.conditions.push_back(SourcePortCondition{rc.source_port});
-        }
-
-        if (!rc.protocol.empty()) {
-            compound.conditions.push_back(ProtocolCondition{rc.protocol});
-        }
-
-        // 隐式 inboundTag=node：没有显式 inboundTag 条件的规则只匹配面板入站
-        if (!rc.inbound_tag.empty()) {
-            // 已有显式 inboundTag，不添加隐式条件
-        } else {
-            compound.conditions.push_back(InboundTagCondition{std::vector<std::string>{"node"}});
         }
 
         if (!compound.conditions.empty()) {

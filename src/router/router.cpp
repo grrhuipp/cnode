@@ -10,13 +10,17 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 namespace acpp {
 
 namespace {
-void ToLower(std::string& s) {
-    std::ranges::transform(s, s.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+inline char ToLowerAscii(unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+}
+
+void ToLowerInPlace(std::string& s) {
+    std::ranges::transform(s, s.begin(), ToLowerAscii);
 }
 }  // namespace
 
@@ -28,50 +32,53 @@ DomainTrie::DomainTrie() : root_(std::make_unique<TrieNode>()) {}
 
 DomainTrie::~DomainTrie() noexcept = default;
 
-void DomainTrie::AddSuffix(const std::string& suffix, const std::string& outbound) {
-    // 转小写并确保以点开头
+void DomainTrie::AddSuffix(const std::string& suffix) {
     std::string lower = suffix;
-    ToLower(lower);
+    ToLowerInPlace(lower);
 
-    if (!lower.empty() && lower[0] != '.') {
-        lower = "." + lower;
-    }
-
-    // 反向插入到 Trie
     TrieNode* node = root_.get();
     for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
-        char c = *it;
-        if (!node->children[c]) {
-            node->children[c] = std::make_unique<TrieNode>();
+        TrieNode* next = nullptr;
+        for (auto& [child_char, child_node] : node->children) {
+            if (child_char == *it) {
+                next = child_node.get();
+                break;
+            }
         }
-        node = node->children[c].get();
+        if (!next) {
+            node->children.emplace_back(*it, std::make_unique<TrieNode>());
+            next = node->children.back().second.get();
+        }
+        node = next;
     }
-    node->outbound = outbound;
+    node->terminal = true;
     rule_count_++;
 }
 
-std::optional<std::string> DomainTrie::MatchSuffix(const std::string& domain) const {
-    // 转小写，添加前导点
-    std::string lower = "." + domain;
-    ToLower(lower);
-
-    // 反向遍历域名，在 Trie 中查找最长匹配
+bool DomainTrie::MatchSuffix(std::string_view lower_domain) const {
     const TrieNode* node = root_.get();
-    std::optional<std::string> result;
-
-    for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
-        char c = *it;
-        auto child = node->children.find(c);
-        if (child == node->children.end()) {
-            break;
+    for (auto it = lower_domain.rbegin(); it != lower_domain.rend(); ++it) {
+        const TrieNode* next = nullptr;
+        for (const auto& [child_char, child_node] : node->children) {
+            if (child_char == *it) {
+                next = child_node.get();
+                break;
+            }
         }
-        node = child->second.get();
-        if (node->outbound) {
-            result = node->outbound;
+        node = next;
+        if (!node) {
+            return false;
+        }
+
+        if (node->terminal) {
+            auto next_it = std::next(it);
+            if (next_it == lower_domain.rend() || *next_it == '.') {
+                return true;
+            }
         }
     }
 
-    return result;
+    return node->terminal;
 }
 
 void DomainTrie::Clear() {
@@ -86,61 +93,66 @@ void DomainTrie::Clear() {
 DomainMatcher::DomainMatcher() = default;
 DomainMatcher::~DomainMatcher() noexcept = default;
 
-void DomainMatcher::AddDomain(const std::string& domain, const std::string& outbound) {
+void DomainMatcher::AddDomain(const std::string& domain) {
     std::string lower = domain;
-    ToLower(lower);
-    domains_[lower] = outbound;
+    ToLowerInPlace(lower);
+    domains_.insert(std::move(lower));
 }
 
-void DomainMatcher::AddSuffix(const std::string& suffix, const std::string& outbound) {
-    suffix_trie_.AddSuffix(suffix, outbound);
+void DomainMatcher::AddSuffix(const std::string& suffix) {
+    suffix_trie_.AddSuffix(suffix);
 }
 
-void DomainMatcher::AddKeyword(const std::string& keyword, const std::string& outbound) {
+void DomainMatcher::AddKeyword(const std::string& keyword) {
     std::string lower = keyword;
-    ToLower(lower);
-    keywords_.emplace_back(lower, outbound);
+    ToLowerInPlace(lower);
+    keywords_.push_back(std::move(lower));
 }
 
-void DomainMatcher::AddRegex(const std::string& pattern, const std::string& outbound) {
+void DomainMatcher::AddRegex(const std::string& pattern) {
     try {
-        regexes_.emplace_back(std::regex(pattern, std::regex::icase), outbound);
+        regexes_.emplace_back(pattern, std::regex::icase);
     } catch (const std::regex_error& e) {
         LOG_WARN("Router: invalid regex pattern '{}': {}", pattern, e.what());
     }
 }
 
-std::optional<std::string> DomainMatcher::Match(const std::string& domain) const {
-    std::string lower = domain;
-    ToLower(lower);
+bool DomainMatcher::Match(std::string_view domain) const {
+    char stack_buf[256];
+    std::string heap_buf;
+    char* lower_ptr = stack_buf;
 
-    // 1. 完全匹配
-    auto it = domains_.find(lower);
-    if (it != domains_.end()) {
-        return it->second;
+    if (domain.size() >= sizeof(stack_buf)) {
+        heap_buf.resize(domain.size());
+        lower_ptr = heap_buf.data();
     }
 
-    // 2. 后缀匹配（Trie，O(n)）
-    auto suffix_result = suffix_trie_.MatchSuffix(lower);
-    if (suffix_result) {
-        return suffix_result;
+    for (size_t i = 0; i < domain.size(); ++i) {
+        lower_ptr[i] = ToLowerAscii(static_cast<unsigned char>(domain[i]));
+    }
+    const std::string_view lower(lower_ptr, domain.size());
+
+    if (domains_.find(lower) != domains_.end()) {
+        return true;
     }
 
-    // 3. 关键词匹配
-    for (const auto& [keyword, outbound] : keywords_) {
+    if (suffix_trie_.MatchSuffix(lower)) {
+        return true;
+    }
+
+    for (const auto& keyword : keywords_) {
         if (lower.find(keyword) != std::string::npos) {
-            return outbound;
+            return true;
         }
     }
 
-    // 4. 正则匹配
-    for (const auto& [regex, outbound] : regexes_) {
-        if (std::regex_search(lower, regex)) {
-            return outbound;
+    for (const auto& regex : regexes_) {
+        if (std::regex_search(lower.begin(), lower.end(), regex)) {
+            return true;
         }
     }
 
-    return std::nullopt;
+    return false;
 }
 
 void DomainMatcher::Clear() {
@@ -157,10 +169,10 @@ void DomainMatcher::Clear() {
 IPMatcher::IPMatcher() = default;
 IPMatcher::~IPMatcher() noexcept = default;
 
-void IPMatcher::AddCIDR(const std::string& cidr, const std::string& outbound) {
+void IPMatcher::AddCIDR(const std::string& cidr) {
     uint32_t network, mask;
     if (Router::ParseCIDR(cidr, network, mask)) {
-        rules_.push_back({network, mask, outbound});
+        rules_.push_back({network, mask});
     }
 }
 
@@ -195,44 +207,40 @@ void IPMatcher::BuildIndex() {
     index_built_ = true;
 }
 
-std::optional<std::string> IPMatcher::Match(const std::string& ip) const {
+bool IPMatcher::Match(std::string_view ip) const {
     auto ip_opt = Router::ParseIPv4(ip);
     if (!ip_opt) {
-        return std::nullopt;
+        return false;
     }
     return MatchIPv4(*ip_opt);
 }
 
-std::optional<std::string> IPMatcher::MatchIPv4(uint32_t ip) const {
+bool IPMatcher::MatchIPv4(uint32_t ip) const {
     if (index_built_ && !trie_nodes_.empty()) {
-        // Radix trie 查询：沿路径找最长匹配前缀
         int node = 0;
-        int last_match = -1;
         if (trie_nodes_[0].rule_index >= 0) {
-            last_match = trie_nodes_[0].rule_index;
+            return true;
         }
         for (uint8_t i = 0; i < 32; ++i) {
             int bit = (ip >> (31 - i)) & 1;
             int next = trie_nodes_[node].children[bit];
-            if (next < 0) break;
+            if (next < 0) {
+                return false;
+            }
             node = next;
             if (trie_nodes_[node].rule_index >= 0) {
-                last_match = trie_nodes_[node].rule_index;
+                return true;
             }
         }
-        if (last_match >= 0) {
-            return rules_[last_match].outbound;
-        }
-        return std::nullopt;
+        return false;
     }
 
-    // 降级：线性匹配
     for (const auto& rule : rules_) {
         if ((ip & rule.mask) == rule.network) {
-            return rule.outbound;
+            return true;
         }
     }
-    return std::nullopt;
+    return false;
 }
 
 void IPMatcher::Clear() {
@@ -274,9 +282,21 @@ bool Router::ParseCIDR(const std::string& cidr, uint32_t& network, uint32_t& mas
     return true;
 }
 
-std::optional<uint32_t> Router::ParseIPv4(const std::string& ip) {
+std::optional<uint32_t> Router::ParseIPv4(std::string_view ip) {
+    char stack_buf[16];
+    std::string heap_buf;
+    const char* ip_cstr = stack_buf;
+
+    if (ip.size() < sizeof(stack_buf)) {
+        std::memcpy(stack_buf, ip.data(), ip.size());
+        stack_buf[ip.size()] = '\0';
+    } else {
+        heap_buf.assign(ip);
+        ip_cstr = heap_buf.c_str();
+    }
+
     struct in_addr addr;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) {
+    if (inet_pton(AF_INET, ip_cstr, &addr) != 1) {
         return std::nullopt;
     }
     return ntohl(addr.s_addr);
