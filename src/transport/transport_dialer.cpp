@@ -174,6 +174,75 @@ cobalt::task<TcpConnectAttemptResult> DialCandidatesSequential(
     co_return last_result;
 }
 
+cobalt::task<void> DialCandidateGroupAfterDelay(
+    net::any_io_executor executor,
+    std::shared_ptr<DualStackRaceState> state,
+    OutboundTransportTarget target,
+    std::vector<OutboundDialCandidate> group,
+    std::chrono::milliseconds delay,
+    bool use_target_bind_fallback) {
+
+    if (delay.count() > 0) {
+        net::steady_timer timer(executor);
+        timer.expires_after(delay);
+        auto [wait_ec] = co_await timer.async_wait(net::as_tuple(cobalt::use_op));
+        if (wait_ec) {
+            co_return;
+        }
+    }
+
+    {
+        std::lock_guard lock(state->lock);
+        if (state->completed) {
+            if (state->pending > 0) {
+                --state->pending;
+            }
+            co_return;
+        }
+    }
+
+    auto attempt = co_await DialCandidatesSequential(
+        executor, target, group, use_target_bind_fallback);
+
+    std::unique_ptr<AsyncStream> loser_stream;
+    bool notify = false;
+    {
+        std::lock_guard lock(state->lock);
+        if (attempt.dial.Ok()) {
+            if (!state->completed) {
+                state->completed = true;
+                state->success = std::make_unique<TcpConnectAttemptResult>(
+                    std::move(attempt));
+                if (state->pending > 0) {
+                    --state->pending;
+                }
+                notify = true;
+            } else {
+                if (state->pending > 0) {
+                    --state->pending;
+                }
+                loser_stream = std::move(attempt.dial.stream);
+            }
+        } else {
+            if (state->pending > 0) {
+                --state->pending;
+            }
+            state->last_failure = std::move(attempt.dial);
+            if (!state->completed && state->pending == 0) {
+                state->completed = true;
+                notify = true;
+            }
+        }
+    }
+
+    if (loser_stream) {
+        loser_stream->Close();
+    }
+    if (notify) {
+        WakeRaceWaiter(state);
+    }
+}
+
 cobalt::task<TcpConnectAttemptResult> DialCandidatesWithFastFallback(
     net::any_io_executor executor,
     const OutboundTransportTarget& target,
@@ -185,78 +254,24 @@ cobalt::task<TcpConnectAttemptResult> DialCandidatesWithFastFallback(
     state->pending = 2;
     state->waiter = std::make_shared<net::steady_timer>(executor);
     state->waiter->expires_at(net::steady_timer::time_point::max());
-    auto target_copy = target;
-
-    auto launch_group =
-        [executor, state, target_copy, use_target_bind_fallback](
-            std::vector<OutboundDialCandidate> group,
-            std::chrono::milliseconds delay) -> cobalt::task<void> {
-            if (delay.count() > 0) {
-                net::steady_timer timer(executor);
-                timer.expires_after(delay);
-                auto [wait_ec] = co_await timer.async_wait(net::as_tuple(cobalt::use_op));
-                if (wait_ec) {
-                    co_return;
-                }
-            }
-
-            {
-                std::lock_guard lock(state->lock);
-                if (state->completed) {
-                    if (state->pending > 0) {
-                        --state->pending;
-                    }
-                    co_return;
-                }
-            }
-
-            auto attempt = co_await DialCandidatesSequential(
-                executor, target_copy, group, use_target_bind_fallback);
-
-            std::unique_ptr<AsyncStream> loser_stream;
-            bool notify = false;
-            {
-                std::lock_guard lock(state->lock);
-                if (attempt.dial.Ok()) {
-                    if (!state->completed) {
-                        state->completed = true;
-                        state->success = std::make_unique<TcpConnectAttemptResult>(
-                            std::move(attempt));
-                        if (state->pending > 0) {
-                            --state->pending;
-                        }
-                        notify = true;
-                    } else {
-                        if (state->pending > 0) {
-                            --state->pending;
-                        }
-                        loser_stream = std::move(attempt.dial.stream);
-                    }
-                } else {
-                    if (state->pending > 0) {
-                        --state->pending;
-                    }
-                    state->last_failure = std::move(attempt.dial);
-                    if (!state->completed && state->pending == 0) {
-                        state->completed = true;
-                        notify = true;
-                    }
-                }
-            }
-
-            if (loser_stream) {
-                loser_stream->Close();
-            }
-            if (notify) {
-                WakeRaceWaiter(state);
-            }
-        };
 
     cobalt::spawn(executor,
-        launch_group(std::vector<OutboundDialCandidate>(primaries), std::chrono::milliseconds(0)),
+        DialCandidateGroupAfterDelay(
+            executor,
+            state,
+            target,
+            std::vector<OutboundDialCandidate>(primaries),
+            std::chrono::milliseconds(0),
+            use_target_bind_fallback),
         net::detached);
     cobalt::spawn(executor,
-        launch_group(std::vector<OutboundDialCandidate>(fallbacks), kFastFallbackDelay),
+        DialCandidateGroupAfterDelay(
+            executor,
+            state,
+            target,
+            std::vector<OutboundDialCandidate>(fallbacks),
+            kFastFallbackDelay,
+            use_target_bind_fallback),
         net::detached);
 
     auto [wait_ec] = co_await state->waiter->async_wait(net::as_tuple(cobalt::use_op));

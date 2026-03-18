@@ -39,6 +39,23 @@ std::string MakeSharedStateKey(const DnsService::Config& config) {
     return key;
 }
 
+cobalt::task<void> PrefetchDomain(DnsService* service, std::string domain) {
+    try {
+        auto result = co_await service->Resolve(domain, false);
+        if (result.Ok()) {
+            LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
+                      domain,
+                      result.addresses[0].to_string(),
+                      result.ttl);
+        } else {
+            LOG_DEBUG("DNS prefetch failed: {} - {}",
+                      domain, result.error_msg);
+        }
+    } catch (const std::exception& e) {
+        LOG_DEBUG("DNS prefetch exception: {} - {}", domain, e.what());
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -659,22 +676,7 @@ cobalt::task<void> DnsService::Prefetch(
         
         // 并发发起解析，不等待结果
         cobalt::spawn(executor_,
-            [this, domain]() -> cobalt::task<void> {
-                try {
-                    auto result = co_await Resolve(domain, false);
-                    if (result.Ok()) {
-                        LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
-                                  domain,
-                                  result.addresses[0].to_string(),
-                                  result.ttl);
-                    } else {
-                        LOG_DEBUG("DNS prefetch failed: {} - {}",
-                                  domain, result.error_msg);
-                    }
-                } catch (const std::exception& e) {
-                    LOG_DEBUG("DNS prefetch exception: {} - {}", domain, e.what());
-                }
-            }(),
+            PrefetchDomain(this, domain),
             net::detached);
     }
     
