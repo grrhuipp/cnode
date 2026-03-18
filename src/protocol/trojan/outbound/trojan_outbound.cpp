@@ -30,19 +30,24 @@ TrojanOutbound::~TrojanOutbound() = default;
 cobalt::task<std::expected<OutboundTransportTarget, ErrorCode>>
 TrojanOutbound::ResolveTransportTarget(SessionContext& ctx) {
     try {
-        auto addr_result = co_await ResolveOutboundAddress(config_.address, dns_service_);
-        if (!addr_result) {
+        auto addrs_result = co_await ResolveOutboundAddresses(config_.address, dns_service_);
+        if (!addrs_result || addrs_result->empty()) {
             LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_.address);
-            co_return std::unexpected(addr_result.error());
+            co_return std::unexpected(addrs_result ? ErrorCode::DNS_RESOLVE_FAILED : addrs_result.error());
         }
-        auto addr = *addr_result;
-        ctx.resolved_ip = addr;
 
         OutboundTransportTarget target;
-        target.host = addr.to_string();
+        target.host = config_.address;
         target.port = config_.port;
         target.timeout = config_.timeout;
         target.stream_settings = &config_.stream_settings;
+        target.candidates.reserve(addrs_result->size());
+        for (const auto& addr : *addrs_result) {
+            target.candidates.push_back(OutboundDialCandidate{
+                .endpoint = tcp::endpoint(addr, config_.port),
+                .bind_local = std::nullopt
+            });
+        }
         target.server_name = config_.GetServerName();
         co_return target;
 

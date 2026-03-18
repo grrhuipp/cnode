@@ -72,9 +72,9 @@ public:
     IOutboundHandler* GetOutboundHandler() override { return &handler_; }
 
 private:
-    // 解析目标地址
-    cobalt::task<std::pair<net::ip::address, ErrorCode>>
-    ResolveTarget(SessionContext& ctx);
+    // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
+    cobalt::task<std::expected<std::vector<net::ip::address>, ErrorCode>>
+    ResolveTargets(SessionContext& ctx);
 
     // 确定本地绑定地址
     std::optional<net::ip::address> DetermineLocalAddress(

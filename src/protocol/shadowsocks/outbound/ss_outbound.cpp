@@ -325,17 +325,23 @@ SsOutbound::SsOutbound(net::any_io_executor executor,
 cobalt::task<std::expected<OutboundTransportTarget, ErrorCode>>
 SsOutbound::ResolveTransportTarget(SessionContext& ctx) {
     try {
-        auto addr_result = co_await ResolveOutboundAddress(config_.address, dns_service_);
-        if (!addr_result) {
-            co_return std::unexpected(addr_result.error());
+        auto addrs_result = co_await ResolveOutboundAddresses(config_.address, dns_service_);
+        if (!addrs_result || addrs_result->empty()) {
+            co_return std::unexpected(addrs_result ? ErrorCode::DNS_RESOLVE_FAILED : addrs_result.error());
         }
-        auto addr = *addr_result;
 
         OutboundTransportTarget target;
-        target.host = addr.to_string();
+        target.host = config_.address;
         target.port = config_.port;
         target.timeout = config_.timeout;
         target.stream_settings = &stream_settings_;
+        target.candidates.reserve(addrs_result->size());
+        for (const auto& addr : *addrs_result) {
+            target.candidates.push_back(OutboundDialCandidate{
+                .endpoint = tcp::endpoint(addr, config_.port),
+                .bind_local = std::nullopt
+            });
+        }
         co_return target;
 
     } catch (const std::exception& e) {

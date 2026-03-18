@@ -45,34 +45,53 @@ FreedomOutbound::ResolveTransportTarget(SessionContext& ctx) {
 
     LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target.ToString());
 
-    // 解析目标地址
-    auto [remote_addr, resolve_err] = co_await ResolveTarget(ctx);
-    if (resolve_err != ErrorCode::OK) {
-        co_return std::unexpected(resolve_err);
+    // 解析目标地址列表（保留多 IP，交给 TransportDialer 按顺序尝试）
+    auto remote_addrs = co_await ResolveTargets(ctx);
+    if (!remote_addrs || remote_addrs->empty()) {
+        co_return std::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
     }
 
-    // 确定本地绑定地址
-    auto local_addr = DetermineLocalAddress(ctx, remote_addr);
-
     OutboundTransportTarget transport_target;
-    transport_target.host = remote_addr.to_string();
+    transport_target.host = target.host;
     transport_target.port = target.port;
-    transport_target.bind_local = local_addr;
-    if (local_addr) {
-        transport_target.bind_mode = settings_.send_through == "auto"
-            ? OutboundTransportTarget::BindMode::Auto
-            : OutboundTransportTarget::BindMode::Explicit;
+    if (settings_.send_through == "auto") {
+        transport_target.bind_mode = OutboundTransportTarget::BindMode::Auto;
+    } else if (settings_.send_through != "0.0.0.0" && !settings_.send_through.empty()) {
+        transport_target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
+    }
+    transport_target.candidates.reserve(remote_addrs->size());
+    for (const auto& remote_addr : *remote_addrs) {
+        OutboundDialCandidate candidate;
+        candidate.endpoint = tcp::endpoint(remote_addr, target.port);
+        candidate.bind_local = DetermineLocalAddress(ctx, remote_addr);
+        transport_target.candidates.push_back(std::move(candidate));
+    }
+    for (const auto& candidate : transport_target.candidates) {
+        if (candidate.bind_local) {
+            transport_target.bind_local = candidate.bind_local;
+            break;
+        }
     }
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 
-    if (local_addr) {
-        LOG_CONN_DEBUG(ctx, "Freedom target {}:{} bind {}",
-                       transport_target.host, transport_target.port,
-                       local_addr->to_string());
+    if (transport_target.candidates.size() == 1) {
+        const auto& candidate = transport_target.candidates.front();
+        if (candidate.bind_local) {
+            LOG_CONN_DEBUG(ctx, "Freedom target {}:{} bind {}",
+                           candidate.endpoint.address().to_string(),
+                           candidate.endpoint.port(),
+                           candidate.bind_local->to_string());
+        } else {
+            LOG_CONN_DEBUG(ctx, "Freedom target {}:{} (system bind)",
+                           candidate.endpoint.address().to_string(),
+                           candidate.endpoint.port());
+        }
     } else {
-        LOG_CONN_DEBUG(ctx, "Freedom target {}:{} (system bind)",
-                       transport_target.host, transport_target.port);
+        LOG_CONN_DEBUG(ctx, "Freedom target {}:{} resolved {} candidates",
+                       transport_target.host,
+                       transport_target.port,
+                       transport_target.candidates.size());
     }
 
     co_return transport_target;
@@ -163,15 +182,14 @@ cobalt::task<UDPDialResult> FreedomOutbound::DialUDP(
     }
 }
 
-cobalt::task<std::pair<net::ip::address, ErrorCode>>
-FreedomOutbound::ResolveTarget(SessionContext& ctx) {
+cobalt::task<std::expected<std::vector<net::ip::address>, ErrorCode>>
+FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     const auto& target = ctx.EffectiveTarget();
 
     // 如果目标已经是 IP，直接返回
     if (target.IsIP() && target.resolved_addr) {
         ctx.dns_result = "none";
-        ctx.resolved_ip = *target.resolved_addr;
-        co_return std::make_pair(*target.resolved_addr, ErrorCode::OK);
+        co_return std::vector<net::ip::address>{*target.resolved_addr};
     }
 
     // 尝试解析为 IP
@@ -179,13 +197,12 @@ FreedomOutbound::ResolveTarget(SessionContext& ctx) {
     auto addr = net::ip::make_address(target.host, ec);
     if (!ec) {
         ctx.dns_result = "none";
-        ctx.resolved_ip = addr;
-        co_return std::make_pair(addr, ErrorCode::OK);
+        co_return std::vector<net::ip::address>{addr};
     }
 
     // 需要 DNS 解析
     if (!dns_service_) {
-        co_return std::make_pair(net::ip::address(), ErrorCode::DNS_RESOLVE_FAILED);
+        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
     // 根据 domain_strategy 决定是否解析
@@ -195,43 +212,33 @@ FreedomOutbound::ResolveTarget(SessionContext& ctx) {
         // 实际上 AsIs 主要影响路由匹配，不影响最终连接
     }
 
-    bool prefer_ipv6 = (settings_.domain_strategy == "UseIPv6");
+    const bool prefer_ipv6 = (settings_.domain_strategy == "UseIPv6");
     auto dns_result = co_await dns_service_->Resolve(target.host, prefer_ipv6);
 
     if (!dns_result.Ok()) {
         ctx.dns_result = "failed";
-        co_return std::make_pair(net::ip::address(), ErrorCode::DNS_RESOLVE_FAILED);
+        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
-    // 选择地址
-    net::ip::address selected;
-    bool found_v4 = false, found_v6 = false;
-
+    std::vector<net::ip::address> addresses;
+    addresses.reserve(dns_result.addresses.size());
     for (const auto& dns_addr : dns_result.addresses) {
-        if (dns_addr.is_v4()) {
-            if (!found_v4) {
-                selected = dns_addr;
-                found_v4 = true;
-            }
-        } else {
-            if (!found_v6) {
-                if (prefer_ipv6 || !found_v4) {
-                    selected = dns_addr;
-                }
-                found_v6 = true;
-            }
+        if (settings_.domain_strategy == "UseIPv4" && !dns_addr.is_v4()) {
+            continue;
         }
+        if (settings_.domain_strategy == "UseIPv6" && !dns_addr.is_v6()) {
+            continue;
+        }
+        addresses.push_back(dns_addr);
     }
 
-    if (selected.is_unspecified() && !dns_result.addresses.empty()) {
-        selected = dns_result.addresses[0];
+    if (addresses.empty()) {
+        ctx.dns_result = "failed";
+        co_return std::unexpected(ErrorCode::DNS_NO_RECORD);
     }
 
-    // 设置 DNS 结果
     ctx.dns_result = dns_result.from_cache ? "cache" : "resolve";
-    ctx.resolved_ip = selected;
-
-    co_return std::make_pair(selected, ErrorCode::OK);
+    co_return addresses;
 }
 
 std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(

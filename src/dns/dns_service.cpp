@@ -131,7 +131,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
     }
     
     // 查询缓存
-    auto cached = cache_->Get(domain);
+    auto cached = cache_->Get(domain, prefer_ipv6);
     if (cached) {
         DnsResult result;
         if (cached->negative) {
@@ -193,9 +193,9 @@ cobalt::task<DnsResult> DnsService::Resolve(
 
     // 缓存结果（使用实际 TTL）
     if (result.Ok()) {
-        cache_->Put(domain, result.addresses, result.ttl);
+        cache_->Put(domain, result.addresses, result.ttl, prefer_ipv6);
     } else if (result.error == ErrorCode::DNS_NO_RECORD) {
-        cache_->PutNegative(domain, 60);
+        cache_->PutNegative(domain, 60, prefer_ipv6);
     }
 
     std::vector<InflightResolve::Waiter> waiters;
@@ -229,67 +229,83 @@ cobalt::task<DnsResult> DnsService::DoResolve(
     // 遍历服务器尝试
     for (const auto& server : servers_) {
         DnsResult result;
-        
-        if (prefer_ipv6) {
-            // 并发查询 A 和 AAAA 记录
-            // 使用 cobalt::gather 实现真正的并发
-            
-            auto query_a = [this, server, domain]() -> cobalt::task<DnsResult> {
-                co_return co_await QueryServer(server, domain, false);
-            };
 
-            auto query_aaaa = [this, server, domain]() -> cobalt::task<DnsResult> {
-                co_return co_await QueryServer(server, domain, true);
-            };
+        auto query_a = [this, server, domain]() -> cobalt::task<DnsResult> {
+            co_return co_await QueryServer(server, domain, false);
+        };
 
-            // 同时发起两个查询，使用 cobalt::gather 等待两者都完成
-            // GCC 误报：协程并行等待的结构化绑定被误认为可能未初始化
+        auto query_aaaa = [this, server, domain]() -> cobalt::task<DnsResult> {
+            co_return co_await QueryServer(server, domain, true);
+        };
+
+        // 默认同时查询 A 和 AAAA，行为对齐 sing-box：
+        // - prefer_ipv6 = true  => AAAA 在前，A 在后
+        // - prefer_ipv6 = false => A 在前，AAAA 在后
+        // 同家族内保持 DNS 返回顺序，后续由拨号器决定如何尝试。
 #ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
-            auto [raw_a, raw_aaaa] = co_await cobalt::gather(query_a(), query_aaaa());
+        auto [raw_a, raw_aaaa] = co_await cobalt::gather(query_a(), query_aaaa());
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif
 
-            // cobalt::gather 返回 result<T> 包装，需要解包
-            DnsResult result_a = raw_a.has_value() ? std::move(*raw_a) : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
-            DnsResult result_aaaa = raw_aaaa.has_value() ? std::move(*raw_aaaa) : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
+        // cobalt::gather 返回 result<T> 包装，需要解包
+        DnsResult result_a = raw_a.has_value()
+            ? std::move(*raw_a)
+            : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
+        DnsResult result_aaaa = raw_aaaa.has_value()
+            ? std::move(*raw_aaaa)
+            : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
 
-            // 合并结果
-            if (result_aaaa.Ok() && result_a.Ok()) {
-                // 两者都成功，合并（IPv6 优先）
+        if (result_a.Ok() && result_aaaa.Ok()) {
+            if (prefer_ipv6) {
                 result = std::move(result_aaaa);
                 result.addresses.insert(result.addresses.end(),
                     result_a.addresses.begin(),
                     result_a.addresses.end());
-                co_return result;
-            } else if (result_aaaa.Ok()) {
-                co_return result_aaaa;
-            } else if (result_a.Ok()) {
-                co_return result_a;
             } else {
-                // 两者都失败，返回 A 记录的错误
                 result = std::move(result_a);
+                result.addresses.insert(result.addresses.end(),
+                    result_aaaa.addresses.begin(),
+                    result_aaaa.addresses.end());
             }
-            
-            // 如果是 NXDOMAIN，不需要继续尝试其他服务器
-            if (result.error == ErrorCode::DNS_NO_RECORD) {
-                co_return result;
+            co_return result;
+        }
+
+        if (prefer_ipv6) {
+            if (result_aaaa.Ok()) {
+                co_return result_aaaa;
             }
-            
+            if (result_a.Ok()) {
+                co_return result_a;
+            }
         } else {
-            // 只查询 A 记录
-            result = co_await QueryServer(server, domain, false);
-            if (result.Ok()) {
-                co_return result;
+            if (result_a.Ok()) {
+                co_return result_a;
             }
-            
-            // 如果是 NXDOMAIN，不需要继续尝试其他服务器
-            if (result.error == ErrorCode::DNS_NO_RECORD) {
-                co_return result;
+            if (result_aaaa.Ok()) {
+                co_return result_aaaa;
             }
+        }
+
+        // 只有 A/AAAA 都明确无记录时，才认为该服务器给出了确定的 no record。
+        if (result_a.error == ErrorCode::DNS_NO_RECORD &&
+            result_aaaa.error == ErrorCode::DNS_NO_RECORD) {
+            result = prefer_ipv6 ? std::move(result_aaaa) : std::move(result_a);
+            co_return result;
+        }
+
+        // 否则保留“首选族”的错误，继续尝试下一个 DNS 服务器。
+        if (prefer_ipv6) {
+            result = (result_aaaa.error != ErrorCode::DNS_NO_RECORD)
+                ? std::move(result_aaaa)
+                : std::move(result_a);
+        } else {
+            result = (result_a.error != ErrorCode::DNS_NO_RECORD)
+                ? std::move(result_a)
+                : std::move(result_aaaa);
         }
     }
     
@@ -636,7 +652,7 @@ cobalt::task<void> DnsService::Prefetch(
         }
         
         // 跳过已缓存的域名
-        auto cached = cache_->Get(domain);
+        auto cached = cache_->Get(domain, false);
         if (cached) {
             continue;
         }
