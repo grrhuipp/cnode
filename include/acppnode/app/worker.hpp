@@ -210,6 +210,7 @@ private:
         std::deque<PendingUdpReply> pending;
         size_t queued_bytes = 0;
         bool write_in_progress = false;
+        bool shrink_pending_on_drain = false;
     };
     std::unordered_map<std::string, UdpReplyQueueState> udp_reply_queues_;
 

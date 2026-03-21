@@ -1,4 +1,5 @@
 #include "acppnode/app/udp_session.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
@@ -332,6 +333,7 @@ uint64_t UDPSession::RegisterCallback(const std::string& destination,
 void UDPSession::UnregisterCallback(uint64_t callback_id) {
     auto it = registered_callbacks_.find(callback_id);
     if (it != registered_callbacks_.end()) {
+        bool removed_reverse_key = false;
         // 清理反向索引
         if (!it->second.destination.empty()) {
             auto callbacks_it = target_to_callbacks_.find(it->second.destination);
@@ -339,6 +341,7 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
                 callbacks_it->second.erase(callback_id);
                 if (callbacks_it->second.empty()) {
                     target_to_callbacks_.erase(callbacks_it);
+                    removed_reverse_key = true;
                 }
             }
         }
@@ -350,6 +353,7 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
                 t_it->second.erase(callback_id);
                 if (t_it->second.empty()) {
                     target_to_callbacks_.erase(t_it);
+                    removed_reverse_key = true;
                 }
             }
         }
@@ -361,6 +365,10 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
                      session_id_, callback_id, it->second.destination);
         }
         registered_callbacks_.erase(it);
+        MaybeShrinkHashContainer(registered_callbacks_, 16);
+        if (removed_reverse_key) {
+            MaybeShrinkHashContainer(target_to_callbacks_, 16);
+        }
     }
 }
 
@@ -490,16 +498,22 @@ void UDPSession::AddTargetMapping(const std::string& target_key, uint64_t callba
 void UDPSession::RemoveTargetMappings(uint64_t callback_id) {
     auto it = registered_callbacks_.find(callback_id);
     if (it != registered_callbacks_.end()) {
+        bool removed_reverse_key = false;
         for (const auto& [target, _] : it->second.sent_targets) {
             auto t_it = target_to_callbacks_.find(target);
             if (t_it != target_to_callbacks_.end()) {
                 t_it->second.erase(callback_id);
                 if (t_it->second.empty()) {
                     target_to_callbacks_.erase(t_it);
+                    removed_reverse_key = true;
                 }
             }
         }
         it->second.sent_targets.clear();
+        MaybeShrinkHashContainer(it->second.sent_targets, 16);
+        if (removed_reverse_key) {
+            MaybeShrinkHashContainer(target_to_callbacks_, 16);
+        }
     }
 }
 
@@ -511,7 +525,9 @@ void UDPSession::MaybePruneTargetMappings(steady_clock::time_point now) {
     next_target_prune_at_ = now + kTargetPruneInterval;
     const auto cutoff = now - kTargetMappingTtl;
 
+    bool removed_reverse_key = false;
     for (auto& [callback_id, entry] : registered_callbacks_) {
+        bool pruned_entry_targets = false;
         for (auto it = entry.sent_targets.begin(); it != entry.sent_targets.end(); ) {
             if (it->second >= cutoff) {
                 ++it;
@@ -523,10 +539,18 @@ void UDPSession::MaybePruneTargetMappings(steady_clock::time_point now) {
                 reverse_it->second.erase(callback_id);
                 if (reverse_it->second.empty()) {
                     target_to_callbacks_.erase(reverse_it);
+                    removed_reverse_key = true;
                 }
             }
             it = entry.sent_targets.erase(it);
+            pruned_entry_targets = true;
         }
+        if (pruned_entry_targets) {
+            MaybeShrinkHashContainer(entry.sent_targets, 16);
+        }
+    }
+    if (removed_reverse_key) {
+        MaybeShrinkHashContainer(target_to_callbacks_, 16);
     }
 }
 
@@ -555,6 +579,8 @@ void UDPSession::Stop() {
 
     registered_callbacks_.clear();
     target_to_callbacks_.clear();
+    MaybeShrinkHashContainer(registered_callbacks_, 16);
+    MaybeShrinkHashContainer(target_to_callbacks_, 16);
     on_packet_ = {};
     receive_callback_ = {};
     
@@ -623,6 +649,7 @@ void UDPSessionManager::RemoveSession(const std::string& session_id) {
     if (it != sessions_.end()) {
         it->second->Stop();
         sessions_.erase(it);
+        MaybeShrinkHashContainer(sessions_, 64);
         LOG_ACCESS_DEBUG("Removed UDP session {}, remaining: {}", session_id, sessions_.size());
     }
 }
@@ -634,7 +661,7 @@ void UDPSessionManager::StartCleanup() {
 
 void UDPSessionManager::CleanupExpiredSessions() {
     if (!running_) return;
-    
+    bool removed_session = false;
     for (auto it = sessions_.begin(); it != sessions_.end(); ) {
         if (it->second->IsExpired(session_timeout_)) {
             LOG_ACCESS_DEBUG("UDP session {} expired, removing", it->first);
@@ -642,9 +669,13 @@ void UDPSessionManager::CleanupExpiredSessions() {
             total_packets_received_ += it->second->PacketsReceived();
             it->second->Stop();
             it = sessions_.erase(it);
+            removed_session = true;
         } else {
             ++it;
         }
+    }
+    if (removed_session) {
+        MaybeShrinkHashContainer(sessions_, 64);
     }
     
     // 每 30 秒清理一次
@@ -664,6 +695,7 @@ void UDPSessionManager::StopAll() {
         session->Stop();
     }
     sessions_.clear();
+    MaybeShrinkHashContainer(sessions_, 64);
 }
 
 }  // namespace acpp

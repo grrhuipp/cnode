@@ -1,5 +1,6 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/connection_guard.hpp"
 #include "acppnode/app/relay.hpp"
@@ -362,11 +363,13 @@ void Worker::CleanupUdpClientSessions(const std::string& tag) {
     }
 
     udp_client_sessions_.erase(sessions_it);
+    MaybeShrinkHashContainer(udp_client_sessions_, 8);
 }
 
 void Worker::StopUdpListening(const std::string& tag) {
     CleanupUdpClientSessions(tag);
     udp_reply_queues_.erase(tag);
+    MaybeShrinkHashContainer(udp_reply_queues_, 8);
 
     auto sock_it = udp_sockets_.find(tag);
     if (sock_it != udp_sockets_.end()) {
@@ -390,6 +393,9 @@ void Worker::EnqueueUdpReply(const std::string& tag,
     auto& queue = udp_reply_queues_[tag];
     queue.queued_bytes += payload.size();
     queue.pending.push_back(PendingUdpReply{std::move(endpoint), std::move(payload)});
+    if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
+        queue.shrink_pending_on_drain = true;
+    }
 
     if (!queue.write_in_progress) {
         StartUdpReplySend(tag, sock);
@@ -432,6 +438,9 @@ void Worker::StartUdpReplySend(const std::string& tag,
 
             if (!state.pending.empty() && sock && sock->is_open()) {
                 StartUdpReplySend(tag, sock);
+            } else if (state.pending.empty() && state.shrink_pending_on_drain) {
+                TryShrinkSequence(state.pending);
+                state.shrink_pending_on_drain = false;
             }
         });
 }
@@ -619,33 +628,58 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
         tcp_stream->ClearPhaseDeadline();
     }
 
-    // 注册活跃会话（用于 CollectTrafficTask 实时读取流量增量）
-    // RAII guard 确保异常/取消路径也能清理，避免悬空指针
-    active_sessions_[ctx.conn_id] = ActiveSession{&ctx, 0, 0};
+    // 活跃会话追踪只覆盖真正进入 relay 的连接，避免大量握手失败/瞬断连接
+    // 把 active_sessions_ 在洪峰时冲大。
     struct ActiveSessionGuard {
         std::unordered_map<uint64_t, ActiveSession>& map;
         uint64_t conn_id;
+        const SessionContext* ctx = nullptr;
         uint64_t last_up = 0;
         uint64_t last_down = 0;
-        ~ActiveSessionGuard() {
+        bool active = false;
+
+        void Start(const SessionContext& session_ctx) {
+            if (active || session_ctx.user_id <= 0) {
+                return;
+            }
+            ctx = &session_ctx;
+            map[conn_id] = ActiveSession{ctx, 0, 0};
+            active = true;
+        }
+
+        void Stop() {
+            if (!active) {
+                return;
+            }
             if (auto it = map.find(conn_id); it != map.end()) {
                 last_up = it->second.last_reported_up;
                 last_down = it->second.last_reported_down;
                 map.erase(it);
+                MaybeShrinkHashContainer(map, 256);
             }
+            ctx = nullptr;
+            active = false;
+        }
+
+        ~ActiveSessionGuard() {
+            Stop();
         }
     } session_guard{active_sessions_, ctx.conn_id};
+
+    ctx.on_relay_start = [&session_guard, &ctx] {
+        session_guard.Start(ctx);
+    };
+    ctx.on_relay_end = [&session_guard] {
+        session_guard.Stop();
+    };
 
     co_await session_handler_->Handle(
         std::move(tcp_stream), ctx, lc_it->second, std::move(connection_limit));
 
     // 写入剩余增量流量（总流量 - guard 记录的已上报部分），避免重复计数
-    // guard 析构时会 erase active_sessions_ 条目并记录 last_reported
-    uint64_t already_up = 0, already_down = 0;
-    if (auto it = active_sessions_.find(ctx.conn_id); it != active_sessions_.end()) {
-        already_up = it->second.last_reported_up;
-        already_down = it->second.last_reported_down;
-    }
+    // relay 结束时 guard 会记录最后一次已上报快照。
+    const uint64_t already_up = session_guard.last_up;
+    const uint64_t already_down = session_guard.last_down;
     uint64_t remaining_up = ctx.bytes_up > already_up ? ctx.bytes_up - already_up : 0;
     uint64_t remaining_down = ctx.bytes_down > already_down ? ctx.bytes_down - already_down : 0;
     if (remaining_up > 0 || remaining_down > 0) {
@@ -703,6 +737,7 @@ Worker::CollectTrafficTask(std::string tag) {
     if (auto it = local_traffic_.find(tag); it != local_traffic_.end()) {
         result = std::move(it->second);
         it->second.clear();
+        MaybeShrinkHashContainer(it->second, 64);
     }
 
     // 2. 收集活跃会话的增量流量（实时统计，无需等连接关闭）
@@ -917,15 +952,20 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
         // ── 懒清理空闲会话 ────────────────────────────────────────────────
         const auto now = std::chrono::steady_clock::now();
         if (session_idle_timeout.count() > 0) {
+            bool removed_idle_session = false;
             for (auto it = client_sessions.begin(); it != client_sessions.end(); ) {
                 if (now - it->second.last_active > session_idle_timeout) {
                     if (it->second.udp_dial.unregister_callback && it->second.callback_id) {
                         it->second.udp_dial.unregister_callback(it->second.callback_id);
                     }
                     it = client_sessions.erase(it);
+                    removed_idle_session = true;
                 } else {
                     ++it;
                 }
+            }
+            if (removed_idle_session) {
+                MaybeShrinkHashContainer(client_sessions, 64);
             }
         }
 

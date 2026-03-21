@@ -89,6 +89,14 @@ struct SessionContext {
     //   - 应视为 noexcept；析构路径会吞掉异常以避免传播
     std::function<void()> on_disconnect;
 
+    // relay 生命周期钩子：
+    //   - on_relay_start: 连接真正进入 TCP/UDP/Mux relay 时触发
+    //   - on_relay_end: relay 结束时触发
+    // 用于将活跃会话追踪范围收敛到真正的转发阶段，避免握手失败/认证失败
+    // 的短连接把实时会话表冲大。
+    std::function<void()> on_relay_start;
+    std::function<void()> on_relay_end;
+
     // 首包数据（用于 Sniff 后回放）
     std::vector<uint8_t> first_packet;
 

@@ -28,6 +28,24 @@ std::chrono::seconds ResolveRelayIdleTimeout(
     return idle_timeout;
 }
 
+struct RelayTrackingGuard {
+    SessionContext& ctx;
+    bool active = false;
+
+    explicit RelayTrackingGuard(SessionContext& session_ctx) : ctx(session_ctx) {
+        if (ctx.on_relay_start) {
+            ctx.on_relay_start();
+            active = true;
+        }
+    }
+
+    ~RelayTrackingGuard() noexcept {
+        if (active && ctx.on_relay_end) {
+            try { ctx.on_relay_end(); } catch (...) {}
+        }
+    }
+};
+
 }  // namespace
 
 SessionHandler::SessionHandler(
@@ -321,6 +339,7 @@ cobalt::task<void> SessionHandler::Handle(
             ? action.make_udp_framer()
             : UdpFramer{PayloadOnlyUdpFramer{ctx.target}};
 
+        RelayTrackingGuard relay_guard{ctx};
         auto relay_result = co_await DoUDPRelay(
             *wrapped_in, udp_result, framer, ctx, stats_, udp_cfg);
 
@@ -369,6 +388,7 @@ cobalt::task<void> SessionHandler::Handle(
         UDPRelayConfig mux_cfg;
         mux_cfg.speed_limit = ctx.speed_limit;
 
+        RelayTrackingGuard relay_guard{ctx};
         auto relay_result = co_await DoMuxRelay(
             *wrapped_in, outbound, ctx, stats_, mux_cfg);
 
@@ -525,16 +545,18 @@ cobalt::task<void> SessionHandler::Handle(
     relay_cfg.speed_limit   = ctx.speed_limit;
 
     // 延迟嗅探路径：首包已从解密流预读，作为 relay 首包数据
-    auto& relay_payload = late_sniff_payload.empty()
-        ? action.initial_payload : late_sniff_payload;
+    std::vector<uint8_t> relay_payload = late_sniff_payload.empty()
+        ? std::move(action.initial_payload)
+        : std::move(late_sniff_payload);
 
     LOG_CONN_DEBUG(ctx, "[SessionHandler] Relay start: {} -> {} via {} payload={}B",
                    ctx.client_ip, ctx.final_target.ToString(), ctx.outbound_tag,
                    relay_payload.size());
 
+    RelayTrackingGuard relay_guard{ctx};
     auto relay_result = co_await DoRelayWithFirstPacket(
         *wrapped_in, *wrapped_out, ctx, stats_,
-        relay_payload, relay_cfg);
+        std::move(relay_payload), relay_cfg);
 
     if (relay_result.error != ErrorCode::OK) {
         LOG_CONN_DEBUG(ctx, "[SessionHandler] Relay end: {} up={}B down={}B closer={} target={}",

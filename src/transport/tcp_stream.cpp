@@ -1,4 +1,5 @@
 #include "acppnode/transport/tcp_stream.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/timeout_scheduler.hpp"
 
@@ -170,6 +171,7 @@ cobalt::task<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         if (pending_offset_ >= pending_data_.size()) {
             pending_data_.clear();
             pending_offset_ = 0;
+            ReleaseIdleBuffer(pending_data_, 1024);
         }
         TouchActivity();
         co_return copy;
@@ -224,6 +226,7 @@ cobalt::task<MultiBuffer> TcpStream::ReadMultiBuffer() {
         if (pending_offset_ >= pending_data_.size()) {
             pending_data_.clear();
             pending_offset_ = 0;
+            ReleaseIdleBuffer(pending_data_, 1024);
         }
         buf->Produce(copy);
         TouchActivity();

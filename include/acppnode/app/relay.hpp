@@ -54,7 +54,7 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
     AsyncStream& target,
     SessionContext& ctx,
     StatsShard& stats,
-    const std::vector<uint8_t>& first_packet,
+    std::vector<uint8_t> first_packet,
     const RelayConfig& config = RelayConfig{});
 
 // ============================================================================

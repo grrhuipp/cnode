@@ -1,4 +1,5 @@
 #include "acppnode/app/relay.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/multi_buffer.hpp"
@@ -6,6 +7,7 @@
 #include "acppnode/infra/log.hpp"
 
 #include <boost/asio/steady_timer.hpp>
+#include <optional>
 
 namespace acpp {
 
@@ -52,7 +54,10 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
     }
 
     TokenBucket rate_limiter(speed_limit);
-    net::steady_timer rate_timer(executor);
+    std::optional<net::steady_timer> rate_timer;
+    if (speed_limit > 0) {
+        rate_timer.emplace(executor);
+    }
     LocalStatsAccumulator stats_acc;
 
     while (true) {
@@ -107,8 +112,8 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
             size_t n = TotalLen(mb);
             auto wait_time = rate_limiter.Consume(n);
             if (wait_time.count() > 0) {
-                rate_timer.expires_after(wait_time);
-                co_await rate_timer.async_wait(cobalt::use_op);
+                rate_timer->expires_after(wait_time);
+                co_await rate_timer->async_wait(cobalt::use_op);
             }
 
             co_await to.WriteMultiBuffer(std::move(mb));
@@ -233,8 +238,10 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
     AsyncStream& target,
     SessionContext& ctx,
     StatsShard& stats,
-    const std::vector<uint8_t>& first_packet,
+    std::vector<uint8_t> first_packet,
     const RelayConfig& config) {
+
+    const size_t first_packet_size = first_packet.size();
 
     if (!first_packet.empty()) {
         try {
@@ -266,7 +273,9 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
                 remaining -= written;
             }
 
-            stats.AddBytesOut(first_packet.size());
+            stats.AddBytesOut(first_packet_size);
+            first_packet.clear();
+            ReleaseIdleBuffer(first_packet, 0);
 
         } catch (const boost::system::system_error& e) {
             MarkAbortiveClose(client);
@@ -288,7 +297,7 @@ cobalt::task<RelayResult> DoRelayWithFirstPacket(
     }
 
     auto result = co_await DoRelay(client, target, ctx, stats, config);
-    result.bytes_up += first_packet.size();
+    result.bytes_up += first_packet_size;
 
     co_return result;
 }

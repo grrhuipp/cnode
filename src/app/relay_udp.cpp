@@ -1,4 +1,5 @@
 #include "acppnode/app/relay.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -61,11 +62,15 @@ cobalt::task<RelayResult> DoUDPRelay(
         std::deque<UDPPacket> reply_queue;
         size_t queued_bytes = 0;
         std::atomic<uint64_t> total_replies{0};
+        bool shrink_queue_on_drain = false;
 
         void push(UDPPacket&& pkt) {
             const size_t pkt_bytes = pkt.data.size();
             queued_bytes += pkt_bytes;
             reply_queue.push_back(std::move(pkt));
+            if (reply_queue.size() >= 64 || queued_bytes >= 256 * 1024) {
+                shrink_queue_on_drain = true;
+            }
         }
 
         bool pop(UDPPacket& pkt) {
@@ -73,6 +78,10 @@ cobalt::task<RelayResult> DoUDPRelay(
             queued_bytes -= reply_queue.front().data.size();
             pkt = std::move(reply_queue.front());
             reply_queue.pop_front();
+            if (reply_queue.empty() && shrink_queue_on_drain) {
+                TryShrinkSequence(reply_queue);
+                shrink_queue_on_drain = false;
+            }
             return true;
         }
 

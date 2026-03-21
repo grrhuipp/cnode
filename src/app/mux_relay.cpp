@@ -2,6 +2,7 @@
 #include "acppnode/protocol/mux/mux_codec.hpp"
 #include "acppnode/protocol/outbound.hpp"
 #include "acppnode/app/udp_types.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/transport_dialer.hpp"
 #include "acppnode/common/buffer_util.hpp"
@@ -27,6 +28,7 @@ constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 16 * 1024 * 1024;
 constexpr size_t kMuxFrameBufKeepCap     = 64 * 1024;
+constexpr size_t kMuxFrameBufReleaseCap  = 256 * 1024;
 constexpr size_t kMuxReplyOverhead       = 128;
 
 // 回包元素（出站 → 客户端）
@@ -44,6 +46,7 @@ struct ReplyQueueState {
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     std::atomic<bool> tcp_overflowed{false};
     std::atomic<uint64_t> udp_dropped{0};
+    bool shrink_queue_on_drain = false;
 
     size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
 
@@ -54,6 +57,9 @@ struct ReplyQueueState {
         }
         tcp_queued_bytes += reply_bytes;
         queue.push_back(std::move(reply));
+        if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
+            shrink_queue_on_drain = true;
+        }
         return true;
     }
 
@@ -65,6 +71,9 @@ struct ReplyQueueState {
         }
         udp_queued_bytes += reply_bytes;
         queue.push_back(std::move(reply));
+        if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
+            shrink_queue_on_drain = true;
+        }
         return true;
     }
 
@@ -78,6 +87,10 @@ struct ReplyQueueState {
         }
         reply = std::move(queue.front());
         queue.pop_front();
+        if (queue.empty() && shrink_queue_on_drain) {
+            TryShrinkSequence(queue);
+            shrink_queue_on_drain = false;
+        }
         return true;
     }
 
@@ -119,12 +132,17 @@ thread_local std::unordered_map<uint64_t, std::weak_ptr<SharedUdpDial>> g_global
 
 void CleanupGlobalIdMap() {
     // 每次新建 UDP 子会话时清理过期条目（频率不高，无需限流）
+    bool removed_expired = false;
     for (auto it = g_global_id_map.begin(); it != g_global_id_map.end(); ) {
         if (it->second.expired()) {
             it = g_global_id_map.erase(it);
+            removed_expired = true;
         } else {
             ++it;
         }
+    }
+    if (removed_expired) {
+        MaybeShrinkHashContainer(g_global_id_map, 64);
     }
 }
 
@@ -242,6 +260,8 @@ cobalt::task<RelayResult> DoMuxRelay(
     std::vector<uint8_t> frame_buf;
     frame_buf.reserve(4096);
     size_t frame_buf_offset = 0;
+    std::vector<uint8_t> write_frame;
+    write_frame.reserve(4096);
 
     RelayResult result;
     parent_ctx.bytes_up = 0;
@@ -292,26 +312,30 @@ cobalt::task<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         MuxReply reply;
         while (reply_queue->Pop(reply)) {
-
-            std::vector<uint8_t> frame;
             if (reply.is_end) {
-                frame = mux::EncodeEnd(reply.session_id);
+                mux::EncodeEndTo(write_frame, reply.session_id);
                 // 子会话已结束，清理本地记录
                 udp_subs.erase(reply.session_id);
                 tcp_subs.erase(reply.session_id);
             } else if (reply.is_udp) {
-                frame = mux::EncodeKeepUDP(
+                mux::EncodeKeepUDPTo(
+                    write_frame,
                     reply.session_id, reply.udp_src,
                     reply.data.data(), reply.data.size());
             } else {
-                frame = mux::EncodeKeepData(
+                mux::EncodeKeepDataTo(
+                    write_frame,
                     reply.session_id,
                     reply.data.data(), reply.data.size());
             }
 
-            if (!co_await write_frame_to_client(frame)) {
+            if (!co_await write_frame_to_client(write_frame)) {
                 running = false;
                 break;
+            }
+            if (write_frame.capacity() > kMuxFrameBufReleaseCap) {
+                write_frame.clear();
+                ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
             }
         }
         if (!running) break;
@@ -413,9 +437,12 @@ cobalt::task<RelayResult> DoMuxRelay(
 
             // ----------------------------------------------------------------
             case mux::SessionStatus::KEEPALIVE: {
-                auto ka = mux::EncodeKeepAlive();
-                if (!co_await write_frame_to_client(ka)) {
+                mux::EncodeKeepAliveTo(write_frame);
+                if (!co_await write_frame_to_client(write_frame)) {
                     running = false;
+                } else if (write_frame.capacity() > kMuxFrameBufReleaseCap) {
+                    write_frame.clear();
+                    ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
                 }
                 break;
             }
@@ -683,6 +710,8 @@ cobalt::task<RelayResult> DoMuxRelay(
             frame_buf_offset = 0;
         }
     }
+
+    ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
 
     // ------------------------------------------------------------------------
     // 清理所有存活的子会话

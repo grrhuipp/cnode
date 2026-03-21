@@ -24,6 +24,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 using namespace acpp;
 
 // ============================================================================
@@ -35,6 +40,17 @@ struct ProcessMemory {
 
     static ProcessMemory Read() {
         ProcessMemory mem;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                sizeof(counters))) {
+            mem.vm_size = static_cast<size_t>(counters.PrivateUsage);
+            mem.vm_rss  = static_cast<size_t>(counters.WorkingSetSize);
+        }
+        return mem;
+#else
         std::ifstream status("/proc/self/status");
         if (!status) return mem;
         std::string line;
@@ -45,6 +61,7 @@ struct ProcessMemory {
                 mem.vm_rss = std::stoull(line.substr(6)) * 1024;
         }
         return mem;
+#endif
     }
 };
 
@@ -68,7 +85,7 @@ static std::string FormatRate(double bytes_per_sec) {
 }
 
 // ============================================================================
-// 异步读取进程内存（Linux /proc/self/statm）
+// 异步读取进程内存
 // ============================================================================
 static cobalt::task<double> GetMemoryMBAsync(net::any_io_executor /*exec*/) {
     ProcessMemory mem = ProcessMemory::Read();
@@ -405,9 +422,49 @@ int main(int argc, char* argv[]) {
     });
 
     // ── 统计采样协程（每秒，主线程）─────────────────────────────────────────
-    auto sample_coro = [&running, &stats](net::steady_timer& timer) -> cobalt::task<void> {
+    uint32_t last_sample_total_conns = 0;
+#ifdef USE_MIMALLOC
+    auto last_force_collect_at = steady_clock::time_point{};
+#endif
+    auto sample_coro = [&running, &stats, &workers, &last_sample_total_conns
+#ifdef USE_MIMALLOC
+        , &last_force_collect_at
+#endif
+        ](net::steady_timer& timer) -> cobalt::task<void> {
         while (running) {
             stats->SampleNow();
+#ifdef USE_MIMALLOC
+            constexpr uint32_t kForceCollectMinPrevConns = 4096;
+            constexpr uint32_t kForceCollectDropFactor = 8;
+            constexpr uint32_t kForceCollectConnFloor = 64;
+            constexpr auto kForceCollectCooldown = std::chrono::seconds(3);
+
+            uint32_t total_conns = 0;
+            for (const auto& w : workers) {
+                total_conns += w->GetActiveConnectionCount();
+            }
+
+            uint32_t force_threshold = last_sample_total_conns / kForceCollectDropFactor;
+            if (force_threshold < kForceCollectConnFloor) {
+                force_threshold = kForceCollectConnFloor;
+            }
+
+            const bool burst_drain =
+                last_sample_total_conns >= kForceCollectMinPrevConns &&
+                total_conns <= force_threshold;
+            const bool newly_idle = (total_conns == 0 && last_sample_total_conns > 0);
+            const auto now = steady_clock::now();
+            const bool cooldown_ok =
+                last_force_collect_at.time_since_epoch().count() == 0 ||
+                now - last_force_collect_at >= kForceCollectCooldown;
+
+            if ((burst_drain || newly_idle) && cooldown_ok) {
+                mi_collect(true);
+                last_force_collect_at = now;
+            }
+
+            last_sample_total_conns = total_conns;
+#endif
             timer.expires_after(std::chrono::seconds(1));
             auto [ec] = co_await timer.async_wait(net::as_tuple(cobalt::use_op));
             if (ec) break;
@@ -419,13 +476,7 @@ int main(int argc, char* argv[]) {
     // ── 统计输出协程（每 N 秒，主线程）──────────────────────────────────────
     auto stats_coro = [&running, &stats, &workers, &main_ctx, &sync_manager](net::steady_timer& timer) -> cobalt::task<void> {
         while (running) {
-#ifdef USE_MIMALLOC
-            // 定期触发 mimalloc 归还未使用的内存页给 OS，
-            // 防止线程本地缓存导致 RSS 虚高
-            mi_collect(false);
-#endif
             auto snapshot = stats->AggregateWithRate();
-            double mem_mb = co_await GetMemoryMBAsync(main_ctx.get_executor());
 
             DnsCacheStats dns_stats;
             if (!workers.empty() && workers[0]->GetDnsService()) {
@@ -444,6 +495,13 @@ int main(int argc, char* argv[]) {
             for (const auto& w : workers) {
                 total_conns += w->GetActiveConnectionCount();
             }
+
+#ifdef USE_MIMALLOC
+            // 常态只做轻量 collect；快速强制回收由每秒 sample_coro 负责。
+            mi_collect(false);
+#endif
+
+            double mem_mb = co_await GetMemoryMBAsync(main_ctx.get_executor());
 
             LOG_INFO("conn={} mem={:.1f}MB in={} out={} rate={}↓/{}↑ dns={:.0f}%",
                      total_conns, mem_mb,
