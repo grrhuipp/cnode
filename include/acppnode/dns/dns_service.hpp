@@ -63,7 +63,6 @@ public:
 // DNS 缓存条目
 // ============================================================================
 struct DnsCacheEntry {
-    std::string domain;
     std::vector<net::ip::address> addresses;
     time_point expire_time;
     time_point last_access;
@@ -116,24 +115,7 @@ private:
         bool prefer_ipv6 = false;
     };
 
-    struct CacheKey {
-        std::string domain;
-        bool prefer_ipv6 = false;
-
-        CacheKey() = default;
-        CacheKey(std::string d, bool ipv6)
-            : domain(std::move(d)), prefer_ipv6(ipv6) {}
-        explicit CacheKey(CacheKeyRef ref)
-            : domain(ref.domain), prefer_ipv6(ref.prefer_ipv6) {}
-    };
-
     struct CacheKeyHash {
-        using is_transparent = void;
-
-        [[nodiscard]] size_t operator()(const CacheKey& key) const noexcept {
-            return (*this)(CacheKeyRef{key.domain, key.prefer_ipv6});
-        }
-
         [[nodiscard]] size_t operator()(CacheKeyRef key) const noexcept {
             size_t h1 = std::hash<std::string_view>{}(key.domain);
             size_t h2 = std::hash<bool>{}(key.prefer_ipv6);
@@ -142,38 +124,33 @@ private:
     };
 
     struct CacheKeyEq {
-        using is_transparent = void;
-
-        [[nodiscard]] bool operator()(const CacheKey& a,
-                                      const CacheKey& b) const noexcept {
-            return operator()(CacheKeyRef{a.domain, a.prefer_ipv6},
-                              CacheKeyRef{b.domain, b.prefer_ipv6});
-        }
-
-        [[nodiscard]] bool operator()(const CacheKey& a,
-                                      CacheKeyRef b) const noexcept {
-            return operator()(CacheKeyRef{a.domain, a.prefer_ipv6}, b);
-        }
-
-        [[nodiscard]] bool operator()(CacheKeyRef a,
-                                      const CacheKey& b) const noexcept {
-            return operator()(a, CacheKeyRef{b.domain, b.prefer_ipv6});
-        }
-
         [[nodiscard]] bool operator()(CacheKeyRef a,
                                       CacheKeyRef b) const noexcept {
             return a.prefer_ipv6 == b.prefer_ipv6 && a.domain == b.domain;
         }
     };
 
+    struct CacheNode {
+        std::string domain;
+        DnsCacheEntry entry;
+        bool prefer_ipv6 = false;
+
+        CacheNode(std::string d, DnsCacheEntry e, bool ipv6)
+            : domain(std::move(d)), entry(std::move(e)), prefer_ipv6(ipv6) {}
+
+        [[nodiscard]] CacheKeyRef Key() const noexcept {
+            return CacheKeyRef{domain, prefer_ipv6};
+        }
+    };
+
     // 分片结构
     //   lock：读写锁，Get 用 shared_lock（并发读），Put/Clear 用 unique_lock（独占写）
-    //   lru_list：仅在写路径（Put）维护，Get 不更新（近似 FIFO 淘汰，对 DNS 足够）
+    //   lru_list：节点持有真实 key/entry，hash 索引只保留 string_view，避免域名字符串存两份
     struct alignas(64) Shard {
         mutable std::shared_mutex lock;
-        std::list<CacheKey> lru_list;
-        std::unordered_map<CacheKey, std::pair<DnsCacheEntry,
-            std::list<CacheKey>::iterator>, CacheKeyHash, CacheKeyEq> cache;
+        std::list<CacheNode> lru_list;
+        std::unordered_map<CacheKeyRef, std::list<CacheNode>::iterator,
+            CacheKeyHash, CacheKeyEq> cache;
         size_t max_entries = 0;
 
         size_t Evict();  // 调用方须持有 unique_lock
@@ -276,7 +253,7 @@ private:
 
     // 解析 DNS 响应报文
     ParsedResponse ParseResponse(
-        const std::vector<uint8_t>& response,
+        std::span<const uint8_t> response,
         uint16_t expected_txid,
         uint32_t& out_ttl);
 

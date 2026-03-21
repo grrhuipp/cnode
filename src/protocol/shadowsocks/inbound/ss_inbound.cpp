@@ -92,7 +92,13 @@ cobalt::task<std::expected<ParsedAction, ErrorCode>> SsInboundHandler::ParseStre
 
     // ── 3. 遍历用户，尝试匹配 ───────────────────────────────────────────────
     // 优化：先尝试上次匹配成功的用户（同一节点活跃用户高度集中）
-    auto users = user_manager_.GetUsersForTag(tag);
+    auto snapshot = user_manager_.GetSnapshot();
+    auto users = snapshot->GetTagUserList(tag);
+    if (!users || users->empty()) {
+        LOG_CONN_FAIL("[{}] SS auth failed from {} (no users configured)", tag, client_ip);
+        OnAuthFail(tag, client_ip);
+        co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
 
     const ss::SsUserInfo* matched = nullptr;
     std::array<uint8_t, 64> subkey_buf{};
@@ -111,14 +117,14 @@ cobalt::task<std::expected<ParsedAction, ErrorCode>> SsInboundHandler::ParseStre
 
     // 优先尝试上次匹配成功的用户
     const size_t hint = last_matched_index_.load(std::memory_order_relaxed);
-    if (hint < users.size() && try_user(users[hint])) {
-        matched = &users[hint];
+    if (hint < users->size() && try_user(*(*users)[hint])) {
+        matched = (*users)[hint];
     } else {
         // 全量遍历（跳过已尝试的 hint）
-        for (size_t i = 0; i < users.size(); ++i) {
+        for (size_t i = 0; i < users->size(); ++i) {
             if (i == hint) continue;
-            if (try_user(users[i])) {
-                matched = &users[i];
+            if (try_user(*(*users)[i])) {
+                matched = (*users)[i];
                 last_matched_index_.store(i, std::memory_order_relaxed);
                 break;
             }

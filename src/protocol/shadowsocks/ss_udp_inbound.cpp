@@ -27,11 +27,12 @@ std::optional<UdpInboundDecodeResult> SsUdpInboundHandler::Decode(
     }
 
     // ── 2. 多用户 HKDF+AEAD 解密 ────────────────────────────────────────────
-    auto users = user_manager_.GetUsersForTag(tag_str);
-    if (users.empty()) return std::nullopt;
+    auto snapshot = user_manager_.GetSnapshot();
+    auto users = snapshot->GetTagUserList(tag_str);
+    if (!users || users->empty()) return std::nullopt;
 
     auto decoded = DecodeUdpPacket(
-        data, len, users,
+        data, len, *users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
 
     // ── 3. 认证失败记录 ──────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ std::optional<UdpInboundDecodeResult> SsUdpInboundHandler::Decode(
         return std::nullopt;
     }
 
-    const SsUserInfo& user = users[decoded->user_index];
+    const SsUserInfo& user = *(*users)[decoded->user_index];
 
     // ── 4. 构建回包编码函数（值捕获密钥 + 密码套件，生命周期安全）────────────
     std::vector<uint8_t> reply_key = user.derived_key;

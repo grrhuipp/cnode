@@ -108,11 +108,18 @@ struct SsUserInfo {
 class SsUserManager {
 public:
     SsUserManager() = default;
+    using Snapshot = SharedUserStore<SsUserInfo>::Snapshot;
+    using SnapshotPtr = SharedUserStore<SsUserInfo>::SnapshotPtr;
+    using UserRawList = typename Snapshot::UserRawList;
 
     // 全局共享存储（RCU，所有 Worker 共享同一份数据）
     static SharedUserStore<SsUserInfo>& SharedStore() {
         static SharedUserStore<SsUserInfo> store;
         return store;
+    }
+
+    [[nodiscard]] SnapshotPtr GetSnapshot() const {
+        return SharedStore().GetSnapshot();
     }
 
     // 增量更新指定 tag 的用户列表（无空窗期，RCU）

@@ -42,7 +42,7 @@ struct SsUdpDecodeResult {
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
     size_t                       datagram_len,
-    const std::vector<SsUserInfo>& users,
+    const std::vector<const SsUserInfo*>& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size);

@@ -37,19 +37,20 @@ void DomainTrie::AddSuffix(const std::string& suffix) {
     ToLowerInPlace(lower);
 
     TrieNode* node = root_.get();
+    auto lower_bound_child = [](auto& children, char ch) {
+        return std::lower_bound(
+            children.begin(), children.end(), ch,
+            [](const auto& child, char value) {
+                return child.first < value;
+            });
+    };
     for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
-        TrieNode* next = nullptr;
-        for (auto& [child_char, child_node] : node->children) {
-            if (child_char == *it) {
-                next = child_node.get();
-                break;
-            }
+        auto child_it = lower_bound_child(node->children, *it);
+        if (child_it == node->children.end() || child_it->first != *it) {
+            child_it = node->children.emplace(
+                child_it, *it, std::make_unique<TrieNode>());
         }
-        if (!next) {
-            node->children.emplace_back(*it, std::make_unique<TrieNode>());
-            next = node->children.back().second.get();
-        }
-        node = next;
+        node = child_it->second.get();
     }
     node->terminal = true;
     rule_count_++;
@@ -57,18 +58,19 @@ void DomainTrie::AddSuffix(const std::string& suffix) {
 
 bool DomainTrie::MatchSuffix(std::string_view lower_domain) const {
     const TrieNode* node = root_.get();
+    auto lower_bound_child = [](const auto& children, char ch) {
+        return std::lower_bound(
+            children.begin(), children.end(), ch,
+            [](const auto& child, char value) {
+                return child.first < value;
+            });
+    };
     for (auto it = lower_domain.rbegin(); it != lower_domain.rend(); ++it) {
-        const TrieNode* next = nullptr;
-        for (const auto& [child_char, child_node] : node->children) {
-            if (child_char == *it) {
-                next = child_node.get();
-                break;
-            }
-        }
-        node = next;
-        if (!node) {
+        auto child_it = lower_bound_child(node->children, *it);
+        if (child_it == node->children.end() || child_it->first != *it) {
             return false;
         }
+        node = child_it->second.get();
 
         if (node->terminal) {
             auto next_it = std::next(it);

@@ -63,15 +63,10 @@ cobalt::task<void> PrefetchDomain(DnsService* service, std::string domain) {
 // ============================================================================
 
 struct DnsService::InflightResolve {
-    struct Waiter {
-        net::any_io_executor executor;
-        std::shared_ptr<net::steady_timer> timer;
-    };
-
     std::mutex lock;
     DnsResult result;
     bool completed = false;
-    std::vector<Waiter> waiters;
+    std::vector<std::shared_ptr<net::steady_timer>> waiters;
 };
 
 struct DnsService::SharedState {
@@ -112,6 +107,7 @@ DnsService::DnsService(net::any_io_executor executor, const Config& config)
     cache_ = shared_state_->cache;
     
     // 解析服务器地址
+    servers_.reserve(config.servers.size());
     for (const auto& server : config.servers) {
         boost::system::error_code ec;
         auto addr = net::ip::make_address(server, ec);
@@ -142,6 +138,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
     auto addr = net::ip::make_address(domain, ec);
     if (!ec) {
         DnsResult result;
+        result.addresses.reserve(1);
         result.addresses.push_back(addr);
         result.from_cache = false;
         co_return result;
@@ -178,15 +175,16 @@ cobalt::task<DnsResult> DnsService::Resolve(
     }
 
     if (!is_leader) {
-        auto wait_timer = std::make_shared<net::steady_timer>(executor_);
-        wait_timer->expires_at(net::steady_timer::time_point::max());
+        std::shared_ptr<net::steady_timer> wait_timer;
 
         {
             std::lock_guard lock(inflight->lock);
             if (inflight->completed) {
                 co_return inflight->result;
             }
-            inflight->waiters.push_back({executor_, wait_timer});
+            wait_timer = std::make_shared<net::steady_timer>(executor_);
+            wait_timer->expires_at(net::steady_timer::time_point::max());
+            inflight->waiters.push_back(wait_timer);
         }
 
         auto [wait_ec] = co_await wait_timer->async_wait(
@@ -215,7 +213,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
         cache_->PutNegative(domain, 60, prefer_ipv6);
     }
 
-    std::vector<InflightResolve::Waiter> waiters;
+    std::vector<std::shared_ptr<net::steady_timer>> waiters;
     {
         std::lock_guard lock(inflight->lock);
         inflight->completed = true;
@@ -224,7 +222,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
     }
 
     for (auto& waiter : waiters) {
-        net::post(waiter.executor, [timer = std::move(waiter.timer)]() mutable {
+        net::post(waiter->get_executor(), [timer = std::move(waiter)]() mutable {
             timer->expires_at(net::steady_timer::clock_type::now());
         });
     }
@@ -279,11 +277,15 @@ cobalt::task<DnsResult> DnsService::DoResolve(
         if (result_a.Ok() && result_aaaa.Ok()) {
             if (prefer_ipv6) {
                 result = std::move(result_aaaa);
+                result.addresses.reserve(
+                    result.addresses.size() + result_a.addresses.size());
                 result.addresses.insert(result.addresses.end(),
                     result_a.addresses.begin(),
                     result_a.addresses.end());
             } else {
                 result = std::move(result_a);
+                result.addresses.reserve(
+                    result.addresses.size() + result_aaaa.addresses.size());
                 result.addresses.insert(result.addresses.end(),
                     result_aaaa.addresses.begin(),
                     result_aaaa.addresses.end());
@@ -362,7 +364,7 @@ cobalt::task<DnsResult> DnsService::QueryServer(
         net::buffer(query), server, cobalt::use_op);
     
     // 等待响应（带超时）- 使用定时器回调，避免 parallel_group
-    std::vector<uint8_t> response(512);
+    std::array<uint8_t, 512> response{};
     net::steady_timer timer(executor_);
     struct QueryTimeoutState {
         std::atomic<bool> timed_out{false};
@@ -405,11 +407,10 @@ cobalt::task<DnsResult> DnsService::QueryServer(
         co_return result;
     }
     
-    response.resize(received);
-    
     // 解析响应
     uint32_t ttl = config_.min_ttl;
-    auto parsed = ParseResponse(response, txid, ttl);
+    auto parsed = ParseResponse(
+        std::span<const uint8_t>(response.data(), received), txid, ttl);
     
     if (!parsed.Ok()) {
         result.error = parsed.error;
@@ -427,7 +428,7 @@ std::vector<uint8_t> DnsService::BuildQuery(
     const std::string& domain, uint16_t txid, bool query_aaaa) {
     
     std::vector<uint8_t> query;
-    query.reserve(64);
+    query.reserve(18 + domain.size());
     
     // Header (12 bytes)
     // Transaction ID
@@ -486,7 +487,7 @@ std::vector<uint8_t> DnsService::BuildQuery(
 }
 
 DnsService::ParsedResponse DnsService::ParseResponse(
-    const std::vector<uint8_t>& response, uint16_t expected_txid, uint32_t& out_ttl) {
+    std::span<const uint8_t> response, uint16_t expected_txid, uint32_t& out_ttl) {
     ParsedResponse result;
 
     if (response.size() < 12) {
@@ -576,6 +577,7 @@ DnsService::ParsedResponse DnsService::ParseResponse(
     
     // 解析 Answer section
     std::vector<net::ip::address> addresses;
+    addresses.reserve(ancount);
     uint32_t min_ttl = UINT32_MAX;
     
     for (uint16_t i = 0; i < ancount && pos < response.size(); ++i) {

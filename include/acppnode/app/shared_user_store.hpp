@@ -27,8 +27,37 @@
 #include <atomic>
 #include <string>
 #include <mutex>
+#include <string_view>
 
 namespace acpp {
+
+struct SharedStoreStringViewHash {
+    using is_transparent = void;
+
+    size_t operator()(std::string_view value) const noexcept {
+        return std::hash<std::string_view>{}(value);
+    }
+
+    size_t operator()(const std::string& value) const noexcept {
+        return (*this)(std::string_view(value));
+    }
+};
+
+struct SharedStoreStringViewEq {
+    using is_transparent = void;
+
+    bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+        return lhs == rhs;
+    }
+
+    bool operator()(const std::string& lhs, std::string_view rhs) const noexcept {
+        return std::string_view(lhs) == rhs;
+    }
+
+    bool operator()(std::string_view lhs, const std::string& rhs) const noexcept {
+        return lhs == std::string_view(rhs);
+    }
+};
 
 // ============================================================================
 // UserSnapshot - 用户数据快照（不可变）
@@ -38,7 +67,11 @@ class UserSnapshot {
 public:
     using UserPtr = std::shared_ptr<const UserT>;
     using UserMap = std::unordered_map<std::string, UserPtr>;
+    using UserRawList = std::vector<const UserT*>;
+    using GlobalUserMap = std::unordered_map<
+        std::string_view, UserPtr, SharedStoreStringViewHash, SharedStoreStringViewEq>;
     using TagMap = std::unordered_map<std::string, std::shared_ptr<const UserMap>>;
+    using TagUserListMap = std::unordered_map<std::string, std::shared_ptr<const UserRawList>>;
     
     UserSnapshot() = default;
     
@@ -56,8 +89,10 @@ public:
 
         auto new_snapshot = std::make_shared<UserSnapshot>();
         if (old) new_snapshot->tag_users_ = old->tag_users_;
+        new_snapshot->tag_users_.reserve(new_snapshot->tag_users_.size() + 1);
 
         auto new_user_map = std::make_shared<UserMap>();
+        new_user_map->reserve(users.size());
         for (auto& user : users) {
             // 必须在 move 之前提取 key：MSVC 函数参数求值顺序为右到左，
             // 若 move 先执行，key() 返回的 string_view 指向已被移走的空字符串
@@ -96,7 +131,7 @@ public:
     // 查找用户（全局）
     UserPtr Find(const std::string& key) const {
         if (!global_index_) return nullptr;
-        auto it = global_index_->find(key);
+        auto it = global_index_->find(std::string_view(key));
         return it != global_index_->end() ? it->second : nullptr;
     }
     
@@ -105,10 +140,19 @@ public:
         auto it = tag_users_.find(tag);
         return (it != tag_users_.end()) ? it->second : nullptr;
     }
+
+    std::shared_ptr<const UserRawList> GetTagUserList(const std::string& tag) const {
+        auto it = tag_user_lists_.find(tag);
+        return (it != tag_user_lists_.end()) ? it->second : nullptr;
+    }
     
     // 获取全局索引
-    std::shared_ptr<const UserMap> GetGlobalIndex() const {
+    std::shared_ptr<const GlobalUserMap> GetGlobalIndex() const {
         return global_index_;
+    }
+
+    std::shared_ptr<const UserRawList> GetGlobalUserList() const {
+        return global_user_list_;
     }
     
     // 用户数量
@@ -123,19 +167,41 @@ public:
 
 private:
     TagMap tag_users_;
-    std::shared_ptr<const UserMap> global_index_;
+    TagUserListMap tag_user_lists_;
+    std::shared_ptr<const GlobalUserMap> global_index_;
+    std::shared_ptr<const UserRawList> global_user_list_;
     
     // 重建全局索引
     void RebuildGlobalIndex() {
-        auto new_index = std::make_shared<UserMap>();
+        auto new_index = std::make_shared<GlobalUserMap>();
+        auto new_global_user_list = std::make_shared<UserRawList>();
+        auto new_tag_user_lists = TagUserListMap{};
+        new_tag_user_lists.reserve(tag_users_.size());
+        size_t total_users = 0;
         for (const auto& [tag, users] : tag_users_) {
+            (void)tag;
             if (users) {
-                for (const auto& [key, user] : *users) {
-                    new_index->emplace(key, user);
-                }
+                total_users += users->size();
             }
         }
+        new_index->reserve(total_users);
+        new_global_user_list->reserve(total_users);
+
+        for (const auto& [tag, users] : tag_users_) {
+            if (users) {
+                auto tag_user_list = std::make_shared<UserRawList>();
+                tag_user_list->reserve(users->size());
+                for (const auto& [key, user] : *users) {
+                    new_index->emplace(std::string_view(key), user);
+                    tag_user_list->push_back(user.get());
+                    new_global_user_list->push_back(user.get());
+                }
+                new_tag_user_lists.emplace(tag, std::move(tag_user_list));
+            }
+        }
+        tag_user_lists_ = std::move(new_tag_user_lists);
         global_index_ = std::move(new_index);
+        global_user_list_ = std::move(new_global_user_list);
     }
 };
 
@@ -195,9 +261,9 @@ public:
     template<typename Func>
     void ForEachUser(Func&& func) const {
         auto snapshot = GetSnapshot();
-        auto index = snapshot->GetGlobalIndex();
-        if (index) {
-            for (const auto& [key, user] : *index) {
+        auto users = snapshot->GetGlobalUserList();
+        if (users) {
+            for (const auto* user : *users) {
                 func(*user);
             }
         }

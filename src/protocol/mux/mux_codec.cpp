@@ -267,6 +267,28 @@ static std::vector<uint8_t> MakeFrameBase(
     return buf;
 }
 
+static void InitFrameBase(
+    std::vector<uint8_t>& buf,
+    uint16_t session_id,
+    SessionStatus status,
+    uint8_t option,
+    size_t reserve_extra = 0)
+{
+    buf.clear();
+    buf.reserve(8 + reserve_extra);
+
+    // MetaLen 占位（稍后回填）
+    buf.push_back(0);
+    buf.push_back(0);
+    // SessionID
+    buf.push_back(static_cast<uint8_t>(session_id >> 8));
+    buf.push_back(static_cast<uint8_t>(session_id & 0xFF));
+    // Status
+    buf.push_back(static_cast<uint8_t>(status));
+    // Option
+    buf.push_back(option);
+}
+
 // 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
 static void FinalizeFrame(
     std::vector<uint8_t>& buf,
@@ -289,18 +311,35 @@ static void FinalizeFrame(
 // ============================================================================
 // EncodeKeepAlive
 // ============================================================================
+void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
+    out.clear();
+    out.reserve(6);
+    out.push_back(0x00);
+    out.push_back(0x04);
+    out.push_back(0x00);
+    out.push_back(0x00);
+    out.push_back(static_cast<uint8_t>(SessionStatus::KEEPALIVE));
+    out.push_back(0x00);
+}
+
 std::vector<uint8_t> EncodeKeepAlive() {
-    // MetaLen=4, SessionID=0, Status=KeepAlive, Option=0
-    return {0x00, 0x04, 0x00, 0x00,
-            static_cast<uint8_t>(SessionStatus::KEEPALIVE), 0x00};
+    std::vector<uint8_t> buf;
+    EncodeKeepAliveTo(buf);
+    return buf;
 }
 
 // ============================================================================
 // EncodeEnd
 // ============================================================================
-std::vector<uint8_t> EncodeEnd(uint16_t session_id, bool error) {
+void EncodeEndTo(std::vector<uint8_t>& out, uint16_t session_id, bool error) {
     uint8_t option = error ? kOptionError : 0x00;
-    auto buf = MakeFrameBase(session_id, SessionStatus::END, option);
+    InitFrameBase(out, session_id, SessionStatus::END, option);
+    FinalizeFrame(out, nullptr, 0);
+}
+
+std::vector<uint8_t> EncodeEnd(uint16_t session_id, bool error) {
+    auto buf = MakeFrameBase(session_id, SessionStatus::END,
+                             error ? kOptionError : 0x00);
     FinalizeFrame(buf, nullptr, 0);
     return buf;
 }
@@ -308,6 +347,15 @@ std::vector<uint8_t> EncodeEnd(uint16_t session_id, bool error) {
 // ============================================================================
 // EncodeKeepData（TCP 数据）
 // ============================================================================
+void EncodeKeepDataTo(
+    std::vector<uint8_t>& out,
+    uint16_t session_id,
+    const uint8_t* data, size_t len)
+{
+    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, len);
+    FinalizeFrame(out, data, len);
+}
+
 std::vector<uint8_t> EncodeKeepData(
     uint16_t session_id,
     const uint8_t* data, size_t len)
@@ -320,22 +368,32 @@ std::vector<uint8_t> EncodeKeepData(
 // ============================================================================
 // EncodeKeepUDP（UDP 回包，携带源地址）
 // ============================================================================
-std::vector<uint8_t> EncodeKeepUDP(
+void EncodeKeepUDPTo(
+    std::vector<uint8_t>& out,
     uint16_t session_id,
     const TargetAddress& src,
     const uint8_t* data, size_t len)
 {
     // 预估地址字节数
     size_t addr_reserve = 3 + 16;  // NetworkType(1) + Port(2) + AddrType(1) + IPv6(16)
-    auto buf = MakeFrameBase(session_id, SessionStatus::KEEP,
-                             kOptionData, addr_reserve + len);
+    InitFrameBase(out, session_id, SessionStatus::KEEP,
+                  kOptionData, addr_reserve + len);
 
     // NetworkType = UDP
-    buf.push_back(static_cast<uint8_t>(NetworkType::UDP));
+    out.push_back(static_cast<uint8_t>(NetworkType::UDP));
     // PortThenAddress
-    AppendAddress(buf, src);
+    AppendAddress(out, src);
 
-    FinalizeFrame(buf, data, len);
+    FinalizeFrame(out, data, len);
+}
+
+std::vector<uint8_t> EncodeKeepUDP(
+    uint16_t session_id,
+    const TargetAddress& src,
+    const uint8_t* data, size_t len)
+{
+    std::vector<uint8_t> buf;
+    EncodeKeepUDPTo(buf, session_id, src, data, len);
     return buf;
 }
 

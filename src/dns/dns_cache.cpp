@@ -8,6 +8,9 @@ DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
     size_t per_shard = (max_size + kNumShards - 1) / kNumShards;
     for (auto& shard : shards_) {
         shard.max_entries = per_shard;
+        if (per_shard > 0) {
+            shard.cache.reserve(per_shard);
+        }
     }
 }
 
@@ -26,7 +29,8 @@ std::optional<DnsCacheEntry> DnsCache::Get(const std::string& domain,
         return std::nullopt;
     }
 
-    const auto& entry = it->second.first;
+    const auto node_it = it->second;
+    const auto& entry = node_it->entry;
 
     // 检查是否过期
     if (now >= entry.expire_time) {
@@ -37,9 +41,10 @@ std::optional<DnsCacheEntry> DnsCache::Get(const std::string& domain,
             std::unique_lock write_lock(shard.lock);
             auto write_it = shard.cache.find(cache_key);
             if (write_it != shard.cache.end() &&
-                now >= write_it->second.first.expire_time) {
-                shard.lru_list.erase(write_it->second.second);
+                now >= write_it->second->entry.expire_time) {
+                auto erase_it = write_it->second;
                 shard.cache.erase(write_it);
+                shard.lru_list.erase(erase_it);
                 erased = true;
             }
         }
@@ -78,16 +83,15 @@ void DnsCache::Put(const std::string& domain,
     auto it = shard.cache.find(cache_key);
     if (it != shard.cache.end()) {
         // 更新现有条目并刷新 LRU 位置
-        auto& entry = it->second.first;
+        auto node_it = it->second;
+        auto& entry = node_it->entry;
         entry.addresses = addresses;
         entry.expire_time = now + std::chrono::seconds(ttl);
         entry.last_access = now;
         entry.ttl = ttl;
         entry.negative = false;
 
-        shard.lru_list.erase(it->second.second);
-        shard.lru_list.emplace_front(domain, prefer_ipv6);
-        it->second.second = shard.lru_list.begin();
+        shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, node_it);
         return;
     }
 
@@ -99,16 +103,15 @@ void DnsCache::Put(const std::string& domain,
 
     // 添加新条目
     DnsCacheEntry entry;
-    entry.domain = domain;
     entry.addresses = addresses;
     entry.expire_time = now + std::chrono::seconds(ttl);
     entry.last_access = now;
     entry.ttl = ttl;
     entry.negative = false;
 
-    shard.lru_list.emplace_front(domain, prefer_ipv6);
-    shard.cache.emplace(*shard.lru_list.begin(),
-                        std::make_pair(std::move(entry), shard.lru_list.begin()));
+    shard.lru_list.emplace_front(domain, std::move(entry), prefer_ipv6);
+    auto node_it = shard.lru_list.begin();
+    shard.cache.emplace(node_it->Key(), node_it);
     write_lock.unlock();
 
     // 更新全局计数（新增1个，淘汰evicted个）
@@ -131,16 +134,15 @@ void DnsCache::PutNegative(const std::string& domain,
 
     auto it = shard.cache.find(cache_key);
     if (it != shard.cache.end()) {
-        auto& entry = it->second.first;
+        auto node_it = it->second;
+        auto& entry = node_it->entry;
         entry.addresses.clear();
         entry.expire_time = now + std::chrono::seconds(ttl);
         entry.last_access = now;
         entry.ttl = ttl;
         entry.negative = true;
 
-        shard.lru_list.erase(it->second.second);
-        shard.lru_list.emplace_front(domain, prefer_ipv6);
-        it->second.second = shard.lru_list.begin();
+        shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, node_it);
         return;
     }
 
@@ -150,15 +152,14 @@ void DnsCache::PutNegative(const std::string& domain,
     }
 
     DnsCacheEntry entry;
-    entry.domain = domain;
     entry.expire_time = now + std::chrono::seconds(ttl);
     entry.last_access = now;
     entry.ttl = ttl;
     entry.negative = true;
 
-    shard.lru_list.emplace_front(domain, prefer_ipv6);
-    shard.cache.emplace(*shard.lru_list.begin(),
-                        std::make_pair(std::move(entry), shard.lru_list.begin()));
+    shard.lru_list.emplace_front(domain, std::move(entry), prefer_ipv6);
+    auto node_it = shard.lru_list.begin();
+    shard.cache.emplace(node_it->Key(), node_it);
     write_lock.unlock();
 
     // 更新全局计数
@@ -195,9 +196,10 @@ size_t DnsCache::Shard::Evict() {
     
     // 先淘汰过期的
     for (auto it = cache.begin(); it != cache.end();) {
-        if (now >= it->second.first.expire_time) {
-            lru_list.erase(it->second.second);
+        auto node_it = it->second;
+        if (now >= node_it->entry.expire_time) {
             it = cache.erase(it);
+            lru_list.erase(node_it);
             ++evicted;
         } else {
             ++it;
@@ -206,8 +208,9 @@ size_t DnsCache::Shard::Evict() {
 
     // 如果还是满了，淘汰 LRU（最后面的）
     while (cache.size() >= max_entries && !lru_list.empty()) {
-        cache.erase(lru_list.back());
-        lru_list.pop_back();
+        auto node_it = std::prev(lru_list.end());
+        cache.erase(node_it->Key());
+        lru_list.erase(node_it);
         ++evicted;
     }
     

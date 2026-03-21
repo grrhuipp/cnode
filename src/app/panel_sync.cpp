@@ -46,6 +46,7 @@ void PanelSyncManager::Stop() { running_ = false; }
 
 std::vector<PanelSyncManager::NodeStatsInfo> PanelSyncManager::GetNodeStats() const {
     std::vector<NodeStatsInfo> result;
+    result.reserve(node_configs_.size());
     for (const auto& [key, cfg] : node_configs_) {
         NodeStatsInfo info;
         info.panel_name  = key.first->Name();
@@ -285,7 +286,13 @@ PanelSyncManager::CollectTraffic(const std::string& tag) {
     }
     co_await cobalt::join(tasks);
 
+    size_t merged_hint = 0;
+    for (const auto& traffic : per_worker) {
+        merged_hint += traffic.size();
+    }
+
     std::unordered_map<int64_t, TrafficData> merged;
+    merged.reserve(merged_hint);
     for (const auto& traffic : per_worker) {
         for (const auto& [uid, t] : traffic) {
             auto& m   = merged[uid];
@@ -324,7 +331,13 @@ PanelSyncManager::CollectOnlineUsers(const std::string& tag,
     }
     co_await cobalt::join(tasks);
 
+    size_t total_online = 0;
+    for (const auto& online : per_worker) {
+        total_online += online.size();
+    }
+
     std::unordered_set<int64_t> users;
+    users.reserve(total_online);
     for (const auto& online : per_worker) {
         users.insert(online.begin(), online.end());
     }

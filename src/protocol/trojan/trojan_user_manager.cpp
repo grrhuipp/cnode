@@ -75,9 +75,11 @@ void TrojanUserManager::UpdateUsersForTag(const std::string& tag, const std::vec
     // 本地存储模式（旧行为）
     // Per-worker: no lock needed
     auto& tag_users = users_by_tag_[tag];
+    tag_users.reserve(new_users.size());
 
     // 构建新用户哈希集合
     std::unordered_set<std::string> new_hashes;
+    new_hashes.reserve(new_users.size());
     for (const auto& user : new_users) {
         new_hashes.insert(user.password_hash);
     }

@@ -86,7 +86,7 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
 std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
     size_t                       datagram_len,
-    const std::vector<SsUserInfo>& users,
+    const std::vector<const SsUserInfo*>& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size)
@@ -104,9 +104,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* salt    = datagram;
     const uint8_t* cipher  = datagram + salt_size;
     const size_t   cipherlen = datagram_len - salt_size;
+    const size_t   plaintext_len = cipherlen - SsAeadCipher::kTagSize;
+    std::vector<uint8_t> plaintext(plaintext_len);
 
     for (size_t i = 0; i < users.size(); ++i) {
-        const auto& user = users[i];
+        const auto& user = *users[i];
 
         // 派生子密钥
         std::array<uint8_t, 64> subkey{};
@@ -118,8 +120,6 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
         // 整包 AEAD 解密（nonce = 全零）
         SsAeadCipher aead(cipher_type, subkey.data(), key_size);
-        const size_t plaintext_len = cipherlen - SsAeadCipher::kTagSize;
-        std::vector<uint8_t> plaintext(plaintext_len);
 
         if (!aead.Decrypt(kZeroNonce.data(), cipher, cipherlen, plaintext.data())) {
             continue;  // 密钥不匹配，尝试下一个用户

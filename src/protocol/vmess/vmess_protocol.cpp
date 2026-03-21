@@ -471,9 +471,11 @@ void VMessUserManager::UpdateUsersForTag(const std::string& tag, const std::vect
     
     // 获取或创建该 tag 的用户 map
     auto& tag_users = users_by_tag_[tag];
+    tag_users.reserve(users.size());
     
     // 构建新用户集合
     std::unordered_set<std::string> new_uuids;
+    new_uuids.reserve(users.size());
     for (const auto& user : users) {
         new_uuids.insert(user.uuid);
     }
@@ -601,8 +603,8 @@ const VMessUser* VMessUserManager::FindByAuthID(const uint8_t* auth_id, int64_t&
         constexpr int64_t hot_cache_window = 300;  // 5 分钟窗口
 
         // 收集有效的热点用户（在锁内，快速操作）
-        // 同时复制 shared_ptr 防止锁释放后其他线程 Clear() 导致对象被释放
-        using CandidateEntry = std::pair<const VMessUser*, std::shared_ptr<const VMessUser>>;
+        // 同时复制 snapshot 引用，防止锁释放后对应用户对象失效
+        using CandidateEntry = std::pair<const VMessUser*, HotUserCache::SnapshotRef>;
         std::vector<CandidateEntry> candidates;
         candidates.reserve(32);
 
@@ -611,13 +613,14 @@ const VMessUser* VMessUserManager::FindByAuthID(const uint8_t* auth_id, int64_t&
             auto it = hot_cache_.entries.find(user);
             if (it != hot_cache_.entries.end() &&
                 it->second.timestamp + hot_cache_window >= now) {
-                candidates.emplace_back(user, it->second.ref);
+                candidates.emplace_back(user, it->second.owner);
             }
         }
         hot_cache_.lock.Unlock();
 
-        // 在锁外验证（AES 解密是耗时操作），shared_ptr 保证对象存活
-        for (const auto& [user, ref] : candidates) {
+        // 在锁外验证（AES 解密是耗时操作），snapshot shared_ptr 保证对象存活
+        for (const auto& [user, owner] : candidates) {
+            (void)owner;
             if (tryUser(*user)) {
                 // 命中！更新时间戳
                 hot_cache_.lock.Lock();
@@ -634,15 +637,15 @@ const VMessUser* VMessUserManager::FindByAuthID(const uint8_t* auth_id, int64_t&
     if (use_shared_store_) {
         // 共享存储模式：从 SharedStore 读取
         auto snapshot = VMessUserManager::SharedStore().GetSnapshot();
-        auto global_index = snapshot->GetGlobalIndex();
-        if (global_index) {
-            for (const auto& [uuid, user_ptr] : *global_index) {
-                if (tryUser(*user_ptr)) {
-                    // 找到！添加到热点缓存（传入 shared_ptr 防止 RCU 更新后悬空）
+        auto global_users = snapshot->GetGlobalUserList();
+        if (global_users) {
+            for (const auto* user : *global_users) {
+                if (tryUser(*user)) {
+                    // 找到！添加到热点缓存（传入 snapshot 保持用户对象存活）
                     hot_cache_.lock.Lock();
-                    hot_cache_.Touch(user_ptr.get(), now, user_ptr);
+                    hot_cache_.Touch(user, now, snapshot);
                     hot_cache_.lock.Unlock();
-                    return user_ptr.get();
+                    return user;
                 }
             }
         }
@@ -669,13 +672,13 @@ std::vector<const VMessUser*> VMessUserManager::GetAllUsers() const {
     
     if (use_shared_store_) {
         auto snapshot = VMessUserManager::SharedStore().GetSnapshot();
-        auto global_index = snapshot->GetGlobalIndex();
-        if (global_index) {
-            for (const auto& [uuid, user_ptr] : *global_index) {
-                result.push_back(user_ptr.get());
-            }
+        auto global_users = snapshot->GetGlobalUserList();
+        if (global_users) {
+            result.reserve(global_users->size());
+            result.insert(result.end(), global_users->begin(), global_users->end());
         }
     } else {
+        result.reserve(Size());
         for (const auto& [tag, users] : users_by_tag_) {
             for (const auto& [uuid, user] : users) {
                 result.push_back(&user);
@@ -733,8 +736,8 @@ const VMessUser* VMessUserManager::FindByAuthIDForTag(
     {
         constexpr int64_t hot_cache_window = 300;  // 5 分钟窗口
 
-        // 同时复制 shared_ptr 防止锁释放后其他线程 Clear() 导致对象被释放
-        using CandidateEntry = std::pair<const VMessUser*, std::shared_ptr<const VMessUser>>;
+        // 同时复制 snapshot 引用，防止锁释放后对应用户对象失效
+        using CandidateEntry = std::pair<const VMessUser*, HotUserCache::SnapshotRef>;
         std::vector<CandidateEntry> candidates;
         candidates.reserve(32);
 
@@ -743,12 +746,13 @@ const VMessUser* VMessUserManager::FindByAuthIDForTag(
             auto it = hot_cache_.entries.find(user);
             if (it != hot_cache_.entries.end() &&
                 it->second.timestamp + hot_cache_window >= now) {
-                candidates.emplace_back(user, it->second.ref);
+                candidates.emplace_back(user, it->second.owner);
             }
         }
         hot_cache_.lock.Unlock();
 
-        for (const auto& [user, ref] : candidates) {
+        for (const auto& [user, owner] : candidates) {
+            (void)owner;
             if (tryUser(*user)) {
                 hot_cache_.lock.Lock();
                 hot_cache_.UpdateTime(user, now);
@@ -764,18 +768,18 @@ const VMessUser* VMessUserManager::FindByAuthIDForTag(
     if (use_shared_store_) {
         // 共享存储模式：从 SharedStore 读取指定 tag 的用户
         auto snapshot = VMessUserManager::SharedStore().GetSnapshot();
-        auto tag_users = snapshot->GetTagUsers(tag);
+        auto tag_users = snapshot->GetTagUserList(tag);
         if (!tag_users) {
             return nullptr;  // 该 tag 没有用户
         }
 
-        for (const auto& [uuid, user_ptr] : *tag_users) {
-            if (tryUser(*user_ptr)) {
-                // 找到！添加到热点缓存（传入 shared_ptr 防止 RCU 更新后悬空）
+        for (const auto* user : *tag_users) {
+            if (tryUser(*user)) {
+                // 找到！添加到热点缓存（传入 snapshot 保持用户对象存活）
                 hot_cache_.lock.Lock();
-                hot_cache_.Touch(user_ptr.get(), now, user_ptr);
+                hot_cache_.Touch(user, now, snapshot);
                 hot_cache_.lock.Unlock();
-                return user_ptr.get();
+                return user;
             }
         }
     } else {

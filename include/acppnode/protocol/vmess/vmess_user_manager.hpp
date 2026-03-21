@@ -23,6 +23,7 @@
 #include <string>
 #include <optional>
 #include <memory>
+#include <list>
 #include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -130,30 +131,37 @@ private:
 
     struct alignas(64) HotUserCache {
         mutable acpp::SpinLock lock;
+        using SnapshotRef = std::shared_ptr<const UserSnapshot<VMessUser>>;
+        static constexpr size_t kMaxEntries = 8192;
 
         // 缓存条目：持有 shared_ptr 防止 RCU 快照更新后用户对象被释放
         struct Entry {
-            std::shared_ptr<const VMessUser> ref;  // 共享存储模式下保持引用
+            SnapshotRef owner;  // 共享存储模式下保持对应 snapshot 存活
             int64_t timestamp;
+            std::list<const VMessUser*>::iterator order_it;
         };
         std::unordered_map<const VMessUser*, Entry> entries;
-        std::vector<const VMessUser*>               active_order;
+        std::list<const VMessUser*>                 active_order;
 
-        // ref: 共享存储模式传入 shared_ptr 保持用户对象存活；
-        //      本地存储模式传空（生命周期由 users_by_tag_ 管理）
+        // owner: 共享存储模式传入 snapshot shared_ptr 保持用户对象存活；
+        //        本地存储模式传空（生命周期由 users_by_tag_ 管理）
         void Touch(const VMessUser* user, int64_t now,
-                   std::shared_ptr<const VMessUser> ref = nullptr) {
+                   SnapshotRef owner = nullptr) {
             auto it = entries.find(user);
             if (it != entries.end()) {
                 it->second.timestamp = now;
-                auto pos = std::find(active_order.begin(), active_order.end(), user);
-                if (pos != active_order.end() && pos != active_order.begin()) {
-                    active_order.erase(pos);
-                    active_order.insert(active_order.begin(), user);
+                if (it->second.order_it != active_order.begin()) {
+                    active_order.splice(active_order.begin(), active_order, it->second.order_it);
                 }
+                it->second.owner = std::move(owner);
             } else {
-                entries[user] = {std::move(ref), now};
-                active_order.insert(active_order.begin(), user);
+                active_order.push_front(user);
+                entries[user] = {std::move(owner), now, active_order.begin()};
+                if (entries.size() > kMaxEntries && !active_order.empty()) {
+                    const auto* tail = active_order.back();
+                    active_order.pop_back();
+                    entries.erase(tail);
+                }
             }
         }
 
@@ -161,8 +169,7 @@ private:
             constexpr int64_t window = 300;
             for (auto it = entries.begin(); it != entries.end(); ) {
                 if (it->second.timestamp + window < now) {
-                    auto pos = std::find(active_order.begin(), active_order.end(), it->first);
-                    if (pos != active_order.end()) active_order.erase(pos);
+                    active_order.erase(it->second.order_it);
                     it = entries.erase(it);
                 } else {
                     ++it;
@@ -176,7 +183,7 @@ private:
         }
 
         size_t Size() const { return entries.size(); }
-        const std::vector<const VMessUser*>& GetActiveUsers() const { return active_order; }
+        const std::list<const VMessUser*>& GetActiveUsers() const { return active_order; }
 
         void UpdateTime(const VMessUser* user, int64_t now) {
             auto it = entries.find(user);

@@ -193,23 +193,23 @@ void SsUserManager::UpdateUsersForTag(const std::string& /*tag*/,
 }
 
 std::vector<SsUserInfo> SsUserManager::GetUsersForTag(const std::string& tag) const {
-    auto snapshot = SharedStore().GetSnapshot();
-    auto tag_users = snapshot->GetTagUsers(tag);
+    auto snapshot = GetSnapshot();
+    auto tag_users = snapshot->GetTagUserList(tag);
     if (!tag_users) return {};
 
     std::vector<SsUserInfo> result;
     result.reserve(tag_users->size());
-    for (const auto& [key, user] : *tag_users)
+    for (const auto* user : *tag_users)
         result.push_back(*user);
     return result;
 }
 
 std::optional<SsUserInfo> SsUserManager::FindUserById(const std::string& tag,
                                                        int64_t user_id) const {
-    auto snapshot = SharedStore().GetSnapshot();
-    auto tag_users = snapshot->GetTagUsers(tag);
+    auto snapshot = GetSnapshot();
+    auto tag_users = snapshot->GetTagUserList(tag);
     if (!tag_users) return std::nullopt;
-    for (const auto& [key, user] : *tag_users)
+    for (const auto* user : *tag_users)
         if (user->user_id == user_id) return *user;
     return std::nullopt;
 }

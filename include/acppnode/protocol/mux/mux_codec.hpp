@@ -88,6 +88,17 @@ struct FrameHeader {
 // 序列化：服务器 → 客户端
 // ============================================================================
 
+void EncodeKeepAliveTo(std::vector<uint8_t>& out);
+void EncodeEndTo(std::vector<uint8_t>& out,
+                 uint16_t session_id, bool error = false);
+void EncodeKeepDataTo(std::vector<uint8_t>& out,
+                      uint16_t session_id,
+                      const uint8_t* data, size_t len);
+void EncodeKeepUDPTo(std::vector<uint8_t>& out,
+                     uint16_t session_id,
+                     const TargetAddress& src,
+                     const uint8_t* data, size_t len);
+
 [[nodiscard]] std::vector<uint8_t> EncodeKeepAlive();
 
 [[nodiscard]] std::vector<uint8_t> EncodeEnd(
