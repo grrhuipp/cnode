@@ -174,6 +174,11 @@ private:
 
 // ============================================================================
 // 基于 UDP 的异步 DNS 服务实现
+//
+// 设计约束：
+// - 一个 Worker / 线程对应一个 DnsService 实例
+// - 实例之间不共享 inflight、socket、事务号或缓存状态
+// - Resolve 路径按线程亲和假设设计，优先减少调度和锁开销
 // ============================================================================
 class DnsService final : public IDnsService {
 public:
@@ -217,8 +222,11 @@ private:
         }
     };
 
-    struct InflightResolve;
-    struct SharedState;
+    struct InflightResolve {
+        DnsResult result;
+        bool completed = false;
+        std::vector<std::shared_ptr<net::steady_timer>> waiters;
+    };
 
     struct ParsedResponse {
         std::vector<net::ip::address> addresses;
@@ -243,13 +251,10 @@ private:
         const std::string& domain,
         bool query_aaaa);
 
-    static std::shared_ptr<SharedState> AcquireSharedState(
-        const Config& config);
-
     // 构建 DNS 查询报文
-    std::vector<uint8_t> BuildQuery(const std::string& domain, 
-                                     uint16_t txid, 
-                                     bool query_aaaa);
+    std::vector<uint8_t> BuildQuery(const std::string& domain,
+                                    uint16_t txid,
+                                    bool query_aaaa);
 
     // 解析 DNS 响应报文
     ParsedResponse ParseResponse(
@@ -261,7 +266,8 @@ private:
     Config config_;
     std::shared_ptr<DnsCache> cache_;
     std::vector<net::ip::udp::endpoint> servers_;
-    std::shared_ptr<SharedState> shared_state_;
+    std::unordered_map<ResolveKey, std::shared_ptr<InflightResolve>, ResolveKeyHash>
+        inflight_resolves_;
 
     // 事务 ID 生成器（atomic，无锁）
     std::atomic<uint16_t> txid_counter_{1};

@@ -2,114 +2,61 @@
 #include "acppnode/infra/log.hpp"
 
 #include <boost/asio/cancel_after.hpp>
-#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/cobalt.hpp>
+
 #include <algorithm>
-#include <random>
 #include <cstring>
 #include <format>
+#include <random>
 
 namespace acpp {
 
-// ============================================================================
-// DNS 报文格式常量
-// ============================================================================
 namespace dns {
 
-constexpr uint16_t FLAG_QR    = 0x8000;  // Query/Response
-constexpr uint16_t FLAG_RCODE = 0x000F;  // Response Code
+constexpr uint16_t FLAG_QR    = 0x8000;
+constexpr uint16_t FLAG_RCODE = 0x000F;
 
 constexpr uint16_t TYPE_A    = 1;
 constexpr uint16_t TYPE_AAAA = 28;
 
 constexpr uint8_t RCODE_OK         = 0;
-constexpr uint8_t RCODE_NAME_ERROR = 3;  // NXDOMAIN
+constexpr uint8_t RCODE_NAME_ERROR = 3;
 
 }  // namespace dns
 
 namespace {
 
-std::string MakeSharedStateKey(const DnsService::Config& config) {
-    std::string key = std::to_string(config.cache_size)
-        + "|" + std::to_string(config.timeout_sec)
-        + "|" + std::to_string(config.min_ttl)
-        + "|" + std::to_string(config.max_ttl);
-    for (const auto& server : config.servers) {
-        key += "|" + server;
+DnsResult MakeCachedResult(const DnsCacheEntry& entry) {
+    DnsResult result;
+    if (entry.negative) {
+        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error_msg = "NXDOMAIN (cached)";
+    } else {
+        result.addresses = entry.addresses;
+        result.ttl = entry.ttl;
     }
-    return key;
+    result.from_cache = true;
+    return result;
 }
 
-cobalt::task<void> PrefetchDomain(DnsService* service, std::string domain) {
-    try {
-        auto result = co_await service->Resolve(domain, false);
-        if (result.Ok()) {
-            LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
-                      domain,
-                      result.addresses[0].to_string(),
-                      result.ttl);
-        } else {
-            LOG_DEBUG("DNS prefetch failed: {} - {}",
-                      domain, result.error_msg);
-        }
-    } catch (const std::exception& e) {
-        LOG_DEBUG("DNS prefetch exception: {} - {}", domain, e.what());
+void StoreResult(DnsCache& cache,
+                 const std::string& domain,
+                 bool prefer_ipv6,
+                 const DnsResult& result) {
+    if (result.Ok()) {
+        cache.Put(domain, result.addresses, result.ttl, prefer_ipv6);
+    } else if (result.error == ErrorCode::DNS_NO_RECORD) {
+        cache.PutNegative(domain, 60, prefer_ipv6);
     }
 }
 
 }  // namespace
 
-// ============================================================================
-// DnsService 实现
-// ============================================================================
-
-struct DnsService::InflightResolve {
-    std::mutex lock;
-    DnsResult result;
-    bool completed = false;
-    std::vector<std::shared_ptr<net::steady_timer>> waiters;
-};
-
-struct DnsService::SharedState {
-    explicit SharedState(const Config& config)
-        : cache(std::make_shared<DnsCache>(
-            config.cache_size, config.min_ttl, config.max_ttl)) {}
-
-    std::shared_ptr<DnsCache> cache;
-    std::mutex inflight_lock;
-    std::unordered_map<ResolveKey, std::shared_ptr<InflightResolve>, ResolveKeyHash>
-        inflight_resolves;
-};
-
-std::shared_ptr<DnsService::SharedState> DnsService::AcquireSharedState(
-    const Config& config) {
-    static std::mutex shared_state_mu;
-    static std::unordered_map<std::string, std::weak_ptr<SharedState>> shared_states;
-
-    const std::string key = MakeSharedStateKey(config);
-
-    std::lock_guard lock(shared_state_mu);
-    if (auto it = shared_states.find(key); it != shared_states.end()) {
-        if (auto shared_state = it->second.lock()) {
-            return shared_state;
-        }
-    }
-
-    auto shared_state = std::make_shared<SharedState>(config);
-    shared_states[key] = shared_state;
-    return shared_state;
-}
-
 DnsService::DnsService(net::any_io_executor executor, const Config& config)
-    : executor_(executor), config_(config) {
-    
-    // 初始化缓存
-    shared_state_ = AcquireSharedState(config);
-    cache_ = shared_state_->cache;
-    
-    // 解析服务器地址
+    : executor_(std::move(executor))
+    , config_(config)
+    , cache_(std::make_shared<DnsCache>(
+        config.cache_size, config.min_ttl, config.max_ttl)) {
     servers_.reserve(config.servers.size());
     for (const auto& server : config.servers) {
         boost::system::error_code ec;
@@ -120,83 +67,54 @@ DnsService::DnsService(net::any_io_executor executor, const Config& config)
             LOG_WARN("Invalid DNS server address: {}", server);
         }
     }
-    
+
     if (servers_.empty()) {
-        // 添加默认服务器
         servers_.emplace_back(net::ip::make_address("8.8.8.8"), 53);
+        servers_.emplace_back(net::ip::make_address("1.1.1.1"), 53);
     }
-    
-    // 随机初始化 txid
+
     std::random_device rd;
-    txid_counter_ = static_cast<uint16_t>(rd() & 0xFFFF);
+    txid_counter_.store(static_cast<uint16_t>(rd() & 0xFFFF),
+                        std::memory_order_relaxed);
 }
 
 DnsService::~DnsService() = default;
 
 cobalt::task<DnsResult> DnsService::Resolve(
     const std::string& domain, bool prefer_ipv6) {
-    
-    // 先尝试解析为 IP（不需要 DNS）
     boost::system::error_code ec;
     auto addr = net::ip::make_address(domain, ec);
     if (!ec) {
         DnsResult result;
         result.addresses.reserve(1);
         result.addresses.push_back(addr);
-        result.from_cache = false;
         co_return result;
     }
-    
-    // 查询缓存
-    auto cached = cache_->Get(domain, prefer_ipv6);
-    if (cached) {
-        DnsResult result;
-        if (cached->negative) {
-            result.error = ErrorCode::DNS_NO_RECORD;
-            result.error_msg = "NXDOMAIN (cached)";
-        } else {
-            result.addresses = cached->addresses;
-            result.ttl = cached->ttl;
-        }
-        result.from_cache = true;
-        co_return result;
+
+    if (auto cached = cache_->Get(domain, prefer_ipv6)) {
+        co_return MakeCachedResult(*cached);
     }
 
     ResolveKey key{domain, prefer_ipv6};
-    std::shared_ptr<InflightResolve> inflight;
-    bool is_leader = false;
-    {
-        std::lock_guard lock(shared_state_->inflight_lock);
-        auto it = shared_state_->inflight_resolves.find(key);
-        if (it == shared_state_->inflight_resolves.end()) {
-            inflight = std::make_shared<InflightResolve>();
-            shared_state_->inflight_resolves.emplace(key, inflight);
-            is_leader = true;
-        } else {
-            inflight = it->second;
+    auto existing = inflight_resolves_.find(key);
+    if (existing != inflight_resolves_.end()) {
+        auto inflight = existing->second;
+        if (inflight->completed) {
+            co_return inflight->result;
         }
-    }
 
-    if (!is_leader) {
-        std::shared_ptr<net::steady_timer> wait_timer;
-
-        {
-            std::lock_guard lock(inflight->lock);
-            if (inflight->completed) {
-                co_return inflight->result;
-            }
-            wait_timer = std::make_shared<net::steady_timer>(executor_);
-            wait_timer->expires_at(net::steady_timer::time_point::max());
-            inflight->waiters.push_back(wait_timer);
-        }
+        auto wait_timer = std::make_shared<net::steady_timer>(executor_);
+        wait_timer->expires_at(net::steady_timer::time_point::max());
+        inflight->waiters.push_back(wait_timer);
 
         auto [wait_ec] = co_await wait_timer->async_wait(
             net::as_tuple(cobalt::use_op));
         (void)wait_ec;
-
-        std::lock_guard lock(inflight->lock);
         co_return inflight->result;
     }
+
+    auto inflight = std::make_shared<InflightResolve>();
+    inflight_resolves_.emplace(key, inflight);
 
     DnsResult result;
     try {
@@ -209,33 +127,15 @@ cobalt::task<DnsResult> DnsService::Resolve(
         result.error_msg = "DNS resolve exception";
     }
 
-    // 缓存结果（使用实际 TTL）
-    if (result.Ok()) {
-        cache_->Put(domain, result.addresses, result.ttl, prefer_ipv6);
-    } else if (result.error == ErrorCode::DNS_NO_RECORD) {
-        cache_->PutNegative(domain, 60, prefer_ipv6);
-    }
+    StoreResult(*cache_, domain, prefer_ipv6, result);
 
-    std::vector<std::shared_ptr<net::steady_timer>> waiters;
-    {
-        std::lock_guard lock(inflight->lock);
-        inflight->completed = true;
-        inflight->result = result;
-        waiters = std::move(inflight->waiters);
-    }
+    inflight->completed = true;
+    inflight->result = result;
+    auto waiters = std::move(inflight->waiters);
+    inflight_resolves_.erase(key);
 
     for (auto& waiter : waiters) {
-        net::post(waiter->get_executor(), [timer = std::move(waiter)]() mutable {
-            timer->expires_at(net::steady_timer::clock_type::now());
-        });
-    }
-
-    {
-        std::lock_guard lock(shared_state_->inflight_lock);
-        auto it = shared_state_->inflight_resolves.find(key);
-        if (it != shared_state_->inflight_resolves.end() && it->second == inflight) {
-            shared_state_->inflight_resolves.erase(it);
-        }
+        waiter->cancel();
     }
 
     co_return result;
@@ -243,71 +143,52 @@ cobalt::task<DnsResult> DnsService::Resolve(
 
 cobalt::task<DnsResult> DnsService::DoResolve(
     const std::string& domain, bool prefer_ipv6) {
-    DnsResult result;
-    net::ip::tcp::resolver resolver(executor_);
-    auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
-        domain,
-        "0",
-        net::as_tuple(cobalt::use_op));
+    auto query_family = [this, &domain](bool query_aaaa) -> cobalt::task<DnsResult> {
+        DnsResult last_result;
+        last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        last_result.error_msg = "DNS server unavailable";
 
-    if (resolve_ec) {
-        if (resolve_ec == net::error::host_not_found ||
-            resolve_ec == net::error::no_data) {
-            result.error = ErrorCode::DNS_NO_RECORD;
-        } else {
-            result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        for (const auto& server : servers_) {
+            auto result = co_await QueryServer(server, domain, query_aaaa);
+            if (result.Ok() || result.error == ErrorCode::DNS_NO_RECORD) {
+                co_return result;
+            }
+            last_result = std::move(result);
         }
-        result.error_msg = resolve_ec.message();
-        co_return result;
-    }
 
-    auto append_unique = [](std::vector<net::ip::address>& out,
-                            const net::ip::address& address) {
-        if (std::find(out.begin(), out.end(), address) == out.end()) {
-            out.push_back(address);
-        }
+        co_return last_result;
     };
 
-    std::vector<net::ip::address> preferred;
-    std::vector<net::ip::address> alternate;
-    for (const auto& entry : endpoints) {
-        const auto address = entry.endpoint().address();
-        if (address.is_v6() == prefer_ipv6) {
-            append_unique(preferred, address);
-        } else {
-            append_unique(alternate, address);
-        }
+    DnsResult primary = co_await query_family(prefer_ipv6);
+    if (primary.Ok()) {
+        co_return primary;
     }
 
-    preferred.insert(preferred.end(), alternate.begin(), alternate.end());
-    if (preferred.empty()) {
-        result.error = ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "resolver returned no addresses";
-        co_return result;
+    DnsResult alternate = co_await query_family(!prefer_ipv6);
+    if (alternate.Ok()) {
+        co_return alternate;
     }
 
-    result.addresses = std::move(preferred);
-    result.ttl = config_.min_ttl;
-    result.error = ErrorCode::OK;
-    co_return result;
+    if (primary.error == ErrorCode::DNS_NO_RECORD &&
+        alternate.error == ErrorCode::DNS_NO_RECORD) {
+        co_return primary;
+    }
+
+    if (primary.error != ErrorCode::DNS_NO_RECORD) {
+        co_return primary;
+    }
+    co_return alternate;
 }
 
 cobalt::task<DnsResult> DnsService::QueryServer(
     const net::ip::udp::endpoint& server,
     const std::string& domain,
     bool query_aaaa) {
-    
     DnsResult result;
-    
-    // 生成事务 ID
-    uint16_t txid = txid_counter_.fetch_add(1, std::memory_order_relaxed);
-    
-    // 构建查询报文
+    const uint16_t txid = txid_counter_.fetch_add(1, std::memory_order_relaxed);
     auto query = BuildQuery(domain, txid, query_aaaa);
-    
-    // 创建 UDP socket
+
     udp::socket socket(executor_);
-    
     boost::system::error_code ec;
     socket.open(server.protocol(), ec);
     if (ec) {
@@ -315,18 +196,28 @@ cobalt::task<DnsResult> DnsService::QueryServer(
         result.error_msg = ec.message();
         co_return result;
     }
-    
-    // 发送查询
-    co_await socket.async_send_to(
-        net::buffer(query), server, cobalt::use_op);
-    
-    // 等待响应（带超时）- 使用 Asio 内置 cancel_after，避免手写取消回调竞态
+
+    socket.connect(server, ec);
+    if (ec) {
+        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = ec.message();
+        co_return result;
+    }
+
+    auto [send_ec, sent] = co_await socket.async_send(
+        net::buffer(query),
+        net::as_tuple(cobalt::use_op));
+    (void)sent;
+    if (send_ec) {
+        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = send_ec.message();
+        co_return result;
+    }
+
     std::array<uint8_t, 512> response{};
-    udp::endpoint sender;
     net::steady_timer timeout_timer(executor_);
-    auto [recv_ec, received] = co_await socket.async_receive_from(
+    auto [recv_ec, received] = co_await socket.async_receive(
         net::buffer(response),
-        sender,
         net::cancel_after(
             timeout_timer,
             std::chrono::seconds(config_.timeout_sec),
@@ -338,24 +229,22 @@ cobalt::task<DnsResult> DnsService::QueryServer(
         result.error_msg = "DNS query timed out";
         co_return result;
     }
-    
+
     if (recv_ec) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = recv_ec.message();
         co_return result;
     }
-    
-    // 解析响应
+
     uint32_t ttl = config_.min_ttl;
     auto parsed = ParseResponse(
         std::span<const uint8_t>(response.data(), received), txid, ttl);
-    
     if (!parsed.Ok()) {
         result.error = parsed.error;
         result.error_msg = parsed.error_msg;
         co_return result;
     }
-    
+
     result.addresses = std::move(parsed.addresses);
     result.ttl = parsed.ttl;
     result.error = ErrorCode::OK;
@@ -364,68 +253,58 @@ cobalt::task<DnsResult> DnsService::QueryServer(
 
 std::vector<uint8_t> DnsService::BuildQuery(
     const std::string& domain, uint16_t txid, bool query_aaaa) {
-    
     std::vector<uint8_t> query;
     query.reserve(18 + domain.size());
-    
-    // Header (12 bytes)
-    // Transaction ID
+
     query.push_back(static_cast<uint8_t>(txid >> 8));
     query.push_back(static_cast<uint8_t>(txid & 0xFF));
-    
-    // Flags: Standard query, recursion desired
-    query.push_back(0x01);  // RD = 1
+
+    query.push_back(0x01);
     query.push_back(0x00);
-    
-    // QDCOUNT = 1
+
     query.push_back(0x00);
     query.push_back(0x01);
-    
-    // ANCOUNT = 0
+
     query.push_back(0x00);
     query.push_back(0x00);
-    
-    // NSCOUNT = 0
+
     query.push_back(0x00);
     query.push_back(0x00);
-    
-    // ARCOUNT = 0
+
     query.push_back(0x00);
     query.push_back(0x00);
-    
-    // Question section
-    // Domain name in DNS format
+
     size_t pos = 0;
     while (pos < domain.size()) {
         size_t dot = domain.find('.', pos);
         if (dot == std::string::npos) {
             dot = domain.size();
         }
-        
-        size_t len = dot - pos;
+
+        const size_t len = dot - pos;
         query.push_back(static_cast<uint8_t>(len));
         for (size_t i = pos; i < dot; ++i) {
             query.push_back(static_cast<uint8_t>(domain[i]));
         }
-        
+
         pos = dot + 1;
     }
-    query.push_back(0x00);  // 结束标记
-    
-    // QTYPE
-    uint16_t qtype = query_aaaa ? dns::TYPE_AAAA : dns::TYPE_A;
+    query.push_back(0x00);
+
+    const uint16_t qtype = query_aaaa ? dns::TYPE_AAAA : dns::TYPE_A;
     query.push_back(static_cast<uint8_t>(qtype >> 8));
     query.push_back(static_cast<uint8_t>(qtype & 0xFF));
-    
-    // QCLASS = IN
+
     query.push_back(0x00);
     query.push_back(0x01);
-    
+
     return query;
 }
 
 DnsService::ParsedResponse DnsService::ParseResponse(
-    std::span<const uint8_t> response, uint16_t expected_txid, uint32_t& out_ttl) {
+    std::span<const uint8_t> response,
+    uint16_t expected_txid,
+    uint32_t& out_ttl) {
     ParsedResponse result;
 
     if (response.size() < 12) {
@@ -433,24 +312,24 @@ DnsService::ParsedResponse DnsService::ParseResponse(
         result.error_msg = "DNS response too short";
         return result;
     }
-    
-    // 检查事务 ID
-    uint16_t txid = (static_cast<uint16_t>(response[0]) << 8) | response[1];
+
+    const uint16_t txid =
+        (static_cast<uint16_t>(response[0]) << 8) | response[1];
     if (txid != expected_txid) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = "DNS transaction ID mismatch";
         return result;
     }
-    
-    // 检查 flags
-    uint16_t flags = (static_cast<uint16_t>(response[2]) << 8) | response[3];
+
+    const uint16_t flags =
+        (static_cast<uint16_t>(response[2]) << 8) | response[3];
     if (!(flags & dns::FLAG_QR)) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS packet is not a response";
         return result;
     }
-    
-    uint8_t rcode = flags & dns::FLAG_RCODE;
+
+    const uint8_t rcode = flags & dns::FLAG_RCODE;
     if (rcode == dns::RCODE_NAME_ERROR) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NXDOMAIN";
@@ -469,37 +348,33 @@ DnsService::ParsedResponse DnsService::ParseResponse(
                 break;
             default:
                 result.error = ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = std::format("DNS response error rcode={}", rcode);
+                result.error_msg = std::format(
+                    "DNS response error rcode={}", rcode);
                 break;
         }
         return result;
     }
-    
-    // 解析 counts
-    uint16_t qdcount = (static_cast<uint16_t>(response[4]) << 8) | response[5];
-    uint16_t ancount = (static_cast<uint16_t>(response[6]) << 8) | response[7];
-    
+
+    const uint16_t qdcount =
+        (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    const uint16_t ancount =
+        (static_cast<uint16_t>(response[6]) << 8) | response[7];
     if (ancount == 0) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NODATA";
         result.negative_cacheable = true;
         return result;
     }
-    
-    // 跳过 Header (12 bytes)
+
     size_t pos = 12;
-    
-    // 跳过 Question section
     for (uint16_t i = 0; i < qdcount; ++i) {
-        // 跳过域名
         while (pos < response.size()) {
-            uint8_t len = response[pos];
+            const uint8_t len = response[pos];
             if (len == 0) {
-                pos++;
+                ++pos;
                 break;
             }
             if ((len & 0xC0) == 0xC0) {
-                // 压缩指针
                 pos += 2;
                 break;
             }
@@ -510,20 +385,18 @@ DnsService::ParsedResponse DnsService::ParseResponse(
             result.error_msg = "DNS question section truncated";
             return result;
         }
-        pos += 4;  // QTYPE + QCLASS
+        pos += 4;
     }
-    
-    // 解析 Answer section
+
     std::vector<net::ip::address> addresses;
     addresses.reserve(ancount);
     uint32_t min_ttl = UINT32_MAX;
-    
+
     for (uint16_t i = 0; i < ancount && pos < response.size(); ++i) {
-        // 跳过域名
         while (pos < response.size()) {
-            uint8_t len = response[pos];
+            const uint8_t len = response[pos];
             if (len == 0) {
-                pos++;
+                ++pos;
                 break;
             }
             if ((len & 0xC0) == 0xC0) {
@@ -532,53 +405,52 @@ DnsService::ParsedResponse DnsService::ParseResponse(
             }
             pos += len + 1;
         }
-        
+
         if (pos + 10 > response.size()) {
             result.error = ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;
         }
-        
-        uint16_t type = (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
-        // uint16_t cls = (static_cast<uint16_t>(response[pos + 2]) << 8) | response[pos + 3];
-        uint32_t ttl = (static_cast<uint32_t>(response[pos + 4]) << 24) |
-                       (static_cast<uint32_t>(response[pos + 5]) << 16) |
-                       (static_cast<uint32_t>(response[pos + 6]) << 8) |
-                       response[pos + 7];
-        uint16_t rdlength = (static_cast<uint16_t>(response[pos + 8]) << 8) | response[pos + 9];
-        
+
+        const uint16_t type =
+            (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
+        const uint32_t ttl =
+            (static_cast<uint32_t>(response[pos + 4]) << 24) |
+            (static_cast<uint32_t>(response[pos + 5]) << 16) |
+            (static_cast<uint32_t>(response[pos + 6]) << 8) |
+            response[pos + 7];
+        const uint16_t rdlength =
+            (static_cast<uint16_t>(response[pos + 8]) << 8) | response[pos + 9];
+
         pos += 10;
-        
         if (pos + rdlength > response.size()) {
             result.error = ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer data truncated";
             return result;
         }
-        
+
         min_ttl = std::min(min_ttl, ttl);
-        
+
         if (type == dns::TYPE_A && rdlength == 4) {
-            // IPv4
             net::ip::address_v4::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 4);
             addresses.emplace_back(net::ip::address_v4(bytes));
         } else if (type == dns::TYPE_AAAA && rdlength == 16) {
-            // IPv6
             net::ip::address_v6::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 16);
             addresses.emplace_back(net::ip::address_v6(bytes));
         }
-        
+
         pos += rdlength;
     }
-    
+
     if (addresses.empty()) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "No supported DNS records in response";
         result.negative_cacheable = true;
         return result;
     }
-    
+
     out_ttl = (min_ttl == UINT32_MAX) ? 60 : min_ttl;
     result.addresses = std::move(addresses);
     result.ttl = out_ttl;
@@ -595,42 +467,37 @@ void DnsService::ClearCache() {
 
 cobalt::task<void> DnsService::Prefetch(
     const std::vector<std::string>& domains) {
-    
     if (domains.empty()) {
         co_return;
     }
-    
-    LOG_DEBUG("DNS prefetch starting for {} domains", domains.size());
-    
-    for (const auto& domain : domains) {
-        // 跳过空域名
-        if (domain.empty()) {
-            continue;
-        }
-        
-        // 跳过已缓存的域名
-        auto cached = cache_->Get(domain, false);
-        if (cached) {
-            continue;
-        }
-        
-        // 并发发起解析，不等待结果
-        cobalt::spawn(executor_,
-            PrefetchDomain(this, domain),
-            net::detached);
-    }
-    
-    co_return;
-}
 
-// ============================================================================
-// 工厂函数
-// ============================================================================
+    LOG_DEBUG("DNS prefetch starting for {} domains", domains.size());
+    for (const auto& domain : domains) {
+        if (domain.empty() || cache_->Get(domain, false)) {
+            continue;
+        }
+
+        try {
+            auto result = co_await Resolve(domain, false);
+            if (result.Ok()) {
+                LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
+                          domain,
+                          result.addresses.front().to_string(),
+                          result.ttl);
+            } else {
+                LOG_DEBUG("DNS prefetch failed: {} - {}",
+                          domain, result.error_msg);
+            }
+        } catch (const std::exception& e) {
+            LOG_DEBUG("DNS prefetch exception: {} - {}", domain, e.what());
+        }
+    }
+}
 
 std::unique_ptr<IDnsService> CreateDnsService(
     net::any_io_executor executor,
     const DnsService::Config& config) {
-    return std::make_unique<DnsService>(executor, config);
+    return std::make_unique<DnsService>(std::move(executor), config);
 }
 
 }  // namespace acpp
