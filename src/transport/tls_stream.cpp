@@ -88,6 +88,10 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
 
 namespace {
 
+[[noreturn]] void ThrowTlsWriteError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
 struct AutoSignState {
     EVP_PKEY* pkey = nullptr;
     std::mutex mu;
@@ -425,14 +429,20 @@ cobalt::task<bool> TlsStream::FlushWriteBio() {
             alignas(64) std::array<uint8_t, kFlushBufSize> buf{};
             int read = BIO_read(write_bio_, buf.data(), pending);
             if (read > 0) {
-                co_await inner_->AsyncWrite(net::buffer(buf.data(), read));
+                size_t written = co_await inner_->AsyncWrite(net::buffer(buf.data(), read));
+                if (written != static_cast<size_t>(read)) {
+                    co_return false;
+                }
             }
         } else {
             // 超大 pending（TLS 握手大证书链等），堆分配回退
             std::vector<uint8_t> buf(pending);
             int read = BIO_read(write_bio_, buf.data(), pending);
             if (read > 0) {
-                co_await inner_->AsyncWrite(net::buffer(buf.data(), read));
+                size_t written = co_await inner_->AsyncWrite(net::buffer(buf.data(), read));
+                if (written != static_cast<size_t>(read)) {
+                    co_return false;
+                }
             }
         }
     } catch (...) {
@@ -503,7 +513,7 @@ cobalt::task<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
 cobalt::task<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     if (!handshake_done_) {
         if (!co_await Handshake()) {
-            co_return 0;
+            ThrowTlsWriteError("TLS handshake failed during write");
         }
     }
     
@@ -520,23 +530,31 @@ cobalt::task<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
             
             // 刷新写缓冲
             if (!co_await FlushWriteBio()) {
-                break;
+                ThrowTlsWriteError("TLS flush write BIO failed");
             }
         } else {
             int err = SSL_get_error(ssl_, ret);
             if (err == SSL_ERROR_WANT_WRITE) {
-                co_await FlushWriteBio();
+                if (!co_await FlushWriteBio()) {
+                    ThrowTlsWriteError("TLS flush write BIO failed");
+                }
             } else if (err == SSL_ERROR_WANT_READ) {
                 auto n = co_await inner_->AsyncRead(net::buffer(read_buffer_));
                 if (n > 0) {
                     BIO_write(read_bio_, read_buffer_.data(), static_cast<int>(n));
+                } else {
+                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
                 }
             } else {
-                break;
+                ThrowTlsWriteError("TLS write failed");
             }
         }
     }
-    
+
+    if (total_written != buf.size()) {
+        ThrowTlsWriteError("TLS partial write");
+    }
+
     co_return total_written;
 }
 
