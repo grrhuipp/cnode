@@ -12,6 +12,20 @@ constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
 
 }  // namespace
 
+void VMessServerAsyncStream::EnsureReadBuffers() {
+    if (read_crypto_buf_.size() != BUF_SIZE) {
+        read_crypto_buf_.resize(BUF_SIZE);
+        read_spare_buf_.resize(BUF_SIZE);
+    }
+}
+
+void VMessServerAsyncStream::EnsureWriteBuffers() {
+    if (write_crypto_buf_.size() != BUF_SIZE) {
+        write_crypto_buf_.resize(BUF_SIZE);
+        write_output_buf_.resize(BUF_SIZE + 2);
+    }
+}
+
 VMessServerAsyncStream::VMessServerAsyncStream(
     std::unique_ptr<AsyncStream> inner,
     VMessRequest&& request)
@@ -248,8 +262,11 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
                 co_return;
             }
 
+            EnsureWriteBuffers();
+
             // 加密到 write_crypto_buf_
-            ssize_t enc_len = write_cipher_->Encrypt(data + offset, chunk_size, write_crypto_buf_);
+            ssize_t enc_len = write_cipher_->Encrypt(
+                data + offset, chunk_size, write_crypto_buf_.data());
             if (enc_len < 0) {
                 co_return;
             }
@@ -278,7 +295,7 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
             out[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
             out[1] = static_cast<uint8_t>(masked_len & 0xFF);
-            std::memcpy(out + 2, write_crypto_buf_, enc_len);
+            std::memcpy(out + 2, write_crypto_buf_.data(), enc_len);
 
             if (padding_len > 0) {
                 RAND_bytes(out + 2 + enc_len, static_cast<int>(padding_len));
@@ -329,7 +346,8 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
     // EOF 标记
     if (chunk_len == overhead + padding_len) {
         if (chunk_len > 0 && chunk_len <= BUF_SIZE) {
-            co_await ReadFull(read_crypto_buf_, chunk_len);
+            EnsureReadBuffers();
+            co_await ReadFull(read_crypto_buf_.data(), chunk_len);
         }
         LOG_ACCESS_DEBUG("VMess stream: ReadChunk EOF marker received after {} chunks", read_chunk_count_);
         read_eof_ = true;
@@ -352,7 +370,8 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
         co_return -1;
     }
 
-    if (!co_await ReadFull(read_crypto_buf_, chunk_len)) {
+    EnsureReadBuffers();
+    if (!co_await ReadFull(read_crypto_buf_.data(), chunk_len)) {
         LOG_ACCESS_DEBUG("VMess stream: ReadChunk ReadFull failed chunk#{} chunk_len={} "
                          "(TCP 连接在 chunk body 传输中断开)",
                          read_chunk_count_, chunk_len);
@@ -366,7 +385,8 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
     size_t expected_plain_len = data_len - overhead;
     if (max_len < expected_plain_len) {
         // 用户 buffer 不够，回退到 read_spare_buf_
-        ssize_t dec_len = read_cipher_->Decrypt(read_crypto_buf_, data_len, read_spare_buf_);
+        ssize_t dec_len = read_cipher_->Decrypt(
+            read_crypto_buf_.data(), data_len, read_spare_buf_.data());
         if (dec_len < 0) {
             LOG_ACCESS_DEBUG("VMess stream: ReadChunk decrypt FAILED chunk#{} data_len={} security={} "
                              "raw_hex=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}...] "
@@ -385,11 +405,13 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
             co_return -1;
         }
         // 拷贝能放下的部分
-        size_t copy = std::min(max_len, static_cast<size_t>(dec_len));
-        std::memcpy(buf, read_spare_buf_, copy);
+        const size_t dec_size = static_cast<size_t>(dec_len);
+        size_t copy = std::min(max_len, dec_size);
+        std::memcpy(buf, read_spare_buf_.data(), copy);
         // 剩余部分存入 read_buffer_
-        if (static_cast<size_t>(dec_len) > copy) {
-            read_buffer_.assign(read_spare_buf_ + copy, read_spare_buf_ + dec_len);
+        if (dec_size > copy) {
+            read_buffer_.assign(read_spare_buf_.begin() + copy,
+                                read_spare_buf_.begin() + dec_size);
             read_buffer_offset_ = 0;
         }
         read_chunk_count_++;
@@ -397,7 +419,7 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
     }
 
     // 直接解密到用户 buffer（零拷贝）
-    ssize_t dec_len = read_cipher_->Decrypt(read_crypto_buf_, data_len, buf);
+    ssize_t dec_len = read_cipher_->Decrypt(read_crypto_buf_.data(), data_len, buf);
     if (dec_len < 0) {
         LOG_ACCESS_DEBUG("VMess stream: ReadChunk decrypt FAILED chunk#{} data_len={} security={} "
                          "raw_hex=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}...] "
@@ -427,8 +449,10 @@ cobalt::task<bool> VMessServerAsyncStream::WriteChunk(const uint8_t* data, size_
         co_return false;
     }
 
+    EnsureWriteBuffers();
+
     // 加密到写方向缓冲区
-    ssize_t enc_len = write_cipher_->Encrypt(data, len, write_crypto_buf_);
+    ssize_t enc_len = write_cipher_->Encrypt(data, len, write_crypto_buf_.data());
     if (enc_len < 0) {
         LOG_ACCESS_DEBUG("VMess stream: WriteChunk encrypt failed (len={}, chunk#{})", len, write_chunk_count_);
         co_return false;
@@ -454,15 +478,15 @@ cobalt::task<bool> VMessServerAsyncStream::WriteChunk(const uint8_t* data, size_
     size_t output_size = 2 + enc_len + padding_len;
 
     // 组装输出到写方向 I/O 缓冲区
-    write_output_buf_[0] = (masked_len >> 8) & 0xFF;
-    write_output_buf_[1] = masked_len & 0xFF;
-    std::memcpy(write_output_buf_ + 2, write_crypto_buf_, enc_len);
+    write_output_buf_[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
+    write_output_buf_[1] = static_cast<uint8_t>(masked_len & 0xFF);
+    std::memcpy(write_output_buf_.data() + 2, write_crypto_buf_.data(), enc_len);
 
     if (padding_len > 0) {
-        RAND_bytes(write_output_buf_ + 2 + enc_len, static_cast<int>(padding_len));
+        RAND_bytes(write_output_buf_.data() + 2 + enc_len, static_cast<int>(padding_len));
     }
 
-    co_return co_await WriteFull(write_output_buf_, output_size);
+    co_return co_await WriteFull(write_output_buf_.data(), output_size);
 }
 
 cobalt::task<bool> VMessServerAsyncStream::SendEOFMarker() {

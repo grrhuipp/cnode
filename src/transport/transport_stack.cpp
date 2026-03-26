@@ -108,6 +108,26 @@ std::shared_ptr<SslContext> AcquireClientTlsContext(const TlsConfig& config) {
     return ctx;
 }
 
+[[nodiscard]] std::string_view ExtractHeaderValue(std::string_view request,
+                                                  std::string_view name) {
+    const size_t pos = request.find(name);
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+
+    size_t start = pos + name.size();
+    while (start < request.size() &&
+           (request[start] == ' ' || request[start] == '\t')) {
+        ++start;
+    }
+
+    const size_t end = request.find("\r\n", start);
+    if (end == std::string_view::npos) {
+        return {};
+    }
+    return request.substr(start, end - start);
+}
+
 // WebSocket 服务端握手（从原始流读 HTTP 请求，回复 101，返回 WsServerStream）
 cobalt::task<TransportBuildResult> DoWsServerHandshake(
     std::unique_ptr<AsyncStream> stream,
@@ -136,7 +156,7 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    std::string request(unsafe::ptr_cast<char>(buf.data()), total);
+    const std::string_view request(unsafe::ptr_cast<char>(buf.data()), total);
 
     // 验证 Upgrade 头
     bool has_upgrade =
@@ -158,18 +178,11 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
     }
 
     // 提取单个 HTTP header 值（找不到则返回空串）
-    auto extract_header_val = [&](std::string_view name) -> std::string {
-        size_t pos = request.find(name);
-        if (pos == std::string::npos) return {};
-        size_t start = pos + name.size();
-        while (start < request.size() && request[start] == ' ') start++;
-        size_t end = request.find("\r\n", start);
-        return end != std::string::npos ? request.substr(start, end - start) : std::string{};
-    };
-
     // 提取 Sec-WebSocket-Key
-    std::string ws_key = extract_header_val("Sec-WebSocket-Key:");
-    if (ws_key.empty()) ws_key = extract_header_val("sec-websocket-key:");
+    std::string_view ws_key = ExtractHeaderValue(request, "Sec-WebSocket-Key:");
+    if (ws_key.empty()) {
+        ws_key = ExtractHeaderValue(request, "sec-websocket-key:");
+    }
     if (ws_key.empty()) {
         LOG_ACCESS_DEBUG("[WS:{}] server: missing Sec-WebSocket-Key header", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -177,20 +190,20 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
 
     // 提取真实客户端 IP（CDN 透传头）
     if (out_real_ip && !ws_cfg.real_ip_header.empty()) {
-        std::string val = extract_header_val(ws_cfg.real_ip_header + ":");
+        std::string_view val = ExtractHeaderValue(request, ws_cfg.real_ip_header + ":");
         if (val.empty()) {
             // 大小写不敏感退路：转小写后再找一次
             std::string lower_name = ws_cfg.real_ip_header;
             for (auto& c : lower_name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            val = extract_header_val(lower_name + ":");
+            val = ExtractHeaderValue(request, lower_name + ":");
         }
         if (!val.empty()) {
             // X-Forwarded-For 可能是逗号分隔列表，取第一个
             auto comma = val.find(',');
-            if (comma != std::string::npos) val = val.substr(0, comma);
-            while (!val.empty() && val.front() == ' ') val.erase(val.begin());
-            while (!val.empty() && val.back()  == ' ') val.pop_back();
-            if (!val.empty()) *out_real_ip = std::move(val);
+            if (comma != std::string_view::npos) val = val.substr(0, comma);
+            while (!val.empty() && val.front() == ' ') val.remove_prefix(1);
+            while (!val.empty() && val.back()  == ' ') val.remove_suffix(1);
+            if (!val.empty()) *out_real_ip = std::string(val);
         }
     }
 

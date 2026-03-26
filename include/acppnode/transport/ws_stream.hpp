@@ -31,6 +31,16 @@ using WsHandshakeResult = std::expected<void, ErrorCode>;
 // ============================================================================
 namespace ws {
 
+struct EncodedFrameHeader {
+    std::array<uint8_t, 14> bytes{};
+    size_t size = 0;
+};
+
+struct EncodedCloseFrame {
+    std::array<uint8_t, 8> bytes{};
+    size_t size = 0;
+};
+
 // 帧类型
 enum class Opcode : uint8_t {
     CONTINUATION = 0x00,
@@ -55,70 +65,77 @@ inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
                      size_t offset = 0);
 
 // 编码帧头
-inline std::vector<uint8_t> EncodeFrameHeader(
+inline EncodedFrameHeader EncodeFrameHeader(
     size_t payload_len, 
     Opcode opcode = Opcode::BINARY,
     bool masked = false,
     const uint8_t* mask_key = nullptr) {
-    
-    std::vector<uint8_t> header;
-    
+    EncodedFrameHeader header;
+    uint8_t* out = header.bytes.data();
+    size_t offset = 0;
+
     // FIN + opcode
-    header.push_back(0x80 | static_cast<uint8_t>(opcode));
-    
+    out[offset++] = static_cast<uint8_t>(0x80 | static_cast<uint8_t>(opcode));
+
     // Mask flag + payload length
     uint8_t len_byte = masked ? 0x80 : 0x00;
     
     if (payload_len <= 125) {
-        header.push_back(len_byte | static_cast<uint8_t>(payload_len));
+        out[offset++] = static_cast<uint8_t>(len_byte | static_cast<uint8_t>(payload_len));
     } else if (payload_len <= 65535) {
-        header.push_back(len_byte | 126);
-        header.push_back(static_cast<uint8_t>(payload_len >> 8));
-        header.push_back(static_cast<uint8_t>(payload_len & 0xFF));
+        out[offset++] = static_cast<uint8_t>(len_byte | 126);
+        out[offset++] = static_cast<uint8_t>(payload_len >> 8);
+        out[offset++] = static_cast<uint8_t>(payload_len & 0xFF);
     } else {
-        header.push_back(len_byte | 127);
+        out[offset++] = static_cast<uint8_t>(len_byte | 127);
         for (int i = 7; i >= 0; --i) {
-            header.push_back(static_cast<uint8_t>((payload_len >> (i * 8)) & 0xFF));
+            out[offset++] = static_cast<uint8_t>((payload_len >> (i * 8)) & 0xFF);
         }
     }
     
     // Mask key (如果需要)
     if (masked && mask_key) {
-        header.insert(header.end(), mask_key, mask_key + 4);
+        std::memcpy(out + offset, mask_key, 4);
+        offset += 4;
     }
-    
+
+    header.size = offset;
     return header;
 }
 
 // 编码 Close 帧
-inline std::vector<uint8_t> EncodeCloseFrame(uint16_t status_code, bool masked = false) {
-    std::vector<uint8_t> frame;
-    
+inline EncodedCloseFrame EncodeCloseFrame(uint16_t status_code, bool masked = false) {
+    EncodedCloseFrame frame;
+    size_t offset = 0;
+
     // Header: FIN + CLOSE opcode
-    frame.push_back(0x88);
-    
+    frame.bytes[offset++] = 0x88;
+
     if (masked) {
         // 客户端：masked + 2 bytes payload + 4 bytes mask
-        frame.push_back(0x82);  // masked + len=2
+        frame.bytes[offset++] = 0x82;  // masked + len=2
         uint8_t mask_key[4];
         if (RAND_bytes(mask_key, sizeof(mask_key)) != 1) [[unlikely]] {
             return {};
         }
-        frame.insert(frame.end(), mask_key, mask_key + 4);
+        std::memcpy(frame.bytes.data() + offset, mask_key, 4);
+        offset += 4;
 
         uint8_t payload[2] = {
             static_cast<uint8_t>((status_code >> 8) & 0xFF),
             static_cast<uint8_t>(status_code & 0xFF),
         };
         MaskData(payload, sizeof(payload), mask_key);
-        frame.insert(frame.end(), payload, payload + sizeof(payload));
+        std::memcpy(frame.bytes.data() + offset, payload, sizeof(payload));
+        offset += sizeof(payload);
     } else {
         // 服务端：unmasked + 2 bytes payload
-        frame.push_back(0x02);  // len=2
-        frame.push_back((status_code >> 8) & 0xFF);
-        frame.push_back(status_code & 0xFF);
+        frame.bytes[offset++] = 0x02;  // len=2
+        frame.bytes[offset++] = static_cast<uint8_t>((status_code >> 8) & 0xFF);
+        frame.bytes[offset++] = static_cast<uint8_t>(status_code & 0xFF);
     }
-    
+
+    frame.size = offset;
     return frame;
 }
 
@@ -144,9 +161,9 @@ inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
 // ============================================================================
 class BaseWsStream : public AsyncStream {
 public:
-    // 16KB 以内的帧合并 header+payload 为单次写入，覆盖绝大多数 relay 包
-    static constexpr size_t kSmallFrameThreshold = 16 * 1024;
-    static constexpr size_t kStreamChunkSize = 16 * 1024;
+    // 将协程帧里的临时大数组压回 4KB/8KB，避免 WS 热路径把每个挂起读写放大成 16KB+。
+    static constexpr size_t kSmallFrameThreshold = 4 * 1024;
+    static constexpr size_t kStreamChunkSize = Buffer::kSize;
     static constexpr size_t kMaxFrameSize = 4 * 1024 * 1024;
 
     BaseWsStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id, bool is_client)
@@ -262,9 +279,9 @@ public:
 
         // 发送 Close 帧（只发送一次，exchange 保证幂等）
         auto close_frame = ws::EncodeCloseFrame(1000, is_client_);
-        if (!close_frame.empty()) {
+        if (close_frame.size != 0) {
             try {
-                co_await inner_->AsyncWrite(net::buffer(close_frame));
+                co_await inner_->AsyncWrite(net::buffer(close_frame.bytes.data(), close_frame.size));
                 LOG_ACCESS_DEBUG("[conn={}] WS {}: sent close frame", conn_id_, is_client_ ? "client" : "server");
             } catch (...) {
                 // 忽略发送错误
@@ -409,8 +426,8 @@ protected:
     std::unique_ptr<AsyncStream> inner_;
     uint64_t conn_id_;
     bool is_client_;
-    CircularBuffer pending_data_{4096};
-    CircularBuffer decoded_buffer_{8192};
+    CircularBuffer pending_data_{512};
+    CircularBuffer decoded_buffer_{1024};
 
 private:
     uint64_t frame_payload_remaining_ = 0;
@@ -445,15 +462,15 @@ public:
 
         if (len <= kSmallFrameThreshold) {
             std::array<uint8_t, kSmallFrameThreshold + 14> frame{};
-            std::memcpy(frame.data(), header.data(), header.size());
-            std::memcpy(frame.data() + header.size(), data, len);
-            if (!co_await WriteFull(frame.data(), header.size() + len)) {
+            std::memcpy(frame.data(), header.bytes.data(), header.size);
+            std::memcpy(frame.data() + header.size, data, len);
+            if (!co_await WriteFull(frame.data(), header.size + len)) {
                 co_return 0;
             }
             co_return len;
         }
 
-        if (!co_await WriteFull(header.data(), header.size())) {
+        if (!co_await WriteFull(header.bytes.data(), header.size)) {
             co_return 0;
         }
 
@@ -499,16 +516,16 @@ public:
 
         if (len <= kSmallFrameThreshold) {
             std::array<uint8_t, kSmallFrameThreshold + 14> frame{};
-            std::memcpy(frame.data(), header.data(), header.size());
-            std::memcpy(frame.data() + header.size(), data, len);
-            ws::MaskData(frame.data() + header.size(), len, mask_key);
-            if (!co_await WriteFull(frame.data(), header.size() + len)) {
+            std::memcpy(frame.data(), header.bytes.data(), header.size);
+            std::memcpy(frame.data() + header.size, data, len);
+            ws::MaskData(frame.data() + header.size, len, mask_key);
+            if (!co_await WriteFull(frame.data(), header.size + len)) {
                 co_return 0;
             }
             co_return len;
         }
 
-        if (!co_await WriteFull(header.data(), header.size())) {
+        if (!co_await WriteFull(header.bytes.data(), header.size)) {
             co_return 0;
         }
 

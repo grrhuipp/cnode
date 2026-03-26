@@ -35,6 +35,9 @@ public:
     cobalt::task<bool> SendResponseHeader();
 
 private:
+    void EnsureReadBuffers();
+    void EnsureWriteBuffers();
+
     // 零拷贝版本：直接读取到指定 buffer
     // 返回: >0 实际读取字节数, 0 EOF, -1 错误
     cobalt::task<ssize_t> ReadChunkInto(uint8_t* buf, size_t max_len);
@@ -88,10 +91,10 @@ private:
     // 读写方向会同时访问缓冲区，因此必须使用独立缓冲区。
     // ========================================================================
     static constexpr size_t BUF_SIZE = MAX_CHUNK_SIZE + 128;
-    alignas(64) uint8_t read_crypto_buf_[BUF_SIZE];        // 读方向：存放从网络读取的加密数据
-    alignas(64) uint8_t read_spare_buf_[BUF_SIZE];         // 读方向：fallback 解密目标
-    alignas(64) uint8_t write_crypto_buf_[BUF_SIZE];       // 写方向：Encrypt 输出
-    alignas(64) uint8_t write_output_buf_[BUF_SIZE + 2];   // 写方向：[header + encrypted + padding]
+    std::vector<uint8_t> read_crypto_buf_;       // 读方向：按需分配，避免每连接预留 2*16KB
+    std::vector<uint8_t> read_spare_buf_;        // 读方向：fallback 解密目标
+    std::vector<uint8_t> write_crypto_buf_;      // 写方向：Encrypt 输出
+    std::vector<uint8_t> write_output_buf_;      // 写方向：[header + encrypted + padding]
     
     uint32_t read_chunk_count_ = 0;
     uint32_t write_chunk_count_ = 0;
