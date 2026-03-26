@@ -1,6 +1,7 @@
 #include "acppnode/dns/dns_service.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/cobalt.hpp>
@@ -349,10 +350,10 @@ cobalt::task<DnsResult> DnsService::QueryServer(
     auto query = BuildQuery(domain, txid, query_aaaa);
     
     // 创建 UDP socket
-    auto socket = std::make_shared<udp::socket>(executor_);
+    udp::socket socket(executor_);
     
     boost::system::error_code ec;
-    socket->open(server.protocol(), ec);
+    socket.open(server.protocol(), ec);
     if (ec) {
         result.error = ErrorCode::SOCKET_CREATE_FAILED;
         result.error_msg = ec.message();
@@ -360,49 +361,31 @@ cobalt::task<DnsResult> DnsService::QueryServer(
     }
     
     // 发送查询
-    co_await socket->async_send_to(
+    co_await socket.async_send_to(
         net::buffer(query), server, cobalt::use_op);
     
-    // 等待响应（带超时）- 使用定时器回调，避免 parallel_group
+    // 等待响应（带超时）- 使用 Asio 内置 cancel_after，避免手写取消回调竞态
     std::array<uint8_t, 512> response{};
-    auto timer = std::make_shared<net::steady_timer>(executor_);
-    struct QueryTimeoutState {
-        std::atomic<bool> timed_out{false};
-        std::atomic<bool> active{true};
-    };
-    auto timeout_state = std::make_shared<QueryTimeoutState>();
-    
-    timer->expires_after(std::chrono::seconds(config_.timeout_sec));
-    timer->async_wait([timeout_state, socket](const boost::system::error_code& ec) {
-        if (!ec && timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
-            timeout_state->timed_out.store(true, std::memory_order_release);
-            boost::system::error_code cancel_ec;
-            socket->cancel(cancel_ec);
-        }
-    });
-    
     udp::endpoint sender;
-    size_t received = 0;
-    
-    try {
-        received = co_await socket->async_receive_from(
-            net::buffer(response), sender, cobalt::use_op);
-        timeout_state->active.store(false, std::memory_order_release);
-        timer->cancel();
-    } catch (const boost::system::system_error& e) {
-        timeout_state->active.store(false, std::memory_order_release);
-        timer->cancel();
-        if (timeout_state->timed_out.load(std::memory_order_acquire)) {
-            result.error = ErrorCode::DNS_TIMEOUT;
-            result.error_msg = "DNS query timed out";
-            co_return result;
-        }
-        ec = e.code();
+    net::steady_timer timeout_timer(executor_);
+    auto [recv_ec, received] = co_await socket.async_receive_from(
+        net::buffer(response),
+        sender,
+        net::cancel_after(
+            timeout_timer,
+            std::chrono::seconds(config_.timeout_sec),
+            net::as_tuple(cobalt::use_op)));
+
+    if (recv_ec == net::error::operation_aborted &&
+        timeout_timer.expiry() <= net::steady_timer::clock_type::now()) {
+        result.error = ErrorCode::DNS_TIMEOUT;
+        result.error_msg = "DNS query timed out";
+        co_return result;
     }
     
-    if (ec) {
+    if (recv_ec) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = ec.message();
+        result.error_msg = recv_ec.message();
         co_return result;
     }
     
