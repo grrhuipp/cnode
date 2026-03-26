@@ -43,7 +43,7 @@ jobs:
       - name: Install Alpine build tools
         run: |
           apk add --no-cache \
-            build-base cmake samurai git curl \
+            build-base binutils cmake samurai git curl \
             zip unzip tar pkgconf linux-headers musl-dev \
             perl bash python3 \
             autoconf automake libtool \
@@ -98,16 +98,18 @@ jobs:
       - name: Build
         run: cmake --build build --parallel $(nproc)
 
-      - name: Verify & strip binary
+      - name: Verify & package binary
         run: |
           file build/cnode
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
+          mkdir -p release-assets
           if [ "${{ matrix.build_type }}" = "Release" ]; then
+            objcopy --only-keep-debug build/cnode build/cnode-linux-amd64.debug
             strip build/cnode
-            mkdir -p release-assets
+            objcopy --add-gnu-debuglink=build/cnode-linux-amd64.debug build/cnode
             cp build/cnode release-assets/cnode-linux-amd64
+            cp build/cnode-linux-amd64.debug release-assets/cnode-linux-amd64.debug
           else
-            mkdir -p release-assets
             cp build/cnode release-assets/cnode-linux-amd64-debug
           fi
           ls -lh release-assets
