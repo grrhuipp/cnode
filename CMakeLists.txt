@@ -319,8 +319,14 @@ target_link_libraries(cnode PRIVATE
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(RANDOM LENGTH 12 ALPHABET "0123456789abcdef" BUILD_ID)
 endif()
-target_compile_definitions(cnode PRIVATE BUILD_ID="${BUILD_ID}")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(BUILD_CHANNEL "debug")
+else()
+    set(BUILD_CHANNEL "release")
+endif()
+target_compile_definitions(cnode PRIVATE BUILD_ID="${BUILD_ID}" BUILD_CHANNEL="${BUILD_CHANNEL}")
 message(STATUS "Build ID: ${BUILD_ID}")
+message(STATUS "Build Channel: ${BUILD_CHANNEL}")
 
 # 条件链接 mimalloc（必须早于其他库以覆盖 malloc/new）
 if(HAS_MIMALLOC)

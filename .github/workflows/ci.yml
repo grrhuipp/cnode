@@ -29,9 +29,6 @@ jobs:
     container:
       image: alpine:3.20
 
-    permissions:
-      contents: write
-
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +37,7 @@ jobs:
     env:
       VCPKG_BINARY_SOURCES: "clear;files,/root/vcpkg-cache,readwrite"
       VCPKG_FORCE_SYSTEM_BINARIES: 1
+      BUILD_ID: ${{ github.run_id }}
 
     steps:
       - name: Install Alpine build tools
@@ -50,7 +48,7 @@ jobs:
             perl bash python3 \
             autoconf automake libtool \
             go nasm \
-            nodejs github-cli
+            nodejs
           # samurai 是 ninja 的轻量替代，vcpkg/cmake 需要 ninja 命令
           ln -sf /usr/bin/samu /usr/bin/ninja
 
@@ -87,10 +85,6 @@ jobs:
             vcpkg-installed-alpine-${{ matrix.build_type }}-
             vcpkg-installed-alpine-
 
-      - name: Generate build ID
-        id: buildid
-        run: echo "id=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')" >> "$GITHUB_OUTPUT"
-
       - name: Configure
         run: |
           cmake -B build -G Ninja \
@@ -99,7 +93,7 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_ID=${{ steps.buildid.outputs.id }}
+            -DBUILD_ID=${{ env.BUILD_ID }}
 
       - name: Build
         run: cmake --build build --parallel $(nproc)
@@ -110,45 +104,47 @@ jobs:
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
           if [ "${{ matrix.build_type }}" = "Release" ]; then
             strip build/cnode
-            cp build/cnode cnode-linux-amd64
-            ls -lh cnode-linux-amd64
+            mkdir -p release-assets
+            cp build/cnode release-assets/cnode-linux-amd64
+          else
+            mkdir -p release-assets
+            cp build/cnode release-assets/cnode-linux-amd64-debug
           fi
+          ls -lh release-assets
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cnode-linux-x64-${{ matrix.build_type }}
-          path: build/cnode
+          name: cnode-release-assets-${{ matrix.build_type }}
+          path: release-assets/*
           if-no-files-found: error
 
-      # 以下步骤仅 Release + push 时执行
-      - name: Fix git safe directory (container ownership mismatch)
-        if: github.event_name == 'push' && matrix.build_type == 'Release'
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.event_name == 'push'
 
-      - name: Delete old release
-        if: github.event_name == 'push' && matrix.build_type == 'Release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: cnode-release-assets-*
+          merge-multiple: true
+
+      - name: Remove old release
         run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cleanup old workflow runs
-        if: github.event_name == 'push' && matrix.build_type == 'Release'
+      - name: Publish release assets
         run: |
-          gh run list --branch "${{ github.ref_name }}" --json databaseId \
-            --jq '.[].databaseId' \
-          | while read -r rid; do
-              [ "$rid" = "${{ github.run_id }}" ] && continue
-              gh run delete "$rid" 2>/dev/null || true
-            done
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish release
-        if: github.event_name == 'push' && matrix.build_type == 'Release'
-        run: |
-          gh release create "${{ github.ref_name }}" cnode-linux-amd64 \
+          gh release create "${{ github.ref_name }}" release-assets/* \
             --title "${{ github.ref_name }}" \
-            --notes "branch: ${{ github.ref_name }}, build_id: ${{ steps.buildid.outputs.id }}"
+            --notes "branch: ${{ github.ref_name }}, build_id: ${{ env.BUILD_ID }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -77,7 +77,10 @@ void PrintVersion() {
 #ifndef BUILD_ID
 #define BUILD_ID "dev"
 #endif
-    std::cout << BUILD_ID << "\n";
+#ifndef BUILD_CHANNEL
+#define BUILD_CHANNEL "release"
+#endif
+    std::cout << BUILD_CHANNEL << ":" << BUILD_ID << "\n";
 }
 
 static std::string FormatRate(double bytes_per_sec) {

@@ -4,7 +4,7 @@
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
 # 每次执行添加/覆盖一个 panel 到同一个 cnode 实例，已有配置文件不会被覆盖
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v build_type"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
@@ -21,6 +21,8 @@ LOG_DIR="$INSTALL_DIR/log"
 usage() {
     echo "用法: bash <(curl -sL ...) [选项]"
     echo ""
+    echo "不带参数时：仅更新 cnode 二进制（默认 release）"
+    echo ""
     echo "必填选项:"
     for opt in $REQUIRED_OPTIONS; do
         echo "  -$opt <value>"
@@ -35,6 +37,7 @@ usage() {
     echo "  -route_url <url>       远程 route.json 下载地址（文件已存在则跳过）"
     echo "  -inbound_url <url>     远程 inbound.json 下载地址（文件已存在则跳过）"
     echo "  -v <version>           指定 release 版本（默认 master）"
+    echo "  -build_type <type>     二进制类型：release / debug（默认 release）"
     exit 1
 }
 
@@ -68,13 +71,16 @@ parse_options() {
         esac
         shift
     done
+}
+
+has_deploy_options() {
     for req in $REQUIRED_OPTIONS; do
         eval "value=\$$req"
-        if [ -z "$value" ]; then
-            echo "缺少必填选项: -$req"
-            usage
+        if [ -n "$value" ]; then
+            return 0
         fi
     done
+    return 1
 }
 
 # ============================================================================
@@ -112,6 +118,15 @@ install_cnode() {
 
     mkdir -p "$INSTALL_DIR"
 
+    BUILD_TYPE="${build_type:-release}"
+    case "$BUILD_TYPE" in
+        release|debug) ;;
+        *)
+            echo "无效的 build_type: $BUILD_TYPE（仅支持 release/debug）"
+            exit 1
+            ;;
+    esac
+
     # 获取远程 build_id
     RELEASE_TAG="${v:-master}"
     RELEASE_INFO=$(curl -sf "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG")
@@ -120,11 +135,13 @@ install_cnode() {
         exit 1
     fi
 
-    REMOTE_ID=$(echo "$RELEASE_INFO" | grep -o 'build_id: [0-9a-f]*' | awk '{print $2}')
+    REMOTE_ID=$(echo "$RELEASE_INFO" | grep -o 'build_id: [^[:space:]]*' | awk '{print $2}')
     if [ -z "$REMOTE_ID" ]; then
         echo "无法解析远程 build_id。"
         exit 1
     fi
+
+    REMOTE_VERSION="$BUILD_TYPE:$REMOTE_ID"
 
     # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
     LOCAL_ID=""
@@ -132,17 +149,22 @@ install_cnode() {
         LOCAL_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     fi
 
-    if [ "$LOCAL_ID" = "$REMOTE_ID" ]; then
-        echo "cnode 已是最新版本: $REMOTE_ID"
+    if [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
+        echo "cnode 已是最新版本: $REMOTE_VERSION"
         return 0
     fi
 
+    ASSET_NAME="cnode-linux-amd64"
+    if [ "$BUILD_TYPE" = "debug" ]; then
+        ASSET_NAME="cnode-linux-amd64-debug"
+    fi
+
     LATEST_URL=$(echo "$RELEASE_INFO" \
-        | jq -r '.assets[] | select(.name | test("linux.*amd64")) | .browser_download_url' \
+        | jq -r --arg asset "$ASSET_NAME" '.assets[] | select(.name == $asset) | .browser_download_url' \
         | head -1)
 
     if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
-        LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64"
+        LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET_NAME"
     fi
 
     # 运行中的二进制无法覆盖（Text file busy），先停服务并杀残留进程
@@ -153,7 +175,7 @@ install_cnode() {
     pkill -f "$BIN_PATH" 2>/dev/null || true
     sleep 1
 
-    echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_ID"
+    echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_VERSION"
     if ! curl -sfL "$LATEST_URL" -o "$BIN_PATH"; then
         echo "cnode 下载失败。"
         exit 1
@@ -162,11 +184,11 @@ install_cnode() {
 
     # 验证下载的版本
     NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
-    if [ "$NEW_ID" != "$REMOTE_ID" ]; then
-        echo "版本校验失败: 期望 $REMOTE_ID，实际 $NEW_ID"
+    if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
+        echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
         exit 1
     fi
-    echo "cnode 已更新到 $REMOTE_ID"
+    echo "cnode 已更新到 $REMOTE_VERSION"
 }
 
 # ============================================================================
@@ -329,7 +351,26 @@ except Exception as e:
 # ============================================================================
 
 main() {
+    if [ $# -eq 0 ]; then
+        install_cnode
+        exit 0
+    fi
+
     parse_options "$@"
+
+    if ! has_deploy_options; then
+        install_cnode
+        exit 0
+    fi
+
+    for req in $REQUIRED_OPTIONS; do
+        eval "value=\$$req"
+        if [ -z "$value" ]; then
+            echo "缺少必填选项: -$req"
+            usage
+        fi
+    done
+
     install_cnode
     install_service
     init_config
