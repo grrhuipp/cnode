@@ -21,6 +21,7 @@ on:
 
 env:
   VCPKG_ROOT: /root/vcpkg
+  BUILD_ID: ${{ github.run_id }}
 
 jobs:
   build:
@@ -37,7 +38,6 @@ jobs:
     env:
       VCPKG_BINARY_SOURCES: "clear;files,/root/vcpkg-cache,readwrite"
       VCPKG_FORCE_SYSTEM_BINARIES: 1
-      BUILD_ID: ${{ github.run_id }}
 
     steps:
       - name: Install Alpine build tools
@@ -137,13 +137,14 @@ jobs:
           merge-multiple: true
 
       - name: Remove old release
-        run: gh release delete "${{ github.ref_name }}" --yes --cleanup-tag 2>/dev/null || true
+        run: gh release delete "${{ github.ref_name }}" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish release assets
         run: |
           gh release create "${{ github.ref_name }}" release-assets/* \
+            --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --notes "branch: ${{ github.ref_name }}, build_id: ${{ env.BUILD_ID }}"
         env:
