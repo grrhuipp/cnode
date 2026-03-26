@@ -373,7 +373,7 @@ cobalt::task<DnsResult> DnsService::QueryServer(
     auto timeout_state = std::make_shared<QueryTimeoutState>();
     
     timer->expires_after(std::chrono::seconds(config_.timeout_sec));
-    timer->async_wait([timeout_state, socket, timer](const boost::system::error_code& ec) {
+    timer->async_wait([timeout_state, socket](const boost::system::error_code& ec) {
         if (!ec && timeout_state->active.exchange(false, std::memory_order_acq_rel)) {
             timeout_state->timed_out.store(true, std::memory_order_release);
             boost::system::error_code cancel_ec;
