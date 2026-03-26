@@ -100,6 +100,7 @@ struct PanelUsersFetchResult {
     std::vector<PanelUser> users;
     ErrorCode error = ErrorCode::OK;
     std::string error_msg;
+    bool not_modified = false;
 
     [[nodiscard]] bool Ok() const noexcept {
         return error == ErrorCode::OK;
@@ -115,6 +116,12 @@ struct PanelUsersFetchResult {
         PanelUsersFetchResult result;
         result.error = code;
         result.error_msg = std::move(msg);
+        return result;
+    }
+
+    [[nodiscard]] static PanelUsersFetchResult NotModified() {
+        PanelUsersFetchResult result;
+        result.not_modified = true;
         return result;
     }
 };
@@ -230,7 +237,6 @@ private:
     
     // 缓存的数据（用于 304 时返回）
     std::unordered_map<int, NodeConfig> cached_configs_;
-    std::unordered_map<int, std::vector<PanelUser>> cached_users_;
     std::shared_ptr<net::ssl::context> https_context_;
 };
 

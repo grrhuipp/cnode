@@ -447,17 +447,11 @@ V2BoardPanel::FetchUsers(int node_id) {
     
     auto resp = co_await HttpGet(path, etag);
     
-    // 304 Not Modified - 返回缓存
+    // 304 Not Modified - 交给上层直接跳过用户重建，避免额外常驻缓存和拷贝
     if (resp.not_modified) {
-        auto cache_it = cached_users_.find(node_id);
-        if (cache_it != cached_users_.end()) {
-            LOG_DEBUG("V2Board[{}]: node {} users not modified (304), cached {} users", 
-                     config_.name, node_id, cache_it->second.size());
-            co_return PanelUsersFetchResult::Success(cache_it->second);
-        }
-        co_return PanelUsersFetchResult::Fail(
-            ErrorCode::PANEL_INVALID_RESPONSE,
-            "received 304 without cached users");
+        LOG_DEBUG("V2Board[{}]: node {} users not modified (304)",
+                 config_.name, node_id);
+        co_return PanelUsersFetchResult::NotModified();
     }
     
     if (resp.status != 200) {
@@ -508,19 +502,14 @@ V2BoardPanel::FetchUsers(int node_id) {
             }
         }
         
-        // 保存 ETag 和缓存
+        // 保存 ETag
         if (!resp.etag.empty()) {
             users_etags_[node_id] = resp.etag;
         }
-        
-        // 直接 move 到缓存，避免拷贝
-        cached_users_[node_id] = std::move(users);
-        
+
         LOG_DEBUG("V2Board[{}]: fetched {} users for node {}", 
-                 config_.name, cached_users_[node_id].size(), node_id);
-        
-        // 返回缓存的拷贝（必要的，因为调用者需要独立副本）
-        co_return PanelUsersFetchResult::Success(cached_users_[node_id]);
+                 config_.name, users.size(), node_id);
+        co_return PanelUsersFetchResult::Success(std::move(users));
         
     } catch (const std::exception& e) {
         LOG_ERROR("V2Board[{}]: parse users error: {}", config_.name, e.what());
@@ -647,7 +636,7 @@ cobalt::task<void> PanelManager::SyncLoop(IPanel* panel, int node_id) {
             // 获取用户列表
             auto users = co_await panel->FetchUsers(node_id);
             
-            if (users.Ok() && user_update_callback_) {
+            if (users.Ok() && !users.not_modified && user_update_callback_) {
                 user_update_callback_(panel->Name(), node_id, users.users);
             }
             

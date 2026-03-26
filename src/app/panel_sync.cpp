@@ -188,7 +188,9 @@ cobalt::task<void> PanelSyncManager::SyncNode(IPanel* panel, int node_id) {
             // 避免启动时 listener 已接收连接但用户未加载导致全量认证失败
             auto users_result = co_await panel->FetchUsers(node_id);
             if (users_result.Ok()) {
-                UpdateUsers(panel->Name(), node_id, users_result.users);
+                if (!users_result.not_modified) {
+                    UpdateUsers(panel->Name(), node_id, users_result.users);
+                }
                 // 该节点用户同步完成，启用 IP ban 追踪
                 if (!limiter_->IsBanTrackingEnabledForTag(tag)) {
                     limiter_->EnableBanTrackingForTag(tag);
