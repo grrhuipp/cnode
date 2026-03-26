@@ -4,7 +4,7 @@
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
 # 每次执行添加/覆盖一个 panel 到同一个 cnode 实例，已有配置文件不会被覆盖
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v build_type debug_file"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
@@ -37,7 +37,6 @@ usage() {
     echo "  -route_url <url>       远程 route.json 下载地址（文件已存在则跳过）"
     echo "  -inbound_url <url>     远程 inbound.json 下载地址（文件已存在则跳过）"
     echo "  -v <version>           指定 release 版本（默认 master）"
-    echo "  -build_type <type>     二进制类型：release / debug（默认 release）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
@@ -119,15 +118,6 @@ install_cnode() {
 
     mkdir -p "$INSTALL_DIR"
 
-    BUILD_TYPE="${build_type:-release}"
-    case "$BUILD_TYPE" in
-        release|debug) ;;
-        *)
-            echo "无效的 build_type: $BUILD_TYPE（仅支持 release/debug）"
-            exit 1
-            ;;
-    esac
-
     DEBUG_FILE="${debug_file:-false}"
     case "$DEBUG_FILE" in
         true|false) ;;
@@ -154,7 +144,7 @@ install_cnode() {
         exit 1
     fi
 
-    REMOTE_VERSION="$BUILD_TYPE:$REMOTE_ID"
+    REMOTE_VERSION="release:$REMOTE_ID"
     DEBUG_PATH="$INSTALL_DIR/cnode-linux-amd64.debug"
 
     # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
@@ -168,32 +158,23 @@ install_cnode() {
         NEED_BINARY_UPDATE=0
     fi
 
-    ASSET_NAME="cnode-linux-amd64"
-    if [ "$BUILD_TYPE" = "debug" ]; then
-        ASSET_NAME="cnode-linux-amd64-debug"
-    fi
-
     LATEST_URL=$(echo "$RELEASE_INFO" \
-        | jq -r --arg asset "$ASSET_NAME" '.assets[] | select(.name == $asset) | .browser_download_url' \
+        | jq -r --arg asset "cnode-linux-amd64" '.assets[] | select(.name == $asset) | .browser_download_url' \
         | head -1)
 
     if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
-        LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET_NAME"
+        LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64"
     fi
 
     NEED_DEBUG_DOWNLOAD=0
     DEBUG_URL=""
     if [ "$DEBUG_FILE" = "true" ]; then
-        if [ "$BUILD_TYPE" != "release" ]; then
-            echo "提示: debug 构建本身包含调试信息，跳过单独 .debug 文件下载"
-        else
-            NEED_DEBUG_DOWNLOAD=1
-            DEBUG_URL=$(echo "$RELEASE_INFO" \
-                | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' \
-                | head -1)
-            if [ -z "$DEBUG_URL" ] || [ "$DEBUG_URL" = "null" ]; then
-                DEBUG_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64.debug"
-            fi
+        NEED_DEBUG_DOWNLOAD=1
+        DEBUG_URL=$(echo "$RELEASE_INFO" \
+            | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' \
+            | head -1)
+        if [ -z "$DEBUG_URL" ] || [ "$DEBUG_URL" = "null" ]; then
+            DEBUG_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64.debug"
         fi
     fi
 

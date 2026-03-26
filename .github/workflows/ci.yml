@@ -25,15 +25,10 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.build_type }} (musl static)
+    name: Release (musl static)
     runs-on: ubuntu-24.04
     container:
       image: alpine:3.20
-
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: [Release, Debug]
 
     env:
       VCPKG_BINARY_SOURCES: "clear;files,/root/vcpkg-cache,readwrite"
@@ -80,15 +75,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/vcpkg_installed
-          key: vcpkg-installed-alpine-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-installed-alpine-release-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-installed-alpine-${{ matrix.build_type }}-
+            vcpkg-installed-alpine-release-
             vcpkg-installed-alpine-
 
       - name: Configure
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DBUILD_SHARED_LIBS=OFF \
@@ -103,21 +98,17 @@ jobs:
           file build/cnode
           ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
           mkdir -p release-assets
-          if [ "${{ matrix.build_type }}" = "Release" ]; then
-            objcopy --only-keep-debug build/cnode build/cnode-linux-amd64.debug
-            strip build/cnode
-            objcopy --add-gnu-debuglink=build/cnode-linux-amd64.debug build/cnode
-            cp build/cnode release-assets/cnode-linux-amd64
-            cp build/cnode-linux-amd64.debug release-assets/cnode-linux-amd64.debug
-          else
-            cp build/cnode release-assets/cnode-linux-amd64-debug
-          fi
+          objcopy --only-keep-debug build/cnode build/cnode-linux-amd64.debug
+          strip build/cnode
+          objcopy --add-gnu-debuglink=build/cnode-linux-amd64.debug build/cnode
+          cp build/cnode release-assets/cnode-linux-amd64
+          cp build/cnode-linux-amd64.debug release-assets/cnode-linux-amd64.debug
           ls -lh release-assets
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cnode-release-assets-${{ matrix.build_type }}
+          name: cnode-release-assets
           path: release-assets/*
           if-no-files-found: error
 
@@ -135,8 +126,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
-          pattern: cnode-release-assets-*
-          merge-multiple: true
+          name: cnode-release-assets
 
       - name: Remove old release
         run: gh release delete "${{ github.ref_name }}" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true

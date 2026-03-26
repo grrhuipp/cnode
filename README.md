@@ -66,10 +66,6 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/
   -node_type vmess \
   -outbound_url https://example.com/outbound.json \
   -route_url https://example.com/route.json
-
-# 安装 debug 版本
-bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh) \
-  -build_type debug
 ```
 
 ### 参数
@@ -88,7 +84,6 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/
 | `-outbound_url` | 否 | 远程 outbound.json 地址 |
 | `-route_url` | 否 | 远程 route.json 地址 |
 | `-inbound_url` | 否 | 远程 inbound.json 地址 |
-| `-build_type` | 否 | 二进制类型：`release` / `debug` |
 | `-debug_file` | 否 | 设为 `true` 时额外下载 Release 对应的 `.debug` 符号文件 |
 
 ### 管理命令
