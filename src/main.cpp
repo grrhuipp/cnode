@@ -7,6 +7,7 @@
 #include "acppnode/app/shared_user_store.hpp"
 #include "acppnode/app/panel_sync.hpp"
 #include "acppnode/geo/geodata.hpp"
+#include "acppnode/dns/dns_service.hpp"
 #include "acppnode/panel/v2board_panel.hpp"
 #include "acppnode/protocol/inbound_registry.hpp"
 #include "acppnode/protocol/vmess/vmess_protocol.hpp"
@@ -185,6 +186,18 @@ int main(int argc, char* argv[]) {
 
     // ── PanelSyncManager ────────────────────────────────────────────────────
     PanelSyncManager sync_manager(main_ctx, workers, connection_limiter);
+    std::unique_ptr<IDnsService> panel_dns_service;
+
+    if (!config.GetPanels().empty()) {
+        DnsService::Config dns_config;
+        dns_config.servers     = config.GetDns().servers;
+        dns_config.timeout_sec = config.GetDns().timeout;
+        dns_config.cache_size  = config.GetDns().cache_size;
+        dns_config.min_ttl     = config.GetDns().min_ttl;
+        dns_config.max_ttl     = config.GetDns().max_ttl;
+        // 面板同步运行在 main_ctx，避免跨 io_context 复用 Worker 的 DNS 服务。
+        panel_dns_service = CreateDnsService(main_ctx.get_executor(), dns_config);
+    }
 
     if (!config.GetPanels().empty()) {
         LOG_CONSOLE("Panels:");
@@ -197,7 +210,7 @@ int main(int argc, char* argv[]) {
         v2cfg.node_type = panel_config.node_type;
 
         auto panel = CreateV2BoardPanel(main_ctx.get_executor(), v2cfg,
-                                        workers[0]->GetDnsService());
+                                        panel_dns_service.get());
         sync_manager.AddPanel(std::move(panel), panel_config);
 
         std::string node_ids_str;
