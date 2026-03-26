@@ -245,88 +245,36 @@ cobalt::task<DnsResult> DnsService::DoResolve(
     // 遍历服务器尝试
     for (const auto& server : servers_) {
         DnsResult result;
+        const bool primary_query_aaaa = prefer_ipv6;
+        auto primary = co_await QueryServer(server, domain, primary_query_aaaa);
 
-        auto query_a = [this, server, domain]() -> cobalt::task<DnsResult> {
-            co_return co_await QueryServer(server, domain, false);
-        };
-
-        auto query_aaaa = [this, server, domain]() -> cobalt::task<DnsResult> {
-            co_return co_await QueryServer(server, domain, true);
-        };
-
-        // 默认同时查询 A 和 AAAA，行为对齐 sing-box：
-        // - prefer_ipv6 = true  => AAAA 在前，A 在后
-        // - prefer_ipv6 = false => A 在前，AAAA 在后
-        // 同家族内保持 DNS 返回顺序，后续由拨号器决定如何尝试。
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
-        auto [raw_a, raw_aaaa] = co_await cobalt::gather(query_a(), query_aaaa());
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
-
-        // cobalt::gather 返回 result<T> 包装，需要解包
-        DnsResult result_a = raw_a.has_value()
-            ? std::move(*raw_a)
-            : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
-        DnsResult result_aaaa = raw_aaaa.has_value()
-            ? std::move(*raw_aaaa)
-            : DnsResult{{}, ErrorCode::DNS_TIMEOUT, "gather exception"};
-
-        if (result_a.Ok() && result_aaaa.Ok()) {
-            if (prefer_ipv6) {
-                result = std::move(result_aaaa);
-                result.addresses.reserve(
-                    result.addresses.size() + result_a.addresses.size());
-                result.addresses.insert(result.addresses.end(),
-                    result_a.addresses.begin(),
-                    result_a.addresses.end());
-            } else {
-                result = std::move(result_a);
-                result.addresses.reserve(
-                    result.addresses.size() + result_aaaa.addresses.size());
-                result.addresses.insert(result.addresses.end(),
-                    result_aaaa.addresses.begin(),
-                    result_aaaa.addresses.end());
+        if (primary.Ok()) {
+            auto secondary = co_await QueryServer(server, domain, !primary_query_aaaa);
+            if (secondary.Ok()) {
+                primary.addresses.reserve(
+                    primary.addresses.size() + secondary.addresses.size());
+                primary.addresses.insert(primary.addresses.end(),
+                    secondary.addresses.begin(),
+                    secondary.addresses.end());
             }
-            co_return result;
+            co_return primary;
         }
 
-        if (prefer_ipv6) {
-            if (result_aaaa.Ok()) {
-                co_return result_aaaa;
-            }
-            if (result_a.Ok()) {
-                co_return result_a;
-            }
-        } else {
-            if (result_a.Ok()) {
-                co_return result_a;
-            }
-            if (result_aaaa.Ok()) {
-                co_return result_aaaa;
-            }
+        auto secondary = co_await QueryServer(server, domain, !primary_query_aaaa);
+        if (secondary.Ok()) {
+            co_return secondary;
         }
 
-        // 只有 A/AAAA 都明确无记录时，才认为该服务器给出了确定的 no record。
-        if (result_a.error == ErrorCode::DNS_NO_RECORD &&
-            result_aaaa.error == ErrorCode::DNS_NO_RECORD) {
-            result = prefer_ipv6 ? std::move(result_aaaa) : std::move(result_a);
-            co_return result;
+        // 只有两种记录都明确无记录时，才认为该服务器给出了确定的 no record。
+        if (primary.error == ErrorCode::DNS_NO_RECORD &&
+            secondary.error == ErrorCode::DNS_NO_RECORD) {
+            co_return primary;
         }
 
-        // 否则保留“首选族”的错误，继续尝试下一个 DNS 服务器。
-        if (prefer_ipv6) {
-            result = (result_aaaa.error != ErrorCode::DNS_NO_RECORD)
-                ? std::move(result_aaaa)
-                : std::move(result_a);
-        } else {
-            result = (result_a.error != ErrorCode::DNS_NO_RECORD)
-                ? std::move(result_a)
-                : std::move(result_aaaa);
-        }
+        // 否则保留非 no-record 的错误，继续尝试下一个 DNS 服务器。
+        result = (primary.error != ErrorCode::DNS_NO_RECORD)
+            ? std::move(primary)
+            : std::move(secondary);
     }
     
     // 所有服务器都失败
