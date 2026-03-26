@@ -388,12 +388,10 @@ cobalt::task<DnsResult> DnsService::QueryServer(
         received = co_await socket->async_receive_from(
             net::buffer(response), sender, cobalt::use_op);
         timeout_state->active.store(false, std::memory_order_release);
-        boost::system::error_code cancel_ec;
-        timer->cancel(cancel_ec);
+        timer->cancel();
     } catch (const boost::system::system_error& e) {
         timeout_state->active.store(false, std::memory_order_release);
-        boost::system::error_code cancel_ec;
-        timer->cancel(cancel_ec);
+        timer->cancel();
         if (timeout_state->timed_out.load(std::memory_order_acquire)) {
             result.error = ErrorCode::DNS_TIMEOUT;
             result.error_msg = "DNS query timed out";
