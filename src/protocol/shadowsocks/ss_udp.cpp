@@ -105,7 +105,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* cipher  = datagram + salt_size;
     const size_t   cipherlen = datagram_len - salt_size;
     const size_t   plaintext_len = cipherlen - SsAeadCipher::kTagSize;
-    std::vector<uint8_t> plaintext(plaintext_len);
+    memory::ByteVector plaintext(plaintext_len);
 
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = *users[i];
@@ -157,17 +157,20 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 // EncodeUdpPacket
 // ============================================================================
 size_t EncodeUdpPacketTo(
-    const TargetAddress&         target,
-    const uint8_t*               payload,
-    size_t                       payload_len,
-    const std::vector<uint8_t>&  master_key,
-    SsCipherType                 cipher_type,
-    size_t                       key_size,
-    size_t                       salt_size,
-    uint8_t*                     output,
-    size_t                       output_size)
+    const TargetAddress&      target,
+    const uint8_t*            payload,
+    size_t                    payload_len,
+    std::span<const uint8_t>  master_key,
+    SsCipherType              cipher_type,
+    size_t                    key_size,
+    size_t                    salt_size,
+    uint8_t*                  output,
+    size_t                    output_size)
 {
     if (key_size > 64 || salt_size > 64) {
+        return 0;
+    }
+    if (master_key.size() < key_size) {
         return 0;
     }
 
@@ -213,22 +216,21 @@ size_t EncodeUdpPacketTo(
     return total_size;
 }
 
-std::vector<uint8_t> EncodeUdpPacket(
-    const TargetAddress&         target,
-    const uint8_t*               payload,
-    size_t                       payload_len,
-    const std::vector<uint8_t>&  master_key,
-    SsCipherType                 cipher_type,
-    size_t                       key_size,
-    size_t                       salt_size)
+memory::ByteVector EncodeUdpPacket(
+    const TargetAddress&      target,
+    const uint8_t*            payload,
+    size_t                    payload_len,
+    std::span<const uint8_t>  master_key,
+    SsCipherType              cipher_type,
+    size_t                    key_size,
+    size_t                    salt_size)
 {
     const size_t addr_size = Socks5AddressEncodedSize(target);
     if (addr_size == 0) {
         return {};
     }
     const size_t total_size = salt_size + addr_size + payload_len + SsAeadCipher::kTagSize;
-    std::vector<uint8_t> result;
-    result.resize(total_size);
+    memory::ByteVector result(total_size);
 
     const size_t written = EncodeUdpPacketTo(
         target, payload, payload_len,

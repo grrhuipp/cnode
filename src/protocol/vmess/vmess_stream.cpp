@@ -66,7 +66,6 @@ VMessServerAsyncStream::VMessServerAsyncStream(
     // pending_data 已经被 move 到 request_ 中
     // 直接使用 request_.pending_data（已在成员 request_ 中）
     if (!request_.pending_data.empty()) {
-        // Move pending_data 到独立成员，避免 request_ 继续占用内存
         pending_data_ = std::move(request_.pending_data);
     }
 }

@@ -1,4 +1,5 @@
 #include "acppnode/transport/transport_dialer.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
 #include "acppnode/infra/log.hpp"
@@ -250,9 +251,12 @@ cobalt::task<TcpConnectAttemptResult> DialCandidatesWithFastFallback(
     const std::vector<OutboundDialCandidate>& fallbacks,
     bool use_target_bind_fallback) {
 
-    auto state = std::make_shared<DualStackRaceState>();
+    auto state = std::allocate_shared<DualStackRaceState>(
+        memory::ThreadLocalAllocator<DualStackRaceState>{});
     state->pending = 2;
-    state->waiter = std::make_shared<net::steady_timer>(executor);
+    state->waiter = std::allocate_shared<net::steady_timer>(
+        memory::ThreadLocalAllocator<net::steady_timer>{},
+        executor);
     state->waiter->expires_at(net::steady_timer::time_point::max());
 
     cobalt::spawn(executor,

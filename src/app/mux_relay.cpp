@@ -2,6 +2,7 @@
 #include "acppnode/protocol/mux/mux_codec.hpp"
 #include "acppnode/protocol/outbound.hpp"
 #include "acppnode/app/udp_types.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/transport_dialer.hpp"
@@ -37,11 +38,11 @@ struct MuxReply {
     bool is_end = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
     TargetAddress udp_src;   // UDP 源地址（is_udp == true 时有效）
-    std::vector<uint8_t> data;
+    memory::ByteVector data;
 };
 
 struct ReplyQueueState {
-    std::deque<MuxReply> queue;
+    memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     std::atomic<bool> tcp_overflowed{false};
@@ -128,7 +129,8 @@ struct TcpSubInfo {
 // ============================================================================
 // thread_local GlobalID 映射（per-Worker，接受跨 Worker 无法复用的限制）
 // ============================================================================
-thread_local std::unordered_map<uint64_t, std::weak_ptr<SharedUdpDial>> g_global_id_map;
+thread_local memory::ThreadLocalUnorderedMap<uint64_t, std::weak_ptr<SharedUdpDial>>
+    g_global_id_map;
 
 void CleanupGlobalIdMap() {
     // 每次新建 UDP 子会话时清理过期条目（频率不高，无需限流）
@@ -249,18 +251,20 @@ cobalt::task<RelayResult> DoMuxRelay(
 
     // 回包队列：单线程，无锁
     // mux_running 保护回调不在 DoMuxRelay 退出后继续推送
-    auto reply_queue = std::make_shared<ReplyQueueState>();
-    auto mux_running = std::make_shared<std::atomic<bool>>(true);
+    auto reply_queue = std::allocate_shared<ReplyQueueState>(
+        memory::ThreadLocalAllocator<ReplyQueueState>{});
+    auto mux_running = std::allocate_shared<std::atomic<bool>>(
+        memory::ThreadLocalAllocator<std::atomic<bool>>{}, true);
 
     // 子会话集合
-    std::unordered_map<uint16_t, UdpSubInfo> udp_subs;
-    std::unordered_map<uint16_t, TcpSubInfo> tcp_subs;
+    memory::ThreadLocalUnorderedMap<uint16_t, UdpSubInfo> udp_subs;
+    memory::ThreadLocalUnorderedMap<uint16_t, TcpSubInfo> tcp_subs;
 
     // 帧累积缓冲区（处理粘包），使用偏移游标避免逐帧 O(n) erase
-    std::vector<uint8_t> frame_buf;
+    memory::ByteVector frame_buf;
     frame_buf.reserve(4096);
     size_t frame_buf_offset = 0;
-    std::vector<uint8_t> write_frame;
+    memory::ByteVector write_frame;
     write_frame.reserve(4096);
 
     RelayResult result;
@@ -282,13 +286,15 @@ cobalt::task<RelayResult> DoMuxRelay(
             active.store(true, std::memory_order_relaxed);
         }
     };
-    auto read_poll = std::make_shared<ReadPollState>();
+    auto read_poll = std::allocate_shared<ReadPollState>(
+        memory::ThreadLocalAllocator<ReadPollState>{});
 
     bool running = true;
     auto write_frame_to_client =
-        [&](const std::vector<uint8_t>& frame) -> cobalt::task<bool> {
+        [&](const auto& frame) -> cobalt::task<bool> {
             try {
-                size_t written = co_await client_stream.AsyncWrite(net::buffer(frame));
+                size_t written = co_await client_stream.AsyncWrite(
+                    net::buffer(frame.data(), frame.size()));
                 if (written > 0) {
                     parent_ctx.bytes_down += written;
                     result.bytes_down += written;
@@ -475,7 +481,8 @@ cobalt::task<RelayResult> DoMuxRelay(
                             (void)co_await write_frame_to_client(ef);
                             break;
                         }
-                        shared = std::make_shared<SharedUdpDial>();
+                        shared = std::allocate_shared<SharedUdpDial>(
+                            memory::ThreadLocalAllocator<SharedUdpDial>{});
                         shared->dial = std::move(dial_result);
                         if (hdr.has_global_id && !mux::IsNullGlobalId(hdr.global_id)) {
                             shared->global_id = hdr.global_id;
@@ -500,7 +507,7 @@ cobalt::task<RelayResult> DoMuxRelay(
                                 reply.is_end     = false;
                                 reply.is_udp     = true;
                                 reply.udp_src    = pkt.target;
-                                reply.data       = pkt.data;
+                                reply.data.assign(pkt.data.begin(), pkt.data.end());
                                 if (!rq->PushUdp(std::move(reply))) {
                                     const uint64_t dropped =
                                         rq->udp_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -577,7 +584,8 @@ cobalt::task<RelayResult> DoMuxRelay(
                         break;
                     }
 
-                    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
+                    auto cancel_flag = std::allocate_shared<std::atomic<bool>>(
+                        memory::ThreadLocalAllocator<std::atomic<bool>>{}, false);
                     uint16_t    sid  = hdr.session_id;
 
                     TcpSubInfo sub;

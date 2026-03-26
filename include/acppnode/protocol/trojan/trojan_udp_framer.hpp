@@ -12,10 +12,10 @@
 // ============================================================================
 
 #include "acppnode/app/udp_types.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/protocol/trojan/trojan_codec.hpp"
 
 #include <deque>
-#include <vector>
 
 namespace acpp::trojan {
 
@@ -45,7 +45,7 @@ public:
             pkt.target, pkt.data.data(), pkt.data.size(), buf, buf_size);
     }
 
-    std::vector<uint8_t> Encode(const UDPPacket& pkt) {
+    memory::ByteVector Encode(const UDPPacket& pkt) {
         return TrojanCodec::EncodeUdpPacket(
             pkt.target, pkt.data.data(), pkt.data.size());
     }
@@ -54,9 +54,9 @@ private:
     // 解析缓冲区（处理粘包，最大 32KB）
     static constexpr size_t kMaxBufferSize = 32768;
 
-    std::vector<uint8_t> buffer_;
+    memory::ByteVector buffer_;
     size_t offset_ = 0;  // 已消费的前缀偏移量，避免每次 erase O(n) 搬移
-    std::deque<UDPPacket> queue_;
+    memory::ThreadLocalDeque<UDPPacket> queue_;
 
     // 将未消费数据搬到头部
     void Compact() {

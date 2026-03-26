@@ -189,7 +189,7 @@ std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
 // ============================================================================
 // 内部：将 PortThenAddress 写入 buf（vector append）
 // ============================================================================
-static void AppendAddress(std::vector<uint8_t>& buf, const TargetAddress& addr) {
+static void AppendAddress(memory::ByteVector& buf, const TargetAddress& addr) {
     // Port (2 BE)
     buf.push_back(static_cast<uint8_t>(addr.port >> 8));
     buf.push_back(static_cast<uint8_t>(addr.port & 0xFF));
@@ -245,13 +245,13 @@ static void AppendAddress(std::vector<uint8_t>& buf, const TargetAddress& addr) 
 // 内部：构建通用帧（不含地址，不含数据）
 // 返回 buf，MetaLen 位于 [0..1]，元数据从 [2] 开始
 // ============================================================================
-static std::vector<uint8_t> MakeFrameBase(
+static memory::ByteVector MakeFrameBase(
     uint16_t session_id,
     SessionStatus status,
     uint8_t option,
     size_t reserve_extra = 0)
 {
-    std::vector<uint8_t> buf;
+    memory::ByteVector buf;
     buf.reserve(8 + reserve_extra);
 
     // MetaLen 占位（稍后回填）
@@ -268,7 +268,7 @@ static std::vector<uint8_t> MakeFrameBase(
 }
 
 static void InitFrameBase(
-    std::vector<uint8_t>& buf,
+    memory::ByteVector& buf,
     uint16_t session_id,
     SessionStatus status,
     uint8_t option,
@@ -291,7 +291,7 @@ static void InitFrameBase(
 
 // 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
 static void FinalizeFrame(
-    std::vector<uint8_t>& buf,
+    memory::ByteVector& buf,
     const uint8_t* payload, size_t payload_len)
 {
     // 回填 MetaLen
@@ -311,7 +311,7 @@ static void FinalizeFrame(
 // ============================================================================
 // EncodeKeepAlive
 // ============================================================================
-void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
+void EncodeKeepAliveTo(memory::ByteVector& out) {
     out.clear();
     out.reserve(6);
     out.push_back(0x00);
@@ -322,8 +322,8 @@ void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
     out.push_back(0x00);
 }
 
-std::vector<uint8_t> EncodeKeepAlive() {
-    std::vector<uint8_t> buf;
+memory::ByteVector EncodeKeepAlive() {
+    memory::ByteVector buf;
     EncodeKeepAliveTo(buf);
     return buf;
 }
@@ -331,13 +331,13 @@ std::vector<uint8_t> EncodeKeepAlive() {
 // ============================================================================
 // EncodeEnd
 // ============================================================================
-void EncodeEndTo(std::vector<uint8_t>& out, uint16_t session_id, bool error) {
+void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
     uint8_t option = error ? kOptionError : 0x00;
     InitFrameBase(out, session_id, SessionStatus::END, option);
     FinalizeFrame(out, nullptr, 0);
 }
 
-std::vector<uint8_t> EncodeEnd(uint16_t session_id, bool error) {
+memory::ByteVector EncodeEnd(uint16_t session_id, bool error) {
     auto buf = MakeFrameBase(session_id, SessionStatus::END,
                              error ? kOptionError : 0x00);
     FinalizeFrame(buf, nullptr, 0);
@@ -348,7 +348,7 @@ std::vector<uint8_t> EncodeEnd(uint16_t session_id, bool error) {
 // EncodeKeepData（TCP 数据）
 // ============================================================================
 void EncodeKeepDataTo(
-    std::vector<uint8_t>& out,
+    memory::ByteVector& out,
     uint16_t session_id,
     const uint8_t* data, size_t len)
 {
@@ -356,7 +356,7 @@ void EncodeKeepDataTo(
     FinalizeFrame(out, data, len);
 }
 
-std::vector<uint8_t> EncodeKeepData(
+memory::ByteVector EncodeKeepData(
     uint16_t session_id,
     const uint8_t* data, size_t len)
 {
@@ -369,7 +369,7 @@ std::vector<uint8_t> EncodeKeepData(
 // EncodeKeepUDP（UDP 回包，携带源地址）
 // ============================================================================
 void EncodeKeepUDPTo(
-    std::vector<uint8_t>& out,
+    memory::ByteVector& out,
     uint16_t session_id,
     const TargetAddress& src,
     const uint8_t* data, size_t len)
@@ -387,12 +387,12 @@ void EncodeKeepUDPTo(
     FinalizeFrame(out, data, len);
 }
 
-std::vector<uint8_t> EncodeKeepUDP(
+memory::ByteVector EncodeKeepUDP(
     uint16_t session_id,
     const TargetAddress& src,
     const uint8_t* data, size_t len)
 {
-    std::vector<uint8_t> buf;
+    memory::ByteVector buf;
     EncodeKeepUDPTo(buf, session_id, src, data, len);
     return buf;
 }

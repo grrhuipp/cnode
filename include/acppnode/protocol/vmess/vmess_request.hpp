@@ -8,9 +8,9 @@
 // ============================================================================
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 #include <array>
-#include <vector>
 #include <cstdint>
 
 namespace acpp {
@@ -124,7 +124,7 @@ struct VMessRequest {
     const VMessUser* user = nullptr;
 
     // 握手后的预读数据（加密的数据块）
-    std::vector<uint8_t> pending_data;
+    memory::ByteVector pending_data;
 
     bool HasChunkMasking()       const { return (options & Option::CHUNK_MASKING)       != 0; }
     bool HasAuthenticatedLength() const { return (options & Option::AUTHENTICATED_LENGTH) != 0; }

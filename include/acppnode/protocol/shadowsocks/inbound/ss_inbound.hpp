@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/handlers/inbound_handler.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/protocol/shadowsocks/shadowsocks_protocol.hpp"
 #include "acppnode/transport/delegating_stream.hpp"
 
@@ -53,8 +54,8 @@ public:
                         ss::SsCipherType cipher_type,
                         size_t key_size,
                         size_t salt_size,
-                        std::vector<uint8_t> master_key,
-                        std::vector<uint8_t> read_subkey,
+                        std::span<const uint8_t> master_key,
+                        std::span<const uint8_t> read_subkey,
                         uint64_t read_nonce);
 
     ~SsServerAsyncStream() noexcept override = default;
@@ -86,7 +87,7 @@ private:
     // ── 读端 ────────────────────────────────────────────────────────────────
     ss::SsAeadCipher        read_cipher_;
     uint64_t                read_nonce_ = 0;
-    std::vector<uint8_t>    read_buf_;      // 已解密但未消耗的数据
+    memory::ByteVector      read_buf_;      // 已解密但未消耗的数据
     size_t                  read_buf_offset_ = 0;
     std::array<uint8_t, kEncryptedChunkSize> read_chunk_buf_{};
 
@@ -94,7 +95,7 @@ private:
     ss::SsCipherType         cipher_type_;
     size_t                   key_size_;
     size_t                   salt_size_;
-    std::vector<uint8_t>     master_key_;
+    memory::ByteVector       master_key_;
     std::unique_ptr<ss::SsAeadCipher> write_cipher_;   // 懒初始化
     uint64_t                 write_nonce_ = 0;
     bool                     write_init_  = false;
@@ -102,7 +103,7 @@ private:
     std::array<uint8_t, kLenHeaderSize + kEncryptedChunkSize> write_chunk_buf_{};
 
     // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配）
-    std::vector<uint8_t> write_batch_buf_;
+    memory::ByteVector write_batch_buf_;
 };
 
 // ============================================================================

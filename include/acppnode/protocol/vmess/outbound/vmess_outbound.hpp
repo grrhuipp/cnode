@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/protocol/outbound.hpp"
 #include "acppnode/protocol/vmess/vmess_protocol.hpp"
@@ -174,10 +175,10 @@ private:
     alignas(64) uint8_t write_output_buf_[CRYPTO_BUF_SIZE]; // 写输出缓冲
     
     // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配）
-    std::vector<uint8_t> write_batch_buf_;
+    memory::ByteVector write_batch_buf_;
 
     // 读缓冲（简化版环形缓冲）
-    std::vector<uint8_t> read_buffer_;
+    memory::ByteVector read_buffer_;
     size_t read_buffer_offset_ = 0;
     bool read_eof_ = false;
 };

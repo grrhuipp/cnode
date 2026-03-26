@@ -204,7 +204,7 @@ cobalt::task<std::size_t> TrojanClientStream::AsyncWrite(net::const_buffer buf) 
             // 合并 header + payload 为单次写入，避免 2 个 TCP 包
             const size_t payload_len = buf.size();
             const size_t total_len = header_len + payload_len;
-            std::vector<uint8_t> combined(total_len);
+            memory::ByteVector combined(total_len);
             std::memcpy(combined.data(), header.data(), header_len);
             if (payload_len > 0) {
                 std::memcpy(combined.data() + header_len, buf.data(), payload_len);

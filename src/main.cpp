@@ -1,4 +1,5 @@
-﻿#include "acppnode/common.hpp"
+#include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/stats.hpp"
@@ -11,10 +12,6 @@
 #include "acppnode/panel/v2board_panel.hpp"
 #include "acppnode/protocol/inbound_registry.hpp"
 #include "acppnode/protocol/vmess/vmess_protocol.hpp"
-
-#ifdef USE_MIMALLOC
-#include <mimalloc.h>
-#endif
 
 #include <boost/asio/signal_set.hpp>
 #include <iostream>
@@ -102,6 +99,9 @@ static cobalt::task<double> GetMemoryMBAsync(net::any_io_executor /*exec*/) {
 // main
 // ============================================================================
 int main(int argc, char* argv[]) {
+    memory::ConfigureProcessAllocator();
+    memory::ThreadScope main_thread_allocator_scope;
+
     std::string config_path = "config.json";
     bool test_mode = false;
 
@@ -377,6 +377,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::thread> worker_threads;
     for (uint32_t i = 0; i < workers.size(); ++i) {
         worker_threads.emplace_back([&io_contexts, i]() {
+            memory::ThreadScope worker_thread_allocator_scope;
             io_contexts[i]->run();
         });
     }
@@ -463,7 +464,7 @@ int main(int argc, char* argv[]) {
                 now - last_force_collect_at >= kForceCollectCooldown;
 
             if ((burst_drain || newly_idle) && cooldown_ok) {
-                mi_collect(true);
+                memory::CollectBurst();
                 last_force_collect_at = now;
             }
 
@@ -500,11 +501,8 @@ int main(int argc, char* argv[]) {
                 total_conns += w->GetActiveConnectionCount();
             }
 
-#ifdef USE_MIMALLOC
-            // 常态只做轻量 collect；快速强制回收由每秒 sample_coro 负责。
-            mi_collect(false);
-#endif
-
+            // 常态不主动扫描 allocator，避免给热路径引入周期性回收开销；
+            // burst/newly idle 的回收由每秒 sample_coro 触发。
             double mem_mb = co_await GetMemoryMBAsync(main_ctx.get_executor());
 
             LOG_INFO("conn={} mem={:.1f}MB in={} out={} rate={}↓/{}↑ dns={:.0f}%",

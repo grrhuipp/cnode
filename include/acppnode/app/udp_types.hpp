@@ -1,12 +1,12 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/app/stats.hpp"
 
-#include <vector>
 #include <memory>
 #include <chrono>
 #include <functional>
@@ -19,7 +19,7 @@ namespace acpp {
 // ============================================================================
 struct UDPPacket {
     TargetAddress target;           // 目标/源地址
-    std::vector<uint8_t> data;      // 原始数据（不含地址头）
+    memory::ByteVector data;        // 原始数据（不含地址头）
 };
 
 // ============================================================================

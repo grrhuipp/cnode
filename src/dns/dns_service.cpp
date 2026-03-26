@@ -55,7 +55,8 @@ void StoreResult(DnsCache& cache,
 DnsService::DnsService(net::any_io_executor executor, const Config& config)
     : executor_(std::move(executor))
     , config_(config)
-    , cache_(std::make_shared<DnsCache>(
+    , cache_(std::allocate_shared<DnsCache>(
+        memory::ThreadLocalAllocator<DnsCache>{},
         config.cache_size, config.min_ttl, config.max_ttl)) {
     servers_.reserve(config.servers.size());
     for (const auto& server : config.servers) {
@@ -103,7 +104,9 @@ cobalt::task<DnsResult> DnsService::Resolve(
             co_return inflight->result;
         }
 
-        auto wait_timer = std::make_shared<net::steady_timer>(executor_);
+        auto wait_timer = std::allocate_shared<net::steady_timer>(
+            memory::ThreadLocalAllocator<net::steady_timer>{},
+            executor_);
         wait_timer->expires_at(net::steady_timer::time_point::max());
         inflight->waiters.push_back(wait_timer);
 
@@ -113,7 +116,8 @@ cobalt::task<DnsResult> DnsService::Resolve(
         co_return inflight->result;
     }
 
-    auto inflight = std::make_shared<InflightResolve>();
+    auto inflight = std::allocate_shared<InflightResolve>(
+        memory::ThreadLocalAllocator<InflightResolve>{});
     inflight_resolves_.emplace(key, inflight);
 
     DnsResult result;
@@ -251,9 +255,9 @@ cobalt::task<DnsResult> DnsService::QueryServer(
     co_return result;
 }
 
-std::vector<uint8_t> DnsService::BuildQuery(
+memory::ByteVector DnsService::BuildQuery(
     const std::string& domain, uint16_t txid, bool query_aaaa) {
-    std::vector<uint8_t> query;
+    memory::ByteVector query;
     query.reserve(18 + domain.size());
 
     query.push_back(static_cast<uint8_t>(txid >> 8));

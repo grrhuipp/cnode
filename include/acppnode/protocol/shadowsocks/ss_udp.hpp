@@ -1,9 +1,11 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/protocol/shadowsocks/shadowsocks_protocol.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace acpp::ss {
@@ -26,7 +28,7 @@ namespace acpp::ss {
 // SS UDP 解码结果
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
-    std::vector<uint8_t> payload;      // 解密后的原始载荷
+    memory::ByteVector   payload;      // 解密后的原始载荷
     size_t               user_index;   // 匹配用户在 users 列表中的下标
 };
 
@@ -57,23 +59,23 @@ struct SsUdpDecodeResult {
 //   - 编码失败：返回 0
 // ============================================================================
 [[nodiscard]] size_t EncodeUdpPacketTo(
-    const TargetAddress&         target,
-    const uint8_t*               payload,
-    size_t                       payload_len,
-    const std::vector<uint8_t>&  master_key,
-    SsCipherType                 cipher_type,
-    size_t                       key_size,
-    size_t                       salt_size,
-    uint8_t*                     output,
-    size_t                       output_size);
+    const TargetAddress&        target,
+    const uint8_t*              payload,
+    size_t                      payload_len,
+    std::span<const uint8_t>    master_key,
+    SsCipherType                cipher_type,
+    size_t                      key_size,
+    size_t                      salt_size,
+    uint8_t*                    output,
+    size_t                      output_size);
 
-[[nodiscard]] std::vector<uint8_t> EncodeUdpPacket(
-    const TargetAddress&         target,
-    const uint8_t*               payload,
-    size_t                       payload_len,
-    const std::vector<uint8_t>&  master_key,
-    SsCipherType                 cipher_type,
-    size_t                       key_size,
-    size_t                       salt_size);
+[[nodiscard]] memory::ByteVector EncodeUdpPacket(
+    const TargetAddress&        target,
+    const uint8_t*              payload,
+    size_t                      payload_len,
+    std::span<const uint8_t>    master_key,
+    SsCipherType                cipher_type,
+    size_t                      key_size,
+    size_t                      salt_size);
 
 }  // namespace acpp::ss

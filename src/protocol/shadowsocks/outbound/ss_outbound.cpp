@@ -23,14 +23,14 @@ SsClientAsyncStream::SsClientAsyncStream(
     ss::SsCipherType cipher_type,
     size_t key_size,
     size_t salt_size,
-    std::vector<uint8_t> master_key,
+    std::span<const uint8_t> master_key,
     TargetAddress target)
     : inner_(std::move(inner))
     , target_(std::move(target))
     , cipher_type_(cipher_type)
     , key_size_(key_size)
     , salt_size_(salt_size)
-    , master_key_(std::move(master_key)) {
+    , master_key_(master_key.begin(), master_key.end()) {
 }
 
 // ── 内部辅助 ─────────────────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ cobalt::task<bool> SsClientAsyncStream::SendHandshake(const uint8_t* data, size_
         // 组装到 handshake_buf: [salt][enc_len(18)][enc_payload]
         const size_t enc_payload_size = payload_size + ss::SsAeadCipher::kTagSize;
         const size_t total = salt_size_ + kLenHeaderSize + enc_payload_size;
-        std::vector<uint8_t> handshake_buf(total);
+        memory::ByteVector handshake_buf(total);
 
         // salt
         std::memcpy(handshake_buf.data(), client_salt.data(), salt_size_);
@@ -265,11 +265,11 @@ cobalt::task<size_t> SsClientAsyncStream::AsyncWrite(net::const_buffer buf) {
 SsOutboundHandler::SsOutboundHandler(ss::SsCipherType cipher_type,
                                      size_t key_size,
                                      size_t salt_size,
-                                     std::vector<uint8_t> master_key)
+                                     std::span<const uint8_t> master_key)
     : cipher_type_(cipher_type)
     , key_size_(key_size)
     , salt_size_(salt_size)
-    , master_key_(std::move(master_key)) {
+    , master_key_(master_key.begin(), master_key.end()) {
 }
 
 cobalt::task<OutboundWrapResult> SsOutboundHandler::WrapStream(
@@ -306,7 +306,10 @@ SsOutbound::SsOutbound(net::any_io_executor executor,
         cipher_info_ = ss::SsCipherInfo{ss::SsCipherType::AES_256_GCM, 32, 32};
     }
 
-    master_key_ = ss::DeriveKey(config_.password, cipher_info_.key_size);
+    {
+        auto derived_key = ss::DeriveKey(config_.password, cipher_info_.key_size);
+        master_key_.assign(derived_key.begin(), derived_key.end());
+    }
     stream_settings_ = config_.stream_settings;
     stream_settings_.RecomputeModes();
     if (stream_settings_.network.empty()) {

@@ -385,7 +385,7 @@ void Worker::StopUdpListening(const std::string& tag) {
 void Worker::EnqueueUdpReply(const std::string& tag,
                              std::shared_ptr<udp::socket> sock,
                              udp::endpoint endpoint,
-                             std::vector<uint8_t> payload) {
+                             memory::ByteVector payload) {
     if (!sock || !sock->is_open() || payload.empty()) {
         return;
     }
@@ -414,7 +414,9 @@ void Worker::StartUdpReplySend(const std::string& tag,
         return;
     }
 
-    auto packet = std::make_shared<PendingUdpReply>(std::move(queue.pending.front()));
+    auto packet = std::allocate_shared<PendingUdpReply>(
+        memory::ThreadLocalAllocator<PendingUdpReply>{},
+        std::move(queue.pending.front()));
     queue.queued_bytes -= packet->payload.size();
     queue.pending.pop_front();
     queue.write_in_progress = true;
@@ -555,7 +557,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
         auto proxy_deadline = tcp_stream->StartPhaseDeadline(handshake_timeout);
 
         constexpr size_t kMaxProxyHeaderBytes = 2048;
-        std::vector<uint8_t> buf;
+        memory::ByteVector buf;
         buf.reserve(256);
 
         while (buf.size() < kMaxProxyHeaderBytes) {
@@ -578,7 +580,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
                     co_return;
                 }
                 if (!buf.empty()) {
-                    tcp_stream->SetPendingData(std::move(buf));
+                    tcp_stream->SetPendingData(std::span<const uint8_t>(buf));
                 }
                 break;
             }
@@ -612,8 +614,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
             }
 
             if (skip < buf.size()) {
-                tcp_stream->SetPendingData(
-                    std::vector<uint8_t>(buf.begin() + static_cast<ptrdiff_t>(skip), buf.end()));
+                tcp_stream->SetPendingData(std::span<const uint8_t>(buf).subspan(skip));
             }
             break;
         }
@@ -631,7 +632,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     // 活跃会话追踪只覆盖真正进入 relay 的连接，避免大量握手失败/瞬断连接
     // 把 active_sessions_ 在洪峰时冲大。
     struct ActiveSessionGuard {
-        std::unordered_map<uint64_t, ActiveSession>& map;
+        memory::ThreadLocalUnorderedMap<uint64_t, ActiveSession>& map;
         uint64_t conn_id;
         const SessionContext* ctx = nullptr;
         uint64_t last_up = 0;
@@ -735,7 +736,10 @@ Worker::CollectTrafficTask(std::string tag) {
     // 1. 收集已关闭连接的流量
     std::unordered_map<int64_t, UserTraffic> result;
     if (auto it = local_traffic_.find(tag); it != local_traffic_.end()) {
-        result = std::move(it->second);
+        result.reserve(it->second.size());
+        for (auto& [user_id, traffic] : it->second) {
+            result.emplace(user_id, std::move(traffic));
+        }
         it->second.clear();
         MaybeShrinkHashContainer(it->second, 64);
     }
@@ -840,7 +844,8 @@ void Worker::StartUdpListening(PortBinding binding,
         StopUdpListening(binding.tag);
     }
 
-    auto sock = std::make_shared<udp::socket>(io_context_);
+    auto sock = std::allocate_shared<udp::socket>(
+        memory::ThreadLocalAllocator<udp::socket>{}, io_context_);
     std::string actual_listen;
     const auto listen_candidates = BuildListenCandidates(binding.listen);
 
@@ -855,7 +860,8 @@ void Worker::StartUdpListening(PortBinding binding,
         }
 
         udp::endpoint ep(addr, binding.port);
-        auto candidate_sock = std::make_shared<udp::socket>(io_context_);
+        auto candidate_sock = std::allocate_shared<udp::socket>(
+            memory::ThreadLocalAllocator<udp::socket>{}, io_context_);
 
         auto retry_or_fail = [&](std::string_view op, std::string_view msg) -> bool {
             if (i + 1 < listen_candidates.size()) {
@@ -937,7 +943,7 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
     if (sock_it == udp_sockets_.end()) co_return;
     auto sock = sock_it->second;  // shared_ptr，回调安全捕获
 
-    std::vector<uint8_t> recv_buf(kRecvBufSize);
+    memory::ByteVector recv_buf(kRecvBufSize);
     auto& client_sessions = udp_client_sessions_[tag];
 
     while (true) {
@@ -1046,8 +1052,7 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
                     stack_buf.data(), stack_buf.size());
                 if (encoded_len == 0) return;
 
-                std::vector<uint8_t> payload;
-                payload.resize(encoded_len);
+                memory::ByteVector payload(encoded_len);
 
                 if (encoded_len <= stack_buf.size()) {
                     std::memcpy(payload.data(), stack_buf.data(), encoded_len);

@@ -13,7 +13,6 @@
 #include "acppnode/protocol/vmess/vmess_request.hpp"
 
 #include <array>
-#include <vector>
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -109,14 +108,14 @@ public:
     ~VMessServerStream();
 
     // 生成响应头（首次写数据前调用）
-    std::vector<uint8_t> GenerateResponseHeader();
+    memory::ByteVector GenerateResponseHeader();
 
     // 解密一个客户端 chunk（返回明文，consumed 为消耗的字节数）
-    std::optional<std::vector<uint8_t>> DecryptChunk(
+    std::optional<memory::ByteVector> DecryptChunk(
         const uint8_t* data, size_t len, size_t& consumed);
 
     // 加密一个响应 chunk
-    std::vector<uint8_t> EncryptChunk(const uint8_t* data, size_t len);
+    memory::ByteVector EncryptChunk(const uint8_t* data, size_t len);
 
     bool ResponseSent() const { return response_sent_; }
 

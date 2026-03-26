@@ -426,7 +426,7 @@ void UDPSession::DoReceive() {
                 packet.data.assign(recv_buffer_.begin(), recv_buffer_.begin() + bytes);
                 
                 // Full Cone NAT 路由 (Per-Worker 单线程，无需锁)
-                std::vector<PacketCallback> matched_callbacks;
+                memory::ThreadLocalVector<PacketCallback> matched_callbacks;
                 matched_callbacks.reserve(4);  // 预分配，覆盖大多数场景
                 
                 auto t_it = target_to_callbacks_.find(sender_key);
@@ -619,7 +619,12 @@ std::shared_ptr<UDPSession> UDPSessionManager::GetOrCreateSession(
     }
     
     // 创建新会话
-    auto session = std::make_shared<UDPSession>(executor, session_id, std::move(on_packet), dns_service_);
+    auto session = std::allocate_shared<UDPSession>(
+        memory::ThreadLocalAllocator<UDPSession>{},
+        executor,
+        session_id,
+        std::move(on_packet),
+        dns_service_);
     auto err = session->Start(bind_address);
     
     if (err != ErrorCode::SUCCESS) {

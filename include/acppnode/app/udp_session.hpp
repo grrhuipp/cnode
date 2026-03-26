@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/common/error.hpp"
@@ -12,8 +13,6 @@
 #include <vector>
 #include <memory>
 #include <chrono>
-#include <unordered_map>
-#include <unordered_set>
 #include <functional>
 
 namespace acpp {
@@ -119,14 +118,16 @@ private:
     struct CallbackEntry {
         std::string destination;  // 空 = Full Cone, 非空 = 精确匹配
         PacketCallback callback;
-        std::unordered_map<std::string, steady_clock::time_point> sent_targets;
+        memory::ThreadLocalUnorderedMap<std::string, steady_clock::time_point> sent_targets;
     };
-    
-    std::unordered_map<uint64_t, CallbackEntry> registered_callbacks_;
+
+    memory::ThreadLocalUnorderedMap<uint64_t, CallbackEntry> registered_callbacks_;
     
     // 反向索引: target_key -> set<callback_id>
     // 用于快速查找哪些 callback 关心这个目标地址
-    std::unordered_map<std::string, std::unordered_set<uint64_t>> target_to_callbacks_;
+    memory::ThreadLocalUnorderedMap<
+        std::string,
+        memory::ThreadLocalUnorderedSet<uint64_t>> target_to_callbacks_;
     
     uint64_t next_callback_id_ = 1;
     
@@ -208,7 +209,7 @@ private:
     IDnsService* dns_service_ = nullptr;
     std::chrono::seconds session_timeout_;
     
-    std::unordered_map<std::string, std::shared_ptr<UDPSession>> sessions_;
+    memory::ThreadLocalUnorderedMap<std::string, std::shared_ptr<UDPSession>> sessions_;
     
     net::steady_timer cleanup_timer_;
     bool running_ = false;

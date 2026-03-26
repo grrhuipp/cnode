@@ -54,6 +54,7 @@ void CachedAESKey::ECBDecrypt(const uint8_t* ciphertext, uint8_t* plaintext) con
 
 // VMess 魔法字符串
 static const char* VMESS_MAGIC = "c48619fe-8f02-49e0-b9e9-edf763e17e21";
+static constexpr size_t kVmessMagicLen = 36;
 
 // ============================================================================
 // 工具函数实现
@@ -165,7 +166,7 @@ static void vmess_kdf_recursive(
     alignas(16) uint8_t inner_input[512];
     if (64 + data_len > sizeof(inner_input)) {
         // 极端情况回退到堆分配
-        std::vector<uint8_t> inner_vec(64 + data_len);
+        memory::ByteVector inner_vec(64 + data_len);
         memcpy(inner_vec.data(), ipad, 64);
         memcpy(inner_vec.data() + 64, data, data_len);
         
@@ -208,7 +209,7 @@ std::array<uint8_t, 16> KDF16(const uint8_t* key, size_t key_len,
 }
 
 // OpenSSL 实现
-std::optional<std::vector<uint8_t>> AES128GCMDecrypt(
+std::optional<memory::ByteVector> AES128GCMDecrypt(
     const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
     const uint8_t* ciphertext, size_t len,
     const uint8_t* aad, size_t aad_len) {
@@ -218,7 +219,7 @@ std::optional<std::vector<uint8_t>> AES128GCMDecrypt(
     SslErrorGuard ssl_guard;  // 安全加固：失败时自动清理错误队列
     
     size_t data_len = len - GCM_TAG_SIZE;
-    std::vector<uint8_t> plaintext(data_len);
+    memory::ByteVector plaintext(data_len);
     
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return std::nullopt;
@@ -254,12 +255,12 @@ std::optional<std::vector<uint8_t>> AES128GCMDecrypt(
     return plaintext;
 }
 
-std::vector<uint8_t> AES128GCMEncrypt(
+memory::ByteVector AES128GCMEncrypt(
     const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
     const uint8_t* plaintext, size_t len,
     const uint8_t* aad, size_t aad_len) {
     
-    std::vector<uint8_t> ciphertext(len + GCM_TAG_SIZE);
+    memory::ByteVector ciphertext(len + GCM_TAG_SIZE);
     
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return {};
@@ -428,11 +429,9 @@ std::optional<VMessUser> VMessUser::FromUUID(const std::string& uuid_str,
     user.speed_limit = speed_limit;
     
     // 计算 CMD Key = MD5(UUID + MAGIC)
-    std::vector<uint8_t> key_material;
-    key_material.insert(key_material.end(), 
-                        user.uuid_bytes.begin(), user.uuid_bytes.end());
-    key_material.insert(key_material.end(), 
-                        VMESS_MAGIC, VMESS_MAGIC + strlen(VMESS_MAGIC));
+    std::array<uint8_t, 16 + kVmessMagicLen> key_material{};
+    std::memcpy(key_material.data(), user.uuid_bytes.data(), user.uuid_bytes.size());
+    std::memcpy(key_material.data() + user.uuid_bytes.size(), VMESS_MAGIC, kVmessMagicLen);
     user.cmd_key = MD5Hash(key_material.data(), key_material.size());
     
     // 计算 Auth Key = KDF16(cmd_key, "AES Auth ID Encryption")
@@ -1347,7 +1346,7 @@ VMessServerStream::VMessServerStream(const VMessRequest& request)
 
 VMessServerStream::~VMessServerStream() = default;
 
-std::vector<uint8_t> VMessServerStream::GenerateResponseHeader() {
+memory::ByteVector VMessServerStream::GenerateResponseHeader() {
     if (response_sent_) {
         return {};
     }
@@ -1391,22 +1390,26 @@ std::vector<uint8_t> VMessServerStream::GenerateResponseHeader() {
     auto header_enc = AES128GCMEncrypt(header_key.data(), header_iv.data(), 12,
                                         resp_data, 4, nullptr, 0);
     
+    if (len_enc.size() != 18 || header_enc.size() != 20) {
+        return {};
+    }
+
     // 组合
-    std::vector<uint8_t> result;
-    result.insert(result.end(), len_enc.begin(), len_enc.end());
-    result.insert(result.end(), header_enc.begin(), header_enc.end());
+    memory::ByteVector result(38);
+    std::memcpy(result.data(), len_enc.data(), len_enc.size());
+    std::memcpy(result.data() + len_enc.size(), header_enc.data(), header_enc.size());
     
     return result;
 }
 
-std::optional<std::vector<uint8_t>> VMessServerStream::DecryptChunk(
+std::optional<memory::ByteVector> VMessServerStream::DecryptChunk(
     const uint8_t* data, size_t len, size_t& consumed) {
     
     consumed = 0;
     
     if (request_.security == Security::NONE || request_.security == Security::ZERO) {
         consumed = len;
-        return std::vector<uint8_t>(data, data + len);
+        return memory::ByteVector(data, data + len);
     }
     
     // AEAD chunk 格式: [2 bytes length] + [encrypted data + 16 bytes tag]
@@ -1433,7 +1436,7 @@ std::optional<std::vector<uint8_t>> VMessServerStream::DecryptChunk(
     }
     
     // 解密
-    std::vector<uint8_t> plaintext(chunk_len);
+    memory::ByteVector plaintext(chunk_len);
     ssize_t decrypted_len = read_cipher_->Decrypt(data + 2, chunk_len + GCM_TAG_SIZE,
                                                    plaintext.data());
     
@@ -1447,9 +1450,9 @@ std::optional<std::vector<uint8_t>> VMessServerStream::DecryptChunk(
     return plaintext;
 }
 
-std::vector<uint8_t> VMessServerStream::EncryptChunk(const uint8_t* data, size_t len) {
+memory::ByteVector VMessServerStream::EncryptChunk(const uint8_t* data, size_t len) {
     if (request_.security == Security::NONE || request_.security == Security::ZERO) {
-        std::vector<uint8_t> result(2 + len);
+        memory::ByteVector result(2 + len);
         result[0] = (len >> 8) & 0xFF;
         result[1] = len & 0xFF;
         memcpy(result.data() + 2, data, len);
@@ -1457,7 +1460,7 @@ std::vector<uint8_t> VMessServerStream::EncryptChunk(const uint8_t* data, size_t
     }
     
     // 加密数据
-    std::vector<uint8_t> ciphertext(len + GCM_TAG_SIZE);
+    memory::ByteVector ciphertext(len + GCM_TAG_SIZE);
     ssize_t encrypted_len = write_cipher_->Encrypt(data, len, ciphertext.data());
     
     if (encrypted_len < 0) {
@@ -1472,10 +1475,10 @@ std::vector<uint8_t> VMessServerStream::EncryptChunk(const uint8_t* data, size_t
         chunk_len ^= write_mask_->NextMask();
     }
     
-    std::vector<uint8_t> result;
-    result.push_back((chunk_len >> 8) & 0xFF);
-    result.push_back(chunk_len & 0xFF);
-    result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + encrypted_len);
+    memory::ByteVector result(2 + static_cast<size_t>(encrypted_len));
+    result[0] = static_cast<uint8_t>((chunk_len >> 8) & 0xFF);
+    result[1] = static_cast<uint8_t>(chunk_len & 0xFF);
+    std::memcpy(result.data() + 2, ciphertext.data(), static_cast<size_t>(encrypted_len));
     
     return result;
 }

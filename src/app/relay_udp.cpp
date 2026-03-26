@@ -1,4 +1,5 @@
 #include "acppnode/app/relay.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/app/udp_session.hpp"
@@ -59,7 +60,7 @@ cobalt::task<RelayResult> DoUDPRelay(
 
     struct SharedState {
         std::atomic<bool> running{true};
-        std::deque<UDPPacket> reply_queue;
+        memory::ThreadLocalDeque<UDPPacket> reply_queue;
         size_t queued_bytes = 0;
         std::atomic<uint64_t> total_replies{0};
         bool shrink_queue_on_drain = false;
@@ -87,7 +88,8 @@ cobalt::task<RelayResult> DoUDPRelay(
 
         bool empty() const { return reply_queue.empty(); }
     };
-    auto state = std::make_shared<SharedState>();
+    auto state = std::allocate_shared<SharedState>(
+        memory::ThreadLocalAllocator<SharedState>{});
 
     const uint64_t conn_id = ctx.conn_id;
     uint64_t callback_id = 0;
@@ -129,7 +131,7 @@ cobalt::task<RelayResult> DoUDPRelay(
 
             const uint8_t* send_data;
             size_t send_len;
-            std::vector<uint8_t> heap_buf;
+            memory::ByteVector heap_buf;
 
             if (encoded_len > 0) {
                 send_data = stack_buf.data();
@@ -189,13 +191,14 @@ cobalt::task<RelayResult> DoUDPRelay(
             active.store(true, std::memory_order_relaxed);
         }
     };
-    auto read_poll = std::make_shared<ReadPollState>();
+    auto read_poll = std::allocate_shared<ReadPollState>(
+        memory::ThreadLocalAllocator<ReadPollState>{});
     AsyncStream* client_ptr = &client_stream;
 
     while (state->running.load()) {
         // ── 批量处理回包（减少协程切换）────────────────────────────────────
         {
-            std::vector<UDPPacket> batch;
+            memory::ThreadLocalVector<UDPPacket> batch;
             batch.reserve(32);
             UDPPacket pkt;
             while (batch.size() < 32 && state->pop(pkt))
@@ -270,7 +273,7 @@ cobalt::task<RelayResult> DoUDPRelay(
                 auto drain_start = std::chrono::steady_clock::now();
 
                 while (std::chrono::steady_clock::now() - drain_start < kDrainTimeout) {
-                    std::vector<UDPPacket> pending;
+                    memory::ThreadLocalVector<UDPPacket> pending;
                     { UDPPacket p; while (state->pop(p)) pending.push_back(std::move(p)); }
 
                     for (const auto& pkt : pending) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <functional>
@@ -27,7 +28,7 @@ using UdpReplyEncoder = std::function<size_t(const TargetAddress&,
 // ============================================================================
 struct UdpInboundDecodeResult {
     TargetAddress        target;        // SOCKS5 目标地址（已解析）
-    std::vector<uint8_t> payload;       // 解密后的原始载荷
+    memory::ByteVector   payload;       // 解密后的原始载荷
     int64_t              user_id     = 0;
     std::string          user_email;
     uint64_t             speed_limit = 0;

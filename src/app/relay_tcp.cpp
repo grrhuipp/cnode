@@ -96,6 +96,10 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
                                        is_upload ? "up" : "down", half_close_timeout.count());
                         from.SetIdleTimeout(half_close_timeout);
                         to.SetIdleTimeout(half_close_timeout);
+                        // 一侧已经 EOF 后，继续向另一侧写数据不应无限等待。
+                        // 给两端都加上 half-close 写 deadline，尽快收敛阻塞写。
+                        from.SetWriteTimeout(half_close_timeout);
+                        to.SetWriteTimeout(half_close_timeout);
                     } else {
                         LOG_CONN_DEBUG(ctx, "[relay] {} half-close: timeout=0, cancel peer immediately",
                                        is_upload ? "up" : "down");

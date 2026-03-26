@@ -44,8 +44,9 @@ std::optional<UdpInboundDecodeResult> SsUdpInboundHandler::Decode(
     const SsUserInfo& user = *(*users)[decoded->user_index];
 
     // ── 4. 构建回包编码函数（值捕获密钥 + 密码套件，生命周期安全）────────────
-    std::vector<uint8_t> reply_key = user.derived_key;
-    const SsCipherInfo   reply_ci  = cipher_info_;
+    memory::ByteVector reply_key;
+    reply_key.assign(user.derived_key.begin(), user.derived_key.end());
+    const SsCipherInfo reply_ci = cipher_info_;
 
     UdpInboundDecodeResult result;
     result.target       = std::move(decoded->target);

@@ -1,12 +1,12 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/error.hpp"
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
 #include <unordered_map>
-#include <list>
 #include <array>
 #include <mutex>
 #include <shared_mutex>
@@ -147,9 +147,11 @@ private:
     //   lock：读写锁，Get 用 shared_lock（并发读），Put/Clear 用 unique_lock（独占写）
     //   lru_list：节点持有真实 key/entry，hash 索引只保留 string_view，避免域名字符串存两份
     struct alignas(64) Shard {
+        using NodeList = memory::ThreadLocalList<CacheNode>;
+
         mutable std::shared_mutex lock;
-        std::list<CacheNode> lru_list;
-        std::unordered_map<CacheKeyRef, std::list<CacheNode>::iterator,
+        NodeList lru_list;
+        memory::ThreadLocalUnorderedMap<CacheKeyRef, NodeList::iterator,
             CacheKeyHash, CacheKeyEq> cache;
         size_t max_entries = 0;
 
@@ -225,7 +227,7 @@ private:
     struct InflightResolve {
         DnsResult result;
         bool completed = false;
-        std::vector<std::shared_ptr<net::steady_timer>> waiters;
+        memory::ThreadLocalVector<std::shared_ptr<net::steady_timer>> waiters;
     };
 
     struct ParsedResponse {
@@ -252,9 +254,9 @@ private:
         bool query_aaaa);
 
     // 构建 DNS 查询报文
-    std::vector<uint8_t> BuildQuery(const std::string& domain,
-                                    uint16_t txid,
-                                    bool query_aaaa);
+    memory::ByteVector BuildQuery(const std::string& domain,
+                                  uint16_t txid,
+                                  bool query_aaaa);
 
     // 解析 DNS 响应报文
     ParsedResponse ParseResponse(
@@ -265,8 +267,8 @@ private:
     net::any_io_executor executor_;
     Config config_;
     std::shared_ptr<DnsCache> cache_;
-    std::vector<net::ip::udp::endpoint> servers_;
-    std::unordered_map<ResolveKey, std::shared_ptr<InflightResolve>, ResolveKeyHash>
+    memory::ThreadLocalVector<net::ip::udp::endpoint> servers_;
+    memory::ThreadLocalUnorderedMap<ResolveKey, std::shared_ptr<InflightResolve>, ResolveKeyHash>
         inflight_resolves_;
 
     // 事务 ID 生成器（atomic，无锁）

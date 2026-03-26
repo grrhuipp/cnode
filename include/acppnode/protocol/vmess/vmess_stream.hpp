@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/protocol/vmess/vmess_cipher.hpp"
 #include "acppnode/transport/delegating_stream.hpp"
 #include "acppnode/infra/log.hpp"
@@ -81,7 +82,7 @@ private:
     bool global_padding_ = false;
     
     // 读缓冲区（用于暂存未消费的解密数据）
-    std::vector<uint8_t> read_buffer_;
+    memory::ByteVector read_buffer_;
     size_t read_buffer_offset_ = 0;
     
     // ========================================================================
@@ -91,19 +92,19 @@ private:
     // 读写方向会同时访问缓冲区，因此必须使用独立缓冲区。
     // ========================================================================
     static constexpr size_t BUF_SIZE = MAX_CHUNK_SIZE + 128;
-    std::vector<uint8_t> read_crypto_buf_;       // 读方向：按需分配，避免每连接预留 2*16KB
-    std::vector<uint8_t> read_spare_buf_;        // 读方向：fallback 解密目标
-    std::vector<uint8_t> write_crypto_buf_;      // 写方向：Encrypt 输出
-    std::vector<uint8_t> write_output_buf_;      // 写方向：[header + encrypted + padding]
+    memory::ByteVector read_crypto_buf_;         // 读方向：按需分配，避免每连接预留 2*16KB
+    memory::ByteVector read_spare_buf_;          // 读方向：fallback 解密目标
+    memory::ByteVector write_crypto_buf_;        // 写方向：Encrypt 输出
+    memory::ByteVector write_output_buf_;        // 写方向：[header + encrypted + padding]
     
     uint32_t read_chunk_count_ = 0;
     uint32_t write_chunk_count_ = 0;
     
     // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配，典型 ~66KB）
-    std::vector<uint8_t> write_batch_buf_;
+    memory::ByteVector write_batch_buf_;
 
     // 预读数据缓冲区（握手时读取的多余数据）
-    std::vector<uint8_t> pending_data_;
+    memory::ByteVector pending_data_;
     size_t pending_offset_ = 0;
 };
 

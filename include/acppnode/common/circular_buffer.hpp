@@ -7,6 +7,8 @@
 // 用于 WebSocket 帧解码缓冲、协议解析暂存等场景。
 // ============================================================================
 
+#include "acppnode/common/allocator.hpp"
+
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -74,7 +76,7 @@ public:
             return;
         }
 
-        data_ = std::vector<uint8_t>(keep_capacity);
+        data_ = memory::ByteVector(keep_capacity);
         head_ = 0;
     }
 
@@ -84,7 +86,7 @@ private:
 
         // 扩容为 2 倍或至少容纳 needed
         size_t new_cap = std::max(data_.size() * 2, needed);
-        std::vector<uint8_t> new_data(new_cap);
+        memory::ByteVector new_data(new_cap);
 
         // 线性化拷贝
         if (size_ > 0) {
@@ -99,7 +101,7 @@ private:
         head_ = 0;
     }
 
-    std::vector<uint8_t> data_;
+    memory::ByteVector data_;
     size_t head_;
     size_t size_;
 };

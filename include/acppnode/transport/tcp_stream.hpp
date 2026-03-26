@@ -1,9 +1,9 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/timeout_scheduler.hpp"
 #include <atomic>
-#include <vector>
 
 namespace acpp {
 
@@ -69,8 +69,8 @@ public:
     const tcp::socket& Socket() const { return socket_; }
     
     // 设置待处理数据（用于 PROXY protocol 等场景）
-    void SetPendingData(std::vector<uint8_t> data) {
-        pending_data_ = std::move(data);
+    void SetPendingData(std::span<const uint8_t> data) {
+        pending_data_.assign(data.begin(), data.end());
         pending_offset_ = 0;
     }
 
@@ -96,8 +96,8 @@ private:
     bool read_shutdown_ = false;
     bool write_shutdown_ = false;
     bool counted_active_ = false;
-    std::vector<uint8_t> pending_data_;  // 待处理数据（PROXY protocol 解析后的剩余数据）
-    size_t pending_offset_ = 0;          // 已消费的偏移，避免 O(n) erase
+    memory::ByteVector pending_data_;  // 待处理数据（PROXY protocol 解析后的剩余数据）
+    size_t pending_offset_ = 0;        // 已消费的偏移，避免 O(n) erase
 
     // 自适应散读策略（仿 Xray allocStrategy）：
     //   低流量 → 1 个 Buffer；读满后加倍，最多 8 个；未读满则收缩。

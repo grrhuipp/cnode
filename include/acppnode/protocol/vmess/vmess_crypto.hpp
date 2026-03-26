@@ -8,8 +8,8 @@
 // ============================================================================
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include <array>
-#include <vector>
 #include <string>
 #include <string_view>
 #include <optional>
@@ -56,12 +56,12 @@ std::array<uint8_t, 16> KDF16(const uint8_t* key, size_t key_len,
 // AES-128-GCM
 // ============================================================================
 
-std::optional<std::vector<uint8_t>> AES128GCMDecrypt(
+std::optional<memory::ByteVector> AES128GCMDecrypt(
     const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
     const uint8_t* ciphertext, size_t len,
     const uint8_t* aad, size_t aad_len);
 
-std::vector<uint8_t> AES128GCMEncrypt(
+memory::ByteVector AES128GCMEncrypt(
     const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
     const uint8_t* plaintext, size_t len,
     const uint8_t* aad, size_t aad_len);

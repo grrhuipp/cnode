@@ -156,7 +156,7 @@ cobalt::task<std::expected<ParsedAction, ErrorCode>> SsInboundHandler::ParseStre
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    std::vector<uint8_t> payload_buf(payload_len + ss::SsAeadCipher::kTagSize);
+    memory::ByteVector payload_buf(payload_len + ss::SsAeadCipher::kTagSize);
     ok = co_await ReadFull(stream, payload_buf.data(), payload_buf.size());
 
     if (!ok) {
@@ -259,8 +259,8 @@ SsServerAsyncStream::SsServerAsyncStream(
     ss::SsCipherType cipher_type,
     size_t key_size,
     size_t salt_size,
-    std::vector<uint8_t> master_key,
-    std::vector<uint8_t> read_subkey,
+    std::span<const uint8_t> master_key,
+    std::span<const uint8_t> read_subkey,
     uint64_t read_nonce)
     : DelegatingAsyncStream(std::move(inner))
     , read_cipher_(cipher_type, read_subkey.data(), key_size)
@@ -268,7 +268,7 @@ SsServerAsyncStream::SsServerAsyncStream(
     , cipher_type_(cipher_type)
     , key_size_(key_size)
     , salt_size_(salt_size)
-    , master_key_(std::move(master_key)) {
+    , master_key_(master_key.begin(), master_key.end()) {
 }
 
 // ── 内部辅助 ─────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/session_context.hpp"
@@ -164,7 +165,7 @@ private:
     void EnqueueUdpReply(const std::string& tag,
                          std::shared_ptr<udp::socket> sock,
                          udp::endpoint endpoint,
-                         std::vector<uint8_t> payload);
+                         memory::ByteVector payload);
     void StartUdpReplySend(const std::string& tag,
                            const std::shared_ptr<udp::socket>& sock);
 
@@ -192,30 +193,40 @@ private:
 
     std::atomic<uint32_t> active_connections_{0};
 
+    using ListenerContextMap =
+        memory::ThreadLocalUnorderedMap<std::string, ListenerContext>;
+    using InboundHandlerMap =
+        memory::ThreadLocalUnorderedMap<std::string, std::shared_ptr<IInboundHandler>>;
+    using UdpSocketMap =
+        memory::ThreadLocalUnorderedMap<std::string, std::shared_ptr<udp::socket>>;
+
     // Worker 私有：只在 Worker io_context 上访问，无锁
-    std::unordered_map<std::string, tcp::acceptor>              acceptors_;
-    std::unordered_map<std::string, ListenerContext>            listener_contexts_;
+    memory::ThreadLocalUnorderedMap<std::string, tcp::acceptor> acceptors_;
+    ListenerContextMap                                           listener_contexts_;
     // shared_ptr：ListenerContext 中的 inbound_handler 与此 map 共享所有权
-    std::unordered_map<std::string, std::shared_ptr<IInboundHandler>> inbound_handlers_;
+    InboundHandlerMap inbound_handlers_;
 
     // UDP：每个 tag 一个 UDP socket（SO_REUSEPORT）
-    std::unordered_map<std::string, std::shared_ptr<udp::socket>> udp_sockets_;
+    UdpSocketMap udp_sockets_;
 
     struct PendingUdpReply {
-        udp::endpoint      endpoint;
-        std::vector<uint8_t> payload;
+        udp::endpoint endpoint;
+        memory::ByteVector payload;
     };
 
     struct UdpReplyQueueState {
-        std::deque<PendingUdpReply> pending;
+        memory::ThreadLocalDeque<PendingUdpReply> pending;
         size_t queued_bytes = 0;
         bool write_in_progress = false;
         bool shrink_pending_on_drain = false;
     };
-    std::unordered_map<std::string, UdpReplyQueueState> udp_reply_queues_;
+    using UdpReplyQueueMap =
+        memory::ThreadLocalUnorderedMap<std::string, UdpReplyQueueState>;
+    UdpReplyQueueMap udp_reply_queues_;
 
     // UDP：每个 tag 对应的协议处理器（直接持有具体类型，无虚调用开销）
-    std::unordered_map<std::string, std::unique_ptr<ss::SsUdpInboundHandler>> udp_inbound_handlers_;
+    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<ss::SsUdpInboundHandler>>
+        udp_inbound_handlers_;
 
     // UDP 客户端会话（Cone 模式：每个客户端 IP:port 维持一个出站 UDPSession）
     struct UdpClientSession {
@@ -226,12 +237,16 @@ private:
         std::chrono::steady_clock::time_point last_active;
     };
     // tag → (client_endpoint_str → session)
-    std::unordered_map<std::string,
-        std::unordered_map<std::string, UdpClientSession>>       udp_client_sessions_;
+    using UdpClientSessionMap =
+        memory::ThreadLocalUnorderedMap<std::string, UdpClientSession>;
+    memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap>
+        udp_client_sessions_;
 
     // Per-Worker 用户流量（无锁）：tag → (user_id → traffic)
-    std::unordered_map<std::string,
-        std::unordered_map<int64_t, UserTraffic>>               local_traffic_;
+    using UserTrafficMap =
+        memory::ThreadLocalUnorderedMap<int64_t, UserTraffic>;
+    memory::ThreadLocalUnorderedMap<std::string, UserTrafficMap>
+        local_traffic_;
 
     // 活跃会话追踪（无锁，仅 Worker 线程访问）
     // 用于 CollectTrafficTask 实时读取活跃连接的流量增量
@@ -240,7 +255,7 @@ private:
         uint64_t last_reported_up = 0;    // 上次收集时的 bytes_up 快照
         uint64_t last_reported_down = 0;  // 上次收集时的 bytes_down 快照
     };
-    std::unordered_map<uint64_t, ActiveSession> active_sessions_; // conn_id → session
+    memory::ThreadLocalUnorderedMap<uint64_t, ActiveSession> active_sessions_; // conn_id → session
 
     std::unique_ptr<IDnsService>       dns_service_;
     std::unique_ptr<UDPSessionManager> udp_session_manager_;

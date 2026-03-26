@@ -12,6 +12,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <cctype>
 #include <format>
 #include <openssl/x509_vfy.h>
 
@@ -43,6 +44,71 @@ namespace acpp {
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace ssl = net::ssl;
+
+namespace {
+
+constexpr size_t kHttpErrorDetailLimit = 256;
+
+std::string CompactLogText(std::string_view text) {
+    std::string result;
+    result.reserve(text.size() < kHttpErrorDetailLimit ? text.size()
+                                                       : kHttpErrorDetailLimit);
+
+    bool truncated  = false;
+    bool last_space = false;
+    for (char ch : text) {
+        if (result.size() >= kHttpErrorDetailLimit) {
+            truncated = true;
+            break;
+        }
+
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            ch = ' ';
+        } else if (std::iscntrl(uch)) {
+            continue;
+        }
+
+        if (ch == ' ') {
+            if (last_space) continue;
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+
+        result.push_back(ch);
+    }
+
+    while (!result.empty() && result.back() == ' ') {
+        result.pop_back();
+    }
+
+    if (truncated) {
+        result += "...";
+    }
+    return result;
+}
+
+std::string FormatHttpFailure(const HttpResponse& resp) {
+    const std::string detail = CompactLogText(resp.body);
+
+    if (resp.status <= 0) {
+        if (!detail.empty()) {
+            return std::format(
+                "request failed before HTTP response (status {}): {}",
+                resp.status, detail);
+        }
+        return std::format("request failed before HTTP response (status {})",
+                           resp.status);
+    }
+
+    if (!detail.empty()) {
+        return std::format("HTTP status {}: {}", resp.status, detail);
+    }
+    return std::format("HTTP status {}", resp.status);
+}
+
+}  // namespace
 
 // ============================================================================
 // V2BoardPanel 实现
@@ -354,10 +420,12 @@ V2BoardPanel::FetchNodeConfig(int node_id) {
     }
 
     if (resp.status != 200) {
-        LOG_DEBUG("V2Board[{}]: FetchNodeConfig failed, status={}", config_.name, resp.status);
+        const auto error_message = FormatHttpFailure(resp);
+        LOG_DEBUG("V2Board[{}]: FetchNodeConfig failed: {}", config_.name,
+                  error_message);
         co_return NodeConfigFetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
-            std::format("HTTP status {}", resp.status));
+            error_message);
     }
     
     try {
@@ -455,10 +523,12 @@ V2BoardPanel::FetchUsers(int node_id) {
     }
     
     if (resp.status != 200) {
-        LOG_DEBUG("V2Board[{}]: FetchUsers failed, status={}", config_.name, resp.status);
+        const auto error_message = FormatHttpFailure(resp);
+        LOG_DEBUG("V2Board[{}]: FetchUsers failed: {}", config_.name,
+                  error_message);
         co_return PanelUsersFetchResult::Fail(
             ErrorCode::PANEL_API_FAILED,
-            std::format("HTTP status {}", resp.status));
+            error_message);
     }
     
     try {
@@ -538,7 +608,8 @@ V2BoardPanel::ReportTraffic(int node_id, const std::vector<TrafficData>& data) {
     auto resp = co_await HttpPost(path, body);
     
     if (resp.status != 200) {
-        LOG_DEBUG("V2Board[{}]: ReportTraffic failed, status={}", config_.name, resp.status);
+        LOG_WARN("V2Board[{}]: ReportTraffic failed for node {}: {}",
+                 config_.name, node_id, FormatHttpFailure(resp));
         co_return false;
     }
     
@@ -568,7 +639,8 @@ V2BoardPanel::ReportOnline(int node_id, const std::vector<int64_t>& user_ids) {
     auto resp = co_await HttpPost(path, body);
     
     if (resp.status != 200) {
-        LOG_DEBUG("V2Board[{}]: ReportOnline failed, status={}", config_.name, resp.status);
+        LOG_WARN("V2Board[{}]: ReportOnline failed for node {}: {}",
+                 config_.name, node_id, FormatHttpFailure(resp));
         co_return false;
     }
     

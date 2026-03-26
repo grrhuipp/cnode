@@ -522,7 +522,9 @@ cobalt::task<void> SessionHandler::Handle(
     // 9. 双向数据转发
     //    initial_payload: 入站首包数据，先写入出站再开始双向 relay
     // ----------------------------------------------------------------
-    // 对齐 Xray：relay 阶段只靠 connIdle，禁用单次读写超时
+    // relay 阶段保留 connIdle，并继续给写方向保留 deadline。
+    // 线上观察到当一侧不再读数据时，纯靠 connIdle 会把阻塞写拖到数分钟，
+    // 导致 inbound/outbound 长时间失衡。
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(ctx, timeouts_);
     if (ctx.pressure_idle_timeout > 0 &&
         relay_idle_timeout < timeouts_.StreamIdleTimeout()) {
@@ -534,10 +536,12 @@ cobalt::task<void> SessionHandler::Handle(
     }
     wrapped_in->SetIdleTimeout(relay_idle_timeout);
     wrapped_in->SetReadTimeout(std::chrono::seconds(0));
-    wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
+    wrapped_in->SetWriteTimeout(
+        std::min(timeouts_.WriteTimeout(), relay_idle_timeout));
     wrapped_out->SetIdleTimeout(relay_idle_timeout);
     wrapped_out->SetReadTimeout(std::chrono::seconds(0));
-    wrapped_out->SetWriteTimeout(std::chrono::seconds(0));
+    wrapped_out->SetWriteTimeout(
+        std::min(timeouts_.WriteTimeout(), relay_idle_timeout));
 
     RelayConfig relay_cfg;
     relay_cfg.uplink_only   = timeouts_.UplinkOnlyTimeout();

@@ -12,6 +12,7 @@
 
 #include "acppnode/protocol/trojan/trojan_user_manager.hpp"
 #include "acppnode/protocol/trojan/trojan_codec.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/app/session_context.hpp"
 
@@ -65,7 +66,7 @@ private:
     TrojanUserInfo user_info_;
 
     // 首包数据（握手解析后的剩余数据）
-    std::vector<uint8_t> first_packet_;
+    memory::ByteVector first_packet_;
     size_t first_packet_offset_ = 0;
 
     bool handshake_done_ = false;

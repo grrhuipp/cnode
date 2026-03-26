@@ -1,7 +1,10 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
+
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <span>
 #include <vector>
 
@@ -13,7 +16,7 @@ namespace acpp {
 // 设计原则：
 //   - 固定 8KB，与 Xray 保持一致，消除多档大小选择的复杂度
 //   - start/end 游标：Advance() 消费数据无需 memmove，Produce() 记录写入量
-//   - New()/Free() 委托给 mimalloc（全局 new/delete 已被替换）
+//   - New()/Free() 直接走 allocator 原语，避免每次分配都把整块 8KB 清零
 // ============================================================================
 struct Buffer {
     static constexpr uint32_t kSize = 8192;
@@ -42,11 +45,25 @@ struct Buffer {
     // 重置游标（复用 buffer）
     void Reset() noexcept { start = 0; end = 0; }
 
-    // 从 pool 获取（mimalloc 管理，不会返回 nullptr）
-    [[nodiscard]] static Buffer* New() noexcept { return new (std::nothrow) Buffer{}; }
+    // 从 allocator 获取；仅初始化游标，payload 保持未初始化以避免热路径无谓 memset。
+    [[nodiscard]] static Buffer* New() noexcept {
+        void* raw = memory::AllocateRaw(sizeof(Buffer), alignof(Buffer));
+        if (!raw) {
+            return nullptr;
+        }
+        auto* b = ::new (raw) Buffer;
+        b->start = 0;
+        b->end = 0;
+        return b;
+    }
 
     // 归还到 pool
-    static void Free(Buffer* b) noexcept { delete b; }
+    static void Free(Buffer* b) noexcept {
+        if (!b) {
+            return;
+        }
+        memory::DeallocateRaw(b, sizeof(Buffer), alignof(Buffer));
+    }
 };
 
 // ============================================================================
@@ -56,7 +73,7 @@ struct Buffer {
 //   - 持有 MultiBuffer 的一方负责最终调用 FreeMultiBuffer()
 //   - std::move(mb) 即为所有权转移，零数据拷贝（只移动指针）
 // ============================================================================
-using MultiBuffer = std::vector<Buffer*>;
+using MultiBuffer = memory::ThreadLocalVector<Buffer*>;
 
 // 计算 MultiBuffer 中所有 Buffer 的有效字节总数
 inline size_t TotalLen(const MultiBuffer& mb) noexcept {

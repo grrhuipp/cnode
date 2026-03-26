@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 namespace acpp::trojan {
@@ -35,10 +36,10 @@ enum class TrojanCommand : uint8_t {
 // Trojan 请求
 // ============================================================================
 struct TrojanRequest {
-    std::string password_hash;      // SHA224 密码哈希（十六进制，56字节）
-    TrojanCommand command;          // 命令
-    TargetAddress target;           // 目标地址
-    std::vector<uint8_t> payload;   // 首包负载（可选）
+    std::string        password_hash;  // SHA224 密码哈希（十六进制，56字节）
+    TrojanCommand      command;        // 命令
+    TargetAddress      target;         // 目标地址
+    memory::ByteVector payload;        // 首包负载（可选）
 
     bool IsValid() const {
         return password_hash.size() == 56 &&
@@ -70,7 +71,7 @@ public:
         size_t& consumed);
 
     // 编码请求（用于客户端）
-    static std::vector<uint8_t> EncodeRequest(
+    static memory::ByteVector EncodeRequest(
         const std::string& password,
         TrojanCommand cmd,
         const TargetAddress& target,
@@ -90,7 +91,7 @@ public:
     // UDP 包格式
     struct UdpPacket {
         TargetAddress target;
-        std::vector<uint8_t> payload;
+        memory::ByteVector payload;
     };
 
     // UDP 解析结果类型
@@ -120,7 +121,7 @@ public:
         size_t len);
 
     // 编码 UDP 包
-    static std::vector<uint8_t> EncodeUdpPacket(
+    static memory::ByteVector EncodeUdpPacket(
         const TargetAddress& target,
         const uint8_t* payload,
         size_t payload_len);

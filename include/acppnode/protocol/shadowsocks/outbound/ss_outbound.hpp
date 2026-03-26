@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/protocol/outbound.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/handlers/outbound_handler.hpp"
 #include "acppnode/protocol/shadowsocks/shadowsocks_protocol.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -40,7 +41,7 @@ public:
                         ss::SsCipherType cipher_type,
                         size_t key_size,
                         size_t salt_size,
-                        std::vector<uint8_t> master_key,
+                        std::span<const uint8_t> master_key,
                         TargetAddress target);
 
     ~SsClientAsyncStream() noexcept override = default;
@@ -89,7 +90,7 @@ private:
     ss::SsCipherType         cipher_type_;
     size_t                   key_size_;
     size_t                   salt_size_;
-    std::vector<uint8_t>     master_key_;
+    memory::ByteVector       master_key_;
     std::unique_ptr<ss::SsAeadCipher> write_cipher_;
     uint64_t                 write_nonce_    = 0;
     bool                     handshake_sent_ = false;
@@ -100,7 +101,7 @@ private:
     std::unique_ptr<ss::SsAeadCipher> read_cipher_;
     uint64_t                 read_nonce_     = 0;
     bool                     read_init_      = false;
-    std::vector<uint8_t>     read_buf_;
+    memory::ByteVector       read_buf_;
     size_t                   read_buf_offset_ = 0;
     std::array<uint8_t, kEncryptedChunkSize> read_chunk_buf_{};
 };
@@ -113,7 +114,7 @@ public:
     SsOutboundHandler(ss::SsCipherType cipher_type,
                       size_t key_size,
                       size_t salt_size,
-                      std::vector<uint8_t> master_key);
+                      std::span<const uint8_t> master_key);
 
     // Handshake: noop（握手在 WrapStream 内 SsClientAsyncStream 首次写完成）
     cobalt::task<OutboundHandshakeResult> Handshake(
@@ -133,7 +134,7 @@ private:
     ss::SsCipherType     cipher_type_;
     size_t               key_size_;
     size_t               salt_size_;
-    std::vector<uint8_t> master_key_;
+    memory::ByteVector master_key_;
 };
 
 // ============================================================================
@@ -159,7 +160,7 @@ private:
     SsOutboundConfig                config_;
     IDnsService*                    dns_service_;
     ss::SsCipherInfo                cipher_info_;
-    std::vector<uint8_t>            master_key_;
+    memory::ByteVector              master_key_;
     StreamSettings                  stream_settings_;
     std::unique_ptr<SsOutboundHandler> handler_;
 };

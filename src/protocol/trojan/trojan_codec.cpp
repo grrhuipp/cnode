@@ -111,14 +111,14 @@ std::optional<TrojanRequest> TrojanCodec::ParseRequest(
     return req;
 }
 
-std::vector<uint8_t> TrojanCodec::EncodeRequest(
+memory::ByteVector TrojanCodec::EncodeRequest(
     const std::string& password,
     TrojanCommand cmd,
     const TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len) {
 
-    std::vector<uint8_t> buf;
+    memory::ByteVector buf;
     buf.resize(128 + payload_len);
 
     ByteWriter writer(buf.data(), buf.size());
@@ -394,12 +394,12 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacketEx(
     return output;
 }
 
-std::vector<uint8_t> TrojanCodec::EncodeUdpPacket(
+memory::ByteVector TrojanCodec::EncodeUdpPacket(
     const TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len) {
 
-    std::vector<uint8_t> buf;
+    memory::ByteVector buf;
     buf.resize(64 + payload_len);
 
     ByteWriter writer(buf.data(), buf.size());

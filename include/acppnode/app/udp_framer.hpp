@@ -13,6 +13,7 @@
 // ============================================================================
 
 #include "acppnode/app/udp_types.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -60,8 +61,8 @@ public:
         return pkt.data.size();
     }
 
-    std::vector<uint8_t> Encode(const UDPPacket& pkt) {
-        return pkt.data;
+    memory::ByteVector Encode(const UDPPacket& pkt) {
+        return memory::ByteVector(pkt.data.begin(), pkt.data.end());
     }
 
 private:
@@ -89,7 +90,7 @@ inline size_t UdpFramerEncodeTo(UdpFramer& f, const UDPPacket& pkt,
     return std::visit([&](auto& impl) { return impl.EncodeTo(pkt, buf, buf_size); }, f);
 }
 
-inline std::vector<uint8_t> UdpFramerEncode(UdpFramer& f, const UDPPacket& pkt) {
+inline memory::ByteVector UdpFramerEncode(UdpFramer& f, const UDPPacket& pkt) {
     return std::visit([&](auto& impl) { return impl.Encode(pkt); }, f);
 }
 
