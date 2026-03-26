@@ -16,6 +16,10 @@ namespace {
 
 constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
 
+[[noreturn]] void ThrowSsWriteError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -380,7 +384,9 @@ cobalt::task<size_t> SsServerAsyncStream::AsyncRead(net::mutable_buffer buf) {
 // ── AsyncWrite ───────────────────────────────────────────────────────────────
 cobalt::task<size_t> SsServerAsyncStream::AsyncWrite(net::const_buffer buf) {
     if (!write_init_) {
-        if (!co_await InitWriteCipher()) co_return 0;
+        if (!co_await InitWriteCipher()) {
+            ThrowSsWriteError("Shadowsocks server init write cipher failed");
+        }
     }
 
     const uint8_t* data     = static_cast<const uint8_t*>(buf.data());
@@ -398,7 +404,7 @@ cobalt::task<size_t> SsServerAsyncStream::AsyncWrite(net::const_buffer buf) {
         auto nonce_l = ss::MakeNonce(write_nonce_);
         if (!write_cipher_->Encrypt(nonce_l.data(), len_plain, 2,
                                     write_chunk_buf_.data())) {
-            co_return written;
+            ThrowSsWriteError("Shadowsocks server encrypt length failed");
         }
         ++write_nonce_;
 
@@ -406,14 +412,14 @@ cobalt::task<size_t> SsServerAsyncStream::AsyncWrite(net::const_buffer buf) {
         auto nonce_p = ss::MakeNonce(write_nonce_);
         if (!write_cipher_->Encrypt(nonce_p.data(), data, chunk_size,
                                     write_chunk_buf_.data() + kLenHeaderSize)) {
-            co_return written;
+            ThrowSsWriteError("Shadowsocks server encrypt payload failed");
         }
         ++write_nonce_;
 
         // 单次写入 enc_len + enc_payload
         const size_t total = kLenHeaderSize + chunk_size + ss::SsAeadCipher::kTagSize;
         if (!co_await WriteFull(write_chunk_buf_.data(), total)) {
-            co_return written;
+            ThrowSsWriteError("Shadowsocks server write chunk failed");
         }
 
         data      += chunk_size;
@@ -434,14 +440,19 @@ cobalt::task<void> SsServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     if (mb.empty()) co_return;
 
     if (!write_init_) {
-        if (!co_await InitWriteCipher()) co_return;
+        if (!co_await InitWriteCipher()) {
+            ThrowSsWriteError("Shadowsocks server init write cipher failed");
+        }
     }
 
     // 快速路径：单 Buffer 退化为现有 AsyncWrite
     if (mb.size() == 1) {
         auto bytes = mb[0]->Bytes();
         if (!bytes.empty()) {
-            co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            size_t written = co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            if (written != bytes.size()) {
+                ThrowSsWriteError("Shadowsocks server partial single-buffer write");
+            }
         }
         co_return;
     }
@@ -474,7 +485,7 @@ cobalt::task<void> SsServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             auto nonce_l = ss::MakeNonce(write_nonce_);
             if (!write_cipher_->Encrypt(nonce_l.data(), len_plain, 2, out)) {
                 write_batch_buf_.resize(old_size);
-                co_return;
+                ThrowSsWriteError("Shadowsocks server batch encrypt length failed");
             }
             ++write_nonce_;
 
@@ -483,7 +494,7 @@ cobalt::task<void> SsServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             if (!write_cipher_->Encrypt(nonce_p.data(), data, chunk_size,
                                         out + kLenHeaderSize)) {
                 write_batch_buf_.resize(old_size);
-                co_return;
+                ThrowSsWriteError("Shadowsocks server batch encrypt payload failed");
             }
             ++write_nonce_;
 
@@ -493,7 +504,11 @@ cobalt::task<void> SsServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     }
 
     if (!write_batch_buf_.empty()) {
-        co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size());
+        if (!co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size())) {
+            write_batch_buf_.clear();
+            ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
+            ThrowSsWriteError("Shadowsocks server batch write failed");
+        }
         write_batch_buf_.clear();
         ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
     }

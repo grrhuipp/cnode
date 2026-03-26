@@ -30,6 +30,10 @@ constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderE
 constexpr size_t kVMessResponseHeaderMax = 1024;
 constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
 
+[[noreturn]] void ThrowVMessWriteError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
 }  // namespace
 
 using namespace vmess;
@@ -501,7 +505,7 @@ cobalt::task<size_t> VMessClientAsyncStream::AsyncRead(net::mutable_buffer buffe
     // 确保收到响应头
     if (!response_received_) {
         if (!co_await ReadResponseHeader()) {
-            co_return 0;
+            ThrowVMessWriteError("VMess client read response header failed");
         }
     }
 
@@ -642,7 +646,7 @@ cobalt::task<size_t> VMessClientAsyncStream::AsyncWrite(net::const_buffer buffer
         size_t chunk_size = std::min(len - total_written, size_t(MAX_CHUNK_SIZE - 16));
 
         if (!co_await WriteChunk(data + total_written, chunk_size)) {
-            co_return total_written > 0 ? total_written : 0;
+            ThrowVMessWriteError("VMess client write chunk failed");
         }
 
         total_written += chunk_size;
@@ -661,7 +665,10 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     if (mb.size() == 1) {
         auto bytes = mb[0]->Bytes();
         if (!bytes.empty()) {
-            co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            size_t written = co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            if (written != bytes.size()) {
+                ThrowVMessWriteError("VMess client partial single-buffer write");
+            }
         }
         co_return;
     }
@@ -690,7 +697,7 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             // 加密到 write_output_buf_ + 2（复用固定缓冲区做临时空间）
             ssize_t enc_len = write_cipher_->Encrypt(data + offset, chunk_size, write_output_buf_ + 2);
             if (enc_len < 0) {
-                co_return;
+                ThrowVMessWriteError("VMess client batch encrypt failed");
             }
 
             uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
@@ -719,7 +726,11 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     }
 
     if (!write_batch_buf_.empty()) {
-        co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size());
+        if (!co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size())) {
+            write_batch_buf_.clear();
+            ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
+            ThrowVMessWriteError("VMess client batch write failed");
+        }
         write_batch_buf_.clear();
         ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
     }
