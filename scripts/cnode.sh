@@ -4,7 +4,7 @@
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
 # 每次执行添加/覆盖一个 panel 到同一个 cnode 实例，已有配置文件不会被覆盖
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v build_type"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v build_type debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
@@ -38,6 +38,7 @@ usage() {
     echo "  -inbound_url <url>     远程 inbound.json 下载地址（文件已存在则跳过）"
     echo "  -v <version>           指定 release 版本（默认 master）"
     echo "  -build_type <type>     二进制类型：release / debug（默认 release）"
+    echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
 
@@ -127,6 +128,15 @@ install_cnode() {
             ;;
     esac
 
+    DEBUG_FILE="${debug_file:-false}"
+    case "$DEBUG_FILE" in
+        true|false) ;;
+        *)
+            echo "无效的 debug_file: $DEBUG_FILE（仅支持 true/false）"
+            exit 1
+            ;;
+    esac
+
     # 获取远程 build_id
     RELEASE_TAG="${v:-master}"
     RELEASE_INFO=$(curl -sf "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG")
@@ -135,13 +145,17 @@ install_cnode() {
         exit 1
     fi
 
-    REMOTE_ID=$(echo "$RELEASE_INFO" | grep -o 'build_id: [^[:space:]]*' | awk '{print $2}')
+    REMOTE_ID=$(echo "$RELEASE_INFO" \
+        | jq -r '.body // ""' \
+        | sed -n 's/.*build_id: \([^[:space:]]*\).*/\1/p' \
+        | head -1)
     if [ -z "$REMOTE_ID" ]; then
         echo "无法解析远程 build_id。"
         exit 1
     fi
 
     REMOTE_VERSION="$BUILD_TYPE:$REMOTE_ID"
+    DEBUG_PATH="$INSTALL_DIR/cnode-linux-amd64.debug"
 
     # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
     LOCAL_ID=""
@@ -149,9 +163,9 @@ install_cnode() {
         LOCAL_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     fi
 
+    NEED_BINARY_UPDATE=1
     if [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
-        echo "cnode 已是最新版本: $REMOTE_VERSION"
-        return 0
+        NEED_BINARY_UPDATE=0
     fi
 
     ASSET_NAME="cnode-linux-amd64"
@@ -167,28 +181,63 @@ install_cnode() {
         LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/$ASSET_NAME"
     fi
 
-    # 运行中的二进制无法覆盖（Text file busy），先停服务并杀残留进程
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        echo "停止 cnode 服务..."
-        systemctl stop "$SERVICE_NAME"
+    NEED_DEBUG_DOWNLOAD=0
+    DEBUG_URL=""
+    if [ "$DEBUG_FILE" = "true" ]; then
+        if [ "$BUILD_TYPE" != "release" ]; then
+            echo "提示: debug 构建本身包含调试信息，跳过单独 .debug 文件下载"
+        else
+            NEED_DEBUG_DOWNLOAD=1
+            DEBUG_URL=$(echo "$RELEASE_INFO" \
+                | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' \
+                | head -1)
+            if [ -z "$DEBUG_URL" ] || [ "$DEBUG_URL" = "null" ]; then
+                DEBUG_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64.debug"
+            fi
+        fi
     fi
-    pkill -f "$BIN_PATH" 2>/dev/null || true
-    sleep 1
 
-    echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_VERSION"
-    if ! curl -sfL "$LATEST_URL" -o "$BIN_PATH"; then
-        echo "cnode 下载失败。"
-        exit 1
+    if [ "$NEED_BINARY_UPDATE" -eq 0 ] && [ "$NEED_DEBUG_DOWNLOAD" -eq 0 ]; then
+        echo "cnode 已是最新版本: $REMOTE_VERSION"
+        return 0
     fi
-    chmod +x "$BIN_PATH"
 
-    # 验证下载的版本
-    NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
-    if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
-        echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
-        exit 1
+    if [ "$NEED_BINARY_UPDATE" -eq 1 ]; then
+        # 运行中的二进制无法覆盖（Text file busy），先停服务并杀残留进程
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "停止 cnode 服务..."
+            systemctl stop "$SERVICE_NAME"
+        fi
+        pkill -f "$BIN_PATH" 2>/dev/null || true
+        sleep 1
+
+        echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_VERSION"
+        if ! curl -sfL "$LATEST_URL" -o "$BIN_PATH"; then
+            echo "cnode 下载失败。"
+            exit 1
+        fi
+        chmod +x "$BIN_PATH"
+
+        # 验证下载的版本
+        NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
+        if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
+            echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
+            exit 1
+        fi
+        echo "cnode 已更新到 $REMOTE_VERSION"
+    else
+        echo "cnode 已是最新版本: $REMOTE_VERSION"
     fi
-    echo "cnode 已更新到 $REMOTE_VERSION"
+
+    if [ "$NEED_DEBUG_DOWNLOAD" -eq 1 ]; then
+        echo "下载符号文件: $DEBUG_PATH"
+        if ! curl -sfL "$DEBUG_URL" -o "$DEBUG_PATH"; then
+            echo ".debug 文件下载失败。"
+            exit 1
+        fi
+        chmod 0644 "$DEBUG_PATH"
+        echo ".debug 文件已下载: $DEBUG_PATH"
+    fi
 }
 
 # ============================================================================

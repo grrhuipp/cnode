@@ -34,6 +34,10 @@ main.cpp → Worker (per-core)
 # 仅更新二进制（默认 release）
 bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh)
 
+# 仅更新二进制并额外下载 Release 符号文件
+bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh) \
+  -debug_file true
+
 # VMess 节点
 bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh) \
   -name my-panel \
@@ -85,6 +89,7 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/
 | `-route_url` | 否 | 远程 route.json 地址 |
 | `-inbound_url` | 否 | 远程 inbound.json 地址 |
 | `-build_type` | 否 | 二进制类型：`release` / `debug` |
+| `-debug_file` | 否 | 设为 `true` 时额外下载 Release 对应的 `.debug` 符号文件 |
 
 ### 管理命令
 
