@@ -2,9 +2,11 @@
 #include "acppnode/infra/log.hpp"
 
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/cobalt.hpp>
+#include <algorithm>
 #include <random>
 #include <cstring>
 #include <format>
@@ -241,46 +243,52 @@ cobalt::task<DnsResult> DnsService::Resolve(
 
 cobalt::task<DnsResult> DnsService::DoResolve(
     const std::string& domain, bool prefer_ipv6) {
-    
-    // 遍历服务器尝试
-    for (const auto& server : servers_) {
-        DnsResult result;
-        const bool primary_query_aaaa = prefer_ipv6;
-        auto primary = co_await QueryServer(server, domain, primary_query_aaaa);
-
-        if (primary.Ok()) {
-            auto secondary = co_await QueryServer(server, domain, !primary_query_aaaa);
-            if (secondary.Ok()) {
-                primary.addresses.reserve(
-                    primary.addresses.size() + secondary.addresses.size());
-                primary.addresses.insert(primary.addresses.end(),
-                    secondary.addresses.begin(),
-                    secondary.addresses.end());
-            }
-            co_return primary;
-        }
-
-        auto secondary = co_await QueryServer(server, domain, !primary_query_aaaa);
-        if (secondary.Ok()) {
-            co_return secondary;
-        }
-
-        // 只有两种记录都明确无记录时，才认为该服务器给出了确定的 no record。
-        if (primary.error == ErrorCode::DNS_NO_RECORD &&
-            secondary.error == ErrorCode::DNS_NO_RECORD) {
-            co_return primary;
-        }
-
-        // 否则保留非 no-record 的错误，继续尝试下一个 DNS 服务器。
-        result = (primary.error != ErrorCode::DNS_NO_RECORD)
-            ? std::move(primary)
-            : std::move(secondary);
-    }
-    
-    // 所有服务器都失败
     DnsResult result;
-    result.error = ErrorCode::DNS_RESOLVE_FAILED;
-    result.error_msg = "All DNS servers failed";
+    net::ip::tcp::resolver resolver(executor_);
+    auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
+        domain,
+        "0",
+        net::as_tuple(cobalt::use_op));
+
+    if (resolve_ec) {
+        if (resolve_ec == net::error::host_not_found ||
+            resolve_ec == net::error::no_data) {
+            result.error = ErrorCode::DNS_NO_RECORD;
+        } else {
+            result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        }
+        result.error_msg = resolve_ec.message();
+        co_return result;
+    }
+
+    auto append_unique = [](std::vector<net::ip::address>& out,
+                            const net::ip::address& address) {
+        if (std::find(out.begin(), out.end(), address) == out.end()) {
+            out.push_back(address);
+        }
+    };
+
+    std::vector<net::ip::address> preferred;
+    std::vector<net::ip::address> alternate;
+    for (const auto& entry : endpoints) {
+        const auto address = entry.endpoint().address();
+        if (address.is_v6() == prefer_ipv6) {
+            append_unique(preferred, address);
+        } else {
+            append_unique(alternate, address);
+        }
+    }
+
+    preferred.insert(preferred.end(), alternate.begin(), alternate.end());
+    if (preferred.empty()) {
+        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error_msg = "resolver returned no addresses";
+        co_return result;
+    }
+
+    result.addresses = std::move(preferred);
+    result.ttl = config_.min_ttl;
+    result.error = ErrorCode::OK;
     co_return result;
 }
 
