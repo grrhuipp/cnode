@@ -10,6 +10,10 @@ namespace {
 
 constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
 
+[[noreturn]] void ThrowVMessWriteError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
 }  // namespace
 
 void VMessServerAsyncStream::EnsureReadBuffers() {
@@ -152,7 +156,7 @@ cobalt::task<size_t> VMessServerAsyncStream::AsyncRead(net::mutable_buffer buffe
         LOG_ACCESS_DEBUG("VMess stream: AsyncRead triggering SendResponseHeader");
         if (!co_await SendResponseHeader()) {
             LOG_ACCESS_DEBUG("VMess stream: AsyncRead SendResponseHeader failed");
-            co_return 0;
+            ThrowVMessWriteError("VMess stream send response header failed");
         }
     }
 
@@ -195,7 +199,7 @@ cobalt::task<size_t> VMessServerAsyncStream::AsyncWrite(net::const_buffer buffer
         LOG_ACCESS_DEBUG("VMess stream: AsyncWrite triggering SendResponseHeader");
         if (!co_await SendResponseHeader()) {
             LOG_ACCESS_DEBUG("VMess stream: AsyncWrite SendResponseHeader failed");
-            co_return 0;
+            ThrowVMessWriteError("VMess stream send response header failed");
         }
     }
 
@@ -207,7 +211,7 @@ cobalt::task<size_t> VMessServerAsyncStream::AsyncWrite(net::const_buffer buffer
         // MAX_CHUNK_SIZE - 16 是最大明文长度（减去 overhead）
         size_t chunk_size = std::min(len - total, size_t(MAX_CHUNK_SIZE - 16));
         if (!co_await WriteChunk(data + total, chunk_size)) {
-            co_return total > 0 ? total : 0;
+            ThrowVMessWriteError("VMess stream write chunk failed");
         }
         total += chunk_size;
     }
@@ -227,7 +231,7 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
     if (!response_header_sent_) {
         if (!co_await SendResponseHeader()) {
-            co_return;
+            ThrowVMessWriteError("VMess stream send response header failed");
         }
     }
 
@@ -237,7 +241,10 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     if (mb.size() == 1) {
         auto bytes = mb[0]->Bytes();
         if (!bytes.empty()) {
-            co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            size_t written = co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+            if (written != bytes.size()) {
+                ThrowVMessWriteError("VMess stream partial single-buffer write");
+            }
         }
         co_return;
     }
@@ -258,7 +265,7 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             size_t overhead = write_cipher_->Overhead();
 
             if (chunk_size + overhead > BUF_SIZE) {
-                co_return;
+                ThrowVMessWriteError("VMess stream batch write buffer overflow");
             }
 
             EnsureWriteBuffers();
@@ -267,7 +274,7 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             ssize_t enc_len = write_cipher_->Encrypt(
                 data + offset, chunk_size, write_crypto_buf_.data());
             if (enc_len < 0) {
-                co_return;
+                ThrowVMessWriteError("VMess stream batch encrypt failed");
             }
 
             // padding + masking（与 WriteChunk 逻辑一致）
@@ -306,7 +313,11 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
     // 单次写入所有 chunk
     if (!write_batch_buf_.empty()) {
-        co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size());
+        if (!co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size())) {
+            write_batch_buf_.clear();
+            ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
+            ThrowVMessWriteError("VMess stream batch write failed");
+        }
         write_batch_buf_.clear();
         ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
     }

@@ -326,10 +326,13 @@ cobalt::task<void> SessionHandler::Handle(
         }
         auto wrapped_in = std::move(*wrapped_in_result);
 
-        // 对齐 Xray：relay 阶段只靠 connIdle
-        wrapped_in->SetIdleTimeout(ResolveRelayIdleTimeout(ctx, timeouts_));
+        // UDP over TCP 回包同样可能被客户端写阻塞拖住，保留写方向 deadline
+        // 避免连接只靠 connIdle 长时间滞留。
+        const auto relay_idle_timeout = ResolveRelayIdleTimeout(ctx, timeouts_);
+        wrapped_in->SetIdleTimeout(relay_idle_timeout);
         wrapped_in->SetReadTimeout(std::chrono::seconds(0));
-        wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
+        wrapped_in->SetWriteTimeout(
+            std::min(timeouts_.WriteTimeout(), relay_idle_timeout));
 
         UDPRelayConfig udp_cfg;
         udp_cfg.speed_limit = ctx.speed_limit;
@@ -380,10 +383,13 @@ cobalt::task<void> SessionHandler::Handle(
         }
         auto wrapped_in = std::move(*wrapped_in_result);
 
-        // 对齐 Xray：relay 阶段只靠 connIdle
-        wrapped_in->SetIdleTimeout(ResolveRelayIdleTimeout(ctx, timeouts_));
+        // Mux 回包写客户端时也可能长期阻塞，保留写方向 deadline，
+        // 避免一个 Mux 连接把多个子会话一起拖住。
+        const auto relay_idle_timeout = ResolveRelayIdleTimeout(ctx, timeouts_);
+        wrapped_in->SetIdleTimeout(relay_idle_timeout);
         wrapped_in->SetReadTimeout(std::chrono::seconds(0));
-        wrapped_in->SetWriteTimeout(std::chrono::seconds(0));
+        wrapped_in->SetWriteTimeout(
+            std::min(timeouts_.WriteTimeout(), relay_idle_timeout));
 
         UDPRelayConfig mux_cfg;
         mux_cfg.speed_limit = ctx.speed_limit;

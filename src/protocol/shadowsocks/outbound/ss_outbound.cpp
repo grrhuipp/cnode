@@ -14,6 +14,14 @@
 
 namespace acpp {
 
+namespace {
+
+[[noreturn]] void ThrowSsWriteError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
+}  // namespace
+
 // ============================================================================
 // SsClientAsyncStream
 // ============================================================================
@@ -250,11 +258,15 @@ cobalt::task<size_t> SsClientAsyncStream::AsyncWrite(net::const_buffer buf) {
     const size_t   len  = buf.size();
 
     if (!handshake_sent_) {
-        if (!co_await SendHandshake(data, len)) co_return 0;
+        if (!co_await SendHandshake(data, len)) {
+            ThrowSsWriteError("Shadowsocks client send handshake failed");
+        }
         co_return len;
     }
 
-    if (!co_await WriteChunk(data, len)) co_return 0;
+    if (!co_await WriteChunk(data, len)) {
+        ThrowSsWriteError("Shadowsocks client write chunk failed");
+    }
     co_return len;
 }
 
