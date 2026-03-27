@@ -28,7 +28,8 @@ constexpr size_t kVMessHandshakeHeaderMax = 512;
 constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
-constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
+constexpr size_t kStreamFlushBufferCount = 8;
+constexpr size_t kStreamFlushBytes = Buffer::kSize * kStreamFlushBufferCount;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {
     throw boost::system::system_error(boost::asio::error::connection_reset, what);
@@ -652,26 +653,31 @@ cobalt::task<size_t> VMessClientAsyncStream::AsyncWrite(net::const_buffer buffer
     co_return total_written;
 }
 
-// 批量加密写入：将多个 Buffer 合并为单次 inner_ 写入
+// 流式加密写入：直接加密到 pool Buffer，再交给下层 scatter-write
 cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     MultiBufferGuard guard{mb};
 
     if (mb.empty()) co_return;
-
-    // 快速路径：单 Buffer 退化为现有 AsyncWrite
-    if (mb.size() == 1) {
-        auto bytes = mb[0]->Bytes();
-        if (!bytes.empty()) {
-            size_t written = co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
-            if (written != bytes.size()) {
-                ThrowVMessWriteError("VMess client partial single-buffer write");
-            }
-        }
-        co_return;
+    const size_t overhead = write_cipher_->Overhead();
+    if (Buffer::kSize <= 2 + overhead + 63) {
+        ThrowVMessWriteError("VMess client buffer budget too small");
     }
+    const size_t stream_chunk_size = std::min(
+        size_t(MAX_CHUNK_SIZE - overhead),
+        size_t(Buffer::kSize - 2 - overhead - 63));
 
-    // 批量路径
-    write_batch_buf_.clear();
+    MultiBuffer out_mb;
+    MultiBufferGuard out_guard{out_mb};
+    size_t out_bytes = 0;
+
+    auto flush_out = [this, &out_mb, &out_bytes]() -> cobalt::task<void> {
+        if (out_mb.empty()) {
+            co_return;
+        }
+        co_await inner_->WriteMultiBuffer(std::move(out_mb));
+        out_mb = MultiBuffer{};
+        out_bytes = 0;
+    };
 
     for (auto* buf : mb) {
         auto bytes = buf->Bytes();
@@ -682,7 +688,7 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
         size_t offset = 0;
 
         while (offset < len) {
-            size_t chunk_size = std::min(len - offset, size_t(MAX_CHUNK_SIZE - 16));
+            size_t chunk_size = std::min(len - offset, stream_chunk_size);
 
             // padding mask（与 WriteChunk 逻辑一致：先 padding，再加密，再 size）
             size_t padding_len = 0;
@@ -691,10 +697,16 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
                 padding_len = padding_mask % 64;
             }
 
-            // 加密到 write_output_buf_ + 2（复用固定缓冲区做临时空间）
-            ssize_t enc_len = write_cipher_->Encrypt(data + offset, chunk_size, write_output_buf_ + 2);
+            Buffer* out = Buffer::New();
+            if (!out) {
+                throw std::bad_alloc();
+            }
+
+            uint8_t* dst = out->Tail().data();
+            ssize_t enc_len = write_cipher_->Encrypt(data + offset, chunk_size, dst + 2);
             if (enc_len < 0) {
-                ThrowVMessWriteError("VMess client batch encrypt failed");
+                Buffer::Free(out);
+                ThrowVMessWriteError("VMess client stream encrypt failed");
             }
 
             uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
@@ -704,33 +716,32 @@ cobalt::task<void> VMessClientAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
                 masked_len ^= size_mask;
             }
 
-            // 追加到批量缓冲
             size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
-            size_t old_size = write_batch_buf_.size();
-            write_batch_buf_.resize(old_size + output_size);
-            uint8_t* out = write_batch_buf_.data() + old_size;
-
-            out[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
-            out[1] = static_cast<uint8_t>(masked_len & 0xFF);
-            std::memcpy(out + 2, write_output_buf_ + 2, enc_len);
+            dst[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
+            dst[1] = static_cast<uint8_t>(masked_len & 0xFF);
 
             if (padding_len > 0) {
-                RAND_bytes(out + 2 + enc_len, static_cast<int>(padding_len));
+                RAND_bytes(dst + 2 + enc_len, static_cast<int>(padding_len));
+            }
+
+            out->Produce(static_cast<uint32_t>(output_size));
+            out_bytes += output_size;
+            try {
+                out_mb.push_back(out);
+            } catch (...) {
+                Buffer::Free(out);
+                throw;
             }
 
             offset += chunk_size;
+
+            if (out_mb.size() >= kStreamFlushBufferCount || out_bytes >= kStreamFlushBytes) {
+                co_await flush_out();
+            }
         }
     }
 
-    if (!write_batch_buf_.empty()) {
-        if (!co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size())) {
-            write_batch_buf_.clear();
-            ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
-            ThrowVMessWriteError("VMess client batch write failed");
-        }
-        write_batch_buf_.clear();
-        ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
-    }
+    co_await flush_out();
 }
 
 cobalt::task<bool> VMessClientAsyncStream::WriteChunk(const uint8_t* data, size_t len) {

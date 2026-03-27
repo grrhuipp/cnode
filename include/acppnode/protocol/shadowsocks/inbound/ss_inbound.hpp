@@ -63,6 +63,7 @@ public:
     SsServerAsyncStream(const SsServerAsyncStream&)            = delete;
     SsServerAsyncStream& operator=(const SsServerAsyncStream&) = delete;
 
+    cobalt::task<MultiBuffer> ReadMultiBuffer() override;
     cobalt::task<size_t> AsyncRead(net::mutable_buffer buf) override;
     cobalt::task<size_t> AsyncWrite(net::const_buffer buf) override;
 
@@ -102,8 +103,6 @@ private:
     // 前 kLenHeaderSize 字节用于 enc_len，后续用于加密载荷，支持单次 WriteFull
     std::array<uint8_t, kLenHeaderSize + kEncryptedChunkSize> write_chunk_buf_{};
 
-    // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配）
-    memory::ByteVector write_batch_buf_;
 };
 
 // ============================================================================

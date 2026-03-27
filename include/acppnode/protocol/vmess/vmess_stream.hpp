@@ -22,6 +22,7 @@ public:
 
     ~VMessServerAsyncStream() override = default;
 
+    cobalt::task<MultiBuffer> ReadMultiBuffer() override { return AsyncStream::ReadMultiBuffer(); }
     cobalt::task<size_t> AsyncRead(net::mutable_buffer buffer) override;
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override;
 
@@ -100,9 +101,6 @@ private:
     uint32_t read_chunk_count_ = 0;
     uint32_t write_chunk_count_ = 0;
     
-    // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配，典型 ~66KB）
-    memory::ByteVector write_batch_buf_;
-
     // 预读数据缓冲区（握手时读取的多余数据）
     memory::ByteVector pending_data_;
     size_t pending_offset_ = 0;

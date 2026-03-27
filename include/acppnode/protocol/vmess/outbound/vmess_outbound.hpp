@@ -99,6 +99,7 @@ public:
     ~VMessClientAsyncStream() override = default;
     
     // AsyncStream 接口
+    cobalt::task<MultiBuffer> ReadMultiBuffer() override { return AsyncStream::ReadMultiBuffer(); }
     cobalt::task<size_t> AsyncRead(net::mutable_buffer buffer) override;
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override;
     cobalt::task<void> WriteMultiBuffer(MultiBuffer mb) override;
@@ -174,9 +175,6 @@ private:
     alignas(64) uint8_t crypto_buf_[CRYPTO_BUF_SIZE];       // 读解密缓冲
     alignas(64) uint8_t write_output_buf_[CRYPTO_BUF_SIZE]; // 写输出缓冲
     
-    // WriteMultiBuffer 批量输出缓冲（持久化避免反复分配）
-    memory::ByteVector write_batch_buf_;
-
     // 读缓冲（简化版环形缓冲）
     memory::ByteVector read_buffer_;
     size_t read_buffer_offset_ = 0;

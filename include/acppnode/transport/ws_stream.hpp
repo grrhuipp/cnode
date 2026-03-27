@@ -476,6 +476,39 @@ class WsServerStream final : public BaseWsStream {
 public:
     WsServerStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id)
         : BaseWsStream(std::move(inner), conn_id, false) {}
+
+    cobalt::task<void> WriteMultiBuffer(MultiBuffer mb) override {
+        if (!CanWrite()) {
+            FreeMultiBuffer(mb);
+            ThrowWsStreamError("WebSocket server write on closed stream");
+        }
+
+        MultiBufferGuard guard{mb};
+        const size_t total_len = TotalLen(mb);
+        if (total_len == 0) {
+            co_return;
+        }
+
+        Buffer* header_buf = Buffer::New();
+        if (!header_buf) {
+            throw std::bad_alloc();
+        }
+
+        auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, false);
+        std::memcpy(header_buf->Tail().data(), header.bytes.data(), header.size);
+        header_buf->Produce(static_cast<uint32_t>(header.size));
+
+        try {
+            mb.reserve(mb.size() + 1);
+            mb.insert(mb.begin(), header_buf);
+        } catch (...) {
+            Buffer::Free(header_buf);
+            throw;
+        }
+
+        co_await inner_->WriteMultiBuffer(std::move(mb));
+        mb = MultiBuffer{};
+    }
     
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!CanWrite()) {
@@ -524,6 +557,54 @@ public:
         const std::string& host,
         const std::string& path,
         const std::unordered_map<std::string, std::string>* headers = nullptr);
+
+    cobalt::task<void> WriteMultiBuffer(MultiBuffer mb) override {
+        if (!CanWrite()) {
+            FreeMultiBuffer(mb);
+            ThrowWsStreamError("WebSocket client write on closed stream");
+        }
+
+        MultiBufferGuard guard{mb};
+        const size_t total_len = TotalLen(mb);
+        if (total_len == 0) {
+            co_return;
+        }
+
+        uint8_t mask_key[4];
+        if (RAND_bytes(mask_key, sizeof(mask_key)) != 1) [[unlikely]] {
+            ThrowWsStreamError("WebSocket client generate mask failed");
+        }
+
+        size_t payload_offset = 0;
+        for (auto* b : mb) {
+            auto bytes = b->Bytes();
+            if (bytes.empty()) {
+                continue;
+            }
+            ws::MaskData(bytes.data(), bytes.size(), mask_key, payload_offset);
+            payload_offset += bytes.size();
+        }
+
+        Buffer* header_buf = Buffer::New();
+        if (!header_buf) {
+            throw std::bad_alloc();
+        }
+
+        auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, true, mask_key);
+        std::memcpy(header_buf->Tail().data(), header.bytes.data(), header.size);
+        header_buf->Produce(static_cast<uint32_t>(header.size));
+
+        try {
+            mb.reserve(mb.size() + 1);
+            mb.insert(mb.begin(), header_buf);
+        } catch (...) {
+            Buffer::Free(header_buf);
+            throw;
+        }
+
+        co_await inner_->WriteMultiBuffer(std::move(mb));
+        mb = MultiBuffer{};
+    }
     
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!CanWrite()) {

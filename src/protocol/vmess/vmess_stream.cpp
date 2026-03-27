@@ -7,8 +7,8 @@ namespace acpp {
 namespace vmess {
 
 namespace {
-
-constexpr size_t kWriteBatchKeepCapacity = 128 * 1024;
+constexpr size_t kStreamFlushBufferCount = 8;
+constexpr size_t kStreamFlushBytes = Buffer::kSize * kStreamFlushBufferCount;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {
     throw boost::system::system_error(boost::asio::error::connection_reset, what);
@@ -222,11 +222,7 @@ cobalt::task<size_t> VMessServerAsyncStream::AsyncWrite(net::const_buffer buffer
 }
 
 // ============================================================================
-// WriteMultiBuffer — 批量加密写入优化
-//
-// 默认实现对每个 Buffer 调用 AsyncWrite，每次产生 1 次 inner_->AsyncWrite。
-// 本优化将所有 Buffer 的 chunk 加密后合并到 write_batch_buf_，
-// 最终单次 WriteFull 完成所有数据的写入，将 N 次 syscall 降为 1 次。
+// WriteMultiBuffer — 流式加密到 pool Buffer，再交给下层 scatter-write
 // ============================================================================
 cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
     MultiBufferGuard guard{mb};
@@ -239,20 +235,26 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 
     if (mb.empty()) co_return;
 
-    // 快速路径：单 Buffer 退化为现有 AsyncWrite（避免额外 copy）
-    if (mb.size() == 1) {
-        auto bytes = mb[0]->Bytes();
-        if (!bytes.empty()) {
-            size_t written = co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
-            if (written != bytes.size()) {
-                ThrowVMessWriteError("VMess stream partial single-buffer write");
-            }
-        }
-        co_return;
+    const size_t overhead = write_cipher_->Overhead();
+    if (Buffer::kSize <= 2 + overhead + 63) {
+        ThrowVMessWriteError("VMess stream buffer budget too small");
     }
+    const size_t stream_chunk_size = std::min(
+        size_t(MAX_CHUNK_SIZE - overhead),
+        size_t(Buffer::kSize - 2 - overhead - 63));
 
-    // 批量路径：所有 Buffer 加密后合并写入
-    write_batch_buf_.clear();
+    MultiBuffer out_mb;
+    MultiBufferGuard out_guard{out_mb};
+    size_t out_bytes = 0;
+
+    auto flush_out = [this, &out_mb, &out_bytes]() -> cobalt::task<void> {
+        if (out_mb.empty()) {
+            co_return;
+        }
+        co_await inner_->WriteMultiBuffer(std::move(out_mb));
+        out_mb = MultiBuffer{};
+        out_bytes = 0;
+    };
 
     for (auto* buf : mb) {
         auto bytes = buf->Bytes();
@@ -263,20 +265,18 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
         size_t offset = 0;
 
         while (offset < len) {
-            size_t chunk_size = std::min(len - offset, size_t(MAX_CHUNK_SIZE - 16));
-            size_t overhead = write_cipher_->Overhead();
-
-            if (chunk_size + overhead > BUF_SIZE) {
-                ThrowVMessWriteError("VMess stream batch write buffer overflow");
+            size_t chunk_size = std::min(len - offset, stream_chunk_size);
+            Buffer* out = Buffer::New();
+            if (!out) {
+                throw std::bad_alloc();
             }
 
-            EnsureWriteBuffers();
-
-            // 加密到 write_crypto_buf_
+            uint8_t* dst = out->Tail().data();
             ssize_t enc_len = write_cipher_->Encrypt(
-                data + offset, chunk_size, write_crypto_buf_.data());
+                data + offset, chunk_size, dst + 2);
             if (enc_len < 0) {
-                ThrowVMessWriteError("VMess stream batch encrypt failed");
+                Buffer::Free(out);
+                ThrowVMessWriteError("VMess stream stream encrypt failed");
             }
 
             // padding + masking（与 WriteChunk 逻辑一致）
@@ -295,34 +295,32 @@ cobalt::task<void> VMessServerAsyncStream::WriteMultiBuffer(MultiBuffer mb) {
             uint16_t masked_len = total_len ^ length_mask;
             write_chunk_count_++;
 
-            // 追加到批量缓冲：[2-byte header][encrypted data][padding]
-            size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
-            size_t old_size = write_batch_buf_.size();
-            write_batch_buf_.resize(old_size + output_size);
-            uint8_t* out = write_batch_buf_.data() + old_size;
-
-            out[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
-            out[1] = static_cast<uint8_t>(masked_len & 0xFF);
-            std::memcpy(out + 2, write_crypto_buf_.data(), enc_len);
+            const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
+            dst[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
+            dst[1] = static_cast<uint8_t>(masked_len & 0xFF);
 
             if (padding_len > 0) {
-                RAND_bytes(out + 2 + enc_len, static_cast<int>(padding_len));
+                RAND_bytes(dst + 2 + enc_len, static_cast<int>(padding_len));
+            }
+
+            out->Produce(static_cast<uint32_t>(output_size));
+            out_bytes += output_size;
+            try {
+                out_mb.push_back(out);
+            } catch (...) {
+                Buffer::Free(out);
+                throw;
             }
 
             offset += chunk_size;
+
+            if (out_mb.size() >= kStreamFlushBufferCount || out_bytes >= kStreamFlushBytes) {
+                co_await flush_out();
+            }
         }
     }
 
-    // 单次写入所有 chunk
-    if (!write_batch_buf_.empty()) {
-        if (!co_await WriteFull(write_batch_buf_.data(), write_batch_buf_.size())) {
-            write_batch_buf_.clear();
-            ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
-            ThrowVMessWriteError("VMess stream batch write failed");
-        }
-        write_batch_buf_.clear();
-        ReleaseIdleBuffer(write_batch_buf_, kWriteBatchKeepCapacity);
-    }
+    co_await flush_out();
 }
 
 // 零拷贝版本：直接解密到用户提供的 buffer
