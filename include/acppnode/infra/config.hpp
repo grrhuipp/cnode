@@ -74,8 +74,8 @@ struct TimeoutsConfig {
     uint32_t read = defaults::kReadTimeout;                 // 连接读方向 deadline
     uint32_t write = defaults::kWriteTimeout;               // 连接写方向 deadline
     uint32_t idle = defaults::kIdleTimeout;                 // UDP/会话空闲超时
-    uint32_t uplink_only = defaults::kUplinkOnlyTimeout;    // 下行关闭后等待上行
-    uint32_t downlink_only = defaults::kDownlinkOnlyTimeout;// 上行关闭后等待下行
+    uint32_t uplink_only = defaults::kUplinkOnlyTimeout;    // 下行关闭后上行最多保留多久
+    uint32_t downlink_only = defaults::kDownlinkOnlyTimeout;// 上行关闭后下行最多保留多久
 
     [[nodiscard]] std::chrono::seconds HandshakeTimeout() const noexcept {
         return std::chrono::seconds(handshake);

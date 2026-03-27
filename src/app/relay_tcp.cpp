@@ -14,11 +14,37 @@ namespace acpp {
 namespace {
 
 constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
+using SteadyClock = net::steady_timer::clock_type;
 
 void MarkAbortiveClose(AsyncStream& stream) {
     if (auto* tcp = stream.GetBaseTcpStream()) {
         tcp->SetAbortiveClose(true);
     }
+}
+
+int64_t ToSteadyNs(SteadyClock::time_point tp) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        tp.time_since_epoch()).count();
+}
+
+std::optional<std::chrono::seconds> RemainingHalfCloseBudget(
+    const std::atomic<int64_t>& deadline_ns) {
+    const int64_t raw = deadline_ns.load(std::memory_order_acquire);
+    if (raw <= 0) {
+        return std::nullopt;
+    }
+
+    const auto deadline = SteadyClock::time_point(std::chrono::nanoseconds(raw));
+    const auto now = SteadyClock::now();
+    if (deadline <= now) {
+        return std::chrono::seconds(0);
+    }
+
+    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(deadline - now);
+    if (remaining.count() == 0) {
+        remaining = std::chrono::seconds(1);
+    }
+    return remaining;
 }
 
 void FlushRelayStats(StatsShard* stats, LocalStatsAccumulator& acc) {
@@ -38,6 +64,8 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
     AsyncStream& to,
     std::atomic<bool>& my_eof,
     std::atomic<bool>& peer_eof,
+    std::atomic<int64_t>& my_half_close_deadline_ns,
+    std::atomic<int64_t>& peer_half_close_deadline_ns,
     std::chrono::seconds half_close_timeout,
     StatsShard* stats,
     bool is_upload,
@@ -61,6 +89,18 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
     LocalStatsAccumulator stats_acc;
 
     while (true) {
+        if (auto remaining = RemainingHalfCloseBudget(my_half_close_deadline_ns)) {
+            if (remaining->count() == 0) {
+                error = ErrorCode::RELAY_TIMEOUT;
+                LOG_CONN_DEBUG(ctx, "[relay] {} absolute half-close timeout, transferred={}B",
+                               is_upload ? "up" : "down", total_bytes);
+                break;
+            }
+
+            from.SetReadTimeout(*remaining);
+            to.SetWriteTimeout(*remaining);
+        }
+
         // 注意：不在这里检查 peer_eof。
         // TCP 全双工：对端关闭写端（EOF）不代表关闭读端，
         // 本方向应继续转发直到自身 EOF 或半关闭超时到期后被 Cancel。
@@ -92,12 +132,16 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
                 // VMess EOF marker 和 TLS close_notify 在 DoRelay 全关闭阶段统一发送。
                 if (!peer_eof.load(std::memory_order_acquire)) {
                     if (half_close_timeout.count() > 0) {
-                        LOG_CONN_DEBUG(ctx, "[relay] {} half-close: arming idle timeout {}s for peer direction",
+                        const auto deadline = SteadyClock::now() + half_close_timeout;
+                        peer_half_close_deadline_ns.store(
+                            ToSteadyNs(deadline), std::memory_order_release);
+
+                        LOG_CONN_DEBUG(ctx, "[relay] {} half-close: arming absolute timeout {}s for peer direction",
                                        is_upload ? "up" : "down", half_close_timeout.count());
                         from.SetIdleTimeout(half_close_timeout);
                         to.SetIdleTimeout(half_close_timeout);
-                        // 一侧已经 EOF 后，继续向另一侧写数据不应无限等待。
-                        // 给两端都加上 half-close 写 deadline，尽快收敛阻塞写。
+                        // 一侧已经 EOF 后，另一侧最多只允许保留 half_close_timeout。
+                        // 当前方向退出后，peer direction 会按共享 absolute deadline 收敛。
                         from.SetWriteTimeout(half_close_timeout);
                         to.SetWriteTimeout(half_close_timeout);
                     } else {
@@ -167,6 +211,8 @@ cobalt::task<RelayResult> DoRelay(
     RelayResult result;
     std::atomic<bool> client_eof{false};
     std::atomic<bool> target_eof{false};
+    std::atomic<int64_t> client_half_close_deadline_ns{0};
+    std::atomic<int64_t> target_half_close_deadline_ns{0};
 
     LOG_CONN_DEBUG(ctx, "Relay started, speed_limit={}, uplink_only={}s, downlink_only={}s",
                    config.speed_limit > 0 ?
@@ -176,9 +222,11 @@ cobalt::task<RelayResult> DoRelay(
 
     auto [raw_up, raw_down] = co_await cobalt::gather(
         RelayOneDirection(client, target, client_eof, target_eof,
+                          client_half_close_deadline_ns, target_half_close_deadline_ns,
                           config.downlink_only,
                           &stats, true, config.speed_limit, &ctx.bytes_up, ctx),
         RelayOneDirection(target, client, target_eof, client_eof,
+                          target_half_close_deadline_ns, client_half_close_deadline_ns,
                           config.uplink_only,
                           &stats, false, config.speed_limit, &ctx.bytes_down, ctx)
     );

@@ -20,8 +20,8 @@ struct UDPDialResult;
 //   - 不再需要 buffer_size / tiered_pool / upload_hint / download_hint
 // ============================================================================
 struct RelayConfig {
-    std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行关闭后等待上行的空闲超时
-    std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行关闭后等待下行的空闲超时
+    std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
+    std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
     uint64_t speed_limit = 0;              // bytes/s，0 = 不限速
 };
 

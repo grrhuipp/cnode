@@ -18,8 +18,8 @@ constexpr uint32_t kDialTimeout = 10;         // 拨号超时
 constexpr uint32_t kReadTimeout = 15;         // 连接读方向 deadline
 constexpr uint32_t kWriteTimeout = 30;        // 连接写方向 deadline
 constexpr uint32_t kIdleTimeout = 300;        // 连接空闲超时（connIdle）
-constexpr uint32_t kUplinkOnlyTimeout = 1;    // 下行 EOF 后等待上行的空闲超时
-constexpr uint32_t kDownlinkOnlyTimeout = 1;  // 上行 EOF 后等待下行的空闲超时
+constexpr uint32_t kUplinkOnlyTimeout = 5;    // 半关闭后另一方向最多保留 5 秒
+constexpr uint32_t kDownlinkOnlyTimeout = 5;  // 半关闭后另一方向最多保留 5 秒
 
 // 连接压力控制
 constexpr uint32_t kMaxConnectionsPerWorker = 10000;  // 每 Worker 连接安全上限
