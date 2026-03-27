@@ -182,7 +182,9 @@ cobalt::task<size_t> VMessServerAsyncStream::AsyncRead(net::mutable_buffer buffe
 
     ssize_t n = co_await ReadChunkInto(buf, len);
     if (n == 0) {
-        // VMess EOF marker：合法的协议级关闭
+        // 传输层直接断开和 VMess EOF marker 都按 EOF 处理：
+        // 对 relay 来说，用户侧已经离线，应尽快进入 half-close 收口，
+        // 而不是把这类场景拖成 connection_reset 再走长超时。
         co_return 0;
     }
     if (n < 0) {
@@ -330,7 +332,7 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
         LOG_ACCESS_DEBUG("VMess stream: ReadChunk TCP-level close (failed to read chunk header) after {} chunks",
                          read_chunk_count_);
         read_eof_ = true;
-        co_return -1;  // TCP-level close 不是合法 VMess EOF，视为错误（对齐 Xray io.UnexpectedEOF）
+        co_return 0;
     }
 
     uint16_t raw_len = (static_cast<uint16_t>(len_buf[0]) << 8) | len_buf[1];
@@ -386,7 +388,7 @@ cobalt::task<ssize_t> VMessServerAsyncStream::ReadChunkInto(uint8_t* buf, size_t
                          "(TCP 连接在 chunk body 传输中断开)",
                          read_chunk_count_, chunk_len);
         read_eof_ = true;
-        co_return -1;
+        co_return 0;
     }
 
     size_t data_len = chunk_len - padding_len;
