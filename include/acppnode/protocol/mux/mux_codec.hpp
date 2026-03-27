@@ -24,7 +24,7 @@ namespace acpp::mux {
 //   若 Status==New 或 (Status==Keep && 地址字段存在):
 //     [NetworkType: 1]       ← TCP=0x01, UDP=0x02
 //     [Port: 2 BE]
-//     [AddrType: 1]          ← IPv4=0x01, Domain=0x02, IPv6=0x03
+//     [AddrType: 1]          ← IPv4=0x01, Domain=0x02
 //     [Address: variable]
 //   若 Status==New && Network==UDP && (元数据剩余 == 8):
 //     [GlobalID: 8]
@@ -117,8 +117,8 @@ void EncodeKeepUDPTo(memory::ByteVector& out,
 // ============================================================================
 // 地址类型转换
 //
-// 项目内部 AddressType: IPv4=1, Domain=3, IPv6=4
-// Mux 线上格式:         IPv4=1, Domain=2, IPv6=3
+// 项目内部 AddressType: IPv4=1, Domain=3
+// Mux 线上格式:         IPv4=1, Domain=2
 // ============================================================================
 [[nodiscard]] uint8_t     ToMuxAddrType(AddressType t) noexcept;
 [[nodiscard]] AddressType FromMuxAddrType(uint8_t t) noexcept;

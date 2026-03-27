@@ -30,7 +30,6 @@ ProxyProtocolResult MakeInvalid() {
 // ============================================================================
 // PROXY Protocol v1 格式：
 //   "PROXY TCP4 192.168.1.1 10.0.0.1 12345 80\r\n"
-//   "PROXY TCP6 ::1 ::1 12345 80\r\n"
 //   "PROXY UNKNOWN\r\n"
 //
 // PROXY Protocol v2 格式（二进制）：
@@ -118,7 +117,7 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
     if (line.size() < 6) return MakeInvalid();
     line.remove_prefix(6);
 
-    // 解析协议族："TCP4"/"TCP6"/"UNKNOWN"
+    // 解析协议族："TCP4"/"UNKNOWN"
     auto sp1 = line.find(' ');
     if (sp1 == std::string_view::npos) return MakeInvalid();
     std::string_view family = line.substr(0, sp1);
@@ -132,7 +131,7 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
         return r;
     }
 
-    if (family != "TCP4" && family != "TCP6") return MakeInvalid();
+    if (family != "TCP4") return MakeInvalid();
 
     // src_ip
     auto sp2 = line.find(' ');
@@ -173,11 +172,10 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
 //   [14..15] 附加长度 (大端 uint16)
 //
 // 命令：0=LOCAL, 1=PROXY
-// 地址族：0=UNSPEC, 1=INET(IPv4), 2=INET6(IPv6), 3=UNIX
+// 地址族：0=UNSPEC, 1=INET(IPv4), 3=UNIX
 // 协议：0=UNSPEC, 1=STREAM(TCP), 2=DGRAM(UDP)
 //
 // 附加数据（INET）：src(4B)+dst(4B)+src_port(2B)+dst_port(2B) = 12B
-// 附加数据（INET6）：src(16B)+dst(16B)+src_port(2B)+dst_port(2B) = 36B
 // ----------------------------------------------------------------------------
 ProxyProtocolResult ProxyProtocolParser::ParseV2(const uint8_t* data, size_t len) {
     constexpr size_t kHeaderSize = 16;
@@ -224,21 +222,7 @@ ProxyProtocolResult ProxyProtocolParser::ParseV2(const uint8_t* data, size_t len
         r.src_port = static_cast<uint16_t>((addr[8] << 8) | addr[9]);
 
     } else if (family == 0x02) {
-        // IPv6：src(16) + dst(16) + src_port(2) + dst_port(2) = 36B
-        if (extra_len < 36) return MakeInvalid();
-
-        // 格式化 IPv6（简单的全展开形式，不做 :: 压缩）
-        char buf[40];
-        std::snprintf(buf, sizeof(buf),
-            "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-            "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-            addr[0], addr[1], addr[2],  addr[3],
-            addr[4], addr[5], addr[6],  addr[7],
-            addr[8], addr[9], addr[10], addr[11],
-            addr[12],addr[13],addr[14], addr[15]);
-        r.src_ip   = buf;
-        r.src_port = static_cast<uint16_t>((addr[32] << 8) | addr[33]);
-
+        return MakeInvalid();
     }
     // UNIX 套接字（family==3）：不携带网络地址，保持 src_ip 为空
 

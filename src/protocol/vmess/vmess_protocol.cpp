@@ -1040,19 +1040,9 @@ bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessReq
             if (!reader.Ok()) return false;
             break;
         }
-        case 3: {  // IPv6
-            auto ipv6_span = reader.ReadBytes(16);
-            if (!reader.Ok()) return false;
-            char buf[INET6_ADDRSTRLEN];
-            snprintf(buf, sizeof(buf),
-                     "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-                     ipv6_span[0], ipv6_span[1], ipv6_span[2], ipv6_span[3],
-                     ipv6_span[4], ipv6_span[5], ipv6_span[6], ipv6_span[7],
-                     ipv6_span[8], ipv6_span[9], ipv6_span[10], ipv6_span[11],
-                     ipv6_span[12], ipv6_span[13], ipv6_span[14], ipv6_span[15]);
-            host = buf;
-            break;
-        }
+        case 3:
+            LOG_ACCESS_DEBUG("VMess: non-IPv4 target is not supported");
+            return false;
         default:
             LOG_ACCESS_DEBUG("VMess: unsupported address type {}", addr_type);
             return false;

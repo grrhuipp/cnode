@@ -109,20 +109,8 @@ std::optional<std::pair<std::string, uint16_t>> HttpSniffer::ParseHttpHost(
     // 检查是否有端口
     size_t colon = host_value.rfind(':');
     
-    // 处理 IPv6 地址 [::1]:8080
     if (host_value[0] == '[') {
-        size_t bracket = host_value.find(']');
-        if (bracket != std::string_view::npos) {
-            host = std::string(host_value.substr(1, bracket - 1));
-            if (bracket + 1 < host_value.size() && host_value[bracket + 1] == ':') {
-                std::string port_str(host_value.substr(bracket + 2));
-                try {
-                    port = static_cast<uint16_t>(std::stoi(port_str));
-                } catch (...) {
-                    port = 0;
-                }
-            }
-        }
+        return std::nullopt;
     } else if (colon != std::string_view::npos) {
         // 检查是否是端口（全数字）
         std::string_view maybe_port = host_value.substr(colon + 1);
@@ -142,7 +130,6 @@ std::optional<std::pair<std::string, uint16_t>> HttpSniffer::ParseHttpHost(
                 port = 0;
             }
         } else {
-            // 可能是 IPv6 地址
             host = std::string(host_value);
         }
     } else {

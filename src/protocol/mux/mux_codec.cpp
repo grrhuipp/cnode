@@ -13,7 +13,6 @@ uint8_t ToMuxAddrType(AddressType t) noexcept {
     switch (t) {
         case AddressType::IPv4:   return 1;
         case AddressType::Domain: return 2;
-        case AddressType::IPv6:   return 3;
         default:                  return 0;
     }
 }
@@ -22,7 +21,6 @@ AddressType FromMuxAddrType(uint8_t t) noexcept {
     switch (t) {
         case 1: return AddressType::IPv4;
         case 2: return AddressType::Domain;
-        case 3: return AddressType::IPv6;
         default: return AddressType::IPv4;
     }
 }
@@ -61,17 +59,7 @@ static bool ParsePortThenAddress(ByteReader& r, TargetAddress& target) {
         target.port = port;
 
     } else if (addr_raw == 3) {
-        // IPv6: 16 字节
-        auto span = r.ReadBytes(16);
-        if (!r.Ok()) return false;
-        boost::asio::ip::address_v6::bytes_type bytes;
-        std::memcpy(bytes.data(), span.data(), 16);
-        auto addr = boost::asio::ip::make_address_v6(bytes);
-        target.type         = AddressType::IPv6;
-        target.host         = addr.to_string();
-        target.resolved_addr = addr;
-        target.port         = port;
-
+        return false;
     } else {
         return false;
     }
@@ -222,22 +210,6 @@ static void AppendAddress(memory::ByteVector& buf, const TargetAddress& addr) {
         buf.insert(buf.end(), addr.host.begin(), addr.host.begin() + dlen);
         break;
     }
-    case AddressType::IPv6: {
-        if (addr.resolved_addr && addr.resolved_addr->is_v6()) {
-            auto bytes = addr.resolved_addr->to_v6().to_bytes();
-            buf.insert(buf.end(), bytes.begin(), bytes.end());
-        } else {
-            boost::system::error_code ec;
-            auto a = boost::asio::ip::make_address_v6(addr.host, ec);
-            if (!ec) {
-                auto bytes = a.to_bytes();
-                buf.insert(buf.end(), bytes.begin(), bytes.end());
-            } else {
-                buf.insert(buf.end(), 16, 0);
-            }
-        }
-        break;
-    }
     }
 }
 
@@ -375,7 +347,7 @@ void EncodeKeepUDPTo(
     const uint8_t* data, size_t len)
 {
     // 预估地址字节数
-    size_t addr_reserve = 3 + 16;  // NetworkType(1) + Port(2) + AddrType(1) + IPv6(16)
+    size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
     InitFrameBase(out, session_id, SessionStatus::KEEP,
                   kOptionData, addr_reserve + len);
 

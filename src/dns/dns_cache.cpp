@@ -14,9 +14,8 @@ DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
     }
 }
 
-std::optional<DnsCacheEntry> DnsCache::Get(const std::string& domain,
-                                           bool prefer_ipv6) {
-    const CacheKeyRef cache_key{domain, prefer_ipv6};
+std::optional<DnsCacheEntry> DnsCache::Get(const std::string& domain) {
+    const CacheKeyRef cache_key{domain};
     auto& shard = GetShard(cache_key);
     const auto now = steady_clock::now();
 
@@ -67,9 +66,8 @@ std::optional<DnsCacheEntry> DnsCache::Get(const std::string& domain,
 
 void DnsCache::Put(const std::string& domain,
                    const std::vector<net::ip::address>& addresses,
-                   uint32_t ttl,
-                   bool prefer_ipv6) {
-    const CacheKeyRef cache_key{domain, prefer_ipv6};
+                   uint32_t ttl) {
+    const CacheKeyRef cache_key{domain};
     auto& shard = GetShard(cache_key);
 
     // 限制 TTL 范围
@@ -109,7 +107,7 @@ void DnsCache::Put(const std::string& domain,
     entry.ttl = ttl;
     entry.negative = false;
 
-    shard.lru_list.emplace_front(domain, std::move(entry), prefer_ipv6);
+    shard.lru_list.emplace_front(domain, std::move(entry));
     auto node_it = shard.lru_list.begin();
     shard.cache.emplace(node_it->Key(), node_it);
     write_lock.unlock();
@@ -123,9 +121,8 @@ void DnsCache::Put(const std::string& domain,
 }
 
 void DnsCache::PutNegative(const std::string& domain,
-                           uint32_t ttl,
-                           bool prefer_ipv6) {
-    const CacheKeyRef cache_key{domain, prefer_ipv6};
+                           uint32_t ttl) {
+    const CacheKeyRef cache_key{domain};
     auto& shard = GetShard(cache_key);
 
     const auto now = steady_clock::now();
@@ -157,7 +154,7 @@ void DnsCache::PutNegative(const std::string& domain,
     entry.ttl = ttl;
     entry.negative = true;
 
-    shard.lru_list.emplace_front(domain, std::move(entry), prefer_ipv6);
+    shard.lru_list.emplace_front(domain, std::move(entry));
     auto node_it = shard.lru_list.begin();
     shard.cache.emplace(node_it->Key(), node_it);
     write_lock.unlock();

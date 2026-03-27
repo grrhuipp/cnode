@@ -38,17 +38,12 @@ bool MatchPrefix(const uint8_t* ip, const uint8_t* cidr, uint8_t prefix) {
 // ============================================================================
 
 bool CIDR::Contains(const net::ip::address& ip) const {
-    if (is_v6 != ip.is_v6()) {
+    if (!ip.is_v4()) {
         return false;
     }
-    
-    if (is_v6) {
-        auto ip_bytes = ip.to_v6().to_bytes();
-        return MatchPrefix(ip_bytes.data(), addr.data(), prefix);
-    } else {
-        auto ip_bytes = ip.to_v4().to_bytes();
-        return MatchPrefix(ip_bytes.data(), addr.data(), prefix);
-    }
+
+    auto ip_bytes = ip.to_v4().to_bytes();
+    return MatchPrefix(ip_bytes.data(), addr.data(), prefix);
 }
 
 namespace {
@@ -72,16 +67,13 @@ std::optional<CIDR> ParseCIDR(const std::string& str) {
     int prefix = std::stoi(prefix_str);
     
     CIDR cidr;
-    cidr.is_v6 = addr.is_v6();
     cidr.prefix = static_cast<uint8_t>(prefix);
-    
-    if (cidr.is_v6) {
-        auto bytes = addr.to_v6().to_bytes();
-        std::memcpy(cidr.addr.data(), bytes.data(), 16);
-    } else {
-        auto bytes = addr.to_v4().to_bytes();
-        std::memcpy(cidr.addr.data(), bytes.data(), 4);
+    if (!addr.is_v4()) {
+        return std::nullopt;
     }
+
+    auto bytes = addr.to_v4().to_bytes();
+    std::memcpy(cidr.addr.data(), bytes.data(), 4);
     
     return cidr;
 }
@@ -171,11 +163,7 @@ bool SuffixTrie::Match(std::string_view domain) const {
 // ============================================================================
 
 void GeoIPData::AddCIDR(const CIDR& cidr) {
-    if (cidr.is_v6) {
-        cidrs_v6_.push_back(cidr);
-    } else {
-        cidrs_v4_.push_back(cidr);
-    }
+    cidrs_v4_.push_back(cidr);
 }
 
 void GeoIPData::AddCIDR(const std::string& cidr_str) {
@@ -202,28 +190,21 @@ void GeoIPData::BuildIndex() {
 }
 
 bool GeoIPData::Match(const net::ip::address& ip) const {
-    if (ip.is_v6()) {
-        // IPv6 保持线性匹配（规则通常很少）
-        for (const auto& cidr : cidrs_v6_) {
-            if (cidr.Contains(ip)) {
-                return true;
-            }
-        }
-    } else {
-        // IPv4 优先用 radix trie（O(32) 最坏）
-        if (index_built_) {
-            auto bytes = ip.to_v4().to_bytes();
-            uint32_t ip_val = (static_cast<uint32_t>(bytes[0]) << 24) |
-                              (static_cast<uint32_t>(bytes[1]) << 16) |
-                              (static_cast<uint32_t>(bytes[2]) << 8)  |
-                              static_cast<uint32_t>(bytes[3]);
-            return trie_v4_.Match(ip_val);
-        }
-        // 降级：未构建索引时线性匹配
-        for (const auto& cidr : cidrs_v4_) {
-            if (cidr.Contains(ip)) {
-                return true;
-            }
+    if (!ip.is_v4()) {
+        return false;
+    }
+
+    if (index_built_) {
+        auto bytes = ip.to_v4().to_bytes();
+        uint32_t ip_val = (static_cast<uint32_t>(bytes[0]) << 24) |
+                          (static_cast<uint32_t>(bytes[1]) << 16) |
+                          (static_cast<uint32_t>(bytes[2]) << 8)  |
+                          static_cast<uint32_t>(bytes[3]);
+        return trie_v4_.Match(ip_val);
+    }
+    for (const auto& cidr : cidrs_v4_) {
+        if (cidr.Contains(ip)) {
+            return true;
         }
     }
     return false;
@@ -526,9 +507,8 @@ std::shared_ptr<GeoIPData> GeoIPLoader::LoadTag(const std::string& tag) {
             const uint8_t* cidr_end = cidr_data + cidr_len;
             
             CIDR cidr;
-            std::memset(cidr.addr.data(), 0, 16);
+            std::memset(cidr.addr.data(), 0, 4);
             cidr.prefix = 0;
-            cidr.is_v6 = false;
             
             while (cidr_ptr < cidr_end) {
                 uint64_t sub_tag = ReadVarint(cidr_ptr, cidr_end);
@@ -540,10 +520,6 @@ std::shared_ptr<GeoIPData> GeoIPLoader::LoadTag(const std::string& tag) {
                     auto [ip_data, ip_len] = ReadLengthDelimited(cidr_ptr, cidr_end);
                     if (ip_len == 4) {
                         std::memcpy(cidr.addr.data(), ip_data, 4);
-                        cidr.is_v6 = false;
-                    } else if (ip_len == 16) {
-                        std::memcpy(cidr.addr.data(), ip_data, 16);
-                        cidr.is_v6 = true;
                     }
                 } else if (sub_field == 2 && sub_wire == 0) {
                     // prefix

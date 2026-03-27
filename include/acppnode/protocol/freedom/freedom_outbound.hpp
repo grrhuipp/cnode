@@ -13,8 +13,8 @@ class UDPSessionManager;
 // Freedom 出站设置
 // ============================================================================
 struct FreedomSettings {
-    std::string send_through = "auto";   // auto / 0.0.0.0 / :: / 具体 IP
-    std::string domain_strategy = "AsIs"; // AsIs / UseIP / UseIPv4 / UseIPv6
+    std::string send_through = "auto";   // auto / 0.0.0.0 / 具体 IPv4
+    std::string domain_strategy = "AsIs"; // AsIs / UseIP / UseIPv4
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
     bool enable_udp = true;               // 是否启用 UDP
     int udp_timeout = 300;                // UDP 会话超时（秒）

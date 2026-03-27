@@ -26,9 +26,6 @@ size_t Socks5AddressEncodedSize(const TargetAddress& addr) {
     if (!ec && ip.is_v4()) {
         return 1 + 4 + 2;
     }
-    if (!ec && ip.is_v6()) {
-        return 1 + 16 + 2;
-    }
 
     if (addr.host.size() > 255) {
         return 0;
@@ -57,11 +54,6 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
         if (!ec && ip.is_v4()) {
             output[pos++] = 0x01;
             auto bytes = ip.to_v4().to_bytes();
-            std::memcpy(output + pos, bytes.data(), bytes.size());
-            pos += bytes.size();
-        } else if (!ec && ip.is_v6()) {
-            output[pos++] = 0x04;
-            auto bytes = ip.to_v6().to_bytes();
             std::memcpy(output + pos, bytes.data(), bytes.size());
             pos += bytes.size();
         } else {

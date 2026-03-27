@@ -21,10 +21,13 @@ std::string SelectUdpBindAddress(
     }
 
     if (!ctx.local_ip.is_unspecified()) {
-        return iputil::NormalizeAddressString(ctx.local_ip);
+        const auto local_ip = iputil::NormalizeAddress(ctx.local_ip);
+        if (local_ip.is_v4()) {
+            return local_ip.to_string();
+        }
     }
 
-    return "::";
+    return "0.0.0.0";
 }
 
 std::string MakeUdpSessionId(const std::string& bind_addr) {
@@ -196,6 +199,9 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
 
     // 如果目标已经是 IP，直接返回
     if (target.IsIP() && target.resolved_addr) {
+        if (!target.resolved_addr->is_v4()) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
         ctx.dns_result = "none";
         co_return std::vector<net::ip::address>{*target.resolved_addr};
     }
@@ -204,6 +210,9 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     boost::system::error_code ec;
     auto addr = net::ip::make_address(target.host, ec);
     if (!ec) {
+        if (!addr.is_v4()) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
         ctx.dns_result = "none";
         co_return std::vector<net::ip::address>{addr};
     }
@@ -220,8 +229,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
         // 实际上 AsIs 主要影响路由匹配，不影响最终连接
     }
 
-    const bool prefer_ipv6 = (settings_.domain_strategy == "UseIPv6");
-    auto dns_result = co_await dns_service_->Resolve(target.host, prefer_ipv6);
+    auto dns_result = co_await dns_service_->Resolve(target.host);
 
     if (!dns_result.Ok()) {
         ctx.dns_result = "failed";
@@ -231,10 +239,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     std::vector<net::ip::address> addresses;
     addresses.reserve(dns_result.addresses.size());
     for (const auto& dns_addr : dns_result.addresses) {
-        if (settings_.domain_strategy == "UseIPv4" && !dns_addr.is_v4()) {
-            continue;
-        }
-        if (settings_.domain_strategy == "UseIPv6" && !dns_addr.is_v6()) {
+        if (!dns_addr.is_v4()) {
             continue;
         }
         addresses.push_back(dns_addr);
@@ -260,14 +265,9 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
         
         auto inbound_local = iputil::NormalizeAddress(ctx.inbound_local_addr.address());
         if (!inbound_local.is_unspecified() && !inbound_local.is_loopback()) {
-            // 检查 IP 版本匹配
             if (remote_addr.is_v4() && inbound_local.is_v4()) {
                 return inbound_local;
             }
-            if (remote_addr.is_v6() && inbound_local.is_v6()) {
-                return inbound_local;
-            }
-            // 版本不匹配，让系统选择
         }
         return std::nullopt;
     }
@@ -284,13 +284,12 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
         return std::nullopt;
     }
     addr = iputil::NormalizeAddress(addr);
-
-    // 检查 IP 版本匹配
-    if (remote_addr.is_v4() && addr.is_v6()) {
-        return std::nullopt;  // 不能用 IPv6 绑定连接 IPv4
+    if (!addr.is_v4()) {
+        return std::nullopt;
     }
-    if (remote_addr.is_v6() && addr.is_v4()) {
-        return std::nullopt;  // 不能用 IPv4 绑定连接 IPv6
+
+    if (!remote_addr.is_v4()) {
+        return std::nullopt;
     }
 
     return addr;

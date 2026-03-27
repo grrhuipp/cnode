@@ -12,21 +12,11 @@ namespace acpp {
 // ============================================================================
 static std::string MakeEndpointKey(const net::ip::address& addr, uint16_t port) {
     const auto normalized = iputil::NormalizeAddress(addr);
-    // IPv6 最长 45 字符 + "[]:" + 最长 5 字符端口 = 53，使用 64 字节栈缓冲区
-    char buf[64];
-    int len;
-    
-    if (normalized.is_v6()) {
-        const auto text = normalized.to_string();
-        len = snprintf(buf, sizeof(buf), "[%s]:%u",
-                       text.c_str(), port);
-    } else {
-        // IPv4：直接格式化字节
-        auto bytes = normalized.to_v4().to_bytes();
-        len = snprintf(buf, sizeof(buf), "%u.%u.%u.%u:%u",
+    char buf[32];
+    auto bytes = normalized.to_v4().to_bytes();
+    int len = snprintf(buf, sizeof(buf), "%u.%u.%u.%u:%u",
                       bytes[0], bytes[1], bytes[2], bytes[3], port);
-    }
-    
+
     return std::string(buf, len);
 }
 
@@ -58,53 +48,32 @@ UDPSession::~UDPSession() {
 }
 
 ErrorCode UDPSession::Start(const std::string& bind_address) {
-    const std::string primary_bind = bind_address.empty() ? "::" : bind_address;
-    std::vector<std::string> bind_candidates{primary_bind};
-    if (primary_bind == "::") {
-        bind_candidates.push_back("0.0.0.0");
-    }
-
+    const std::string primary_bind = bind_address.empty() ? "0.0.0.0" : bind_address;
     std::string last_error = "bind failed";
 
-    for (size_t i = 0; i < bind_candidates.size(); ++i) {
-        const auto& candidate = bind_candidates[i];
-        try {
-            auto addr = net::ip::make_address(candidate);
-            udp::endpoint local_ep(addr, 0);  // 端口 0 = 自动分配
-
-            udp::socket sock(executor_);
-            sock.open(local_ep.protocol());
-            if (iputil::IsDualStackWildcardAddress(addr)) {
-                boost::system::error_code v6_ec;
-                sock.set_option(net::ip::v6_only(false), v6_ec);
-                if (v6_ec) {
-                    LOG_WARN("UDP session {} dual-stack wildcard unavailable on {}: {}",
-                             session_id_, candidate, v6_ec.message());
-                }
-            }
-            sock.set_option(udp::socket::reuse_address(true));
-            sock.bind(local_ep);
-
-            socket_ = std::move(sock);
-            local_port_ = socket_.local_endpoint().port();
-            running_ = true;
-
-            if (candidate != primary_bind) {
-                LOG_WARN("UDP session {} fallback bind {} -> {}",
-                         session_id_, primary_bind, candidate);
-            }
-            LOG_ACCESS_DEBUG("UDP session {} started on {}",
-                             session_id_,
-                             iputil::FormatEndpointForLog(candidate, local_port_));
-            return ErrorCode::SUCCESS;
-
-        } catch (const boost::system::system_error& e) {
-            last_error = e.what();
-            if (i + 1 < bind_candidates.size()) {
-                LOG_WARN("UDP session {} bind {} failed: {}, retrying {}",
-                         session_id_, candidate, e.what(), bind_candidates[i + 1]);
-            }
+    try {
+        auto addr = net::ip::make_address(primary_bind);
+        if (!addr.is_v4()) {
+            LOG_CONN_FAIL("UDP session {} does not support non-IPv4 bind {}", session_id_, primary_bind);
+            return ErrorCode::NETWORK_BIND_FAILED;
         }
+
+        udp::endpoint local_ep(addr, 0);  // 端口 0 = 自动分配
+        udp::socket sock(executor_);
+        sock.open(local_ep.protocol());
+        sock.set_option(udp::socket::reuse_address(true));
+        sock.bind(local_ep);
+
+        socket_ = std::move(sock);
+        local_port_ = socket_.local_endpoint().port();
+        running_ = true;
+
+        LOG_ACCESS_DEBUG("UDP session {} started on {}",
+                         session_id_,
+                         iputil::FormatEndpointForLog(primary_bind, local_port_));
+        return ErrorCode::SUCCESS;
+    } catch (const boost::system::system_error& e) {
+        last_error = e.what();
     }
 
     LOG_CONN_FAIL("UDP session {} start failed: {}", session_id_, last_error);
@@ -121,15 +90,17 @@ cobalt::task<ErrorCode> UDPSession::Send(const UDPPacket& packet, uint64_t callb
         udp::endpoint remote_ep;
         
         if (packet.target.resolved_addr) {
+            if (!packet.target.resolved_addr->is_v4()) {
+                co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
+            }
             remote_ep = udp::endpoint(*packet.target.resolved_addr, packet.target.port);
         } else if (packet.target.type == AddressType::Domain) {
             if (!dns_service_) {
                 LOG_CONN_FAIL("UDP session {} DNS service not available", session_id_);
                 co_return ErrorCode::DNS_RESOLVE_FAILED;
             }
-            
-            bool socket_is_v6 = socket_.local_endpoint().address().is_v6();
-            auto dns_result = co_await dns_service_->Resolve(packet.target.host, socket_is_v6);
+
+            auto dns_result = co_await dns_service_->Resolve(packet.target.host);
             
             if (!dns_result.Ok()) {
                 LOG_ACCESS_DEBUG("UDP session {} DNS resolve failed for {}: {}", 
@@ -138,43 +109,25 @@ cobalt::task<ErrorCode> UDPSession::Send(const UDPPacket& packet, uint64_t callb
             }
             
             net::ip::address selected_addr;
-            bool found = false;
-            
-            for (const auto& addr : dns_result.addresses) {
-                if (addr.is_v6() == socket_is_v6) {
-                    selected_addr = addr;
-                    found = true;
-                    break;
-                }
-            }
-            
-            if (!found && !dns_result.addresses.empty()) {
+            if (!dns_result.addresses.empty()) {
                 selected_addr = dns_result.addresses[0];
             }
-            
+
             if (selected_addr.is_unspecified()) {
                 co_return ErrorCode::DNS_RESOLVE_FAILED;
             }
-            
+
             remote_ep = udp::endpoint(selected_addr, packet.target.port);
         } else {
             boost::system::error_code ec;
             auto addr = net::ip::make_address(packet.target.host, ec);
-            if (ec) {
+            if (ec || !addr.is_v4()) {
                 co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
             }
             remote_ep = udp::endpoint(addr, packet.target.port);
         }
-        
-        // 地址族适配
-        bool socket_is_v6 = socket_.local_endpoint().address().is_v6();
-        bool target_is_v6 = remote_ep.address().is_v6();
-        
-        if (socket_is_v6 && !target_is_v6) {
-            auto v4 = remote_ep.address().to_v4();
-            auto mapped = net::ip::make_address_v6(net::ip::v4_mapped, v4);
-            remote_ep = udp::endpoint(mapped, remote_ep.port());
-        } else if (!socket_is_v6 && target_is_v6) {
+
+        if (!remote_ep.address().is_v4()) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
         }
         
@@ -231,15 +184,17 @@ cobalt::task<ErrorCode> UDPSession::SendTo(
         udp::endpoint remote_ep;
         
         if (target.resolved_addr) {
+            if (!target.resolved_addr->is_v4()) {
+                co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
+            }
             remote_ep = udp::endpoint(*target.resolved_addr, target.port);
         } else if (target.type == AddressType::Domain) {
             if (!dns_service_) {
                 LOG_CONN_FAIL("UDP session {} DNS service not available", session_id_);
                 co_return ErrorCode::DNS_RESOLVE_FAILED;
             }
-            
-            bool socket_is_v6 = socket_.local_endpoint().address().is_v6();
-            auto dns_result = co_await dns_service_->Resolve(target.host, socket_is_v6);
+
+            auto dns_result = co_await dns_service_->Resolve(target.host);
             
             if (!dns_result.Ok()) {
                 LOG_ACCESS_DEBUG("UDP session {} DNS resolve failed for {}", session_id_, target.host);
@@ -247,40 +202,25 @@ cobalt::task<ErrorCode> UDPSession::SendTo(
             }
             
             net::ip::address selected_addr;
-            for (const auto& addr : dns_result.addresses) {
-                if (addr.is_v6() == socket_is_v6) {
-                    selected_addr = addr;
-                    break;
-                }
-            }
-            
-            if (selected_addr.is_unspecified() && !dns_result.addresses.empty()) {
+            if (!dns_result.addresses.empty()) {
                 selected_addr = dns_result.addresses[0];
             }
-            
+
             if (selected_addr.is_unspecified()) {
                 co_return ErrorCode::DNS_RESOLVE_FAILED;
             }
-            
+
             remote_ep = udp::endpoint(selected_addr, target.port);
         } else {
             boost::system::error_code ec;
             auto addr = net::ip::make_address(target.host, ec);
-            if (ec) {
+            if (ec || !addr.is_v4()) {
                 co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
             }
             remote_ep = udp::endpoint(addr, target.port);
         }
-        
-        // 地址族适配
-        bool socket_is_v6 = socket_.local_endpoint().address().is_v6();
-        bool target_is_v6 = remote_ep.address().is_v6();
-        
-        if (socket_is_v6 && !target_is_v6) {
-            auto v4 = remote_ep.address().to_v4();
-            auto mapped = net::ip::make_address_v6(net::ip::v4_mapped, v4);
-            remote_ep = udp::endpoint(mapped, remote_ep.port());
-        } else if (!socket_is_v6 && target_is_v6) {
+
+        if (!remote_ep.address().is_v4()) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
         }
         
@@ -414,8 +354,6 @@ void UDPSession::DoReceive() {
                 auto addr = net::ip::make_address(normalized_addr, parse_ec);
                 if (!parse_ec && addr.is_v4()) {
                     packet.target.type = AddressType::IPv4;
-                } else if (!parse_ec && addr.is_v6()) {
-                    packet.target.type = AddressType::IPv6;
                 } else {
                     packet.target.type = AddressType::IPv4;
                 }

@@ -45,8 +45,7 @@ public:
 
     // 异步解析域名
     virtual cobalt::task<DnsResult> Resolve(
-        const std::string& domain, 
-        bool prefer_ipv6 = false) = 0;
+        const std::string& domain) = 0;
 
     // 获取缓存统计
     [[nodiscard]] virtual DnsCacheStats GetCacheStats() const = 0;
@@ -87,19 +86,16 @@ public:
     explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl);
 
     // 查询缓存
-    std::optional<DnsCacheEntry> Get(const std::string& domain,
-                                     bool prefer_ipv6 = false);
+    std::optional<DnsCacheEntry> Get(const std::string& domain);
 
     // 添加缓存
     void Put(const std::string& domain, 
              const std::vector<net::ip::address>& addresses,
-             uint32_t ttl,
-             bool prefer_ipv6 = false);
+             uint32_t ttl);
 
     // 添加负缓存
     void PutNegative(const std::string& domain,
-                     uint32_t ttl = 60,
-                     bool prefer_ipv6 = false);
+                     uint32_t ttl = 60);
 
     // 清空
     void Clear();
@@ -112,34 +108,30 @@ private:
 
     struct CacheKeyRef {
         std::string_view domain;
-        bool prefer_ipv6 = false;
     };
 
     struct CacheKeyHash {
         [[nodiscard]] size_t operator()(CacheKeyRef key) const noexcept {
-            size_t h1 = std::hash<std::string_view>{}(key.domain);
-            size_t h2 = std::hash<bool>{}(key.prefer_ipv6);
-            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            return std::hash<std::string_view>{}(key.domain);
         }
     };
 
     struct CacheKeyEq {
         [[nodiscard]] bool operator()(CacheKeyRef a,
                                       CacheKeyRef b) const noexcept {
-            return a.prefer_ipv6 == b.prefer_ipv6 && a.domain == b.domain;
+            return a.domain == b.domain;
         }
     };
 
     struct CacheNode {
         std::string domain;
         DnsCacheEntry entry;
-        bool prefer_ipv6 = false;
 
-        CacheNode(std::string d, DnsCacheEntry e, bool ipv6)
-            : domain(std::move(d)), entry(std::move(e)), prefer_ipv6(ipv6) {}
+        CacheNode(std::string d, DnsCacheEntry e)
+            : domain(std::move(d)), entry(std::move(e)) {}
 
         [[nodiscard]] CacheKeyRef Key() const noexcept {
-            return CacheKeyRef{domain, prefer_ipv6};
+            return CacheKeyRef{domain};
         }
     };
 
@@ -196,8 +188,7 @@ public:
     ~DnsService() override;
 
     cobalt::task<DnsResult> Resolve(
-        const std::string& domain,
-        bool prefer_ipv6 = false) override;
+        const std::string& domain) override;
 
     DnsCacheStats GetCacheStats() const override;
     void ClearCache() override;
@@ -209,18 +200,15 @@ public:
 private:
     struct ResolveKey {
         std::string domain;
-        bool prefer_ipv6 = false;
 
         bool operator==(const ResolveKey& other) const noexcept {
-            return prefer_ipv6 == other.prefer_ipv6 && domain == other.domain;
+            return domain == other.domain;
         }
     };
 
     struct ResolveKeyHash {
         size_t operator()(const ResolveKey& key) const noexcept {
-            size_t h1 = std::hash<std::string>{}(key.domain);
-            size_t h2 = std::hash<bool>{}(key.prefer_ipv6);
-            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            return std::hash<std::string>{}(key.domain);
         }
     };
 
@@ -244,8 +232,7 @@ private:
 
     // 内部解析实现
     cobalt::task<DnsResult> DoResolve(
-        const std::string& domain,
-        bool prefer_ipv6);
+        const std::string& domain);
 
     // 发送 DNS 查询并等待响应
     cobalt::task<DnsResult> QueryServer(

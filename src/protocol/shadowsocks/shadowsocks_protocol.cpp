@@ -252,21 +252,7 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
         result.target = TargetAddress(domain, port);
 
     } else if (atyp == 0x04) {
-        // IPv6: 16 bytes addr + 2 bytes port
-        if (idx + 16 + 2 > len) return std::nullopt;
-        char ipbuf[64];
-        std::snprintf(ipbuf, sizeof(ipbuf),
-                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-                      data[idx+0],  data[idx+1],  data[idx+2],  data[idx+3],
-                      data[idx+4],  data[idx+5],  data[idx+6],  data[idx+7],
-                      data[idx+8],  data[idx+9],  data[idx+10], data[idx+11],
-                      data[idx+12], data[idx+13], data[idx+14], data[idx+15]);
-        idx += 16;
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx+1]);
-        idx += 2;
-        result.target = TargetAddress(std::string(ipbuf), port);
-
+        return std::nullopt;
     } else {
         return std::nullopt;  // 未知 ATYP
     }
@@ -281,16 +267,12 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
 std::vector<uint8_t> EncodeSocks5Address(const TargetAddress& addr) {
     std::vector<uint8_t> buf;
 
-    if (addr.type == AddressType::IPv4 || addr.type == AddressType::IPv6) {
+    if (addr.type == AddressType::IPv4) {
         boost::system::error_code ec;
         auto ip = net::ip::make_address(addr.host, ec);
         if (!ec && ip.is_v4()) {
             buf.push_back(0x01);
             auto bytes = ip.to_v4().to_bytes();
-            buf.insert(buf.end(), bytes.begin(), bytes.end());
-        } else if (!ec && ip.is_v6()) {
-            buf.push_back(0x04);
-            auto bytes = ip.to_v6().to_bytes();
             buf.insert(buf.end(), bytes.begin(), bytes.end());
         } else {
             // 解析失败，回退到域名编码

@@ -55,8 +55,7 @@ enum class Command : uint8_t {
 
 enum class AddressType : uint8_t {
     IPv4   = 1,
-    Domain = 2,
-    IPv6   = 3
+    Domain = 2
 };
 
 // ============================================================================

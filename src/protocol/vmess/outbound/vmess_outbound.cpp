@@ -253,11 +253,8 @@ cobalt::task<OutboundHandshakeResult> VMessClientAsyncStream::SendHandshake() {
         if (!append_header_u8(1)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
         auto bytes = addr.to_v4().to_bytes();
         if (!append_header(bytes.data(), bytes.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    } else if (!ec && addr.is_v6()) {
-        // IPv6
-        if (!append_header_u8(3)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        auto bytes = addr.to_v6().to_bytes();
-        if (!append_header(bytes.data(), bytes.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    } else if (!ec) {
+        co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     } else {
         // Domain
         if (target_.host.size() > 255) co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);

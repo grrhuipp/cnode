@@ -15,9 +15,8 @@ namespace geo {
 // IP CIDR 表示
 // ============================================================================
 struct CIDR {
-    std::array<uint8_t, 16> addr;  // IPv4 用前 4 字节，IPv6 用全部
+    std::array<uint8_t, 4> addr;
     uint8_t prefix;
-    bool is_v6;
     
     bool Contains(const net::ip::address& ip) const;
 };
@@ -55,11 +54,10 @@ public:
     bool Match(const net::ip::address& ip) const;
     bool Match(const std::string& ip_str) const;
 
-    size_t Size() const { return cidrs_v4_.size() + cidrs_v6_.size(); }
+    size_t Size() const { return cidrs_v4_.size(); }
 
 private:
     std::vector<CIDR> cidrs_v4_;
-    std::vector<CIDR> cidrs_v6_;
     IPv4RadixTrie trie_v4_;        // IPv4 加速查询
     bool index_built_ = false;
 };

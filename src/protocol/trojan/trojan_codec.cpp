@@ -88,14 +88,7 @@ std::optional<TrojanRequest> TrojanCodec::ParseRequest(
         req.target = TargetAddress(domain, port);
 
     } else if (atype == 0x04) {
-        auto ipv6_bytes = reader.ReadBytes(16);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return std::nullopt;
-
-        char ip_str[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, ipv6_bytes.data(), ip_str, sizeof(ip_str));
-        req.target = TargetAddress(ip_str, port);
-
+        return std::nullopt;
     } else {
         return std::nullopt;
     }
@@ -140,10 +133,7 @@ memory::ByteVector TrojanCodec::EncodeRequest(
         inet_pton(AF_INET, target.host.c_str(), &addr);
         writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 4);
     } else {
-        writer.WriteU8(0x04);
-        in6_addr addr;
-        inet_pton(AF_INET6, target.host.c_str(), &addr);
-        writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 16);
+        return {};
     }
 
     writer.WriteU16BE(target.port);
@@ -173,7 +163,7 @@ size_t TrojanCodec::EncodeRequestTo(
     } else if (target.type == AddressType::IPv4) {
         header_size += 1 + 4;
     } else {
-        header_size += 1 + 16;
+        return 0;
     }
 
     if (header_size > output_size) {
@@ -198,10 +188,7 @@ size_t TrojanCodec::EncodeRequestTo(
         inet_pton(AF_INET, target.host.c_str(), &addr);
         writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 4);
     } else {
-        writer.WriteU8(0x04);
-        in6_addr addr;
-        inet_pton(AF_INET6, target.host.c_str(), &addr);
-        writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 16);
+        return 0;
     }
 
     writer.WriteU16BE(target.port);
@@ -261,14 +248,7 @@ std::optional<TrojanCodec::UdpPacket> TrojanCodec::ParseUdpPacket(
         pkt.target = TargetAddress(domain, port);
 
     } else if (atype == 0x04) {
-        auto ipv6_bytes = reader.ReadBytes(16);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return std::nullopt;
-
-        char ip_str[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, ipv6_bytes.data(), ip_str, sizeof(ip_str));
-        pkt.target = TargetAddress(ip_str, port);
-
+        return std::nullopt;
     } else {
         return std::nullopt;
     }
@@ -343,17 +323,9 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacketEx(
         pkt.target = TargetAddress(domain, port);
 
     } else if (atype == 0x04) {
-        auto ipv6_bytes = reader.ReadBytes(16);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) {
-            output.error_reason = "incomplete IPv6 address";
-            return output;
-        }
-
-        char ip_str[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, ipv6_bytes.data(), ip_str, sizeof(ip_str));
-        pkt.target = TargetAddress(ip_str, port);
-
+        output.result = UdpParseResult::INVALID;
+        output.error_reason = "non-IPv4 target is not supported";
+        return output;
     } else {
         output.result = UdpParseResult::INVALID;
         output.error_reason = std::format("invalid atype: 0x{:02x}", atype);
@@ -414,10 +386,7 @@ memory::ByteVector TrojanCodec::EncodeUdpPacket(
         inet_pton(AF_INET, target.host.c_str(), &addr);
         writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 4);
     } else {
-        writer.WriteU8(0x04);
-        in6_addr addr;
-        inet_pton(AF_INET6, target.host.c_str(), &addr);
-        writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 16);
+        return {};
     }
 
     writer.WriteU16BE(target.port);
@@ -446,7 +415,7 @@ size_t TrojanCodec::EncodeUdpPacketTo(
     } else if (target.type == AddressType::IPv4) {
         header_size = 1 + 4;
     } else {
-        header_size = 1 + 16;
+        return 0;
     }
     header_size += 2 + 2 + 2;  // port + payload_len + CRLF
 
@@ -466,10 +435,7 @@ size_t TrojanCodec::EncodeUdpPacketTo(
         inet_pton(AF_INET, target.host.c_str(), &addr);
         writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 4);
     } else {
-        writer.WriteU8(0x04);
-        in6_addr addr;
-        inet_pton(AF_INET6, target.host.c_str(), &addr);
-        writer.WriteBytes(unsafe::ptr_cast<const uint8_t>(&addr), 16);
+        return 0;
     }
 
     writer.WriteU16BE(target.port);

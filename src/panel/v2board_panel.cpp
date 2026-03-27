@@ -253,7 +253,7 @@ V2BoardPanel::HttpRequest(http::verb method, const std::string& path,
         if (url_parts_.literal_address) {
             endpoint = tcp::endpoint(*url_parts_.literal_address, port);
         } else if (dns_service_) {
-            auto dns_result = co_await dns_service_->Resolve(url_parts_.host, false);
+            auto dns_result = co_await dns_service_->Resolve(url_parts_.host);
             if (!dns_result.Ok() || dns_result.addresses.empty()) {
                 result.status = 0;
                 result.body = "DNS resolve failed for " + url_parts_.host;

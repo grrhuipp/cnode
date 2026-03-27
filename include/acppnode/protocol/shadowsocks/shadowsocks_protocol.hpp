@@ -172,7 +172,6 @@ struct SsAddress {
 // 从字节流解析 SOCKS5 目标地址
 // ATYP=0x01: IPv4(4) + PORT(2)
 // ATYP=0x03: len(1) + name + PORT(2)
-// ATYP=0x04: IPv6(16) + PORT(2)
 [[nodiscard]] std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len);
 
 // 编码 SOCKS5 目标地址（用于出站握手）

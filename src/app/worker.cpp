@@ -29,30 +29,7 @@ constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 
 std::vector<std::string> BuildListenCandidates(std::string_view listen) {
-    std::vector<std::string> candidates;
-    candidates.emplace_back(listen);
-    if (listen == "::") {
-        candidates.emplace_back("0.0.0.0");
-    }
-    return candidates;
-}
-
-template <typename SocketLike>
-void TryEnableDualStack(
-    SocketLike& socket,
-    const net::ip::address& addr,
-    uint32_t worker_id,
-    std::string_view label) {
-    if (!iputil::IsDualStackWildcardAddress(addr)) {
-        return;
-    }
-
-    boost::system::error_code ec;
-    socket.set_option(net::ip::v6_only(false), ec);
-    if (ec) {
-        LOG_WARN("Worker[{}]: {} dual-stack wildcard unavailable: {}",
-                 worker_id, label, ec.message());
-    }
+    return {std::string(listen)};
 }
 
 uint32_t ComputePressureThreshold(const Config& config) {
@@ -269,6 +246,11 @@ void Worker::StartListening(PortBinding binding) {
                       id_, listen_addr, ec.message());
             return;
         }
+        if (!addr.is_v4()) {
+            LOG_ERROR("Worker[{}]: non-IPv4 listen address '{}' is not supported",
+                      id_, listen_addr);
+            return;
+        }
 
         tcp::endpoint ep(addr, binding.port);
         tcp::acceptor candidate_acceptor(io_context_);
@@ -291,7 +273,6 @@ void Worker::StartListening(PortBinding binding) {
         }
 
         candidate_acceptor.set_option(net::socket_base::reuse_address(true), ec);
-        TryEnableDualStack(candidate_acceptor, addr, id_, "TCP listener");
 
 #ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡
@@ -858,6 +839,11 @@ void Worker::StartUdpListening(PortBinding binding,
                       id_, listen_addr, ec.message());
             return;
         }
+        if (!addr.is_v4()) {
+            LOG_ERROR("Worker[{}]: non-IPv4 UDP listen address '{}' is not supported",
+                      id_, listen_addr);
+            return;
+        }
 
         udp::endpoint ep(addr, binding.port);
         auto candidate_sock = std::allocate_shared<udp::socket>(
@@ -881,7 +867,6 @@ void Worker::StartUdpListening(PortBinding binding,
         }
 
         candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
-        TryEnableDualStack(*candidate_sock, addr, id_, "UDP listener");
 
 #ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡
@@ -995,9 +980,7 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
 
         // ── 找到或创建客户端会话 ──────────────────────────────────────────
         const std::string client_key =
-            normalized_client_addr.is_v6()
-                ? std::format("[{}]:{}", client_ip, client_ep.port())
-                : std::format("{}:{}", client_ip, client_ep.port());
+            std::format("{}:{}", client_ip, client_ep.port());
 
         auto session_it = client_sessions.find(client_key);
         bool need_new_session = (session_it == client_sessions.end()) ||

@@ -17,8 +17,6 @@ constexpr uint16_t FLAG_QR    = 0x8000;
 constexpr uint16_t FLAG_RCODE = 0x000F;
 
 constexpr uint16_t TYPE_A    = 1;
-constexpr uint16_t TYPE_AAAA = 28;
-
 constexpr uint8_t RCODE_OK         = 0;
 constexpr uint8_t RCODE_NAME_ERROR = 3;
 
@@ -41,12 +39,11 @@ DnsResult MakeCachedResult(const DnsCacheEntry& entry) {
 
 void StoreResult(DnsCache& cache,
                  const std::string& domain,
-                 bool prefer_ipv6,
                  const DnsResult& result) {
     if (result.Ok()) {
-        cache.Put(domain, result.addresses, result.ttl, prefer_ipv6);
+        cache.Put(domain, result.addresses, result.ttl);
     } else if (result.error == ErrorCode::DNS_NO_RECORD) {
-        cache.PutNegative(domain, 60, prefer_ipv6);
+        cache.PutNegative(domain, 60);
     }
 }
 
@@ -82,21 +79,27 @@ DnsService::DnsService(net::any_io_executor executor, const Config& config)
 DnsService::~DnsService() = default;
 
 cobalt::task<DnsResult> DnsService::Resolve(
-    const std::string& domain, bool prefer_ipv6) {
+    const std::string& domain) {
     boost::system::error_code ec;
     auto addr = net::ip::make_address(domain, ec);
     if (!ec) {
+        if (!addr.is_v4()) {
+            DnsResult result;
+            result.error = ErrorCode::PROTOCOL_INVALID_ADDRESS;
+            result.error_msg = "only IPv4 literals are supported";
+            co_return result;
+        }
         DnsResult result;
         result.addresses.reserve(1);
         result.addresses.push_back(addr);
         co_return result;
     }
 
-    if (auto cached = cache_->Get(domain, prefer_ipv6)) {
+    if (auto cached = cache_->Get(domain)) {
         co_return MakeCachedResult(*cached);
     }
 
-    ResolveKey key{domain, prefer_ipv6};
+    ResolveKey key{domain};
     auto existing = inflight_resolves_.find(key);
     if (existing != inflight_resolves_.end()) {
         auto inflight = existing->second;
@@ -122,7 +125,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
 
     DnsResult result;
     try {
-        result = co_await DoResolve(domain, prefer_ipv6);
+        result = co_await DoResolve(domain);
     } catch (const std::exception& e) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = e.what();
@@ -131,7 +134,7 @@ cobalt::task<DnsResult> DnsService::Resolve(
         result.error_msg = "DNS resolve exception";
     }
 
-    StoreResult(*cache_, domain, prefer_ipv6, result);
+    StoreResult(*cache_, domain, result);
 
     inflight->completed = true;
     inflight->result = result;
@@ -146,42 +149,20 @@ cobalt::task<DnsResult> DnsService::Resolve(
 }
 
 cobalt::task<DnsResult> DnsService::DoResolve(
-    const std::string& domain, bool prefer_ipv6) {
-    auto query_family = [this, &domain](bool query_aaaa) -> cobalt::task<DnsResult> {
-        DnsResult last_result;
-        last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
-        last_result.error_msg = "DNS server unavailable";
+    const std::string& domain) {
+    DnsResult last_result;
+    last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
+    last_result.error_msg = "DNS server unavailable";
 
-        for (const auto& server : servers_) {
-            auto result = co_await QueryServer(server, domain, query_aaaa);
-            if (result.Ok() || result.error == ErrorCode::DNS_NO_RECORD) {
-                co_return result;
-            }
-            last_result = std::move(result);
+    for (const auto& server : servers_) {
+        auto result = co_await QueryServer(server, domain, false);
+        if (result.Ok() || result.error == ErrorCode::DNS_NO_RECORD) {
+            co_return result;
         }
-
-        co_return last_result;
-    };
-
-    DnsResult primary = co_await query_family(prefer_ipv6);
-    if (primary.Ok()) {
-        co_return primary;
+        last_result = std::move(result);
     }
 
-    DnsResult alternate = co_await query_family(!prefer_ipv6);
-    if (alternate.Ok()) {
-        co_return alternate;
-    }
-
-    if (primary.error == ErrorCode::DNS_NO_RECORD &&
-        alternate.error == ErrorCode::DNS_NO_RECORD) {
-        co_return primary;
-    }
-
-    if (primary.error != ErrorCode::DNS_NO_RECORD) {
-        co_return primary;
-    }
-    co_return alternate;
+    co_return last_result;
 }
 
 cobalt::task<DnsResult> DnsService::QueryServer(
@@ -295,7 +276,7 @@ memory::ByteVector DnsService::BuildQuery(
     }
     query.push_back(0x00);
 
-    const uint16_t qtype = query_aaaa ? dns::TYPE_AAAA : dns::TYPE_A;
+    const uint16_t qtype = dns::TYPE_A;
     query.push_back(static_cast<uint8_t>(qtype >> 8));
     query.push_back(static_cast<uint8_t>(qtype & 0xFF));
 
@@ -439,10 +420,6 @@ DnsService::ParsedResponse DnsService::ParseResponse(
             net::ip::address_v4::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 4);
             addresses.emplace_back(net::ip::address_v4(bytes));
-        } else if (type == dns::TYPE_AAAA && rdlength == 16) {
-            net::ip::address_v6::bytes_type bytes;
-            std::memcpy(bytes.data(), &response[pos], 16);
-            addresses.emplace_back(net::ip::address_v6(bytes));
         }
 
         pos += rdlength;
@@ -477,12 +454,12 @@ cobalt::task<void> DnsService::Prefetch(
 
     LOG_DEBUG("DNS prefetch starting for {} domains", domains.size());
     for (const auto& domain : domains) {
-        if (domain.empty() || cache_->Get(domain, false)) {
+        if (domain.empty() || cache_->Get(domain)) {
             continue;
         }
 
         try {
-            auto result = co_await Resolve(domain, false);
+            auto result = co_await Resolve(domain);
             if (result.Ok()) {
                 LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
                           domain,

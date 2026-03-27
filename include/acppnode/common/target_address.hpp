@@ -25,13 +25,12 @@ struct TargetAddress {
     }
     
     TargetAddress(const net::ip::address& addr, uint16_t p)
-        : port(p), resolved_addr(addr) {
+        : port(p) {
         if (addr.is_v4()) {
             type = AddressType::IPv4;
-        } else {
-            type = AddressType::IPv6;
+            resolved_addr = addr;
+            host = addr.to_string();
         }
-        host = addr.to_string();
     }
     
     // 判断是否有效
@@ -46,7 +45,7 @@ struct TargetAddress {
     
     // 判断是否为 IP
     bool IsIP() const {
-        return type == AddressType::IPv4 || type == AddressType::IPv6;
+        return type == AddressType::IPv4;
     }
     
     // 判断是否已解析
@@ -64,9 +63,6 @@ struct TargetAddress {
     
     // 转换为字符串
     std::string ToString() const {
-        if (type == AddressType::IPv6) {
-            return std::format("[{}]:{}", host, port);
-        }
         return std::format("{}:{}", host, port);
     }
     
@@ -90,10 +86,13 @@ private:
         if (!ec) {
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
+                resolved_addr = addr;
             } else {
-                type = AddressType::IPv6;
+                type = AddressType::Domain;
+                host.clear();
+                resolved_addr.reset();
+                return;
             }
-            resolved_addr = addr;
         } else {
             type = AddressType::Domain;
         }
@@ -109,33 +108,19 @@ inline std::optional<TargetAddress> TargetAddress::Parse(const std::string& addr
     std::string host;
     uint16_t port = 0;
     
-    // IPv6 格式：[::1]:8080
     if (addr[0] == '[') {
-        auto close_bracket = addr.find(']');
-        if (close_bracket == std::string::npos) {
-            return std::nullopt;
-        }
-        host = addr.substr(1, close_bracket - 1);
-        
-        if (close_bracket + 1 < addr.size() && addr[close_bracket + 1] == ':') {
-            try {
-                port = static_cast<uint16_t>(std::stoi(addr.substr(close_bracket + 2)));
-            } catch (...) {
-                return std::nullopt;
-            }
-        }
-    } else {
-        // IPv4 或域名格式：host:port
-        auto colon = addr.rfind(':');
-        if (colon == std::string::npos) {
-            return std::nullopt;
-        }
-        host = addr.substr(0, colon);
-        try {
-            port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
-        } catch (...) {
-            return std::nullopt;
-        }
+        return std::nullopt;
+    }
+
+    auto colon = addr.rfind(':');
+    if (colon == std::string::npos) {
+        return std::nullopt;
+    }
+    host = addr.substr(0, colon);
+    try {
+        port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
+    } catch (...) {
+        return std::nullopt;
     }
     
     if (host.empty() || port == 0) {
