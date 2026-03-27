@@ -211,7 +211,7 @@ public:
         while (true) {
             if (frame_payload_remaining_ == 0) {
                 if (!co_await PrepareNextDataFrame()) {
-                    if (peer_closed_cleanly_) {
+                    if (peer_closed_cleanly_ || transport_eof_) {
                         co_return 0;
                     }
                     ThrowWsStreamError("WebSocket read frame header failed");
@@ -224,6 +224,9 @@ public:
                 if (!co_await ReadFull(scratch.data(), payload_len)) {
                     frame_payload_remaining_ = 0;
                     frame_mask_offset_ = 0;
+                    if (transport_eof_) {
+                        co_return 0;
+                    }
                     ThrowWsStreamError("WebSocket read frame payload failed");
                 }
 
@@ -249,6 +252,9 @@ public:
             if (!co_await ReadFull(buf, chunk)) {
                 frame_payload_remaining_ = 0;
                 frame_mask_offset_ = 0;
+                if (transport_eof_) {
+                    co_return 0;
+                }
                 ThrowWsStreamError("WebSocket read frame payload failed");
             }
 
@@ -329,8 +335,20 @@ protected:
         
         // 从底层流读取剩余
         while (total < len) {
-            size_t n = co_await inner_->AsyncRead(net::buffer(buf + total, len - total));
+            size_t n = 0;
+            try {
+                n = co_await inner_->AsyncRead(net::buffer(buf + total, len - total));
+            } catch (const boost::system::system_error& e) {
+                if (e.code() == boost::asio::error::eof ||
+                    e.code() == boost::asio::error::connection_reset ||
+                    e.code() == boost::asio::error::broken_pipe) {
+                    transport_eof_ = true;
+                    co_return false;
+                }
+                throw;
+            }
             if (n == 0) {
+                transport_eof_ = true;
                 co_return false;
             }
             total += n;
@@ -443,6 +461,7 @@ private:
     size_t frame_mask_offset_ = 0;
     bool frame_masked_ = false;
     bool peer_closed_cleanly_ = false;
+    bool transport_eof_ = false;
 
     // write_closed_：写端已关闭（Close Frame 已发送），幂等标志
     // closed_：连接已完全关闭（幂等 Close() 标志）
