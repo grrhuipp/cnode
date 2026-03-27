@@ -92,6 +92,10 @@ namespace {
     throw boost::system::system_error(boost::asio::error::connection_reset, what);
 }
 
+[[noreturn]] void ThrowTlsReadError(const char* what) {
+    throw boost::system::system_error(boost::asio::error::connection_reset, what);
+}
+
 struct AutoSignState {
     EVP_PKEY* pkey = nullptr;
     std::mutex mu;
@@ -475,7 +479,7 @@ std::string TlsStream::ReceivedSni() const {
 cobalt::task<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
     if (!handshake_done_) {
         if (!co_await Handshake()) {
-            co_return 0;
+            ThrowTlsReadError("TLS handshake failed during read");
         }
     }
     
@@ -494,18 +498,22 @@ cobalt::task<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
         
         if (err == SSL_ERROR_WANT_READ) {
             // 先刷新写缓冲
-            co_await FlushWriteBio();
+            if (!co_await FlushWriteBio()) {
+                ThrowTlsReadError("TLS flush write BIO failed");
+            }
             
             // 从底层读取
             auto n = co_await inner_->AsyncRead(net::buffer(read_buffer_));
             if (n == 0) {
-                co_return 0;
+                ThrowTlsReadError("TLS peer closed without close_notify");
             }
             BIO_write(read_bio_, read_buffer_.data(), static_cast<int>(n));
         } else if (err == SSL_ERROR_WANT_WRITE) {
-            co_await FlushWriteBio();
+            if (!co_await FlushWriteBio()) {
+                ThrowTlsReadError("TLS flush write BIO failed");
+            }
         } else {
-            co_return 0;
+            ThrowTlsReadError("TLS read failed");
         }
     }
 }

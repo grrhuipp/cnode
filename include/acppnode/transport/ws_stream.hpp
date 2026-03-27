@@ -26,7 +26,7 @@ namespace acpp {
 
 using WsHandshakeResult = std::expected<void, ErrorCode>;
 
-[[noreturn]] inline void ThrowWsWriteError(const char* what) {
+[[noreturn]] inline void ThrowWsStreamError(const char* what) {
     throw boost::system::system_error(boost::asio::error::connection_reset, what);
 }
 
@@ -211,7 +211,10 @@ public:
         while (true) {
             if (frame_payload_remaining_ == 0) {
                 if (!co_await PrepareNextDataFrame()) {
-                    co_return 0;
+                    if (peer_closed_cleanly_) {
+                        co_return 0;
+                    }
+                    ThrowWsStreamError("WebSocket read frame header failed");
                 }
             }
 
@@ -221,7 +224,7 @@ public:
                 if (!co_await ReadFull(scratch.data(), payload_len)) {
                     frame_payload_remaining_ = 0;
                     frame_mask_offset_ = 0;
-                    co_return 0;
+                    ThrowWsStreamError("WebSocket read frame payload failed");
                 }
 
                 if (frame_masked_) {
@@ -246,7 +249,7 @@ public:
             if (!co_await ReadFull(buf, chunk)) {
                 frame_payload_remaining_ = 0;
                 frame_mask_offset_ = 0;
-                co_return 0;
+                ThrowWsStreamError("WebSocket read frame payload failed");
             }
 
             if (frame_masked_) {
@@ -392,6 +395,7 @@ protected:
                 if (!co_await DiscardPayload(payload_len)) {
                     co_return false;
                 }
+                peer_closed_cleanly_ = true;
                 co_return false;
             }
 
@@ -438,6 +442,7 @@ private:
     std::array<uint8_t, 4> frame_mask_key_{0, 0, 0, 0};
     size_t frame_mask_offset_ = 0;
     bool frame_masked_ = false;
+    bool peer_closed_cleanly_ = false;
 
     // write_closed_：写端已关闭（Close Frame 已发送），幂等标志
     // closed_：连接已完全关闭（幂等 Close() 标志）
@@ -455,7 +460,7 @@ public:
     
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!CanWrite()) {
-            ThrowWsWriteError("WebSocket server write on closed stream");
+            ThrowWsStreamError("WebSocket server write on closed stream");
         }
 
         const uint8_t* data = static_cast<const uint8_t*>(buffer.data());
@@ -469,18 +474,18 @@ public:
             std::memcpy(frame.data(), header.bytes.data(), header.size);
             std::memcpy(frame.data() + header.size, data, len);
             if (!co_await WriteFull(frame.data(), header.size + len)) {
-                ThrowWsWriteError("WebSocket server write frame failed");
+                ThrowWsStreamError("WebSocket server write frame failed");
             }
             co_return len;
         }
 
         if (!co_await WriteFull(header.bytes.data(), header.size)) {
-            ThrowWsWriteError("WebSocket server write header failed");
+            ThrowWsStreamError("WebSocket server write header failed");
         }
 
         // 发送 payload
         if (!co_await WriteFull(data, len)) {
-            ThrowWsWriteError("WebSocket server write payload failed");
+            ThrowWsStreamError("WebSocket server write payload failed");
         }
 
         co_return len;
@@ -503,7 +508,7 @@ public:
     
     cobalt::task<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!CanWrite()) {
-            ThrowWsWriteError("WebSocket client write on closed stream");
+            ThrowWsStreamError("WebSocket client write on closed stream");
         }
 
         const uint8_t* data = static_cast<const uint8_t*>(buffer.data());
@@ -512,7 +517,7 @@ public:
         // RFC 6455 §5.3: 客户端必须为每帧生成随机 mask key
         uint8_t mask_key[4];
         if (RAND_bytes(mask_key, sizeof(mask_key)) != 1) [[unlikely]] {
-            ThrowWsWriteError("WebSocket client generate mask failed");
+            ThrowWsStreamError("WebSocket client generate mask failed");
         }
 
         // 编码帧头（客户端需要 mask）
@@ -524,13 +529,13 @@ public:
             std::memcpy(frame.data() + header.size, data, len);
             ws::MaskData(frame.data() + header.size, len, mask_key);
             if (!co_await WriteFull(frame.data(), header.size + len)) {
-                ThrowWsWriteError("WebSocket client write frame failed");
+                ThrowWsStreamError("WebSocket client write frame failed");
             }
             co_return len;
         }
 
         if (!co_await WriteFull(header.bytes.data(), header.size)) {
-            ThrowWsWriteError("WebSocket client write header failed");
+            ThrowWsStreamError("WebSocket client write header failed");
         }
 
         std::array<uint8_t, kStreamChunkSize> masked_chunk{};
@@ -540,7 +545,7 @@ public:
             std::memcpy(masked_chunk.data(), data + offset, chunk);
             ws::MaskData(masked_chunk.data(), chunk, mask_key, offset);
             if (!co_await WriteFull(masked_chunk.data(), chunk)) {
-                ThrowWsWriteError("WebSocket client write payload failed");
+                ThrowWsStreamError("WebSocket client write payload failed");
             }
             offset += chunk;
         }
