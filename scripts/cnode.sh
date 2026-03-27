@@ -382,14 +382,28 @@ except Exception as e:
 
 main() {
     if [ $# -eq 0 ]; then
+        WAS_ACTIVE=0
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            WAS_ACTIVE=1
+        fi
         install_cnode
+        if [ "$WAS_ACTIVE" -eq 1 ]; then
+            systemctl start "$SERVICE_NAME"
+        fi
         exit 0
     fi
 
     parse_options "$@"
 
     if ! has_deploy_options; then
+        WAS_ACTIVE=0
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            WAS_ACTIVE=1
+        fi
         install_cnode
+        if [ "$WAS_ACTIVE" -eq 1 ]; then
+            systemctl start "$SERVICE_NAME"
+        fi
         exit 0
     fi
 
