@@ -378,6 +378,7 @@ int main(int argc, char* argv[]) {
     for (uint32_t i = 0; i < workers.size(); ++i) {
         worker_threads.emplace_back([&io_contexts, i]() {
             memory::ThreadScope worker_thread_allocator_scope;
+            memory::MarkThreadPoolThread();
             io_contexts[i]->run();
         });
     }
@@ -430,19 +431,23 @@ int main(int argc, char* argv[]) {
     uint32_t last_sample_total_conns = 0;
 #ifdef USE_MIMALLOC
     auto last_force_collect_at = steady_clock::time_point{};
+    auto last_steady_collect_at = steady_clock::time_point{};
 #endif
     auto sample_coro = [&running, &stats, &workers, &last_sample_total_conns
 #ifdef USE_MIMALLOC
-        , &last_force_collect_at
+        , &last_force_collect_at, &last_steady_collect_at
 #endif
         ](net::steady_timer& timer) -> cobalt::task<void> {
         while (running) {
             stats->SampleNow();
+            constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
 #ifdef USE_MIMALLOC
             constexpr uint32_t kForceCollectMinPrevConns = 4096;
             constexpr uint32_t kForceCollectDropFactor = 8;
             constexpr uint32_t kForceCollectConnFloor = 64;
             constexpr auto kForceCollectCooldown = std::chrono::seconds(3);
+            constexpr uint32_t kSteadyCollectMinConns = 2048;
+            constexpr auto kSteadyCollectInterval = std::chrono::seconds(5);
 
             uint32_t total_conns = 0;
             for (const auto& w : workers) {
@@ -462,14 +467,31 @@ int main(int argc, char* argv[]) {
             const bool cooldown_ok =
                 last_force_collect_at.time_since_epoch().count() == 0 ||
                 now - last_force_collect_at >= kForceCollectCooldown;
+            const bool steady_collect_due =
+                total_conns >= kSteadyCollectMinConns &&
+                (last_steady_collect_at.time_since_epoch().count() == 0 ||
+                 now - last_steady_collect_at >= kSteadyCollectInterval);
 
             if ((burst_drain || newly_idle) && cooldown_ok) {
                 memory::CollectBurst();
                 last_force_collect_at = now;
+                last_steady_collect_at = now;
+            } else if (steady_collect_due) {
+                memory::CollectSteady();
+                last_steady_collect_at = now;
             }
 
             last_sample_total_conns = total_conns;
 #endif
+            {
+                static auto last_log_flush_at = steady_clock::time_point{};
+                const auto flush_now = steady_clock::now();
+                if (last_log_flush_at.time_since_epoch().count() == 0 ||
+                    flush_now - last_log_flush_at >= kAsyncLogFlushInterval) {
+                    Log::Flush();
+                    last_log_flush_at = flush_now;
+                }
+            }
             timer.expires_after(std::chrono::seconds(1));
             auto [ec] = co_await timer.async_wait(net::as_tuple(cobalt::use_op));
             if (ec) break;

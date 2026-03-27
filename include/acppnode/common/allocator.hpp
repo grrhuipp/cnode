@@ -157,9 +157,18 @@ inline void CollectCurrentThread(bool force) noexcept {
     }
 }
 
+inline void CollectSteady() noexcept {
+    CollectCurrentThread(false);
+    mi_collect(false);
+}
+
 inline void CollectBurst() noexcept {
     CollectCurrentThread(true);
     mi_collect(true);
+}
+
+inline void MarkThreadPoolThread() noexcept {
+    mi_thread_set_in_threadpool();
 }
 
 class ThreadScope final {
@@ -306,7 +315,9 @@ inline void DeallocateRaw(void* p,
     ::operator delete(p);
 }
 inline void CollectCurrentThread(bool /*force*/) noexcept {}
+inline void CollectSteady() noexcept {}
 inline void CollectBurst() noexcept {}
+inline void MarkThreadPoolThread() noexcept {}
 
 class ThreadScope final {
 public:

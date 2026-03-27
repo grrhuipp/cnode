@@ -148,7 +148,8 @@ void CleanupOldFiles() {
 // ============================================================================
 boost::shared_ptr<AsyncFileSink> MakeAsyncFileSink(
     const std::filesystem::path& log_dir,
-    const std::string& prefix)
+    const std::string& prefix,
+    bool auto_flush)
 {
     auto backend = boost::make_shared<sinks::text_file_backend>(
         keywords::file_name = (log_dir / (prefix + "_%Y-%m-%d.log")).string(),
@@ -156,9 +157,8 @@ boost::shared_ptr<AsyncFileSink> MakeAsyncFileSink(
         keywords::time_based_rotation =
             sinks::file::rotation_at_time_point(0, 0, 0)
     );
-    // async 前端已批量化写入（队列 → backend），auto_flush 保证每批写入后 fsync
-    // 效果：批量写入减少 syscall 次数，同时 tail -f 无明显延迟
-    backend->auto_flush(true);
+    // app 日志保持更及时的 flush，access 日志则优先吞吐与更低写盘开销。
+    backend->auto_flush(auto_flush);
 
     // 日志轮转时压缩前一天的日志文件
     backend->set_open_handler([](sinks::text_file_backend::stream_type&) {
@@ -201,7 +201,7 @@ bool Log::Init(const std::string& level,
         // ── app sink ─────────────────────────────────────────────────────────
         // 格式：[timestamp] [level] [tid] message
         {
-            auto sink = MakeAsyncFileSink(log_dir, "app");
+            auto sink = MakeAsyncFileSink(log_dir, "app", true);
             sink->set_filter(
                 attr_channel == std::string("app") &&
                 attr_severity >= min_level_
@@ -222,7 +222,7 @@ bool Log::Init(const std::string& level,
         // ── access sink ──────────────────────────────────────────────────────
         // 格式：message（原样写入，调用方自己拼格式）
         {
-            auto sink = MakeAsyncFileSink(log_dir, "access");
+            auto sink = MakeAsyncFileSink(log_dir, "access", false);
             sink->set_filter(attr_channel == std::string("access"));
             sink->set_formatter(expr::stream << expr::smessage);
             logging::core::get()->add_sink(sink);
