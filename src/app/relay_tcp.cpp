@@ -59,6 +59,15 @@ void FlushRelayStats(StatsShard* stats, LocalStatsAccumulator& acc) {
     acc.Reset();
 }
 
+bool ConsumeRelayTimeoutSignals(AsyncStream& from, AsyncStream& to) {
+    // half-close 的 absolute deadline 会通过 phase deadline 主动 cancel 正在进行的 I/O，
+    // 这里统一把 read/write/idle/phase 四类超时信号都折叠成 relay timeout。
+    bool timed_out = ConsumeReadSideTimeout(from) || ConsumeWriteSideTimeout(to);
+    bool from_phase = from.ConsumePhaseDeadline();
+    bool to_phase = to.ConsumePhaseDeadline();
+    return timed_out || from_phase || to_phase;
+}
+
 cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
     AsyncStream& from,
     AsyncStream& to,
@@ -144,6 +153,11 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
                         // 当前方向退出后，peer direction 会按共享 absolute deadline 收敛。
                         from.SetWriteTimeout(half_close_timeout);
                         to.SetWriteTimeout(half_close_timeout);
+                        // 仅修改 write timeout 不会缩短已经 arm 的 async_write deadline。
+                        // 用 absolute phase deadline 主动取消正在进行的读/写，确保 half-close
+                        // 预算对 in-flight I/O 也立即生效。
+                        (void)from.StartPhaseDeadline(half_close_timeout);
+                        (void)to.StartPhaseDeadline(half_close_timeout);
                     } else {
                         LOG_CONN_DEBUG(ctx, "[relay] {} half-close: timeout=0, cancel peer immediately",
                                        is_upload ? "up" : "down");
@@ -182,7 +196,7 @@ cobalt::task<std::pair<uint64_t, ErrorCode>> RelayOneDirection(
         } catch (const boost::system::system_error& e) {
             error = MapAsioError(e.code());
             if (error == ErrorCode::CANCELLED &&
-                (ConsumeReadSideTimeout(from) || ConsumeWriteSideTimeout(to))) {
+                ConsumeRelayTimeoutSignals(from, to)) {
                 error = ErrorCode::RELAY_TIMEOUT;
                 LOG_CONN_DEBUG(ctx, "[relay] {} cancelled by timeout, transferred={}B",
                                is_upload ? "up" : "down", total_bytes);
@@ -240,6 +254,11 @@ cobalt::task<RelayResult> DoRelay(
 
     auto [bytes_up, error_up] = up_result;
     auto [bytes_down, error_down] = down_result;
+
+    // relay 结束后立刻清掉 half-close phase deadline，
+    // 避免后续优雅关闭被残留 absolute deadline 误取消。
+    client.ClearPhaseDeadline();
+    target.ClearPhaseDeadline();
 
     result.bytes_up = bytes_up;
     result.bytes_down = bytes_down;
