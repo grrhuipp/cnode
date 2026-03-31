@@ -2,7 +2,13 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/app/mux_relay.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/config.hpp"
 #include "acppnode/sniff/sniffer.hpp"
+#include "acppnode/router/router.hpp"
+#include "acppnode/dns/dns_service.hpp"
+#include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/transport_stack.hpp"
+#include "acppnode/handlers/inbound_handler.hpp"
 #include "acppnode/protocol/outbound.hpp"
 #include "acppnode/transport/transport_dialer.hpp"
 #include "acppnode/transport/tcp_stream.hpp"
@@ -420,7 +426,7 @@ cobalt::task<void> SessionHandler::Handle(
         LOG_CONN_FAIL_CTX(ctx, "DIAL_FAILED {} -> {} via {}: {}",
                           ctx.client_ip, ctx.final_target.ToString(),
                           ctx.outbound_tag, dial_result.error_msg);
-        ctx.SetError(dial_result.error_code);
+        ctx.SetError(dial_result.error);
         ctx.TransitionTo(ConnState::CLOSING);
         co_return;
     }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/core/constants.hpp"
 #include "acppnode/transport/tls_stream.hpp"  // TlsConfig
 #include <boost/json.hpp>
 #include <cstdint>
@@ -31,7 +32,7 @@ enum StreamFlags : uint8_t {
 // WebSocket 传输配置
 // ============================================================================
 struct WsConfig {
-    std::string path = "/";
+    std::string path = std::string(constants::binding::kRootPath);
     std::unordered_map<std::string, std::string> headers;
 
     // 若非空，从该 HTTP header 提取真实客户端 IP（覆盖 TCP 层地址）。
@@ -54,8 +55,8 @@ struct WsConfig {
 //   { "network": "tcp", "security": "none" } → 明文 TCP
 // ============================================================================
 struct StreamSettings {
-    std::string network  = "tcp";   // "tcp" | "ws"
-    std::string security = "none";  // "none" | "tls"
+    std::string network  = std::string(constants::protocol::kTcp);   // "tcp" | "ws"
+    std::string security = std::string(constants::protocol::kNone);  // "none" | "tls"
 
     TlsConfig tls;  // 当 security == "tls" 时生效
     WsConfig  ws;   // 当 network  == "ws"  时生效

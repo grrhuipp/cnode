@@ -1,10 +1,25 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <boost/system/error_code.hpp>
 
 namespace acpp {
+
+enum class ErrorDomain : uint8_t {
+    General = 0,
+    Network,
+    Protocol,
+    Routing,
+    Dial,
+    Relay,
+    Sniff,
+    Tls,
+    Vmess,
+    Dns,
+    Panel,
+};
 
 // ============================================================================
 // 错误码定义
@@ -226,6 +241,155 @@ constexpr bool IsConnectionClosed(ErrorCode code) {
            code == ErrorCode::RELAY_CLIENT_CLOSED ||
            code == ErrorCode::RELAY_TARGET_CLOSED;
 }
+
+// 错误码所属领域
+[[nodiscard]]
+constexpr ErrorDomain ErrorCodeDomain(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::TIMEOUT:
+        case ErrorCode::CANCELLED:
+        case ErrorCode::INTERNAL:
+        case ErrorCode::INVALID_ARGUMENT:
+        case ErrorCode::NOT_FOUND:
+        case ErrorCode::ALREADY_EXISTS:
+        case ErrorCode::PERMISSION_DENIED:
+        case ErrorCode::RESOURCE_EXHAUSTED:
+        case ErrorCode::NOT_SUPPORTED:
+        case ErrorCode::CONNECTION_CLOSED:
+            return ErrorDomain::General;
+
+        case ErrorCode::SOCKET_CREATE_FAILED:
+        case ErrorCode::SOCKET_BIND_FAILED:
+        case ErrorCode::SOCKET_LISTEN_FAILED:
+        case ErrorCode::SOCKET_CONNECT_FAILED:
+        case ErrorCode::SOCKET_READ_FAILED:
+        case ErrorCode::SOCKET_WRITE_FAILED:
+        case ErrorCode::SOCKET_CLOSED:
+        case ErrorCode::SOCKET_EOF:
+        case ErrorCode::NETWORK_BIND_FAILED:
+        case ErrorCode::NETWORK_IO_ERROR:
+            return ErrorDomain::Network;
+
+        case ErrorCode::PROTOCOL_INVALID_VERSION:
+        case ErrorCode::PROTOCOL_INVALID_COMMAND:
+        case ErrorCode::PROTOCOL_INVALID_ADDRESS:
+        case ErrorCode::PROTOCOL_AUTH_FAILED:
+        case ErrorCode::PROTOCOL_DECODE_FAILED:
+        case ErrorCode::PROTOCOL_ENCODE_FAILED:
+        case ErrorCode::PROTOCOL_UNSUPPORTED:
+            return ErrorDomain::Protocol;
+
+        case ErrorCode::ROUTER_NO_MATCH:
+        case ErrorCode::ROUTER_OUTBOUND_NOT_FOUND:
+        case ErrorCode::ROUTER_INVALID_RULE:
+        case ErrorCode::BLOCKED:
+            return ErrorDomain::Routing;
+
+        case ErrorCode::DIAL_DNS_FAILED:
+        case ErrorCode::DIAL_CONNECT_FAILED:
+        case ErrorCode::DIAL_TIMEOUT:
+        case ErrorCode::DIAL_REFUSED:
+        case ErrorCode::DIAL_NETWORK_UNREACHABLE:
+        case ErrorCode::DIAL_HOST_UNREACHABLE:
+        case ErrorCode::OUTBOUND_CONNECTION_FAILED:
+            return ErrorDomain::Dial;
+
+        case ErrorCode::RELAY_READ_FAILED:
+        case ErrorCode::RELAY_WRITE_FAILED:
+        case ErrorCode::RELAY_TIMEOUT:
+        case ErrorCode::RELAY_CLIENT_CLOSED:
+        case ErrorCode::RELAY_TARGET_CLOSED:
+            return ErrorDomain::Relay;
+
+        case ErrorCode::SNIFF_FAILED:
+        case ErrorCode::SNIFF_TIMEOUT:
+        case ErrorCode::SNIFF_UNSUPPORTED:
+        case ErrorCode::SNIFF_INCOMPLETE:
+            return ErrorDomain::Sniff;
+
+        case ErrorCode::TLS_HANDSHAKE_FAILED:
+        case ErrorCode::TLS_CERT_INVALID:
+        case ErrorCode::TLS_VERSION_MISMATCH:
+        case ErrorCode::TLS_VERIFY_FAILED:
+        case ErrorCode::TLS_ALERT_RECEIVED:
+            return ErrorDomain::Tls;
+
+        case ErrorCode::VMESS_INVALID_USER:
+        case ErrorCode::VMESS_INVALID_REQUEST:
+        case ErrorCode::VMESS_TIMESTAMP_EXPIRED:
+        case ErrorCode::VMESS_REPLAY_ATTACK:
+        case ErrorCode::VMESS_CHECKSUM_MISMATCH:
+        case ErrorCode::VMESS_INVALID_RESPONSE:
+            return ErrorDomain::Vmess;
+
+        case ErrorCode::DNS_RESOLVE_FAILED:
+        case ErrorCode::DNS_TIMEOUT:
+        case ErrorCode::DNS_NO_RECORD:
+        case ErrorCode::DNS_SERVER_FAILED:
+        case ErrorCode::DNS_FORMAT_ERROR:
+        case ErrorCode::DNS_REFUSED:
+            return ErrorDomain::Dns;
+
+        case ErrorCode::PANEL_API_FAILED:
+        case ErrorCode::PANEL_AUTH_FAILED:
+        case ErrorCode::PANEL_NODE_NOT_FOUND:
+        case ErrorCode::PANEL_USER_NOT_FOUND:
+        case ErrorCode::PANEL_USER_DISABLED:
+        case ErrorCode::PANEL_TRAFFIC_EXCEEDED:
+        case ErrorCode::PANEL_RATE_LIMITED:
+        case ErrorCode::PANEL_INVALID_RESPONSE:
+        case ErrorCode::PANEL_NETWORK_ERROR:
+            return ErrorDomain::Panel;
+
+        default:
+            return ErrorDomain::General;
+    }
+}
+
+// 错误消息统一格式化
+[[nodiscard]]
+inline std::string ErrorMessage(ErrorCode code, std::string_view message = {}) {
+    return message.empty() ? std::string(ErrorCodeToString(code)) : std::string(message);
+}
+
+// ========================================================================
+// 统一结果状态
+//
+// 让不同模块的 Result 类型共享同一套 error / error_msg / Ok() 语义，
+// 避免每个接口重复实现“错误码 + 错误消息 + 成功判断”。
+// ========================================================================
+struct ResultStatus {
+    ErrorCode error = ErrorCode::OK;
+    std::string error_msg;
+
+    [[nodiscard]] bool Ok() const noexcept {
+        return error == ErrorCode::OK;
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return Ok();
+    }
+
+    void SetError(ErrorCode code, std::string_view msg = {}) {
+        error = code;
+        error_msg = ErrorMessage(code, msg);
+    }
+
+    void ClearError() noexcept {
+        error = ErrorCode::OK;
+        error_msg.clear();
+    }
+
+    [[nodiscard]] static ResultStatus Success() {
+        return {};
+    }
+
+    [[nodiscard]] static ResultStatus Fail(ErrorCode code, std::string msg = {}) {
+        ResultStatus result;
+        result.SetError(code, msg);
+        return result;
+    }
+};
 
 // 从 Boost.Asio error_code 映射到 ErrorCode
 ErrorCode MapAsioError(const boost::system::error_code& ec);

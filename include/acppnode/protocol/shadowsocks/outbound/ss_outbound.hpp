@@ -24,7 +24,7 @@ struct SsOutboundConfig {
     std::string            address;
     uint16_t               port    = 8388;
     std::string            password;
-    std::string            method  = "aes-256-gcm";
+    std::string            method  = std::string(constants::protocol::kAes256Gcm);
     StreamSettings         stream_settings;
     std::chrono::seconds   timeout{10};
 };
@@ -49,6 +49,8 @@ public:
     SsClientAsyncStream(const SsClientAsyncStream&)            = delete;
     SsClientAsyncStream& operator=(const SsClientAsyncStream&) = delete;
 
+    cobalt::task<MultiBuffer> ReadMultiBuffer() override;
+    cobalt::task<void> WriteMultiBuffer(MultiBuffer mb) override;
     cobalt::task<size_t> AsyncRead(net::mutable_buffer buf) override;
     cobalt::task<size_t> AsyncWrite(net::const_buffer buf) override;
 
@@ -70,6 +72,8 @@ public:
     const TcpStream* GetBaseTcpStream() const override { return inner_->GetBaseTcpStream(); }
 
 private:
+    cobalt::task<bool> EnsureReadCipherInitialized();
+
     // enc_len header (2 + kTagSize) + 加密载荷 (payload + kTagSize)
     static constexpr size_t kLenHeaderSize = 2 + ss::SsAeadCipher::kTagSize;  // 18
     static constexpr size_t kEncryptedChunkSize =
@@ -78,6 +82,7 @@ private:
     cobalt::task<bool> ReadFull(uint8_t* buf, size_t len);
     cobalt::task<bool> WriteFull(const uint8_t* buf, size_t len);
     cobalt::task<bool> ReadNextChunk();
+    cobalt::task<bool> SendHandshake(const MultiBuffer& mb, size_t& consumed_prefix);
     // 首次写：发送 [client_salt][enc_len][len_tag][enc_addr_payload][payload_tag]
     cobalt::task<bool> SendHandshake(const uint8_t* data, size_t data_len);
     // 普通 chunk 写入（握手后）

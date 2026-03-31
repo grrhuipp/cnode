@@ -8,6 +8,7 @@
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/app/port_binding.hpp"
+#include "acppnode/protocol/inbound_registry.hpp"
 #include "acppnode/dns/dns_service.hpp"
 #include "acppnode/geo/geodata.hpp"
 #include "acppnode/protocol/sniff_config.hpp"
@@ -62,6 +63,7 @@ public:
     [[nodiscard]] const trojan::TrojanUserManager& GetTrojanUserManager() const { return trojan_user_manager_; }
     [[nodiscard]] ss::SsUserManager& GetSsUserManager() { return ss_user_manager_; }
     [[nodiscard]] const ss::SsUserManager& GetSsUserManager() const { return ss_user_manager_; }
+    [[nodiscard]] InboundProtocolDeps GetInboundProtocolDeps();
 
     [[nodiscard]] UDPSessionManager& GetUDPSessionManager() { return *udp_session_manager_; }
 
@@ -121,8 +123,8 @@ public:
 
     [[nodiscard]] std::vector<int64_t> GetOnlineUserIds(
         const std::string& tag, const std::string& protocol) const {
-        if (protocol == "trojan") return trojan_user_manager_.GetOnlineUserIds(tag);
-        if (protocol == "shadowsocks") return ss_user_manager_.GetOnlineUserIds(tag);
+        if (protocol == constants::protocol::kTrojan) return trojan_user_manager_.GetOnlineUserIds(tag);
+        if (protocol == constants::protocol::kShadowsocks) return ss_user_manager_.GetOnlineUserIds(tag);
         return user_manager_.GetOnlineUserIds(tag);
     }
 

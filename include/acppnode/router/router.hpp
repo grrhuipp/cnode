@@ -245,9 +245,9 @@ class NetworkCondition {
 public:
     explicit NetworkCondition(std::vector<std::string> networks) {
         for (const auto& net : networks) {
-            if (net == "tcp") {
+            if (net == constants::protocol::kTcp) {
                 mask_ |= 0x1;
-            } else if (net == "udp") {
+            } else if (net == constants::protocol::kUdp) {
                 mask_ |= 0x2;
             } else if (net == "tcp,udp" || net == "udp,tcp") {
                 mask_ |= 0x3;
@@ -435,7 +435,7 @@ public:
 
 private:
     std::vector<CompoundRoutingRule> compound_rules_;
-    std::string default_outbound_ = "direct";
+    std::string default_outbound_ = std::string(constants::protocol::kDirect);
     geo::GeoManager* geo_manager_ = nullptr;
 };
 

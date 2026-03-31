@@ -51,6 +51,16 @@ uint32_t ComputePressureThreshold(const Config& config) {
 
 }
 
+InboundProtocolDeps Worker::GetInboundProtocolDeps() {
+    auto& stats = Stats();
+    return InboundProtocolDeps{
+        &user_manager_,
+        &trojan_user_manager_,
+        &ss_user_manager_,
+        &stats,
+    };
+}
+
 // ============================================================================
 // Worker 构造 / 析构
 // ============================================================================
@@ -162,7 +172,8 @@ void Worker::InitRouter() {
             compound.conditions.push_back(InboundTagCondition{rc.inbound_tag});
         } else {
             // 隐式 inboundTag=node：没有显式 inboundTag 条件的规则只匹配面板入站
-            compound.conditions.push_back(InboundTagCondition{std::vector<std::string>{"node"}});
+            compound.conditions.push_back(
+                InboundTagCondition{std::vector<std::string>{std::string(constants::protocol::kNode)}});
         }
 
         if (!rc.user.empty()) {
@@ -980,7 +991,7 @@ cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
 
         // ── 找到或创建客户端会话 ──────────────────────────────────────────
         const std::string client_key =
-            std::format("{}:{}", client_ip, client_ep.port());
+            iputil::FormatEndpointForLog(client_ip, client_ep.port());
 
         auto session_it = client_sessions.find(client_key);
         bool need_new_session = (session_it == client_sessions.end()) ||

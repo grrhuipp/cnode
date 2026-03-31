@@ -52,12 +52,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <any>
 #include <atomic>
 #include <functional>
 
 // 子模块
 #include "acppnode/common/unique_function.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/common/network.hpp"
 #include "acppnode/common/conn_state.hpp"
 #include "acppnode/common/defaults.hpp"

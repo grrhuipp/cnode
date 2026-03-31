@@ -12,7 +12,7 @@ namespace acpp {
 // ============================================================================
 // 会话上下文
 // ============================================================================
-struct SessionContext {
+struct SessionContext : ResultStatus {
     // 连接标识
     uint64_t conn_id = 0;
     uint32_t worker_id = 0;
@@ -73,10 +73,9 @@ struct SessionContext {
     
     // 限速 (bytes/s), 0 = 不限速
     uint64_t speed_limit = 0;
-    
-    // 错误信息
-    ErrorCode error_code = ErrorCode::OK;
-    std::string error_msg;
+
+    // 错误状态复用统一 ResultStatus
+    using ResultStatus::SetError;
     
     // 协议特定数据（类型安全：各协议定义 XxxProtocolData : IProtocolData）
     // 取用：static_cast<XxxProtocolData*>(protocol_data.get())
@@ -111,12 +110,6 @@ struct SessionContext {
         if (on_disconnect) {
             try { on_disconnect(); } catch (...) {}
         }
-    }
-    
-    // 设置错误
-    void SetError(ErrorCode code, std::string_view msg = "") {
-        error_code = code;
-        error_msg = msg.empty() ? std::string(ErrorCodeToString(code)) : std::string(msg);
     }
     
     // 状态转换

@@ -8,6 +8,7 @@
 #include "acppnode/handlers/outbound_handler.hpp"
 
 #include <expected>
+#include <utility>
 
 namespace acpp {
 
@@ -17,8 +18,7 @@ struct UDPPacket;
 // ============================================================================
 // UDP 拨号结果
 // ============================================================================
-struct UDPDialResult {
-    ErrorCode error = ErrorCode::SUCCESS;
+struct UDPDialResult : ResultStatus {
     
     // 发送函数：发送 UDP 包到目标
     // callback_id: 关联的回调 ID，用于记录发送目标，支持 Full Cone 回包路由
@@ -37,7 +37,30 @@ struct UDPDialResult {
     // 会话 ID（用于管理）
     std::string session_id;
     
-    [[nodiscard]] bool Ok() const noexcept { return error == ErrorCode::SUCCESS && static_cast<bool>(send); }
+    [[nodiscard]] bool Ok() const noexcept {
+        return ResultStatus::Ok() && static_cast<bool>(send);
+    }
+
+    [[nodiscard]] static UDPDialResult Fail(ErrorCode code, std::string msg = {}) {
+        UDPDialResult result;
+        result.SetError(code, msg);
+        return result;
+    }
+
+    [[nodiscard]] static UDPDialResult Success(
+        unique_function<cobalt::task<ErrorCode>(const UDPPacket&, uint64_t callback_id)> send,
+        std::function<void(std::function<void(const UDPPacket&)>)> set_callback,
+        std::function<uint64_t(const std::string&, std::function<void(const UDPPacket&)>)> register_callback,
+        std::function<void(uint64_t)> unregister_callback,
+        std::string session_id) {
+        UDPDialResult result;
+        result.send = std::move(send);
+        result.set_callback = std::move(set_callback);
+        result.register_callback = std::move(register_callback);
+        result.unregister_callback = std::move(unregister_callback);
+        result.session_id = std::move(session_id);
+        return result;
+    }
 };
 
 // ============================================================================
@@ -86,7 +109,7 @@ public:
         SessionContext& ctx,
         net::any_io_executor executor,
         std::function<void(const UDPPacket&)> on_packet) {
-        co_return UDPDialResult{ErrorCode::NOT_SUPPORTED, nullptr, nullptr, nullptr, nullptr, ""};
+        co_return UDPDialResult::Fail(ErrorCode::NOT_SUPPORTED, "UDP dial not supported");
     }
 
     // 获取出站标识
@@ -97,7 +120,9 @@ public:
     [[nodiscard]] virtual IOutboundHandler* GetOutboundHandler() { return nullptr; }
 
     // 获取 SendThrough 配置
-    [[nodiscard]] virtual std::string SendThrough() const { return "auto"; }
+    [[nodiscard]] virtual std::string SendThrough() const {
+        return std::string(constants::binding::kAuto);
+    }
 
     // 是否支持 UDP
     [[nodiscard]] virtual bool SupportsUDP() const { return false; }

@@ -26,14 +26,12 @@ struct DnsCacheStats {
 // ============================================================================
 // DNS 解析结果
 // ============================================================================
-struct DnsResult {
+struct DnsResult : ResultStatus {
     std::vector<net::ip::address> addresses;
-    ErrorCode error = ErrorCode::OK;
-    std::string error_msg;
     bool from_cache = false;
     uint32_t ttl = 60;  // DNS TTL
 
-    [[nodiscard]] bool Ok() const noexcept { return error == ErrorCode::OK && !addresses.empty(); }
+    [[nodiscard]] bool Ok() const noexcept { return ResultStatus::Ok() && !addresses.empty(); }
 };
 
 // ============================================================================
@@ -218,15 +216,13 @@ private:
         memory::ThreadLocalVector<std::shared_ptr<net::steady_timer>> waiters;
     };
 
-    struct ParsedResponse {
+    struct ParsedResponse : ResultStatus {
         std::vector<net::ip::address> addresses;
-        ErrorCode error = ErrorCode::OK;
-        std::string error_msg;
         uint32_t ttl = 60;
         bool negative_cacheable = false;
 
         [[nodiscard]] bool Ok() const noexcept {
-            return error == ErrorCode::OK && !addresses.empty();
+            return ResultStatus::Ok() && !addresses.empty();
         }
     };
 

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "acppnode/core/constants.hpp"
+
 namespace acpp {
 
 // ============================================================================
@@ -15,9 +17,9 @@ enum class Network : uint8_t {
 
 constexpr const char* NetworkToString(Network n) {
     switch (n) {
-        case Network::TCP: return "tcp";
-        case Network::UDP: return "udp";
-        case Network::MUX: return "mux";
+        case Network::TCP: return constants::protocol::kTcp.data();
+        case Network::UDP: return constants::protocol::kUdp.data();
+        case Network::MUX: return constants::protocol::kMux.data();
         default: return "unknown";
     }
 }

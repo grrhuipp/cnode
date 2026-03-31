@@ -20,13 +20,14 @@ std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    if (lower == "aes-128-gcm") {
+    if (lower == std::string(constants::protocol::kAes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM, 16, 16};
     }
-    if (lower == "aes-256-gcm") {
+    if (lower == std::string(constants::protocol::kAes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM, 32, 32};
     }
-    if (lower == "chacha20-ietf-poly1305" || lower == "chacha20-poly1305") {
+    if (lower == std::string(constants::protocol::kChacha20IetfPoly1305) ||
+        lower == "chacha20-poly1305") {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
     return std::nullopt;
@@ -176,6 +177,60 @@ bool SsAeadCipher::Decrypt(const uint8_t* nonce,
     if (EVP_DecryptFinal_ex(ctx_, output + out_len, &final_len) != 1) return false;
 
     return true;
+}
+
+// ============================================================================
+// SsAeadStreamDecryptor
+// ============================================================================
+
+SsAeadStreamDecryptor::SsAeadStreamDecryptor(const SsAeadCipher& cipher)
+    : type_(cipher.Type())
+    , key_(cipher.Key().begin(), cipher.Key().end()) {
+    ctx_ = EVP_CIPHER_CTX_new();
+}
+
+SsAeadStreamDecryptor::~SsAeadStreamDecryptor() {
+    if (ctx_) {
+        EVP_CIPHER_CTX_free(ctx_);
+        ctx_ = nullptr;
+    }
+}
+
+bool SsAeadStreamDecryptor::Init(const uint8_t* nonce) noexcept {
+    if (!ctx_ || !nonce) return false;
+
+    const EVP_CIPHER* cipher = GetCipher(type_);
+    if (!cipher) return false;
+
+    if (EVP_CIPHER_CTX_reset(ctx_) != 1) return false;
+    if (EVP_DecryptInit_ex(ctx_, cipher, nullptr, nullptr, nullptr) != 1) return false;
+    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) return false;
+    if (EVP_DecryptInit_ex(ctx_, nullptr, nullptr, key_.data(), nonce) != 1) return false;
+    return true;
+}
+
+bool SsAeadStreamDecryptor::Update(const uint8_t* ciphertext,
+                                   size_t ciphertext_len,
+                                   uint8_t* output,
+                                   int* out_len) noexcept {
+    if (!ctx_ || !ciphertext || !output || !out_len) return false;
+
+    return EVP_DecryptUpdate(
+        ctx_, output, out_len,
+        ciphertext, static_cast<int>(ciphertext_len)) == 1;
+}
+
+bool SsAeadStreamDecryptor::Final(const uint8_t* tag) noexcept {
+    if (!ctx_ || !tag) return false;
+
+    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_TAG, 16,
+                             const_cast<uint8_t*>(tag)) != 1) {
+        return false;
+    }
+
+    int final_len = 0;
+    uint8_t dummy[1]{};
+    return EVP_DecryptFinal_ex(ctx_, dummy, &final_len) == 1;
 }
 
 // ============================================================================

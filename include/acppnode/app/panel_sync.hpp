@@ -17,18 +17,11 @@
 // ============================================================================
 
 #include "acppnode/common.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/panel/v2board_panel.hpp"
-
-#include <map>
-#include <vector>
-#include <string>
-#include <memory>
 
 namespace acpp {
+
+class ConnectionLimiter;
+struct PanelConfig;
 
 // ============================================================================
 // PanelSyncManager
@@ -37,7 +30,7 @@ class PanelSyncManager {
 public:
     PanelSyncManager(net::io_context& io_context,
                      std::vector<std::unique_ptr<Worker>>& workers,
-                     ConnectionLimiterPtr limiter);
+                     std::shared_ptr<ConnectionLimiter> limiter);
 
     // 注册面板（必须在 Start() 之前调用）
     void AddPanel(std::unique_ptr<IPanel> panel, const PanelConfig& panel_config);
@@ -93,7 +86,7 @@ private:
     // ── 成员 ─────────────────────────────────────────────────────────────────
     net::io_context&                       io_context_;
     std::vector<std::unique_ptr<Worker>>&  workers_;
-    ConnectionLimiterPtr                   limiter_;
+    std::shared_ptr<ConnectionLimiter>     limiter_;
 
     std::vector<std::unique_ptr<IPanel>>              panels_;
     std::map<IPanel*, PanelConfig>                    panel_configs_;

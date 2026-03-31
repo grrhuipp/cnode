@@ -34,7 +34,7 @@ public:
         size_t           len);
 
     [[nodiscard]] std::string_view Protocol() const noexcept {
-        return "shadowsocks";
+        return constants::protocol::kShadowsocks;
     }
 
 private:

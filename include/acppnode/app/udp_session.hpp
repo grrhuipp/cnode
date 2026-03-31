@@ -41,7 +41,7 @@ public:
     ~UDPSession();
     
     // 启动会话（绑定本地端口）
-    ErrorCode Start(const std::string& bind_address = "0.0.0.0");
+    ErrorCode Start(const std::string& bind_address = std::string(constants::network::kAnyIpv4));
     
     // 发送数据包到目标（关联 callback_id 用于回包路由）
     cobalt::task<ErrorCode> Send(const UDPPacket& packet, uint64_t callback_id = 0);
@@ -156,8 +156,8 @@ private:
     time_point next_target_prune_at_{};
     bool running_ = false;
 
-    static constexpr auto kTargetMappingTtl = std::chrono::minutes(2);
-    static constexpr auto kTargetPruneInterval = std::chrono::seconds(30);
+    static constexpr auto kTargetMappingTtl = std::chrono::seconds(defaults::kUdpTargetMappingTtl);
+    static constexpr auto kTargetPruneInterval = std::chrono::seconds(defaults::kUdpTargetPruneInterval);
     
     // 统计
     uint64_t packets_sent_ = 0;
@@ -173,7 +173,7 @@ class UDPSessionManager {
 public:
     explicit UDPSessionManager(net::any_io_executor executor,
                                 IDnsService* dns_service = nullptr,
-                                std::chrono::seconds session_timeout = std::chrono::seconds(300));
+                                std::chrono::seconds session_timeout = std::chrono::seconds(defaults::kUdpSessionTimeout));
     ~UDPSessionManager();
     
     // 获取或创建会话
@@ -181,7 +181,7 @@ public:
         const std::string& session_id,
         net::any_io_executor executor,
         UDPSession::PacketCallback on_packet,
-        const std::string& bind_address = "0.0.0.0");
+        const std::string& bind_address = std::string(constants::network::kAnyIpv4));
     
     // 获取现有会话
     std::shared_ptr<UDPSession> GetSession(const std::string& session_id);

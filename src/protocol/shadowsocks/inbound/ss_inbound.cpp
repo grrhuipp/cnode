@@ -360,7 +360,7 @@ cobalt::task<bool> SsServerAsyncStream::InitWriteCipher() {
     co_return true;
 }
 
-// ── ReadMultiBuffer — 小 chunk 直接解密到 pool Buffer ──────────────────────
+// ── ReadMultiBuffer — 流式解密到 pool Buffer 链 ────────────────────────────
 cobalt::task<MultiBuffer> SsServerAsyncStream::ReadMultiBuffer() {
     if (read_buf_offset_ < read_buf_.size()) {
         co_return co_await AsyncStream::ReadMultiBuffer();
@@ -389,40 +389,57 @@ cobalt::task<MultiBuffer> SsServerAsyncStream::ReadMultiBuffer() {
         co_return MultiBuffer{};
     }
 
-    if (payload_len > Buffer::kSize) {
-        read_buf_.clear();
-        read_buf_offset_ = 0;
-        read_buf_.resize(payload_len);
-
-        auto nonce2 = ss::MakeNonce(read_nonce_);
-        if (!read_cipher_.Decrypt(nonce2.data(), read_chunk_buf_.data(),
-                                  enc_payload_len, read_buf_.data())) {
-            read_buf_.clear();
-            co_return MultiBuffer{};
-        }
-        ++read_nonce_;
-        co_return co_await AsyncStream::ReadMultiBuffer();
-    }
-
-    Buffer* out = Buffer::New();
-    if (!out) {
+    ss::SsAeadStreamDecryptor decryptor(read_cipher_);
+    auto nonce2 = ss::MakeNonce(read_nonce_);
+    if (!decryptor.Init(nonce2.data())) {
         co_return MultiBuffer{};
     }
 
-    try {
-        auto nonce2 = ss::MakeNonce(read_nonce_);
-        if (!read_cipher_.Decrypt(nonce2.data(), read_chunk_buf_.data(),
-                                  enc_payload_len, out->Tail().data())) {
-            Buffer::Free(out);
+    MultiBuffer out_mb;
+    MultiBufferGuard guard{out_mb};
+    out_mb.reserve((payload_len + Buffer::kSize - 1) / Buffer::kSize);
+
+    size_t remaining = payload_len;
+    size_t offset = 0;
+    while (remaining > 0) {
+        Buffer* out = Buffer::New();
+        if (!out) {
             co_return MultiBuffer{};
         }
-        ++read_nonce_;
-        out->Produce(payload_len);
-        co_return MultiBuffer{out};
-    } catch (...) {
-        Buffer::Free(out);
-        throw;
+
+        const size_t to_process = std::min(remaining, static_cast<size_t>(out->Available()));
+        try {
+            int produced = 0;
+            if (!decryptor.Update(read_chunk_buf_.data() + offset, to_process,
+                                  out->Tail().data(), &produced)) {
+                Buffer::Free(out);
+                co_return MultiBuffer{};
+            }
+            if (produced < 0 || static_cast<size_t>(produced) != to_process) {
+                Buffer::Free(out);
+                co_return MultiBuffer{};
+            }
+
+            out->Produce(static_cast<uint32_t>(produced));
+            out_mb.push_back(out);
+        } catch (...) {
+            Buffer::Free(out);
+            throw;
+        }
+
+        offset += to_process;
+        remaining -= to_process;
     }
+
+    if (!decryptor.Final(read_chunk_buf_.data() + payload_len)) {
+        co_return MultiBuffer{};
+    }
+
+    ++read_nonce_;
+
+    MultiBuffer result = std::move(out_mb);
+    out_mb = MultiBuffer{};
+    co_return result;
 }
 
 // ── AsyncRead ────────────────────────────────────────────────────────────────
@@ -598,7 +615,7 @@ const bool kSsInboundRegistered = [] {
                 return nullptr;
             }
             const std::string method = req.cipher_method.empty()
-                ? "aes-256-gcm"
+                ? std::string(acpp::constants::protocol::kAes256Gcm)
                 : req.cipher_method;
             return acpp::CreateSsInboundHandler(
                 *deps.ss_user_manager,
@@ -615,7 +632,7 @@ const bool kSsInboundRegistered = [] {
                 return nullptr;
             }
             const std::string method = req.cipher_method.empty()
-                ? "aes-256-gcm"
+                ? std::string(acpp::constants::protocol::kAes256Gcm)
                 : req.cipher_method;
             auto cipher = acpp::ss::ParseCipherMethod(method);
             if (!cipher) {
@@ -627,7 +644,7 @@ const bool kSsInboundRegistered = [] {
 
     reg.load_static_users =
         [](std::string_view tag, const boost::json::object& settings) -> bool {
-            std::string method = "aes-256-gcm";
+            std::string method = std::string(acpp::constants::protocol::kAes256Gcm);
             if (const auto* m = settings.if_contains("method"); m && m->is_string()) {
                 method = std::string(m->as_string());
             }
@@ -682,7 +699,7 @@ const bool kSsInboundRegistered = [] {
            const acpp::NodeConfig& node_config,
            const std::vector<acpp::PanelUser>& panel_users) {
             const std::string method = node_config.cipher.empty()
-                ? "aes-256-gcm"
+                ? std::string(acpp::constants::protocol::kAes256Gcm)
                 : node_config.cipher;
 
             auto cipher_info = acpp::ss::ParseCipherMethod(method);
@@ -716,7 +733,8 @@ const bool kSsInboundRegistered = [] {
         acpp::ss::SsUserManager::UpdateSharedUsersForTag(std::string(tag), {});
     };
 
-    acpp::InboundFactory::Instance().Register("shadowsocks", std::move(reg));
+    acpp::InboundFactory::Instance().Register(
+        acpp::constants::protocol::kShadowsocks, std::move(reg));
     return true;
 }();
 }  // namespace

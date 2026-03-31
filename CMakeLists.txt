@@ -216,6 +216,8 @@ set(CNODE_SOURCES
     # Infra (logging, config)
     src/infra/log.cpp
     src/infra/config.cpp
+    src/infra/config_loader.cpp
+    src/infra/config_validation.cpp
     
     # DNS
     src/dns/dns_service.cpp
@@ -238,12 +240,21 @@ set(CNODE_SOURCES
     src/app/session_handler.cpp
     src/app/worker.cpp
     src/app/panel_sync.cpp
+    src/app/panel_sync_node.cpp
+    src/app/bootstrap_inbounds.cpp
+    src/app/bootstrap_panels.cpp
+    src/app/bootstrap_cli.cpp
+    src/app/bootstrap_runtime.cpp
+    src/app/bootstrap_monitor.cpp
+    src/app/bootstrap_shutdown.cpp
+    src/app/bootstrap_setup.cpp
     src/app/relay_tcp.cpp        # DoRelay, DoRelayWithFirstPacket (TCP)
     src/app/relay_udp.cpp        # DoUDPRelay (UDP)
     src/app/mux_relay.cpp
     src/app/session_context.cpp
     src/app/stats.cpp
     src/app/udp_session.cpp
+    src/app/bootstrap.cpp
     
     # Sniff
     src/sniff/sniffer.cpp

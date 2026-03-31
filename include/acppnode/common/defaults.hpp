@@ -36,9 +36,18 @@ constexpr uint32_t kDnsMaxTTL = 3600;
 constexpr uint32_t kPanelPullInterval = 60;
 constexpr uint32_t kPanelPushInterval = 60;
 constexpr uint32_t kPanelConfigRefreshInterval = 300;
+constexpr uint32_t kPanelSyncMaxAttempts = 4;
+constexpr uint32_t kPanelSyncRetryBaseSeconds = 5;
+constexpr uint32_t kUdpSessionTimeout = 300;
+constexpr uint32_t kUdpSessionCleanupInterval = 30;
+constexpr uint32_t kUdpTargetMappingTtl = 120;
+constexpr uint32_t kUdpTargetPruneInterval = 30;
 
 // 统计输出间隔
 constexpr uint32_t kStatsOutputInterval = 10;
+
+// 日志保留
+constexpr uint16_t kLogRetentionDays = 15;
 
 }  // namespace defaults
 }  // namespace acpp

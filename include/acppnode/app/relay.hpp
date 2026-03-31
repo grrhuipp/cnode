@@ -28,11 +28,9 @@ struct RelayConfig {
 // ============================================================================
 // Relay 结果
 // ============================================================================
-struct RelayResult {
+struct RelayResult : ResultStatus {
     uint64_t bytes_up = 0;
     uint64_t bytes_down = 0;
-    ErrorCode error = ErrorCode::OK;
-    std::string error_msg;
     bool client_closed_first = false;
 };
 

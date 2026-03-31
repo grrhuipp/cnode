@@ -8,7 +8,7 @@ namespace acpp {
 // Blackhole 出站设置
 // ============================================================================
 struct BlackholeSettings {
-    std::string response = "none";  // none / http
+    std::string response = std::string(constants::protocol::kNone);  // none / http
 };
 
 // ============================================================================

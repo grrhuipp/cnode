@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/core/constants.hpp"
+
 #include <boost/asio/ip/address.hpp>
 #include <boost/system/error_code.hpp>
 
@@ -9,7 +11,7 @@
 namespace acpp::iputil {
 
 inline bool IsWildcardBindAddress(std::string_view value) noexcept {
-    return value.empty() || value == "0.0.0.0";
+    return value.empty() || value == constants::network::kAnyIpv4;
 }
 
 inline boost::asio::ip::address NormalizeAddress(
@@ -17,7 +19,7 @@ inline boost::asio::ip::address NormalizeAddress(
     if (addr.is_v4()) {
         return addr;
     }
-    return boost::asio::ip::make_address("0.0.0.0");
+    return boost::asio::ip::make_address(constants::network::kAnyIpv4);
 }
 
 inline std::string NormalizeAddressString(

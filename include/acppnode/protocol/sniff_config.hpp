@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/core/constants.hpp"
+
 #include <string>
 #include <vector>
 
@@ -10,7 +12,10 @@ namespace acpp {
 // ============================================================================
 struct SniffConfig {
     bool enabled = true;
-    std::vector<std::string> dest_override = {"tls", "http"};
+    std::vector<std::string> dest_override = {
+        std::string(constants::protocol::kTls),
+        std::string(constants::protocol::kHttp),
+    };
     std::vector<std::string> domains_excluded;
 
     std::string ToString() const {

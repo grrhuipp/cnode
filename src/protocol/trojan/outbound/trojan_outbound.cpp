@@ -113,7 +113,7 @@ std::unique_ptr<IOutbound> CreateTrojanOutbound(
 // ============================================================================
 namespace {
 const bool kTrojanRegistered = (acpp::OutboundFactory::Instance().Register(
-    "trojan",
+    acpp::constants::protocol::kTrojan,
     [](const acpp::OutboundConfig& cfg,
        acpp::net::any_io_executor executor,
        acpp::IDnsService* dns,
@@ -146,7 +146,7 @@ const bool kTrojanRegistered = (acpp::OutboundFactory::Instance().Register(
         trojan_config.stream_settings.RecomputeModes();
         if (!trojan_config.stream_settings.IsTls()) {
             // Trojan 默认启用 TLS，保持旧行为
-            trojan_config.stream_settings.security = "tls";
+            trojan_config.stream_settings.security = std::string(acpp::constants::protocol::kTls);
             trojan_config.stream_settings.RecomputeModes();
         }
         trojan_config.stream_settings.tls.server_name = trojan_config.GetServerName();

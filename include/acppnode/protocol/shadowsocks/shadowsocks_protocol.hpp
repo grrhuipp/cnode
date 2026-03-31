@@ -75,10 +75,40 @@ public:
                                const uint8_t* ciphertext, size_t ciphertext_len,
                                uint8_t* output) noexcept;
 
+    [[nodiscard]] SsCipherType Type() const noexcept { return type_; }
+    [[nodiscard]] std::span<const uint8_t> Key() const noexcept { return key_; }
+
     static constexpr size_t kTagSize = 16;
 
 private:
     SsCipherType type_;
+    std::vector<uint8_t> key_;
+    EVP_CIPHER_CTX*      ctx_ = nullptr;
+};
+
+// ========================================================================
+// SsAeadStreamDecryptor
+//
+// 用于 ReadMultiBuffer 的流式 AEAD 解密器：
+//   - 先对长度字段做一次 one-shot 解密
+//   - 再按 Buffer 片段调用 EVP_DecryptUpdate/Final
+//   - 避免先落入线性 ByteVector，再二次拷贝到 pool Buffer
+// ========================================================================
+class SsAeadStreamDecryptor {
+public:
+    explicit SsAeadStreamDecryptor(const SsAeadCipher& cipher);
+    ~SsAeadStreamDecryptor();
+
+    SsAeadStreamDecryptor(const SsAeadStreamDecryptor&)            = delete;
+    SsAeadStreamDecryptor& operator=(const SsAeadStreamDecryptor&) = delete;
+
+    bool Init(const uint8_t* nonce) noexcept;
+    bool Update(const uint8_t* ciphertext, size_t ciphertext_len,
+                uint8_t* output, int* out_len) noexcept;
+    bool Final(const uint8_t* tag) noexcept;
+
+private:
+    SsCipherType         type_;
     std::vector<uint8_t> key_;
     EVP_CIPHER_CTX*      ctx_ = nullptr;
 };

@@ -13,10 +13,10 @@ namespace acpp {
 // 日志配置
 // ============================================================================
 struct LogConfig {
-    std::string level = "info";              // trace/debug/info/warn/error
-    std::filesystem::path log_dir = "/var/log/acppnode";
-    uint16_t max_days = 15;                  // 日志保留天数（按天切割）
-    
+    std::string level = std::string(constants::logging::kDefaultLevel);  // trace/debug/info/warn/error
+    std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
+    uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）
+
     static LogConfig FromJson(const boost::json::object& j);
 };
 
@@ -29,7 +29,7 @@ struct DnsConfig {
     uint32_t cache_size = defaults::kDnsCacheSize;
     uint32_t min_ttl = defaults::kDnsMinTTL;
     uint32_t max_ttl = defaults::kDnsMaxTTL;
-    
+
     static DnsConfig FromJson(const boost::json::object& j);
 };
 
@@ -38,19 +38,19 @@ struct DnsConfig {
 // ============================================================================
 struct PanelConfig {
     std::string name;                        // 面板名称
-    std::string type = "V2Board";            // 面板类型
+    std::string type = std::string(constants::panel::kV2BoardType);  // 面板类型
     std::string api_host;                    // API 地址
     std::string api_key;                     // API 密钥
     std::vector<int> node_ids;               // 节点 ID 列表
-    std::string node_type = "vmess";         // 节点类型: vmess/trojan/shadowsocks
-    
+    std::string node_type = std::string(constants::panel::kDefaultNodeType);  // 节点类型: vmess/trojan/shadowsocks
+
     // TLS 配置
     // false: 强制关闭 TLS（由外部 nginx/caddy 处理）
     // true:  程序处理 TLS，根据面板下发配置决定证书
     bool tls_enable = false;
     std::string tls_cert;                    // 证书文件路径（空则自签名）
     std::string tls_key;                     // 私钥文件路径（空则自签名）
-    
+
     static PanelConfig FromJson(const boost::json::object& j);
 };
 
@@ -61,7 +61,7 @@ struct LimitsConfig {
     uint32_t max_connections = defaults::kMaxConnections;
     uint32_t max_connections_per_ip = defaults::kMaxConnectionsPerIP;
     size_t buffer_size = defaults::kBufferSize;
-    
+
     static LimitsConfig FromJson(const boost::json::object& j);
 };
 
@@ -108,7 +108,7 @@ struct TimeoutsConfig {
     [[nodiscard]] std::chrono::seconds DownlinkOnlyTimeout() const noexcept {
         return std::chrono::seconds(downlink_only);
     }
-    
+
     static TimeoutsConfig FromJson(const boost::json::object& j);
 };
 
@@ -118,7 +118,7 @@ struct TimeoutsConfig {
 struct InboundConfig {
     std::vector<std::string> tags;           // 入站标识（支持多标签，匹配任一即可）
     std::string protocol;                    // vmess/trojan/...
-    std::string listen = "0.0.0.0";          // 监听地址
+    std::string listen = std::string(constants::network::kAnyIpv4);  // 监听地址
     uint16_t port = 0;                       // 监听端口
     boost::json::object settings;             // 协议特定配置
     StreamSettings stream_settings;          // 传输层配置（network + security）
@@ -149,12 +149,12 @@ struct RouteRuleConfig {
     std::vector<std::string> protocol;       // 嗅探协议 (http/tls/bittorrent)
 
     std::string outbound_tag;                // 目标出站
-    
+
     static RouteRuleConfig FromJson(const boost::json::object& j);
 };
 
 struct RoutingConfig {
-    std::string domain_strategy = "AsIs";    // AsIs/IPIfNonMatch/IPOnDemand
+    std::string domain_strategy = std::string(constants::protocol::kAsIs);  // AsIs/IPIfNonMatch/IPOnDemand
     std::vector<RouteRuleConfig> rules;
 
     static RoutingConfig FromJson(const boost::json::object& j);
@@ -180,13 +180,13 @@ class Config {
 public:
     // 从单个文件加载（兼容旧格式）
     static std::optional<Config> LoadFromFile(const std::filesystem::path& path);
-    
+
     // 从目录加载（新格式：inbound.json, outbound.json, route.json）
     static std::optional<Config> LoadFromDirectory(const std::filesystem::path& dir);
-    
+
     // 从 JSON 加载配置
     static std::optional<Config> LoadFromJson(const boost::json::object& j);
-    
+
     // Getter
     const LogConfig& GetLog() const { return log_; }
     const DnsConfig& GetDns() const { return dns_; }
@@ -196,19 +196,19 @@ public:
     const std::vector<PanelConfig>& GetPanels() const { return panels_; }
     const std::vector<InboundConfig>& GetInbounds() const { return inbounds_; }
     const std::vector<OutboundConfig>& GetOutbounds() const { return outbounds_; }
-    
+
     uint32_t GetWorkers() const { return workers_; }
-    
+
     // 配置目录路径（用于加载 geo 文件）
     const std::filesystem::path& GetConfigDir() const { return config_dir_; }
-    
+
     // 验证配置
     bool Validate() const;
-    
+
     // 提取路由中使用的 GeoIP/GeoSite tag
     std::vector<std::string> GetUsedGeoIPTags() const;
     std::vector<std::string> GetUsedGeoSiteTags() const;
-    
+
 private:
     LogConfig log_;
     DnsConfig dns_;

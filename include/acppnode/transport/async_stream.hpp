@@ -223,26 +223,22 @@ inline bool ConsumeWriteSideTimeout(AsyncStream& stream) {
 // ============================================================================
 // DialResult - 拨号结果
 // ============================================================================
-struct DialResult {
+struct DialResult : ResultStatus {
     std::unique_ptr<AsyncStream> stream;  // 成功时有效
-    ErrorCode error_code = ErrorCode::OK; // 错误码
-    std::string error_msg;                // 错误描述
 
     [[nodiscard]] bool Ok() const noexcept {
-        return error_code == ErrorCode::OK && stream != nullptr;
+        return ResultStatus::Ok() && stream != nullptr;
     }
 
     [[nodiscard]] static DialResult Success(std::unique_ptr<AsyncStream> s) {
         DialResult r;
         r.stream = std::move(s);
-        r.error_code = ErrorCode::OK;
         return r;
     }
 
     [[nodiscard]] static DialResult Fail(ErrorCode code, const std::string& msg = "") {
         DialResult r;
-        r.error_code = code;
-        r.error_msg = msg.empty() ? std::string(ErrorCodeToString(code)) : msg;
+        r.SetError(code, msg);
         return r;
     }
 };

@@ -13,11 +13,11 @@ class UDPSessionManager;
 // Freedom 出站设置
 // ============================================================================
 struct FreedomSettings {
-    std::string send_through = "auto";   // auto / 0.0.0.0 / 具体 IPv4
-    std::string domain_strategy = "AsIs"; // AsIs / UseIP / UseIPv4
+    std::string send_through = std::string(constants::binding::kAuto);   // auto / 0.0.0.0 / 具体 IPv4
+    std::string domain_strategy = std::string(constants::protocol::kAsIs); // AsIs / UseIP / UseIPv4
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
     bool enable_udp = true;               // 是否启用 UDP
-    int udp_timeout = 300;                // UDP 会话超时（秒）
+    int udp_timeout = defaults::kUdpSessionTimeout;     // UDP 会话超时（秒）
 };
 
 // ============================================================================
@@ -55,7 +55,7 @@ public:
                     const FreedomSettings& settings,
                     IDnsService* dns_service,
                     UDPSessionManager* udp_session_manager,  // Per-worker UDP manager
-                    std::chrono::seconds dial_timeout = std::chrono::seconds(10));
+                    std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
 
     cobalt::task<std::expected<OutboundTransportTarget, ErrorCode>>
         ResolveTransportTarget(SessionContext& ctx) override;
@@ -98,6 +98,6 @@ std::unique_ptr<IOutbound> CreateFreedomOutbound(
     const FreedomSettings& settings,
     IDnsService* dns_service,
     UDPSessionManager* udp_session_manager,  // Per-worker UDP manager
-    std::chrono::seconds dial_timeout = std::chrono::seconds(10));
+    std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
 
 }  // namespace acpp

@@ -11,7 +11,7 @@ namespace acpp {
 std::string SessionContext::ToAccessLog() const {
     std::string timestamp = FormatTimestamp(accept_time_us);
 
-    std::string src = std::format("{}:{}",
+    std::string src = iputil::FormatEndpointForLog(
         client_ip.empty() ? iputil::NormalizeAddressString(src_addr.address()) : client_ip,
         src_addr.port());
 
@@ -32,10 +32,13 @@ std::string SessionContext::ToAccessLog() const {
     std::string user_str = user_email.empty() ?
         (user_id > 0 ? std::to_string(user_id) : "-") : user_email;
 
-    std::string dns_str = dns_result.empty() ? "none" : dns_result;
+    std::string dns_str = dns_result.empty()
+        ? std::string(constants::state::kNone)
+        : dns_result;
 
     std::string sniff_str = sniff_result.success ?
-        std::format("{}:{}", sniff_result.protocol, sniff_result.domain) : "none";
+        std::format("{}:{}", sniff_result.protocol, sniff_result.domain) :
+        std::string(constants::state::kNone);
 
     std::string in_tag  = inbound_tag.empty()  ? "-" : inbound_tag;
     std::string out_tag = outbound_tag.empty() ? "-" : outbound_tag;

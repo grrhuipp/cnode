@@ -121,7 +121,7 @@ cobalt::task<TcpConnectAttemptResult> DialSingleCandidate(
         tcp_result = co_await TcpStream::ConnectWithBind(
             executor, *bind_local, candidate.endpoint, target.timeout);
         if (!tcp_result.Ok() && ShouldRetryWithoutBind(
-                target.bind_mode, true, tcp_result.error_code)) {
+                target.bind_mode, true, tcp_result.error)) {
             LOG_WARN("TransportDialer: auto bind {} -> {}:{} failed ({}), retrying with system bind",
                      bind_local->to_string(),
                      candidate.endpoint.address().to_string(),

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
-#include <format>
+#include "acppnode/common/ip_utils.hpp"
 
 namespace acpp {
 
@@ -63,14 +63,15 @@ struct TargetAddress {
     
     // 转换为字符串
     std::string ToString() const {
-        return std::format("{}:{}", host, port);
+        return iputil::FormatEndpointForLog(host, port);
     }
     
     // 转换为带解析 IP 的字符串
     std::string ToStringWithResolved() const {
         if (resolved_addr && IsDomain()) {
-            return std::format("{}({}):{}",
-                host, resolved_addr->to_string(), port);
+            return iputil::FormatEndpointForLog(
+                host + "(" + resolved_addr->to_string() + ")",
+                port);
         }
         return ToString();
     }

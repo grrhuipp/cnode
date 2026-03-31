@@ -31,11 +31,11 @@ struct PanelUser {
 // ============================================================================
 struct NodeConfig {
     int node_id = 0;
-    std::string protocol = "vmess";
+    std::string protocol = std::string(constants::protocol::kDefaultNodeProtocol);
     uint16_t port = 0;
     
     // Transport
-    std::string network = "tcp";   // tcp / ws
+    std::string network = std::string(constants::protocol::kTcp);   // tcp / ws
     std::string path;              // WebSocket path
     std::string host;              // Host header
     
@@ -46,15 +46,18 @@ struct NodeConfig {
     std::string tls_key;           // 私钥文件路径（Trojan 需要）
     
     // Shadowsocks 专用
-    std::string cipher = "aes-256-gcm";  // 加密方法
+    std::string cipher = std::string(constants::protocol::kAes256Gcm);  // 加密方法
 
     // Sniff（默认开启，自动覆盖 TLS/HTTP 目标）
     bool sniff_enabled = true;
-    std::vector<std::string> dest_override = {"tls", "http"};
+    std::vector<std::string> dest_override = {
+        std::string(constants::protocol::kTls),
+        std::string(constants::protocol::kHttp),
+    };
     
     // 同步间隔
-    int pull_interval = 60;    // 用户列表刷新间隔
-    int push_interval = 60;    // 流量上报间隔
+    int pull_interval = defaults::kPanelPullInterval;    // 用户列表刷新间隔
+    int push_interval = defaults::kPanelPushInterval;    // 流量上报间隔
 };
 
 // ============================================================================
@@ -66,14 +69,12 @@ struct TrafficData {
     uint64_t download = 0;
 };
 
-struct NodeConfigFetchResult {
+struct NodeConfigFetchResult : ResultStatus {
     std::optional<NodeConfig> config;
-    ErrorCode error = ErrorCode::OK;
-    std::string error_msg;
     bool missing = false;
 
     [[nodiscard]] bool Ok() const noexcept {
-        return error == ErrorCode::OK && config.has_value();
+        return ResultStatus::Ok() && config.has_value();
     }
 
     [[nodiscard]] static NodeConfigFetchResult Success(NodeConfig node_config) {
@@ -90,20 +91,17 @@ struct NodeConfigFetchResult {
 
     [[nodiscard]] static NodeConfigFetchResult Fail(ErrorCode code, std::string msg = {}) {
         NodeConfigFetchResult result;
-        result.error = code;
-        result.error_msg = std::move(msg);
+        result.SetError(code, msg);
         return result;
     }
 };
 
-struct PanelUsersFetchResult {
+struct PanelUsersFetchResult : ResultStatus {
     std::vector<PanelUser> users;
-    ErrorCode error = ErrorCode::OK;
-    std::string error_msg;
     bool not_modified = false;
 
     [[nodiscard]] bool Ok() const noexcept {
-        return error == ErrorCode::OK;
+        return ResultStatus::Ok();
     }
 
     [[nodiscard]] static PanelUsersFetchResult Success(std::vector<PanelUser> value) {
@@ -114,8 +112,7 @@ struct PanelUsersFetchResult {
 
     [[nodiscard]] static PanelUsersFetchResult Fail(ErrorCode code, std::string msg = {}) {
         PanelUsersFetchResult result;
-        result.error = code;
-        result.error_msg = std::move(msg);
+        result.SetError(code, msg);
         return result;
     }
 
@@ -164,7 +161,7 @@ struct V2BoardConfig {
     std::string api_host;
     std::string api_key;
     std::vector<int> node_ids;
-    std::string node_type = "vmess";
+    std::string node_type = std::string(constants::panel::kDefaultNodeType);
 };
 
 // ============================================================================
@@ -187,7 +184,7 @@ public:
     ~V2BoardPanel() override;
 
     std::string Name() const override { return config_.name; }
-    std::string Type() const override { return "V2Board"; }
+    std::string Type() const override { return std::string(constants::protocol::kV2Board); }
 
     cobalt::task<NodeConfigFetchResult>
     FetchNodeConfig(int node_id) override;

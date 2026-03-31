@@ -25,10 +25,9 @@ struct UDPPacket {
 // ============================================================================
 // UDP Relay 结果
 // ============================================================================
-struct UDPRelayResult {
+struct UDPRelayResult : ResultStatus {
     uint64_t bytes_up = 0;
     uint64_t bytes_down = 0;
-    ErrorCode error = ErrorCode::OK;
     bool client_closed_first = false;
 };
 

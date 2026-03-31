@@ -38,7 +38,7 @@ std::unique_ptr<IOutbound> CreateBlackholeOutbound(
 // ============================================================================
 namespace {
 const bool kBlackholeRegistered = (acpp::OutboundFactory::Instance().Register(
-    "blackhole",
+    acpp::constants::protocol::kBlackhole,
     [](const acpp::OutboundConfig& cfg,
        acpp::net::any_io_executor /*executor*/,
        acpp::IDnsService* /*dns*/,

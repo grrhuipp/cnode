@@ -140,10 +140,10 @@ std::optional<V2BoardPanel::UrlParts> V2BoardPanel::ParseUrl(const std::string& 
     }
 
     const std::string_view scheme = url_view.substr(0, scheme_pos);
-    if (scheme != "http" && scheme != "https") {
+    if (scheme != constants::protocol::kHttp && scheme != constants::protocol::kHttps) {
         return std::nullopt;
     }
-    parts.use_ssl = (scheme == "https");
+    parts.use_ssl = (scheme == constants::protocol::kHttps);
 
     std::string_view rest = url_view.substr(scheme_pos + 3);
     const size_t path_pos = rest.find('/');
@@ -439,7 +439,9 @@ V2BoardPanel::FetchNodeConfig(int node_id) {
         auto* sp = j.if_contains("server_port");
         config.port = (sp && sp->is_int64()) ? static_cast<uint16_t>(sp->as_int64()) : 0;
         auto* np = j.if_contains("network");
-        config.network = (np && np->is_string()) ? std::string(np->as_string()) : "tcp";
+        config.network = (np && np->is_string())
+            ? std::string(np->as_string())
+            : std::string(constants::protocol::kTcp);
 
         // networkSettings 可能是 null
         auto* nsp = j.if_contains("networkSettings");
@@ -455,7 +457,7 @@ V2BoardPanel::FetchNodeConfig(int node_id) {
         }
 
         // tls 可能是 null 或 0/1
-        auto* tlsp = j.if_contains("tls");
+        auto* tlsp = j.if_contains(constants::protocol::kTls);
         if (tlsp && !tlsp->is_null()) {
             if (tlsp->is_int64()) config.tls_enabled = tlsp->as_int64() != 0;
             else if (tlsp->is_bool()) config.tls_enabled = tlsp->as_bool();

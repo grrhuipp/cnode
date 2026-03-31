@@ -2,23 +2,21 @@
 
 #include "acppnode/common.hpp"
 #include "acppnode/app/connection_guard.hpp"
-#include "acppnode/app/session_context.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/infra/config.hpp"
 #include "acppnode/protocol/sniff_config.hpp"
-#include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/stream_settings.hpp"
-#include "acppnode/transport/transport_stack.hpp"
-#include "acppnode/handlers/inbound_handler.hpp"
-#include "acppnode/handlers/outbound_handler.hpp"
-#include "acppnode/protocol/outbound.hpp"
-#include "acppnode/router/router.hpp"
-#include "acppnode/dns/dns_service.hpp"
-#include "acppnode/app/relay.hpp"
 
 #include <optional>
+#include <utility>
 
 namespace acpp {
+
+class AsyncStream;
+class ConnectionLimiter;
+class IDnsService;
+class IInboundHandler;
+class OutboundManager;
+class Router;
+struct TimeoutsConfig;
 
 // ============================================================================
 // SessionContext - 入站监听器配置（SessionHandler 的调用参数）
@@ -34,8 +32,29 @@ struct ListenerContext {
     // shared_ptr 明确表达 ListenerContext 共享 handler 所有权，
     // 避免裸指针悬空风险（Worker 同时在 inbound_handlers_ 持有同一 handler）
     std::shared_ptr<IInboundHandler> inbound_handler;
-    ConnectionLimiterPtr             limiter;         // 早期 IP ban 检查（TLS 握手前）
+    std::shared_ptr<ConnectionLimiter> limiter;         // 早期 IP ban 检查（TLS 握手前）
 };
+
+[[nodiscard]] inline ListenerContext MakeListenerContext(
+    std::string inbound_tag,
+    std::vector<std::string> inbound_tags,
+    std::string protocol,
+    StreamSettings stream_settings,
+    SniffConfig sniff_config,
+    std::shared_ptr<ConnectionLimiter> limiter,
+    std::string fixed_outbound = {},
+    bool proxy_protocol = true) {
+    ListenerContext ctx;
+    ctx.inbound_tag     = std::move(inbound_tag);
+    ctx.inbound_tags    = std::move(inbound_tags);
+    ctx.protocol        = std::move(protocol);
+    ctx.stream_settings = std::move(stream_settings);
+    ctx.sniff_config    = std::move(sniff_config);
+    ctx.proxy_protocol  = proxy_protocol;
+    ctx.fixed_outbound  = std::move(fixed_outbound);
+    ctx.limiter         = std::move(limiter);
+    return ctx;
+}
 
 // ============================================================================
 // SessionHandler - 应用层会话协调器

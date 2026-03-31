@@ -213,7 +213,8 @@ const bool kVmessInboundRegistered = [] {
         acpp::vmess::VMessUserManager::UpdateSharedUsersForTag(std::string(tag), {});
     };
 
-    acpp::InboundFactory::Instance().Register("vmess", std::move(reg));
+    acpp::InboundFactory::Instance().Register(
+        acpp::constants::protocol::kVmess, std::move(reg));
     return true;
 }();
 }  // namespace

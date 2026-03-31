@@ -15,7 +15,7 @@ std::string SelectUdpBindAddress(
     const FreedomSettings& settings,
     const SessionContext& ctx) {
     if (!settings.send_through.empty() &&
-        settings.send_through != "auto" &&
+        settings.send_through != constants::binding::kAuto &&
         !iputil::IsWildcardBindAddress(settings.send_through)) {
         return settings.send_through;
     }
@@ -27,7 +27,7 @@ std::string SelectUdpBindAddress(
         }
     }
 
-    return "0.0.0.0";
+    return std::string(constants::network::kAnyIpv4);
 }
 
 std::string MakeUdpSessionId(const std::string& bind_addr) {
@@ -47,8 +47,8 @@ FreedomOutbound::FreedomOutbound(
     , dns_service_(dns_service)
     , udp_session_manager_(udp_session_manager)
     , dial_timeout_(dial_timeout) {
-    stream_settings_.network = "tcp";
-    stream_settings_.security = "none";
+    stream_settings_.network = std::string(constants::protocol::kTcp);
+    stream_settings_.security = std::string(constants::protocol::kNone);
     stream_settings_.RecomputeModes();
 }
 
@@ -82,7 +82,7 @@ FreedomOutbound::ResolveTransportTarget(SessionContext& ctx) {
     OutboundTransportTarget transport_target;
     transport_target.host = target.host;
     transport_target.port = target.port;
-    if (settings_.send_through == "auto") {
+    if (settings_.send_through == constants::binding::kAuto) {
         transport_target.bind_mode = OutboundTransportTarget::BindMode::Auto;
     } else if (!iputil::IsWildcardBindAddress(settings_.send_through)) {
         transport_target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
@@ -131,7 +131,7 @@ cobalt::task<UDPDialResult> FreedomOutbound::DialUDP(
     std::function<void(const UDPPacket&)> on_packet) {
     
     if (!settings_.enable_udp) {
-        co_return UDPDialResult{ErrorCode::NOT_SUPPORTED, nullptr, nullptr, nullptr, nullptr, ""};
+        co_return UDPDialResult::Fail(ErrorCode::NOT_SUPPORTED, "UDP disabled for this outbound");
     }
     
     // Per-worker UDP session
@@ -143,14 +143,14 @@ cobalt::task<UDPDialResult> FreedomOutbound::DialUDP(
     try {
         if (!udp_session_manager_) {
             LOG_CONN_FAIL("Freedom UDP: UDPSessionManager not available");
-            co_return UDPDialResult{ErrorCode::INTERNAL, nullptr, nullptr, nullptr, nullptr, ""};
+            co_return UDPDialResult::Fail(ErrorCode::INTERNAL, "UDPSessionManager not available");
         }
         
         // 获取或创建 session（使用当前 executor）
         auto session = udp_session_manager_->GetOrCreateSession(session_id, executor, nullptr, bind_addr);
         
         if (!session) {
-            co_return UDPDialResult{ErrorCode::NETWORK_BIND_FAILED, nullptr, nullptr, nullptr, nullptr, ""};
+            co_return UDPDialResult::Fail(ErrorCode::NETWORK_BIND_FAILED, "failed to create UDP session");
         }
         
         LOG_CONN_DEBUG(ctx, "Freedom UDP session {} port {}", 
@@ -178,18 +178,16 @@ cobalt::task<UDPDialResult> FreedomOutbound::DialUDP(
             session->UnregisterCallback(callback_id);
         };
         
-        co_return UDPDialResult{
-            ErrorCode::SUCCESS, 
-            send_fn, 
-            set_cb_fn, 
-            register_fn,
-            unregister_fn,
-            session_id
-        };
+        co_return UDPDialResult::Success(
+            std::move(send_fn),
+            std::move(set_cb_fn),
+            std::move(register_fn),
+            std::move(unregister_fn),
+            session_id);
         
     } catch (const std::exception& e) {
         LOG_CONN_FAIL("Freedom UDP dial failed: {}", e.what());
-        co_return UDPDialResult{ErrorCode::INTERNAL, nullptr, nullptr, nullptr, nullptr, ""};
+        co_return UDPDialResult::Fail(ErrorCode::INTERNAL, e.what());
     }
 }
 
@@ -202,7 +200,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
         if (!target.resolved_addr->is_v4()) {
             co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
-        ctx.dns_result = "none";
+        ctx.dns_result = std::string(constants::state::kNone);
         co_return std::vector<net::ip::address>{*target.resolved_addr};
     }
 
@@ -213,7 +211,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
         if (!addr.is_v4()) {
             co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
-        ctx.dns_result = "none";
+        ctx.dns_result = std::string(constants::state::kNone);
         co_return std::vector<net::ip::address>{addr};
     }
 
@@ -223,7 +221,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     }
 
     // 根据 domain_strategy 决定是否解析
-    if (settings_.domain_strategy == "AsIs") {
+    if (settings_.domain_strategy == constants::protocol::kAsIs) {
         // AsIs 模式：使用系统解析器（通过 TcpStream::Connect 的域名版本）
         // 这里我们还是需要解析，因为需要 IP 来连接
         // 实际上 AsIs 主要影响路由匹配，不影响最终连接
@@ -232,7 +230,7 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     auto dns_result = co_await dns_service_->Resolve(target.host);
 
     if (!dns_result.Ok()) {
-        ctx.dns_result = "failed";
+        ctx.dns_result = std::string(constants::state::kFailed);
         co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
@@ -246,11 +244,13 @@ FreedomOutbound::ResolveTargets(SessionContext& ctx) {
     }
 
     if (addresses.empty()) {
-        ctx.dns_result = "failed";
+        ctx.dns_result = std::string(constants::state::kFailed);
         co_return std::unexpected(ErrorCode::DNS_NO_RECORD);
     }
 
-    ctx.dns_result = dns_result.from_cache ? "cache" : "resolve";
+    ctx.dns_result = dns_result.from_cache
+        ? std::string(constants::state::kCache)
+        : std::string(constants::state::kResolve);
     co_return addresses;
 }
 
@@ -258,7 +258,7 @@ std::optional<net::ip::address> FreedomOutbound::DetermineLocalAddress(
     const SessionContext& ctx,
     const net::ip::address& remote_addr) {
     
-    if (settings_.send_through == "auto") {
+    if (settings_.send_through == constants::binding::kAuto) {
         // auto 模式：源进源出
         // 使用入站连接的本地 IP 作为出站绑定地址
         // 这样可以实现「哪个 IP 进哪个 IP 出」
@@ -315,7 +315,7 @@ std::unique_ptr<IOutbound> CreateFreedomOutbound(
 // ============================================================================
 namespace {
 const bool kFreedomRegistered = (acpp::OutboundFactory::Instance().Register(
-    "freedom",
+    acpp::constants::protocol::kFreedom,
     [](const acpp::OutboundConfig& cfg,
        acpp::net::any_io_executor /*executor*/,
        acpp::IDnsService* dns,
@@ -325,8 +325,10 @@ const bool kFreedomRegistered = (acpp::OutboundFactory::Instance().Register(
         acpp::FreedomSettings settings;
 
         // 支持 PascalCase 和 camelCase
-        settings.send_through    = acpp::json::GetString(s, "SendThrough",    "sendThrough",    "auto");
-        settings.domain_strategy = acpp::json::GetString(s, "DomainStrategy", "domainStrategy", "AsIs");
+        settings.send_through    = acpp::json::GetString(
+            s, "SendThrough", "sendThrough", std::string(acpp::constants::binding::kAuto));
+        settings.domain_strategy = acpp::json::GetString(
+            s, "DomainStrategy", "domainStrategy", std::string(acpp::constants::protocol::kAsIs));
         settings.redirect        = acpp::json::GetString(s, "Redirect",       "redirect",       "");
 
         // Xray 顶级 sendThrough 优先于 settings 内的

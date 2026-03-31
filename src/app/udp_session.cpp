@@ -48,7 +48,9 @@ UDPSession::~UDPSession() {
 }
 
 ErrorCode UDPSession::Start(const std::string& bind_address) {
-    const std::string primary_bind = bind_address.empty() ? "0.0.0.0" : bind_address;
+    const std::string primary_bind = bind_address.empty()
+        ? std::string(constants::network::kAnyIpv4)
+        : bind_address;
     std::string last_error = "bind failed";
 
     try {
@@ -622,7 +624,7 @@ void UDPSessionManager::CleanupExpiredSessions() {
     }
     
     // 每 30 秒清理一次
-    cleanup_timer_.expires_after(std::chrono::seconds(30));
+    cleanup_timer_.expires_after(std::chrono::seconds(defaults::kUdpSessionCleanupInterval));
     cleanup_timer_.async_wait([this](boost::system::error_code ec) {
         if (!ec && running_) {
             CleanupExpiredSessions();

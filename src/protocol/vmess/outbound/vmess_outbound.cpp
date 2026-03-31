@@ -857,7 +857,7 @@ cobalt::task<bool> VMessClientAsyncStream::WriteFull(const uint8_t* buf, size_t 
 // ============================================================================
 namespace {
 const bool kVMessRegistered = (acpp::OutboundFactory::Instance().Register(
-    "vmess",
+    acpp::constants::protocol::kVmess,
     [](const acpp::OutboundConfig& cfg,
        acpp::net::any_io_executor executor,
        acpp::IDnsService* dns,
@@ -888,12 +888,13 @@ const bool kVMessRegistered = (acpp::OutboundFactory::Instance().Register(
         vmess_config.uuid     = GetString(user, "id");
         vmess_config.alter_id = static_cast<int>(GetInt(user, "alterId", 0));
 
-        std::string security = GetString(user, "security", "auto");
-        if (security == "aes-128-gcm" || security == "auto") {
+        std::string security = GetString(user, "security", std::string(acpp::constants::binding::kAuto));
+        if (security == acpp::constants::protocol::kAes128Gcm ||
+            security == acpp::constants::binding::kAuto) {
             vmess_config.security = acpp::vmess::Security::AES_128_GCM;
-        } else if (security == "chacha20-poly1305") {
+        } else if (security == acpp::constants::protocol::kChacha20IetfPoly1305) {
             vmess_config.security = acpp::vmess::Security::CHACHA20_POLY1305;
-        } else if (security == "none") {
+        } else if (security == acpp::constants::protocol::kNone) {
             vmess_config.security = acpp::vmess::Security::NONE;
         }
 

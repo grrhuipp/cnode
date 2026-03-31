@@ -26,7 +26,7 @@ struct SniffResult {
     }
 
     [[nodiscard]] std::string ToString() const {
-        if (!success) return "none";
+        if (!success) return std::string(constants::state::kNone);
         if (port > 0) {
             return protocol + ":" + domain + ":" + std::to_string(port);
         }

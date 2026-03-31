@@ -57,7 +57,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <any>
 #include <bit>
 #include <cassert>
 #include <cctype>

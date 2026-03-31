@@ -15,6 +15,7 @@
 #include "acppnode/transport/proxy_protocol.hpp"
 #include "acppnode/transport/tcp_stream.hpp"   // SetupListenerSocket
 #include "acppnode/transport/tls_stream.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/connection_guard.hpp"
@@ -29,7 +30,7 @@ namespace acpp {
 // ============================================================================
 struct BaseInboundConfig {
     std::string tag;                // 入站标识
-    std::string listen = "0.0.0.0"; // 监听地址
+    std::string listen = std::string(constants::network::kAnyIpv4); // 监听地址
     uint16_t port = 0;              // 监听端口
     uint32_t worker_id = 0;         // 所属 worker
     

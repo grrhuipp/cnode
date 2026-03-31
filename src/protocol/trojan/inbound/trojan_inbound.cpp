@@ -199,7 +199,8 @@ const bool kTrojanInboundRegistered = [] {
         acpp::trojan::TrojanUserManager::UpdateSharedUsersForTag(std::string(tag), {});
     };
 
-    acpp::InboundFactory::Instance().Register("trojan", std::move(reg));
+    acpp::InboundFactory::Instance().Register(
+        acpp::constants::protocol::kTrojan, std::move(reg));
     return true;
 }();
 }  // namespace
