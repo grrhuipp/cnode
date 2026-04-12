@@ -230,6 +230,7 @@ cobalt::task<bool> PanelSyncManager::CreateInbounds(IPanel* panel, int node_id,
         ss.security      = std::string(constants::protocol::kTls);
         ss.tls.cert_file = cert_file;
         ss.tls.key_file  = key_file;
+        ss.tls.server_name = node_config.tls_sni;
     }
 
     if (ss.network == constants::protocol::kWs) {

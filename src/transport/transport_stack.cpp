@@ -70,7 +70,7 @@ std::shared_ptr<SslContext> AcquireServerTlsContext(const TlsConfig& config) {
 
     const std::string key = config.IsServer()
         ? MakeTlsCacheKey("server", config)
-        : std::string("server|auto-sign");
+        : MakeTlsCacheKey("server-auto-sign", config);
 
     std::lock_guard lock(cache_mu);
     if (auto it = cache.find(key); it != cache.end()) {
@@ -81,7 +81,7 @@ std::shared_ptr<SslContext> AcquireServerTlsContext(const TlsConfig& config) {
     if (config.IsServer()) {
         ctx = SslContext::CreateServer(config);
     } else {
-        ctx = SslContext::CreateServerAutoSign();
+        ctx = SslContext::CreateServerAutoSign(config);
     }
 
     if (ctx) {

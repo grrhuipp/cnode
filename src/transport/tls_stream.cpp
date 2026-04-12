@@ -187,6 +187,13 @@ std::string ToWildcard(std::string_view sni) {
     return "*" + std::string(sni.substr(dot));
 }
 
+std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
+    if (config.server_name.empty()) {
+        return "localhost";
+    }
+    return ToWildcard(config.server_name);
+}
+
 // SNI 回调：根据客户端请求的域名切换泛域名证书
 int AutoSignSniCallback(SSL* ssl, int* /*ad*/, void* /*arg*/) {
     const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
@@ -203,7 +210,7 @@ int AutoSignSniCallback(SSL* ssl, int* /*ad*/, void* /*arg*/) {
 
 }  // namespace
 
-std::unique_ptr<SslContext> SslContext::CreateServerAutoSign() {
+std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
     auto& state = GetAutoSignState();
 
     // 只在首次调用时生成 EC P-256 密钥
@@ -222,8 +229,9 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign() {
         state.pkey = pkey;
     }
 
-    // 默认证书（localhost），用于无 SNI 的连接
-    X509* default_cert = state.GetOrCreate("localhost");
+    // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
+    const std::string default_name = ResolveAutoSignDefaultName(config);
+    X509* default_cert = state.GetOrCreate(default_name);
     if (!default_cert) {
         LOG_ERROR("默认自签证书生成失败");
         return nullptr;
@@ -257,7 +265,8 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign() {
         return SSL_TLSEXT_ERR_NOACK;
     }, nullptr);
 
-    LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书）");
+    LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书，默认域名={}）",
+             default_name);
     return std::unique_ptr<SslContext>(new SslContext(ctx));
 }
 

@@ -126,7 +126,7 @@ protected:
             }
             return ctx;
         } else {
-            auto ctx = SslContext::CreateServerAutoSign();
+            auto ctx = SslContext::CreateServerAutoSign(config_.tls);
             if (ctx) {
                 LOG_DEBUG("[{}] TLS 自动签名模式（按 SNI 生成证书）", config_.tag);
             }

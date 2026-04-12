@@ -20,7 +20,7 @@ struct TlsConfig {
     std::string ca_file;                // CA 证书（可选，用于客户端验证）
     
     // 客户端配置
-    std::string server_name;            // SNI 服务器名
+    std::string server_name;            // 客户端 SNI / 自签证书默认域名
     bool allow_insecure = false;        // 是否允许不验证证书
     std::vector<std::string> alpn;      // ALPN 协议列表
     
@@ -41,7 +41,7 @@ public:
     static std::unique_ptr<SslContext> CreateServer(const TlsConfig& config);
     
     // 创建服务端上下文（自签名，根据 SNI 动态生成证书）
-    static std::unique_ptr<SslContext> CreateServerAutoSign();
+    static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
     
     // 创建客户端上下文
     static std::unique_ptr<SslContext> CreateClient(const TlsConfig& config);
