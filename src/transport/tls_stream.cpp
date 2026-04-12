@@ -96,6 +96,18 @@ namespace {
     throw boost::system::system_error(boost::asio::error::connection_reset, what);
 }
 
+bool IsBenignServerHandshakeError(unsigned long err_code) {
+    if (err_code == 0) return false;
+    const auto reason = ERR_GET_REASON(err_code);
+#ifdef SSL_R_WRONG_VERSION_NUMBER
+    if (reason == SSL_R_WRONG_VERSION_NUMBER) return true;
+#endif
+#ifdef SSL_R_HTTP_REQUEST
+    if (reason == SSL_R_HTTP_REQUEST) return true;
+#endif
+    return false;
+}
+
 struct AutoSignState {
     EVP_PKEY* pkey = nullptr;
     std::mutex mu;
@@ -410,9 +422,14 @@ cobalt::task<bool> TlsStream::Handshake() {
                 co_return false;
             }
         } else {
+            const unsigned long err_code = ERR_get_error();
             char buf[256];
-            ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            LOG_CONN_FAIL("TLS handshake error: {}", buf);
+            ERR_error_string_n(err_code, buf, sizeof(buf));
+            if (is_server_ && IsBenignServerHandshakeError(err_code)) {
+                LOG_ACCESS_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", buf);
+            } else {
+                LOG_CONN_FAIL("TLS handshake error: {}", buf);
+            }
             co_return false;
         }
     }
