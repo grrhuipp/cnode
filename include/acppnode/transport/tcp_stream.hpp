@@ -4,6 +4,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/timeout_scheduler.hpp"
 #include <atomic>
+#include <memory>
 
 namespace acpp {
 
@@ -120,6 +121,8 @@ private:
 
     // 阶段性绝对 deadline：一次性触发，不随 I/O 重置（共享调度）。
     std::atomic<bool> phase_deadline_timed_out_{false};
+    std::shared_ptr<std::atomic<bool>> phase_deadline_handle_state_ =
+        std::make_shared<std::atomic<bool>>(false);
     TimeoutScheduler* timeout_scheduler_ = nullptr;
     TimeoutToken idle_timer_token_;
     TimeoutToken read_deadline_token_;

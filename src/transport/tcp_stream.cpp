@@ -652,28 +652,42 @@ PhaseDeadlineHandle TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) 
     }
 
     phase_deadline_timed_out_.store(false, std::memory_order_release);
+    if (!phase_deadline_handle_state_) {
+        phase_deadline_handle_state_ = std::make_shared<std::atomic<bool>>(false);
+    }
+    phase_deadline_handle_state_->store(false, std::memory_order_release);
 
     tcp::socket* sock = &socket_;
     std::atomic<bool>* timed_out = &phase_deadline_timed_out_;
+    auto handle_state = phase_deadline_handle_state_;
 
     phase_deadline_token_ = timeout_scheduler_->ScheduleAfter(
         std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [sock, timed_out]() {
+        [sock, timed_out, handle_state]() {
             timed_out->store(true, std::memory_order_release);
+            handle_state->store(true, std::memory_order_release);
             boost::system::error_code cancel_ec;
             sock->cancel(cancel_ec);
     });
 
-    return PhaseDeadlineHandle{timed_out};
+    return PhaseDeadlineHandle{std::move(handle_state)};
 }
 
 void TcpStream::ClearPhaseDeadline() {
     phase_deadline_timed_out_.store(false, std::memory_order_release);
+    if (phase_deadline_handle_state_) {
+        phase_deadline_handle_state_->store(false, std::memory_order_release);
+    }
     CancelPhaseDeadline();
 }
 
 bool TcpStream::ConsumePhaseDeadline() noexcept {
-    return phase_deadline_timed_out_.exchange(false, std::memory_order_acq_rel);
+    const bool timed_out =
+        phase_deadline_timed_out_.exchange(false, std::memory_order_acq_rel);
+    if (phase_deadline_handle_state_) {
+        phase_deadline_handle_state_->store(false, std::memory_order_release);
+    }
+    return timed_out;
 }
 
 // 每次成功 I/O 后调用——仅写一个时间戳，零 epoll 操作

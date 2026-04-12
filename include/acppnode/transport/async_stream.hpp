@@ -4,6 +4,8 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/transport/multi_buffer.hpp"
 
+#include <memory>
+
 namespace acpp {
 
 class TcpStream;  // 前置声明
@@ -12,20 +14,18 @@ class PhaseDeadlineHandle {
 public:
     PhaseDeadlineHandle() = default;
 
-    // 直接引用 TcpStream::phase_deadline_timed_out_，零堆分配。
-    // 安全性：TcpStream 析构时 CancelPhaseDeadline() 已撤销定时器，
-    // 且 PhaseDeadlineHandle 的生命周期不超过持有它的协程帧（TcpStream 在同一帧内）。
-    explicit PhaseDeadlineHandle(std::atomic<bool>* expired) noexcept
+    // 句柄持有独立的共享状态，避免包装/替换底层流后悬空引用。
+    explicit PhaseDeadlineHandle(std::shared_ptr<std::atomic<bool>> expired) noexcept
         : expired_(expired) {}
 
     [[nodiscard]] bool Expired() const noexcept {
         return expired_ && expired_->load(std::memory_order_acquire);
     }
 
-    explicit operator bool() const noexcept { return expired_ != nullptr; }
+    explicit operator bool() const noexcept { return static_cast<bool>(expired_); }
 
 private:
-    std::atomic<bool>* expired_ = nullptr;
+    std::shared_ptr<std::atomic<bool>> expired_;
 };
 
 // ============================================================================
