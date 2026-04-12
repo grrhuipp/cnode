@@ -217,9 +217,10 @@ cobalt::task<bool> PanelSyncManager::CreateInbounds(IPanel* panel, int node_id,
     bool tls_enable        = node_config.tls_enabled;
 
     if (panel_cfg) {
-        if (!panel_cfg->tls_enable) {
-            tls_enable = false;
-        } else {
+        // 本地 panels[].tlsEnable 表示“由 cnode 处理 TLS”，
+        // 其优先级应高于面板下发的 tls 开关。
+        tls_enable = panel_cfg->tls_enable;
+        if (tls_enable) {
             if (!panel_cfg->tls_cert.empty()) cert_file = panel_cfg->tls_cert;
             if (!panel_cfg->tls_key.empty())  key_file  = panel_cfg->tls_key;
         }

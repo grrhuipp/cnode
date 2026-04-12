@@ -46,7 +46,7 @@ struct PanelConfig {
 
     // TLS 配置
     // false: 强制关闭 TLS（由外部 nginx/caddy 处理）
-    // true:  程序处理 TLS，根据面板下发配置决定证书
+    // true:  程序处理 TLS，并以本地配置决定是否加载证书/自签
     bool tls_enable = false;
     std::string tls_cert;                    // 证书文件路径（空则自签名）
     std::string tls_key;                     // 私钥文件路径（空则自签名）
