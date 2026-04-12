@@ -60,9 +60,8 @@ std::string SessionContext::ToAccessLogComplete(
 // 格式化时间戳（本地时区，跨平台）
 std::string FormatTimestamp(int64_t timestamp_us) {
     using namespace std::chrono;
-    auto tp = floor<seconds>(system_clock::time_point{microseconds{timestamp_us}});
-    auto zt = zoned_time{current_zone(), tp};
-    return std::format("{:%Y-%m-%d %H:%M:%S}", zt);
+    const auto tp = floor<seconds>(system_clock::time_point{microseconds{timestamp_us}});
+    return FormatLocalTime(tp, "%Y-%m-%d %H:%M:%S");
 }
 
 // 生成唯一连接 ID

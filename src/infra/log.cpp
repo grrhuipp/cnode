@@ -98,12 +98,7 @@ bool GzipFile(const std::filesystem::path& src) {
 // 获取今日日期字符串（YYYY-MM-DD）
 // ============================================================================
 std::string TodayDateString() {
-    using namespace std::chrono;
-    auto now = system_clock::now();
-    auto local_now = zoned_time{current_zone(), now}.get_local_time();
-    auto days = floor<std::chrono::days>(local_now);
-    year_month_day ymd{days};
-    return std::format("{:%Y-%m-%d}", ymd);
+    return FormatLocalTime(std::chrono::system_clock::now(), "%Y-%m-%d");
 }
 
 // ============================================================================

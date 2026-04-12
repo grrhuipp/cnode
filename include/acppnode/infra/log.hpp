@@ -12,6 +12,7 @@
 // ============================================================================
 
 #include <chrono>
+#include "acppnode/common/clock.hpp"
 #include <filesystem>
 #include <format>
 #include <ostream>
@@ -30,16 +31,16 @@ namespace acpp {
 // 优化：thread_local 缓存日期时间部分，仅秒变化时重新格式化
 inline std::string LogLocalNow() {
     using namespace std::chrono;
-    thread_local const time_zone* tz = current_zone();
     thread_local std::string cached_base;   // "2026-03-04 14:23:45"
-    thread_local seconds cached_sec{};
+    thread_local std::time_t cached_sec = -1;
 
     auto now = system_clock::now();
     auto secs = floor<seconds>(now);
+    auto sec_tt = system_clock::to_time_t(secs);
 
-    if (secs.time_since_epoch() != cached_sec) {
-        cached_sec = secs.time_since_epoch();
-        cached_base = std::format("{:%Y-%m-%d %H:%M:%S}", zoned_time{tz, secs});
+    if (sec_tt != cached_sec) {
+        cached_sec = sec_tt;
+        cached_base = FormatLocalTime(secs, "%Y-%m-%d %H:%M:%S");
     }
 
     auto us = duration_cast<microseconds>(now - secs).count();
