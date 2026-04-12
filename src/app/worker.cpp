@@ -493,13 +493,17 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
         co_return;
     }
 
+    // ListenerContext 存在 unordered_map 中。连接建立后如果继续新增/重建监听，
+    // map rehash 会使对 value 的引用失效；把它复制到协程帧里可避免悬空引用。
+    ListenerContext listener = lc_it->second;
+
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
 
     SessionContext ctx;
     ctx.worker_id        = id_;
     ctx.inbound_tag      = tag;
-    ctx.inbound_tags     = lc_it->second.inbound_tags;
-    ctx.inbound_protocol = lc_it->second.protocol;
+    ctx.inbound_tags     = listener.inbound_tags;
+    ctx.inbound_protocol = listener.protocol;
     try {
         const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
         ctx.client_ip = normalized_remote.to_string();
@@ -523,8 +527,8 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     }
 
     std::optional<ConnectionLimitGuard> connection_limit;
-    if (lc_it->second.limiter) {
-        auto reject = lc_it->second.limiter->TryAcceptGlobal();
+    if (listener.limiter) {
+        auto reject = listener.limiter->TryAcceptGlobal();
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={} (pre-proxy)",
                 FormatTimestamp(ctx.accept_time_us),
@@ -534,7 +538,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
             tcp_stream->Close();
             co_return;
         }
-        connection_limit.emplace(lc_it->second.limiter, ctx.client_ip);
+        connection_limit.emplace(listener.limiter, ctx.client_ip);
     }
 
     // ----------------------------------------------------------------
@@ -543,7 +547,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     // 支持 v1（文本）和 v2（二进制，IPv4 头恰好 28 字节）自动检测。
     // 若数据不是 PROXY 头，全部放回 pending_data，对后续协议透明。
     // ----------------------------------------------------------------
-    if (lc_it->second.proxy_protocol) {
+    if (listener.proxy_protocol) {
         const auto handshake_timeout = config_.GetTimeouts().HandshakeTimeout();
         tcp_stream->SetIdleTimeout(handshake_timeout);
         auto proxy_deadline = tcp_stream->StartPhaseDeadline(handshake_timeout);
@@ -667,7 +671,7 @@ cobalt::task<void> Worker::ProcessReceivedConnection(
     };
 
     co_await session_handler_->Handle(
-        std::move(tcp_stream), ctx, lc_it->second, std::move(connection_limit));
+        std::move(tcp_stream), ctx, listener, std::move(connection_limit));
 
     // 写入剩余增量流量（总流量 - guard 记录的已上报部分），避免重复计数
     // relay 结束时 guard 会记录最后一次已上报快照。
