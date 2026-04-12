@@ -100,7 +100,8 @@ bool GzipFile(const std::filesystem::path& src) {
 std::string TodayDateString() {
     using namespace std::chrono;
     auto now = system_clock::now();
-    auto days = floor<std::chrono::days>(now);
+    auto local_now = zoned_time{current_zone(), now}.get_local_time();
+    auto days = floor<std::chrono::days>(local_now);
     year_month_day ymd{days};
     return std::format("{:%Y-%m-%d}", ymd);
 }
@@ -113,6 +114,8 @@ void CleanupOldFiles() {
     try {
         auto now = std::filesystem::file_time_type::clock::now();
         auto today = TodayDateString();
+        auto today_app_log = std::format("app_{}.log", today);
+        auto today_access_log = std::format("access_{}.log", today);
 
         for (const auto& entry : std::filesystem::directory_iterator(g_log_dir)) {
             if (!entry.is_regular_file()) continue;
@@ -133,7 +136,9 @@ void CleanupOldFiles() {
             }
 
             // 压缩非今日的 .log 文件
-            if (name.ends_with(".log") && name.find(today) == std::string::npos) {
+            if (name.ends_with(".log")
+                && name != today_app_log
+                && name != today_access_log) {
                 GzipFile(entry.path());
             }
         }
