@@ -40,6 +40,28 @@ private:
     bool success_;
 };
 
+[[nodiscard]] std::string FormatHexPrefix(const uint8_t* data, size_t len, size_t max_bytes = 16) {
+    if (!data || len == 0) {
+        return "-";
+    }
+
+    const size_t limit = std::min(len, max_bytes);
+    std::string out;
+    out.reserve(limit * 3 + 8);
+    static constexpr char kHex[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < limit; ++i) {
+        if (i > 0) out.push_back(' ');
+        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
+        out.push_back(kHex[data[i] & 0x0F]);
+    }
+
+    if (len > limit) {
+        out.append(" ...");
+    }
+    return out;
+}
+
 // ============================================================================
 // CachedAESKey 实现
 // ============================================================================
@@ -815,22 +837,33 @@ VMessParser::VMessParser(const VMessUserManager& user_manager, const std::string
 }
 
 std::pair<std::optional<VMessRequest>, size_t>
-VMessParser::ParseRequest(const uint8_t* data, size_t len) {
+VMessParser::ParseRequest(const uint8_t* data, size_t len, uint64_t trace_conn_id) {
     // VMess AEAD 请求格式：
     // AuthID (16) + LengthEncrypted (2+16) + ConnectionNonce (8) + HeaderEncrypted (N+16)
-    
+
+    LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequest start len={} tag={} prefix={}",
+                     trace_conn_id,
+                     len,
+                     tag_.empty() ? "all" : tag_,
+                     FormatHexPrefix(data, len, 24));
+
     if (len < 16 + 18 + 8) {  // 最小长度
         LOG_ACCESS_DEBUG("VMess: data too short, len={}", len);
+        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequest short packet len={} min={} prefix={}",
+                         trace_conn_id,
+                         len,
+                         16 + 18 + 8,
+                         FormatHexPrefix(data, len, 24));
         return {std::nullopt, 0};
     }
-    
+
     // 提取 AuthID (16 bytes)
     const uint8_t* auth_id = data;
-    
+
     // 查找用户 - 根据是否指定 tag 选择查找方式
     int64_t timestamp;
     const VMessUser* user;
-    
+
     if (tag_.empty()) {
         // 兼容模式：搜索所有用户
         user = user_manager_.FindByAuthID(auth_id, timestamp);
@@ -838,30 +871,57 @@ VMessParser::ParseRequest(const uint8_t* data, size_t len) {
         // 优化模式：只搜索指定 tag 的用户
         user = user_manager_.FindByAuthIDForTag(tag_, auth_id, timestamp);
     }
-    
+
     if (!user) {
-        LOG_ACCESS_DEBUG("VMess: user not found by auth_id (tag={}, users={})", 
-                  tag_.empty() ? "all" : tag_, user_manager_.Size());
+        LOG_ACCESS_DEBUG("VMess: user not found by auth_id (tag={}, users={})",
+                         tag_.empty() ? "all" : tag_, user_manager_.Size());
+        LOG_ACCESS_TRACE("[conn={}] VMess: auth_id miss tag={} users={} auth_id={}",
+                         trace_conn_id,
+                         tag_.empty() ? "all" : tag_,
+                         user_manager_.Size(),
+                         FormatHexPrefix(auth_id, 16, 8));
         return {std::nullopt, 0};
     }
-    
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t skew = now - timestamp;
+
     LOG_ACCESS_DEBUG("VMess: found user {} by auth_id", user->email);
-    
+    LOG_ACCESS_TRACE("[conn={}] VMess: auth ok user={} tag={} ts={} skew={}s auth_id={}",
+                     trace_conn_id,
+                     user->email,
+                     tag_.empty() ? "all" : tag_,
+                     timestamp,
+                     skew,
+                     FormatHexPrefix(auth_id, 16, 8));
+
     // 读取 connectionNonce (8 bytes after AuthID + encrypted length)
     const uint8_t* connection_nonce = data + 16 + 18;
-    
+
     // 解析请求头
     VMessRequest request;
     size_t consumed = 0;
-    
+
     if (!ParseRequestHeader(data + 16, len - 16, user, auth_id, connection_nonce,
+                           trace_conn_id,
                            request, consumed)) {
         LOG_ACCESS_DEBUG("VMess: failed to parse request header");
+        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequestHeader failed user={} nonce={}",
+                         trace_conn_id,
+                         user->email,
+                         FormatHexPrefix(connection_nonce, 8, 8));
         return {std::nullopt, 0};
     }
-    
+
     request.user = user;
-    
+
+    LOG_ACCESS_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
+                     trace_conn_id,
+                     user->email,
+                     16 + consumed,
+                     len > (16 + consumed) ? (len - (16 + consumed)) : 0);
+
     return {request, 16 + consumed};
 }
 
@@ -869,17 +929,22 @@ bool VMessParser::ParseRequestHeader(const uint8_t* data, size_t len,
                                      const VMessUser* user,
                                      const uint8_t* auth_id,
                                      const uint8_t* connection_nonce,
+                                     uint64_t trace_conn_id,
                                      VMessRequest& request,
                                      size_t& consumed) {
     // 格式: LengthEncrypted (18) + ConnectionNonce (8) + HeaderEncrypted (N+16)
-    
+
     if (len < 18 + 8) {
+        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequestHeader short len={} min={}",
+                         trace_conn_id,
+                         len,
+                         18 + 8);
         return false;
     }
-    
+
     const uint8_t* len_enc = data;
     connection_nonce = data + 18;
-    
+
     // 派生长度加密密钥
     // ISSUE-02-02: 使用 unsafe::ptr_cast 替代 reinterpret_cast
     std::string auth_id_str(unsafe::ptr_cast<const char>(auth_id), 16);
@@ -903,25 +968,40 @@ bool VMessParser::ParseRequestHeader(const uint8_t* data, size_t len,
     // 解密长度 (AAD = auth_id)
     auto len_dec = AES128GCMDecrypt(len_key.data(), len_iv.data(), 12,
                                      len_enc, 18, auth_id, 16);
-    
+
     if (!len_dec || len_dec->size() != 2) {
         LOG_ACCESS_DEBUG("VMess: header length decrypt failed");
+        LOG_ACCESS_TRACE("[conn={}] VMess: header length decrypt failed user={} auth_id={} nonce={}",
+                         trace_conn_id,
+                         user ? user->email : "",
+                         FormatHexPrefix(auth_id, 16, 8),
+                         FormatHexPrefix(connection_nonce, 8, 8));
         return false;
     }
-    
+
     uint16_t header_len = (static_cast<uint16_t>((*len_dec)[0]) << 8) | (*len_dec)[1];
     LOG_ACCESS_DEBUG("VMess: header length = {}", header_len);
-    
+    LOG_ACCESS_TRACE("[conn={}] VMess: header_len={} user={} nonce={}",
+                     trace_conn_id,
+                     header_len,
+                     user ? user->email : "",
+                     FormatHexPrefix(connection_nonce, 8, 8));
+
     // 检查是否有足够数据
     size_t needed = 18 + 8 + static_cast<size_t>(header_len) + 16;
     if (len < needed) {
         LOG_ACCESS_DEBUG("VMess: not enough data for header, need {}, have {}", needed, len);
+        LOG_ACCESS_TRACE("[conn={}] VMess: incomplete header need={} have={} header_len={}",
+                         trace_conn_id,
+                         needed,
+                         len,
+                         header_len);
         return false;
     }
-    
+
     // 读取加密的请求头
     const uint8_t* header_enc = data + 18 + 8;
-    
+
     // 派生请求头加密密钥
     const std::array<std::string_view, 3> header_key_path{
         KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY,
@@ -941,23 +1021,35 @@ bool VMessParser::ParseRequestHeader(const uint8_t* data, size_t len,
     // 解密请求头 (AAD = auth_id)
     auto header_dec = AES128GCMDecrypt(header_key.data(), header_iv.data(), 12,
                                         header_enc, header_len + 16, auth_id, 16);
-    
+
     if (!header_dec) {
         LOG_ACCESS_DEBUG("VMess: header decrypt failed");
+        LOG_ACCESS_TRACE("[conn={}] VMess: header decrypt failed user={} header_len={} nonce={} enc_prefix={}",
+                         trace_conn_id,
+                         user ? user->email : "",
+                         header_len,
+                         FormatHexPrefix(connection_nonce, 8, 8),
+                         FormatHexPrefix(header_enc, header_len + 16, 16));
         return false;
     }
-    
+
     // 解析解密后的请求头
-    if (!ParseDecryptedHeader(header_dec->data(), header_dec->size(), request)) {
+    if (!ParseDecryptedHeader(header_dec->data(), header_dec->size(), trace_conn_id, request)) {
         LOG_ACCESS_DEBUG("VMess: parse decrypted header failed");
+        LOG_ACCESS_TRACE("[conn={}] VMess: ParseDecryptedHeader failed plain_len={} prefix={}",
+                         trace_conn_id,
+                         header_dec->size(),
+                         FormatHexPrefix(header_dec->data(), header_dec->size(), 24));
         return false;
     }
-    
+
     consumed = 18 + 8 + header_len + 16;
     return true;
 }
 
-bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessRequest& request) {
+bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len,
+                                       uint64_t trace_conn_id,
+                                       VMessRequest& request) {
     // VMess 请求头格式：
     // 1 byte: version
     // 16 bytes: body IV
@@ -972,57 +1064,65 @@ bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessReq
     // N bytes: address
     // (padding)
     // 4 bytes: checksum (fnv1a)
-    
+
     if (len < 41) {  // 最小长度
+        LOG_ACCESS_TRACE("[conn={}] VMess: decrypted header too short len={} min={}",
+                         trace_conn_id,
+                         len,
+                         41);
         return false;
     }
-    
+
     // ISSUE-02-03: 使用 ByteReader 进行安全协议解析
     ByteReader reader(data, len);
-    
+
     // Version
     request.version = reader.ReadU8();
     if (!reader.Ok() || request.version != VERSION) {
         LOG_ACCESS_DEBUG("VMess: unsupported version {}", request.version);
+        LOG_ACCESS_TRACE("[conn={}] VMess: unsupported version={} prefix={}",
+                         trace_conn_id,
+                         request.version,
+                         FormatHexPrefix(data, len, 24));
         return false;
     }
-    
+
     // Body IV (16 bytes)
     auto iv_span = reader.ReadBytes(16);
     if (!reader.Ok()) return false;
     std::memcpy(request.body_iv.data(), iv_span.data(), 16);
-    
+
     // Body Key (16 bytes)
     auto key_span = reader.ReadBytes(16);
     if (!reader.Ok()) return false;
     std::memcpy(request.body_key.data(), key_span.data(), 16);
-    
+
     // Response header
     request.response_header = reader.ReadU8();
-    
+
     // Options
     request.options = reader.ReadU8();
-    
+
     // Padding len + Security
     uint8_t ps = reader.ReadU8();
     request.padding_len = (ps >> 4) & 0x0F;
     request.security = static_cast<Security>(ps & 0x0F);
-    
+
     // Reserved (skip)
     reader.Skip(1);
-    
+
     // Command
     request.command = static_cast<Command>(reader.ReadU8());
-    
+
     // Port (big endian)
     uint16_t port = reader.ReadU16BE();
-    
+
     // Address type
     uint8_t addr_type = reader.ReadU8();
     if (!reader.Ok()) return false;
-    
+
     std::string host;
-    
+
     switch (addr_type) {
         case 1: {  // IPv4
             auto ipv4_span = reader.ReadBytes(4);
@@ -1042,18 +1142,23 @@ bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessReq
         }
         case 3:
             LOG_ACCESS_DEBUG("VMess: non-IPv4 target is not supported");
+            LOG_ACCESS_TRACE("[conn={}] VMess: IPv6 target is not supported", trace_conn_id);
             return false;
         default:
             LOG_ACCESS_DEBUG("VMess: unsupported address type {}", addr_type);
+            LOG_ACCESS_TRACE("[conn={}] VMess: unsupported address type={} prefix={}",
+                             trace_conn_id,
+                             addr_type,
+                             FormatHexPrefix(data, len, 24));
             return false;
     }
-    
+
     request.target = TargetAddress(host, port);
-    
+
     // 跳过 padding
     reader.Skip(request.padding_len);
     if (!reader.Ok()) return false;
-    
+
     // 验证 FNV1a checksum
     // 注意：FNV1a 需要对原始数据计算，使用 reader.Position() 获取当前位置
     size_t pos = reader.Position();
@@ -1061,12 +1166,30 @@ bool VMessParser::ParseDecryptedHeader(const uint8_t* data, size_t len, VMessReq
     
     uint32_t expected_fnv = FNV1a32(data, pos);
     uint32_t actual_fnv = reader.ReadU32BE();
-    
+
     if (!reader.Ok() || expected_fnv != actual_fnv) {
         LOG_ACCESS_DEBUG("VMess: FNV1a checksum mismatch");
+        LOG_ACCESS_TRACE("[conn={}] VMess: checksum mismatch expected={:#010x} actual={:#010x} target={} padding={} options={:#04x} security={} command={}",
+                         trace_conn_id,
+                         expected_fnv,
+                         actual_fnv,
+                         request.target.ToString(),
+                         request.padding_len,
+                         static_cast<int>(request.options),
+                         static_cast<int>(request.security),
+                         static_cast<int>(request.command));
         return false;
     }
-    
+
+    LOG_ACCESS_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={} response_header={:#04x}",
+                     trace_conn_id,
+                     request.target.ToString(),
+                     static_cast<int>(request.command),
+                     static_cast<int>(request.security),
+                     static_cast<int>(request.options),
+                     request.padding_len,
+                     static_cast<int>(request.response_header));
+
     return true;
 }
 

@@ -128,7 +128,8 @@ cobalt::task<void> SessionHandler::Handle(
     std::string ws_real_ip;
     auto build_result = co_await TransportStack::BuildInbound(
         std::move(raw_conn), listener.stream_settings,
-        listener.stream_settings.IsWs() ? &ws_real_ip : nullptr);
+        listener.stream_settings.IsWs() ? &ws_real_ip : nullptr,
+        ctx.conn_id);
 
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "[SessionHandler] Transport handshake failed ({}/{})",

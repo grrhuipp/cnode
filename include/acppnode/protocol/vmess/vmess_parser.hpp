@@ -37,17 +37,20 @@ public:
     // 解析 VMess AEAD 请求头
     // 返回：(解析结果, 消耗的字节数)；解析失败时返回 (nullopt, 0)
     std::pair<std::optional<VMessRequest>, size_t>
-    ParseRequest(const uint8_t* data, size_t len);
+    ParseRequest(const uint8_t* data, size_t len, uint64_t trace_conn_id = 0);
 
 private:
     bool ParseRequestHeader(const uint8_t* data, size_t len,
                             const VMessUser* user,
                             const uint8_t* auth_id,
                             const uint8_t* connection_nonce,
+                            uint64_t trace_conn_id,
                             VMessRequest& request,
                             size_t& consumed);
 
-    bool ParseDecryptedHeader(const uint8_t* data, size_t len, VMessRequest& request);
+    bool ParseDecryptedHeader(const uint8_t* data, size_t len,
+                              uint64_t trace_conn_id,
+                              VMessRequest& request);
 
     const VMessUserManager& user_manager_;
     std::string             tag_;

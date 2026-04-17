@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cctype>
 #include <format>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -128,6 +129,81 @@ std::shared_ptr<SslContext> AcquireClientTlsContext(const TlsConfig& config) {
     return request.substr(start, end - start);
 }
 
+[[nodiscard]] std::string_view ExtractHeaderValueAny(
+    std::string_view request,
+    std::initializer_list<std::string_view> names) {
+    for (auto name : names) {
+        auto value = ExtractHeaderValue(request, name);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] std::string_view ExtractRequestLine(std::string_view request) {
+    const size_t end = request.find("\r\n");
+    if (end == std::string_view::npos) {
+        return request;
+    }
+    return request.substr(0, end);
+}
+
+[[nodiscard]] std::string_view ExtractRequestPath(std::string_view request_line) {
+    constexpr std::string_view kGet = "GET ";
+    if (!request_line.starts_with(kGet)) {
+        return {};
+    }
+
+    const size_t start = kGet.size();
+    const size_t end = request_line.find(' ', start);
+    if (end == std::string_view::npos || end <= start) {
+        return {};
+    }
+    return request_line.substr(start, end - start);
+}
+
+[[nodiscard]] std::string_view TrimAscii(std::string_view value) {
+    while (!value.empty() &&
+           (value.front() == ' ' || value.front() == '\t' ||
+            value.front() == '\r' || value.front() == '\n')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() &&
+           (value.back() == ' ' || value.back() == '\t' ||
+            value.back() == '\r' || value.back() == '\n')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+[[nodiscard]] std::string SanitizeForLog(std::string_view value, size_t max_len = 160) {
+    value = TrimAscii(value);
+    if (value.empty()) {
+        return "-";
+    }
+
+    const size_t limit = std::min(value.size(), max_len);
+    std::string out;
+    out.reserve(limit + 4);
+
+    for (size_t i = 0; i < limit; ++i) {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            out.push_back(' ');
+        } else if (std::isprint(ch)) {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('?');
+        }
+    }
+
+    if (value.size() > limit) {
+        out.append("...");
+    }
+    return out;
+}
+
 // WebSocket 服务端握手（从原始流读 HTTP 请求，回复 101，返回 WsServerStream）
 cobalt::task<TransportBuildResult> DoWsServerHandshake(
     std::unique_ptr<AsyncStream> stream,
@@ -152,11 +228,41 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
         if (sv.find("\r\n\r\n") != std::string_view::npos) found = true;
     }
     if (!found) {
+        std::string_view partial(unsafe::ptr_cast<char>(buf.data()), total);
         LOG_ACCESS_DEBUG("[WS:{}] server: HTTP upgrade request too large or incomplete", conn_id);
+        LOG_ACCESS_TRACE("[WS:{}] server: incomplete upgrade bytes={} first_line='{}'",
+                         conn_id,
+                         total,
+                         SanitizeForLog(ExtractRequestLine(partial)));
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const std::string_view request(unsafe::ptr_cast<char>(buf.data()), total);
+    const std::string_view request_line = ExtractRequestLine(request);
+    const std::string_view request_path = ExtractRequestPath(request_line);
+    const std::string_view host = ExtractHeaderValueAny(request, {"Host:", "host:"});
+    const std::string_view upgrade = ExtractHeaderValueAny(request, {"Upgrade:", "upgrade:"});
+    const std::string_view connection = ExtractHeaderValueAny(request, {"Connection:", "connection:"});
+    const std::string_view version = ExtractHeaderValueAny(
+        request, {"Sec-WebSocket-Version:", "sec-websocket-version:"});
+    const std::string_view user_agent = ExtractHeaderValueAny(request, {"User-Agent:", "user-agent:"});
+    const std::string_view origin = ExtractHeaderValueAny(request, {"Origin:", "origin:"});
+    const std::string_view subprotocol = ExtractHeaderValueAny(
+        request, {"Sec-WebSocket-Protocol:", "sec-websocket-protocol:"});
+
+    LOG_ACCESS_TRACE(
+        "[WS:{}] server: upgrade request line='{}' path='{}' host='{}' upgrade='{}' connection='{}' version='{}' ua='{}' origin='{}' proto='{}' bytes={}",
+        conn_id,
+        SanitizeForLog(request_line),
+        SanitizeForLog(request_path),
+        SanitizeForLog(host),
+        SanitizeForLog(upgrade),
+        SanitizeForLog(connection),
+        SanitizeForLog(version),
+        SanitizeForLog(user_agent),
+        SanitizeForLog(origin),
+        SanitizeForLog(subprotocol),
+        total);
 
     // 验证 Upgrade 头
     bool has_upgrade =
@@ -165,6 +271,12 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
         request.find("upgrade: websocket")  != std::string::npos;
     if (!has_upgrade) {
         LOG_ACCESS_DEBUG("[WS:{}] server: missing 'Upgrade: websocket' header", conn_id);
+        LOG_ACCESS_TRACE("[WS:{}] server: reject missing upgrade line='{}' host='{}' upgrade='{}' connection='{}'",
+                         conn_id,
+                         SanitizeForLog(request_line),
+                         SanitizeForLog(host),
+                         SanitizeForLog(upgrade),
+                         SanitizeForLog(connection));
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -173,6 +285,11 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
         std::string get_line = "GET " + ws_cfg.path + " ";
         if (request.find(get_line) == std::string::npos) {
             LOG_ACCESS_DEBUG("[WS:{}] server: path mismatch, expected '{}'", conn_id, ws_cfg.path);
+            LOG_ACCESS_TRACE("[WS:{}] server: reject path mismatch expected='{}' actual='{}' line='{}'",
+                             conn_id,
+                             ws_cfg.path,
+                             SanitizeForLog(request_path),
+                             SanitizeForLog(request_line));
             co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
@@ -185,6 +302,11 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
     }
     if (ws_key.empty()) {
         LOG_ACCESS_DEBUG("[WS:{}] server: missing Sec-WebSocket-Key header", conn_id);
+        LOG_ACCESS_TRACE("[WS:{}] server: reject missing key line='{}' host='{}' version='{}'",
+                         conn_id,
+                         SanitizeForLog(request_line),
+                         SanitizeForLog(host),
+                         SanitizeForLog(version));
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -201,8 +323,7 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
             // X-Forwarded-For 可能是逗号分隔列表，取第一个
             auto comma = val.find(',');
             if (comma != std::string_view::npos) val = val.substr(0, comma);
-            while (!val.empty() && val.front() == ' ') val.remove_prefix(1);
-            while (!val.empty() && val.back()  == ' ') val.remove_suffix(1);
+            val = TrimAscii(val);
             if (!val.empty()) *out_real_ip = std::string(val);
         }
     }
@@ -235,6 +356,15 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
     if (header_end < total) {
         ws->SetPendingData(buf.data() + header_end, total - header_end);
     }
+    LOG_ACCESS_TRACE(
+        "[WS:{}] server: handshake accepted path='{}' host='{}' key_len={} pending={} real_ip_header='{}' real_ip='{}'",
+        conn_id,
+        ws_cfg.path.empty() ? "/" : ws_cfg.path,
+        SanitizeForLog(host),
+        TrimAscii(ws_key).size(),
+        header_end < total ? (total - header_end) : 0,
+        ws_cfg.real_ip_header.empty() ? "-" : ws_cfg.real_ip_header,
+        (out_real_ip && !out_real_ip->empty()) ? *out_real_ip : std::string("-"));
     LOG_ACCESS_DEBUG("[WS:{}] server: handshake ok (path={})", conn_id, ws_cfg.path);
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
@@ -247,7 +377,8 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
 cobalt::task<TransportBuildResult> TransportStack::BuildInbound(
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
-    std::string* out_real_ip)
+    std::string* out_real_ip,
+    uint64_t trace_conn_id)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
@@ -277,9 +408,12 @@ cobalt::task<TransportBuildResult> TransportStack::BuildInbound(
 
     // 2. WebSocket 层（服务端）
     if (s.IsWs()) {
-        // conn_id：用自增计数器生成，避免 reinterpret_cast<uintptr_t>（CLAUDE.md 禁止）
-        static std::atomic<uint64_t> s_conn_counter{1};
-        uint64_t conn_id = s_conn_counter.fetch_add(1, std::memory_order_relaxed);
+        uint64_t conn_id = trace_conn_id;
+        if (conn_id == 0) {
+            // 兜底：无上层连接号时使用本地自增计数器
+            static std::atomic<uint64_t> s_conn_counter{1};
+            conn_id = s_conn_counter.fetch_add(1, std::memory_order_relaxed);
+        }
         auto ws_result = co_await DoWsServerHandshake(std::move(stream), s.ws, conn_id, out_real_ip);
         if (!ws_result) {
             LOG_ACCESS_DEBUG("[TransportStack] BuildInbound: WS server handshake failed ({})",

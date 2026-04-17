@@ -31,12 +31,14 @@ public:
     // @param s            StreamSettings（协议+安全配置）
     // @param out_real_ip  若非 nullptr，WS 握手成功且 WsConfig::real_ip_header
     //                     已配置时，写入提取到的真实客户端 IP（否则保持不变）
+    // @param trace_conn_id 若非 0，传输层 trace 日志使用该连接号，便于与上层会话日志关联
     // @return             成功返回完成 TLS 握手、WS 升级后的流；失败返回 ErrorCode
     // -----------------------------------------------------------------------
     static cobalt::task<TransportBuildResult> BuildInbound(
         std::unique_ptr<AsyncStream> raw,
         const StreamSettings& s,
-        std::string* out_real_ip = nullptr);
+        std::string* out_real_ip = nullptr,
+        uint64_t trace_conn_id = 0);
 
     // -----------------------------------------------------------------------
     // 构建出站传输栈（客户端模式）

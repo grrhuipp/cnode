@@ -154,6 +154,11 @@ private:
 #define LOG_ACCESS_FMT(fmt_str, ...) acpp::Log::WriteAccess(std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
 // 无 ctx 的协议层 access 日志（按级别过滤，用于协议解析函数内）
+#define LOG_ACCESS_TRACE(fmt_str, ...) \
+    do { \
+        if (acpp::Log::ShouldLog(acpp::LogLevel::TRACE)) \
+            acpp::Log::WriteAccess(std::format("{} [trace] " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
+    } while(0)
 #define LOG_ACCESS_DEBUG(fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \

@@ -5,9 +5,36 @@
 #include "acppnode/app/session_context.hpp"
 #include "acppnode/panel/v2board_panel.hpp"
 
+#include <algorithm>
 #include <array>
 
 namespace acpp {
+
+namespace {
+
+[[nodiscard]] std::string FormatHexPrefix(const uint8_t* data, size_t len, size_t max_bytes = 24) {
+    if (!data || len == 0) {
+        return "-";
+    }
+
+    const size_t limit = std::min(len, max_bytes);
+    std::string out;
+    out.reserve(limit * 3 + 8);
+    static constexpr char kHex[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < limit; ++i) {
+        if (i > 0) out.push_back(' ');
+        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
+        out.push_back(kHex[data[i] & 0x0F]);
+    }
+
+    if (len > limit) {
+        out.append(" ...");
+    }
+    return out;
+}
+
+}  // namespace
 
 // ============================================================================
 // VMessInboundHandler 实现（代理层，无传输层知识）
@@ -42,11 +69,22 @@ cobalt::task<std::expected<ParsedAction, ErrorCode>> VMessInboundHandler::ParseS
     if (!read_result) co_return std::unexpected(read_result.error());
     const size_t total_read = *read_result;
 
+    LOG_CONN_TRACE(ctx,
+                   "[VMess][{}] handshake bytes={} prefix={}",
+                   tag,
+                   total_read,
+                   FormatHexPrefix(handshake_buf.data(), total_read));
+
     // VMess AEAD 解析（tag 限定范围，减少搜索量）
     vmess::VMessParser parser(user_manager_, tag);
-    auto [request, consumed] = parser.ParseRequest(handshake_buf.data(), total_read);
+    auto [request, consumed] = parser.ParseRequest(handshake_buf.data(), total_read, ctx.conn_id);
 
     if (!request) {
+        LOG_CONN_TRACE(ctx,
+                       "[VMess][{}] auth failed after {} handshake bytes prefix={}",
+                       tag,
+                       total_read,
+                       FormatHexPrefix(handshake_buf.data(), total_read));
         LOG_CONN_FAIL("[{}] VMess auth failed from {}", tag, client_ip);
         OnAuthFail(tag, client_ip);
         co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -58,6 +96,16 @@ cobalt::task<std::expected<ParsedAction, ErrorCode>> VMessInboundHandler::ParseS
             handshake_buf.data() + consumed,
             handshake_buf.data() + total_read);
     }
+
+    LOG_CONN_TRACE(ctx,
+                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
+                   tag,
+                   static_cast<int>(request->command),
+                   static_cast<int>(request->security),
+                   static_cast<int>(request->options),
+                   request->target.ToString(),
+                   consumed,
+                   request->pending_data.size());
 
     // 填充用户信息
     if (request->user) {
