@@ -204,6 +204,29 @@ std::shared_ptr<SslContext> AcquireClientTlsContext(const TlsConfig& config) {
     return out;
 }
 
+[[nodiscard]] std::string FormatHexPrefix(std::span<const uint8_t> data, size_t max_bytes = 24) {
+    if (data.empty()) {
+        return "-";
+    }
+
+    const size_t limit = std::min(data.size(), max_bytes);
+    std::string out;
+    out.reserve(limit * 3 + 8);
+    static constexpr char kHex[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < limit; ++i) {
+        if (i > 0) out.push_back(' ');
+        const uint8_t byte = data[i];
+        out.push_back(kHex[(byte >> 4) & 0x0F]);
+        out.push_back(kHex[byte & 0x0F]);
+    }
+
+    if (data.size() > limit) {
+        out.append(" ...");
+    }
+    return out;
+}
+
 // WebSocket 服务端握手（从原始流读 HTTP 请求，回复 101，返回 WsServerStream）
 cobalt::task<TransportBuildResult> DoWsServerHandshake(
     std::unique_ptr<AsyncStream> stream,
@@ -221,6 +244,12 @@ cobalt::task<TransportBuildResult> DoWsServerHandshake(
             net::buffer(buf.data() + total, buf.size() - total));
         if (n == 0) {
             LOG_ACCESS_DEBUG("[WS:{}] server: peer closed during HTTP upgrade read", conn_id);
+            std::string_view partial(unsafe::ptr_cast<char>(buf.data()), total);
+            LOG_ACCESS_TRACE("[WS:{}] server: peer closed during upgrade read bytes={} first_line='{}' prefix_hex={}",
+                             conn_id,
+                             total,
+                             SanitizeForLog(ExtractRequestLine(partial)),
+                             FormatHexPrefix(std::span<const uint8_t>(buf.data(), total)));
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         total += n;
