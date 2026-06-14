@@ -92,6 +92,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DBUILD_SHARED_LIBS=OFF \
+            -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ env.BUILD_ID }}
 
