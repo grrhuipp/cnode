@@ -33,6 +33,7 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     // 设置 TLS 版本
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     // 加载证书
     if (SSL_CTX_use_certificate_chain_file(ctx, config.cert_file.c_str()) <= 0) {
@@ -217,6 +218,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     SSL_CTX_use_certificate(ctx, default_cert);
     SSL_CTX_use_PrivateKey(ctx, state.pkey);
@@ -240,6 +242,7 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     // 设置 TLS 版本
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     if (config.allow_insecure) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
@@ -269,6 +272,7 @@ TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_ser
     if (!ssl_) {
         throw std::runtime_error("Failed to create SSL object");
     }
+    SSL_set_mode(ssl_, SSL_MODE_RELEASE_BUFFERS);
 
     // 创建内存 BIO 对
     read_bio_ = BIO_new(BIO_s_mem());
