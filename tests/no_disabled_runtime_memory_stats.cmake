@@ -5,6 +5,6 @@ if(NOT cmake_source MATCHES "option\\(CNODE_MEMORY_STATS[^\n]*ON\\)")
     message(FATAL_ERROR "runtime memory stats must be enabled in release builds during RSS tuning")
 endif()
 
-if(NOT monitor_source MATCHES "mem-live: buffer=\\{\\}/\\{\\} .*tls_stream=\\{\\}/\\{\\}")
+if(NOT monitor_source MATCHES "mem-live: async_stream=\\{\\}/\\{\\} tcp_stream=\\{\\}/\\{\\} tls_stream=\\{\\}/\\{\\}")
     message(FATAL_ERROR "runtime memory logs must include live/peak TLS stream counters")
 endif()
