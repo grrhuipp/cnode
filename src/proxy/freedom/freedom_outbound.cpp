@@ -321,16 +321,32 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
+    AsyncStream* inbound_control = inbound.control;
 
     if (buf::TotalLen(first_payload) > 0) {
+        if (inbound_control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound_control,
+                *stream, ctx, stats, first_payload, relay_config);
+        }
         co_return co_await DoRelayLinkWithFirstPacket(
             io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats,
             first_payload, relay_config);
     }
     if (!initial_payload.empty()) {
+        if (inbound_control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound_control,
+                *stream, ctx, stats, initial_payload, relay_config);
+        }
         co_return co_await DoRelayLinkWithFirstPacket(
             io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats,
             initial_payload, relay_config);
+    }
+    if (inbound_control) {
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer, *inbound_control,
+            *stream, ctx, stats, relay_config);
     }
     co_return co_await DoRelayLink(
         io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);

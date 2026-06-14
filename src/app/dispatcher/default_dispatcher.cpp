@@ -144,9 +144,11 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         has_protocol_link ? inbound_link.reader : inbound_endpoint;
     transport::MultiBufferWriter* inbound_writer =
         has_protocol_link ? inbound_link.writer : inbound_endpoint;
-    if (inbound_endpoint) {
-        (void)inbound_endpoint->ConsumePhaseDeadline();
-        inbound_endpoint->ClearPhaseDeadline();
+    AsyncStream* inbound_control =
+        inbound_link.control ? inbound_link.control : inbound_endpoint;
+    if (inbound_control) {
+        (void)inbound_control->ConsumePhaseDeadline();
+        inbound_control->ClearPhaseDeadline();
     }
 
     LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
@@ -312,7 +314,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         inbound_local_addr ? &*inbound_local_addr : nullptr,
         ctx,
         timeouts,
-        transport::Link{inbound_reader, inbound_writer},
+        transport::Link{inbound_reader, inbound_writer, inbound_control},
         relay_cfg,
         use_owned_first_payload
             ? std::span<const uint8_t>{}

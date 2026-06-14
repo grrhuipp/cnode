@@ -424,6 +424,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_half_close_phase_deadline_as_eof.cmake
 )
 
+add_test(
+    NAME no_outbound_link_control_bypass
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_outbound_link_control_bypass.cmake
+)
+
 
 add_test(
     NAME no_dispatcher_protocol_includes

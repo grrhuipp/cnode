@@ -3,6 +3,10 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 
+namespace acpp {
+class AsyncStream;
+}
+
 namespace acpp::transport {
 
 class MultiBufferReader {
@@ -23,6 +27,7 @@ public:
 struct Link {
     MultiBufferReader* reader = nullptr;
     MultiBufferWriter* writer = nullptr;
+    AsyncStream* control = nullptr;
 
     [[nodiscard]] bool Valid() const noexcept {
         return reader && writer;

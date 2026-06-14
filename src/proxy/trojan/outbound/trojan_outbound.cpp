@@ -185,8 +185,15 @@ proxy::trojan::outbound::Handler::Process(
         stream->SetWriteTimeout(relay_write_timeout);
         stream->ClearPhaseDeadline();
 
-        auto result = co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
+        RelayResult result;
+        if (inbound.control) {
+            result = co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                *stream, ctx, stats, relay_config);
+        } else {
+            result = co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
+        }
         result.bytes_up += prewritten_bytes;
         ctx.traffic.bytes_up = result.bytes_up;
         co_return result;
