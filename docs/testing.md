@@ -10,7 +10,7 @@ ctest --test-dir build --output-on-failure
 Current expected local gate count:
 
 ```text
-141/141 tests passed
+145/145 tests passed
 ```
 
 ## Gate Groups
@@ -26,6 +26,8 @@ kept after the migration because they define the final architecture contract:
 - panel/control-plane isolation from traffic hot paths
 - deployment configuration layout
 - AnyTLS wire/config semantics
+- source-in/source-out endpoint preservation across TCP, substreams, Mux, and
+  UDP auto binding
 
 These gates can be consolidated by domain later, but they should not be removed
 without an equivalent broader gate replacing them.

@@ -1417,6 +1417,14 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             ctx.inbound.source_ip        = client_ip;
             ctx.inbound.source_addr      = normalized_client_addr;
             ctx.inbound.source_port      = client_ep.port();
+            if (sock) {
+                IoErrorCode local_ec;
+                const auto local_ep = sock->local_endpoint(local_ec);
+                if (!local_ec && !local_ep.address().is_unspecified()) {
+                    const auto local_addr = iputil::NormalizeAddress(local_ep.address());
+                    ctx.inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
+                }
+            }
             ctx.content.network          = Network::UDP;
             ctx.outbound.original_target           = decoded->target;
             ctx.outbound.target                    = decoded->target;

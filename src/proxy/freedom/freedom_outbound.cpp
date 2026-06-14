@@ -104,13 +104,31 @@ bool PreservesDnsOrder(Handler::DomainStrategy strategy) {
 std::string SelectUdpBindAddress(
     const FreedomSettings& settings,
     const session::Context& ctx) {
+    const bool auto_bind = settings.send_through == constants::binding::kAuto;
     if (!settings.send_through.empty() &&
-        settings.send_through != constants::binding::kAuto &&
+        !auto_bind &&
         !iputil::IsWildcardBindAddress(settings.send_through)) {
         return settings.send_through;
     }
 
     const auto& target = ctx.outbound.target;
+    if (auto_bind && ctx.inbound.local_endpoint) {
+        const auto inbound_local =
+            iputil::NormalizeAddress(ctx.inbound.local_endpoint->address());
+        const bool target_is_v6 =
+            (target.resolved_addr && target.resolved_addr->is_v6()) ||
+            target.type == AddressType::IPv6;
+        const bool target_is_v4 =
+            (target.resolved_addr && target.resolved_addr->is_v4()) ||
+            target.type == AddressType::IPv4;
+        if (!inbound_local.is_unspecified() && !inbound_local.is_loopback() &&
+            ((target_is_v4 && inbound_local.is_v4()) ||
+             (target_is_v6 && inbound_local.is_v6()) ||
+             target.type == AddressType::Domain)) {
+            return inbound_local.to_string();
+        }
+    }
+
     if ((target.resolved_addr && target.resolved_addr->is_v6()) ||
         target.type == AddressType::IPv6) {
         return "::";

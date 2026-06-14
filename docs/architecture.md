@@ -26,14 +26,15 @@ should create a parallel path around this chain.
 - `app/dispatcher` owns the handoff from inbound session metadata to routing and
   outbound selection. It must preserve the accepted local endpoint so
   `sendThrough: "auto"` can keep source-in/source-out behavior even when a
-  protocol exposes only a reader/writer link.
+  protocol exposes only a reader/writer link or carries UDP over a TCP-like
+  substream.
 - `app/router` only makes routing decisions and returns outbound tags.
 - `app/proxyman` owns prepared inbound and outbound handler construction.
 - `transport/internet` owns TCP, TLS, WebSocket, PROXY protocol, and dialer
   mechanics.
 - `app/relay` and `common/mux` only move already-prepared data.
-  Mux sub-sessions inherit the parent inbound local endpoint before dispatching
-  outbound work.
+  Mux TCP and UDP sub-sessions inherit the parent inbound local endpoint before
+  dispatching outbound work.
 - `service/controller` and `api/*` own panel synchronization and never enter the
   hot traffic path.
 

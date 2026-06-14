@@ -31,6 +31,14 @@ same local address as the outbound source. If that bind fails, cnode reports the
 dial failure instead of retrying with a different system-selected source. This
 also applies to protocol substreams such as AnyTLS and Mux: the accepted TCP
 local endpoint is preserved in the session context before substream dispatch.
+UDP traffic follows the same rule whenever the inbound path has a concrete local
+endpoint. This includes UDP-over-TCP paths such as Trojan UDP, VMess UDP over
+TCP/Mux, AnyTLS UoT, and Mux UDP: Freedom UDP with `sendThrough: "auto"` binds
+to the preserved inbound local address. Native UDP listeners record their socket
+local endpoint when they are bound to a concrete local IP; a wildcard UDP
+listener cannot infer the packet's destination local IP without packet-info
+support, so strict per-IP source binding requires explicit local listen
+addresses.
 
 ## Panel example
 
