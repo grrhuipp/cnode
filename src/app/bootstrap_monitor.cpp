@@ -275,7 +275,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
             LOG_INFO("mem-live: buffer={}/{} ({:.1f}MB live) async_stream={}/{} tcp_stream={}/{}",
                      runtime_mem.buffers_live,
                      runtime_mem.buffers_peak,
-                     runtime_mem.buffers_live * sizeof(Buffer) / (1024.0 * 1024.0),
+                     runtime_mem.buffers_live * sizeof(buf::Buffer) / (1024.0 * 1024.0),
                      runtime_mem.async_streams_live,
                      runtime_mem.async_streams_peak,
                      runtime_mem.tcp_streams_live,
