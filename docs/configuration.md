@@ -57,9 +57,7 @@ options are ignored instead of being translated into a cnode-only schema.
       "NodeType": "trojan",
       "ListenIP": "auto",
       "SendIP": "auto",
-      "EnableDNS": false,
-      "DNSType": "",
-      "ProxyProtocol": "auto",
+      "EnableDNS": true,
       "TLSEnable": false,
       "TLSCert": "",
       "TLSKey": ""
@@ -84,9 +82,7 @@ equivalent trusted TLS terminator in front of the listener.
       "NodeType": "anytls",
       "ListenIP": "auto",
       "SendIP": "auto",
-      "EnableDNS": false,
-      "DNSType": "",
-      "ProxyProtocol": "auto",
+      "EnableDNS": true,
       "TLSEnable": true,
       "TLSCert": "/opt/cnode/certs/fullchain.pem",
       "TLSKey": "/opt/cnode/certs/privkey.pem"
@@ -157,6 +153,8 @@ Use `"auto"` when the same node may receive traffic both directly and through a
 load balancer. Use `"on"` only when every connection is guaranteed to come from
 a trusted upstream that always sends PROXY protocol.
 
+When `ProxyProtocol` is omitted, cnode uses `"auto"`.
+
 ## SendIP
 
 `SendIP` controls the local source address used by the panel-created direct
@@ -178,7 +176,8 @@ leave from IP A.
 
 Panel `DNSType` is copied into the generated freedom outbound
 `settings.domainStrategy` when `EnableDNS` is enabled. If `EnableDNS: true` and
-`DNSType` is empty, cnode uses `"UseIP"`.
+`DNSType` is omitted or empty, cnode uses `"UseIP"`. `EnableDNS` defaults to
+`true`.
 
 cnode follows xray-core freedom outbound values:
 

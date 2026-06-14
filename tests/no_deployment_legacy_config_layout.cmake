@@ -41,11 +41,21 @@ if(configuration_doc MATCHES "boolean values are still accepted" OR
 endif()
 
 foreach(file IN ITEMS
-    "${PROJECT_SOURCE_DIR}/docs/configuration.md"
     "${PROJECT_SOURCE_DIR}/config/config.json.example"
     "${PROJECT_SOURCE_DIR}/scripts/cnode.sh")
     file(READ "${file}" content)
-    if(NOT content MATCHES "ProxyProtocol[^\n\r]*(auto|\\\"auto\\\")")
-        message(FATAL_ERROR "Deployment docs/examples/scripts must use final ProxyProtocol string values: ${file}")
+    if(content MATCHES "\"DNSType\"" OR content MATCHES "\"ProxyProtocol\"")
+        message(FATAL_ERROR "Deployment examples/scripts should rely on final DNSType/ProxyProtocol defaults instead of writing those fields: ${file}")
+    endif()
+    if(NOT content MATCHES "\"EnableDNS\"[ \t\r\n]*:[ \t\r\n]*true" AND
+       NOT content MATCHES "EnableDNS:[ \t\r\n]*true")
+        message(FATAL_ERROR "Deployment examples/scripts must default EnableDNS to true: ${file}")
     endif()
 endforeach()
+
+if(NOT configuration_doc MATCHES "When `ProxyProtocol` is omitted, cnode uses `\"auto\"`")
+    message(FATAL_ERROR "Configuration docs must describe omitted ProxyProtocol default")
+endif()
+if(NOT configuration_doc MATCHES "`EnableDNS` defaults to[ \r\n]+`true`")
+    message(FATAL_ERROR "Configuration docs must describe EnableDNS default true")
+endif()

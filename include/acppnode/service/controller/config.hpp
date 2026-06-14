@@ -25,7 +25,7 @@ struct PanelConfig {
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
     std::string ListenIP = std::string(constants::network::kDualStackAuto);
     std::string SendIP = std::string(constants::binding::kAuto);
-    bool EnableDNS = false;
+    bool EnableDNS = true;
     std::string DNSType;
     ProxyProtocolMode ProxyProtocol = ProxyProtocolMode::Auto; // off / auto / on
 

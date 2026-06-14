@@ -401,9 +401,7 @@ add_panel_json() {
             NodeType: $node_type,
             ListenIP: "auto",
             SendIP: "auto",
-            EnableDNS: false,
-            DNSType: "",
-            ProxyProtocol: "auto",
+            EnableDNS: true,
             TLSEnable: false,
             TLSCert: "",
             TLSKey: ""
