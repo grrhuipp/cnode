@@ -2,6 +2,7 @@
 
 #include "../anytls_codec.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
