@@ -22,8 +22,8 @@ namespace acpp::memory {
 
 #ifdef USE_MIMALLOC
 
-inline constexpr long kMimallocPurgeDelayMs = 1000;
-inline constexpr long kMimallocMinimalPurgeSizeKiB = 128;
+inline constexpr long kMimallocPurgeDelayMs = 250;
+inline constexpr long kMimallocMinimalPurgeSizeKiB = 64;
 
 namespace detail {
 
@@ -66,10 +66,13 @@ inline std::pmr::memory_resource* GetThreadLocalHeapResource() noexcept {
 }
 
 inline void ConfigureProcessAllocator() noexcept {
-    mi_option_set_enabled(mi_option_purge_decommits, false);
+    // RSS matters more than virtual retention for long-running proxy workloads.
+    // Allow purged pages to be decommitted so connection churn returns memory to
+    // the OS instead of keeping it resident in worker heaps.
+    mi_option_set_enabled(mi_option_purge_decommits, true);
 
     const long purge_delay = mi_option_get(mi_option_purge_delay);
-    if (purge_delay >= 0 && purge_delay < kMimallocPurgeDelayMs) {
+    if (purge_delay < 0 || purge_delay > kMimallocPurgeDelayMs) {
         mi_option_set(mi_option_purge_delay, kMimallocPurgeDelayMs);
     }
 
