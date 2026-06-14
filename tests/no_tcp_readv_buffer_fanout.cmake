@@ -1,7 +1,7 @@
 file(READ "${PROJECT_SOURCE_DIR}/src/transport/internet/tcp_stream.cpp" tcp_source)
 
-if(NOT tcp_source MATCHES "kMaxReadAllocBuffers[ \t\r\n]*=[ \t\r\n]*2")
-    message(FATAL_ERROR "TcpStream scatter-read must cap pending read buffers at 2")
+if(NOT tcp_source MATCHES "kMaxReadAllocBuffers[ \t\r\n]*=[ \t\r\n]*1")
+    message(FATAL_ERROR "TcpStream reads must keep pending read buffers capped at 1")
 endif()
 
 if(NOT tcp_source MATCHES
@@ -16,4 +16,8 @@ endif()
 
 if(tcp_source MATCHES "std::min\\([ \t\r\n]*n_alloc[ \t\r\n]*\\*[ \t\r\n]*2u[ \t\r\n]*,[ \t\r\n]*8u[ \t\r\n]*\\)")
     message(FATAL_ERROR "TcpStream scatter-read must not grow back to 8 pending relay buffers")
+endif()
+
+if(NOT tcp_source MATCHES "if constexpr \\([ \t\r\n]*kMaxReadAllocBuffers[ \t\r\n]*>[ \t\r\n]*1[ \t\r\n]*\\)")
+    message(FATAL_ERROR "TcpStream must guard scatter-read growth behind kMaxReadAllocBuffers")
 endif()
