@@ -4,13 +4,14 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/bootstrap_setup.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
-#include "acppnode/app/panel_sync.hpp"
+#include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/geo/geodata.hpp"
 #include "acppnode/app/bootstrap.hpp"
 
 #include <iostream>
+#include <exception>
 
 namespace acpp {
 
@@ -19,7 +20,7 @@ namespace acpp {
 // ============================================================================
 int RunFromCommandLine(int argc, char* argv[]) {
     memory::ConfigureProcessAllocator();
-    memory::ThreadScope main_thread_allocator_scope;
+    [[maybe_unused]] memory::ThreadScope main_thread_allocator_scope;
 
     const CommandLineOptions cli = ParseCommandLine(argc, argv);
     if (cli.action == CommandLineAction::Help) {
@@ -40,19 +41,27 @@ int RunFromCommandLine(int argc, char* argv[]) {
 
     if (!Log::Init(config.GetLog().level,
                    config.GetLog().log_dir,
-                   config.GetLog().max_days)) {
+                   config.GetLog().max_days,
+                   config.GetLog().access_path,
+                   config.GetLog().error_path)) {
         std::cerr << "Failed to initialize logging\n";
         return 1;
     }
 
     LOG_CONSOLE("╔═══════════════════════════════════════════════════════════╗");
     LOG_CONSOLE("║              acppnode v1.0.0 - VMess Proxy                ║");
-    LOG_CONSOLE("║       C++23 / Boost.Asio / SO_REUSEPORT / Lock-Free       ║");
+    LOG_CONSOLE("║     C++23 / standalone Asio / SO_REUSEPORT / mimalloc     ║");
     LOG_CONSOLE("╚═══════════════════════════════════════════════════════════╝");
     LOG_CONSOLE("");
     LOG_CONSOLE("Configuration:");
     LOG_CONSOLE("  Workers:        {}", config.GetWorkers());
+#if defined(__APPLE__)
+    LOG_CONSOLE("  I/O backend:    kqueue (macOS)");
+#elif defined(_WIN32)
+    LOG_CONSOLE("  I/O backend:    IOCP (Windows)");
+#else
     LOG_CONSOLE("  I/O backend:    epoll (Linux)");
+#endif
     LOG_CONSOLE("  Accept model:   SO_REUSEPORT per-worker");
 #ifdef USE_MIMALLOC
     LOG_CONSOLE("  Allocator:      mimalloc");
@@ -60,8 +69,18 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("  Allocator:      system");
 #endif
 
-    auto env = CreateBootstrapEnvironment(config, cli.test_mode);
-    RunApplicationRuntime(MakeRuntimeContext(env));
+    if (!config.Validate()) {
+        std::cerr << "Invalid configuration\n";
+        return 1;
+    }
+
+    try {
+        auto env = CreateBootstrapEnvironment(config, cli.test_mode);
+        RunApplicationRuntime(MakeRuntimeContext(env));
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
+        return 1;
+    }
     return 0;
 }
 

@@ -34,41 +34,35 @@ ShardedStats::ShardedStats(uint32_t num_workers)
 
 StatsSnapshot ShardedStats::Aggregate() const {
     StatsSnapshot snapshot;
-    
+
     for (const auto& shard : shards_) {
         // 热点数据
-        snapshot.bytes_in += shard.hot.bytes_in.load(std::memory_order_relaxed);
-        snapshot.bytes_out += shard.hot.bytes_out.load(std::memory_order_relaxed);
-        
+        snapshot.bytes_in += shard.hot.bytes_in;
+        snapshot.bytes_out += shard.hot.bytes_out;
+
         // 冷数据
-        snapshot.connections_total += shard.cold.connections_total.load(std::memory_order_relaxed);
-        snapshot.connections_active += shard.cold.connections_active.load(std::memory_order_relaxed);
-        snapshot.errors += shard.cold.errors.load(std::memory_order_relaxed);
+        snapshot.connections_total += shard.cold.connections_total;
+        snapshot.connections_active += shard.cold.connections_active;
+        snapshot.errors += shard.cold.errors;
     }
-    
-    snapshot.dns_queries = dns_queries_.load(std::memory_order_relaxed);
-    snapshot.dns_cache_hits = dns_cache_hits_.load(std::memory_order_relaxed);
-    snapshot.dns_cache_misses = dns_cache_misses_.load(std::memory_order_relaxed);
-    
     return snapshot;
 }
 
-StatsSnapshot ShardedStats::AggregateWithRate() {
-    // 只读取 sample_coro 每秒计算好的速率，不触发额外采样
-    StatsSnapshot snapshot = Aggregate();
-    snapshot.bytes_in_rate  = current_in_rate_.load(std::memory_order_relaxed);
-    snapshot.bytes_out_rate = current_out_rate_.load(std::memory_order_relaxed);
+StatsSnapshot ShardedStats::WithCurrentRate(StatsSnapshot snapshot) const {
+    snapshot.bytes_in_rate  = current_in_rate_;
+    snapshot.bytes_out_rate = current_out_rate_;
     return snapshot;
 }
 
 void ShardedStats::SampleNow() {
-    auto now = steady_clock::now();
+    SampleNow(Aggregate());
+}
 
+void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {
+    auto now = steady_clock::now();
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_sample_time_).count();
     if (elapsed_ms <= 0) return;
-
-    auto snapshot = Aggregate();
 
     uint64_t delta_in   = snapshot.bytes_in         - last_bytes_in_;
     uint64_t delta_out  = snapshot.bytes_out        - last_bytes_out_;
@@ -97,8 +91,8 @@ void ShardedStats::SampleNow() {
         auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - oldest_start).count();
         if (window_ms > 0) {
-            current_in_rate_.store(window_in  * 1000.0 / window_ms, std::memory_order_relaxed);
-            current_out_rate_.store(window_out * 1000.0 / window_ms, std::memory_order_relaxed);
+            current_in_rate_ = window_in  * 1000.0 / window_ms;
+            current_out_rate_ = window_out * 1000.0 / window_ms;
         }
     }
 
@@ -116,12 +110,12 @@ std::string FormatBytes(uint64_t bytes) {
     constexpr std::string_view units[] = {"B", "KB", "MB", "GB", "TB"};
     int unit_index = 0;
     double value = static_cast<double>(bytes);
-    
+
     while (value >= 1024 && unit_index < 4) {
         value /= 1024;
         unit_index++;
     }
-    
+
     if (unit_index == 0) {
         return std::format("{}{}", bytes, units[unit_index]);
     }

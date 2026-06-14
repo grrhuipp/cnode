@@ -8,13 +8,13 @@
 #include <memory>
 #include <memory_resource>
 #include <new>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #ifdef USE_MIMALLOC
-#include <boost/cobalt/this_thread.hpp>
 #include <mimalloc.h>
 #endif
 
@@ -29,7 +29,6 @@ namespace detail {
 
 inline thread_local mi_heap_t* g_thread_heap = nullptr;
 inline thread_local uint32_t g_thread_scope_depth = 0;
-inline thread_local std::pmr::memory_resource* g_prev_cobalt_resource = nullptr;
 
 }  // namespace detail
 
@@ -74,10 +73,12 @@ inline void ConfigureProcessAllocator() noexcept {
         mi_option_set(mi_option_purge_delay, kMimallocPurgeDelayMs);
     }
 
+#if !defined(MI_MALLOC_VERSION) || MI_MALLOC_VERSION < 300
     const long minimal_purge = mi_option_get(mi_option_minimal_purge_size);
     if (minimal_purge <= 0 || minimal_purge > kMimallocMinimalPurgeSizeKiB) {
         mi_option_set(mi_option_minimal_purge_size, kMimallocMinimalPurgeSizeKiB);
     }
+#endif
 
     std::pmr::set_default_resource(GetThreadLocalHeapResource());
 }
@@ -168,7 +169,9 @@ inline void CollectBurst() noexcept {
 }
 
 inline void MarkThreadPoolThread() noexcept {
+#if !defined(MI_MALLOC_VERSION) || MI_MALLOC_VERSION < 300
     mi_thread_set_in_threadpool();
+#endif
 }
 
 class ThreadScope final {
@@ -177,8 +180,6 @@ public:
         if (detail::g_thread_scope_depth++ == 0) {
             mi_thread_init();
             detail::g_thread_heap = mi_heap_new();
-            detail::g_prev_cobalt_resource =
-                boost::cobalt::this_thread::set_default_resource(GetThreadLocalHeapResource());
         }
     }
 
@@ -193,8 +194,6 @@ public:
                 mi_heap_delete(heap);
                 detail::g_thread_heap = nullptr;
             }
-            boost::cobalt::this_thread::set_default_resource(detail::g_prev_cobalt_resource);
-            detail::g_prev_cobalt_resource = nullptr;
             mi_collect(true);
             mi_thread_done();
         }
@@ -284,6 +283,9 @@ template <class Key,
 using ThreadLocalUnorderedSet =
     std::unordered_set<Key, Hash, Eq, ThreadLocalAllocator<Key>>;
 
+using ThreadLocalString =
+    std::basic_string<char, std::char_traits<char>, ThreadLocalAllocator<char>>;
+
 using ByteVector = ThreadLocalVector<uint8_t>;
 
 #else
@@ -327,23 +329,32 @@ public:
 };
 
 template <class T>
-using ThreadLocalVector = std::vector<T>;
+using ThreadLocalAllocator = std::allocator<T>;
 
 template <class T>
-using ThreadLocalDeque = std::deque<T>;
+using ThreadLocalVector = std::vector<T, ThreadLocalAllocator<T>>;
 
 template <class T>
-using ThreadLocalList = std::list<T>;
+using ThreadLocalDeque = std::deque<T, ThreadLocalAllocator<T>>;
+
+template <class T>
+using ThreadLocalList = std::list<T, ThreadLocalAllocator<T>>;
 
 template <class Key, class Value,
           class Hash = std::hash<Key>,
           class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedMap = std::unordered_map<Key, Value, Hash, Eq>;
+using ThreadLocalUnorderedMap =
+    std::unordered_map<Key, Value, Hash, Eq,
+                       ThreadLocalAllocator<std::pair<const Key, Value>>>;
 
 template <class Key,
           class Hash = std::hash<Key>,
           class Eq = std::equal_to<Key>>
-using ThreadLocalUnorderedSet = std::unordered_set<Key, Hash, Eq>;
+using ThreadLocalUnorderedSet =
+    std::unordered_set<Key, Hash, Eq, ThreadLocalAllocator<Key>>;
+
+using ThreadLocalString =
+    std::basic_string<char, std::char_traits<char>, ThreadLocalAllocator<char>>;
 
 using ByteVector = ThreadLocalVector<uint8_t>;
 

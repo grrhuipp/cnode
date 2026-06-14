@@ -1,26 +1,121 @@
 #pragma once
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/target_address.hpp"
 #include "acppnode/common/error.hpp"
-#include "acppnode/app/session_context.hpp"
-#include "acppnode/app/stats.hpp"
 
-#include <memory>
-#include <chrono>
-#include <functional>
-#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <new>
+#include <span>
+#include <type_traits>
+#include <utility>
 
 namespace acpp {
 
-// ============================================================================
-// UDP 数据包
-// ============================================================================
-struct UDPPacket {
-    TargetAddress target;           // 目标/源地址
-    memory::ByteVector data;        // 原始数据（不含地址头）
+struct TargetAddress;
+class UDPSession;
+
+// UDP receive 回调的只读视图。
+// data 指向 UDPSession 的 receive buffer，仅在同步回调期间有效；
+// 需要排队或跨协程保存时，回调方应复制到 Buffer/MultiBuffer 局部持有类型。
+struct UDPPacketView {
+    const TargetAddress& target;
+    std::span<const uint8_t> data;
 };
+
+// ============================================================================
+// PacketCallback - UDP 回包热路径的小对象回调
+//
+// 只支持 move-only；常见 relay/mux/SS UDP 回包 lambda 直接放在对象内，
+// 注册回调时不经过 std::function 的 type-erasure 堆节点。
+// ============================================================================
+class PacketCallback {
+public:
+    static constexpr size_t kInlineBytes = 176;
+
+    PacketCallback() noexcept = default;
+    PacketCallback(std::nullptr_t) noexcept {}
+
+    PacketCallback(const PacketCallback&) = delete;
+    PacketCallback& operator=(const PacketCallback&) = delete;
+
+    PacketCallback(PacketCallback&& other) noexcept {
+        MoveFrom(std::move(other));
+    }
+
+    PacketCallback& operator=(PacketCallback&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            MoveFrom(std::move(other));
+        }
+        return *this;
+    }
+
+    template <typename Fn>
+        requires (!std::is_same_v<std::decay_t<Fn>, PacketCallback> &&
+                  std::is_invocable_v<std::decay_t<Fn>&, UDPPacketView>)
+    PacketCallback(Fn&& fn) {
+        using F = std::decay_t<Fn>;
+        static_assert(sizeof(F) <= kInlineBytes,
+                      "UDP PacketCallback capture is too large for inline hot-path storage");
+        static_assert(alignof(F) <= alignof(std::max_align_t),
+                      "UDP PacketCallback capture alignment is too large");
+
+        new (storage_) F(std::forward<Fn>(fn));
+        invoke_ = [](void* ptr, UDPPacketView pkt) {
+            (*static_cast<F*>(ptr))(pkt);
+        };
+        move_ = [](void* dst, void* src) {
+            new (dst) F(std::move(*static_cast<F*>(src)));
+            static_cast<F*>(src)->~F();
+        };
+        destroy_ = [](void* ptr) {
+            static_cast<F*>(ptr)->~F();
+        };
+    }
+
+    ~PacketCallback() {
+        Reset();
+    }
+
+    explicit operator bool() const noexcept {
+        return invoke_ != nullptr;
+    }
+
+    void operator()(UDPPacketView pkt) {
+        invoke_(storage_, pkt);
+    }
+
+    void Reset() noexcept {
+        if (destroy_) {
+            destroy_(storage_);
+        }
+        invoke_ = nullptr;
+        move_ = nullptr;
+        destroy_ = nullptr;
+    }
+
+private:
+    void MoveFrom(PacketCallback&& other) noexcept {
+        invoke_ = other.invoke_;
+        move_ = other.move_;
+        destroy_ = other.destroy_;
+        if (move_) {
+            move_(storage_, other.storage_);
+            other.invoke_ = nullptr;
+            other.move_ = nullptr;
+            other.destroy_ = nullptr;
+        }
+    }
+
+    alignas(std::max_align_t) std::byte storage_[kInlineBytes]{};
+    void (*invoke_)(void*, UDPPacketView) = nullptr;
+    void (*move_)(void*, void*) = nullptr;
+    void (*destroy_)(void*) = nullptr;
+};
+
+// UDP 拨号不再有独立结果壳：UDP-capable 出站的 DialUDP/DispatchUDP 直接返回
+// 当前 Worker 的 `UDPSession*`（nullptr 表示拨号失败）。datagram 入站（原生 SS
+// UDP 监听、Mux UDP 子会话）直接在该 session 上 SendTo/RegisterCallback。
 
 // ============================================================================
 // UDP Relay 结果
@@ -30,15 +125,6 @@ struct UDPRelayResult : ResultStatus {
     uint64_t bytes_down = 0;
     bool client_closed_first = false;
 };
-
-// ============================================================================
-// UDP 接收回调类型
-// ============================================================================
-using UDPReceiveCallback = std::function<void(
-    const net::ip::address& from_addr,
-    uint16_t from_port,
-    const uint8_t* data,
-    size_t len)>;
 
 // ============================================================================
 // UDP Relay 配置

@@ -2,13 +2,14 @@
 
 #include "acppnode/app/bootstrap_runtime.hpp"
 
-#include <atomic>
+#include <asio/signal_set.hpp>
+
 #include <memory>
 
 namespace acpp {
 
-[[nodiscard]] std::shared_ptr<net::signal_set> InstallShutdownHandler(
+[[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
     const RuntimeContext& ctx,
-    std::atomic<bool>& running);
+    RuntimeState& state);
 
 }  // namespace acpp

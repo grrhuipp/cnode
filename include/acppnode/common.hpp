@@ -4,22 +4,24 @@
 // acppnode - Common Definitions (umbrella header)
 //
 // 子模块头文件（可单独 include）：
-//   common/unique_function.hpp  — unique_function<> move-only wrapper
 //   common/network.hpp          — Network 枚举、AddressType 枚举
-//   common/conn_state.hpp       — ConnState 枚举
 //   common/defaults.hpp         — defaults:: 命名空间常量
 //   common/clock.hpp            — 时间工具（NowMicros/NowMillis/FormatBytes 等）
 // ============================================================================
 
-#include <boost/asio.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ip/udp.hpp>
-#include <boost/cobalt.hpp>
+#include <asio.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/awaitable.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/ip/udp.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/system_error.hpp>
 
 // Windows 兼容性
 #ifdef _WIN32
-// 宏污染清理（boost/asio.hpp 间接包含 <windows.h>）
+// 宏污染清理（asio.hpp 间接包含 <windows.h>）
 #  ifdef ERROR
 #    undef ERROR
 #  endif
@@ -56,40 +58,43 @@
 #include <functional>
 
 // 子模块
-#include "acppnode/common/unique_function.hpp"
+#include "acppnode/common/asio_types.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/common/network.hpp"
-#include "acppnode/common/conn_state.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/clock.hpp"
 
 namespace acpp {
 
 // ============================================================================
-// Boost.Asio + Boost.Cobalt 别名
-// ============================================================================
-namespace net = boost::asio;
-namespace cobalt = boost::cobalt;
-using tcp = net::ip::tcp;
-using udp = net::ip::udp;
-
-// ============================================================================
 // 前向声明
 // ============================================================================
 struct TargetAddress;
-struct SessionContext;
 struct SniffResult;
 struct DialResult;
+namespace app::dns {
 struct DnsCacheStats;
-struct PanelUser;
-struct NodeConfig;
-struct TrafficData;
+class DNS;
+}  // namespace app::dns
+namespace api {
+struct UserInfo;
+struct NodeInfo;
+struct UserTraffic;
+struct NodeStatus;
+}  // namespace api
 
 class AsyncStream;
 class Datagram;
-class IOutbound;
-class IDnsService;
-class IPanel;
+class Outbound;
+
+namespace session {
+struct Context;
+}  // namespace session
+
+namespace api {
+class API;
+struct ClientInfo;
+}  // namespace api
 
 class Config;
 class Stats;

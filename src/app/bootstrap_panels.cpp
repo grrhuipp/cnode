@@ -1,39 +1,51 @@
 #include "acppnode/app/bootstrap_panels.hpp"
 
-#include "acppnode/app/panel_sync.hpp"
+#include "acppnode/api/panel_factory.hpp"
+#include "acppnode/service/controller/controller.hpp"
+#include "acppnode/service/controller/config.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/panel/v2board_panel.hpp"
+
+#include <stdexcept>
 
 namespace acpp {
 
 void SetupPanels(net::io_context& main_ctx,
-                 PanelSyncManager& sync_manager,
-                 const Config& config) {
+                 Controller& controller,
+                 const Config& config,
+                 app::dns::DNS& panel_dns_service) {
     if (config.GetPanels().empty()) {
         return;
     }
 
     LOG_CONSOLE("Panels:");
     for (const auto& panel_config : config.GetPanels()) {
-        V2BoardConfig v2cfg;
-        v2cfg.name      = panel_config.name;
-        v2cfg.api_host  = panel_config.api_host;
-        v2cfg.api_key   = panel_config.api_key;
-        v2cfg.node_type = panel_config.node_type;
+        if (!panel_config.Validate()) {
+            throw std::runtime_error("invalid panel config");
+        }
+        for (int node_id : panel_config.NodeIDs) {
+            api::Config api_config;
+            api_config.Name = panel_config.Name;
+            api_config.APIHost = panel_config.APIHost;
+            api_config.Key = panel_config.Key;
+            api_config.NodeID = node_id;
+            api_config.NodeType = panel_config.NodeType;
 
-        // 面板同步临时改走 Asio resolver，避开当前自定义 DNS 协程崩溃路径。
-        auto panel = CreateV2BoardPanel(main_ctx.get_executor(), v2cfg, nullptr);
-        sync_manager.AddPanel(std::move(panel), panel_config);
+            PanelConfig node_panel_config = panel_config;
+            node_panel_config.NodeIDs = {node_id};
+
+            auto panel = api::CreatePanelClient(main_ctx, api_config, panel_dns_service);
+            controller.AddPanel(std::move(panel), node_panel_config);
+        }
 
         std::string node_ids_str;
-        for (size_t i = 0; i < panel_config.node_ids.size(); ++i) {
+        for (size_t i = 0; i < panel_config.NodeIDs.size(); ++i) {
             if (i > 0) node_ids_str += ", ";
-            node_ids_str += std::to_string(panel_config.node_ids[i]);
+            node_ids_str += std::to_string(panel_config.NodeIDs[i]);
         }
         LOG_CONSOLE("  - {} [{}] ({}): nodes=[{}]",
-                    panel_config.name, panel_config.node_type,
-                    panel_config.api_host, node_ids_str);
+                    panel_config.Name, panel_config.NodeType,
+                    panel_config.APIHost, node_ids_str);
     }
 }
 

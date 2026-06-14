@@ -2,7 +2,7 @@
 
 /**
  * acpp::unsafe - Unsafe 操作集中管理模块（ISSUE-02-02）
- * 
+ *
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │ ⚠️  警告：本模块包含可能导致未定义行为的操作                              │
  * │                                                                         │
@@ -26,6 +26,7 @@
 #include <span>
 #include <limits>
 #include <string>
+#include <string_view>
 
 namespace acpp {
 namespace unsafe {
@@ -41,13 +42,13 @@ using byte = uint8_t;
 
 /**
  * 将指针转换为另一类型
- * 
+ *
  * 危险：可能违反严格别名规则（Strict Aliasing）
  * 安全使用条件：
  *   - To 是 char/unsigned char/std::byte（总是安全）
  *   - From 和 To 布局兼容
  *   - 指针对齐正确
- * 
+ *
  * @tparam To 目标类型
  * @tparam From 源类型
  * @param ptr 源指针
@@ -56,7 +57,7 @@ using byte = uint8_t;
 template<typename To, typename From>
 [[nodiscard]] inline To* ptr_cast(From* ptr) noexcept {
     static_assert(!std::is_same_v<To, void>, "Cannot cast to void*");
-    
+
 #ifdef ACPP_DEBUG
     // Debug 模式：检查对齐
     if (ptr != nullptr) {
@@ -64,7 +65,7 @@ template<typename To, typename From>
                "Unaligned pointer cast!");
     }
 #endif
-    
+
     return reinterpret_cast<To*>(ptr);
 }
 
@@ -74,14 +75,14 @@ template<typename To, typename From>
 template<typename To, typename From>
 [[nodiscard]] inline const To* ptr_cast(const From* ptr) noexcept {
     static_assert(!std::is_same_v<To, void>, "Cannot cast to void*");
-    
+
 #ifdef ACPP_DEBUG
     if (ptr != nullptr) {
         assert(reinterpret_cast<uintptr_t>(ptr) % alignof(To) == 0 &&
                "Unaligned pointer cast!");
     }
 #endif
-    
+
     return reinterpret_cast<const To*>(ptr);
 }
 
@@ -96,11 +97,11 @@ template<typename T>
 
 /**
  * 从字节数组读取整数（网络字节序/大端）
- * 
+ *
  * 安全条件：
  *   - src 至少有 sizeof(T) 字节可读
  *   - T 是整数类型
- * 
+ *
  * @tparam T 整数类型
  * @param src 源字节数组
  * @return 读取的值（已转换为主机字节序）
@@ -108,7 +109,7 @@ template<typename T>
 template<typename T>
 [[nodiscard]] inline T read_be(const byte* src) noexcept {
     static_assert(std::is_integral_v<T>, "T must be integral");
-    
+
     if constexpr (sizeof(T) == 1) {
         return static_cast<T>(*src);
     } else if constexpr (sizeof(T) == 2) {
@@ -143,7 +144,7 @@ template<typename T>
 template<typename T>
 [[nodiscard]] inline T read_le(const byte* src) noexcept {
     static_assert(std::is_integral_v<T>, "T must be integral");
-    
+
     if constexpr (sizeof(T) == 1) {
         return static_cast<T>(*src);
     } else if constexpr (sizeof(T) == 2) {
@@ -174,7 +175,7 @@ template<typename T>
 
 /**
  * 向字节数组写入整数（网络字节序/大端）
- * 
+ *
  * 安全条件：
  *   - dst 至少有 sizeof(T) 字节可写
  *   - T 是整数类型
@@ -182,7 +183,7 @@ template<typename T>
 template<typename T>
 inline void write_be(byte* dst, T value) noexcept {
     static_assert(std::is_integral_v<T>, "T must be integral");
-    
+
     if constexpr (sizeof(T) == 1) {
         *dst = static_cast<byte>(value);
     } else if constexpr (sizeof(T) == 2) {
@@ -211,7 +212,7 @@ inline void write_be(byte* dst, T value) noexcept {
 template<typename T>
 inline void write_le(byte* dst, T value) noexcept {
     static_assert(std::is_integral_v<T>, "T must be integral");
-    
+
     if constexpr (sizeof(T) == 1) {
         *dst = static_cast<byte>(value);
     } else if constexpr (sizeof(T) == 2) {
@@ -240,14 +241,14 @@ inline void write_le(byte* dst, T value) noexcept {
 
 /**
  * 安全的内存复制（带边界检查）
- * 
+ *
  * @param dst 目标缓冲区
  * @param dst_size 目标缓冲区大小
  * @param src 源缓冲区
  * @param count 要复制的字节数
  * @return true 成功，false 缓冲区溢出
  */
-[[nodiscard]] inline bool memcpy_safe(void* dst, size_t dst_size, 
+[[nodiscard]] inline bool memcpy_safe(void* dst, size_t dst_size,
                                        const void* src, size_t count) noexcept {
     if (count > dst_size) {
         return false;
@@ -258,7 +259,7 @@ inline void write_le(byte* dst, T value) noexcept {
 
 /**
  * 不安全的内存复制（无边界检查，仅供性能关键路径使用）
- * 
+ *
  * 调用前必须确保：
  *   - dst 至少有 count 字节可写
  *   - src 至少有 count 字节可读
@@ -270,9 +271,9 @@ inline void memcpy_unsafe(void* dst, const void* src, size_t count) noexcept {
 
 /**
  * 零拷贝类型转换
- * 
+ *
  * 将字节数组直接解释为指定类型（适用于 POD 类型）
- * 
+ *
  * 安全条件：
  *   - T 是 POD/trivially copyable 类型
  *   - src 至少有 sizeof(T) 字节
@@ -281,7 +282,7 @@ inline void memcpy_unsafe(void* dst, const void* src, size_t count) noexcept {
 template<typename T>
 [[nodiscard]] inline T bit_cast(const byte* src) noexcept {
     static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
-    
+
     T result;
     std::memcpy(&result, src, sizeof(T));
     return result;
@@ -293,9 +294,9 @@ template<typename T>
 
 /**
  * 将一种类型的位模式重新解释为另一种类型
- * 
+ *
  * 这是标准的 bit_cast 实现，在 C++20 中可使用 std::bit_cast
- * 
+ *
  * 安全条件：
  *   - sizeof(To) == sizeof(From)
  *   - To 和 From 都是 trivially copyable
@@ -305,7 +306,7 @@ template<typename To, typename From>
     static_assert(sizeof(To) == sizeof(From), "Size mismatch");
     static_assert(std::is_trivially_copyable_v<To>, "To must be trivially copyable");
     static_assert(std::is_trivially_copyable_v<From>, "From must be trivially copyable");
-    
+
     To dst;
     std::memcpy(&dst, &src, sizeof(To));
     return dst;
@@ -417,24 +418,24 @@ template<typename T>
 
 /**
  * 恒定时间内存比较（防止时序攻击）
- * 
+ *
  * 与 CRYPTO_memcmp 类似，始终比较所有字节
  */
 [[nodiscard]] inline bool constant_time_compare(
-    const void* a, size_t a_len, 
+    const void* a, size_t a_len,
     const void* b, size_t b_len) noexcept {
-    
+
     // 长度不同时也要执行比较以保持恒定时间
     volatile size_t len = std::min(a_len, b_len);
     volatile unsigned char result = (a_len != b_len) ? 1 : 0;
-    
+
     const volatile unsigned char* pa = static_cast<const volatile unsigned char*>(a);
     const volatile unsigned char* pb = static_cast<const volatile unsigned char*>(b);
-    
+
     for (size_t i = 0; i < len; ++i) {
         result |= pa[i] ^ pb[i];
     }
-    
+
     return result == 0;
 }
 
@@ -442,8 +443,14 @@ template<typename T>
  * 恒定时间字符串比较
  */
 [[nodiscard]] inline bool constant_time_string_compare(
-    const std::string& a, 
+    const std::string& a,
     const std::string& b) noexcept {
+    return constant_time_compare(a.data(), a.size(), b.data(), b.size());
+}
+
+[[nodiscard]] inline bool constant_time_string_compare(
+    std::string_view a,
+    std::string_view b) noexcept {
     return constant_time_compare(a.data(), a.size(), b.data(), b.size());
 }
 

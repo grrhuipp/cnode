@@ -1,18 +1,26 @@
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include <boost/json/src.hpp>  // 仅在此 TU 提供 Boost.JSON 实现
+#include "acppnode/infra/json.hpp"
+#include "../app/proxyman/outbound/source_config.hpp"
 
 #include <fstream>
 #include <iterator>
 #include <utility>
+#include <vector>
 
 namespace acpp {
 
 namespace {
 
+std::optional<json::value> ParseConfigContent(
+    const std::filesystem::path&,
+    std::string_view content) {
+    return json::parse(content);
+}
+
 // 从磁盘读取并解析单个 JSON 文件
-std::optional<boost::json::value> LoadJsonFile(const std::filesystem::path& path) {
+std::optional<json::value> LoadJsonFile(const std::filesystem::path& path) {
     if (!std::filesystem::exists(path)) {
         return std::nullopt;
     }
@@ -25,18 +33,87 @@ std::optional<boost::json::value> LoadJsonFile(const std::filesystem::path& path
     try {
         std::string content((std::istreambuf_iterator<char>(file)),
                             std::istreambuf_iterator<char>());
-        return boost::json::parse(content);
+        return ParseConfigContent(path, content);
     } catch (const std::exception& e) {
         LOG_CONSOLE("  ERROR: Failed to parse {}: {}", path.filename().string(), e.what());
         return std::nullopt;
     }
 }
 
+template <typename AddFn>
+void LoadConfigItems(const json::value& value, AddFn&& add) {
+    if (value.is_array()) {
+        for (const auto& item : value.as_array()) {
+            add(item.as_object());
+        }
+    } else if (value.is_object()) {
+        add(value.as_object());
+    }
+}
+
+const json::value& SelectConfigList(const json::value& value, std::string_view key) {
+    if (value.is_object()) {
+        if (const auto* nested = value.as_object().if_contains(key); nested) {
+            return *nested;
+        }
+    }
+    return value;
+}
+
+RoutingConfig ParseRoutingConfigValue(const json::value& value) {
+    const auto& obj = value.as_object();
+    if (auto* routing = obj.if_contains("routing"); routing && routing->is_object()) {
+        return RoutingConfig::FromJson(routing->as_object());
+    }
+    return RoutingConfig::FromJson(obj);
+}
+
+std::optional<proxyman::outbound::PreparedOutboundConfig> PrepareOutboundForLoad(
+    proxyman::outbound::OutboundSourceConfig raw_config) {
+    auto prepared = proxyman::outbound::PrepareOutboundConfig(raw_config);
+    if (!prepared) {
+        LOG_WARN("  Skipped outbound '{}' with unsupported protocol '{}'",
+                 raw_config.tag, raw_config.protocol);
+        return std::nullopt;
+    }
+    return prepared;
+}
+
+void LoadInboundItems(
+    std::vector<StaticInboundConfig>& inbounds,
+    const json::value& value,
+    std::string_view source_name) {
+    size_t count_before = inbounds.size();
+    LoadConfigItems(value, [&](const json::object& item) {
+        inbounds.push_back(StaticInboundConfig::FromJson(item));
+    });
+    LOG_CONSOLE("  Loaded: {} ({} inbounds)",
+                source_name,
+                inbounds.size() - count_before);
+}
+
+void LoadOutboundItems(
+    std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds,
+    const json::value& value,
+    std::string_view source_name) {
+    size_t count_before = outbounds.size();
+    LoadConfigItems(value, [&](const json::object& item) {
+        auto prepared = PrepareOutboundForLoad(
+            proxyman::outbound::OutboundSourceConfig::FromJson(item));
+        if (prepared) {
+            outbounds.push_back(std::move(*prepared));
+        }
+    });
+    LOG_CONSOLE("  Loaded: {} ({} outbounds)",
+                source_name,
+                outbounds.size() - count_before);
+}
+
 }  // namespace
 
 std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     std::filesystem::path config_dir;
-    boost::json::value main_config;
+    json::value main_config;
 
     LOG_CONSOLE("Loading configuration from: {}", path.string());
 
@@ -48,20 +125,22 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         auto config_path = path / constants::paths::kDefaultConfigFile;
         if (auto j = LoadJsonFile(config_path)) {
             main_config = std::move(*j);
-            LOG_CONSOLE("  Loaded: {}", constants::paths::kDefaultConfigFile);
+            LOG_CONSOLE("  Loaded: {}", config_path.filename().string());
         } else {
-            main_config = boost::json::object{};
+            main_config = json::object{};
             LOG_CONSOLE("  {} not found, using defaults", constants::paths::kDefaultConfigFile);
         }
     } else {
-        config_dir = path.parent_path();
+        auto file_path = path;
+
+        config_dir = file_path.parent_path();
         if (config_dir.empty()) {
             config_dir = ".";
         }
         LOG_CONSOLE("  Mode: file");
         LOG_CONSOLE("  Config directory: {}", config_dir.string());
 
-        std::ifstream file(path);
+        std::ifstream file(file_path);
         if (!file.is_open()) {
             LOG_ERROR("Failed to open config file: {}", path.string());
             return std::nullopt;
@@ -70,15 +149,16 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         try {
             std::string content((std::istreambuf_iterator<char>(file)),
                                 std::istreambuf_iterator<char>());
-            main_config = boost::json::parse(content);
-            LOG_CONSOLE("  Loaded: {}", path.filename().string());
+            main_config = *ParseConfigContent(file_path, content);
+            LOG_CONSOLE("  Loaded: {}", file_path.filename().string());
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to parse config file: {}", e.what());
             return std::nullopt;
         }
     }
 
-    auto cfg_opt = LoadFromJson(main_config.as_object());
+    const auto& main_object = main_config.as_object();
+    auto cfg_opt = LoadFromJson(main_object);
     if (!cfg_opt) {
         return std::nullopt;
     }
@@ -88,45 +168,34 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 
     LOG_CONSOLE("  Scanning for additional config files...");
 
-    if (auto j = LoadJsonFile(config_dir / constants::paths::kInboundFile)) {
+    const auto default_inbound_path = config_dir / constants::paths::kInboundFile;
+    if (auto j = LoadJsonFile(default_inbound_path)) {
         try {
-            size_t count_before = cfg.inbounds_.size();
-            if (j->is_array()) {
-                for (const auto& item : j->as_array()) {
-                    cfg.inbounds_.push_back(InboundConfig::FromJson(item.as_object()));
-                }
-            } else if (j->is_object()) {
-                cfg.inbounds_.push_back(InboundConfig::FromJson(j->as_object()));
-            }
-            LOG_CONSOLE("  Loaded: {} ({} inbounds)",
-                        constants::paths::kInboundFile,
-                        cfg.inbounds_.size() - count_before);
+            LoadInboundItems(
+                cfg.static_inbounds_,
+                SelectConfigList(*j, "inbounds"),
+                constants::paths::kInboundFile);
         } catch (const std::exception& e) {
             LOG_WARN("  Failed to parse {}: {}", constants::paths::kInboundFile, e.what());
         }
     }
 
-    if (auto j = LoadJsonFile(config_dir / constants::paths::kOutboundFile)) {
+    const auto default_outbound_path = config_dir / constants::paths::kOutboundFile;
+    if (auto j = LoadJsonFile(default_outbound_path)) {
         try {
-            size_t count_before = cfg.outbounds_.size();
-            if (j->is_array()) {
-                for (const auto& item : j->as_array()) {
-                    cfg.outbounds_.push_back(OutboundConfig::FromJson(item.as_object()));
-                }
-            } else if (j->is_object()) {
-                cfg.outbounds_.push_back(OutboundConfig::FromJson(j->as_object()));
-            }
-            LOG_CONSOLE("  Loaded: {} ({} outbounds)",
-                        constants::paths::kOutboundFile,
-                        cfg.outbounds_.size() - count_before);
+            LoadOutboundItems(
+                cfg.prepared_outbounds_,
+                SelectConfigList(*j, "outbounds"),
+                constants::paths::kOutboundFile);
         } catch (const std::exception& e) {
             LOG_WARN("  Failed to parse {}: {}", constants::paths::kOutboundFile, e.what());
         }
     }
 
-    if (auto j = LoadJsonFile(config_dir / constants::paths::kRouteFile)) {
+    const auto default_route_path = config_dir / constants::paths::kRouteFile;
+    if (auto j = LoadJsonFile(default_route_path)) {
         try {
-            cfg.routing_ = RoutingConfig::FromJson(j->as_object());
+            cfg.routing_ = ParseRoutingConfigValue(*j);
             LOG_CONSOLE("  Loaded: {} ({} rules)",
                         constants::paths::kRouteFile,
                         cfg.routing_.rules.size());
@@ -137,29 +206,31 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 
     bool has_direct = false;
     bool has_blackhole = false;
-    for (const auto& ob : cfg.outbounds_) {
+    for (const auto& ob : cfg.prepared_outbounds_) {
         if (ob.tag == constants::protocol::kDirect) has_direct = true;
         if (ob.tag == constants::protocol::kBlackhole) has_blackhole = true;
     }
 
     if (!has_direct) {
-        OutboundConfig direct;
+        proxyman::outbound::OutboundSourceConfig direct;
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
-        direct.settings = boost::json::object{
-            {"sendThrough", constants::binding::kAuto},
-            {"domainStrategy", constants::protocol::kAsIs}
-        };
-        cfg.outbounds_.insert(cfg.outbounds_.begin(), direct);
-        LOG_CONSOLE("  Added built-in outbound: {} (SendThrough: {})",
+        auto prepared = proxyman::outbound::PrepareOutboundConfig(direct);
+        if (prepared) {
+            cfg.prepared_outbounds_.insert(cfg.prepared_outbounds_.begin(), std::move(*prepared));
+        }
+        LOG_CONSOLE("  Added built-in outbound: {} (sendThrough: {})",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
 
     if (!has_blackhole) {
-        OutboundConfig blackhole;
+        proxyman::outbound::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
-        cfg.outbounds_.push_back(blackhole);
+        auto prepared = PrepareOutboundForLoad(std::move(blackhole));
+        if (prepared) {
+            cfg.prepared_outbounds_.push_back(std::move(*prepared));
+        }
         LOG_CONSOLE("  Added built-in outbound: {}", constants::protocol::kBlackhole);
     }
 
@@ -174,12 +245,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 
     LOG_CONSOLE("Configuration summary:");
     LOG_CONSOLE("  Workers: {}", cfg.workers_);
-    LOG_CONSOLE("  Inbounds: {}", cfg.inbounds_.size());
-    LOG_CONSOLE("  Outbounds: {}", cfg.outbounds_.size());
+    LOG_CONSOLE("  Inbounds: {}", cfg.static_inbounds_.size());
+    LOG_CONSOLE("  Outbounds: {}", cfg.prepared_outbounds_.size());
     LOG_CONSOLE("  Route rules: {}", cfg.routing_.rules.size());
     LOG_CONSOLE("  Default outbound: {}",
-                cfg.outbounds_.empty() ? std::string(constants::protocol::kDirect)
-                                       : cfg.outbounds_.front().tag);
+                cfg.prepared_outbounds_.empty() ? std::string(constants::protocol::kDirect)
+                                                : cfg.prepared_outbounds_.front().tag);
     if (!cfg.panels_.empty()) {
         LOG_CONSOLE("  Panels: {}", cfg.panels_.size());
     }

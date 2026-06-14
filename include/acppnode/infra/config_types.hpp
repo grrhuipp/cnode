@@ -1,0 +1,71 @@
+#pragma once
+
+#include "acppnode/common/defaults.hpp"
+#include "acppnode/core/constants.hpp"
+#include "acppnode/infra/json.hpp"
+#include "acppnode/infra/runtime_config_types.hpp"
+#include "acppnode/proxy/sniff_config.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace acpp {
+
+// ============================================================================
+// 日志配置
+// ============================================================================
+struct LogConfig {
+    std::string level = std::string(constants::logging::kDefaultLevel);  // trace/debug/info/warn/error
+    std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
+    std::filesystem::path access_path;
+    std::filesystem::path error_path;
+    uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）
+
+    static LogConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// DNS 配置
+// ============================================================================
+struct DnsConfig {
+    std::vector<std::string> servers = {"8.8.8.8", "1.1.1.1"};
+    uint32_t timeout = defaults::kDnsTimeout;
+    uint32_t cache_size = defaults::kDnsCacheSize;
+    uint32_t min_ttl = defaults::kDnsMinTTL;
+    uint32_t max_ttl = defaults::kDnsMaxTTL;
+
+    static DnsConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
+// 入站配置
+// ============================================================================
+struct StaticUser {
+    std::string id;
+    std::string password;
+    std::string email;
+};
+
+struct StaticUserConfig {
+    std::string method = std::string(constants::protocol::kAes256Gcm);
+    std::string padding_scheme;
+    std::vector<StaticUser> clients;
+};
+
+struct StaticInboundConfig {
+    std::vector<std::string> tags;
+    std::string protocol;
+    std::string listen = std::string(constants::network::kDualStackAuto);
+    uint16_t port = 0;
+    StaticUserConfig static_users;
+    StreamSettings stream_settings;
+    SniffConfig sniffing;
+    std::string outbound_tag;
+
+    static StaticInboundConfig FromJson(const json::object& j);
+};
+
+}  // namespace acpp

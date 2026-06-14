@@ -1,37 +1,28 @@
 #pragma once
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/target_address.hpp"
-#include <span>
+#include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 
 namespace acpp {
+
+struct TargetAddress;
 
 // ============================================================================
 // 嗅探结果
 // ============================================================================
 struct SniffResult {
     bool success = false;           // 是否嗅探成功
-    std::string protocol;           // 协议类型："tls", "http", "quic"
+    std::string_view protocol;      // 协议类型："tls", "http", "quic"（常量视图）
     std::string domain;             // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
 
     // 转换为 TargetAddress
-    [[nodiscard]] TargetAddress ToTarget() const {
-        TargetAddress addr;
-        addr.type = AddressType::Domain;
-        addr.host = domain;
-        addr.port = port;
-        return addr;
-    }
+    [[nodiscard]] TargetAddress ToTarget() const;
 
-    [[nodiscard]] std::string ToString() const {
-        if (!success) return std::string(constants::state::kNone);
-        if (port > 0) {
-            return protocol + ":" + domain + ":" + std::to_string(port);
-        }
-        return protocol + ":" + domain;
-    }
+    [[nodiscard]] std::string ToString() const;
 };
 
 // ============================================================================
@@ -42,8 +33,8 @@ public:
     SniffResult Sniff(std::span<const uint8_t> data);
 
 private:
-    std::optional<std::string> ParseClientHello(std::span<const uint8_t> data);
-    std::optional<std::string> ExtractSNI(std::span<const uint8_t> extensions);
+    std::optional<std::string_view> ParseClientHello(std::span<const uint8_t> data);
+    std::optional<std::string_view> ExtractSNI(std::span<const uint8_t> extensions);
 };
 
 // ============================================================================
@@ -54,8 +45,12 @@ public:
     SniffResult Sniff(std::span<const uint8_t> data);
 
 private:
-    std::optional<std::pair<std::string, uint16_t>> ParseHttpHost(
-        std::span<const uint8_t> data);
+    struct HostPortView {
+        std::string_view host;
+        uint16_t port = 0;
+    };
+
+    std::optional<HostPortView> ParseHttpHost(std::span<const uint8_t> data);
 };
 
 // ============================================================================

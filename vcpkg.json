@@ -3,11 +3,8 @@
     "version": "1.0.0",
     "description": "High-performance C++23 proxy server",
     "dependencies": [
-        "boost-asio",
-        "boost-beast",
-        "boost-cobalt",
-        "boost-json",
-        "boost-log",
+        "asio",
+        "openssl",
         "mimalloc",
         "zlib"
     ],

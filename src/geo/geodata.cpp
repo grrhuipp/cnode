@@ -1,25 +1,245 @@
 #include "acppnode/geo/geodata.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
-#include <fstream>
+#include "acppnode/common/string_hash.hpp"
+
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace acpp {
 namespace geo {
 
+// ============================================================================
+// IP CIDR 表示
+// ============================================================================
+struct CIDR {
+    std::array<uint8_t, 16> addr;
+    uint8_t prefix;
+    bool is_v6 = false;
+
+    bool Contains(const net::ip::address& ip) const;
+};
+
+// ============================================================================
+// IPv4 Radix Trie — 位前缀树，O(32) 最坏查询
+// ============================================================================
+class IPv4RadixTrie {
+public:
+    void Insert(uint32_t ip, uint8_t prefix);
+    bool Match(uint32_t ip) const;
+    bool Empty() const { return nodes_.size() <= 1; }
+
+private:
+    struct Node {
+        int children[2]{-1, -1};
+        bool terminal = false;
+    };
+    std::vector<Node> nodes_{1};
+};
+
+// ============================================================================
+// IPv6 Radix Trie — 位前缀树，O(128) 最坏查询
+// ============================================================================
+class IPv6RadixTrie {
+public:
+    void Insert(const std::array<uint8_t, 16>& ip, uint8_t prefix);
+    bool Match(const std::array<uint8_t, 16>& ip) const;
+    bool Empty() const { return nodes_.size() <= 1; }
+
+private:
+    struct Node {
+        int children[2]{-1, -1};
+        bool terminal = false;
+    };
+    std::vector<Node> nodes_{1};
+};
+
+// ============================================================================
+// GeoIP 数据
+// ============================================================================
+class GeoIPData {
+public:
+    void AddCIDR(const CIDR& cidr);
+    void AddCIDR(const std::string& cidr_str);
+    void BuildIndex();
+    bool Match(const net::ip::address& ip) const;
+    bool Match(const std::string& ip_str) const;
+    size_t Size() const { return cidrs_v4_.size() + cidrs_v6_.size(); }
+
+private:
+    std::vector<CIDR> cidrs_v4_;
+    std::vector<CIDR> cidrs_v6_;
+    IPv4RadixTrie trie_v4_;
+    IPv6RadixTrie trie_v6_;
+    bool index_built_ = false;
+};
+
+// ============================================================================
+// 域名后缀 Trie — 反向字符 trie，O(域名长度) 查询
+// ============================================================================
+class SuffixTrie {
+public:
+    void Insert(const std::string& domain);
+    bool Match(std::string_view domain) const;
+    bool Empty() const { return nodes_.size() <= 1; }
+
+private:
+    struct Child {
+        char ch;
+        int node_index;
+    };
+
+    struct Node {
+        std::vector<Child> children;
+        bool terminal = false;
+    };
+    std::vector<Node> nodes_{1};
+};
+
+class GeoSiteData {
+public:
+    enum class Type {
+        PLAIN,
+        DomainSuffix,
+        FULL,
+        REGEXP
+    };
+
+    struct Entry {
+        Type type;
+        std::string value;
+    };
+
+    void AddEntry(Type type, const std::string& value);
+    bool Match(std::string_view domain) const;
+    size_t Size() const { return entries_.size(); }
+
+private:
+    std::vector<Entry> entries_;
+    std::unordered_set<std::string, TransparentStringHash,
+                       TransparentStringEq> full_domains_;
+    SuffixTrie suffix_trie_;
+    std::vector<std::string> plain_keywords_;
+};
+
+// ============================================================================
+// GeoIP 懒加载器
+// ============================================================================
+class GeoIPLoader {
+public:
+    explicit GeoIPLoader(const std::filesystem::path& dat_path);
+
+    GeoIPData* Get(const std::string& tag);
+    bool Match(std::string_view tag, const net::ip::address& ip);
+    bool HasTag(const std::string& tag);
+    std::vector<std::string> GetAllTags();
+    size_t LoadedCount() const;
+    void Finalize() { finalized_ = true; }
+    bool IsFinalized() const { return finalized_; }
+
+private:
+    bool LoadIndex();
+    GeoIPData* LoadTag(const std::string& tag);
+
+    std::filesystem::path dat_path_;
+    bool index_loaded_ = false;
+
+    struct TagInfo {
+        uint64_t offset;
+        uint64_t size;
+    };
+    std::unordered_map<std::string, TagInfo, TransparentStringHash, TransparentStringEq> tag_index_;
+
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<std::string, std::unique_ptr<GeoIPData>,
+                       TransparentStringHash, TransparentStringEq> loaded_;
+
+    bool finalized_ = false;
+};
+
+// ============================================================================
+// GeoSite 懒加载器
+// ============================================================================
+class GeoSiteLoader {
+public:
+    explicit GeoSiteLoader(const std::filesystem::path& dat_path);
+
+    GeoSiteData* Get(const std::string& tag);
+    bool Match(std::string_view tag, std::string_view domain);
+    bool HasTag(const std::string& tag);
+    std::vector<std::string> GetAllTags();
+    size_t LoadedCount() const;
+    void Finalize() { finalized_ = true; }
+    bool IsFinalized() const { return finalized_; }
+
+private:
+    bool LoadIndex();
+    GeoSiteData* LoadTag(const std::string& tag);
+
+    std::filesystem::path dat_path_;
+    bool index_loaded_ = false;
+
+    struct TagInfo {
+        uint64_t offset;
+        uint64_t size;
+    };
+    std::unordered_map<std::string, TagInfo, TransparentStringHash, TransparentStringEq> tag_index_;
+
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<std::string, std::unique_ptr<GeoSiteData>,
+                       TransparentStringHash, TransparentStringEq> loaded_;
+
+    bool finalized_ = false;
+};
+
+struct GeoManager::Impl {
+    std::unique_ptr<GeoIPLoader> geoip_loader;
+    std::unique_ptr<GeoSiteLoader> geosite_loader;
+};
+
 namespace {
+
+char LowerAscii(unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+}
+
+std::string LowerTag(std::string_view tag) {
+    std::string lower(tag);
+    std::ranges::transform(lower, lower.begin(), LowerAscii);
+    return lower;
+}
+
+auto LowerBoundSuffixChild(auto& children, char ch) {
+    return std::lower_bound(
+        children.begin(), children.end(), ch,
+        [](const auto& child, char value) {
+            return child.ch < value;
+        });
+}
 
 bool MatchPrefix(const uint8_t* ip, const uint8_t* cidr, uint8_t prefix) {
     size_t full_bytes = prefix / 8;
     size_t remaining_bits = prefix % 8;
-    
+
     // 比较完整字节
     if (std::memcmp(ip, cidr, full_bytes) != 0) {
         return false;
     }
-    
+
     // 比较剩余位
     if (remaining_bits > 0) {
         uint8_t mask = 0xFF << (8 - remaining_bits);
@@ -27,7 +247,7 @@ bool MatchPrefix(const uint8_t* ip, const uint8_t* cidr, uint8_t prefix) {
             return false;
         }
     }
-    
+
     return true;
 }
 
@@ -38,6 +258,12 @@ bool MatchPrefix(const uint8_t* ip, const uint8_t* cidr, uint8_t prefix) {
 // ============================================================================
 
 bool CIDR::Contains(const net::ip::address& ip) const {
+    if (is_v6) {
+        if (!ip.is_v6()) return false;
+        auto ip_bytes = ip.to_v6().to_bytes();
+        return MatchPrefix(ip_bytes.data(), addr.data(), prefix);
+    }
+
     if (!ip.is_v4()) {
         return false;
     }
@@ -54,28 +280,40 @@ std::optional<CIDR> ParseCIDR(const std::string& str) {
     if (slash_pos == std::string::npos) {
         return std::nullopt;
     }
-    
+
     std::string ip_str = str.substr(0, slash_pos);
     std::string prefix_str = str.substr(slash_pos + 1);
-    
-    boost::system::error_code ec;
+
+    IoErrorCode ec;
     auto addr = net::ip::make_address(ip_str, ec);
     if (ec) {
         return std::nullopt;
     }
-    
+
     int prefix = std::stoi(prefix_str);
-    
-    CIDR cidr;
-    cidr.prefix = static_cast<uint8_t>(prefix);
-    if (!addr.is_v4()) {
+
+    if (addr.is_v4()) {
+        if (prefix < 0 || prefix > 32) {
+            return std::nullopt;
+        }
+        CIDR cidr;
+        cidr.prefix = static_cast<uint8_t>(prefix);
+        auto bytes = addr.to_v4().to_bytes();
+        std::memcpy(cidr.addr.data(), bytes.data(), 4);
+        return cidr;
+    } else if (addr.is_v6()) {
+        if (prefix < 0 || prefix > 128) {
+            return std::nullopt;
+        }
+        CIDR cidr;
+        cidr.prefix = static_cast<uint8_t>(prefix);
+        cidr.is_v6 = true;
+        auto bytes = addr.to_v6().to_bytes();
+        std::memcpy(cidr.addr.data(), bytes.data(), 16);
+        return cidr;
+    } else {
         return std::nullopt;
     }
-
-    auto bytes = addr.to_v4().to_bytes();
-    std::memcpy(cidr.addr.data(), bytes.data(), 4);
-    
-    return cidr;
 }
 
 }  // anonymous namespace
@@ -110,6 +348,37 @@ bool IPv4RadixTrie::Match(uint32_t ip) const {
 }
 
 // ============================================================================
+// IPv6 Radix Trie 实现
+// ============================================================================
+
+void IPv6RadixTrie::Insert(const std::array<uint8_t, 16>& ip, uint8_t prefix) {
+    int node = 0;
+    for (uint8_t i = 0; i < prefix; ++i) {
+        const uint8_t byte = ip[i / 8];
+        const int bit = (byte >> (7 - (i % 8))) & 1;
+        if (nodes_[node].children[bit] < 0) {
+            nodes_[node].children[bit] = static_cast<int>(nodes_.size());
+            nodes_.push_back({});
+        }
+        node = nodes_[node].children[bit];
+    }
+    nodes_[node].terminal = true;
+}
+
+bool IPv6RadixTrie::Match(const std::array<uint8_t, 16>& ip) const {
+    int node = 0;
+    for (uint8_t i = 0; i < 128; ++i) {
+        if (nodes_[node].terminal) return true;
+        const uint8_t byte = ip[i / 8];
+        const int bit = (byte >> (7 - (i % 8))) & 1;
+        const int next = nodes_[node].children[bit];
+        if (next < 0) return false;
+        node = next;
+    }
+    return nodes_[node].terminal;
+}
+
+// ============================================================================
 // SuffixTrie 实现（域名后缀匹配用）
 // ============================================================================
 
@@ -119,14 +388,16 @@ void SuffixTrie::Insert(const std::string& domain) {
     for (auto it = domain.rbegin(); it != domain.rend(); ++it) {
         char c = static_cast<char>(::tolower(static_cast<unsigned char>(*it)));
         auto& children = nodes_[node].children;
-        auto child_it = children.find(c);
-        if (child_it == children.end()) {
+        auto child_it = LowerBoundSuffixChild(children, c);
+        if (child_it == children.end() || child_it->ch != c) {
             int new_id = static_cast<int>(nodes_.size());
-            children[c] = new_id;
             nodes_.push_back({});
+            auto& refreshed_children = nodes_[node].children;
+            auto insert_it = LowerBoundSuffixChild(refreshed_children, c);
+            refreshed_children.insert(insert_it, SuffixTrie::Child{c, new_id});
             node = new_id;
         } else {
-            node = child_it->second;
+            node = child_it->node_index;
         }
     }
     // 标记为域名边界（需要在 '.' 处才算真正的后缀匹配）
@@ -140,10 +411,11 @@ bool SuffixTrie::Match(std::string_view domain) const {
     // 反向遍历域名，在 trie 中查找
     for (auto it = domain.rbegin(); it != domain.rend(); ++it) {
         char c = static_cast<char>(::tolower(static_cast<unsigned char>(*it)));
-        auto& children = nodes_[node].children;
-        auto child_it = children.find(c);
+        const auto& children = nodes_[node].children;
+        auto child_it = LowerBoundSuffixChild(children, c);
         if (child_it == children.end()) return false;
-        node = child_it->second;
+        if (child_it->ch != c) return false;
+        node = child_it->node_index;
 
         // 在 '.' 边界或域名开头检查是否匹配
         if (nodes_[node].terminal) {
@@ -163,7 +435,13 @@ bool SuffixTrie::Match(std::string_view domain) const {
 // ============================================================================
 
 void GeoIPData::AddCIDR(const CIDR& cidr) {
-    cidrs_v4_.push_back(cidr);
+    if (cidr.is_v6) {
+        if (cidr.prefix > 128) return;
+        cidrs_v6_.push_back(cidr);
+    } else {
+        if (cidr.prefix > 32) return;
+        cidrs_v4_.push_back(cidr);
+    }
 }
 
 void GeoIPData::AddCIDR(const std::string& cidr_str) {
@@ -186,32 +464,48 @@ void GeoIPData::BuildIndex() {
         trie_v4_.Insert(ip, cidr.prefix);
     }
 
+    // 构建 IPv6 radix trie
+    trie_v6_ = IPv6RadixTrie{};
+    for (const auto& cidr : cidrs_v6_) {
+        trie_v6_.Insert(cidr.addr, cidr.prefix);
+    }
+
     index_built_ = true;
 }
 
 bool GeoIPData::Match(const net::ip::address& ip) const {
-    if (!ip.is_v4()) {
+    if (ip.is_v4()) {
+        if (index_built_) {
+            auto bytes = ip.to_v4().to_bytes();
+            uint32_t ip_val = (static_cast<uint32_t>(bytes[0]) << 24) |
+                              (static_cast<uint32_t>(bytes[1]) << 16) |
+                              (static_cast<uint32_t>(bytes[2]) << 8)  |
+                              static_cast<uint32_t>(bytes[3]);
+            return trie_v4_.Match(ip_val);
+        }
+        for (const auto& cidr : cidrs_v4_) {
+            if (cidr.Contains(ip)) {
+                return true;
+            }
+        }
         return false;
     }
 
-    if (index_built_) {
-        auto bytes = ip.to_v4().to_bytes();
-        uint32_t ip_val = (static_cast<uint32_t>(bytes[0]) << 24) |
-                          (static_cast<uint32_t>(bytes[1]) << 16) |
-                          (static_cast<uint32_t>(bytes[2]) << 8)  |
-                          static_cast<uint32_t>(bytes[3]);
-        return trie_v4_.Match(ip_val);
-    }
-    for (const auto& cidr : cidrs_v4_) {
-        if (cidr.Contains(ip)) {
-            return true;
+    if (ip.is_v6()) {
+        if (index_built_) {
+            return trie_v6_.Match(ip.to_v6().to_bytes());
+        }
+        for (const auto& cidr : cidrs_v6_) {
+            if (cidr.Contains(ip)) {
+                return true;
+            }
         }
     }
     return false;
 }
 
 bool GeoIPData::Match(const std::string& ip_str) const {
-    boost::system::error_code ec;
+    IoErrorCode ec;
     auto ip = net::ip::make_address(ip_str, ec);
     if (ec) {
         return false;
@@ -230,7 +524,7 @@ void GeoSiteData::AddEntry(Type type, const std::string& value) {
     // 建立快速查找索引
     if (type == Type::FULL) {
         full_domains_.insert(value);
-    } else if (type == Type::DOMAIN) {
+    } else if (type == Type::DomainSuffix) {
         suffix_trie_.Insert(value);
     } else if (type == Type::PLAIN) {
         // 小写存储用于包含匹配
@@ -241,7 +535,7 @@ void GeoSiteData::AddEntry(Type type, const std::string& value) {
     }
 }
 
-bool GeoSiteData::Match(const std::string& domain) const {
+bool GeoSiteData::Match(std::string_view domain) const {
     // 使用栈上 buffer 进行小写转换，避免堆分配
     char stack_buf[128];
     std::string heap_buf;
@@ -260,7 +554,7 @@ bool GeoSiteData::Match(const std::string& domain) const {
     std::string_view lower_domain(lower_ptr, domain.size());
 
     // 1. 完全匹配（O(1) 哈希查找）
-    if (full_domains_.count(std::string(lower_domain)) > 0) {
+    if (full_domains_.contains(lower_domain)) {
         return true;
     }
 
@@ -282,7 +576,7 @@ bool GeoSiteData::Match(const std::string& domain) const {
 // ============================================================================
 // V2Ray dat 文件格式
 // ============================================================================
-// 
+//
 // GeoIP dat 文件格式 (protobuf):
 // message GeoIP {
 //   string country_code = 1;
@@ -370,43 +664,43 @@ bool GeoIPLoader::LoadIndex() {
     if (index_loaded_) {
         return true;
     }
-    
+
     std::ifstream file(dat_path_, std::ios::binary);
     if (!file) {
         LOG_ERROR("GeoIP: failed to open {}", dat_path_.string());
         return false;
     }
-    
+
     // 读取整个文件
     file.seekg(0, std::ios::end);
     size_t file_size = file.tellg();
     file.seekg(0, std::ios::beg);
-    
+
     std::vector<uint8_t> data(file_size);
     file.read(unsafe::ptr_cast<char>(data.data()), file_size);
-    
+
     const uint8_t* ptr = data.data();
     const uint8_t* end = ptr + file_size;
-    
+
     // 解析 GeoIPList
     while (ptr < end) {
         uint64_t tag_value = ReadVarint(ptr, end);
         uint32_t field_number = static_cast<uint32_t>(tag_value >> 3);
         uint32_t wire_type = static_cast<uint32_t>(tag_value & 0x7);
-        
+
         if (field_number == 1 && wire_type == 2) {
             // GeoIP entry
             auto [entry_data, entry_len] = ReadLengthDelimited(ptr, end);
             const uint8_t* entry_ptr = entry_data;
             const uint8_t* entry_end = entry_data + entry_len;
-            
+
             std::string country_code;
-            
+
             while (entry_ptr < entry_end) {
                 uint64_t sub_tag = ReadVarint(entry_ptr, entry_end);
                 uint32_t sub_field = static_cast<uint32_t>(sub_tag >> 3);
                 uint32_t sub_wire = static_cast<uint32_t>(sub_tag & 0x7);
-                
+
                 if (sub_field == 1 && sub_wire == 2) {
                     // country_code
                     auto [cc_data, cc_len] = ReadLengthDelimited(entry_ptr, entry_end);
@@ -421,7 +715,7 @@ bool GeoIPLoader::LoadIndex() {
                     SkipField(entry_ptr, entry_end, sub_wire);
                 }
             }
-            
+
             if (!country_code.empty()) {
                 TagInfo info;
                 info.offset = entry_data - data.data();
@@ -432,94 +726,112 @@ bool GeoIPLoader::LoadIndex() {
             SkipField(ptr, end, wire_type);
         }
     }
-    
+
     index_loaded_ = true;
     LOG_DEBUG("GeoIP: indexed {} tags from {}", tag_index_.size(), dat_path_.string());
     return true;
 }
 
-std::shared_ptr<GeoIPData> GeoIPLoader::Get(const std::string& tag) {
+GeoIPData* GeoIPLoader::Get(const std::string& tag) {
     std::string lower_tag = tag;
     std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
-    
-    // 无锁快速路径：加载完成后不需要锁
-    if (finalized_.load(std::memory_order_acquire)) {
+
+    // 快速路径：启动预加载完成后不需要锁
+    if (finalized_) {
         auto it = loaded_.find(lower_tag);
-        return (it != loaded_.end()) ? it->second : nullptr;
+        return (it != loaded_.end()) ? it->second.get() : nullptr;
     }
-    
+
     // 加载阶段需要锁
     {
         std::shared_lock lock(mutex_);
         auto it = loaded_.find(lower_tag);
         if (it != loaded_.end()) {
-            return it->second;
+            return it->second.get();
         }
     }
-    
+
     // 加载
     return LoadTag(lower_tag);
 }
 
-std::shared_ptr<GeoIPData> GeoIPLoader::LoadTag(const std::string& tag) {
+bool GeoIPLoader::Match(std::string_view tag, const net::ip::address& ip) {
+    if (finalized_) {
+        // Route construction lowercases geo tags before finalize; hot path only
+        // does a read-only lookup and never allocates a compatibility copy.
+        auto it = loaded_.find(tag);
+        return it != loaded_.end() && it->second && it->second->Match(ip);
+    }
+
+    std::string lower_tag = LowerTag(tag);
+    auto data = Get(lower_tag);
+    return data && data->Match(ip);
+}
+
+GeoIPData* GeoIPLoader::LoadTag(const std::string& tag) {
     std::unique_lock lock(mutex_);
-    
+
     // 双重检查
     auto it = loaded_.find(tag);
     if (it != loaded_.end()) {
-        return it->second;
+        return it->second.get();
     }
-    
+
     if (!LoadIndex()) {
         return nullptr;
     }
-    
+
     auto tag_it = tag_index_.find(tag);
     if (tag_it == tag_index_.end()) {
         LOG_DEBUG("GeoIP: tag '{}' not found", tag);
         return nullptr;
     }
-    
+
     // 读取并解析
     std::ifstream file(dat_path_, std::ios::binary);
     if (!file) {
         return nullptr;
     }
-    
+
     file.seekg(tag_it->second.offset);
     std::vector<uint8_t> data(tag_it->second.size);
     file.read(unsafe::ptr_cast<char>(data.data()), data.size());
-    
-    auto geoip_data = std::make_shared<GeoIPData>();
-    
+
+    auto geoip_data = std::make_unique<GeoIPData>();
+    auto* geoip_ptr = geoip_data.get();
+
     const uint8_t* ptr = data.data();
     const uint8_t* end = ptr + data.size();
-    
+
     while (ptr < end) {
         uint64_t tag_value = ReadVarint(ptr, end);
         uint32_t field_number = static_cast<uint32_t>(tag_value >> 3);
         uint32_t wire_type = static_cast<uint32_t>(tag_value & 0x7);
-        
+
         if (field_number == 2 && wire_type == 2) {
             // CIDR
             auto [cidr_data, cidr_len] = ReadLengthDelimited(ptr, end);
             const uint8_t* cidr_ptr = cidr_data;
             const uint8_t* cidr_end = cidr_data + cidr_len;
-            
+
             CIDR cidr;
-            std::memset(cidr.addr.data(), 0, 4);
+            cidr.addr.fill(0);
             cidr.prefix = 0;
-            
+
             while (cidr_ptr < cidr_end) {
                 uint64_t sub_tag = ReadVarint(cidr_ptr, cidr_end);
                 uint32_t sub_field = static_cast<uint32_t>(sub_tag >> 3);
                 uint32_t sub_wire = static_cast<uint32_t>(sub_tag & 0x7);
-                
+
                 if (sub_field == 1 && sub_wire == 2) {
                     // ip bytes
                     auto [ip_data, ip_len] = ReadLengthDelimited(cidr_ptr, cidr_end);
                     if (ip_len == 4) {
                         std::memcpy(cidr.addr.data(), ip_data, 4);
+                        cidr.is_v6 = false;
+                    } else if (ip_len == 16) {
+                        std::memcpy(cidr.addr.data(), ip_data, 16);
+                        cidr.is_v6 = true;
                     }
                 } else if (sub_field == 2 && sub_wire == 0) {
                     // prefix
@@ -528,7 +840,7 @@ std::shared_ptr<GeoIPData> GeoIPLoader::LoadTag(const std::string& tag) {
                     SkipField(cidr_ptr, cidr_end, sub_wire);
                 }
             }
-            
+
             geoip_data->AddCIDR(cidr);
         } else {
             SkipField(ptr, end, wire_type);
@@ -538,17 +850,17 @@ std::shared_ptr<GeoIPData> GeoIPLoader::LoadTag(const std::string& tag) {
     // 构建 IPv4 radix trie 索引加速查询
     geoip_data->BuildIndex();
 
-    loaded_[tag] = geoip_data;
-    LOG_DEBUG("GeoIP: loaded tag '{}' with {} CIDRs", tag, geoip_data->Size());
-    
-    return geoip_data;
+    loaded_[tag] = std::move(geoip_data);
+    LOG_DEBUG("GeoIP: loaded tag '{}' with {} CIDRs", tag, geoip_ptr->Size());
+
+    return geoip_ptr;
 }
 
 bool GeoIPLoader::HasTag(const std::string& tag) {
     if (!index_loaded_) {
         LoadIndex();
     }
-    
+
     std::string lower_tag = tag;
     std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
     return tag_index_.count(lower_tag) > 0;
@@ -558,7 +870,7 @@ std::vector<std::string> GeoIPLoader::GetAllTags() {
     if (!index_loaded_) {
         LoadIndex();
     }
-    
+
     std::vector<std::string> tags;
     for (const auto& [tag, _] : tag_index_) {
         tags.push_back(tag);
@@ -567,7 +879,7 @@ std::vector<std::string> GeoIPLoader::GetAllTags() {
 }
 
 size_t GeoIPLoader::LoadedCount() const {
-    if (finalized_.load(std::memory_order_acquire)) {
+    if (finalized_) {
         return loaded_.size();
     }
     std::shared_lock lock(mutex_);
@@ -586,40 +898,40 @@ bool GeoSiteLoader::LoadIndex() {
     if (index_loaded_) {
         return true;
     }
-    
+
     std::ifstream file(dat_path_, std::ios::binary);
     if (!file) {
         LOG_ERROR("GeoSite: failed to open {}", dat_path_.string());
         return false;
     }
-    
+
     file.seekg(0, std::ios::end);
     size_t file_size = file.tellg();
     file.seekg(0, std::ios::beg);
-    
+
     std::vector<uint8_t> data(file_size);
     file.read(unsafe::ptr_cast<char>(data.data()), file_size);
-    
+
     const uint8_t* ptr = data.data();
     const uint8_t* end = ptr + file_size;
-    
+
     while (ptr < end) {
         uint64_t tag_value = ReadVarint(ptr, end);
         uint32_t field_number = static_cast<uint32_t>(tag_value >> 3);
         uint32_t wire_type = static_cast<uint32_t>(tag_value & 0x7);
-        
+
         if (field_number == 1 && wire_type == 2) {
             auto [entry_data, entry_len] = ReadLengthDelimited(ptr, end);
             const uint8_t* entry_ptr = entry_data;
             const uint8_t* entry_end = entry_data + entry_len;
-            
+
             std::string country_code;
-            
+
             while (entry_ptr < entry_end) {
                 uint64_t sub_tag = ReadVarint(entry_ptr, entry_end);
                 uint32_t sub_field = static_cast<uint32_t>(sub_tag >> 3);
                 uint32_t sub_wire = static_cast<uint32_t>(sub_tag & 0x7);
-                
+
                 if (sub_field == 1 && sub_wire == 2) {
                     auto [cc_data, cc_len] = ReadLengthDelimited(entry_ptr, entry_end);
                     country_code.assign(unsafe::ptr_cast<const char>(cc_data), cc_len);
@@ -629,7 +941,7 @@ bool GeoSiteLoader::LoadIndex() {
                     SkipField(entry_ptr, entry_end, sub_wire);
                 }
             }
-            
+
             if (!country_code.empty()) {
                 TagInfo info;
                 info.offset = entry_data - data.data();
@@ -640,92 +952,106 @@ bool GeoSiteLoader::LoadIndex() {
             SkipField(ptr, end, wire_type);
         }
     }
-    
+
     index_loaded_ = true;
     LOG_DEBUG("GeoSite: indexed {} tags from {}", tag_index_.size(), dat_path_.string());
     return true;
 }
 
-std::shared_ptr<GeoSiteData> GeoSiteLoader::Get(const std::string& tag) {
+GeoSiteData* GeoSiteLoader::Get(const std::string& tag) {
     std::string lower_tag = tag;
     std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
-    
-    // 无锁快速路径：加载完成后不需要锁
-    if (finalized_.load(std::memory_order_acquire)) {
+
+    // 快速路径：启动预加载完成后不需要锁
+    if (finalized_) {
         auto it = loaded_.find(lower_tag);
-        return (it != loaded_.end()) ? it->second : nullptr;
+        return (it != loaded_.end()) ? it->second.get() : nullptr;
     }
-    
+
     // 加载阶段需要锁
     {
         std::shared_lock lock(mutex_);
         auto it = loaded_.find(lower_tag);
         if (it != loaded_.end()) {
-            return it->second;
+            return it->second.get();
         }
     }
-    
+
     return LoadTag(lower_tag);
 }
 
-std::shared_ptr<GeoSiteData> GeoSiteLoader::LoadTag(const std::string& tag) {
+bool GeoSiteLoader::Match(std::string_view tag, std::string_view domain) {
+    if (finalized_) {
+        // Route construction lowercases geo tags before finalize; hot path only
+        // does a read-only lookup and never allocates a compatibility copy.
+        auto it = loaded_.find(tag);
+        return it != loaded_.end() && it->second && it->second->Match(domain);
+    }
+
+    std::string lower_tag = LowerTag(tag);
+    auto data = Get(lower_tag);
+    return data && data->Match(domain);
+}
+
+GeoSiteData* GeoSiteLoader::LoadTag(const std::string& tag) {
     std::unique_lock lock(mutex_);
-    
+
     auto it = loaded_.find(tag);
     if (it != loaded_.end()) {
-        return it->second;
+        return it->second.get();
     }
-    
+
     if (!LoadIndex()) {
         return nullptr;
     }
-    
+
     auto tag_it = tag_index_.find(tag);
     if (tag_it == tag_index_.end()) {
         LOG_DEBUG("GeoSite: tag '{}' not found", tag);
         return nullptr;
     }
-    
+
     std::ifstream file(dat_path_, std::ios::binary);
     if (!file) {
         return nullptr;
     }
-    
+
     file.seekg(tag_it->second.offset);
     std::vector<uint8_t> data(tag_it->second.size);
     file.read(unsafe::ptr_cast<char>(data.data()), data.size());
-    
-    auto geosite_data = std::make_shared<GeoSiteData>();
-    
+
+    auto geosite_data = std::make_unique<GeoSiteData>();
+    auto* geosite_ptr = geosite_data.get();
+
     const uint8_t* ptr = data.data();
     const uint8_t* end = ptr + data.size();
-    
+
     while (ptr < end) {
         uint64_t tag_value = ReadVarint(ptr, end);
         uint32_t field_number = static_cast<uint32_t>(tag_value >> 3);
         uint32_t wire_type = static_cast<uint32_t>(tag_value & 0x7);
-        
+
         if (field_number == 2 && wire_type == 2) {
             // Domain
             auto [domain_data, domain_len] = ReadLengthDelimited(ptr, end);
             const uint8_t* domain_ptr = domain_data;
             const uint8_t* domain_end = domain_data + domain_len;
-            
+
             GeoSiteData::Type type = GeoSiteData::Type::PLAIN;
             std::string value;
-            
+
             while (domain_ptr < domain_end) {
                 uint64_t sub_tag = ReadVarint(domain_ptr, domain_end);
                 uint32_t sub_field = static_cast<uint32_t>(sub_tag >> 3);
                 uint32_t sub_wire = static_cast<uint32_t>(sub_tag & 0x7);
-                
+
                 if (sub_field == 1 && sub_wire == 0) {
                     // type
                     uint64_t type_val = ReadVarint(domain_ptr, domain_end);
                     switch (type_val) {
                         case 0: type = GeoSiteData::Type::PLAIN; break;
                         case 1: type = GeoSiteData::Type::REGEXP; break;
-                        case 2: type = GeoSiteData::Type::DOMAIN; break;
+                        case 2: type = GeoSiteData::Type::DomainSuffix; break;
                         case 3: type = GeoSiteData::Type::FULL; break;
                         default: break;
                     }
@@ -737,7 +1063,7 @@ std::shared_ptr<GeoSiteData> GeoSiteLoader::LoadTag(const std::string& tag) {
                     SkipField(domain_ptr, domain_end, sub_wire);
                 }
             }
-            
+
             if (!value.empty()) {
                 geosite_data->AddEntry(type, value);
             }
@@ -745,18 +1071,18 @@ std::shared_ptr<GeoSiteData> GeoSiteLoader::LoadTag(const std::string& tag) {
             SkipField(ptr, end, wire_type);
         }
     }
-    
-    loaded_[tag] = geosite_data;
-    LOG_DEBUG("GeoSite: loaded tag '{}' with {} entries", tag, geosite_data->Size());
-    
-    return geosite_data;
+
+    loaded_[tag] = std::move(geosite_data);
+    LOG_DEBUG("GeoSite: loaded tag '{}' with {} entries", tag, geosite_ptr->Size());
+
+    return geosite_ptr;
 }
 
 bool GeoSiteLoader::HasTag(const std::string& tag) {
     if (!index_loaded_) {
         LoadIndex();
     }
-    
+
     std::string lower_tag = tag;
     std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
     return tag_index_.count(lower_tag) > 0;
@@ -766,7 +1092,7 @@ std::vector<std::string> GeoSiteLoader::GetAllTags() {
     if (!index_loaded_) {
         LoadIndex();
     }
-    
+
     std::vector<std::string> tags;
     for (const auto& [tag, _] : tag_index_) {
         tags.push_back(tag);
@@ -775,7 +1101,7 @@ std::vector<std::string> GeoSiteLoader::GetAllTags() {
 }
 
 size_t GeoSiteLoader::LoadedCount() const {
-    if (finalized_.load(std::memory_order_acquire)) {
+    if (finalized_) {
         return loaded_.size();
     }
     std::shared_lock lock(mutex_);
@@ -786,90 +1112,79 @@ size_t GeoSiteLoader::LoadedCount() const {
 // GeoManager 实现
 // ============================================================================
 
+GeoManager::GeoManager()
+    : impl_(std::make_unique<Impl>()) {
+}
+
+GeoManager::~GeoManager() = default;
+
+GeoManager::GeoManager(GeoManager&&) noexcept = default;
+
+GeoManager& GeoManager::operator=(GeoManager&&) noexcept = default;
+
 bool GeoManager::Init(const std::filesystem::path& geoip_path,
                       const std::filesystem::path& geosite_path) {
     if (std::filesystem::exists(geoip_path)) {
-        geoip_loader_ = std::make_unique<GeoIPLoader>(geoip_path);
+        impl_->geoip_loader = std::make_unique<GeoIPLoader>(geoip_path);
         LOG_DEBUG("GeoIP: loaded from {}", geoip_path.string());
     }
-    
+
     if (std::filesystem::exists(geosite_path)) {
-        geosite_loader_ = std::make_unique<GeoSiteLoader>(geosite_path);
+        impl_->geosite_loader = std::make_unique<GeoSiteLoader>(geosite_path);
         LOG_DEBUG("GeoSite: loaded from {}", geosite_path.string());
     }
-    
-    return geoip_loader_ || geosite_loader_;
+
+    return impl_->geoip_loader || impl_->geosite_loader;
 }
 
 void GeoManager::PreloadTags(const std::vector<std::string>& geoip_tags,
                              const std::vector<std::string>& geosite_tags) {
-    if (geoip_loader_) {
+    if (impl_->geoip_loader) {
         for (const auto& tag : geoip_tags) {
-            geoip_loader_->Get(tag);
+            impl_->geoip_loader->Get(tag);
         }
         // 预加载完成，标记为 finalized（之后的查询无需锁）
-        geoip_loader_->Finalize();
-        LOG_DEBUG("GeoIP finalized: {} tags loaded, lock-free queries enabled", 
-                 geoip_loader_->LoadedCount());
+        impl_->geoip_loader->Finalize();
+        LOG_DEBUG("GeoIP finalized: {} tags loaded, lock-free queries enabled",
+                 impl_->geoip_loader->LoadedCount());
     }
-    
-    if (geosite_loader_) {
+
+    if (impl_->geosite_loader) {
         for (const auto& tag : geosite_tags) {
-            geosite_loader_->Get(tag);
+            impl_->geosite_loader->Get(tag);
         }
         // 预加载完成，标记为 finalized
-        geosite_loader_->Finalize();
+        impl_->geosite_loader->Finalize();
         LOG_DEBUG("GeoSite finalized: {} tags loaded, lock-free queries enabled",
-                 geosite_loader_->LoadedCount());
+                 impl_->geosite_loader->LoadedCount());
     }
 }
 
-bool GeoManager::MatchGeoIP(const std::string& tag, const net::ip::address& ip) const {
-    if (!geoip_loader_) {
+bool GeoManager::MatchGeoIP(std::string_view tag, const net::ip::address& ip) const {
+    if (!impl_->geoip_loader) {
         return false;
     }
-    
-    auto data = geoip_loader_->Get(tag);
-    if (!data) {
-        return false;
-    }
-    
-    return data->Match(ip);
+    return impl_->geoip_loader->Match(tag, ip);
 }
 
-bool GeoManager::MatchGeoIP(const std::string& tag, const std::string& ip_str) const {
-    boost::system::error_code ec;
-    auto ip = net::ip::make_address(ip_str, ec);
-    if (ec) {
+bool GeoManager::MatchGeoSite(std::string_view tag, std::string_view domain) const {
+    if (!impl_->geosite_loader) {
         return false;
     }
-    return MatchGeoIP(tag, ip);
-}
-
-bool GeoManager::MatchGeoSite(const std::string& tag, const std::string& domain) const {
-    if (!geosite_loader_) {
-        return false;
-    }
-    
-    auto data = geosite_loader_->Get(tag);
-    if (!data) {
-        return false;
-    }
-    
-    return data->Match(domain);
+    return impl_->geosite_loader->Match(tag, domain);
 }
 
 GeoManager::Stats GeoManager::GetStats() const {
     Stats stats{};
-    
-    if (geoip_loader_) {
-        stats.geoip_tags_loaded = geoip_loader_->LoadedCount();
+
+    if (impl_->geoip_loader) {
+        stats.geoip_tags_loaded = impl_->geoip_loader->LoadedCount();
     }
-    
-    if (geosite_loader_) {
-        stats.geosite_tags_loaded = geosite_loader_->LoadedCount();
+
+    if (impl_->geosite_loader) {
+        stats.geosite_tags_loaded = impl_->geosite_loader->LoadedCount();
     }
-    
+
     return stats;
 }
 

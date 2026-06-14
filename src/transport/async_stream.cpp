@@ -1,7 +1,50 @@
 #include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/tcp_stream.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/memory_stats.hpp"
+#include "acppnode/transport/internet/tcp_stream.hpp"
+
+#include <new>
 
 namespace acpp {
+
+void* AsyncStream::operator new(std::size_t size) {
+    if (void* ptr = memory::AllocateRaw(size, alignof(AsyncStream))) {
+        memory::OnAsyncStreamNew();
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+void* AsyncStream::operator new(std::size_t size, std::align_val_t alignment) {
+    if (void* ptr = memory::AllocateRaw(size, static_cast<std::size_t>(alignment))) {
+        memory::OnAsyncStreamNew();
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+void AsyncStream::operator delete(void* ptr) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocateRaw(ptr, 0, alignof(AsyncStream));
+}
+
+void AsyncStream::operator delete(void* ptr, std::size_t size) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocateRaw(ptr, size, alignof(AsyncStream));
+}
+
+void AsyncStream::operator delete(void* ptr, std::align_val_t alignment) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocateRaw(ptr, 0, static_cast<std::size_t>(alignment));
+}
+
+void AsyncStream::operator delete(
+    void* ptr,
+    std::size_t size,
+    std::align_val_t alignment) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocateRaw(ptr, size, static_cast<std::size_t>(alignment));
+}
 
 // ============================================================================
 // AsyncStream::ReadMultiBuffer - 默认实现
@@ -9,26 +52,19 @@ namespace acpp {
 // 分配一个 8KB pool Buffer，调用 AsyncRead 填充，返回指针。
 // 子类（TcpStream、VMessStream 等）可 override 实现零拷贝优化路径。
 // ============================================================================
-cobalt::task<MultiBuffer> AsyncStream::ReadMultiBuffer() {
-    Buffer* buf = Buffer::New();
-    if (!buf) co_return MultiBuffer{};
+net::awaitable<buf::MultiBuffer> AsyncStream::ReadMultiBuffer() {
+    buf::BufferGuard buf{buf::Buffer::New()};
+    if (!buf) co_return buf::MultiBuffer{};
 
-    try {
-        size_t n = co_await AsyncRead(
-            net::mutable_buffer(buf->Tail().data(), buf->Available()));
+    size_t n = co_await AsyncRead(
+        net::mutable_buffer(buf->Tail().data(), buf->Available()));
 
-        if (n == 0) {
-            Buffer::Free(buf);
-            co_return MultiBuffer{};  // EOF
-        }
-
-        buf->Produce(static_cast<uint32_t>(n));
-        co_return MultiBuffer{buf};
-
-    } catch (...) {
-        Buffer::Free(buf);
-        throw;
+    if (n == 0) {
+        co_return buf::MultiBuffer{};  // EOF
     }
+
+    buf->Produce(static_cast<uint32_t>(n));
+    co_return buf::MultiBuffer{buf.release()};
 }
 
 // ============================================================================
@@ -37,8 +73,7 @@ cobalt::task<MultiBuffer> AsyncStream::ReadMultiBuffer() {
 // 逐个 Buffer 调用 AsyncWrite，写完后释放。
 // TcpStream override 使用 scatter-write (writev) 将多个 Buffer 合并为单次系统调用。
 // ============================================================================
-cobalt::task<void> AsyncStream::WriteMultiBuffer(MultiBuffer mb) {
-    MultiBufferGuard guard{mb};
+net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
 
     for (auto* b : mb) {
         auto bytes = b->Bytes();
@@ -50,65 +85,77 @@ cobalt::task<void> AsyncStream::WriteMultiBuffer(MultiBuffer mb) {
 }
 
 void AsyncStream::SetIdleTimeout(std::chrono::seconds timeout) {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         tcp->SetIdleTimeout(timeout);
     }
 }
 
 void AsyncStream::SetReadTimeout(std::chrono::seconds timeout) {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         tcp->SetReadTimeout(timeout);
     }
 }
 
 void AsyncStream::SetWriteTimeout(std::chrono::seconds timeout) {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         tcp->SetWriteTimeout(timeout);
     }
 }
 
+void AsyncStream::SetStreamLabel(std::string_view label) noexcept {
+    if (auto* tcp = BaseTcpStream()) {
+        tcp->SetStreamLabel(label);
+    }
+}
+
+void AsyncStream::SetAbortiveClose(bool enable) noexcept {
+    if (auto* tcp = BaseTcpStream()) {
+        tcp->SetAbortiveClose(enable);
+    }
+}
+
 bool AsyncStream::ConsumeIdleTimeout() noexcept {
-    auto* tcp = GetBaseTcpStream();
+    auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeIdleTimeout();
 }
 
 bool AsyncStream::ConsumeReadTimeout() noexcept {
-    auto* tcp = GetBaseTcpStream();
+    auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeReadTimeout();
 }
 
 bool AsyncStream::ConsumeWriteTimeout() noexcept {
-    auto* tcp = GetBaseTcpStream();
+    auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeWriteTimeout();
 }
 
 PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout) {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         return tcp->StartPhaseDeadline(timeout);
     }
     return {};
 }
 
 void AsyncStream::ClearPhaseDeadline() {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         tcp->ClearPhaseDeadline();
     }
 }
 
 bool AsyncStream::ConsumePhaseDeadline() noexcept {
-    auto* tcp = GetBaseTcpStream();
+    auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumePhaseDeadline();
 }
 
 std::optional<tcp::endpoint> AsyncStream::LocalEndpoint() const {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         return tcp->LocalEndpoint();
     }
     return std::nullopt;
 }
 
 std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
-    if (auto* tcp = GetBaseTcpStream()) {
+    if (auto* tcp = BaseTcpStream()) {
         return tcp->RemoteEndpoint();
     }
     return std::nullopt;

@@ -3,7 +3,8 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <boost/system/error_code.hpp>
+
+#include "acppnode/common/asio_types.hpp"
 
 namespace acpp {
 
@@ -139,7 +140,7 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::RESOURCE_EXHAUSTED: return "RESOURCE_EXHAUSTED";
         case ErrorCode::NOT_SUPPORTED: return "NOT_SUPPORTED";
         case ErrorCode::CONNECTION_CLOSED: return "CONNECTION_CLOSED";
-        
+
         case ErrorCode::SOCKET_CREATE_FAILED: return "SOCKET_CREATE_FAILED";
         case ErrorCode::SOCKET_BIND_FAILED: return "SOCKET_BIND_FAILED";
         case ErrorCode::SOCKET_LISTEN_FAILED: return "SOCKET_LISTEN_FAILED";
@@ -150,7 +151,7 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::SOCKET_EOF: return "SOCKET_EOF";
         case ErrorCode::NETWORK_BIND_FAILED: return "NETWORK_BIND_FAILED";
         case ErrorCode::NETWORK_IO_ERROR: return "NETWORK_IO_ERROR";
-        
+
         case ErrorCode::PROTOCOL_INVALID_VERSION: return "PROTOCOL_INVALID_VERSION";
         case ErrorCode::PROTOCOL_INVALID_COMMAND: return "PROTOCOL_INVALID_COMMAND";
         case ErrorCode::PROTOCOL_INVALID_ADDRESS: return "PROTOCOL_INVALID_ADDRESS";
@@ -158,12 +159,12 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::PROTOCOL_DECODE_FAILED: return "PROTOCOL_DECODE_FAILED";
         case ErrorCode::PROTOCOL_ENCODE_FAILED: return "PROTOCOL_ENCODE_FAILED";
         case ErrorCode::PROTOCOL_UNSUPPORTED: return "PROTOCOL_UNSUPPORTED";
-        
+
         case ErrorCode::ROUTER_NO_MATCH: return "ROUTER_NO_MATCH";
         case ErrorCode::ROUTER_OUTBOUND_NOT_FOUND: return "ROUTER_OUTBOUND_NOT_FOUND";
         case ErrorCode::ROUTER_INVALID_RULE: return "ROUTER_INVALID_RULE";
         case ErrorCode::BLOCKED: return "BLOCKED";
-        
+
         case ErrorCode::DIAL_DNS_FAILED: return "DIAL_DNS_FAILED";
         case ErrorCode::DIAL_CONNECT_FAILED: return "DIAL_CONNECT_FAILED";
         case ErrorCode::DIAL_TIMEOUT: return "DIAL_TIMEOUT";
@@ -171,38 +172,38 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::DIAL_NETWORK_UNREACHABLE: return "DIAL_NETWORK_UNREACHABLE";
         case ErrorCode::DIAL_HOST_UNREACHABLE: return "DIAL_HOST_UNREACHABLE";
         case ErrorCode::OUTBOUND_CONNECTION_FAILED: return "OUTBOUND_CONNECTION_FAILED";
-        
+
         case ErrorCode::RELAY_READ_FAILED: return "RELAY_READ_FAILED";
         case ErrorCode::RELAY_WRITE_FAILED: return "RELAY_WRITE_FAILED";
         case ErrorCode::RELAY_TIMEOUT: return "RELAY_TIMEOUT";
         case ErrorCode::RELAY_CLIENT_CLOSED: return "RELAY_CLIENT_CLOSED";
         case ErrorCode::RELAY_TARGET_CLOSED: return "RELAY_TARGET_CLOSED";
-        
+
         case ErrorCode::SNIFF_FAILED: return "SNIFF_FAILED";
         case ErrorCode::SNIFF_TIMEOUT: return "SNIFF_TIMEOUT";
         case ErrorCode::SNIFF_UNSUPPORTED: return "SNIFF_UNSUPPORTED";
         case ErrorCode::SNIFF_INCOMPLETE: return "SNIFF_INCOMPLETE";
-        
+
         case ErrorCode::TLS_HANDSHAKE_FAILED: return "TLS_HANDSHAKE_FAILED";
         case ErrorCode::TLS_CERT_INVALID: return "TLS_CERT_INVALID";
         case ErrorCode::TLS_VERSION_MISMATCH: return "TLS_VERSION_MISMATCH";
         case ErrorCode::TLS_VERIFY_FAILED: return "TLS_VERIFY_FAILED";
         case ErrorCode::TLS_ALERT_RECEIVED: return "TLS_ALERT_RECEIVED";
-        
+
         case ErrorCode::VMESS_INVALID_USER: return "VMESS_INVALID_USER";
         case ErrorCode::VMESS_INVALID_REQUEST: return "VMESS_INVALID_REQUEST";
         case ErrorCode::VMESS_TIMESTAMP_EXPIRED: return "VMESS_TIMESTAMP_EXPIRED";
         case ErrorCode::VMESS_REPLAY_ATTACK: return "VMESS_REPLAY_ATTACK";
         case ErrorCode::VMESS_CHECKSUM_MISMATCH: return "VMESS_CHECKSUM_MISMATCH";
         case ErrorCode::VMESS_INVALID_RESPONSE: return "VMESS_INVALID_RESPONSE";
-        
+
         case ErrorCode::DNS_RESOLVE_FAILED: return "DNS_RESOLVE_FAILED";
         case ErrorCode::DNS_TIMEOUT: return "DNS_TIMEOUT";
         case ErrorCode::DNS_NO_RECORD: return "DNS_NO_RECORD";
         case ErrorCode::DNS_SERVER_FAILED: return "DNS_SERVER_FAILED";
         case ErrorCode::DNS_FORMAT_ERROR: return "DNS_FORMAT_ERROR";
         case ErrorCode::DNS_REFUSED: return "DNS_REFUSED";
-        
+
         case ErrorCode::PANEL_API_FAILED: return "PANEL_API_FAILED";
         case ErrorCode::PANEL_AUTH_FAILED: return "PANEL_AUTH_FAILED";
         case ErrorCode::PANEL_NODE_NOT_FOUND: return "PANEL_NODE_NOT_FOUND";
@@ -212,7 +213,7 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::PANEL_RATE_LIMITED: return "PANEL_RATE_LIMITED";
         case ErrorCode::PANEL_INVALID_RESPONSE: return "PANEL_INVALID_RESPONSE";
         case ErrorCode::PANEL_NETWORK_ERROR: return "PANEL_NETWORK_ERROR";
-        
+
         default: return "UNKNOWN";
     }
 }
@@ -391,7 +392,7 @@ struct ResultStatus {
     }
 };
 
-// 从 Boost.Asio error_code 映射到 ErrorCode
-ErrorCode MapAsioError(const boost::system::error_code& ec);
+// 从 Asio error_code 映射到 ErrorCode
+ErrorCode MapAsioError(const IoErrorCode& ec);
 
 }  // namespace acpp

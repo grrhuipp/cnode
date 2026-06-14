@@ -1,0 +1,393 @@
+#include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+
+#include "acppnode/app/udp_session.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
+
+#include <deque>
+#include <unordered_map>
+
+namespace acpp::proxyman::inbound {
+
+class UdpWorker::PendingUdpReply {
+public:
+    udp::endpoint endpoint;
+    buf::MultiBuffer payload;
+    std::vector<net::const_buffer> send_buffers;
+
+    [[nodiscard]] size_t PayloadSize() const noexcept {
+        return buf::TotalLen(payload);
+    }
+
+    void PrepareSendBuffers() {
+        send_buffers.clear();
+        send_buffers.reserve(payload.size());
+        for (const auto* buffer : payload) {
+            if (buffer && !buffer->IsEmpty()) {
+                send_buffers.emplace_back(buffer->Bytes().data(), buffer->Len());
+            }
+        }
+    }
+};
+
+namespace {
+
+struct UdpReplyQueueState {
+    std::deque<UdpWorker::PendingUdpReply> pending;
+    size_t queued_bytes = 0;
+    bool write_in_progress = false;
+    bool shrink_pending_on_drain = false;
+};
+
+struct UdpClientSession {
+    UDPSession* udp_dial = nullptr;
+    uint64_t callback_id = 0;
+    int64_t user_id = 0;
+    std::chrono::steady_clock::time_point last_active;
+};
+
+using UdpClientSessionMap =
+    std::unordered_map<
+        UdpEndpointKey,
+        UdpClientSession,
+        UdpEndpointKeyHash>;
+
+struct UdpSocketDeleter {
+    void operator()(udp::socket* socket) const noexcept {
+        if (!socket) {
+            return;
+        }
+        std::destroy_at(socket);
+        memory::ThreadLocalAllocator<udp::socket>{}.deallocate(socket, 1);
+    }
+};
+
+using UdpSocketPtr = std::unique_ptr<udp::socket, UdpSocketDeleter>;
+
+}  // namespace
+
+struct UdpWorker::Impl {
+    using UdpSocketMap =
+        memory::ThreadLocalUnorderedMap<std::string, UdpSocketPtr>;
+
+    Impl(std::string tag, std::unique_ptr<UdpHandler> proxy)
+        : tag(std::move(tag))
+        , proxy(std::move(proxy)) {}
+
+    std::string tag;
+    std::unique_ptr<UdpHandler> proxy;
+    UdpSocketMap udp_sockets;
+    memory::ThreadLocalVector<UdpSocketPtr> retired_udp_sockets;
+    memory::ThreadLocalUnorderedMap<std::string, UdpReplyQueueState> reply_queues;
+    memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap> client_sessions;
+};
+
+UdpWorker::UdpWorker(std::string tag, std::unique_ptr<UdpHandler> proxy)
+    : impl_(std::make_unique<Impl>(std::move(tag), std::move(proxy))) {}
+
+UdpWorker::~UdpWorker() noexcept = default;
+UdpWorker::UdpWorker(UdpWorker&&) noexcept = default;
+UdpWorker& UdpWorker::operator=(UdpWorker&&) noexcept = default;
+
+void UdpWorker::PendingUdpReplyDeleter::operator()(
+    PendingUdpReply* reply) const noexcept {
+    delete reply;
+}
+
+std::string_view UdpWorker::Tag() const noexcept {
+    return impl_->tag;
+}
+
+void UdpWorker::Close() noexcept {
+    CloseAllSockets();
+    CleanupAllClientSessions();
+    impl_->reply_queues.clear();
+    MaybeShrinkHashContainer(impl_->reply_queues, 8);
+}
+
+void UdpWorker::SetBanTrackingEnabled(bool enabled) noexcept {
+    if (impl_->proxy) {
+        impl_->proxy->SetBanTrackingEnabled(enabled);
+    }
+}
+
+bool UdpWorker::EnqueueReply(const std::string& socket_key,
+                             udp::endpoint endpoint,
+                             buf::MultiBuffer payload) {
+    const size_t payload_size = buf::TotalLen(payload);
+    if (payload_size == 0) {
+        return false;
+    }
+
+    auto& queue = impl_->reply_queues[socket_key];
+    const bool should_start_send = !queue.write_in_progress;
+    queue.queued_bytes += payload_size;
+
+    PendingUdpReply reply;
+    reply.endpoint = std::move(endpoint);
+    reply.payload = std::move(payload);
+    queue.pending.push_back(std::move(reply));
+    if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
+        queue.shrink_pending_on_drain = true;
+    }
+    return should_start_send;
+}
+
+bool UdpWorker::EnqueueReply(const std::string& socket_key,
+                             udp::endpoint endpoint,
+                             buf::BufferGuard payload) {
+    if (!payload || payload->IsEmpty()) {
+        return false;
+    }
+
+    const size_t payload_size = payload->Len();
+    auto& queue = impl_->reply_queues[socket_key];
+    const bool should_start_send = !queue.write_in_progress;
+    queue.queued_bytes += payload_size;
+
+    PendingUdpReply reply;
+    reply.endpoint = std::move(endpoint);
+    reply.payload.push_back(payload.release());
+    queue.pending.push_back(std::move(reply));
+    if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
+        queue.shrink_pending_on_drain = true;
+    }
+    return should_start_send;
+}
+
+UdpWorker::PendingUdpReplyPtr
+UdpWorker::BeginReplySend(const std::string& socket_key) {
+    auto it = impl_->reply_queues.find(socket_key);
+    if (it == impl_->reply_queues.end()) {
+        return nullptr;
+    }
+
+    auto& queue = it->second;
+    if (queue.write_in_progress || queue.pending.empty()) {
+        return nullptr;
+    }
+
+    PendingUdpReplyPtr packet{
+        new PendingUdpReply(std::move(queue.pending.front()))};
+    queue.queued_bytes -= packet->PayloadSize();
+    queue.pending.pop_front();
+    queue.write_in_progress = true;
+    packet->PrepareSendBuffers();
+    return packet;
+}
+
+const std::vector<net::const_buffer>&
+UdpWorker::ReplySendBuffers(const PendingUdpReply& reply) noexcept {
+    return reply.send_buffers;
+}
+
+const udp::endpoint&
+UdpWorker::ReplyEndpoint(const PendingUdpReply& reply) noexcept {
+    return reply.endpoint;
+}
+
+bool UdpWorker::CompleteReplySend(const std::string& socket_key) {
+    auto it = impl_->reply_queues.find(socket_key);
+    if (it == impl_->reply_queues.end()) {
+        return false;
+    }
+
+    auto& queue = it->second;
+    queue.write_in_progress = false;
+    if (queue.pending.empty()) {
+        if (queue.shrink_pending_on_drain) {
+            TryShrinkSequence(queue.pending);
+            queue.shrink_pending_on_drain = false;
+        }
+        return false;
+    }
+    return true;
+}
+
+void UdpWorker::ClearReplyQueue(const std::string& socket_key) {
+    impl_->reply_queues.erase(socket_key);
+    MaybeShrinkHashContainer(impl_->reply_queues, 8);
+}
+
+bool UdpWorker::HasClientSession(const std::string& socket_key,
+                                 const UdpEndpointKey& client_key) const noexcept {
+    auto sessions_it = impl_->client_sessions.find(socket_key);
+    if (sessions_it == impl_->client_sessions.end()) {
+        return false;
+    }
+    auto session_it = sessions_it->second.find(client_key);
+    return session_it != sessions_it->second.end() &&
+           session_it->second.udp_dial != nullptr;
+}
+
+void UdpWorker::UpsertClientSession(
+    const std::string& socket_key,
+    const UdpEndpointKey& client_key,
+    UDPSession& session,
+    uint64_t response_callback,
+    int64_t user_id,
+    std::chrono::steady_clock::time_point now) {
+    auto& sessions = impl_->client_sessions[socket_key];
+    sessions.insert_or_assign(client_key, UdpClientSession{
+        .udp_dial = &session,
+        .callback_id = response_callback,
+        .user_id = user_id,
+        .last_active = now,
+    });
+}
+
+net::awaitable<UdpWorker::UdpClientSendResult>
+UdpWorker::SendToClientSession(
+    const std::string& socket_key,
+    const UdpEndpointKey& client_key,
+    const TargetAddress& target,
+    buf::MultiBuffer payload,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds idle_timeout) {
+    auto sessions_it = impl_->client_sessions.find(socket_key);
+    if (sessions_it == impl_->client_sessions.end()) {
+        payload.clear();
+        co_return UdpClientSendResult{};
+    }
+    auto session_it = sessions_it->second.find(client_key);
+    if (session_it == sessions_it->second.end() || !session_it->second.udp_dial) {
+        payload.clear();
+        co_return UdpClientSendResult{};
+    }
+
+    auto& session = session_it->second;
+    session.last_active = now;
+    UdpClientSendResult result;
+    result.found = true;
+    result.user_id = session.user_id;
+    result.error = co_await session.udp_dial->SendTo(
+        target,
+        std::move(payload),
+        session.callback_id);
+    if (result.error != ErrorCode::OK && result.error != ErrorCode::SUCCESS &&
+        idle_timeout.count() > 0) {
+        session.last_active -= idle_timeout;
+    }
+    co_return result;
+}
+
+void UdpWorker::CleanupIdleClientSessions(
+    const std::string& socket_key,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::seconds idle_timeout) {
+    if (idle_timeout.count() <= 0) {
+        return;
+    }
+
+    auto sessions_it = impl_->client_sessions.find(socket_key);
+    if (sessions_it == impl_->client_sessions.end()) {
+        return;
+    }
+
+    bool removed_idle_session = false;
+    for (auto it = sessions_it->second.begin(); it != sessions_it->second.end();) {
+        if (now - it->second.last_active > idle_timeout) {
+            if (it->second.callback_id && it->second.udp_dial) {
+                it->second.udp_dial->UnregisterCallback(it->second.callback_id);
+            }
+            it = sessions_it->second.erase(it);
+            removed_idle_session = true;
+        } else {
+            ++it;
+        }
+    }
+    if (removed_idle_session) {
+        MaybeShrinkHashContainer(sessions_it->second, 64);
+    }
+}
+
+void UdpWorker::CleanupClientSessions(const std::string& socket_key) {
+    auto sessions_it = impl_->client_sessions.find(socket_key);
+    if (sessions_it == impl_->client_sessions.end()) {
+        return;
+    }
+
+    for (auto& [client_key, session] : sessions_it->second) {
+        (void)client_key;
+        if (session.callback_id && session.udp_dial) {
+            session.udp_dial->UnregisterCallback(session.callback_id);
+        }
+    }
+
+    impl_->client_sessions.erase(sessions_it);
+    MaybeShrinkHashContainer(impl_->client_sessions, 8);
+}
+
+void UdpWorker::CleanupAllClientSessions() {
+    while (!impl_->client_sessions.empty()) {
+        CleanupClientSessions(impl_->client_sessions.begin()->first);
+    }
+}
+
+udp::socket* UdpWorker::MakeSocket(net::io_context& io_context) {
+    memory::ThreadLocalAllocator<udp::socket> alloc;
+    udp::socket* raw = alloc.allocate(1);
+    try {
+        std::construct_at(raw, io_context);
+    } catch (...) {
+        alloc.deallocate(raw, 1);
+        throw;
+    }
+    return raw;
+}
+
+udp::socket* UdpWorker::AttachSocket(const std::string& socket_key, udp::socket* socket) {
+    if (!socket) {
+        return nullptr;
+    }
+    UdpSocketPtr owned(socket);
+    auto* raw = owned.get();
+    impl_->udp_sockets[socket_key] = std::move(owned);
+    return raw;
+}
+
+udp::socket* UdpWorker::FindSocket(const std::string& socket_key) noexcept {
+    auto it = impl_->udp_sockets.find(socket_key);
+    return it == impl_->udp_sockets.end() ? nullptr : it->second.get();
+}
+
+const udp::socket* UdpWorker::FindSocket(const std::string& socket_key) const noexcept {
+    auto it = impl_->udp_sockets.find(socket_key);
+    return it == impl_->udp_sockets.end() ? nullptr : it->second.get();
+}
+
+std::vector<std::string> UdpWorker::SocketKeys() const {
+    std::vector<std::string> keys;
+    keys.reserve(impl_->udp_sockets.size());
+    for (const auto& [socket_key, socket] : impl_->udp_sockets) {
+        (void)socket;
+        keys.push_back(socket_key);
+    }
+    return keys;
+}
+
+void UdpWorker::CloseSocket(const std::string& socket_key) noexcept {
+    CleanupClientSessions(socket_key);
+    ClearReplyQueue(socket_key);
+
+    auto sock_it = impl_->udp_sockets.find(socket_key);
+    if (sock_it == impl_->udp_sockets.end()) {
+        return;
+    }
+
+    IoErrorCode ec;
+    sock_it->second->cancel(ec);
+    sock_it->second->close(ec);
+    impl_->retired_udp_sockets.push_back(std::move(sock_it->second));
+    impl_->udp_sockets.erase(sock_it);
+    MaybeShrinkHashContainer(impl_->udp_sockets, 8);
+}
+
+void UdpWorker::CloseAllSockets() noexcept {
+    while (!impl_->udp_sockets.empty()) {
+        CloseSocket(impl_->udp_sockets.begin()->first);
+    }
+    TryShrinkSequence(impl_->retired_udp_sockets);
+}
+
+}  // namespace acpp::proxyman::inbound

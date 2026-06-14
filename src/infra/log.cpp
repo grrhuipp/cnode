@@ -1,74 +1,36 @@
 #include "acppnode/infra/log.hpp"
 
-#include <boost/log/core.hpp>
-#include <boost/log/expressions.hpp>
-#include <boost/log/sinks/text_file_backend.hpp>
-#include <boost/log/sinks/async_frontend.hpp>
-#include <boost/log/sinks/sync_frontend.hpp>
-#include <boost/log/sinks/text_ostream_backend.hpp>
-#include <boost/log/sources/channel_logger.hpp>
-#include <boost/log/sources/severity_channel_logger.hpp>
-#include <boost/log/sources/record_ostream.hpp>
-#include <boost/log/attributes/clock.hpp>
-#include <boost/log/attributes/current_thread_id.hpp>
-#include <boost/log/support/date_time.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/core/null_deleter.hpp>
-#include <boost/make_shared.hpp>
-#include <boost/shared_ptr.hpp>
-
 #include <zlib.h>
 
 #include <filesystem>
 #include <fstream>
-#include <format>
 #include <iostream>
+#include <array>
+#include <mutex>
 #include <vector>
-
-namespace logging  = boost::log;
-namespace sinks    = boost::log::sinks;
-namespace src      = boost::log::sources;
-namespace expr     = boost::log::expressions;
-namespace attrs    = boost::log::attributes;
-namespace keywords = boost::log::keywords;
-
-// 属性关键字声明（必须在命名空间外）
-BOOST_LOG_ATTRIBUTE_KEYWORD(attr_severity, "Severity", acpp::LogLevel)
-BOOST_LOG_ATTRIBUTE_KEYWORD(attr_channel,  "Channel",  std::string)
 
 namespace acpp {
 
-// 静态成员定义
-LogLevel Log::min_level_  = LogLevel::INFO;
-bool     Log::initialized_ = false;
+LogLevel Log::min_level_{LogLevel::INFO};
+bool Log::initialized_{false};
 
 namespace {
 
-// ============================================================================
-// 类型别名
-// ============================================================================
-using AppLogger   = src::severity_channel_logger_mt<LogLevel, std::string>;
-using PlainLogger = src::channel_logger_mt<std::string>;
-using AsyncFileSink   = sinks::asynchronous_sink<sinks::text_file_backend>;
-using SyncConsoleSink = sinks::synchronous_sink<sinks::text_ostream_backend>;
-
-// ============================================================================
-// 全局日志器（Init 中用 unique_ptr 惰性构造）
-// ============================================================================
-std::unique_ptr<AppLogger>   g_app_logger;
-std::unique_ptr<PlainLogger> g_access_logger;
-std::unique_ptr<PlainLogger> g_console_logger;
-
-// 保留 sink 引用，用于 Flush/Shutdown
-std::vector<boost::shared_ptr<AsyncFileSink>>  g_file_sinks;
-boost::shared_ptr<SyncConsoleSink>             g_console_sink;
-
+std::mutex g_lifecycle_mutex;
+std::mutex g_error_mutex;
+std::mutex g_access_mutex;
+std::mutex g_console_mutex;
+std::ofstream g_error_file;
+std::ofstream g_access_file;
 std::filesystem::path g_log_dir;
+std::filesystem::path g_access_path;
+std::filesystem::path g_error_path;
 uint16_t g_max_days = 15;
 
-// ============================================================================
-// gzip 压缩单个文件：src → src.gz，成功后删除原文件
-// ============================================================================
+std::string TodayDateString() {
+    return FormatLocalTime(std::chrono::system_clock::now(), "%Y-%m-%d");
+}
+
 bool GzipFile(const std::filesystem::path& src) {
     auto dst = src;
     dst += ".gz";
@@ -76,264 +38,208 @@ bool GzipFile(const std::filesystem::path& src) {
     std::ifstream in(src, std::ios::binary);
     if (!in) return false;
 
-    gzFile gz = gzopen(dst.string().c_str(), "wb6");  // 压缩级别 6（平衡速度与比率）
+    gzFile gz = gzopen(dst.string().c_str(), "wb6");
     if (!gz) return false;
 
-    char buf[65536];
-    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
-        if (gzwrite(gz, buf, static_cast<unsigned>(in.gcount())) <= 0) {
+    std::array<char, 64 * 1024> buf{};
+    while (in.read(buf.data(), static_cast<std::streamsize>(buf.size())) || in.gcount() > 0) {
+        if (gzwrite(gz, buf.data(), static_cast<unsigned>(in.gcount())) <= 0) {
             gzclose(gz);
             std::filesystem::remove(dst);
             return false;
         }
     }
+
     gzclose(gz);
     in.close();
-
     std::filesystem::remove(src);
     return true;
 }
 
-// ============================================================================
-// 获取今日日期字符串（YYYY-MM-DD）
-// ============================================================================
-std::string TodayDateString() {
-    return FormatLocalTime(std::chrono::system_clock::now(), "%Y-%m-%d");
-}
-
-// ============================================================================
-// 过期日志清理 + 非今日日志自动压缩
-// ============================================================================
 void CleanupOldFiles() {
     if (g_log_dir.empty()) return;
+
     try {
-        auto now = std::filesystem::file_time_type::clock::now();
-        auto today = TodayDateString();
-        auto today_app_log = std::format("app_{}.log", today);
-        auto today_access_log = std::format("access_{}.log", today);
+        const auto now = std::filesystem::file_time_type::clock::now();
+        const auto today = TodayDateString();
+        const auto today_error_log = std::format("error_{}.log", today);
+        const auto today_access_log = std::format("access_{}.log", today);
 
         for (const auto& entry : std::filesystem::directory_iterator(g_log_dir)) {
             if (!entry.is_regular_file()) continue;
-            auto name = entry.path().filename().string();
 
-            bool is_log = (name.rfind("app_", 0) == 0 || name.rfind("access_", 0) == 0);
+            const auto name = entry.path().filename().string();
+            const bool is_log = name.rfind("error_", 0) == 0 || name.rfind("access_", 0) == 0;
             if (!is_log) continue;
 
-            // 过期清理（.log 和 .log.gz 都检查）
             if (g_max_days > 0) {
-                auto age  = now - entry.last_write_time();
-                auto days = static_cast<uint16_t>(
-                    std::chrono::duration_cast<std::chrono::hours>(age).count() / 24);
+                const auto age = now - entry.last_write_time();
+                const auto days = std::chrono::duration_cast<std::chrono::hours>(age).count() / 24;
                 if (days > g_max_days) {
                     std::filesystem::remove(entry.path());
                     continue;
                 }
             }
 
-            // 压缩非今日的 .log 文件
-            if (name.ends_with(".log")
-                && name != today_app_log
-                && name != today_access_log) {
+            if (name.ends_with(".log") && name != today_error_log && name != today_access_log) {
                 GzipFile(entry.path());
             }
         }
-    } catch (...) {}
+    } catch (...) {
+    }
 }
 
-// ============================================================================
-// 创建异步文件 sink
-//   - 按日期命名：prefix_%Y-%m-%d.log
-//   - 每日零点轮转
-//   - 追加模式（重启后续写同日文件）
-// ============================================================================
-boost::shared_ptr<AsyncFileSink> MakeAsyncFileSink(
-    const std::filesystem::path& log_dir,
-    const std::string& prefix,
-    bool auto_flush)
-{
-    auto backend = boost::make_shared<sinks::text_file_backend>(
-        keywords::file_name = (log_dir / (prefix + "_%Y-%m-%d.log")).string(),
-        keywords::open_mode = std::ios::app,
-        keywords::time_based_rotation =
-            sinks::file::rotation_at_time_point(0, 0, 0)
-    );
-    // app 日志保持更及时的 flush，access 日志则优先吞吐与更低写盘开销。
-    backend->auto_flush(auto_flush);
-
-    // 日志轮转时压缩前一天的日志文件
-    backend->set_open_handler([](sinks::text_file_backend::stream_type&) {
-        CleanupOldFiles();
-    });
-
-    return boost::make_shared<AsyncFileSink>(backend);
+std::ofstream OpenLogFile(std::string_view prefix) {
+    const auto path = g_log_dir / std::format("{}_{}.log", prefix, TodayDateString());
+    return std::ofstream(path, std::ios::app);
 }
 
-}  // anonymous namespace
+std::ofstream OpenConfiguredLogFile(
+    const std::filesystem::path& configured_path,
+    std::string_view fallback_prefix) {
+    if (configured_path.empty()) {
+        return OpenLogFile(fallback_prefix);
+    }
 
-// ============================================================================
-// Log::Init
-// ============================================================================
+    if (auto parent = configured_path.parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent);
+    }
+    return std::ofstream(configured_path, std::ios::app);
+}
+
+LogLevel ParseLevel(std::string_view level) {
+    if (level == "none") return LogLevel::NONE;
+    if (level == "trace") return LogLevel::TRACE;
+    if (level == "debug") return LogLevel::DEBUG;
+    if (level == "info") return LogLevel::INFO;
+    if (level == "warning") return LogLevel::WARN;
+    if (level == "warn") return LogLevel::WARN;
+    if (level == "error") return LogLevel::ERROR;
+    return LogLevel::INFO;
+}
+
+}  // namespace
+
 bool Log::Init(const std::string& level,
                const std::filesystem::path& log_dir,
-               uint16_t max_days) {
-    if (initialized_) return true;
+               uint16_t max_days,
+               const std::filesystem::path& access_path,
+               const std::filesystem::path& error_path) {
+    {
+        std::lock_guard lock(g_lifecycle_mutex);
+        if (initialized_) return true;
 
-    // 解析日志级别
-    if      (level == "trace") min_level_ = LogLevel::TRACE;
-    else if (level == "debug") min_level_ = LogLevel::DEBUG;
-    else if (level == "info")  min_level_ = LogLevel::INFO;
-    else if (level == "warn")  min_level_ = LogLevel::WARN;
-    else if (level == "error") min_level_ = LogLevel::ERROR;
+        min_level_ = ParseLevel(level);
+        g_log_dir = log_dir;
+        g_access_path = access_path;
+        g_error_path = error_path;
+        g_max_days = max_days;
 
-    g_log_dir  = log_dir;
-    g_max_days = max_days;
+        try {
+            const bool uses_daily_fallback = g_access_path.empty() || g_error_path.empty();
+            if (uses_daily_fallback) {
+                std::filesystem::create_directories(g_log_dir);
+                CleanupOldFiles();
+            }
 
-    try {
-        std::filesystem::create_directories(log_dir);
-        CleanupOldFiles();
+            g_error_file = OpenConfiguredLogFile(g_error_path, "error");
+            g_access_file = OpenConfiguredLogFile(g_access_path, "access");
+            if (!g_error_file || !g_access_file) {
+                std::cerr << "Log initialization failed: cannot open access/error log files"
+                          << std::endl;
+                return false;
+            }
 
-        // 向 Boost.Log 核心注册全局属性（时间戳 + 线程 ID）
-        logging::core::get()->add_global_attribute(
-            "TimeStamp", attrs::local_clock());
-        logging::core::get()->add_global_attribute(
-            "ThreadID",  attrs::current_thread_id());
-
-        // ── app sink ─────────────────────────────────────────────────────────
-        // 格式：[timestamp] [level] [tid] message
-        {
-            auto sink = MakeAsyncFileSink(log_dir, "app", true);
-            sink->set_filter(
-                attr_channel == std::string("app") &&
-                attr_severity >= min_level_
-            );
-            sink->set_formatter(
-                expr::stream
-                    << "[" << expr::format_date_time<boost::posix_time::ptime>(
-                               "TimeStamp", "%Y-%m-%d %H:%M:%S.%f") << "]"
-                    << " [" << attr_severity << "]"
-                    << " [" << expr::attr<attrs::current_thread_id::value_type>(
-                               "ThreadID") << "]"
-                    << " " << expr::smessage
-            );
-            logging::core::get()->add_sink(sink);
-            g_file_sinks.push_back(sink);
+            initialized_ = true;
+        } catch (const std::exception& e) {
+            std::cerr << "Log initialization failed: " << e.what() << std::endl;
+            return false;
         }
-
-        // ── access sink ──────────────────────────────────────────────────────
-        // 格式：message（原样写入，调用方自己拼格式）
-        {
-            auto sink = MakeAsyncFileSink(log_dir, "access", false);
-            sink->set_filter(attr_channel == std::string("access"));
-            sink->set_formatter(expr::stream << expr::smessage);
-            logging::core::get()->add_sink(sink);
-            g_file_sinks.push_back(sink);
-        }
-
-        // ── console sink（同步，立即输出）────────────────────────────────────
-        // 格式：[timestamp] [info] message
-        {
-            auto backend = boost::make_shared<sinks::text_ostream_backend>();
-            backend->add_stream(
-                boost::shared_ptr<std::ostream>(&std::cout, boost::null_deleter{}));
-            backend->auto_flush(true);
-
-            g_console_sink = boost::make_shared<SyncConsoleSink>(backend);
-            g_console_sink->set_filter(attr_channel == std::string("console"));
-            g_console_sink->set_formatter(
-                expr::stream
-                    << "[" << expr::format_date_time<boost::posix_time::ptime>(
-                               "TimeStamp", "%Y-%m-%d %H:%M:%S.%f") << "]"
-                    << " [info] " << expr::smessage
-            );
-            logging::core::get()->add_sink(g_console_sink);
-        }
-
-        // ── 构造各通道日志器 ──────────────────────────────────────────────────
-        g_app_logger     = std::make_unique<AppLogger>(keywords::channel = "app");
-        g_access_logger  = std::make_unique<PlainLogger>(keywords::channel = "access");
-        g_console_logger = std::make_unique<PlainLogger>(keywords::channel = "console");
-
-        initialized_ = true;
-
-        WriteConsole("Log system initialized");
-        WriteConsole(std::format("  Level:     {}", level));
-        WriteConsole(std::format("  Directory: {}", log_dir.string()));
-        WriteConsole(std::format("  Retention: {} days (daily rotation)", max_days));
-        WriteConsole("  app.log    - Program state logs");
-        WriteConsole("  access.log - Connection logs (access + errors)");
-
-        WriteApp(LogLevel::INFO, std::format(
-            "Log system initialized, level={}, dir={}, max_days={}",
-            level, log_dir.string(), max_days));
-
-        return true;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Log initialization failed: " << e.what() << std::endl;
-        return false;
     }
+
+    WriteConsole("Log system initialized");
+    WriteConsole(std::format("  Level:     {}", level));
+    WriteConsole(std::format("  Directory: {}", log_dir.string()));
+    WriteConsole(std::format("  Retention: {} days (daily rotation)", max_days));
+    WriteConsole(std::format("  AccessPath: {}",
+                             g_access_path.empty() ? "(daily access_YYYY-MM-DD.log)" : g_access_path.string()));
+    WriteConsole(std::format("  ErrorPath:  {}",
+                             g_error_path.empty() ? "(daily error_YYYY-MM-DD.log)" : g_error_path.string()));
+
+    WriteApp(LogLevel::INFO, std::format(
+        "Log system initialized, level={}, access_path={}, error_path={}, dir={}, max_days={}",
+        level,
+        g_access_path.empty() ? std::string("(daily)") : g_access_path.string(),
+        g_error_path.empty() ? std::string("(daily)") : g_error_path.string(),
+        log_dir.string(), max_days));
+
+    return true;
 }
 
-// ============================================================================
-// Log::Shutdown
-// ============================================================================
 void Log::Shutdown() {
+    std::lock_guard lifecycle_lock(g_lifecycle_mutex);
     if (!initialized_) return;
+
+    {
+        std::lock_guard error_lock(g_error_mutex);
+        if (g_error_file) g_error_file.flush();
+        g_error_file.close();
+    }
+    {
+        std::lock_guard access_lock(g_access_mutex);
+        if (g_access_file) g_access_file.flush();
+        g_access_file.close();
+    }
+    {
+        std::lock_guard console_lock(g_console_mutex);
+        std::cout.flush();
+    }
     initialized_ = false;
-
-    // 先 flush，等异步队列清空
-    for (const auto& sink : g_file_sinks) {
-        sink->stop();
-        logging::core::get()->remove_sink(sink);
-    }
-    g_file_sinks.clear();
-
-    if (g_console_sink) {
-        g_console_sink->flush();
-        logging::core::get()->remove_sink(g_console_sink);
-        g_console_sink.reset();
-    }
-
-    g_app_logger.reset();
-    g_access_logger.reset();
-    g_console_logger.reset();
 }
 
-// ============================================================================
-// Log::Flush  —  等待异步队列写完
-// ============================================================================
 void Log::Flush() {
-    for (const auto& sink : g_file_sinks) {
-        sink->flush();
+    {
+        std::lock_guard error_lock(g_error_mutex);
+        if (g_error_file) g_error_file.flush();
+    }
+    {
+        std::lock_guard access_lock(g_access_mutex);
+        if (g_access_file) g_access_file.flush();
+    }
+    {
+        std::lock_guard console_lock(g_console_mutex);
+        std::cout.flush();
     }
 }
 
-// ============================================================================
-// Write 系列
-// ============================================================================
 void Log::WriteApp(LogLevel level, const std::string& msg) {
-    if (!initialized_ || !g_app_logger) return;
-    BOOST_LOG_SEV(*g_app_logger, level) << msg;
+    if (!ShouldLog(level)) return;
+
+    std::lock_guard lock(g_error_mutex);
+    if (!initialized_ || !g_error_file) return;
+
+    g_error_file << '[' << LogLocalNow() << "] [" << level << "] " << msg << '\n';
+    if (level >= LogLevel::WARN) {
+        g_error_file.flush();
+    }
 }
 
 void Log::WriteAccess(const std::string& msg) {
-    if (!initialized_ || !g_access_logger) return;
-    BOOST_LOG(*g_access_logger) << msg;
+    if (min_level_ == LogLevel::NONE) return;
+
+    std::lock_guard lock(g_access_mutex);
+    if (!initialized_ || !g_access_file) return;
+
+    g_access_file << msg << '\n';
 }
 
 void Log::WriteConsole(const std::string& msg) {
-    if (!initialized_ || !g_console_logger) {
-        // 初始化完成前直接打印（bootstrap 阶段）
-        std::cout << msg << std::endl;
-        return;
-    }
-    BOOST_LOG(*g_console_logger) << msg;
+    std::lock_guard lock(g_console_mutex);
+    std::cout << '[' << LogLocalNow() << "] [info] " << msg << std::endl;
 }
 
-// ============================================================================
-// Log::ShouldLog  —  宏的前置快速过滤，避免无效 std::format 调用
-// ============================================================================
 bool Log::ShouldLog(LogLevel level) noexcept {
+    if (min_level_ == LogLevel::NONE) return false;
     return level >= min_level_;
 }
 

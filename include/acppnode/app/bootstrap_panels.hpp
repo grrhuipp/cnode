@@ -1,15 +1,20 @@
 #pragma once
 
-#include "acppnode/common.hpp"
+#include "acppnode/common/asio_types.hpp"
 
 namespace acpp {
-class PanelSyncManager;
+class Config;
+class Controller;
+namespace app::dns {
+class DNS;
+}
 }
 
 namespace acpp {
 
 void SetupPanels(net::io_context& main_ctx,
-                 PanelSyncManager& sync_manager,
-                 const Config& config);
+                 Controller& controller,
+                 const Config& config,
+                 app::dns::DNS& panel_dns_service);
 
 }  // namespace acpp

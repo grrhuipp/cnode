@@ -6,17 +6,16 @@
 // 只放稳定的第三方库和标准库头文件，不放项目自身头文件。
 // 项目头文件改动频繁，放进 PCH 会导致全量重编。
 //
-// 编译收益最大的是 Boost（Asio + Cobalt 展开量极大），其次是标准库模板。
+// 编译收益最大的是 Asio/OpenSSL，其次是标准库模板。
 // ============================================================================
 
 // ============================================================================
-// Windows 预处理（必须在 Boost/winsock2 之前）
+// Windows 预处理（必须在 Asio/系统 socket 头之前）
 // ============================================================================
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  define NOMINMAX
-// Boost.Log 依赖 Boost.Atomic wait 操作（WaitOnAddress），需要 Windows 8+ (0x0602)
-// Boost.Asio 默认设置 _WIN32_WINNT=0x0601，在此覆盖为 Windows 10
+// 统一设置 Windows 10 API 级别，供 Asio 和系统 socket API 使用。
 #  undef  _WIN32_WINNT
 #  define _WIN32_WINNT 0x0A00
 #  undef  WINVER
@@ -24,21 +23,19 @@
 #endif
 
 // ============================================================================
-// Boost（最重，PCH 收益最大）
+// Asio（最重，PCH 收益最大）
 // ============================================================================
-#include <boost/asio.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ip/udp.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/cobalt.hpp>
-#include <boost/json.hpp>
+#include <asio.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/awaitable.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/ip/udp.hpp>
+#include <asio/ssl.hpp>
+#include <asio/steady_timer.hpp>
 
-// Boost.Beast（WebSocket 传输层）
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-
-// Boost/windows.h 宏污染清理
+// Windows 宏污染清理
 #ifdef _WIN32
 #  ifdef ERROR
 #    undef ERROR
@@ -84,7 +81,6 @@
 #include <queue>
 #include <random>
 #include <ranges>
-#include <shared_mutex>
 #include <span>
 #include <sstream>
 #include <string>
@@ -104,7 +100,7 @@
 #endif
 
 // ============================================================================
-// AWS-LC（OpenSSL 兼容头文件）
+// OpenSSL（vcpkg）
 // ============================================================================
 #include <openssl/aes.h>
 #include <openssl/bn.h>

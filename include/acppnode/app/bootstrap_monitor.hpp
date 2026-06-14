@@ -2,10 +2,8 @@
 
 #include "acppnode/app/bootstrap_runtime.hpp"
 
-#include <atomic>
-
 namespace acpp {
 
-void StartRuntimeMonitoring(const RuntimeContext& ctx, std::atomic<bool>& running);
+void StartRuntimeMonitoring(const RuntimeContext& ctx, RuntimeState& state);
 
 }  // namespace acpp

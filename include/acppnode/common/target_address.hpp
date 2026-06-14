@@ -1,7 +1,13 @@
 #pragma once
 
-#include "acppnode/common.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/network.hpp"
+
+#include <charconv>
+#include <format>
+#include <optional>
+#include <string>
+#include <string_view>
 
 namespace acpp {
 
@@ -10,89 +16,99 @@ namespace acpp {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::IPv4;
-    std::string host;                              // IP 或域名
+    std::string host;                // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
-    
+
     // DNS 解析后的地址
     std::optional<net::ip::address> resolved_addr;
-    
+
     // 构造函数
     TargetAddress() = default;
-    
-    TargetAddress(const std::string& h, uint16_t p)
+
+    TargetAddress(std::string_view h, uint16_t p)
         : host(h), port(p) {
         DetermineType();
     }
-    
+
     TargetAddress(const net::ip::address& addr, uint16_t p)
         : port(p) {
         if (addr.is_v4()) {
             type = AddressType::IPv4;
             resolved_addr = addr;
-            host = addr.to_string();
+        } else if (addr.is_v6()) {
+            type = AddressType::IPv6;
+            resolved_addr = addr;
         }
     }
-    
+
     // 判断是否有效
     bool IsValid() const {
-        return !host.empty() && port > 0;
+        return port > 0 && (!host.empty() || resolved_addr.has_value());
     }
-    
+
     // 判断是否为域名
     bool IsDomain() const {
         return type == AddressType::Domain;
     }
-    
+
     // 判断是否为 IP
     bool IsIP() const {
+        return type == AddressType::IPv4 || type == AddressType::IPv6;
+    }
+
+    bool IsIPv4() const {
         return type == AddressType::IPv4;
     }
-    
+
+    bool IsIPv6() const {
+        return type == AddressType::IPv6;
+    }
+
     // 判断是否已解析
     bool IsResolved() const {
         return resolved_addr.has_value();
     }
-    
-    // 获取用于连接的地址（优先使用解析后的地址）
-    std::string GetConnectHost() const {
-        if (resolved_addr) {
-            return resolved_addr->to_string();
-        }
-        return host;
-    }
-    
+
     // 转换为字符串
     std::string ToString() const {
-        return iputil::FormatEndpointForLog(host, port);
-    }
-    
-    // 转换为带解析 IP 的字符串
-    std::string ToStringWithResolved() const {
-        if (resolved_addr && IsDomain()) {
-            return iputil::FormatEndpointForLog(
-                host + "(" + resolved_addr->to_string() + ")",
-                port);
+        if (host.empty() && resolved_addr) {
+            return iputil::FormatEndpointForLog(resolved_addr->to_string(), port);
         }
-        return ToString();
+        return iputil::FormatEndpointForLog(std::string_view(host.data(), host.size()), port);
     }
-    
+
     // 从字符串解析
     [[nodiscard]]
-    static std::optional<TargetAddress> Parse(const std::string& addr);
-    
+    static std::optional<TargetAddress> Parse(std::string_view addr);
+
 private:
+    static bool ParsePort(std::string_view text, uint16_t& port) {
+        if (text.empty()) {
+            return false;
+        }
+        uint32_t value = 0;
+        const char* first = text.data();
+        const char* last = text.data() + text.size();
+        auto [ptr, ec] = std::from_chars(first, last, value);
+        if (ec != std::errc{} || ptr != last || value == 0 || value > 65535) {
+            return false;
+        }
+        port = static_cast<uint16_t>(value);
+        return true;
+    }
+
     void DetermineType() {
-        boost::system::error_code ec;
-        auto addr = net::ip::make_address(host, ec);
+        IoErrorCode ec;
+        auto addr = net::ip::make_address(std::string_view(host.data(), host.size()), ec);
         if (!ec) {
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
                 resolved_addr = addr;
-            } else {
-                type = AddressType::Domain;
                 host.clear();
-                resolved_addr.reset();
-                return;
+            } else if (addr.is_v6()) {
+                type = AddressType::IPv6;
+                resolved_addr = addr;
+                host.clear();
             }
         } else {
             type = AddressType::Domain;
@@ -101,34 +117,71 @@ private:
 };
 
 // 从字符串解析地址
-inline std::optional<TargetAddress> TargetAddress::Parse(const std::string& addr) {
+inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) {
     if (addr.empty()) {
         return std::nullopt;
     }
-    
-    std::string host;
+
+    std::string_view host;
     uint16_t port = 0;
-    
-    if (addr[0] == '[') {
-        return std::nullopt;
+
+    if (addr.front() == '[') {
+        const auto close = addr.find(']');
+        if (close == std::string::npos ||
+            close + 1 >= addr.size() ||
+            addr[close + 1] != ':') {
+            return std::nullopt;
+        }
+        host = addr.substr(1, close - 1);
+        if (!ParsePort(addr.substr(close + 2), port)) {
+            return std::nullopt;
+        }
+    } else {
+        const auto colon = addr.rfind(':');
+        if (colon == std::string::npos ||
+            addr.find(':') != colon) {
+            return std::nullopt;
+        }
+        host = addr.substr(0, colon);
+        if (!ParsePort(addr.substr(colon + 1), port)) {
+            return std::nullopt;
+        }
     }
 
-    auto colon = addr.rfind(':');
-    if (colon == std::string::npos) {
-        return std::nullopt;
-    }
-    host = addr.substr(0, colon);
-    try {
-        port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
-    } catch (...) {
-        return std::nullopt;
-    }
-    
     if (host.empty() || port == 0) {
         return std::nullopt;
     }
-    
+
     return TargetAddress(host, port);
 }
 
 }  // namespace acpp
+
+template <>
+struct std::formatter<acpp::TargetAddress> {
+    constexpr auto parse(std::format_parse_context& ctx) {
+        return ctx.begin();
+    }
+
+    template <class FormatContext>
+    auto format(const acpp::TargetAddress& target, FormatContext& ctx) const {
+        std::string ip_storage;
+        std::string_view host(target.host.data(), target.host.size());
+        const bool use_resolved = host.empty() && target.resolved_addr.has_value();
+        if (use_resolved) {
+            ip_storage = target.resolved_addr->to_string();
+            host = ip_storage;
+        }
+        if (host.empty()) {
+            host = "unknown";
+        }
+
+        const bool needs_brackets = use_resolved
+            ? target.resolved_addr->is_v6()
+            : host.find(':') != std::string_view::npos;
+        if (needs_brackets) {
+            return std::format_to(ctx.out(), "[{}]:{}", host, target.port);
+        }
+        return std::format_to(ctx.out(), "{}:{}", host, target.port);
+    }
+};

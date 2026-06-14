@@ -1,9 +1,10 @@
 #pragma once
 
-#include "acppnode/common.hpp"
+#include "acppnode/core/constants.hpp"
 
 #include <ostream>
 #include <string>
+#include <string_view>
 
 namespace acpp {
 

@@ -1,5 +1,10 @@
 #include "acppnode/infra/config.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
+#include <algorithm>
+#include <cctype>
+#include <format>
+#include <stdexcept>
 #include <thread>
 
 namespace acpp {
@@ -11,58 +16,33 @@ namespace acpp {
 namespace {
 
 // 从 object 中取 string，不存在则返回默认值
-inline std::string jstr(const boost::json::object& obj, std::string_view key,
+inline std::string jstr(const json::object& obj, std::string_view key,
                         std::string_view def = "") {
     auto* p = obj.if_contains(key);
     if (!p || !p->is_string()) return std::string(def);
     return std::string(p->as_string());
 }
 
-// 双键版本：先查 key1（camelCase），再查 key2（PascalCase）
-inline std::string jstr2(const boost::json::object& obj,
-                         std::string_view key1, std::string_view key2,
-                         std::string_view def = "") {
-    auto* p = obj.if_contains(key1);
-    if (p && p->is_string()) return std::string(p->as_string());
-    auto* q = obj.if_contains(key2);
-    if (q && q->is_string()) return std::string(q->as_string());
-    return std::string(def);
-}
-
 // 从 object 中取 bool，不存在则返回默认值
-inline bool jbool(const boost::json::object& obj, std::string_view key,
+inline bool jbool(const json::object& obj, std::string_view key,
                   bool def = false) {
     auto* p = obj.if_contains(key);
     if (!p || !p->is_bool()) return def;
     return p->as_bool();
 }
 
-// 双键版本
-inline bool jbool2(const boost::json::object& obj,
-                   std::string_view key1, std::string_view key2,
-                   bool def = false) {
-    auto* p = obj.if_contains(key1);
-    if (p && p->is_bool()) return p->as_bool();
-    auto* q = obj.if_contains(key2);
-    if (q && q->is_bool()) return q->as_bool();
-    return def;
-}
-
-// 从 object 中取 int64，双键版本
-inline int64_t jint2(const boost::json::object& obj,
-                     std::string_view key1, std::string_view key2,
-                     int64_t def = 0) {
-    for (auto key : {key1, key2}) {
-        auto* p = obj.if_contains(key);
-        if (!p) continue;
-        if (p->is_int64()) return p->as_int64();
-        if (p->is_uint64()) return static_cast<int64_t>(p->as_uint64());
-    }
+// 从 object 中取 int64，不存在则返回默认值
+inline int64_t jint(const json::object& obj, std::string_view key,
+                    int64_t def = 0) {
+    auto* p = obj.if_contains(key);
+    if (!p) return def;
+    if (p->is_int64()) return p->as_int64();
+    if (p->is_uint64()) return static_cast<int64_t>(p->as_uint64());
     return def;
 }
 
 // 从 JSON array 中提取 string vector
-inline std::vector<std::string> jstr_array(const boost::json::value& v) {
+inline std::vector<std::string> jstr_array(const json::value& v) {
     std::vector<std::string> result;
     if (v.is_array()) {
         for (const auto& item : v.as_array()) {
@@ -74,57 +54,27 @@ inline std::vector<std::string> jstr_array(const boost::json::value& v) {
     return result;
 }
 
-// 从 JSON array 中提取 int vector
-inline std::vector<int> jint_array(const boost::json::value& v) {
-    std::vector<int> result;
-    if (v.is_array()) {
-        for (const auto& item : v.as_array()) {
-            if (item.is_int64()) {
-                result.push_back(static_cast<int>(item.as_int64()));
-            } else if (item.is_uint64()) {
-                result.push_back(static_cast<int>(item.as_uint64()));
-            }
-        }
-    }
-    return result;
-}
-
-// 从 object 中取 string array，双键版本
-inline std::vector<std::string> jstr_array2(const boost::json::object& obj,
-                                            std::string_view key1, std::string_view key2) {
-    auto* p = obj.if_contains(key1);
-    if (p && p->is_array()) return jstr_array(*p);
-    auto* q = obj.if_contains(key2);
-    if (q && q->is_array()) return jstr_array(*q);
-    return {};
-}
-
-// 从 object 中取 int array，双键版本
-inline std::vector<int> jint_array2(const boost::json::object& obj,
-                                    std::string_view key1, std::string_view key2) {
-    auto* p = obj.if_contains(key1);
-    if (p && p->is_array()) return jint_array(*p);
-    auto* q = obj.if_contains(key2);
-    if (q && q->is_array()) return jint_array(*q);
-    return {};
-}
 
 } // anonymous namespace
 
 // ============================================================================
 // LogConfig
 // ============================================================================
-LogConfig LogConfig::FromJson(const boost::json::object& j) {
+LogConfig LogConfig::FromJson(const json::object& j) {
     LogConfig cfg;
-    // 支持 Xray "loglevel" 和 cnode "level"/"Level"
-    auto level = jstr2(j, "loglevel", "level");
-    if (level.empty()) level = jstr(j, "Level");
+    auto level = jstr(j, "loglevel");
     if (!level.empty()) cfg.level = level;
 
-    auto dir = jstr2(j, "logDir", "LogDir");
+    auto dir = jstr(j, "logDir");
     if (!dir.empty()) cfg.log_dir = dir;
 
-    auto days = jint2(j, "maxDays", "MaxDays", cfg.max_days);
+    auto access_path = jstr(j, "access");
+    if (!access_path.empty()) cfg.access_path = access_path;
+
+    auto error_path = jstr(j, "error");
+    if (!error_path.empty()) cfg.error_path = error_path;
+
+    auto days = jint(j, "maxDays", cfg.max_days);
     cfg.max_days = static_cast<uint16_t>(days);
     return cfg;
 }
@@ -132,67 +82,50 @@ LogConfig LogConfig::FromJson(const boost::json::object& j) {
 // ============================================================================
 // DnsConfig
 // ============================================================================
-DnsConfig DnsConfig::FromJson(const boost::json::object& j) {
+DnsConfig DnsConfig::FromJson(const json::object& j) {
     DnsConfig cfg;
-    auto servers = jstr_array2(j, "servers", "Servers");
-    if (!servers.empty()) cfg.servers = std::move(servers);
-    cfg.timeout    = static_cast<uint32_t>(jint2(j, "timeout",   "Timeout",   cfg.timeout));
-    cfg.cache_size = static_cast<uint32_t>(jint2(j, "cacheSize", "CacheSize", cfg.cache_size));
-    cfg.min_ttl    = static_cast<uint32_t>(jint2(j, "minTTL",    "MinTTL",    cfg.min_ttl));
-    cfg.max_ttl    = static_cast<uint32_t>(jint2(j, "maxTTL",    "MaxTTL",    cfg.max_ttl));
-    return cfg;
-}
-
-// ============================================================================
-// PanelConfig
-// ============================================================================
-PanelConfig PanelConfig::FromJson(const boost::json::object& j) {
-    PanelConfig cfg;
-    cfg.name      = jstr2(j, "name",      "Name");
-    cfg.type      = jstr2(j, "type",      "Type",      std::string(constants::panel::kV2BoardType));
-    cfg.api_host  = jstr2(j, "apiHost",   "ApiHost");
-    cfg.api_key   = jstr2(j, "apiKey",    "ApiKey");
-    cfg.node_type = jstr2(j, "nodeType",  "NodeType",  std::string(constants::panel::kDefaultNodeType));
-
-    auto ids = jint_array2(j, "nodeID", "NodeID");
-    if (!ids.empty()) cfg.node_ids = std::move(ids);
-
-    cfg.tls_enable = jbool2(j, "tlsEnable", "TlsEnable", false);
-    cfg.tls_cert   = jstr2(j, "tlsCert",    "TlsCert");
-    cfg.tls_key    = jstr2(j, "tlsKey",     "TlsKey");
+    if (auto* servers = j.if_contains("servers"); servers && servers->is_array()) {
+        auto parsed = jstr_array(*servers);
+        if (!parsed.empty()) cfg.servers = std::move(parsed);
+    }
+    cfg.timeout    = static_cast<uint32_t>(jint(j, "timeout",   cfg.timeout));
+    cfg.cache_size = static_cast<uint32_t>(jint(j, "cacheSize", cfg.cache_size));
+    cfg.min_ttl    = static_cast<uint32_t>(jint(j, "minTTL",    cfg.min_ttl));
+    cfg.max_ttl    = static_cast<uint32_t>(jint(j, "maxTTL",    cfg.max_ttl));
     return cfg;
 }
 
 // ============================================================================
 // LimitsConfig
 // ============================================================================
-LimitsConfig LimitsConfig::FromJson(const boost::json::object& j) {
+LimitsConfig LimitsConfig::FromJson(const json::object& j) {
     LimitsConfig cfg;
-    cfg.max_connections        = static_cast<uint32_t>(jint2(j, "maxConnections",      "MaxConnections",      cfg.max_connections));
-    cfg.max_connections_per_ip = static_cast<uint32_t>(jint2(j, "maxConnectionsPerIP", "MaxConnectionsPerIP", cfg.max_connections_per_ip));
-    cfg.buffer_size            = static_cast<size_t>(jint2(j, "bufferSize",            "BufferSize",          static_cast<int64_t>(cfg.buffer_size)));
+    cfg.max_connections        = static_cast<uint32_t>(jint(j, "maxConnections",      cfg.max_connections));
+    cfg.max_connections_per_ip = static_cast<uint32_t>(jint(j, "maxConnectionsPerIP", cfg.max_connections_per_ip));
+    cfg.buffer_size            = static_cast<size_t>(jint(j, "bufferSize",            static_cast<int64_t>(cfg.buffer_size)));
     return cfg;
 }
 
 // ============================================================================
 // TimeoutsConfig
 // ============================================================================
-TimeoutsConfig TimeoutsConfig::FromJson(const boost::json::object& j) {
+TimeoutsConfig TimeoutsConfig::FromJson(const json::object& j) {
     TimeoutsConfig cfg;
-    cfg.handshake     = static_cast<uint32_t>(jint2(j, "handshake",     "Handshake",     cfg.handshake));
-    cfg.dial          = static_cast<uint32_t>(jint2(j, "dial",          "Dial",          cfg.dial));
-    cfg.read          = static_cast<uint32_t>(jint2(j, "read",          "Read",          cfg.read));
-    cfg.write         = static_cast<uint32_t>(jint2(j, "write",         "Write",         cfg.write));
-    cfg.idle          = static_cast<uint32_t>(jint2(j, "idle",          "Idle",          cfg.idle));
-    cfg.uplink_only   = static_cast<uint32_t>(jint2(j, "uplinkOnly",   "UplinkOnly",    cfg.uplink_only));
-    cfg.downlink_only = static_cast<uint32_t>(jint2(j, "downlinkOnly", "DownlinkOnly",  cfg.downlink_only));
+    cfg.handshake     = static_cast<uint32_t>(jint(j, "handshake",     cfg.handshake));
+    cfg.dial          = static_cast<uint32_t>(jint(j, "dial",          cfg.dial));
+    cfg.read          = static_cast<uint32_t>(jint(j, "read",          cfg.read));
+    cfg.write         = static_cast<uint32_t>(jint(j, "write",         cfg.write));
+    cfg.idle          = static_cast<uint32_t>(jint(j, "connIdle",      cfg.idle));
+    cfg.idle          = static_cast<uint32_t>(jint(j, "idle",          cfg.idle));
+    cfg.uplink_only   = static_cast<uint32_t>(jint(j, "uplinkOnly",    cfg.uplink_only));
+    cfg.downlink_only = static_cast<uint32_t>(jint(j, "downlinkOnly",  cfg.downlink_only));
     return cfg;
 }
 
 // ============================================================================
 // RouteRuleConfig
 // ============================================================================
-RouteRuleConfig RouteRuleConfig::FromJson(const boost::json::object& j) {
+RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     RouteRuleConfig rule;
 
     // 域名匹配 - 处理 xray 格式 (domain 数组可能包含 geosite:xxx, full:xxx 等)
@@ -329,39 +262,16 @@ RouteRuleConfig RouteRuleConfig::FromJson(const boost::json::object& j) {
         rule.outbound_tag = std::string(j.at("outboundTag").as_string());
     }
 
-    // 兼容旧格式
-    if (j.contains("OutboundTag")) {
-        rule.outbound_tag = std::string(j.at("OutboundTag").as_string());
-    }
-    // 兼容旧格式的简单规则
-    if (j.contains("Type") && j.contains("Value")) {
-        std::string type = std::string(j.at("Type").as_string());
-        std::string value = std::string(j.at("Value").as_string());
-        if (type == "domain") {
-            rule.domain_suffix.push_back(value);
-        } else if (type == "ip") {
-            rule.ip.push_back(value);
-        }
-    }
-
     return rule;
 }
 
 // ============================================================================
 // RoutingConfig
 // ============================================================================
-RoutingConfig RoutingConfig::FromJson(const boost::json::object& j) {
+RoutingConfig RoutingConfig::FromJson(const json::object& j) {
     RoutingConfig cfg;
-    if (j.contains("DomainStrategy")) {
-        cfg.domain_strategy = std::string(j.at("DomainStrategy").as_string());
-    }
     if (j.contains("domainStrategy")) {
         cfg.domain_strategy = std::string(j.at("domainStrategy").as_string());
-    }
-    if (j.contains("Rules")) {
-        for (const auto& rule : j.at("Rules").as_array()) {
-            cfg.rules.push_back(RouteRuleConfig::FromJson(rule.as_object()));
-        }
     }
     if (j.contains("rules")) {
         for (const auto& rule : j.at("rules").as_array()) {
@@ -375,9 +285,9 @@ RoutingConfig RoutingConfig::FromJson(const boost::json::object& j) {
 // WsConfig / StreamSettings
 // ============================================================================
 
-WsConfig WsConfig::FromJson(const boost::json::object& j) {
+WsConfig WsConfig::FromJson(const json::object& j) {
     WsConfig cfg;
-    cfg.path = jstr(j, "path", jstr(j, "Path", std::string(constants::binding::kRootPath)));
+    cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     // headers 字段
     auto parse_headers = [&](std::string_view key) {
         auto* p = j.if_contains(key);
@@ -390,53 +300,44 @@ WsConfig WsConfig::FromJson(const boost::json::object& j) {
         }
     };
     parse_headers("headers");
-    parse_headers("Headers");
-    cfg.real_ip_header = jstr(j, "realIpHeader", jstr(j, "real_ip_header", ""));
+    cfg.real_ip_header = jstr(j, "realIpHeader", "");
     return cfg;
 }
 
-StreamSettings StreamSettings::FromJson(const boost::json::object& j) {
+StreamSettings StreamSettings::FromJson(const json::object& j) {
     StreamSettings cfg;
 
-    // network / Network
-    cfg.network  = jstr(j, "network",  jstr(j, "Network",  std::string(constants::protocol::kTcp)));
-    cfg.security = jstr(j, "security", jstr(j, "Security", std::string(constants::protocol::kNone)));
+    cfg.network  = jstr(j, "network",  std::string(constants::protocol::kTcp));
+    cfg.security = jstr(j, "security", std::string(constants::protocol::kNone));
 
-    // TLS 配置（支持 tlsSettings / TlsSettings 两种 key）
+    // TLS 配置
     auto parse_tls = [&](std::string_view key) {
         auto* p = j.if_contains(key);
         if (!p || !p->is_object()) return;
         const auto& t = p->as_object();
-        cfg.tls.server_name    = jstr(t, "serverName",    jstr(t, "ServerName",    ""));
-        cfg.tls.allow_insecure = jbool(t, "allowInsecure", jbool(t, "AllowInsecure", false));
+        cfg.tls.server_name    = jstr(t, "serverName", "");
+        cfg.tls.allow_insecure = jbool(t, "allowInsecure", false);
         // ALPN
         if (auto* ap = t.if_contains("alpn"); ap && ap->is_array()) {
             cfg.tls.alpn = jstr_array(*ap);
-        } else if (auto* ap2 = t.if_contains("Alpn"); ap2 && ap2->is_array()) {
-            cfg.tls.alpn = jstr_array(*ap2);
         }
         // 证书（服务端）
         auto* certs = t.if_contains("certificates");
-        if (!certs) certs = t.if_contains("Certificates");
         if (certs && certs->is_array() && !certs->as_array().empty()) {
             const auto& c = certs->as_array()[0];
             if (c.is_object()) {
-                cfg.tls.cert_file = jstr(c.as_object(), "certificateFile",
-                                   jstr(c.as_object(), "CertificateFile", ""));
-                cfg.tls.key_file  = jstr(c.as_object(), "keyFile",
-                                   jstr(c.as_object(), "KeyFile",  ""));
+                cfg.tls.cert_file = jstr(c.as_object(), "certificateFile", "");
+                cfg.tls.key_file  = jstr(c.as_object(), "keyFile", "");
             }
         }
-        // 也支持直接的 cert/key 字段
         if (cfg.tls.cert_file.empty())
-            cfg.tls.cert_file = jstr(t, "certFile", jstr(t, "CertFile", ""));
+            cfg.tls.cert_file = jstr(t, "certFile", "");
         if (cfg.tls.key_file.empty())
-            cfg.tls.key_file  = jstr(t, "keyFile",  jstr(t, "KeyFile",  ""));
+            cfg.tls.key_file  = jstr(t, "keyFile", "");
     };
     parse_tls("tlsSettings");
-    parse_tls("TlsSettings");
 
-    // WS 配置（支持 wsSettings / WsSettings 两种 key）
+    // WS 配置
     auto parse_ws = [&](std::string_view key) {
         auto* p = j.if_contains(key);
         if (p && p->is_object()) {
@@ -444,7 +345,6 @@ StreamSettings StreamSettings::FromJson(const boost::json::object& j) {
         }
     };
     parse_ws("wsSettings");
-    parse_ws("WsSettings");
 
     cfg.RecomputeModes();
     return cfg;
@@ -465,10 +365,88 @@ void StreamSettings::RecomputeModes() noexcept {
 }
 
 // ============================================================================
-// InboundConfig
+// StaticInboundConfig
 // ============================================================================
-InboundConfig InboundConfig::FromJson(const boost::json::object& j) {
-    InboundConfig cfg;
+namespace {
+
+std::string_view StaticUserArrayKeyForProtocol(std::string_view protocol) noexcept {
+    if (protocol == constants::protocol::kAnyTLS) {
+        return "users";
+    }
+    return "clients";
+}
+
+StaticUserConfig ParseStaticUserConfig(
+    std::string_view protocol,
+    const json::object& settings) {
+    StaticUserConfig config;
+    if (const auto* method = settings.if_contains("method");
+            method && method->is_string()) {
+        config.method = std::string(method->as_string());
+    }
+    if (const auto* padding = settings.if_contains("paddingScheme");
+            padding && padding->is_array()) {
+        bool first = true;
+        for (const auto& item : padding->as_array()) {
+            if (!item.is_string()) {
+                continue;
+            }
+            if (!first) {
+                config.padding_scheme.push_back('\n');
+            }
+            config.padding_scheme.append(std::string(item.as_string()));
+            first = false;
+        }
+    }
+
+    if (protocol == constants::protocol::kShadowsocks) {
+        StaticUser user;
+        if (const auto* password = settings.if_contains("password");
+                password && password->is_string()) {
+            user.password = std::string(password->as_string());
+        }
+        if (const auto* email = settings.if_contains("email");
+                email && email->is_string()) {
+            user.email = std::string(email->as_string());
+        }
+        if (!user.password.empty()) {
+            config.clients.push_back(std::move(user));
+        }
+    }
+
+    const auto user_array_key = StaticUserArrayKeyForProtocol(protocol);
+    if (const auto* users = settings.if_contains(user_array_key);
+            users && users->is_array()) {
+        for (const auto& client : users->as_array()) {
+            if (!client.is_object()) {
+                continue;
+            }
+            const auto& client_obj = client.as_object();
+
+            StaticUser user;
+            if (const auto* id = client_obj.if_contains("id");
+                    id && id->is_string()) {
+                user.id = std::string(id->as_string());
+            }
+            if (const auto* password = client_obj.if_contains("password");
+                    password && password->is_string()) {
+                user.password = std::string(password->as_string());
+            }
+            if (const auto* email = client_obj.if_contains("email");
+                    email && email->is_string()) {
+                user.email = std::string(email->as_string());
+            }
+            config.clients.push_back(std::move(user));
+        }
+    }
+
+    return config;
+}
+
+}  // namespace
+
+StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
+    StaticInboundConfig cfg;
 
     // tag 支持字符串或数组（多标签匹配任一）
     auto parse_tag = [&](std::string_view key) {
@@ -485,36 +463,25 @@ InboundConfig InboundConfig::FromJson(const boost::json::object& j) {
         }
     };
     parse_tag("tag");
-    if (cfg.tags.empty()) parse_tag("Tag");
 
     if (j.contains("protocol")) {
         cfg.protocol = std::string(j.at("protocol").as_string());
-    } else if (j.contains("Protocol")) {
-        cfg.protocol = std::string(j.at("Protocol").as_string());
     }
 
     if (j.contains("listen")) {
         cfg.listen = std::string(j.at("listen").as_string());
-    } else if (j.contains("Listen")) {
-        cfg.listen = std::string(j.at("Listen").as_string());
     }
 
     if (j.contains("port")) {
         cfg.port = static_cast<uint16_t>(j.at("port").as_int64());
-    } else if (j.contains("Port")) {
-        cfg.port = static_cast<uint16_t>(j.at("Port").as_int64());
     }
 
     if (j.contains("settings") && j.at("settings").is_object()) {
-        cfg.settings = j.at("settings").as_object();
-    } else if (j.contains("Settings") && j.at("Settings").is_object()) {
-        cfg.settings = j.at("Settings").as_object();
+        cfg.static_users = ParseStaticUserConfig(cfg.protocol, j.at("settings").as_object());
     }
 
     if (j.contains("streamSettings") && j.at("streamSettings").is_object()) {
         cfg.stream_settings = StreamSettings::FromJson(j.at("streamSettings").as_object());
-    } else if (j.contains("StreamSettings") && j.at("StreamSettings").is_object()) {
-        cfg.stream_settings = StreamSettings::FromJson(j.at("StreamSettings").as_object());
     }
 
     // Xray sniffing 配置
@@ -531,7 +498,6 @@ InboundConfig InboundConfig::FromJson(const boost::json::object& j) {
         }
     };
     parse_sniffing("sniffing");
-    parse_sniffing("Sniffing");
 
     if (j.contains("outbound") && j.at("outbound").is_string())
         cfg.outbound_tag = std::string(j.at("outbound").as_string());
@@ -542,96 +508,43 @@ InboundConfig InboundConfig::FromJson(const boost::json::object& j) {
 }
 
 // ============================================================================
-// OutboundConfig
-// ============================================================================
-OutboundConfig OutboundConfig::FromJson(const boost::json::object& j) {
-    OutboundConfig cfg;
-
-    // 支持大小写混合
-    if (j.contains("tag")) {
-        cfg.tag = std::string(j.at("tag").as_string());
-    } else if (j.contains("Tag")) {
-        cfg.tag = std::string(j.at("Tag").as_string());
-    }
-
-    if (j.contains("protocol")) {
-        cfg.protocol = std::string(j.at("protocol").as_string());
-    } else if (j.contains("Protocol")) {
-        cfg.protocol = std::string(j.at("Protocol").as_string());
-    }
-
-    if (j.contains("settings") && j.at("settings").is_object()) {
-        cfg.settings = j.at("settings").as_object();
-    } else if (j.contains("Settings") && j.at("Settings").is_object()) {
-        cfg.settings = j.at("Settings").as_object();
-    }
-
-    if (j.contains("streamSettings") && j.at("streamSettings").is_object()) {
-        cfg.stream_settings = StreamSettings::FromJson(j.at("streamSettings").as_object());
-    } else if (j.contains("StreamSettings") && j.at("StreamSettings").is_object()) {
-        cfg.stream_settings = StreamSettings::FromJson(j.at("StreamSettings").as_object());
-    }
-
-    // Xray 顶级 sendThrough 字段
-    if (j.contains("sendThrough") && j.at("sendThrough").is_string()) {
-        cfg.send_through = std::string(j.at("sendThrough").as_string());
-    } else if (j.contains("SendThrough") && j.at("SendThrough").is_string()) {
-        cfg.send_through = std::string(j.at("SendThrough").as_string());
-    }
-
-    return cfg;
-}
-
-// ============================================================================
 // Config
 // ============================================================================
 
-std::optional<Config> Config::LoadFromJson(const boost::json::object& j) {
+std::optional<Config> Config::LoadFromJson(const json::object& j) {
     Config cfg;
 
     try {
-        // Log（支持 "log" / "Log"）
         if (j.contains("log") && j.at("log").is_object()) {
             cfg.log_ = LogConfig::FromJson(j.at("log").as_object());
-        } else if (j.contains("Log") && j.at("Log").is_object()) {
-            cfg.log_ = LogConfig::FromJson(j.at("Log").as_object());
         }
 
-        // Workers（支持 "workers" / "Workers"）
-        cfg.workers_ = static_cast<uint32_t>(jint2(j, "workers", "Workers", cfg.workers_));
+        cfg.workers_ = static_cast<uint32_t>(jint(j, "workers", cfg.workers_));
 
-        // DNS（支持 "dns" / "Dns"）
         if (j.contains("dns") && j.at("dns").is_object()) {
             cfg.dns_ = DnsConfig::FromJson(j.at("dns").as_object());
-        } else if (j.contains("Dns") && j.at("Dns").is_object()) {
-            cfg.dns_ = DnsConfig::FromJson(j.at("Dns").as_object());
         }
 
-        // Limits（支持 "limits" / "Limits"）
         if (j.contains("limits") && j.at("limits").is_object()) {
             cfg.limits_ = LimitsConfig::FromJson(j.at("limits").as_object());
-        } else if (j.contains("Limits") && j.at("Limits").is_object()) {
-            cfg.limits_ = LimitsConfig::FromJson(j.at("Limits").as_object());
         }
 
-        // Timeouts（支持 "timeouts" / "Timeouts"）
         if (j.contains("timeouts") && j.at("timeouts").is_object()) {
             cfg.timeouts_ = TimeoutsConfig::FromJson(j.at("timeouts").as_object());
-        } else if (j.contains("Timeouts") && j.at("Timeouts").is_object()) {
-            cfg.timeouts_ = TimeoutsConfig::FromJson(j.at("Timeouts").as_object());
         }
 
-        // Panels（支持 "panels" / "Panels"）
         auto parse_panels = [&](std::string_view key) {
             if (!j.contains(key)) return;
             const auto& arr = j.at(key);
             if (!arr.is_array()) return;
             for (const auto& panel : arr.as_array()) {
+                if (!panel.is_object()) {
+                    throw std::runtime_error("panel entry must be an object");
+                }
                 cfg.panels_.push_back(PanelConfig::FromJson(panel.as_object()));
             }
         };
         parse_panels("panels");
-        if (cfg.panels_.empty()) parse_panels("Panels");
 
         // Workers 默认值
         if (cfg.workers_ == 0) {

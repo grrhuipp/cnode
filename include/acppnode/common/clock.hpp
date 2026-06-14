@@ -53,7 +53,8 @@ std::string FormatBytes(uint64_t bytes);
 // 格式化时间戳
 std::string FormatTimestamp(int64_t timestamp_us);
 
-// 生成唯一连接 ID
-uint64_t GenerateConnId();
+// 生成 Worker 本地连接 ID：高 32 位为 worker_id，低 32 位为线程本地序号。
+// 连接在 Worker 线程归属内创建，避免全局原子计数器的跨线程争用。
+uint64_t GenerateWorkerConnId(uint32_t worker_id);
 
 }  // namespace acpp

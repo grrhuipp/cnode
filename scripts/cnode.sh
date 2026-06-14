@@ -13,6 +13,7 @@ BIN_PATH="$INSTALL_DIR/cnode"
 SERVICE_NAME="cnode"
 REPO="grrhuipp/cnode"
 LOG_DIR="$INSTALL_DIR/log"
+CONFIG_JSON="$CONFIG_DIR/config.json"
 
 # ============================================================================
 # 参数解析
@@ -33,9 +34,9 @@ usage() {
     echo "  -tls_enable true       启用 TLS（trojan 需要）"
     echo "  -tls_cert <path>       TLS 证书路径"
     echo "  -tls_key <path>        TLS 私钥路径"
-    echo "  -outbound_url <url>    远程 outbound.json 下载地址（文件已存在则跳过）"
-    echo "  -route_url <url>       远程 route.json 下载地址（文件已存在则跳过）"
-    echo "  -inbound_url <url>     远程 inbound.json 下载地址（文件已存在则跳过）"
+    echo "  -outbound_url <url>    远程 outbounds.json 下载地址（文件已存在则跳过）"
+    echo "  -route_url <url>       远程 routing.json 下载地址（文件已存在则跳过）"
+    echo "  -inbound_url <url>     远程 inbounds.json 下载地址（文件已存在则跳过）"
     echo "  -v <version>           指定 release 版本（默认 master）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
@@ -255,17 +256,19 @@ init_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$LOG_DIR"
 
-    # config.json（仅不存在时创建）
-    if [ ! -f "$CONFIG_DIR/config.json" ]; then
+    # config.json（cnode 配置；仅新安装创建。已有配置文件不覆盖）
+    if [ ! -f "$CONFIG_JSON" ]; then
         DNS_SERVER="1.1.1.1"
         if [ -n "$dns" ] && echo "$dns" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
             DNS_SERVER="$dns"
         fi
 
-        cat > "$CONFIG_DIR/config.json" <<EOF
+        cat > "$CONFIG_JSON" <<EOF
 {
   "log": {
     "loglevel": "info",
+    "access": "$LOG_DIR/access.log",
+    "error": "$LOG_DIR/error.log",
     "logDir": "$LOG_DIR"
   },
   "workers": 0,
@@ -276,6 +279,13 @@ init_config() {
     "minTTL": 60,
     "maxTTL": 3600
   },
+  "timeouts": {
+    "handshake": 60,
+    "dial": 10,
+    "read": 15,
+    "write": 30,
+    "idle": 300
+  },
   "panels": []
 }
 EOF
@@ -284,16 +294,16 @@ EOF
 
     # 远程配置文件（指定了 url 则每次覆盖下载）
     if [ -n "$inbound_url" ]; then
-        echo "下载 inbound.json: $inbound_url"
-        curl -sfL "$inbound_url" -o "$CONFIG_DIR/inbound.json" || echo "警告: inbound.json 下载失败"
+        echo "下载 inbounds.json: $inbound_url"
+        curl -sfL "$inbound_url" -o "$CONFIG_DIR/inbounds.json" || echo "警告: inbounds.json 下载失败"
     fi
     if [ -n "$outbound_url" ]; then
-        echo "下载 outbound.json: $outbound_url"
-        curl -sfL "$outbound_url" -o "$CONFIG_DIR/outbound.json" || echo "警告: outbound.json 下载失败"
+        echo "下载 outbounds.json: $outbound_url"
+        curl -sfL "$outbound_url" -o "$CONFIG_DIR/outbounds.json" || echo "警告: outbounds.json 下载失败"
     fi
     if [ -n "$route_url" ]; then
-        echo "下载 route.json: $route_url"
-        curl -sfL "$route_url" -o "$CONFIG_DIR/route.json" || echo "警告: route.json 下载失败"
+        echo "下载 routing.json: $route_url"
+        curl -sfL "$route_url" -o "$CONFIG_DIR/routing.json" || echo "警告: routing.json 下载失败"
     fi
 
     # 每次更新 geo 数据
@@ -304,14 +314,16 @@ EOF
 }
 
 # ============================================================================
-# 添加/覆盖 panel（jq 同名覆盖）
+# 添加/覆盖 panel
 # ============================================================================
 
 add_panel() {
-    # 解析 node_id 为 JSON 数组: "1,2,3" -> [1,2,3]
-    NODE_ID_JSON=$(echo "$node_id" | tr ',' '\n' | jq -s '.')
+    add_panel_json
+}
 
-    # 构建 panel JSON
+add_panel_json() {
+    # config.json 分支：写入最终 panel schema。
+    NODE_ID_JSON=$(echo "$node_id" | tr ',' '\n' | jq -s '.')
     PANEL_JSON=$(jq -n \
         --arg name "$name" \
         --arg api_host "$api_host" \
@@ -319,39 +331,46 @@ add_panel() {
         --argjson node_ids "$NODE_ID_JSON" \
         --arg node_type "$node_type" \
         '{
-            name: $name,
-            type: "V2Board",
-            apiHost: $api_host,
-            apiKey: $api_key,
-            nodeID: $node_ids,
-            nodeType: $node_type
+            Name: $name,
+            Type: "V2board",
+            APIHost: $api_host,
+            Key: $api_key,
+            NodeIDs: $node_ids,
+            NodeType: $node_type,
+            ListenIP: "auto",
+            SendIP: "auto",
+            EnableDNS: false,
+            DNSType: "",
+            ProxyProtocol: "auto",
+            TLSEnable: false,
+            TLSCert: "",
+            TLSKey: ""
         }')
 
-    # TLS 配置（单次 jq 调用完成）
     if [ "$tls_enable" = "true" ]; then
         PANEL_JSON=$(echo "$PANEL_JSON" | jq \
             --arg cert "$tls_cert" \
             --arg key  "$tls_key" \
-            '.tlsEnable = true
-             | if $cert != "" then .tlsCert = $cert else . end
-             | if $key  != "" then .tlsKey  = $key  else . end')
+            '.TLSEnable = true
+             | if $cert != "" then .TLSCert = $cert else . end
+             | if $key  != "" then .TLSKey  = $key  else . end')
     fi
 
     # 校验现有 config.json 是否合法
-    if ! jq empty "$CONFIG_DIR/config.json" 2>/dev/null; then
+    if ! jq empty "$CONFIG_JSON" 2>/dev/null; then
         echo "警告: config.json 格式损坏，尝试自动修复..."
         # 用 python/sed 尝试修复常见问题（缺逗号等），若失败则重建
         if command -v python3 >/dev/null 2>&1; then
             python3 -c "
 import json, re, sys
-with open('$CONFIG_DIR/config.json') as f:
+with open('$CONFIG_JSON') as f:
     text = f.read()
 # 修复对象/数组元素之间缺少逗号: }{ → },{  或 ]{ → ],{
 text = re.sub(r'(\})\s*(\{)', r'\1,\2', text)
 text = re.sub(r'(\])\s*(\{)', r'\1,\2', text)
 try:
     obj = json.loads(text)
-    with open('$CONFIG_DIR/config.json', 'w') as f:
+    with open('$CONFIG_JSON', 'w') as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     print('自动修复成功')
 except Exception as e:
@@ -369,11 +388,11 @@ except Exception as e:
 
     # 先删除同名 panel（去重），再追加
     jq --arg name "$name" --argjson panel "$PANEL_JSON" \
-        '.panels = [.panels[] | select(.name != $name)] + [$panel]' \
-        "$CONFIG_DIR/config.json" > "$CONFIG_DIR/config.json.tmp" \
-        && mv "$CONFIG_DIR/config.json.tmp" "$CONFIG_DIR/config.json"
+        '.panels = [.panels[] | select(.Name != $name)] + [$panel]' \
+        "$CONFIG_JSON" > "$CONFIG_JSON.tmp" \
+        && mv "$CONFIG_JSON.tmp" "$CONFIG_JSON"
 
-    echo "已添加 panel: $name (nodeType=$node_type, nodeID=$node_id)"
+    echo "已添加 panel: $name (nodeType=$node_type, NodeIDs=$node_id)"
 }
 
 # ============================================================================

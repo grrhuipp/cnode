@@ -1,27 +1,168 @@
 #include "acppnode/app/worker.hpp"
+#include "acppnode/app/port_binding.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/traffic_types.hpp"
+#include "acppnode/app/worker_runtime_config.hpp"
+#include "acppnode/app/worker_stats.hpp"
+#include "acppnode/common/session.hpp"
+#include "acppnode/common/rule.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/container_util.hpp"
+#include "acppnode/common/online_device.hpp"
+#include "acppnode/common/string_hash.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/app/connection_guard.hpp"
-#include "acppnode/app/relay.hpp"
+#include "acppnode/app/dispatcher/default_dispatcher.hpp"
+#include "acppnode/app/proxyman/inbound/manager.hpp"
+#include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
+#include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "acppnode/app/proxyman/outbound/manager.hpp"
+#include "acppnode/app/session_tracking.hpp"
+#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/proxyman/outbound/handler.hpp"
+#include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
-#include "acppnode/transport/tcp_stream.hpp"
-#include "acppnode/transport/proxy_protocol.hpp"
-#include "acppnode/protocol/outbound.hpp"
-#include "acppnode/protocol/protocol_registry.hpp"
-#include "acppnode/router/router.hpp"
+#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/app/router/router.hpp"
 #include "acppnode/common/error.hpp"
+#include "acppnode/app/proxyman/inbound/handler.hpp"
+#include "acppnode/proxy/inbound.hpp"
 
 #ifndef _WIN32
 #include <sys/socket.h>
 #endif
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <span>
 
 namespace acpp {
+
+struct Worker::ListenerSlot {
+    // Worker 线程内稳定的 per-tag slot。AcceptLoop 持有 slot 指针；
+    // 配置热更新只替换当前 inbound handler 指针，TCP acceptor 生命周期
+    // 由 slot 内的 tcp_worker 承载，避免每次 accept 后查 map。
+    proxyman::inbound::Handler* handler = nullptr;
+    std::unique_ptr<proxyman::inbound::TcpWorker> tcp_worker;
+};
+
+struct Worker::ListenerState {
+    using ListenerSlotMap =
+        memory::ThreadLocalUnorderedMap<std::string, ListenerSlot>;
+
+    memory::ThreadLocalUnorderedMap<std::string, std::string> tcp_listener_tags;
+    ListenerSlotMap listener_slots;
+    memory::ThreadLocalUnorderedMap<std::string, std::string> udp_socket_tags;
+    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<proxyman::inbound::UdpWorker>>
+        udp_workers;
+
+    void StartListening(Worker& worker, const PortBinding& binding);
+    void StopListening(Worker& worker, const std::string& tag);
+    void StartUdpListening(
+        Worker& worker,
+        const PortBinding& binding,
+        std::unique_ptr<proxyman::inbound::UdpHandler> handler);
+    void StopUdpListening(Worker& worker, const std::string& tag);
+    void RetireInboundHandler(Worker& worker, const std::string& tag);
+    void DrainRetiredHandlersIfIdle(Worker& worker);
+
+    net::awaitable<void> AcceptLoop(
+        Worker& worker,
+        std::string listener_key,
+        std::string tag,
+        tcp::acceptor* acceptor,
+        ListenerSlot* slot);
+
+    net::awaitable<void> ProcessReceivedConnection(
+        Worker& worker,
+        tcp::socket socket,
+        tcp::endpoint remote_ep,
+        proxyman::inbound::Handler* inbound_handler);
+
+    net::awaitable<void> UdpReceiveLoop(
+        Worker& worker,
+        std::string socket_key,
+        std::string tag,
+        const proxyman::inbound::UdpHandler* handler,
+        ListenerSlot* listener_slot);
+
+    [[nodiscard]] proxyman::inbound::UdpWorker*
+    FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept;
+    [[nodiscard]] const proxyman::inbound::UdpWorker*
+    FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept;
+
+    void EnqueueUdpReply(const std::string& tag,
+                         udp::socket* sock,
+                         udp::endpoint endpoint,
+                         std::span<const uint8_t> payload,
+                         uint32_t worker_id);
+    void EnqueueUdpReply(const std::string& tag,
+                         udp::socket* sock,
+                         udp::endpoint endpoint,
+                         buf::MultiBuffer payload,
+                         uint32_t worker_id);
+    void EnqueueUdpReply(const std::string& tag,
+                         udp::socket* sock,
+                         udp::endpoint endpoint,
+                         buf::BufferGuard payload,
+                         uint32_t worker_id);
+    void StartUdpReplySend(const std::string& tag,
+                           udp::socket* sock,
+                           uint32_t worker_id);
+};
+
+struct Worker::RuntimeState {
+    RuntimeState(net::io_context& io_context,
+                 const WorkerRuntimeConfig& runtime_config,
+                 StatsShard& stats_ref)
+        : io_context(io_context)
+        , runtime_snapshot(std::make_shared<WorkerRuntimeConfig>(runtime_config))
+        , stats(stats_ref)
+        , listener_state(std::make_unique<ListenerState>())
+        , inbound_manager(std::make_unique<proxyman::inbound::Manager>(stats))
+        , session_tracking(std::make_unique<app::SessionTrackingState>())
+        , dns_service(std::make_unique<app::dns::DNS>(io_context, runtime_config.dns))
+        , udp_session_manager(std::make_unique<UDPSessionManager>(
+              io_context,
+              *dns_service,
+              runtime_config.timeouts.SessionIdleTimeout()))
+        , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
+        , router(std::make_unique<app::router::Router>())
+        , rule_manager(std::make_unique<rule::Manager>())
+        , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
+
+    [[nodiscard]] std::shared_ptr<const WorkerRuntimeConfig> Snapshot() const {
+        return runtime_snapshot.load(std::memory_order_acquire);
+    }
+
+    void StoreSnapshot(std::shared_ptr<const WorkerRuntimeConfig> snapshot) {
+        runtime_snapshot.store(std::move(snapshot), std::memory_order_release);
+    }
+
+    void InitOutbounds(Worker& worker,
+                       const std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds);
+    void InitRouter(Worker& worker,
+                    const RoutingConfig& routing,
+                    std::string_view default_outbound_tag,
+                    geo::GeoManager* geo_manager);
+
+    net::io_context& io_context;
+    std::atomic<std::shared_ptr<const WorkerRuntimeConfig>> runtime_snapshot;
+    StatsShard& stats;
+    uint32_t active_connections = 0;
+
+    std::unique_ptr<ListenerState> listener_state;
+    std::unique_ptr<proxyman::inbound::Manager> inbound_manager;
+    std::unique_ptr<app::SessionTrackingState> session_tracking;
+    std::unique_ptr<app::dns::DNS> dns_service;
+    std::unique_ptr<UDPSessionManager> udp_session_manager;
+    std::unique_ptr<proxyman::outbound::Manager> outbound_manager;
+    std::unique_ptr<app::router::Router> router;
+    std::unique_ptr<rule::Manager> rule_manager;
+    std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
+};
 
 namespace {
 
@@ -29,36 +170,222 @@ constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 
 std::vector<std::string> BuildListenCandidates(std::string_view listen) {
+    if (listen.empty() || listen == constants::network::kDualStackAuto) {
+        return {
+            std::string(constants::network::kAnyIpv4),
+            std::string(constants::network::kAnyIpv6),
+        };
+    }
     return {std::string(listen)};
 }
 
-uint32_t ComputePressureThreshold(const Config& config) {
-    uint32_t threshold = defaults::kMaxConnectionsPerWorker
-        * defaults::kPressurePercent / 100;
+std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
+    std::string key;
+    key.reserve(tag.size() + listen.size() + 12);
+    key.append(tag);
+    key.push_back('|');
+    key.append(listen);
+    key.push_back('|');
+    key.append(std::to_string(port));
+    return key;
+}
 
-    const uint32_t configured_max = config.GetLimits().max_connections;
-    const uint32_t workers = std::max<uint32_t>(1, config.GetWorkers());
-    if (configured_max > 0) {
-        const uint32_t per_worker_budget = std::max<uint32_t>(
-            1, (configured_max + workers - 1) / workers);
-        const uint32_t configured_threshold = std::max<uint32_t>(
-            1, per_worker_budget * defaults::kPressurePercent / 100);
-        threshold = std::min(threshold, configured_threshold);
+[[nodiscard]] bool SameInboundUsersEntry(
+    const InboundUsersRuntimeEntry& entry,
+    std::string_view protocol,
+    std::string_view tag) {
+    return entry.protocol == protocol && entry.tag == tag;
+}
+
+[[nodiscard]] bool EmptyUserSet(const proxyman::inbound::UserSet& users) noexcept {
+    return users.vmess_accounts.empty() &&
+           users.trojan_users.empty() &&
+           users.ss_users.empty();
+}
+
+template <typename User, typename SameIdentity>
+void AddOrReplaceUsers(
+    std::vector<User>& current,
+    const std::vector<User>& incoming,
+    SameIdentity same_identity) {
+    current.reserve(current.size() + incoming.size());
+    for (const auto& user : incoming) {
+        auto it = std::find_if(current.begin(), current.end(),
+            [&](const User& existing) { return same_identity(existing, user); });
+        if (it == current.end()) {
+            current.push_back(user);
+        } else {
+            *it = user;
+        }
+    }
+}
+
+template <typename User, typename SameIdentity>
+void RemoveUsersByIdentity(
+    std::vector<User>& current,
+    const std::vector<User>& removing,
+    SameIdentity same_identity) {
+    std::erase_if(current, [&](const User& existing) {
+        return std::any_of(removing.begin(), removing.end(),
+            [&](const User& user) { return same_identity(existing, user); });
+    });
+}
+
+void AddInboundUsersToSnapshot(
+    std::vector<InboundUsersRuntimeEntry>& entries,
+    std::string_view protocol,
+    std::string_view tag,
+    const proxyman::inbound::UserSet& users) {
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [&](const InboundUsersRuntimeEntry& entry) {
+            return SameInboundUsersEntry(entry, protocol, tag);
+        });
+    if (it == entries.end()) {
+        entries.push_back(InboundUsersRuntimeEntry{
+            std::string(protocol),
+            std::string(tag),
+            users,
+        });
+        return;
     }
 
-    return std::max<uint32_t>(threshold, 1);
+    AddOrReplaceUsers(
+        it->users.vmess_accounts,
+        users.vmess_accounts,
+        [](const vmess::MemoryAccount& a, const vmess::MemoryAccount& b) {
+            return a.uuid == b.uuid;
+        });
+    AddOrReplaceUsers(
+        it->users.trojan_users,
+        users.trojan_users,
+        [](const trojan::TrojanUserInfo& a, const trojan::TrojanUserInfo& b) {
+            return a.password_hash == b.password_hash;
+        });
+    AddOrReplaceUsers(
+        it->users.ss_users,
+        users.ss_users,
+        [](const ss::SsUserInfo& a, const ss::SsUserInfo& b) {
+            if (a.user_id != 0 && b.user_id != 0) {
+                return a.user_id == b.user_id;
+            }
+            return a.password == b.password;
+        });
 }
 
+void ApplyInboundUsersToSnapshot(
+    std::vector<InboundUsersRuntimeEntry>& entries,
+    std::string_view protocol,
+    std::string_view tag,
+    const proxyman::inbound::UserSet& users) {
+    std::erase_if(entries, [&](const InboundUsersRuntimeEntry& entry) {
+        return SameInboundUsersEntry(entry, protocol, tag);
+    });
+    entries.push_back(InboundUsersRuntimeEntry{
+        std::string(protocol),
+        std::string(tag),
+        users,
+    });
 }
 
-InboundProtocolDeps Worker::GetInboundProtocolDeps() {
-    auto& stats = Stats();
-    return InboundProtocolDeps{
-        &user_manager_,
-        &trojan_user_manager_,
-        &ss_user_manager_,
-        &stats,
-    };
+void RemoveInboundUsersFromSnapshot(
+    std::vector<InboundUsersRuntimeEntry>& entries,
+    std::string_view protocol,
+    std::string_view tag,
+    const proxyman::inbound::UserSet& users) {
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [&](const InboundUsersRuntimeEntry& entry) {
+            return SameInboundUsersEntry(entry, protocol, tag);
+        });
+    if (it == entries.end()) {
+        return;
+    }
+
+    RemoveUsersByIdentity(
+        it->users.vmess_accounts,
+        users.vmess_accounts,
+        [](const vmess::MemoryAccount& a, const vmess::MemoryAccount& b) {
+            return a.uuid == b.uuid;
+        });
+    RemoveUsersByIdentity(
+        it->users.trojan_users,
+        users.trojan_users,
+        [](const trojan::TrojanUserInfo& a, const trojan::TrojanUserInfo& b) {
+            return a.password_hash == b.password_hash;
+        });
+    RemoveUsersByIdentity(
+        it->users.ss_users,
+        users.ss_users,
+        [](const ss::SsUserInfo& a, const ss::SsUserInfo& b) {
+            if (a.user_id != 0 && b.user_id != 0) {
+                return a.user_id == b.user_id;
+            }
+            return a.password == b.password;
+        });
+
+    if (EmptyUserSet(it->users)) {
+        entries.erase(it);
+    }
+}
+
+void ClearInboundUsersFromSnapshot(
+    std::vector<InboundUsersRuntimeEntry>& entries,
+    std::string_view protocol,
+    std::string_view tag) {
+    std::erase_if(entries, [&](const InboundUsersRuntimeEntry& entry) {
+        return SameInboundUsersEntry(entry, protocol, tag);
+    });
+}
+
+void RemoveInboundRuntimeFromSnapshot(WorkerRuntimeConfig& snapshot, std::string_view tag) {
+    std::erase_if(snapshot.static_inbounds, [&](const StaticInboundRuntimeEntry& entry) {
+        return entry.tag == tag;
+    });
+    std::erase_if(snapshot.inbound_users, [&](const InboundUsersRuntimeEntry& entry) {
+        return entry.tag == tag;
+    });
+}
+
+void ApplyProxyProtocolResult(
+    uint32_t worker_id,
+    session::Context& ctx,
+    const tcp::endpoint& remote_ep,
+    const ProxyProtocolResult& result) {
+    if (!result.success()) {
+        return;
+    }
+
+    if (result.src_addr) {
+        const auto src_addr = iputil::NormalizeAddress(*result.src_addr);
+        ctx.inbound.source_addr = src_addr;
+        ctx.inbound.source_ip = src_addr.to_string();
+        ctx.inbound.source_port = result.src_port;
+        LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
+                       ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
+                       ctx.inbound.source_ip, result.src_port);
+    } else if (!result.src_ip.empty()) {
+        ctx.inbound.source_addr = net::ip::address{};
+        ctx.inbound.source_ip = result.src_ip;
+        ctx.inbound.source_port = result.src_port;
+        LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
+                       ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
+                       ctx.inbound.source_ip, result.src_port);
+    }
+}
+
+}  // namespace
+
+std::unique_ptr<Inbound> Worker::NewInboundHandler(
+    std::string_view protocol,
+    ConnectionLimiterPtr limiter,
+    const proxyman::inbound::BuildRequest& req) {
+    return runtime_->inbound_manager->NewHandler(protocol, std::move(limiter), req);
+}
+
+std::unique_ptr<proxyman::inbound::UdpHandler> Worker::NewUdpInboundHandler(
+    std::string_view protocol,
+    ConnectionLimiterPtr limiter,
+    const proxyman::inbound::BuildRequest& req) {
+    return runtime_->inbound_manager->NewUdpHandler(protocol, std::move(limiter), req);
 }
 
 // ============================================================================
@@ -66,415 +393,439 @@ InboundProtocolDeps Worker::GetInboundProtocolDeps() {
 // ============================================================================
 
 Worker::Worker(uint32_t id, net::io_context& io_context,
-               const Config& config, ShardedStats& global_stats,
+               const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
                geo::GeoManager* geo_manager)
     : id_(id)
-    , io_context_(io_context)
-    , config_(config)
-    , global_stats_(global_stats)
-    , geo_manager_(geo_manager)
-    , user_manager_(true)
-    , trojan_user_manager_(true) {
+    , runtime_(std::make_unique<RuntimeState>(io_context, runtime_config, stats)) {
 
-    InitDnsService();
-    InitUDPSessionManager();
-    InitOutbounds();
-    InitRouter();
-
-    session_handler_ = std::make_unique<SessionHandler>(
-        *outbound_manager_,
-        *router_,
-        *dns_service_,
-        global_stats_.GetShard(id_),
-        config_.GetTimeouts());
+    runtime_->dispatcher->BindRuleManager(*runtime_->rule_manager);
+    runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
+    runtime_->udp_session_manager->StartCleanup();
+    const auto runtime_snapshot = runtime_->Snapshot();
+    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
+              id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
+    runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
+    runtime_->dispatcher->BindOutboundManager(*runtime_->outbound_manager);
+    const std::string_view default_outbound_tag = runtime_snapshot->outbounds.empty()
+        ? std::string_view(constants::protocol::kDirect)
+        : std::string_view(runtime_snapshot->outbounds.front().tag);
+    runtime_->InitRouter(*this, runtime_snapshot->routing, default_outbound_tag, geo_manager);
 }
 
 Worker::~Worker() {
-    while (!udp_sockets_.empty()) {
-        StopUdpListening(udp_sockets_.begin()->first);
+    while (!runtime_->listener_state->udp_workers.empty()) {
+        runtime_->listener_state->StopUdpListening(*this, runtime_->listener_state->udp_workers.begin()->first);
     }
-    while (!udp_client_sessions_.empty()) {
-        CleanupUdpClientSessions(udp_client_sessions_.begin()->first);
-    }
-    if (udp_session_manager_) {
-        udp_session_manager_->StopAll();
-    }
+    runtime_->udp_session_manager->StopAll();
+}
+
+net::io_context::executor_type Worker::GetExecutor() {
+    return runtime_->io_context.get_executor();
 }
 
 // ============================================================================
 // 初始化
 // ============================================================================
 
-void Worker::InitDnsService() {
-    DnsService::Config dns_config;
-    dns_config.servers    = config_.GetDns().servers;
-    dns_config.timeout_sec = config_.GetDns().timeout;
-    dns_config.cache_size = config_.GetDns().cache_size;
-    dns_config.min_ttl    = config_.GetDns().min_ttl;
-    dns_config.max_ttl    = config_.GetDns().max_ttl;
-    dns_service_ = CreateDnsService(io_context_.get_executor(), dns_config);
-}
+void Worker::RuntimeState::InitOutbounds(
+    Worker& worker,
+    const std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds) {
+    outbound_manager->Clear();
+    const auto snapshot = Snapshot();
+    const auto dial_timeout = snapshot->timeouts.DialTimeout();
 
-void Worker::InitUDPSessionManager() {
-    auto timeout = config_.GetTimeouts().SessionIdleTimeout();
-    udp_session_manager_ = std::make_unique<UDPSessionManager>(
-        io_context_.get_executor(), dns_service_.get(), timeout);
-    udp_session_manager_->StartCleanup();
-    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
-              id_, timeout.count());
-}
-
-void Worker::InitOutbounds() {
-    outbound_manager_ = std::make_unique<OutboundManager>();
-    const auto dial_timeout = config_.GetTimeouts().DialTimeout();
-    const auto executor     = io_context_.get_executor();
-
-    for (const auto& ob_config : config_.GetOutbounds()) {
-        auto outbound = OutboundFactory::Instance().Create(
-            ob_config, executor,
-            dns_service_.get(), udp_session_manager_.get(),
+    for (const auto& prepared_outbound : outbounds) {
+        auto handler = proxyman::outbound::NewHandler(
+            prepared_outbound, worker.runtime_->io_context,
+            *dns_service, udp_session_manager.get(),
+            stats,
             dial_timeout);
 
-        if (outbound) {
+        if (handler) {
             LOG_DEBUG("Worker[{}]: registered {} outbound '{}'",
-                      id_, ob_config.protocol, ob_config.tag);
-            outbound_manager_->RegisterOutbound(std::move(outbound));
+                      worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
+            (void)outbound_manager->AddHandler(std::move(handler));
         } else {
             LOG_WARN("Worker[{}]: failed to create {} outbound '{}'"
                      " (unregistered protocol or invalid config)",
-                     id_, ob_config.protocol, ob_config.tag);
+                     worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
         }
     }
 }
 
-void Worker::InitRouter() {
-    const auto& routing = config_.GetRouting();
-    router_ = std::make_unique<Router>();
-    // 默认出站 = 第一个 outbound（LoadFromFile 保证 direct 在最前面）
-    const auto& outbounds = config_.GetOutbounds();
-    if (!outbounds.empty()) {
-        router_->SetDefaultOutbound(outbounds.front().tag);
-    }
-
-    if (geo_manager_) {
-        router_->SetGeoManager(geo_manager_);
-    }
-
-    for (const auto& rc : routing.rules) {
-        CompoundRoutingRule compound;
-        compound.outbound_tag = rc.outbound_tag;
-
-        if (!rc.network.empty()) {
-            compound.conditions.push_back(NetworkCondition{rc.network});
-        }
-
-        if (!rc.inbound_tag.empty()) {
-            compound.conditions.push_back(InboundTagCondition{rc.inbound_tag});
-        } else {
-            // 隐式 inboundTag=node：没有显式 inboundTag 条件的规则只匹配面板入站
-            compound.conditions.push_back(
-                InboundTagCondition{std::vector<std::string>{std::string(constants::protocol::kNode)}});
-        }
-
-        if (!rc.user.empty()) {
-            compound.conditions.push_back(UserCondition{rc.user});
-        }
-
-        if (!rc.source_port.empty()) {
-            compound.conditions.push_back(SourcePortCondition{rc.source_port});
-        }
-
-        if (!rc.port.empty()) {
-            compound.conditions.push_back(PortCondition{rc.port});
-        }
-
-        if (!rc.protocol.empty()) {
-            compound.conditions.push_back(ProtocolCondition{rc.protocol});
-        }
-
-        {
-            IPMatcher sim;
-            for (const auto& v : rc.source) { sim.AddCIDR(v); }
-            if (!sim.Empty()) {
-                sim.BuildIndex();
-                compound.conditions.push_back(SourceIPCondition{std::move(sim)});
-            }
-        }
-
-        IPMatcher im;
-        for (const auto& v : rc.ip) { im.AddCIDR(v); }
-        if (!im.Empty()) {
-            im.BuildIndex();
-            compound.conditions.push_back(IPCondition{std::move(im)});
-        }
-
-        DomainMatcher dm;
-        for (const auto& v : rc.domain)         { dm.AddSuffix(v); }
-        for (const auto& v : rc.domain_suffix)  { dm.AddSuffix(v); }
-        for (const auto& v : rc.domain_keyword) { dm.AddKeyword(v); }
-        for (const auto& v : rc.domain_full)    { dm.AddDomain(v); }
-        if (!dm.Empty()) {
-            compound.conditions.push_back(DomainCondition{std::move(dm)});
-        }
-
-        if (!rc.geosite.empty()) {
-            compound.conditions.push_back(GeoSiteCondition{rc.geosite});
-        }
-
-        if (!rc.geoip.empty()) {
-            compound.conditions.push_back(GeoIPCondition{rc.geoip});
-        }
-
-        if (!compound.conditions.empty()) {
-            router_->AddCompoundRule(std::move(compound));
-        }
-    }
+void Worker::RuntimeState::InitRouter(
+    Worker& worker,
+    const RoutingConfig& routing,
+    std::string_view default_outbound_tag,
+    geo::GeoManager* geo_manager) {
+    router->Configure(routing, default_outbound_tag, geo_manager);
+    dispatcher->BindRouter(*router);
 
     LOG_DEBUG("Worker[{}]: router initialized, {} rules, default='{}'",
-              id_, routing.rules.size(), router_->DefaultOutbound());
+              worker.id_, routing.rules.size(), router->DefaultOutbound());
 }
 
 // ============================================================================
 // SO_REUSEPORT 监听管理（仅在 Worker io_context 上调用）
 // ============================================================================
 
-void Worker::StartListening(PortBinding binding) {
-    if (acceptors_.contains(binding.tag)) {
-        LOG_WARN("Worker[{}]: replacing existing TCP listener tag={}", id_, binding.tag);
-        StopListening(binding.tag);
+void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
+    const bool replacing = std::ranges::any_of(
+        tcp_listener_tags,
+        [&](const auto& item) { return item.second == binding.tag; });
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
+        StopListening(worker, binding.tag);
     }
 
-    tcp::acceptor acceptor(io_context_);
-    std::string actual_listen;
+    auto* inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
+    if (!inbound_handler) {
+        LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
+                  worker.id_, binding.tag);
+        return;
+    }
+    auto& listener_slot = listener_slots[binding.tag];
+    if (!listener_slot.tcp_worker) {
+        listener_slot.tcp_worker = std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
+    }
+    auto& tcp_worker = *listener_slot.tcp_worker;
+
     const auto listen_candidates = BuildListenCandidates(binding.listen);
+    size_t bound_count = 0;
 
     for (size_t i = 0; i < listen_candidates.size(); ++i) {
         const auto& listen_addr = listen_candidates[i];
-        boost::system::error_code ec;
+        IoErrorCode ec;
         auto addr = net::ip::make_address(listen_addr, ec);
         if (ec) {
             LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
-                      id_, listen_addr, ec.message());
-            return;
-        }
-        if (!addr.is_v4()) {
-            LOG_ERROR("Worker[{}]: non-IPv4 listen address '{}' is not supported",
-                      id_, listen_addr);
-            return;
+                      worker.id_, listen_addr, ec.message());
+            if (listen_candidates.size() == 1) return;
+            continue;
         }
 
         tcp::endpoint ep(addr, binding.port);
-        tcp::acceptor candidate_acceptor(io_context_);
+        const std::string listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
+        tcp::acceptor* candidate_acceptor =
+            tcp_worker.CreateAcceptor(listener_key, worker.runtime_->io_context);
+        if (!candidate_acceptor) {
+            LOG_ERROR("Worker[{}]: failed to create TCP acceptor tag={} key={}",
+                      worker.id_, binding.tag, listener_key);
+            continue;
+        }
 
-        auto retry_or_fail = [&](std::string_view op, std::string_view msg) -> bool {
-            if (i + 1 < listen_candidates.size()) {
-                LOG_WARN("Worker[{}]: TCP {} {}:{} failed: {}, retrying {}",
-                         id_, op, listen_addr, binding.port, msg, listen_candidates[i + 1]);
+        auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
+            tcp_worker.CloseAcceptor(listener_key);
+            if (listen_candidates.size() > 1) {
+                LOG_WARN("Worker[{}]: TCP {} {} failed: {}, continuing dual-stack bind",
+                         worker.id_,
+                         op,
+                         iputil::FormatEndpointForLog(listen_addr, binding.port),
+                         msg);
                 return true;
             }
-            LOG_ERROR("Worker[{}]: TCP {} {}:{} failed: {}",
-                      id_, op, listen_addr, binding.port, msg);
+            LOG_ERROR("Worker[{}]: TCP {} {} failed: {}",
+                      worker.id_, op,
+                      iputil::FormatEndpointForLog(listen_addr, binding.port),
+                      msg);
             return false;
         };
 
-        candidate_acceptor.open(ep.protocol(), ec);
+        candidate_acceptor->open(ep.protocol(), ec);
         if (ec) {
-            if (retry_or_fail("open", ec.message())) continue;
+            if (fail_candidate("open", ec.message())) continue;
             return;
         }
 
-        candidate_acceptor.set_option(net::socket_base::reuse_address(true), ec);
+        if (addr.is_v6()) {
+            candidate_acceptor->set_option(net::ip::v6_only(true), ec);
+            if (ec) {
+                if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
+                return;
+            }
+        }
+
+        candidate_acceptor->set_option(net::socket_base::reuse_address(true), ec);
 
 #ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡
         // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
         int optval = 1;
-        if (::setsockopt(candidate_acceptor.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+        if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
-            if (retry_or_fail("SO_REUSEPORT", strerror(errno))) continue;
+            if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
             return;
         }
 #endif
 
-        candidate_acceptor.bind(ep, ec);
+        candidate_acceptor->bind(ep, ec);
         if (ec) {
-            if (retry_or_fail("bind", ec.message())) continue;
+            if (fail_candidate("bind", ec.message())) continue;
             return;
         }
 
-        candidate_acceptor.listen(net::socket_base::max_listen_connections, ec);
+        candidate_acceptor->listen(net::socket_base::max_listen_connections, ec);
         if (ec) {
-            if (retry_or_fail("listen", ec.message())) continue;
+            if (fail_candidate("listen", ec.message())) continue;
             return;
         }
 
-        acceptor = std::move(candidate_acceptor);
-        actual_listen = listen_addr;
-        break;
+        tcp::acceptor* acceptor = candidate_acceptor;
+        if (!acceptor) {
+            LOG_ERROR("Worker[{}]: failed to attach TCP acceptor tag={} key={}",
+                      worker.id_, binding.tag, listener_key);
+            continue;
+        }
+        tcp_listener_tags.emplace(listener_key, binding.tag);
+
+        net::co_spawn(worker.runtime_->io_context.get_executor(),
+                      AcceptLoop(worker, listener_key, binding.tag, acceptor, &listener_slot),
+                      [](std::exception_ptr) {});
+
+        ++bound_count;
+        LOG_INFO("Worker[{}]: listening {} tag={} protocol={} (SO_REUSEPORT)",
+                 worker.id_,
+                 iputil::FormatEndpointForLog(listen_addr, binding.port),
+                 binding.tag, binding.protocol);
     }
 
-    if (actual_listen.empty()) {
-        return;
+    if (bound_count == 0) {
+        LOG_ERROR("Worker[{}]: no TCP listener bound tag={} protocol={}",
+                  worker.id_, binding.tag, binding.protocol);
     }
-    binding.listen = actual_listen;
-
-    acceptors_.emplace(binding.tag, std::move(acceptor));
-
-    cobalt::spawn(io_context_.get_executor(),
-                  AcceptLoop(binding.tag),
-                  [](std::exception_ptr) {});
-
-    LOG_INFO("Worker[{}]: listening {} tag={} protocol={} (SO_REUSEPORT)",
-             id_,
-             iputil::FormatEndpointForLog(binding.listen, binding.port),
-             binding.tag, binding.protocol);
 }
 
-void Worker::StopListening(const std::string& tag) {
-    auto it = acceptors_.find(tag);
-    if (it == acceptors_.end()) return;
-    boost::system::error_code ec;
-    it->second.close(ec);  // 使 AcceptLoop 收到 operation_aborted 退出
-    acceptors_.erase(it);
-    LOG_INFO("Worker[{}]: stopped listening tag={}", id_, tag);
+void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag) {
+    memory::ThreadLocalVector<std::string> listener_keys;
+    for (const auto& [listener_key, listener_tag] : tcp_listener_tags) {
+        if (listener_tag == tag) {
+            listener_keys.push_back(listener_key);
+        }
+    }
+    if (listener_keys.empty()) return;
+
+    auto slot_it = listener_slots.find(tag);
+    for (const auto& listener_key : listener_keys) {
+        if (slot_it != listener_slots.end() && slot_it->second.tcp_worker) {
+            slot_it->second.tcp_worker->CloseAcceptor(listener_key);  // 使 AcceptLoop 收到 operation_aborted 退出
+        }
+        tcp_listener_tags.erase(listener_key);
+    }
+    MaybeShrinkHashContainer(tcp_listener_tags, 8);
+    LOG_INFO("Worker[{}]: stopped listening tag={} sockets={}",
+             worker.id_, tag, listener_keys.size());
 }
 
-void Worker::CleanupUdpClientSessions(const std::string& tag) {
-    auto sessions_it = udp_client_sessions_.find(tag);
-    if (sessions_it == udp_client_sessions_.end()) {
-        return;
+proxyman::inbound::UdpWorker*
+Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept {
+    auto tag_it = udp_socket_tags.find(socket_key);
+    if (tag_it == udp_socket_tags.end()) {
+        return nullptr;
     }
+    auto worker_it = udp_workers.find(tag_it->second);
+    if (worker_it == udp_workers.end() || !worker_it->second) {
+        return nullptr;
+    }
+    return worker_it->second.get();
+}
 
-    for (auto& [client_key, session] : sessions_it->second) {
-        (void)client_key;
-        if (session.udp_dial.unregister_callback && session.callback_id != 0) {
-            session.udp_dial.unregister_callback(session.callback_id);
-        } else if (session.udp_dial.set_callback) {
-            session.udp_dial.set_callback(std::function<void(const UDPPacket&)>{});
+const proxyman::inbound::UdpWorker*
+Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept {
+    auto tag_it = udp_socket_tags.find(socket_key);
+    if (tag_it == udp_socket_tags.end()) {
+        return nullptr;
+    }
+    auto worker_it = udp_workers.find(tag_it->second);
+    if (worker_it == udp_workers.end() || !worker_it->second) {
+        return nullptr;
+    }
+    return worker_it->second.get();
+}
+
+void Worker::ListenerState::StopUdpListening(Worker& worker, const std::string& tag) {
+    memory::ThreadLocalVector<std::string> socket_keys;
+    for (const auto& [socket_key, socket_tag] : udp_socket_tags) {
+        if (socket_tag == tag) {
+            socket_keys.push_back(socket_key);
         }
     }
 
-    udp_client_sessions_.erase(sessions_it);
-    MaybeShrinkHashContainer(udp_client_sessions_, 8);
-}
+    for (const auto& socket_key : socket_keys) {
+        if (auto* udp_worker = FindUdpWorkerBySocketKey(socket_key)) {
+            udp_worker->CloseSocket(socket_key);
+        }
 
-void Worker::StopUdpListening(const std::string& tag) {
-    CleanupUdpClientSessions(tag);
-    udp_reply_queues_.erase(tag);
-    MaybeShrinkHashContainer(udp_reply_queues_, 8);
-
-    auto sock_it = udp_sockets_.find(tag);
-    if (sock_it != udp_sockets_.end()) {
-        boost::system::error_code ec;
-        sock_it->second->cancel(ec);
-        sock_it->second->close(ec);
-        udp_sockets_.erase(sock_it);
+        udp_socket_tags.erase(socket_key);
     }
 
-    udp_inbound_handlers_.erase(tag);
+    MaybeShrinkHashContainer(udp_socket_tags, 8);
+    if (auto it = udp_workers.find(tag); it != udp_workers.end()) {
+        it->second->Close();
+        udp_workers.erase(it);
+    }
+    (void)worker;
 }
 
-void Worker::EnqueueUdpReply(const std::string& tag,
-                             std::shared_ptr<udp::socket> sock,
-                             udp::endpoint endpoint,
-                             memory::ByteVector payload) {
-    if (!sock || !sock->is_open() || payload.empty()) {
+void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
+                                            udp::socket* sock,
+                                            udp::endpoint endpoint,
+                                            std::span<const uint8_t> payload,
+                                            uint32_t worker_id) {
+    if (payload.empty()) {
         return;
     }
 
-    auto& queue = udp_reply_queues_[tag];
-    queue.queued_bytes += payload.size();
-    queue.pending.push_back(PendingUdpReply{std::move(endpoint), std::move(payload)});
-    if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
-        queue.shrink_pending_on_drain = true;
+    buf::MultiBuffer mb;
+    mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+    size_t offset = 0;
+    while (offset < payload.size()) {
+        buf::BufferGuard buffer{buf::Buffer::New()};
+        if (!buffer) {
+            return;
+        }
+        const size_t n = std::min(payload.size() - offset,
+                                  static_cast<size_t>(buffer->Available()));
+        std::memcpy(buffer->Tail().data(), payload.data() + offset, n);
+        buffer->Produce(static_cast<uint32_t>(n));
+        mb.push_back(buffer.release());
+        offset += n;
+    }
+    EnqueueUdpReply(tag, sock, std::move(endpoint), std::move(mb), worker_id);
+}
+
+void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
+                                            udp::socket* sock,
+                                            udp::endpoint endpoint,
+                                            buf::MultiBuffer payload,
+                                            uint32_t worker_id) {
+    auto* udp_worker = FindUdpWorkerBySocketKey(tag);
+    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
+    if (current_sock != sock || !sock || !sock->is_open() || payload.empty()) {
+        return;
     }
 
-    if (!queue.write_in_progress) {
-        StartUdpReplySend(tag, sock);
+    if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
+        StartUdpReplySend(tag, sock, worker_id);
     }
 }
 
-void Worker::StartUdpReplySend(const std::string& tag,
-                               const std::shared_ptr<udp::socket>& sock) {
-    auto queue_it = udp_reply_queues_.find(tag);
-    if (queue_it == udp_reply_queues_.end() || !sock || !sock->is_open()) {
+void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
+                                            udp::socket* sock,
+                                            udp::endpoint endpoint,
+                                            buf::BufferGuard payload,
+                                            uint32_t worker_id) {
+    auto* udp_worker = FindUdpWorkerBySocketKey(tag);
+    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
+    if (current_sock != sock || !sock || !sock->is_open() || !payload || payload->IsEmpty()) {
         return;
     }
 
-    auto& queue = queue_it->second;
-    if (queue.write_in_progress || queue.pending.empty()) {
+    if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
+        StartUdpReplySend(tag, sock, worker_id);
+    }
+}
+
+void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
+                                              udp::socket* sock,
+                                              uint32_t worker_id) {
+    auto* udp_worker = FindUdpWorkerBySocketKey(tag);
+    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
+    if (current_sock != sock ||
+        !sock || !sock->is_open()) {
         return;
     }
 
-    auto packet = std::allocate_shared<PendingUdpReply>(
-        memory::ThreadLocalAllocator<PendingUdpReply>{},
-        std::move(queue.pending.front()));
-    queue.queued_bytes -= packet->payload.size();
-    queue.pending.pop_front();
-    queue.write_in_progress = true;
+    auto packet = udp_worker->BeginReplySend(tag);
+    if (!packet) {
+        return;
+    }
 
     sock->async_send_to(
-        net::buffer(packet->payload),
-        packet->endpoint,
-        [this, tag, sock, packet](boost::system::error_code ec, size_t /*bytes_sent*/) {
-            auto it = udp_reply_queues_.find(tag);
-            if (it == udp_reply_queues_.end()) {
+        proxyman::inbound::UdpWorker::ReplySendBuffers(*packet),
+        proxyman::inbound::UdpWorker::ReplyEndpoint(*packet),
+        [this, tag, sock, packet = std::move(packet), worker_id](IoErrorCode ec, size_t /*bytes_sent*/) {
+            auto* udp_worker = FindUdpWorkerBySocketKey(tag);
+            if (!udp_worker) {
                 return;
             }
 
-            auto& state = it->second;
-            state.write_in_progress = false;
-
-            if (ec && ec != net::error::operation_aborted) {
+            if (ec && ec != io_error::operation_aborted) {
                 LOG_ACCESS_DEBUG("Worker[{}]: UDP reply send failed tag={}: {}",
-                                 id_, tag, ec.message());
+                                 worker_id, tag, ec.message());
             }
 
-            if (!state.pending.empty() && sock && sock->is_open()) {
-                StartUdpReplySend(tag, sock);
-            } else if (state.pending.empty() && state.shrink_pending_on_drain) {
-                TryShrinkSequence(state.pending);
-                state.shrink_pending_on_drain = false;
+            const bool current_sock =
+                udp_worker->FindSocket(tag) == sock;
+
+            const bool has_pending = udp_worker->CompleteReplySend(tag);
+            if (has_pending && current_sock && sock && sock->is_open()) {
+                StartUdpReplySend(tag, sock, worker_id);
             }
         });
 }
 
 // ============================================================================
-// AcceptLoop — 每 tag 一个协程，运行在 Worker io_context 上
+// AcceptLoop — 每个 TCP socket 一个协程，运行在 Worker io_context 上
 // ============================================================================
 
-cobalt::task<void> Worker::AcceptLoop(std::string tag) {
+net::awaitable<void> Worker::ListenerState::AcceptLoop(
+    Worker& worker,
+    std::string listener_key,
+    std::string tag,
+    tcp::acceptor* acceptor,
+    ListenerSlot* slot) {
     while (true) {
-        auto acc_it = acceptors_.find(tag);
-        if (acc_it == acceptors_.end()) co_return;
+        if (!acceptor) co_return;
 
-        auto [ec, socket] = co_await acc_it->second.async_accept(
-            net::as_tuple(cobalt::use_op));
+        auto [ec, socket] = co_await acceptor->async_accept(
+            net::as_tuple(net::use_awaitable));
 
-        if (ec == net::error::operation_aborted) co_return;
+        if (ec == io_error::operation_aborted) co_return;
         if (ec) {
-            LOG_WARN("Worker[{}]: accept error tag={}: {}", id_, tag, ec.message());
+            if (!slot || !slot->tcp_worker ||
+                slot->tcp_worker->FindAcceptor(listener_key) != acceptor) {
+                co_return;
+            }
+            LOG_WARN("Worker[{}]: accept error tag={}: {}", worker.id_, tag, ec.message());
             const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
                 ? kAcceptResourceBackoff
                 : kAcceptErrorBackoff;
-            net::steady_timer timer(io_context_);
+            net::steady_timer timer(worker.runtime_->io_context);
             timer.expires_after(backoff);
-            (void)co_await timer.async_wait(net::as_tuple(cobalt::use_op));
+            (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
             continue;
         }
 
         // 获取远端地址（可能失败，不影响接受）
         tcp::endpoint remote_ep;
-        boost::system::error_code ep_ec;
+        IoErrorCode ep_ec;
         remote_ep = socket.remote_endpoint(ep_ec);
 
-        SetupConnectedSocket(socket);
-        active_connections_.fetch_add(1, std::memory_order_relaxed);
+        auto* inbound_handler = slot ? slot->handler : nullptr;
+        if (!inbound_handler) {
+            LOG_ERROR("Worker[{}]: no inbound handler for tag={}", worker.id_, tag);
+            socket.close();
+            continue;
+        }
 
-        cobalt::spawn(io_context_.get_executor(),
-                      ProcessReceivedConnection(std::move(socket), remote_ep, tag),
-                      [this](std::exception_ptr) {
-                          active_connections_.fetch_sub(1, std::memory_order_relaxed);
+        ++worker.runtime_->active_connections;
+
+        net::co_spawn(worker.runtime_->io_context.get_executor(),
+                      ProcessReceivedConnection(worker, std::move(socket), remote_ep, inbound_handler),
+                      [&worker](std::exception_ptr ep) {
+                          if (ep) {
+                              try {
+                                  std::rethrow_exception(ep);
+                              } catch (const std::exception& e) {
+                                  LOG_ERROR("Worker[{}]: TCP connection coroutine failed: {}",
+                                            worker.id_, e.what());
+                              } catch (...) {
+                                  LOG_ERROR("Worker[{}]: TCP connection coroutine failed: unknown",
+                                            worker.id_);
+                              }
+                          }
+                          --worker.runtime_->active_connections;
+                          worker.runtime_->listener_state->DrainRetiredHandlersIfIdle(worker);
                       });
     }
 }
@@ -483,313 +834,354 @@ cobalt::task<void> Worker::AcceptLoop(std::string tag) {
 // ProcessReceivedConnection — per-connection 协程
 // ============================================================================
 
-cobalt::task<void> Worker::ProcessReceivedConnection(
-    tcp::socket socket, tcp::endpoint remote_ep, std::string tag) {
-
-    auto lc_it = listener_contexts_.find(tag);
-    if (lc_it == listener_contexts_.end()) {
-        LOG_ERROR("Worker[{}]: no listener context for tag={}", id_, tag);
+net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
+    Worker& worker,
+    tcp::socket socket,
+    tcp::endpoint remote_ep,
+    proxyman::inbound::Handler* inbound_handler) {
+    if (!inbound_handler) {
+        LOG_ERROR("Worker[{}]: no inbound handler for accepted connection", worker.id_);
         socket.close();
         co_return;
     }
-
-    // ListenerContext 存在 unordered_map 中。连接建立后如果继续新增/重建监听，
-    // map rehash 会使对 value 的引用失效；把它复制到协程帧里可避免悬空引用。
-    ListenerContext listener = lc_it->second;
+    proxyman::inbound::ReceiverSettings& listener = inbound_handler->ReceiverSettings();
 
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
 
-    SessionContext ctx;
-    ctx.worker_id        = id_;
-    ctx.inbound_tag      = tag;
-    ctx.inbound_tags     = listener.inbound_tags;
-    ctx.inbound_protocol = listener.protocol;
+    session::Context ctx;
+    ctx.conn_id = session::NewID(worker.id_);
+    ctx.worker_id = worker.id_;
+    ctx.inbound.tag      = listener.inbound_tag;
+    ctx.inbound.tags     = listener.RouteInboundTags();
     try {
         const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
-        ctx.client_ip = normalized_remote.to_string();
-        ctx.src_addr  = tcp::endpoint(normalized_remote, remote_ep.port());
-
-        const auto local_ep = tcp_stream->LocalEndpoint();
-        ctx.inbound_local_addr = tcp::endpoint(
-            iputil::NormalizeAddress(local_ep.address()),
-            local_ep.port());
+        ctx.inbound.source_addr = normalized_remote;
+        ctx.inbound.source_ip = normalized_remote.to_string();
+        ctx.inbound.source_port = remote_ep.port();
     } catch (...) {
-        ctx.client_ip = "unknown";
+        ctx.inbound.source_ip = "unknown";
     }
-    ctx.worker_active_connections = active_connections_.load(std::memory_order_relaxed);
-
-    const uint32_t pressure_threshold = ComputePressureThreshold(config_);
-    if (ctx.worker_active_connections >= pressure_threshold) {
-        const uint32_t pressure_idle = defaults::kPressureIdleTimeout;
-        if (config_.GetTimeouts().idle > pressure_idle) {
-            ctx.pressure_idle_timeout = pressure_idle;
-        }
+    const auto runtime_snapshot = worker.runtime_->Snapshot();
+    uint32_t pressure_idle_timeout = 0;
+    if (worker.runtime_->active_connections >= runtime_snapshot->pressure_threshold) {
+        pressure_idle_timeout = runtime_snapshot->pressure_idle_timeout;
     }
-
-    std::optional<ConnectionLimitGuard> connection_limit;
-    if (listener.limiter) {
-        auto reject = listener.limiter->TryAcceptGlobal();
-        if (reject != ConnectionLimiter::RejectReason::NONE) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={} (pre-proxy)",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.client_ip, ctx.src_addr.port(), ctx.inbound_tag,
-                ConnectionLimiter::RejectReasonToString(reject));
-            global_stats_.GetShard(id_).OnError();
-            tcp_stream->Close();
-            co_return;
-        }
-        connection_limit.emplace(listener.limiter, ctx.client_ip);
-    }
+    LOG_CONN_DEBUG(ctx, "Worker[{}]: accepted TCP tag={} from {}:{}",
+                   worker.id_,
+                   ctx.inbound.tag,
+                   ctx.inbound.source_ip,
+                   ctx.inbound.source_port);
 
     // ----------------------------------------------------------------
     // PROXY Protocol 检测（负载均衡器透传真实客户端 IP）
     //
-    // 支持 v1（文本）和 v2（二进制，IPv4 头恰好 28 字节）自动检测。
-    // 若数据不是 PROXY 头，全部放回 pending_data，对后续协议透明。
+    // 读取、消耗和 pending-data 管理由 transport/internet 完成；
+    // Worker 只把解析出的真实客户端地址写入当前 session。
     // ----------------------------------------------------------------
-    if (listener.proxy_protocol) {
-        const auto handshake_timeout = config_.GetTimeouts().HandshakeTimeout();
-        tcp_stream->SetIdleTimeout(handshake_timeout);
-        auto proxy_deadline = tcp_stream->StartPhaseDeadline(handshake_timeout);
-
-        constexpr size_t kMaxProxyHeaderBytes = 2048;
-        memory::ByteVector buf;
-        buf.reserve(256);
-
-        while (buf.size() < kMaxProxyHeaderBytes) {
-            std::array<uint8_t, 256> chunk{};
-            size_t n = co_await tcp_stream->AsyncRead(net::buffer(chunk));
-            if (n == 0) {
-                const bool timed_out = proxy_deadline.Expired()
-                    || tcp_stream->ConsumePhaseDeadline()
-                    || tcp_stream->ConsumeIdleTimeout();
-                if (timed_out) {
+    if (listener.proxy_protocol != ProxyProtocolMode::Off) {
+        auto proxy_read = co_await tcp_stream->ReadProxyProtocolHeader(
+            runtime_snapshot->timeouts.HandshakeTimeout());
+        if (!proxy_read.ok()) {
+            switch (proxy_read.status) {
+                case ProxyProtocolReadStatus::TimedOut:
                     LOG_WARN("Worker[{}]: PROXY protocol pre-read timed out tag={} client={}",
-                             id_, tag, ctx.client_ip);
-                    tcp_stream->Close();
-                    co_return;
-                }
-                auto result = ProxyProtocolParser::Parse(buf.data(), buf.size());
-                if (result.incomplete()) {
-                    LOG_WARN("Worker[{}]: truncated PROXY protocol header tag={}", id_, tag);
-                    tcp_stream->Close();
-                    co_return;
-                }
-                if (!buf.empty()) {
-                    tcp_stream->SetPendingData(std::span<const uint8_t>(buf));
-                }
-                break;
+                             worker.id_, ctx.inbound.tag, ctx.inbound.source_ip);
+                    break;
+                case ProxyProtocolReadStatus::Truncated:
+                    LOG_WARN("Worker[{}]: truncated PROXY protocol header tag={}",
+                             worker.id_, ctx.inbound.tag);
+                    break;
+                case ProxyProtocolReadStatus::TooLarge:
+                    LOG_WARN("Worker[{}]: PROXY protocol header exceeded {} bytes tag={}",
+                             worker.id_, 2048, ctx.inbound.tag);
+                    break;
+                case ProxyProtocolReadStatus::Invalid:
+                    LOG_WARN("Worker[{}]: invalid PROXY protocol header tag={}",
+                             worker.id_, ctx.inbound.tag);
+                    break;
+                case ProxyProtocolReadStatus::Ok:
+                    break;
             }
-
-            buf.insert(buf.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
-
-            auto result = ProxyProtocolParser::Parse(buf.data(), buf.size());
-            if (result.incomplete()) {
-                continue;
-            }
-
-            if (result.status == ProxyProtocolParseStatus::Invalid) {
-                LOG_WARN("Worker[{}]: invalid PROXY protocol header tag={}", id_, tag);
-                tcp_stream->Close();
-                co_return;
-            }
-
-            size_t skip = 0;
-            if (result.success()) {
-                skip = result.consumed;
-                if (!result.src_ip.empty()) {
-                    boost::system::error_code src_ec;
-                    auto src_addr = net::ip::make_address(result.src_ip, src_ec);
-                    ctx.client_ip = src_ec
-                        ? result.src_ip
-                        : iputil::NormalizeAddressString(src_addr);
-                    LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
-                                  tag, iputil::NormalizeAddressString(remote_ep.address()),
-                                  ctx.client_ip, result.src_port);
-                }
-            }
-
-            if (skip < buf.size()) {
-                tcp_stream->SetPendingData(std::span<const uint8_t>(buf).subspan(skip));
-            }
-            break;
-        }
-
-        if (buf.size() >= kMaxProxyHeaderBytes) {
-            LOG_WARN("Worker[{}]: PROXY protocol header exceeded {} bytes tag={}",
-                     id_, kMaxProxyHeaderBytes, tag);
             tcp_stream->Close();
             co_return;
         }
 
-        tcp_stream->ClearPhaseDeadline();
+        if (listener.proxy_protocol == ProxyProtocolMode::On &&
+            proxy_read.result.status != ProxyProtocolParseStatus::Success) {
+            LOG_WARN("Worker[{}]: missing required PROXY protocol header tag={} client={}",
+                     worker.id_, ctx.inbound.tag, ctx.inbound.source_ip);
+            tcp_stream->Close();
+            co_return;
+        }
+
+        ApplyProxyProtocolResult(worker.id_, ctx, remote_ep, proxy_read.result);
     }
 
-    // 活跃会话追踪只覆盖真正进入 relay 的连接，避免大量握手失败/瞬断连接
-    // 把 active_sessions_ 在洪峰时冲大。
-    struct ActiveSessionGuard {
-        memory::ThreadLocalUnorderedMap<uint64_t, ActiveSession>& map;
-        uint64_t conn_id;
-        const SessionContext* ctx = nullptr;
-        uint64_t last_up = 0;
-        uint64_t last_down = 0;
-        bool active = false;
-
-        void Start(const SessionContext& session_ctx) {
-            if (active || session_ctx.user_id <= 0) {
-                return;
-            }
-            ctx = &session_ctx;
-            map[conn_id] = ActiveSession{ctx, 0, 0};
-            active = true;
-        }
-
-        void Stop() {
-            if (!active) {
-                return;
-            }
-            if (auto it = map.find(conn_id); it != map.end()) {
-                last_up = it->second.last_reported_up;
-                last_down = it->second.last_reported_down;
-                map.erase(it);
-                MaybeShrinkHashContainer(map, 256);
-            }
-            ctx = nullptr;
-            active = false;
-        }
-
-        ~ActiveSessionGuard() {
-            Stop();
-        }
-    } session_guard{active_sessions_, ctx.conn_id};
-
-    ctx.on_relay_start = [&session_guard, &ctx] {
-        session_guard.Start(ctx);
-    };
-    ctx.on_relay_end = [&session_guard] {
-        session_guard.Stop();
-    };
-
-    co_await session_handler_->Handle(
-        std::move(tcp_stream), ctx, listener, std::move(connection_limit));
-
-    // 写入剩余增量流量（总流量 - guard 记录的已上报部分），避免重复计数
-    // relay 结束时 guard 会记录最后一次已上报快照。
-    const uint64_t already_up = session_guard.last_up;
-    const uint64_t already_down = session_guard.last_down;
-    uint64_t remaining_up = ctx.bytes_up > already_up ? ctx.bytes_up - already_up : 0;
-    uint64_t remaining_down = ctx.bytes_down > already_down ? ctx.bytes_down - already_down : 0;
-    if (remaining_up > 0 || remaining_down > 0) {
-        AddUserTraffic(ctx.inbound_tag, ctx.user_id, remaining_up, remaining_down);
-    }
+    co_await inbound_handler->ProcessAcceptedTCP(
+        worker.runtime_->io_context, *worker.runtime_->dispatcher, worker.runtime_->stats, runtime_snapshot->timeouts,
+        std::move(tcp_stream), ctx,
+        pressure_idle_timeout);
 }
 
 // ============================================================================
 // 线程安全 Async 接口（主线程调用，post 到 Worker 线程）
 // ============================================================================
 
-void Worker::AddListenerAsync(PortBinding binding) {
-    net::post(io_context_,
-        [this, b = std::move(binding)]() mutable {
-            StartListening(std::move(b));
+void Worker::AddListenerAsync(const PortBinding& binding) {
+    net::post(runtime_->io_context,
+        [this, b = binding] {
+            runtime_->listener_state->StartListening(*this, b);
         });
 }
 
-void Worker::RemoveListenerAsync(std::string tag) {
-    net::post(io_context_,
+void Worker::ShutdownListenersAsync(std::vector<std::string> tags,
+                                    std::function<void()> on_done) {
+    net::post(runtime_->io_context,
+        [this, tags = std::move(tags), on_done = std::move(on_done)]() mutable {
+            for (const auto& tag : tags) {
+                runtime_->listener_state->StopListening(*this, tag);
+                runtime_->listener_state->StopUdpListening(*this, tag);
+            }
+            net::post(runtime_->io_context, [on_done = std::move(on_done)]() mutable {
+                if (on_done) {
+                    on_done();
+                }
+            });
+        });
+}
+
+void Worker::RegisterListenerAsync(proxyman::inbound::ReceiverSettings&& receiver,
+                                   std::unique_ptr<Inbound> handler) {
+    net::post(runtime_->io_context,
+        [this, receiver = std::move(receiver), h = std::move(handler)]() mutable {
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+            runtime_->listener_state->RetireInboundHandler(*this, receiver.inbound_tag);
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+            auto inbound_handler =
+                std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(h));
+            auto& settings = inbound_handler->ReceiverSettings();
+            if (settings.has_fixed_outbound &&
+                !runtime_->outbound_manager->GetHandler(settings.fixed_outbound_tag)) {
+                LOG_WARN("Worker[{}]: listener tag={} fixed outbound '{}' not found",
+                         id_, settings.inbound_tag, settings.fixed_outbound_tag);
+            }
+            const std::string key(settings.inbound_tag);
+            auto* registered = runtime_->inbound_manager->AddHandler(std::move(inbound_handler));
+            if (!registered) {
+                LOG_WARN("Worker[{}]: failed to add inbound handler tag={}", id_, key);
+                return;
+            }
+            runtime_->listener_state->listener_slots[key].handler = registered;
+        });
+}
+
+void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config) {
+    net::post(runtime_->io_context,
+        [this, cfg = std::move(config)]() mutable {
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+            runtime_->outbound_manager->RemoveHandler(cfg.tag);
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+
+            auto current_snapshot = runtime_->Snapshot();
+            auto handler = proxyman::outbound::NewHandler(
+                cfg, runtime_->io_context,
+                *runtime_->dns_service, runtime_->udp_session_manager.get(),
+                runtime_->stats,
+                current_snapshot->timeouts.DialTimeout());
+
+            if (!handler) {
+                LOG_WARN("Worker[{}]: failed to create dynamic {} outbound '{}'",
+                         id_, cfg.protocol, cfg.tag);
+                return;
+            }
+
+            LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
+                      id_, cfg.protocol, cfg.tag);
+            if (!runtime_->outbound_manager->AddHandler(std::move(handler))) {
+                LOG_WARN("Worker[{}]: failed to add dynamic outbound '{}'",
+                         id_, cfg.tag);
+                return;
+            }
+
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            std::erase_if(next_snapshot->outbounds,
+                          [&](const auto& outbound) { return outbound.tag == cfg.tag; });
+            next_snapshot->outbounds.push_back(std::move(cfg));
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+        });
+}
+
+void Worker::RemoveOutboundAsync(std::string tag) {
+    net::post(runtime_->io_context,
         [this, t = std::move(tag)] {
-            StopListening(t);
-            StopUdpListening(t);
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->outbound_manager->RemoveHandler(t);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            std::erase_if(next_snapshot->outbounds,
+                          [&](const auto& outbound) { return outbound.tag == t; });
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
         });
 }
 
-void Worker::RegisterListenerAsync(ListenerContext ctx,
-                                   std::shared_ptr<IInboundHandler> handler) {
-    net::post(io_context_,
-        [this, ctx = std::move(ctx), h = std::move(handler)]() mutable {
-            ctx.inbound_handler = h;  // shared_ptr 赋值，两处共享所有权
-            inbound_handlers_[ctx.inbound_tag] = std::move(h);
-            listener_contexts_[ctx.inbound_tag] = std::move(ctx);
+void Worker::ListenerState::RetireInboundHandler(Worker& worker, const std::string& tag) {
+    auto* retiring = worker.runtime_->inbound_manager->GetHandler(tag);
+    if (auto slot_it = listener_slots.find(tag);
+            slot_it != listener_slots.end() &&
+            slot_it->second.handler == retiring) {
+        slot_it->second.handler = nullptr;
+    }
+    worker.runtime_->inbound_manager->RemoveHandler(tag);
+}
+
+void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
+    if (worker.runtime_->active_connections != 0) {
+        return;
+    }
+    worker.runtime_->inbound_manager->DrainRetiredHandlers();
+    worker.runtime_->outbound_manager->DrainRetiredHandlers();
+}
+
+void Worker::ApplyInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
+    net::post(runtime_->io_context,
+        [this,
+         protocol = std::move(protocol),
+         tag = std::move(tag),
+         users = std::move(users)] {
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->inbound_manager->ApplyUsers(protocol, tag, users);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            ApplyInboundUsersToSnapshot(next_snapshot->inbound_users, protocol, tag, users);
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+        });
+}
+
+void Worker::AddInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
+    net::post(runtime_->io_context,
+        [this,
+         protocol = std::move(protocol),
+         tag = std::move(tag),
+         users = std::move(users)] {
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->inbound_manager->AddUsers(protocol, tag, users);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            AddInboundUsersToSnapshot(next_snapshot->inbound_users, protocol, tag, users);
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+        });
+}
+
+void Worker::RemoveInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
+    net::post(runtime_->io_context,
+        [this,
+         protocol = std::move(protocol),
+         tag = std::move(tag),
+         users = std::move(users)] {
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->inbound_manager->RemoveUsers(protocol, tag, users);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            RemoveInboundUsersFromSnapshot(next_snapshot->inbound_users, protocol, tag, users);
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+        });
+}
+
+void Worker::ClearInboundUsersAsync(std::string protocol, std::string tag) {
+    net::post(runtime_->io_context,
+        [this, protocol = std::move(protocol), tag = std::move(tag)] {
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->inbound_manager->ClearUsers(protocol, tag);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            ClearInboundUsersFromSnapshot(next_snapshot->inbound_users, protocol, tag);
+            runtime_->StoreSnapshot(std::move(next_snapshot));
         });
 }
 
 void Worker::UnregisterListenerAsync(std::string tag) {
-    net::post(io_context_,
+    net::post(runtime_->io_context,
         [this, t = std::move(tag)] {
-            StopListening(t);
-            StopUdpListening(t);
-            listener_contexts_.erase(t);
-            inbound_handlers_.erase(t);
+            auto current_snapshot = runtime_->Snapshot();
+            runtime_->listener_state->StopListening(*this, t);
+            runtime_->listener_state->StopUdpListening(*this, t);
+            runtime_->listener_state->RetireInboundHandler(*this, t);
+            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+            RemoveInboundRuntimeFromSnapshot(*next_snapshot, t);
+            runtime_->StoreSnapshot(std::move(next_snapshot));
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+        });
+}
+
+void Worker::EnableBanTrackingAsync(std::string tag) {
+    net::post(runtime_->io_context,
+        [this, t = std::move(tag)] {
+            if (auto* h = runtime_->inbound_manager->GetHandler(t)) {
+                h->SetBanTrackingEnabled(true);
+            }
+            if (auto h = runtime_->listener_state->udp_workers.find(t);
+                    h != runtime_->listener_state->udp_workers.end() && h->second) {
+                h->second->SetBanTrackingEnabled(true);
+            }
+        });
+}
+
+void Worker::UpdateRuleAsync(std::string tag, std::vector<rule::DetectRule> rules) {
+    net::post(runtime_->io_context,
+        [this, t = std::move(tag), r = std::move(rules)] {
+            runtime_->rule_manager->UpdateRule(t, r);
         });
 }
 
 // ============================================================================
-// 数据收集协程（在 Worker 线程执行，供 cobalt::spawn 从主线程调用）
+// 数据收集协程（在 Worker 线程执行，供 Spawn 从主线程调用）
 // ============================================================================
 
-cobalt::task<std::unordered_map<int64_t, Worker::UserTraffic>>
-Worker::CollectTrafficTask(std::string tag) {
-    // 1. 收集已关闭连接的流量
-    std::unordered_map<int64_t, UserTraffic> result;
-    if (auto it = local_traffic_.find(tag); it != local_traffic_.end()) {
-        result.reserve(it->second.size());
-        for (auto& [user_id, traffic] : it->second) {
-            result.emplace(user_id, std::move(traffic));
-        }
-        it->second.clear();
-        MaybeShrinkHashContainer(it->second, 64);
-    }
-
-    // 2. 收集活跃会话的增量流量（实时统计，无需等连接关闭）
-    for (auto& [conn_id, session] : active_sessions_) {
-        if (session.ctx->inbound_tag != tag) continue;
-        if (session.ctx->user_id <= 0) continue;
-
-        uint64_t cur_up = session.ctx->bytes_up;
-        uint64_t cur_down = session.ctx->bytes_down;
-        uint64_t delta_up = cur_up - session.last_reported_up;
-        uint64_t delta_down = cur_down - session.last_reported_down;
-        session.last_reported_up = cur_up;
-        session.last_reported_down = cur_down;
-
-        if (delta_up > 0 || delta_down > 0) {
-            auto& t = result[session.ctx->user_id];
-            t.upload   += delta_up;
-            t.download += delta_down;
-        }
-    }
-
-    co_return result;
+net::awaitable<Worker::UserTrafficSnapshot>
+Worker::GetTrafficTask(std::string tag) {
+    co_return runtime_->session_tracking->CollectAndResetTraffic(tag);
 }
 
-cobalt::task<std::vector<int64_t>>
-Worker::CollectOnlineUsersTask(std::string tag) {
-    auto lc_it = listener_contexts_.find(tag);
-    if (lc_it == listener_contexts_.end()) co_return {};
-    co_return GetOnlineUserIds(tag, lc_it->second.protocol);
+void Worker::AddUserTraffic(std::string_view tag,
+                            int64_t user_id,
+                            uint64_t upload,
+                            uint64_t download) {
+    runtime_->session_tracking->AddUserTraffic(
+        tag,
+        user_id,
+        upload,
+        download);
+}
+
+net::awaitable<std::vector<OnlineDevice>>
+Worker::GetOnlineDeviceTask(std::string tag) {
+    auto* handler = runtime_->inbound_manager->GetHandler(tag);
+    if (!handler) {
+        co_return std::vector<OnlineDevice>{};
+    }
+    co_return runtime_->inbound_manager->GetOnlineDevices(handler->ReceiverSettings().protocol, tag);
+}
+
+net::awaitable<std::vector<rule::DetectResult>>
+Worker::GetDetectResultTask(std::string tag) {
+    co_return runtime_->rule_manager->GetDetectResult(tag);
 }
 
 // ============================================================================
-// 内存统计（近似，主线程 stats_coro 读取）
+// 内存统计（近似，主线程 runtime_->statscoro 读取）
 // ============================================================================
 
 Worker::MemoryStats Worker::GetMemoryStats() const {
     MemoryStats stats;
 
-    if (dns_service_) {
-        auto dns_stats       = dns_service_->GetCacheStats();
-        stats.dns_entries    = dns_stats.entries;
-        stats.dns_estimated_bytes = dns_stats.entries * 256;
-    }
+    auto dns_stats       = runtime_->dns_service->GetCacheStats();
+    stats.dns_entries    = dns_stats.entries;
+    stats.dns_estimated_bytes = dns_stats.entries * 256;
 
-    if (udp_session_manager_) {
-        stats.udp_sessions        = udp_session_manager_->ActiveSessionCount();
-        stats.udp_estimated_bytes = stats.udp_sessions * 1024;
-    }
+    stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
+    stats.udp_estimated_bytes = stats.udp_sessions * 1024;
 
-    stats.vmess_users   = user_manager_.Size();
-    stats.trojan_users  = trojan_user_manager_.Size();
-    stats.users_estimated_bytes = (stats.vmess_users + stats.trojan_users + ss_user_manager_.Size()) * 512;
+    const auto user_stats = runtime_->inbound_manager->GetUserMemoryStats();
+    stats.vmess_accounts = user_stats.vmess_accounts;
+    stats.trojan_users = user_stats.trojan_users;
+    stats.users_estimated_bytes =
+        (user_stats.vmess_accounts + user_stats.trojan_users + user_stats.shadowsocks_users) * 512;
 
     stats.total_estimated_bytes = stats.dns_estimated_bytes
                                 + stats.udp_estimated_bytes
@@ -797,88 +1189,92 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
     return stats;
 }
 
+net::awaitable<Worker::RuntimeStatsSnapshot>
+Worker::CollectRuntimeStatsTask() const {
+    RuntimeStatsSnapshot snapshot;
+    snapshot.memory = GetMemoryStats();
+    snapshot.dns_cache = runtime_->dns_service->GetCacheStats();
+    snapshot.stats = runtime_->stats.Snapshot();
+    snapshot.active_connections = runtime_->active_connections;
+    co_return snapshot;
+}
+
 // ============================================================================
 // UDP 监听（SO_REUSEPORT，与 TCP acceptor 同端口）
 //
-// 具体的解码/认证/ban 逻辑委托给 SsUdpInboundHandler（直接调用，无虚分派）。
+// 具体的解码/认证/ban 逻辑委托给 Shadowsocks inbound Handler（直接调用，无虚分派）。
 // ============================================================================
 
-void Worker::AddUdpListenerAsync(PortBinding binding,
-                                 std::unique_ptr<ss::SsUdpInboundHandler> handler) {
-    net::post(io_context_,
-        [this, b = std::move(binding), h = std::move(handler)]() mutable {
-            StartUdpListening(std::move(b), std::move(h));
+void Worker::AddUdpListenerAsync(const PortBinding& binding,
+                                 std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
+    net::post(runtime_->io_context,
+        [this, b = binding, h = std::move(handler)]() mutable {
+            runtime_->listener_state->StartUdpListening(*this, b, std::move(h));
         });
 }
 
-void Worker::StartUdpListening(PortBinding binding,
-                               std::unique_ptr<ss::SsUdpInboundHandler> handler) {
-    auto sock_it = udp_sockets_.find(binding.tag);
-    if (sock_it != udp_sockets_.end() && sock_it->second && sock_it->second->is_open()) {
-        boost::system::error_code ec;
-        auto addr = net::ip::make_address(binding.listen, ec);
-        if (ec) {
-            LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
-                      id_, binding.listen, ec.message());
-            return;
-        }
-        udp::endpoint ep(addr, binding.port);
-        boost::system::error_code local_ec;
-        auto local_ep = sock_it->second->local_endpoint(local_ec);
-        if (!local_ec && local_ep == ep) {
-            CleanupUdpClientSessions(binding.tag);
-            udp_inbound_handlers_[binding.tag] = std::move(handler);
-            LOG_INFO("Worker[{}]: reused UDP socket {} tag={} protocol={}",
-                     id_,
-                     iputil::FormatEndpointForLog(binding.listen, binding.port),
-                     binding.tag,
-                     udp_inbound_handlers_.at(binding.tag)->Protocol());
-            return;
-        }
-
-        LOG_WARN("Worker[{}]: replacing existing UDP listener tag={}", id_, binding.tag);
-        StopUdpListening(binding.tag);
+void Worker::ListenerState::StartUdpListening(
+    Worker& worker,
+    const PortBinding& binding,
+    std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
+    const bool replacing = std::ranges::any_of(
+        udp_socket_tags,
+        [&](const auto& item) { return item.second == binding.tag; });
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
+        StopUdpListening(worker, binding.tag);
     }
 
-    auto sock = std::allocate_shared<udp::socket>(
-        memory::ThreadLocalAllocator<udp::socket>{}, io_context_);
-    std::string actual_listen;
+    const auto* udp_handler = handler.get();
+    auto udp_worker =
+        std::make_unique<proxyman::inbound::UdpWorker>(binding.tag, std::move(handler));
+    udp_workers[binding.tag] = std::move(udp_worker);
+    auto& listener_slot = listener_slots[binding.tag];
+
     const auto listen_candidates = BuildListenCandidates(binding.listen);
+    size_t bound_count = 0;
 
     for (size_t i = 0; i < listen_candidates.size(); ++i) {
         const auto& listen_addr = listen_candidates[i];
-        boost::system::error_code ec;
+        IoErrorCode ec;
         auto addr = net::ip::make_address(listen_addr, ec);
         if (ec) {
             LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
-                      id_, listen_addr, ec.message());
-            return;
+                      worker.id_, listen_addr, ec.message());
+            if (listen_candidates.size() == 1) return;
+            continue;
         }
-        if (!addr.is_v4()) {
-            LOG_ERROR("Worker[{}]: non-IPv4 UDP listen address '{}' is not supported",
-                      id_, listen_addr);
-            return;
-        }
-
         udp::endpoint ep(addr, binding.port);
-        auto candidate_sock = std::allocate_shared<udp::socket>(
-            memory::ThreadLocalAllocator<udp::socket>{}, io_context_);
+        auto* current_udp_worker = udp_workers[binding.tag].get();
+        udp::socket* candidate_sock =
+            current_udp_worker->MakeSocket(worker.runtime_->io_context);
 
-        auto retry_or_fail = [&](std::string_view op, std::string_view msg) -> bool {
-            if (i + 1 < listen_candidates.size()) {
-                LOG_WARN("Worker[{}]: UDP {} {}:{} failed: {}, retrying {}",
-                         id_, op, listen_addr, binding.port, msg, listen_candidates[i + 1]);
+        auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
+            if (listen_candidates.size() > 1) {
+                LOG_WARN("Worker[{}]: UDP {} {} failed: {}, continuing dual-stack bind",
+                         worker.id_,
+                         op,
+                         iputil::FormatEndpointForLog(listen_addr, binding.port),
+                         msg);
                 return true;
             }
-            LOG_ERROR("Worker[{}]: UDP {} {}:{} failed: {}",
-                      id_, op, listen_addr, binding.port, msg);
+            LOG_ERROR("Worker[{}]: UDP {} {} failed: {}",
+                      worker.id_, op, iputil::FormatEndpointForLog(listen_addr, binding.port), msg);
             return false;
         };
 
         candidate_sock->open(ep.protocol(), ec);
         if (ec) {
-            if (retry_or_fail("open", ec.message())) continue;
+            if (fail_candidate("open", ec.message())) continue;
             return;
+        }
+
+        if (addr.is_v6()) {
+            candidate_sock->set_option(net::ip::v6_only(true), ec);
+            if (ec) {
+                if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
+                return;
+            }
         }
 
         candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
@@ -889,39 +1285,44 @@ void Worker::StartUdpListening(PortBinding binding,
         int optval = 1;
         if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
-            if (retry_or_fail("SO_REUSEPORT", strerror(errno))) continue;
+            if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
             return;
         }
 #endif
 
         candidate_sock->bind(ep, ec);
         if (ec) {
-            if (retry_or_fail("bind", ec.message())) continue;
+            if (fail_candidate("bind", ec.message())) continue;
             return;
         }
 
-        sock = std::move(candidate_sock);
-        actual_listen = listen_addr;
-        break;
+        const std::string socket_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
+        udp::socket* bound_sock =
+            current_udp_worker->AttachSocket(socket_key, candidate_sock);
+        if (!bound_sock) {
+            LOG_ERROR("Worker[{}]: failed to attach UDP socket tag={} key={}",
+                      worker.id_, binding.tag, socket_key);
+            continue;
+        }
+        udp_socket_tags[socket_key] = binding.tag;
+
+        net::co_spawn(worker.runtime_->io_context.get_executor(),
+                      UdpReceiveLoop(worker, socket_key, binding.tag, udp_handler, &listener_slot),
+                      [](std::exception_ptr) {});
+
+        ++bound_count;
+        LOG_INFO("Worker[{}]: UDP listening {} tag={} protocol={} (SO_REUSEPORT)",
+                 worker.id_,
+                 iputil::FormatEndpointForLog(listen_addr, binding.port),
+                 binding.tag,
+                 binding.protocol);
     }
 
-    if (actual_listen.empty()) {
-        return;
+    if (bound_count == 0) {
+        udp_workers.erase(binding.tag);
+        LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
+                  worker.id_, binding.tag, binding.protocol);
     }
-    binding.listen = actual_listen;
-
-    udp_sockets_[binding.tag] = sock;
-    udp_inbound_handlers_[binding.tag] = std::move(handler);
-
-    cobalt::spawn(io_context_.get_executor(),
-                  UdpReceiveLoop(binding.tag),
-                  [](std::exception_ptr) {});
-
-    LOG_INFO("Worker[{}]: UDP listening {} tag={} protocol={} (SO_REUSEPORT)",
-             id_,
-             iputil::FormatEndpointForLog(binding.listen, binding.port),
-             binding.tag,
-             udp_inbound_handlers_.at(binding.tag)->Protocol());
 }
 
 // ============================================================================
@@ -929,179 +1330,146 @@ void Worker::StartUdpListening(PortBinding binding,
 //
 // 设计参考 Xray Cone 模式：
 //   - 每个客户端 (IP:port) 维护一个出站 UDPSession（首包建立，后续复用）
-//   - 协议解码/ban 检查/认证失败记录 完全委托给 SsUdpInboundHandler（直接调用）
-//   - 回包编码函数由 Decode 绑定，Worker 无需感知协议细节
+//   - 协议解码/ban 检查/认证失败记录 完全委托给 Shadowsocks inbound Handler
+//     （直接调用）
+//   - 回包编码所需的 key/cipher 由 Decode 结果携带，Worker 无需感知协议细节
 //   - 会话空闲超过配置的 session idle 后下次收包时懒清理
 // ============================================================================
 
-cobalt::task<void> Worker::UdpReceiveLoop(std::string tag) {
-    constexpr size_t kRecvBufSize  = 65536;
-    constexpr size_t kUdpReplyStackBufSize = 8 * 1024;
-    const auto session_idle_timeout = config_.GetTimeouts().SessionIdleTimeout();
+net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
+    Worker& worker,
+    std::string socket_key,
+    std::string tag,
+    const proxyman::inbound::UdpHandler* handler,
+    ListenerSlot* listener_slot) {
+    constexpr size_t kRecvBufSize = buf::Buffer::kSize;
+    const auto runtime_snapshot = worker.runtime_->Snapshot();
+    const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
 
-    auto sock_it = udp_sockets_.find(tag);
-    if (sock_it == udp_sockets_.end()) co_return;
-    auto sock = sock_it->second;  // shared_ptr，回调安全捕获
-
-    memory::ByteVector recv_buf(kRecvBufSize);
-    auto& client_sessions = udp_client_sessions_[tag];
+    auto* udp_worker = FindUdpWorkerBySocketKey(socket_key);
+    if (!udp_worker) co_return;
+    udp::socket* sock = udp_worker->FindSocket(socket_key);
+    if (!sock) co_return;
 
     while (true) {
         udp::endpoint client_ep;
-        auto [ec, n] = co_await sock->async_receive_from(
-            net::buffer(recv_buf), client_ep,
-            net::as_tuple(cobalt::use_op));
+        auto [wait_ec] = co_await sock->async_wait(
+            udp::socket::wait_read,
+            net::as_tuple(net::use_awaitable));
+        if (wait_ec == io_error::operation_aborted) co_return;
+        if (wait_ec) continue;
 
-        if (ec == net::error::operation_aborted) co_return;
+        buf::BufferGuard recv_buf{buf::Buffer::New()};
+        if (!recv_buf) {
+            LOG_ERROR("Worker[{}]: UDP receive buffer allocation failed tag={}", worker.id_, tag);
+            co_return;
+        }
+        auto [ec, n] = co_await sock->async_receive_from(
+            net::buffer(recv_buf->Tail().data(), kRecvBufSize), client_ep,
+            net::as_tuple(net::use_awaitable));
+
+        if (ec == io_error::operation_aborted) co_return;
         if (ec || n == 0) continue;
 
         // ── 懒清理空闲会话 ────────────────────────────────────────────────
         const auto now = std::chrono::steady_clock::now();
-        if (session_idle_timeout.count() > 0) {
-            bool removed_idle_session = false;
-            for (auto it = client_sessions.begin(); it != client_sessions.end(); ) {
-                if (now - it->second.last_active > session_idle_timeout) {
-                    if (it->second.udp_dial.unregister_callback && it->second.callback_id) {
-                        it->second.udp_dial.unregister_callback(it->second.callback_id);
-                    }
-                    it = client_sessions.erase(it);
-                    removed_idle_session = true;
-                } else {
-                    ++it;
-                }
-            }
-            if (removed_idle_session) {
-                MaybeShrinkHashContainer(client_sessions, 64);
-            }
-        }
+        udp_worker->CleanupIdleClientSessions(socket_key, now, session_idle_timeout);
 
         // ── 协议解码（ban 检查 + 用户匹配 + 认证失败记录 均在协议层处理）──
-        auto hdl_it = udp_inbound_handlers_.find(tag);
-        if (hdl_it == udp_inbound_handlers_.end() || !hdl_it->second) {
+        if (!handler) {
             continue;
         }
-        auto* handler = hdl_it->second.get();
 
-        auto lc_it = listener_contexts_.find(tag);
-        const std::string fixed_outbound =
-            (lc_it != listener_contexts_.end()) ? lc_it->second.fixed_outbound : "";
+        const proxyman::inbound::ReceiverSettings* listener =
+            listener_slot && listener_slot->handler
+                ? &listener_slot->handler->ReceiverSettings()
+                : nullptr;
 
         const std::string client_ip =
             iputil::NormalizeAddressString(client_ep.address());
         const auto normalized_client_addr =
             iputil::NormalizeAddress(client_ep.address());
-        auto decoded = handler->Decode(tag, client_ip, recv_buf.data(), n);
+        auto decoded = handler->DecodeUdp(tag, client_ip, recv_buf->Tail().data(), n);
         if (!decoded) continue;
 
         // ── 找到或创建客户端会话 ──────────────────────────────────────────
-        const std::string client_key =
-            iputil::FormatEndpointForLog(client_ip, client_ep.port());
+        const UdpEndpointKey client_key{normalized_client_addr, client_ep.port()};
+        auto client_key_log = [&]() {
+            return iputil::FormatEndpointForLog(client_ip, client_ep.port());
+        };
 
-        auto session_it = client_sessions.find(client_key);
-        bool need_new_session = (session_it == client_sessions.end()) ||
-                                !session_it->second.udp_dial.Ok();
+        bool need_new_session = !udp_worker->HasClientSession(socket_key, client_key);
 
         if (need_new_session) {
             // 路由决策
-            SessionContext ctx;
-            ctx.worker_id        = id_;
-            ctx.inbound_tag      = tag;
-            if (auto lc = listener_contexts_.find(tag); lc != listener_contexts_.end()) {
-                ctx.inbound_tags = lc->second.inbound_tags;
+            session::Context ctx;
+            ctx.conn_id = session::NewID(worker.id_);
+            ctx.worker_id = worker.id_;
+            ctx.inbound.tag      = tag;
+            if (listener) {
+                ctx.inbound.tags = listener->RouteInboundTags();
             }
-            ctx.inbound_protocol = std::string(handler->Protocol());
-            ctx.client_ip        = client_ip;
-            ctx.src_addr         = tcp::endpoint(normalized_client_addr, client_ep.port());
-            ctx.network          = Network::UDP;
-            ctx.target           = decoded->target;
-            ctx.final_target     = decoded->target;
-            ctx.user_id          = decoded->user_id;
-            ctx.user_email       = decoded->user_email;
-            ctx.speed_limit      = decoded->speed_limit;
+            ctx.inbound.source_ip        = client_ip;
+            ctx.inbound.source_addr      = normalized_client_addr;
+            ctx.inbound.source_port      = client_ep.port();
+            ctx.content.network          = Network::UDP;
+            ctx.outbound.original_target           = decoded->target;
+            ctx.outbound.target                    = decoded->target;
+            ctx.inbound.user_id          = decoded->user_id;
+            ctx.inbound.user_email       = decoded->user_email;
+            ctx.content.speed_limit      = decoded->speed_limit;
 
-            std::string outbound_tag = fixed_outbound.empty()
-                ? router_->Route(ctx) : fixed_outbound;
-            ctx.outbound_tag = outbound_tag;
-
-            auto* outbound = outbound_manager_->GetOutbound(outbound_tag);
-            if (!outbound || !outbound->SupportsUDP()) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP no UDP outbound for tag={} client={}",
-                          id_, tag, client_key);
-                continue;
-            }
-
-            auto executor   = io_context_.get_executor();
-            auto udp_result = co_await outbound->DialUDP(ctx, executor, nullptr);
-            if (!udp_result.Ok()) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP DialUDP failed for client={}", id_, client_key);
+            UDPSession* udp_result = co_await worker.runtime_->dispatcher->DispatchUDP(ctx, listener);
+            if (!udp_result) {
+                LOG_ACCESS_DEBUG("Worker[{}]: UDP DialUDP failed for client={}", worker.id_, client_key_log());
                 continue;
             }
 
             // ── 注册回包回调：协议编码后 send_to 客户端 ──────────────────
-            // encode_reply 由协议层绑定，已值捕获用户密钥等上下文
-            auto encode_fn         = std::move(decoded->encode_reply);
+            // response_context 为协议私有不透明对象，Worker 只负责回传给 handler。
+            auto response_context = decoded->response_context;
+            if (!response_context) {
+                LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
+                                 worker.id_, client_key_log());
+                continue;
+            }
             udp::endpoint ep_copy  = client_ep;
+            // 回调在 StopUdpListening 清理客户端会话时注销，生命周期短于本接收协程的 socket_key。
+            const std::string* socket_key_ref = &socket_key;
+            const uint32_t worker_id = worker.id_;
 
             uint64_t cb_id = 0;
-            auto reply_cb = [this, tag, sock, ep_copy, encode_fn = std::move(encode_fn)](const UDPPacket& pkt) {
-                std::array<uint8_t, kUdpReplyStackBufSize> stack_buf;
-                size_t encoded_len = encode_fn(
-                    pkt.target, pkt.data.data(), pkt.data.size(),
-                    stack_buf.data(), stack_buf.size());
-                if (encoded_len == 0) return;
-
-                memory::ByteVector payload(encoded_len);
-
-                if (encoded_len <= stack_buf.size()) {
-                    std::memcpy(payload.data(), stack_buf.data(), encoded_len);
-                } else {
-                    const size_t written = encode_fn(
-                        pkt.target, pkt.data.data(), pkt.data.size(),
-                        payload.data(), payload.size());
-                    if (written != encoded_len) return;
-                }
-
-                EnqueueUdpReply(tag, sock, ep_copy, std::move(payload));
+            auto reply_cb = [this, socket_key_ref, sock, ep_copy,
+                             handler, response_context, worker_id](UDPPacketView pkt) {
+                auto payload = handler->EncodeUdpResponse(pkt, *response_context);
+                if (payload.empty()) return;
+                EnqueueUdpReply(*socket_key_ref, sock, ep_copy, std::move(payload), worker_id);
             };
 
-            if (udp_result.register_callback) {
-                cb_id = udp_result.register_callback("", std::move(reply_cb));
-            } else if (udp_result.set_callback) {
-                udp_result.set_callback(std::move(reply_cb));
-            }
+            cb_id = udp_result->RegisterCallback(std::move(reply_cb));
 
-            LOG_ACCESS(ctx.ToAccessLog());
+            LOG_ACCESS(FormatAccessLog(ctx));
 
-            UdpClientSession sess;
-            sess.udp_dial       = std::move(udp_result);
-            sess.callback_id    = cb_id;
-            sess.user_id        = decoded->user_id;
-            sess.fixed_outbound = fixed_outbound;
-            sess.last_active    = now;
-
-            client_sessions[client_key] = std::move(sess);
-            session_it = client_sessions.find(client_key);
+            udp_worker->UpsertClientSession(
+                socket_key, client_key, *udp_result, cb_id, decoded->user_id, now);
         }
 
         // ── 发往出站 ──────────────────────────────────────────────────────
-        auto& sess = session_it->second;
-        sess.last_active = now;
-
-        UDPPacket out_pkt;
-        out_pkt.target = decoded->target;
-        out_pkt.data   = std::move(decoded->payload);
-
-        auto send_ec = co_await sess.udp_dial.send(out_pkt, sess.callback_id);
+        const size_t payload_size = buf::TotalLen(decoded->payload);
+        auto send_result = co_await udp_worker->SendToClientSession(
+            socket_key,
+            client_key,
+            decoded->target,
+            std::move(decoded->payload),
+            now,
+            session_idle_timeout);
+        auto send_ec = send_result.error;
         if (send_ec != ErrorCode::OK && send_ec != ErrorCode::SUCCESS) {
-            LOG_ACCESS_DEBUG("Worker[{}]: UDP send failed for client={}", id_, client_key);
-            // 下次收包时懒清理
-            if (session_idle_timeout.count() > 0) {
-                sess.last_active -= session_idle_timeout;
-            }
+            LOG_ACCESS_DEBUG("Worker[{}]: UDP send failed for client={}", worker.id_, client_key_log());
         } else {
             // 流量统计（上行：客户端发送的原始载荷）
-            AddUserTraffic(tag, sess.user_id,
-                           static_cast<uint64_t>(out_pkt.data.size()), 0);
+            worker.AddUserTraffic(tag, send_result.user_id,
+                                  static_cast<uint64_t>(payload_size), 0);
         }
     }
 }

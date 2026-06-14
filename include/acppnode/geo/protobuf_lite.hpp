@@ -32,29 +32,29 @@ class ProtoReader {
 public:
     ProtoReader(const uint8_t* data, size_t size)
         : data_(data), size_(size), pos_(0) {}
-    
+
     ProtoReader(std::string_view data)
         // ISSUE-02-02: 使用 unsafe::ptr_cast 替代 reinterpret_cast
         : data_(unsafe::ptr_cast<const uint8_t>(data.data()))
         , size_(data.size())
         , pos_(0) {}
-    
+
     // 是否还有数据
     bool HasMore() const { return pos_ < size_; }
-    
+
     // 当前位置
     size_t Position() const { return pos_; }
-    
+
     // 剩余字节数
     size_t Remaining() const { return size_ - pos_; }
-    
+
     // 跳过指定字节
     bool Skip(size_t n) {
         if (pos_ + n > size_) return false;
         pos_ += n;
         return true;
     }
-    
+
     // 读取 tag（field number + wire type）
     bool ReadTag(uint32_t& field_number, WireType& wire_type) {
         uint64_t tag;
@@ -63,7 +63,7 @@ public:
         wire_type = static_cast<WireType>(tag & 0x07);
         return true;
     }
-    
+
     // 读取 varint
     bool ReadVarint(uint64_t& value) {
         value = 0;
@@ -79,18 +79,18 @@ public:
         }
         return false;
     }
-    
+
     bool ReadVarint32(uint32_t& value) {
         uint64_t v;
         if (!ReadVarint(v)) return false;
         value = static_cast<uint32_t>(v);
         return true;
     }
-    
+
     bool ReadVarint64(uint64_t& value) {
         return ReadVarint(value);
     }
-    
+
     // 读取定长数据
     bool ReadFixed32(uint32_t& value) {
         if (pos_ + 4 > size_) return false;
@@ -98,14 +98,14 @@ public:
         pos_ += 4;
         return true;
     }
-    
+
     bool ReadFixed64(uint64_t& value) {
         if (pos_ + 8 > size_) return false;
         std::memcpy(&value, data_ + pos_, 8);
         pos_ += 8;
         return true;
     }
-    
+
     // 读取 bytes/string（先读长度，再读数据）
     bool ReadBytes(std::string_view& data) {
         uint64_t len;
@@ -116,14 +116,14 @@ public:
         pos_ += len;
         return true;
     }
-    
+
     bool ReadString(std::string& str) {
         std::string_view sv;
         if (!ReadBytes(sv)) return false;
         str = std::string(sv);
         return true;
     }
-    
+
     // 读取原始字节
     bool ReadRaw(std::vector<uint8_t>& data) {
         uint64_t len;
@@ -134,7 +134,7 @@ public:
         pos_ += len;
         return true;
     }
-    
+
     // 读取子消息（返回子 reader）
     std::optional<ProtoReader> ReadSubMessage() {
         uint64_t len;
@@ -144,7 +144,7 @@ public:
         pos_ += len;
         return sub;
     }
-    
+
     // 跳过当前字段
     bool SkipField(WireType wire_type) {
         switch (wire_type) {
@@ -165,7 +165,7 @@ public:
                 return false;
         }
     }
-    
+
     // 获取当前位置的原始数据指针
     const uint8_t* CurrentData() const { return data_ + pos_; }
 

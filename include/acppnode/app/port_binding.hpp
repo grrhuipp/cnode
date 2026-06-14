@@ -15,14 +15,14 @@ struct PortBinding {
     uint16_t    port     = 0;
     std::string protocol;           // "vmess" / "trojan"
     std::string tag;                // inbound tag
-    std::string listen = std::string(constants::network::kAnyIpv4); // 监听地址
+    std::string listen = std::string(constants::network::kDualStackAuto); // 监听地址
 };
 
 [[nodiscard]] inline PortBinding MakePortBinding(
     uint16_t port,
     std::string protocol,
     std::string tag,
-    std::string listen = std::string(constants::network::kAnyIpv4)) {
+    std::string listen = std::string(constants::network::kDualStackAuto)) {
     PortBinding binding;
     binding.port     = port;
     binding.protocol = std::move(protocol);

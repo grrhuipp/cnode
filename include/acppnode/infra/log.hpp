@@ -6,7 +6,7 @@
 //
 // 日志输出说明：
 // - 控制台:     只打印配置信息和状态统计
-// - app.log:    程序自身状态日志（初始化、监听、统计、面板同步等）
+// - error.log:  程序状态与错误日志（对齐 XrayR ErrorPath）
 // - access.log: 所有连接相关日志（访问记录、连接失败、认证失败等）
 //
 // ============================================================================
@@ -53,10 +53,11 @@ enum class LogLevel {
     DEBUG,
     INFO,
     WARN,
-    ERROR
+    ERROR,
+    NONE
 };
 
-// Boost.Log 格式化器通过 ADL 在此命名空间找到该运算符
+// 日志输出通过该运算符格式化级别文本。
 inline std::ostream& operator<<(std::ostream& os, LogLevel level) {
     switch (level) {
         case LogLevel::TRACE: return os << "trace";
@@ -64,6 +65,7 @@ inline std::ostream& operator<<(std::ostream& os, LogLevel level) {
         case LogLevel::INFO:  return os << "info";
         case LogLevel::WARN:  return os << "warn";
         case LogLevel::ERROR: return os << "error";
+        case LogLevel::NONE:  return os << "none";
     }
     return os << "?";
 }
@@ -73,7 +75,9 @@ public:
     // 初始化日志系统
     [[nodiscard]] static bool Init(const std::string& level,
                                    const std::filesystem::path& log_dir,
-                                   uint16_t max_days = 15);
+                                   uint16_t max_days = 15,
+                                   const std::filesystem::path& access_path = {},
+                                   const std::filesystem::path& error_path = {});
 
     // 关闭日志系统
     static void Shutdown();
@@ -103,7 +107,7 @@ private:
 #define LOG_CONSOLE(fmt_str, ...) acpp::Log::WriteConsole(std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
 // ============================================================================
-// 应用日志（写入 app.log，不输出到控制台）
+// 应用日志（写入 error.log/ErrorPath，不输出到控制台）
 // 由运行时 level 配置控制是否输出，不在编译期裁剪
 // ============================================================================
 
@@ -131,21 +135,21 @@ private:
 #define LOG_CONN_TRACE(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::TRACE)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][trace] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][trace] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 #define LOG_CONN_DEBUG(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][debug] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][debug] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 #define LOG_CONN_INFO(ctx, fmt_str, ...) \
-    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__))
+    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__))
 #define LOG_CONN_WARN(ctx, fmt_str, ...) \
-    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][warn] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__))
+    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][warn] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__))
 #define LOG_CONN_ERROR(ctx, fmt_str, ...) \
-    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][error] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__))
+    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][error] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__))
 
 // ============================================================================
 // 访问日志（写入 access.log）
@@ -172,6 +176,6 @@ private:
 // ============================================================================
 #define LOG_CONN_FAIL(fmt_str, ...) acpp::Log::WriteAccess(std::format("{} " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__))
 #define LOG_CONN_FAIL_CTX(ctx, fmt_str, ...) \
-    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound_tag __VA_OPT__(,) __VA_ARGS__))
+    acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__))
 
 }  // namespace acpp

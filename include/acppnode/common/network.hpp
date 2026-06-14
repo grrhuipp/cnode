@@ -29,7 +29,8 @@ constexpr const char* NetworkToString(Network n) {
 // ============================================================================
 enum class AddressType : uint8_t {
     IPv4 = 1,
-    Domain = 3
+    Domain = 3,
+    IPv6 = 4
 };
 
 }  // namespace acpp

@@ -1,107 +1,89 @@
 #include "acppnode/app/bootstrap_inbounds.hpp"
 
 #include "acppnode/app/port_binding.hpp"
-#include "acppnode/app/session_handler.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/app/rate_limiter.hpp"
+#include "acppnode/app/static_inbound_prepared_config.hpp"
 #include "acppnode/app/worker.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/panel/v2board_panel.hpp"
-#include "acppnode/protocol/inbound_registry.hpp"
-#include "acppnode/protocol/vmess/vmess_protocol.hpp"
+#include "acppnode/api/api.hpp"
+#include "acppnode/proxy/inbound.hpp"
+#include "acppnode/proxy/vmess/account.hpp"
 
 #include <utility>
 
 namespace acpp {
 
 std::vector<std::string> SetupStaticInbounds(
-    const Config& config,
+    const std::vector<StaticInboundRuntimeEntry>& runtime_inbounds,
     std::vector<std::unique_ptr<Worker>>& workers,
-    std::shared_ptr<ConnectionLimiter> connection_limiter) {
+    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters) {
     std::vector<std::string> static_inbound_tags;
-    auto& inbound_factory = InboundFactory::Instance();
 
-    if (config.GetInbounds().empty()) {
+    if (runtime_inbounds.empty()) {
         return static_inbound_tags;
     }
 
     LOG_CONSOLE("Static Inbounds:");
-    for (const auto& inbound : config.GetInbounds()) {
-        const std::string& protocol = inbound.protocol;
-        const std::string tag = inbound.tags.empty()
-            ? naming::BuildProtocolPortTag(protocol, inbound.port)
-            : inbound.tags.front();
-        std::vector<std::string> all_tags = inbound.tags.empty()
-            ? std::vector<std::string>{tag}
-            : inbound.tags;
 
-        if (!inbound_factory.Has(protocol)) {
-            LOG_WARN("Static inbound '{}': unsupported protocol '{}', skipped", tag, protocol);
-            continue;
-        }
-
-        InboundBuildRequest req;
-        req.tag = tag;
-        req.protocol = protocol;
-        req.cipher_method = std::string(constants::protocol::kAes256Gcm);
-        if (const auto* method = inbound.settings.if_contains("method");
-                method && method->is_string()) {
-            req.cipher_method = std::string(method->as_string());
-        }
-
-        if (!inbound_factory.LoadStaticUsers(protocol, tag, inbound.settings)) {
-            LOG_WARN("Static inbound '{}': load users failed, skipped", tag);
-            continue;
-        }
-
+    for (const auto& inbound : runtime_inbounds) {
         bool register_failed = false;
         for (const auto& worker : workers) {
-            auto deps = worker->GetInboundProtocolDeps();
+            auto* connection_limiter = connection_limiters[worker->Id()].get();
 
-            inbound_factory.SyncWorkerUsers(protocol, deps, tag);
-            auto handler = inbound_factory.CreateTcpHandler(
-                protocol, deps, connection_limiter, req);
+            worker->ApplyInboundUsersAsync(inbound.protocol, inbound.tag, inbound.users);
+            auto handler = worker->NewInboundHandler(
+                inbound.protocol, connection_limiter, inbound.build_request);
             if (!handler) {
-                LOG_WARN("Static inbound '{}': create handler failed, skipped", tag);
+                LOG_WARN("Static inbound '{}': create handler failed, skipped", inbound.tag);
                 register_failed = true;
                 break;
             }
+            handler->SetBanTrackingEnabled(true);
 
-            auto lc = MakeListenerContext(
-                tag,
-                all_tags,
-                protocol,
+            auto receiver = proxyman::inbound::MakeReceiverSettings(
+                inbound.tag,
+                inbound.all_tags,
+                inbound.protocol,
                 inbound.stream_settings,
                 inbound.sniffing,
                 connection_limiter,
-                inbound.outbound_tag.empty()
-                    ? std::string(constants::protocol::kDirect)
-                    : inbound.outbound_tag);
-            worker->RegisterListenerAsync(std::move(lc), std::move(handler));
+                inbound.outbound_tag);
+            worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
         }
 
         if (register_failed) {
             for (const auto& worker : workers) {
-                worker->UnregisterListenerAsync(tag);
+                worker->UnregisterListenerAsync(inbound.tag);
             }
             continue;
         }
 
-        auto binding = MakePortBinding(inbound.port, protocol, tag, inbound.listen);
+        auto binding = MakePortBinding(
+            inbound.port,
+            inbound.protocol,
+            inbound.tag,
+            inbound.listen);
         for (const auto& worker : workers) {
             worker->AddListenerAsync(binding);
-            auto deps = worker->GetInboundProtocolDeps();
+            auto* connection_limiter = connection_limiters[worker->Id()].get();
 
-            auto udp_handler = inbound_factory.CreateUdpHandler(
-                protocol, deps, connection_limiter, req);
+            auto udp_handler = worker->NewUdpInboundHandler(
+                inbound.protocol,
+                connection_limiter,
+                inbound.build_request);
             if (udp_handler) {
+                udp_handler->SetBanTrackingEnabled(true);
                 worker->AddUdpListenerAsync(binding, std::move(udp_handler));
             }
         }
-        static_inbound_tags.push_back(tag);
+        static_inbound_tags.push_back(inbound.tag);
         LOG_CONSOLE("  - {} port={} protocol={} network={}",
-                    tag, inbound.port, protocol, inbound.stream_settings.network);
+                    inbound.tag,
+                    inbound.port,
+                    inbound.protocol,
+                    inbound.stream_settings.network);
     }
 
     return static_inbound_tags;
@@ -109,8 +91,7 @@ std::vector<std::string> SetupStaticInbounds(
 
 void SetupTestMode(
     std::vector<std::unique_ptr<Worker>>& workers,
-    std::shared_ptr<ConnectionLimiter> connection_limiter) {
-    auto& inbound_factory = InboundFactory::Instance();
+    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters) {
     const std::string protocol = std::string(constants::protocol::kDefaultNodeProtocol);
 
     LOG_CONSOLE("");
@@ -118,7 +99,7 @@ void SetupTestMode(
                 constants::test::kTestPort,
                 constants::test::kTestVmessUuid);
 
-    auto test_user = vmess::VMessUser::FromUUID(
+    auto test_user = vmess::MemoryAccount::FromUUID(
         std::string(constants::test::kTestVmessUuid), 1, "test@example.com");
 
     if (!test_user) {
@@ -139,25 +120,26 @@ void SetupTestMode(
         std::string(constants::protocol::kHttp),
     };
 
-    std::vector<vmess::VMessUser> users = {*test_user};
-    vmess::VMessUserManager::UpdateSharedUsersForTag(kTestTag, std::move(users));
+    proxyman::inbound::UserSet test_users;
+    test_users.vmess_accounts.push_back(*test_user);
 
-    InboundBuildRequest req;
+    proxyman::inbound::BuildRequest req;
     req.tag = kTestTag;
     req.protocol = protocol;
 
     for (const auto& worker : workers) {
-        auto deps = worker->GetInboundProtocolDeps();
+        auto* connection_limiter = connection_limiters[worker->Id()].get();
 
-        inbound_factory.SyncWorkerUsers(protocol, deps, kTestTag);
-        auto handler = inbound_factory.CreateTcpHandler(
-            protocol, deps, connection_limiter, req);
+        worker->ApplyInboundUsersAsync(protocol, kTestTag, test_users);
+        auto handler = worker->NewInboundHandler(
+            protocol, connection_limiter, req);
         if (!handler) {
             LOG_WARN("Test mode: failed to create vmess inbound handler on worker {}", worker->Id());
             continue;
         }
+        handler->SetBanTrackingEnabled(true);
 
-        auto lc = MakeListenerContext(
+        auto receiver = proxyman::inbound::MakeReceiverSettings(
             kTestTag,
             std::vector<std::string>{kTestTag},
             protocol,
@@ -166,7 +148,7 @@ void SetupTestMode(
             connection_limiter);
 
         // RegisterListenerAsync：post 到 Worker 线程，在 run() 启动后执行
-        worker->RegisterListenerAsync(std::move(lc), std::move(handler));
+        worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
     }
 
     auto test_binding = MakePortBinding(
