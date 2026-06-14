@@ -85,16 +85,20 @@ void SessionTrackingState::RegisterActiveSession(uint64_t conn_id,
 }
 
 void SessionTrackingState::UnregisterActiveSession(uint64_t conn_id,
-                                                   std::string_view tag,
-                                                   int64_t user_id,
                                                    const session::Traffic& traffic) noexcept {
+    memory::ThreadLocalString tag;
+    int64_t user_id = 0;
     uint64_t last_up = 0;
     uint64_t last_down = 0;
     if (auto it = impl_->active_sessions.find(conn_id); it != impl_->active_sessions.end()) {
+        tag = std::move(it->second.tag);
+        user_id = it->second.user_id;
         last_up = it->second.last_reported_up;
         last_down = it->second.last_reported_down;
         impl_->active_sessions.erase(it);
         MaybeShrinkHashContainer(impl_->active_sessions, 256);
+    } else {
+        return;
     }
 
     const uint64_t remaining_up =
@@ -102,7 +106,11 @@ void SessionTrackingState::UnregisterActiveSession(uint64_t conn_id,
     const uint64_t remaining_down =
         traffic.bytes_down > last_down ? traffic.bytes_down - last_down : 0;
     if (remaining_up > 0 || remaining_down > 0) {
-        AddUserTrafficTo(impl_->local_traffic, tag, user_id, remaining_up, remaining_down);
+        AddUserTrafficTo(impl_->local_traffic,
+                         std::string_view(tag),
+                         user_id,
+                         remaining_up,
+                         remaining_down);
     }
 }
 

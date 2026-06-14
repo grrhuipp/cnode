@@ -63,8 +63,6 @@ struct ActiveSessionScope {
 
         session_tracking->UnregisterActiveSession(
             ctx.conn_id,
-            ctx.inbound.tag,
-            ctx.inbound.user_id,
             ctx.traffic);
     }
 };

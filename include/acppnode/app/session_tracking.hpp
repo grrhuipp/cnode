@@ -35,8 +35,6 @@ public:
                                session::Traffic& traffic);
 
     void UnregisterActiveSession(uint64_t conn_id,
-                                 std::string_view tag,
-                                 int64_t user_id,
                                  const session::Traffic& traffic) noexcept;
 
     [[nodiscard]] UserTrafficSnapshot CollectAndResetTraffic(std::string_view tag);
