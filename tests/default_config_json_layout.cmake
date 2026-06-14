@@ -1,6 +1,6 @@
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/core/constants.hpp" constants_header)
 file(READ "${PROJECT_SOURCE_DIR}/docs/configuration.md" configuration_doc)
-file(READ "${PROJECT_SOURCE_DIR}/docs/xray-core-xrayr-alignment.md" alignment_doc)
+file(READ "${PROJECT_SOURCE_DIR}/docs/architecture.md" architecture_doc)
 file(READ "${PROJECT_SOURCE_DIR}/src/infra/config_loader.cpp" config_loader)
 file(READ "${PROJECT_SOURCE_DIR}/scripts/cnode.sh" deploy_script)
 
@@ -73,7 +73,7 @@ endforeach()
 foreach(pattern
         "默认主配置文件为 `config.json`"
         "与 XrayR[ \r\n]+YAML 配置布局有意不同")
-    if(NOT alignment_doc MATCHES "${pattern}")
-        message(FATAL_ERROR "Alignment doc must record cnode JSON-vs-XrayR YAML boundary: ${pattern}")
+    if(NOT architecture_doc MATCHES "${pattern}")
+        message(FATAL_ERROR "Architecture doc must record cnode JSON-vs-XrayR YAML boundary: ${pattern}")
     endif()
 endforeach()
