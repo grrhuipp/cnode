@@ -1322,6 +1322,13 @@ add_test(
 )
 
 add_test(
+    NAME no_panel_inbound_fixed_outbound
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_panel_inbound_fixed_outbound.cmake
+)
+
+add_test(
     NAME no_panel_client_hot_path_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

@@ -23,7 +23,9 @@ the routing object directly or `{ "routing": { ... } }`. Unsupported xray-core
 options are ignored instead of being translated into a cnode-only schema.
 Routing rules follow xray-core matching semantics: a rule without `inboundTag`
 matches traffic from every inbound, while `inboundTag` only restricts matching
-when it is explicitly present.
+when it is explicitly present. Static and panel-created inbounds both enter the
+same router path; panel-created freedom outbounds are not an implicit bypass for
+`routing.json`.
 
 ## Panel example
 
