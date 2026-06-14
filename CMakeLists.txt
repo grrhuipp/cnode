@@ -1420,6 +1420,13 @@ add_test(
 )
 
 add_test(
+    NAME no_tcp_readv_buffer_fanout
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_tcp_readv_buffer_fanout.cmake
+)
+
+add_test(
     NAME no_lazy_mimalloc_pool_shrink
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

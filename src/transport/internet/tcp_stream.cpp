@@ -29,6 +29,7 @@ namespace {
 constexpr int kSocketBufferSizeLow  = 8 * 1024;
 constexpr int kSocketBufferSizeMid  = 16 * 1024;
 constexpr int kSocketBufferSizeHigh = 32 * 1024;
+constexpr uint32_t kMaxReadAllocBuffers = 2;
 constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
 constexpr uint8_t kReadGrowStreakRequired = 2;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
@@ -301,7 +302,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 //
 // 自适应散读（仿 Xray ReadVReader allocStrategy）：
 //   - 低流量 / 启动：单 Buffer 快速路径，零额外堆分配
-//   - 读满后加倍（1→2→4→8），使用 readv / WSARecv 单次系统调用填多个 Buffer
+//   - 连续大包后升到 2 个 Buffer，限制高并发时挂起读常驻 payload
 //   - 未读满则收缩到实际使用数，避免浪费
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
@@ -383,8 +384,8 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     // ── 散读路径：n_alloc 个 Buffer，单次 readv / WSARecv ───────────────
     const uint32_t n_alloc = impl_->read_alloc_count;
 
-    // 在协程帧上分配（co_await 期间保持有效），最多 8 个
-    std::array<buf::BufferGuard, 8> buffers{};
+    // 在协程帧上分配（co_await 期间保持有效），最多 kMaxReadAllocBuffers 个。
+    std::array<buf::BufferGuard, kMaxReadAllocBuffers> buffers{};
     for (uint32_t i = 0; i < n_alloc; ++i) {
         buffers[i] = buf::BufferGuard{buf::Buffer::New()};
         if (!buffers[i]) {
@@ -393,8 +394,8 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         }
     }
 
-    // 构造 scatter iovec（栈分配，n_alloc <= 8）
-    std::array<net::mutable_buffer, 8> iov_arr;
+    // 构造 scatter iovec（栈分配，n_alloc <= kMaxReadAllocBuffers）
+    std::array<net::mutable_buffer, kMaxReadAllocBuffers> iov_arr;
     for (uint32_t i = 0; i < n_alloc; ++i)
         iov_arr[i] = net::mutable_buffer(buffers[i]->Tail().data(), buf::Buffer::kSize);
     auto iov = std::span(iov_arr.data(), n_alloc);
@@ -435,9 +436,9 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 
     TouchActivity();
 
-    // 自适应调整：全部读满 → 加倍（上限 8），否则收缩到实际使用数
+    // 自适应调整：全部读满 → 加倍（上限 kMaxReadAllocBuffers），否则收缩到实际使用数
     if (used >= n_alloc) {
-        impl_->read_alloc_count = std::min(n_alloc * 2u, 8u);
+        impl_->read_alloc_count = std::min(n_alloc * 2u, kMaxReadAllocBuffers);
     } else {
         impl_->read_alloc_count = std::max(used, 1u);
     }
