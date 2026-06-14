@@ -22,7 +22,7 @@ CONFIG_JSON="$CONFIG_DIR/config.json"
 usage() {
     echo "用法: bash <(curl -sL ...) [选项]"
     echo ""
-    echo "不带参数时：仅更新 cnode 二进制（默认 release）"
+    echo "不带参数时：仅更新 cnode 二进制（默认 latest release）"
     echo ""
     echo "必填选项:"
     for opt in $REQUIRED_OPTIONS; do
@@ -37,7 +37,7 @@ usage() {
     echo "  -outbound_url <url>    远程 outbounds.json 下载地址（文件已存在则跳过）"
     echo "  -route_url <url>       远程 routing.json 下载地址（文件已存在则跳过）"
     echo "  -inbound_url <url>     远程 inbounds.json 下载地址（文件已存在则跳过）"
-    echo "  -v <version>           指定 release 版本（默认 master）"
+    echo "  -v <version>           指定 release tag（默认 latest）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
@@ -130,12 +130,18 @@ install_cnode() {
 
     # 获取远程 build_id。GitHub API 在部分机房偶发不可达，API 失败时
     # 回退到 release 直链下载，只跳过 build_id 强校验。
-    RELEASE_TAG="${v:-master}"
-    RELEASE_ASSET_BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
+    RELEASE_TAG="${v:-latest}"
+    if [ "$RELEASE_TAG" = "latest" ]; then
+        RELEASE_API_URL="https://api.github.com/repos/$REPO/releases/latest"
+        RELEASE_ASSET_BASE="https://github.com/$REPO/releases/latest/download"
+    else
+        RELEASE_API_URL="https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG"
+        RELEASE_ASSET_BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
+    fi
     RELEASE_INFO=$(curl -fsSL --connect-timeout 10 --retry 2 \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: cnode-installer" \
-        "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG" 2>/dev/null || true)
+        "$RELEASE_API_URL" 2>/dev/null || true)
 
     REMOTE_ID=""
     REMOTE_VERSION=""

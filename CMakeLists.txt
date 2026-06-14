@@ -1371,6 +1371,13 @@ add_test(
 )
 
 add_test(
+    NAME no_branch_name_release_tag
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_branch_name_release_tag.cmake
+)
+
+add_test(
     NAME no_stats_traffic_cross_layer_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
