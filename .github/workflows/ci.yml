@@ -142,6 +142,17 @@ jobs:
           commit: ${{ github.sha }}
           EOF
 
+          tag_ref="tags/${{ env.RELEASE_TAG }}"
+          if gh api "repos/${{ github.repository }}/git/ref/${tag_ref}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${{ github.repository }}/git/refs/${tag_ref}" \
+              -f sha="${{ github.sha }}" \
+              -F force=true >/dev/null
+          else
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/${tag_ref}" \
+              -f sha="${{ github.sha }}" >/dev/null
+          fi
+
           if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release edit "${{ env.RELEASE_TAG }}" \
               --repo "${{ github.repository }}" \

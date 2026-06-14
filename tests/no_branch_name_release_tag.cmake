@@ -22,6 +22,15 @@ if(NOT ci_workflow MATCHES "BUILD_ID:[^\n]*\\$\\{\\{ github\\.run_id \\}\\}-\\$\
     message(FATAL_ERROR "Build ID must include run_attempt so rerun artifacts have an unambiguous version")
 endif()
 
+foreach(pattern IN ITEMS
+        "git/refs/\\$\\{tag_ref\\}"
+        "-F force=true"
+        "ref=\"refs/\\$\\{tag_ref\\}\"")
+    if(NOT ci_workflow MATCHES "${pattern}")
+        message(FATAL_ERROR "CI must move the stable cnode-latest tag to the published commit: ${pattern}")
+    endif()
+endforeach()
+
 if(NOT ci_workflow MATCHES "build_id:[^\n]*\\$\\{\\{ env\\.BUILD_ID \\}\\}")
     message(FATAL_ERROR "Release notes must include a parseable build_id field")
 endif()
