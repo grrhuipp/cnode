@@ -114,6 +114,11 @@ void AsyncStream::SetAbortiveClose(bool enable) noexcept {
     }
 }
 
+void AsyncStream::CloseAbortive() {
+    SetAbortiveClose(true);
+    Close();
+}
+
 bool AsyncStream::ConsumeIdleTimeout() noexcept {
     auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeIdleTimeout();

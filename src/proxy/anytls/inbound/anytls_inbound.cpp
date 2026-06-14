@@ -569,7 +569,7 @@ private:
         }
         streams_.clear();
         if (stream_) {
-            stream_->Close();
+            stream_->CloseAbortive();
         }
     }
 

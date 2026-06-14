@@ -81,6 +81,7 @@ public:
     void ShutdownWrite() override;
     net::awaitable<void> AsyncShutdownWrite() override;
     void Close() override;
+    void CloseAbortive() override;
     void Cancel() noexcept override;
     int NativeHandle() const override;
     bool IsOpen() const override;

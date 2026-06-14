@@ -740,6 +740,12 @@ void TlsStream::Close() {
     inner_.Close();
 }
 
+void TlsStream::CloseAbortive() {
+    shutdown_initiated_ = true;
+    inner_.SetAbortiveClose(true);
+    inner_.Close();
+}
+
 void TlsStream::Cancel() noexcept {
     inner_.Cancel();
 }

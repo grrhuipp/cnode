@@ -247,6 +247,14 @@ public:
         inner_->Close();
     }
 
+    void CloseAbortive() override {
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
+        inner_->CloseAbortive();
+    }
+
     void ShutdownWrite() override {
         if (write_closed_) {
             return;
