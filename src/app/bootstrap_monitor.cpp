@@ -143,12 +143,9 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
         constexpr uint32_t kForceCollectMinPrevConns = 4096;
         constexpr uint32_t kForceCollectDropFactor = 4;
         constexpr uint32_t kForceCollectConnFloor = 64;
-        constexpr auto kForceCollectCooldown = std::chrono::seconds(1);
+        constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
         constexpr uint32_t kSteadyCollectMinConns = 512;
-        constexpr auto kSteadyCollectInterval = std::chrono::seconds(2);
-        constexpr uint32_t kRssGuardMinConns = 256;
-        constexpr size_t kTargetRssPerConnBytes = 50 * 1024;
-        constexpr auto kRssGuardForceCollectInterval = std::chrono::seconds(3);
+        constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
 
         uint32_t total_conns = 0;
         for (const auto& worker_snapshot : worker_snapshots) {
@@ -172,16 +169,8 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
             total_conns >= kSteadyCollectMinConns &&
             (last_steady_collect_at.time_since_epoch().count() == 0 ||
              now - last_steady_collect_at >= kSteadyCollectInterval);
-        const auto proc_mem = ProcessMemory::Read();
-        const bool rss_per_conn_over_target =
-            total_conns >= kRssGuardMinConns &&
-            proc_mem.vm_rss / static_cast<size_t>(total_conns) > kTargetRssPerConnBytes;
-        const bool rss_guard_collect_due =
-            rss_per_conn_over_target &&
-            (last_force_collect_at.time_since_epoch().count() == 0 ||
-             now - last_force_collect_at >= kRssGuardForceCollectInterval);
 
-        if (((burst_drain || newly_idle) && cooldown_ok) || rss_guard_collect_due) {
+        if ((burst_drain || newly_idle) && cooldown_ok) {
             co_await CollectWorkerHeaps(ctx, true);
             last_force_collect_at = now;
             last_steady_collect_at = now;
