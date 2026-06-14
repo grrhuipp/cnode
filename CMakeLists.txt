@@ -1398,6 +1398,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/anytls_outbound_wire_format.cmake
 )
 
+add_test(
+    NAME no_anytls_outbound_custom_relay
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_anytls_outbound_custom_relay.cmake
+)
+
 
 # 平台链接库
 if(WIN32)

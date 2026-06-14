@@ -509,78 +509,6 @@ struct Handler::ClientSession {
     }
 };
 
-struct HalfCloseWatchState {
-    std::atomic_bool upload_done = false;
-    std::atomic_bool download_done = false;
-    std::atomic_bool finished = false;
-};
-
-template <typename LogicalStreamPtr>
-void SpawnLogicalCloseWatch(net::io_context& io_context,
-                            std::shared_ptr<HalfCloseWatchState> state,
-                            LogicalStreamPtr logical,
-                            std::chrono::seconds timeout) {
-    if (!state || !logical || state->download_done.load() || state->finished.load()) {
-        return;
-    }
-
-    if (timeout.count() <= 0) {
-        logical->Close(ErrorCode::RELAY_TIMEOUT);
-        return;
-    }
-
-    net::co_spawn(
-        io_context.get_executor(),
-        [state = std::move(state),
-         logical = std::move(logical),
-         timeout]() -> net::awaitable<void> {
-            auto executor = co_await net::this_coro::executor;
-            net::steady_timer timer(executor);
-            timer.expires_after(timeout);
-            auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-            if (!ec && !state->download_done.load() && !state->finished.load()) {
-                logical->Close(ErrorCode::RELAY_TIMEOUT);
-            }
-        },
-        net::detached);
-}
-
-void SpawnInboundCancelWatch(net::io_context& io_context,
-                             std::shared_ptr<HalfCloseWatchState> state,
-                             transport::MultiBufferReader* reader,
-                             std::chrono::seconds timeout) {
-    auto* stream = dynamic_cast<AsyncStream*>(reader);
-    if (!state || !stream || state->upload_done.load() || state->finished.load()) {
-        return;
-    }
-
-    auto cancel_stream = [state, stream]() {
-        if (!state->upload_done.load() && !state->finished.load()) {
-            stream->Cancel();
-        }
-    };
-
-    if (timeout.count() <= 0) {
-        cancel_stream();
-        return;
-    }
-
-    net::co_spawn(
-        io_context.get_executor(),
-        [state = std::move(state),
-         stream,
-         timeout]() -> net::awaitable<void> {
-            auto executor = co_await net::this_coro::executor;
-            net::steady_timer timer(executor);
-            timer.expires_after(timeout);
-            auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-            if (!ec && !state->upload_done.load() && !state->finished.load()) {
-                stream->Cancel();
-            }
-        },
-        net::detached);
-}
-
 void Handler::CloseSession(std::shared_ptr<ClientSession> session) noexcept {
     if (session && session->stream) {
         session->CloseAll(ErrorCode::CANCELLED);
@@ -910,91 +838,33 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream.SetWriteTimeout(std::chrono::seconds(0));
     stream.ClearPhaseDeadline();
 
-    auto half_close_state = std::make_shared<HalfCloseWatchState>();
+    struct LogicalEndpoint final : transport::MultiBufferReader,
+                                   transport::MultiBufferWriter {
+        std::shared_ptr<ClientSession> session;
+        std::shared_ptr<ClientSession::LogicalStream> logical;
+        uint32_t sid = 0;
+        bool is_udp = false;
+        TargetAddress original_target;
 
-    auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = 0;
-        while (true) {
-            try {
-                auto mb = co_await inbound.reader->ReadMultiBuffer();
-                if (mb.empty()) {
-                    half_close_state->upload_done.store(true);
-                    if (auto ok = co_await session->WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
-                        logical->Close(ok.error());
-                        co_return std::make_pair(bytes, ok.error());
-                    }
-                    SpawnLogicalCloseWatch(
-                        io_context,
-                        half_close_state,
-                        logical,
-                        relay_config.downlink_only);
-                    co_return std::make_pair(bytes, ErrorCode::OK);
-                }
-                const size_t n = buf::TotalLen(mb);
-                if (is_udp) {
-                    std::string packet;
-                    for (auto* buffer : mb) {
-                        if (!buffer || buffer->IsEmpty()) {
-                            continue;
-                        }
-                        auto frame = BuildFrameBytes(
-                            kCmdPSH,
-                            sid,
-                            buffer->Bytes());
-                        if (!frame) {
-                            half_close_state->upload_done.store(true);
-                            logical->Close(frame.error());
-                            co_return std::make_pair(bytes, frame.error());
-                        }
-                        packet.append(*frame);
-                    }
-                    mb.clear();
-                    if (auto ok = co_await session->WriteUdpPacket(sid, std::move(packet)); !ok) {
-                        half_close_state->upload_done.store(true);
-                        logical->Close(ok.error());
-                        co_return std::make_pair(bytes, ok.error());
-                    }
-                } else {
-                    if (auto ok = co_await session->WritePayloadFrames(sid, std::move(mb)); !ok) {
-                        half_close_state->upload_done.store(true);
-                        logical->Close(ok.error());
-                        co_return std::make_pair(bytes, ok.error());
-                    }
-                }
-                bytes += n;
-                ctx.traffic.bytes_up = bytes;
-                stats.AddBytesOut(n);
-            } catch (const IoSystemError& e) {
-                const ErrorCode error = MapAsioError(e.code());
-                half_close_state->upload_done.store(true);
-                logical->Close(error);
-                co_return std::make_pair(bytes, error);
-            } catch (...) {
-                half_close_state->upload_done.store(true);
-                logical->Close(ErrorCode::RELAY_READ_FAILED);
-                co_return std::make_pair(bytes, ErrorCode::RELAY_READ_FAILED);
-            }
-        }
-    };
+        LogicalEndpoint(std::shared_ptr<ClientSession> s,
+                        std::shared_ptr<ClientSession::LogicalStream> l,
+                        uint32_t stream_id,
+                        bool udp,
+                        TargetAddress target)
+            : session(std::move(s))
+            , logical(std::move(l))
+            , sid(stream_id)
+            , is_udp(udp)
+            , original_target(std::move(target)) {}
 
-    auto download = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = 0;
-        while (true) {
+        net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
             auto payload = co_await logical->ReadPayload();
             if (!payload) {
-                half_close_state->download_done.store(true);
-                const ErrorCode error =
-                    payload.error() == ErrorCode::OK ? ErrorCode::OK : payload.error();
-                if (error == ErrorCode::OK) {
-                    SpawnInboundCancelWatch(
-                        io_context,
-                        half_close_state,
-                        inbound.reader,
-                        relay_config.uplink_only);
+                if (payload.error() == ErrorCode::OK) {
+                    co_return buf::MultiBuffer{};
                 }
-                co_return std::make_pair(bytes, error);
+                throw IoSystemError(io_error::connection_reset, "AnyTLS logical stream closed");
             }
-            const size_t n = buf::TotalLen(*payload);
             if (is_udp) {
                 for (auto* buffer : *payload) {
                     if (buffer && !buffer->IsEmpty()) {
@@ -1002,47 +872,95 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                     }
                 }
             }
-            try {
-                co_await inbound.writer->WriteMultiBuffer(std::move(*payload));
-            } catch (const IoSystemError& e) {
-                const ErrorCode error = MapAsioError(e.code());
-                half_close_state->download_done.store(true);
-                SpawnInboundCancelWatch(
-                    io_context,
-                    half_close_state,
-                    inbound.reader,
-                    std::chrono::seconds(0));
-                co_return std::make_pair(bytes, error);
-            } catch (...) {
-                half_close_state->download_done.store(true);
-                SpawnInboundCancelWatch(
-                    io_context,
-                    half_close_state,
-                    inbound.reader,
-                    std::chrono::seconds(0));
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
+            co_return std::move(*payload);
+        }
+
+        net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+            if (mb.empty()) {
+                co_return;
             }
-            bytes += n;
-            ctx.traffic.bytes_down = bytes;
-            stats.AddBytesIn(n);
+
+            std::expected<void, ErrorCode> ok;
+            if (is_udp) {
+                std::string packet;
+                for (auto* buffer : mb) {
+                    if (!buffer || buffer->IsEmpty()) {
+                        continue;
+                    }
+                    auto frame = BuildFrameBytes(kCmdPSH, sid, buffer->Bytes());
+                    if (!frame) {
+                        mb.clear();
+                        logical->Close(frame.error());
+                        throw IoSystemError(io_error::connection_reset, "AnyTLS UDP frame encode failed");
+                    }
+                    packet.append(*frame);
+                }
+                mb.clear();
+                if (packet.empty()) {
+                    co_return;
+                }
+                ok = co_await session->WriteUdpPacket(sid, std::move(packet));
+            } else {
+                ok = co_await session->WritePayloadFrames(sid, std::move(mb));
+            }
+
+            if (!ok) {
+                logical->Close(ok.error());
+                throw IoSystemError(io_error::connection_reset, "AnyTLS logical write failed");
+            }
+        }
+
+        net::awaitable<void> AsyncShutdownWrite() override {
+            if (session) {
+                (void)co_await session->WriteFrameSerialized(kCmdFIN, sid, {});
+            }
+        }
+
+        void Cancel() noexcept {
+            if (logical) {
+                logical->Close(ErrorCode::CANCELLED);
+            }
         }
     };
 
-    using namespace net::experimental::awaitable_operators;
-    auto [up, down] = co_await (upload() && download());
-    half_close_state->finished.store(true);
+    LogicalEndpoint target_endpoint(
+        session,
+        logical,
+        sid,
+        is_udp,
+        original_target);
 
     RelayResult result;
-    result.bytes_up = up.first;
-    result.bytes_down = down.first;
-    result.client_closed_first = up.second != ErrorCode::OK;
-    if (up.second != ErrorCode::OK) {
-        result.error = up.second;
-    } else if (down.second != ErrorCode::OK) {
-        result.error = down.second;
+    if (buf::TotalLen(first_payload) > 0) {
+        result = co_await DoRelayLinkWithFirstPacket(
+            io_context,
+            *inbound.reader,
+            *inbound.writer,
+            target_endpoint,
+            ctx,
+            stats,
+            first_payload,
+            relay_config);
+    } else if (!initial_payload.empty()) {
+        result = co_await DoRelayLinkWithFirstPacket(
+            io_context,
+            *inbound.reader,
+            *inbound.writer,
+            target_endpoint,
+            ctx,
+            stats,
+            initial_payload,
+            relay_config);
+    } else {
+        result = co_await DoRelayLink(
+            io_context,
+            *inbound.reader,
+            *inbound.writer,
+            target_endpoint,
+            ctx,
+            stats,
+            relay_config);
     }
-    ctx.traffic.bytes_up = result.bytes_up;
-    ctx.traffic.bytes_down = result.bytes_down;
 
     try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
     session->UnregisterLogicalStream(sid);
