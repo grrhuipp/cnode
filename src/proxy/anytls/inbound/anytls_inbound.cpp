@@ -419,6 +419,16 @@ public:
         WakeInputReader();
     }
 
+    template <typename CompletionToken>
+    auto AsyncWaitInput(CompletionToken&& token) {
+        return net::async_initiate<CompletionToken, void()>(
+            [this](auto&& handler) {
+                input_waiter_ = MakePendingWait(
+                    std::forward<decltype(handler)>(handler));
+            },
+            token);
+    }
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
@@ -439,16 +449,6 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
-    template <typename CompletionToken>
-    auto AsyncWaitInput(CompletionToken&& token) {
-        return net::async_initiate<CompletionToken, void()>(
-            [this](auto&& handler) {
-                input_waiter_ = MakePendingWait(
-                    std::forward<decltype(handler)>(handler));
-            },
-            token);
-    }
-
     void WakeInputReader() noexcept {
         ResumeWaiter(io_context_, input_waiter_);
     }

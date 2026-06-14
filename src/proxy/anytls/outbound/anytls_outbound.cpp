@@ -225,6 +225,16 @@ struct Handler::ClientSession {
             WakePayloadReader();
         }
 
+        template <typename CompletionToken>
+        auto AsyncWaitPayload(CompletionToken&& token) {
+            return net::async_initiate<CompletionToken, void()>(
+                [this](auto&& handler) {
+                    payload_waiter_ = MakePendingWait(
+                        std::forward<decltype(handler)>(handler));
+                },
+                token);
+        }
+
         net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
             while (!closed_) {
                 if (!queue_.empty()) {
@@ -254,16 +264,6 @@ struct Handler::ClientSession {
                 syn_timer_->cancel();
             }
             WakePayloadReader();
-        }
-
-        template <typename CompletionToken>
-        auto AsyncWaitPayload(CompletionToken&& token) {
-            return net::async_initiate<CompletionToken, void()>(
-                [this](auto&& handler) {
-                    payload_waiter_ = MakePendingWait(
-                        std::forward<decltype(handler)>(handler));
-                },
-                token);
         }
 
         void WakePayloadReader() noexcept {
