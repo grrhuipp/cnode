@@ -17,6 +17,10 @@ if(NOT ci_workflow MATCHES "BUILD_ID:[^\n]*\\$\\{\\{ github\\.run_id \\}\\}-\\$\
     message(FATAL_ERROR "Build ID must include run_attempt so rerun artifacts have an unambiguous version")
 endif()
 
+if(NOT ci_workflow MATCHES "build_id:[^\n]*\\$\\{\\{ env\\.BUILD_ID \\}\\}")
+    message(FATAL_ERROR "Release notes must include a parseable build_id field")
+endif()
+
 foreach(pattern IN ITEMS
         "\\.github/workflows/ci\\.yml"
         "scripts/\\*\\*/\\*\\.sh"
@@ -36,4 +40,9 @@ endif()
 
 if(NOT deploy_script MATCHES "releases/latest")
     message(FATAL_ERROR "Deployment script must support GitHub's latest release endpoint")
+endif()
+
+string(FIND "${deploy_script}" "build_id: \\([^,[:space:]]*\\)" build_id_parse_pattern_pos)
+if(build_id_parse_pattern_pos EQUAL -1)
+    message(FATAL_ERROR "Deployment script must parse build_id without swallowing a trailing comma")
 endif()

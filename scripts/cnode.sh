@@ -148,7 +148,7 @@ install_cnode() {
     if [ -n "$RELEASE_INFO" ]; then
         REMOTE_ID=$(echo "$RELEASE_INFO" \
             | jq -r '.body // ""' 2>/dev/null \
-            | sed -n 's/.*build_id: \([^[:space:]]*\).*/\1/p' \
+            | sed -n 's/.*build_id: \([^,[:space:]]*\).*/\1/p' \
             | head -1)
         if [ -n "$REMOTE_ID" ]; then
             REMOTE_VERSION="release:$REMOTE_ID"

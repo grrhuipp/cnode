@@ -139,6 +139,8 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "${{ env.RELEASE_TAG }}" \
-            --notes "branch: ${{ github.ref_name }}, build_id: ${{ env.BUILD_ID }}, commit: ${{ github.sha }}"
+            --notes "branch: ${{ github.ref_name }}
+          build_id: ${{ env.BUILD_ID }}
+          commit: ${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
