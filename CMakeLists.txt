@@ -1524,6 +1524,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_hot_path_buffer_memory_stats.cmake
 )
 
+add_test(
+    NAME no_write_deadline_per_write_timer_churn
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_write_deadline_per_write_timer_churn.cmake
+)
+
 
 # 平台链接库
 if(WIN32)

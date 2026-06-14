@@ -134,6 +134,7 @@ struct TcpStream::Impl {
     TimeoutToken read_deadline_token;
     TimeoutToken write_deadline_token;
     TimeoutToken phase_deadline_token;
+    std::chrono::steady_clock::time_point write_deadline_at;
     uint32_t read_alloc_count = 1;
     uint8_t read_grow_streak = 0;
     StreamLabelKind stream_label = StreamLabelKind::Unknown;
@@ -142,6 +143,7 @@ struct TcpStream::Impl {
     uint32_t read_timeout_sec = 0;
     uint32_t write_timeout_sec = 0;
     uint32_t phase_deadline_generation = 0;
+    bool write_deadline_active = false;
 };
 
 // ============================================================================
@@ -184,6 +186,7 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     impl_->read_deadline_token = other.impl_->read_deadline_token;
     impl_->write_deadline_token = other.impl_->write_deadline_token;
     impl_->phase_deadline_token = other.impl_->phase_deadline_token;
+    impl_->write_deadline_at = other.impl_->write_deadline_at;
     impl_->read_alloc_count = other.impl_->read_alloc_count;
     impl_->read_grow_streak = other.impl_->read_grow_streak;
     impl_->stream_label = other.impl_->stream_label;
@@ -233,6 +236,9 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         impl_->read_timeout_sec = other.impl_->read_timeout_sec;
         impl_->write_timeout_sec = other.impl_->write_timeout_sec;
         impl_->phase_deadline_generation = other.impl_->phase_deadline_generation;
+        impl_->write_deadline_at = other.impl_->write_deadline_at;
+        impl_->write_deadline_active = other.impl_->write_deadline_active;
+        other.impl_->write_deadline_active = false;
         other.CancelIdleTimer();
         other.CancelReadDeadline();
         other.CancelWriteDeadline();
@@ -491,7 +497,7 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(
         impl_->socket, bufs_span, net::as_tuple(net::use_awaitable));
-    CancelWriteDeadline();
+    DisarmWriteDeadline();
 
     if (ec) {
         throw IoSystemError(ec);
@@ -507,7 +513,7 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(impl_->socket, buf,
         net::as_tuple(net::use_awaitable));
-    CancelWriteDeadline();
+    DisarmWriteDeadline();
 
     if (ec) {
         throw IoSystemError(ec);
@@ -1073,17 +1079,51 @@ void TcpStream::ArmReadDeadline() {
 void TcpStream::ArmWriteDeadline() {
     if (impl_->write_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
 
-    CancelWriteDeadline();
     impl_->SetFlag(kWriteTimedOut, false);
-    tcp::socket* sock = &impl_->socket;
-    uint8_t* flags = &impl_->flags;
+    impl_->write_deadline_active = true;
+    impl_->write_deadline_at = steady_clock::now() + SecondsFromU32(impl_->write_timeout_sec);
+    if (!impl_->write_deadline_token.Valid()) {
+        ScheduleWriteDeadlineCheck();
+    }
+}
+
+void TcpStream::DisarmWriteDeadline() noexcept {
+    impl_->write_deadline_active = false;
+}
+
+void TcpStream::ScheduleWriteDeadlineCheck() {
+    if (impl_->write_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
+    if (!impl_->write_deadline_active) return;
+
+    const auto now = steady_clock::now();
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        impl_->write_deadline_at - now);
+    if (remaining <= std::chrono::milliseconds::zero()) {
+        remaining = std::chrono::milliseconds(1);
+    }
+
+    TcpStream* self = this;
     impl_->write_deadline_token = impl_->timeout_scheduler->ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            SecondsFromU32(impl_->write_timeout_sec)),
-        [sock, flags]() {
-            *flags |= static_cast<uint8_t>(kWriteTimedOut);
-            IoErrorCode cancel_ec;
-            sock->cancel(cancel_ec);
+        remaining,
+        [self]() {
+            self->impl_->write_deadline_token.Reset();
+            if (!self->impl_->socket.is_open() || self->impl_->write_timeout_sec == 0) {
+                return;
+            }
+            if (!self->impl_->write_deadline_active) {
+                return;
+            }
+
+            const auto now = steady_clock::now();
+            if (now >= self->impl_->write_deadline_at) {
+                self->impl_->SetFlag(kWriteTimedOut);
+                self->impl_->write_deadline_active = false;
+                IoErrorCode cancel_ec;
+                self->impl_->socket.cancel(cancel_ec);
+                return;
+            }
+
+            self->ScheduleWriteDeadlineCheck();
     });
 }
 
@@ -1096,6 +1136,8 @@ void TcpStream::CancelReadDeadline() noexcept {
 }
 
 void TcpStream::CancelWriteDeadline() noexcept {
+    impl_->write_deadline_active = false;
+    impl_->SetFlag(kWriteTimedOut, false);
     if (impl_->timeout_scheduler) {
         impl_->timeout_scheduler->Cancel(impl_->write_deadline_token);
     } else {

@@ -101,6 +101,8 @@ private:
     void CancelIdleTimer() noexcept;
     void ArmReadDeadline();
     void ArmWriteDeadline();
+    void DisarmWriteDeadline() noexcept;
+    void ScheduleWriteDeadlineCheck();
     void CancelReadDeadline() noexcept;
     void CancelWriteDeadline() noexcept;
     void CancelPhaseDeadline() noexcept;
