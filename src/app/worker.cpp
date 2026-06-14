@@ -853,6 +853,11 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     ctx.worker_id = worker.id_;
     ctx.inbound.tag      = listener.inbound_tag;
     ctx.inbound.tags     = listener.RouteInboundTags();
+    const auto local_ep = tcp_stream->LocalEndpoint();
+    if (!local_ep.address().is_unspecified()) {
+        const auto local_addr = iputil::NormalizeAddress(local_ep.address());
+        ctx.inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
+    }
     try {
         const auto normalized_remote = iputil::NormalizeAddress(remote_ep.address());
         ctx.inbound.source_addr = normalized_remote;

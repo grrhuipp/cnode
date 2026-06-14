@@ -36,6 +36,7 @@ struct Inbound {
     net::ip::address source_addr;
     std::string source_ip;
     uint16_t source_port = 0;
+    std::optional<tcp::endpoint> local_endpoint;
     std::string_view tag;
     const std::vector<std::string>* tags = nullptr;
     int64_t user_id = 0;

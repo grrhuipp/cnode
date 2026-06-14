@@ -1336,6 +1336,13 @@ add_test(
 )
 
 add_test(
+    NAME no_source_bound_context_loss
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_source_bound_context_loss.cmake
+)
+
+add_test(
     NAME no_panel_client_hot_path_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

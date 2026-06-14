@@ -267,6 +267,9 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
 
     std::optional<tcp::endpoint> inbound_local_addr =
         inbound_endpoint ? inbound_endpoint->LocalEndpoint() : std::nullopt;
+    if (!inbound_local_addr && ctx.inbound.local_endpoint) {
+        inbound_local_addr = ctx.inbound.local_endpoint;
+    }
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(
         timeouts, pressure_idle_timeout);
     if (pressure_idle_timeout > 0 &&

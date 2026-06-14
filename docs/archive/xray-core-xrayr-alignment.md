@@ -844,6 +844,7 @@ Worker 不负责：
   - Router routing 规则已对齐 xray-core：规则未显式配置 `inboundTag` 时不再隐式追加 `node` 入站条件，而是匹配所有 inbound；只有配置中写出 `inboundTag` 时才按入站标签限制匹配。新增 `no_router_implicit_inbound_tag` 结构门防止回退。
   - Panel 动态 inbound 不再通过 `fixed_outbound` 绕过 Router；面板创建的 freedom outbound 作为 `routing.json` 未命中时的 fallback tag，命中规则优先，未命中回到本节点 freedom outbound，实现源进源出。新增 `no_panel_inbound_fixed_outbound` 结构门防止回退。
   - Freedom `sendThrough=auto` 的源进源出语义已收紧：按入站连接本地 IP 绑定出站源 IP，绑定/拨号失败时不再回退到系统默认源地址，避免“进 .54 出 .52”这类漂移。新增 `no_auto_bind_system_fallback` 结构门防止回退。
+  - AnyTLS / Mux 等协议子流不再丢失 accepted TCP local endpoint；Worker 在 accept 时写入 session context，dispatcher 与 Mux 子会话继续把该 endpoint 传给 outbound，使未命中 routing fallback 的 panel freedom outbound 能真正做到哪个 IP 进哪个 IP 出。新增 `no_source_bound_context_loss` 结构门防止回退。
   - 默认配置入口已改为 JSON 布局：CLI、部署配置文档和阶段 4 对齐约束均明确 `config.json` 是默认主配置文件；`config_loader` 已删除 `.yml` / `.yaml` 主配置解析兼容，并新增 `default_config_json_layout` 防止回退到 XrayR 式 YAML 默认入口或 YAML 解析入口。
   - Trojan inbound 修复后已重新执行本地 Windows 增量构建、远端 Linux x86_64 Release 构建、远端 inbound / outbound 真实请求矩阵和全量 `ctest`：`ctest` 共 141 项全部通过，远端 inbound 真实请求 12/12 通过，远端 outbound 真实请求 12/12 通过。
   - 远端 Linux x86_64 Release 构建已在 `node-02.11.9527app.site` 完成，当前部署二进制为 `/opt/cnode-e2e/bin/cnode`，构建产物为 `/opt/cnode-e2e/build/cnode`；使用远端 Debian 13 / GCC 14.2 / CMake / Ninja / `/root/vcpkg` 构建。构建过程中发现并删除了 `ParseDnsConfigValue`、`FirstBytes`、`DomainMatcher::AddRegex`、`DomainMatcher::Clear`、`DomainTrie::Clear`、`IPMatcher::Clear` 等未使用内部 helper，并修正 `Worker::RuntimeState` 初始化顺序，Linux 增量构建不再产生这些 warning。

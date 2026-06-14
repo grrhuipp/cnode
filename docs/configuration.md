@@ -28,7 +28,9 @@ same router path. For panel-created inbounds, the panel-created freedom outbound
 is the fallback when no routing rule matches, so unmatched traffic keeps
 strict source-in/source-out behavior: traffic entering a local address uses the
 same local address as the outbound source. If that bind fails, cnode reports the
-dial failure instead of retrying with a different system-selected source.
+dial failure instead of retrying with a different system-selected source. This
+also applies to protocol substreams such as AnyTLS and Mux: the accepted TCP
+local endpoint is preserved in the session context before substream dispatch.
 
 ## Panel example
 

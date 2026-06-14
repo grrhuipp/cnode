@@ -511,7 +511,7 @@ net::awaitable<void> RunTcpSubDispatch(
     try {
         (void)co_await outbound_handler.Dispatch(
             io_context,
-            nullptr,
+            sub->ctx.inbound.local_endpoint ? &*sub->ctx.inbound.local_endpoint : nullptr,
             sub->ctx,
             timeouts,
             link,
@@ -929,6 +929,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                     sub_ctx.inbound.source_addr      = parent_ctx.inbound.source_addr;
                     sub_ctx.inbound.source_port      = parent_ctx.inbound.source_port;
                     sub_ctx.inbound.source_ip        = parent_ctx.inbound.source_ip;
+                    sub_ctx.inbound.local_endpoint   = parent_ctx.inbound.local_endpoint;
                     sub_ctx.inbound.tag              = parent_ctx.inbound.tag;
                     sub_ctx.inbound.tags             = parent_ctx.inbound.tags;
                     sub_ctx.inbound.user_id          = parent_ctx.inbound.user_id;
