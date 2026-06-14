@@ -147,7 +147,7 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
         constexpr uint32_t kForceCollectDropFactor = 4;
         constexpr uint32_t kForceCollectConnFloor = 64;
         constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
-        constexpr uint64_t kChurnForceCollectConnections = 8192;
+        constexpr uint64_t kChurnForceCollectConnections = 2048;
         constexpr uint32_t kChurnForceCollectMinConns = 512;
         constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
         constexpr uint32_t kSteadyCollectMinConns = 512;
@@ -190,6 +190,10 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
              now - last_steady_collect_at >= kSteadyCollectInterval);
 
         if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
+            const char* reason =
+                churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
+            LOG_INFO("mem-collect force reason={} conn={} churn={}",
+                     reason, total_conns, churn_since_force);
             co_await CollectWorkerHeaps(ctx, true);
             last_force_collect_at = now;
             last_steady_collect_at = now;

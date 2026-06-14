@@ -17,12 +17,16 @@ if(NOT monitor_source MATCHES "kSteadyCollectInterval[ \t\r\n]*=[ \t\r\n]*std::c
     message(FATAL_ERROR "steady mimalloc collection interval must stay frequent without becoming a CPU tax")
 endif()
 
-if(NOT monitor_source MATCHES "kChurnForceCollectConnections[ \t\r\n]*=[ \t\r\n]*8192")
-    message(FATAL_ERROR "churn-driven full collection must wait for enough connection turnover")
+if(NOT monitor_source MATCHES "kChurnForceCollectConnections[ \t\r\n]*=[ \t\r\n]*2048")
+    message(FATAL_ERROR "churn-driven full collection must react to sustained connection turnover")
 endif()
 
 if(NOT monitor_source MATCHES "kChurnForceCollectCooldown[ \t\r\n]*=[ \t\r\n]*std::chrono::seconds\\(60\\)")
     message(FATAL_ERROR "churn-driven full collection must stay low-frequency to avoid a CPU tax")
+endif()
+
+if(NOT monitor_source MATCHES "mem-collect force reason=")
+    message(FATAL_ERROR "force collection must be observable in production logs")
 endif()
 
 if(monitor_source MATCHES "kTargetRssPerConnBytes|rss_guard_collect_due|rss_per_conn_over_target")
