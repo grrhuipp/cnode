@@ -21,6 +21,9 @@ either an array of inbound objects or an object containing an `inbounds` array;
 `outbounds.json` follows the same rule for `outbounds`; `routing.json` accepts
 the routing object directly or `{ "routing": { ... } }`. Unsupported xray-core
 options are ignored instead of being translated into a cnode-only schema.
+Routing rules follow xray-core matching semantics: a rule without `inboundTag`
+matches traffic from every inbound, while `inboundTag` only restricts matching
+when it is explicitly present.
 
 ## Panel example
 

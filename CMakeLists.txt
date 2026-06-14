@@ -1042,6 +1042,13 @@ add_test(
 )
 
 add_test(
+    NAME no_router_implicit_inbound_tag
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_router_implicit_inbound_tag.cmake
+)
+
+add_test(
     NAME no_worker_public_udp_worker_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

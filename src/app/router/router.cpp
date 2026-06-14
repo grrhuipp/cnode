@@ -369,12 +369,6 @@ struct CompoundRoutingRule {
         SortUniqueStrings(inbound_tag_values);
     }
 
-    void SetSingleInboundTagCondition(std::string_view tag) {
-        has_inbound_tag_condition = true;
-        inbound_tag_values.clear();
-        inbound_tag_values.emplace_back(tag);
-    }
-
     void SetUserCondition(const std::vector<std::string>& users) {
         has_user_condition = true;
         user_values.clear();
@@ -857,8 +851,6 @@ void Router::Configure(
 
         if (!rc.inbound_tag.empty()) {
             compound.SetInboundTagCondition(rc.inbound_tag);
-        } else {
-            compound.SetSingleInboundTagCondition(constants::protocol::kNode);
         }
 
         if (!rc.user.empty()) {
