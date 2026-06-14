@@ -14,6 +14,104 @@
 
 namespace acpp {
 
+namespace {
+
+class ShadowsocksOutboundEndpoint final
+    : public transport::MultiBufferReader
+    , public transport::MultiBufferWriter {
+public:
+    ShadowsocksOutboundEndpoint(std::unique_ptr<transport::MultiBufferWriter> request_writer,
+                                const ss::SsCipherInfo& cipher_info,
+                                const ss::KeyBytes& master_key,
+                                AsyncStream& stream)
+        : request_writer_(std::move(request_writer))
+        , cipher_info_(cipher_info)
+        , master_key_(master_key)
+        , stream_(stream) {}
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (!response_reader_) {
+            auto reader_result = co_await ss::ReadTCPResponse(
+                cipher_info_, master_key_, stream_);
+            if (!reader_result) {
+                throw IoSystemError(
+                    io_error::connection_reset,
+                    "Shadowsocks response header failed");
+            }
+            response_reader_ = std::move(reader_result.value());
+        }
+        co_return co_await response_reader_->ReadMultiBuffer();
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (!request_writer_) {
+            mb.clear();
+            throw IoSystemError(
+                io_error::not_connected,
+                "Shadowsocks request writer is not initialized");
+        }
+        co_await request_writer_->WriteMultiBuffer(std::move(mb));
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        stream_.ShutdownWrite();
+        co_return;
+    }
+
+    void SetIdleTimeout(std::chrono::seconds timeout) {
+        stream_.SetIdleTimeout(timeout);
+    }
+
+    void SetReadTimeout(std::chrono::seconds timeout) {
+        stream_.SetReadTimeout(timeout);
+    }
+
+    void SetWriteTimeout(std::chrono::seconds timeout) {
+        stream_.SetWriteTimeout(timeout);
+    }
+
+    bool ConsumeIdleTimeout() noexcept {
+        return stream_.ConsumeIdleTimeout();
+    }
+
+    bool ConsumeReadTimeout() noexcept {
+        return stream_.ConsumeReadTimeout();
+    }
+
+    bool ConsumeWriteTimeout() noexcept {
+        return stream_.ConsumeWriteTimeout();
+    }
+
+    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+        return stream_.StartPhaseDeadline(timeout);
+    }
+
+    void ClearPhaseDeadline() {
+        stream_.ClearPhaseDeadline();
+    }
+
+    bool ConsumePhaseDeadline() noexcept {
+        return stream_.ConsumePhaseDeadline();
+    }
+
+    void Cancel() noexcept {
+        stream_.Cancel();
+    }
+
+    void SetAbortiveClose(bool enable = true) noexcept {
+        stream_.SetAbortiveClose(enable);
+    }
+
+private:
+    std::unique_ptr<transport::MultiBufferWriter> request_writer_;
+    ss::SsCipherInfo cipher_info_;
+    ss::KeyBytes master_key_;
+    AsyncStream& stream_;
+    std::unique_ptr<transport::MultiBufferReader> response_reader_;
+};
+
+}  // namespace
+
 net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Process(
     net::io_context& io_context,
     const tcp::endpoint* inbound_local_addr,
@@ -27,7 +125,6 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     (void)inbound_local_addr;
-    (void)relay_config;
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -90,139 +187,44 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     }
     auto request_writer = std::move(request_writer_result.value());
 
-    uint64_t prewritten_bytes = 0;
-    try {
-        if (buf::TotalLen(first_payload) > 0) {
-            const size_t first_payload_size = buf::TotalLen(first_payload);
-            co_await request_writer->WriteMultiBuffer(std::move(first_payload));
-            first_payload.clear();
-            prewritten_bytes += first_payload_size;
-            stats.AddBytesOut(first_payload_size);
-            ctx.traffic.bytes_up = prewritten_bytes;
-        }
-
-        if (!initial_payload.empty()) {
-            buf::MultiBuffer initial_mb;
-            initial_mb.reserve((initial_payload.size() + buf::Buffer::kSize - 1) /
-                               buf::Buffer::kSize);
-
-            size_t offset = 0;
-            while (offset < initial_payload.size()) {
-                buf::BufferGuard out{buf::Buffer::New()};
-                if (!out) {
-                    throw std::bad_alloc();
-                }
-                const size_t chunk = std::min(
-                    initial_payload.size() - offset,
-                    static_cast<size_t>(out->Available()));
-                std::memcpy(
-                    out->Tail().data(),
-                    initial_payload.data() + offset,
-                    chunk);
-                out->Produce(static_cast<uint32_t>(chunk));
-                initial_mb.push_back(out.release());
-                offset += chunk;
-            }
-
-            const size_t initial_payload_size = initial_payload.size();
-            co_await request_writer->WriteMultiBuffer(std::move(initial_mb));
-            prewritten_bytes += initial_payload_size;
-            stats.AddBytesOut(initial_payload_size);
-            ctx.traffic.bytes_up = prewritten_bytes;
-        }
-    } catch (const IoSystemError& e) {
-        stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : MapAsioError(e.code()));
-    } catch (const std::bad_alloc&) {
-        stream->Cancel();
-        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (...) {
-        stream->Cancel();
-        co_return std::unexpected(ErrorCode::RELAY_WRITE_FAILED);
-    }
-
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
     stream->ClearPhaseDeadline();
 
-    auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = prewritten_bytes;
-        while (true) {
-            try {
-                buf::MultiBuffer mb = co_await inbound.reader->ReadMultiBuffer();
-                if (mb.empty()) {
-                    co_return std::make_pair(bytes, ErrorCode::OK);
-                }
-                const size_t n = buf::TotalLen(mb);
-                co_await request_writer->WriteMultiBuffer(std::move(mb));
-                bytes += n;
-                ctx.traffic.bytes_up = bytes;
-                stats.AddBytesOut(n);
-            } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
-            } catch (...) {
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-            }
+    ShadowsocksOutboundEndpoint target_endpoint(
+        std::move(request_writer),
+        cipher_info_,
+        master_key_,
+        *stream);
+    if (buf::TotalLen(first_payload) > 0) {
+        if (inbound.control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                target_endpoint, ctx, stats, first_payload, relay_config);
         }
-    };
-
-    auto download = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = 0;
-        auto response_reader_result = co_await ss::ReadTCPResponse(
-            cipher_info_, master_key_, *stream);
-        if (!response_reader_result) {
-            co_return std::make_pair(
-                bytes,
-                response_reader_result.error() == ErrorCode::OK
-                    ? ErrorCode::SOCKET_READ_FAILED
-                    : response_reader_result.error());
-        }
-        auto response_reader = std::move(response_reader_result.value());
-
-        while (true) {
-            try {
-                buf::MultiBuffer mb = co_await response_reader->ReadMultiBuffer();
-                if (mb.empty()) {
-                    co_return std::make_pair(bytes, ErrorCode::OK);
-                }
-                const size_t n = buf::TotalLen(mb);
-                co_await inbound.writer->WriteMultiBuffer(std::move(mb));
-                bytes += n;
-                ctx.traffic.bytes_down = bytes;
-                stats.AddBytesIn(n);
-            } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
-            } catch (...) {
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-            }
-        }
-    };
-
-    using namespace net::experimental::awaitable_operators;
-    auto [up, down] = co_await (upload() && download());
-
-    RelayResult result;
-    result.bytes_up = up.first;
-    result.bytes_down = down.first;
-    result.client_closed_first = up.second != ErrorCode::OK;
-    if (up.second != ErrorCode::OK) {
-        result.error = up.second;
-    } else if (down.second != ErrorCode::OK) {
-        result.error = down.second;
+        co_return co_await DoRelayLinkWithFirstPacket(
+            io_context, *inbound.reader, *inbound.writer, target_endpoint,
+            ctx, stats, first_payload, relay_config);
     }
-    ctx.traffic.bytes_up = result.bytes_up;
-    ctx.traffic.bytes_down = result.bytes_down;
-
-    if (result.error != ErrorCode::OK) {
-        stream->Cancel();
-    } else {
-        try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
-        stream->Cancel();
+    if (!initial_payload.empty()) {
+        if (inbound.control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                target_endpoint, ctx, stats, initial_payload, relay_config);
+        }
+        co_return co_await DoRelayLinkWithFirstPacket(
+            io_context, *inbound.reader, *inbound.writer, target_endpoint,
+            ctx, stats, initial_payload, relay_config);
     }
-    co_return result;
+    if (inbound.control) {
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer, *inbound.control,
+            target_endpoint, ctx, stats, relay_config);
+    }
+    co_return co_await DoRelayLink(
+        io_context, *inbound.reader, *inbound.writer,
+        target_endpoint, ctx, stats, relay_config);
 }
 
 proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,

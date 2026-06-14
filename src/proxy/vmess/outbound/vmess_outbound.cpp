@@ -1,5 +1,6 @@
 #include "acppnode/proxy/vmess/outbound/vmess_outbound.hpp"
 #include "../encoding/client.hpp"
+#include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
@@ -8,7 +9,6 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
-#include <asio/experimental/awaitable_operators.hpp>
 #include <chrono>
 #include <cstring>
 #include <openssl/rand.h>
@@ -18,9 +18,84 @@ namespace acpp {
 
 namespace {
 
-[[noreturn]] void ThrowVMessWriteError(const char* what) {
-    throw IoSystemError(io_error::connection_reset, what);
-}
+class VMessOutboundEndpoint final
+    : public transport::MultiBufferReader
+    , public transport::MultiBufferWriter {
+public:
+    VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
+                          AsyncStream& stream) noexcept
+        : session_(session)
+        , stream_(stream) {}
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (!response_header_read_) {
+            if (!co_await session_.DecodeResponseHeader(stream_)) {
+                throw IoSystemError(
+                    io_error::connection_reset,
+                    "VMess client read response header failed");
+            }
+            response_header_read_ = true;
+        }
+        co_return co_await session_.DecodeResponseBody(stream_);
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        co_await session_.EncodeRequestBody(stream_, std::move(mb));
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        co_await session_.EncodeRequestBodyEOF(stream_);
+    }
+
+    void SetIdleTimeout(std::chrono::seconds timeout) {
+        stream_.SetIdleTimeout(timeout);
+    }
+
+    void SetReadTimeout(std::chrono::seconds timeout) {
+        stream_.SetReadTimeout(timeout);
+    }
+
+    void SetWriteTimeout(std::chrono::seconds timeout) {
+        stream_.SetWriteTimeout(timeout);
+    }
+
+    bool ConsumeIdleTimeout() noexcept {
+        return stream_.ConsumeIdleTimeout();
+    }
+
+    bool ConsumeReadTimeout() noexcept {
+        return stream_.ConsumeReadTimeout();
+    }
+
+    bool ConsumeWriteTimeout() noexcept {
+        return stream_.ConsumeWriteTimeout();
+    }
+
+    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+        return stream_.StartPhaseDeadline(timeout);
+    }
+
+    void ClearPhaseDeadline() {
+        stream_.ClearPhaseDeadline();
+    }
+
+    bool ConsumePhaseDeadline() noexcept {
+        return stream_.ConsumePhaseDeadline();
+    }
+
+    void Cancel() noexcept {
+        stream_.Cancel();
+    }
+
+    void SetAbortiveClose(bool enable = true) noexcept {
+        stream_.SetAbortiveClose(enable);
+    }
+
+private:
+    vmess::encoding::ClientSession& session_;
+    AsyncStream& stream_;
+    bool response_header_read_ = false;
+};
 
 }  // namespace
 
@@ -63,7 +138,6 @@ proxy::vmess::outbound::Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     (void)inbound_local_addr;
-    (void)relay_config;
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -151,107 +225,41 @@ proxy::vmess::outbound::Handler::Process(
             ? ErrorCode::TIMEOUT
             : code);
     }
-    auto initial_body_result = co_await vmess_session.EncodeRequestBody(*stream, initial_payload);
-    if (!initial_body_result) {
-        ErrorCode code = initial_body_result.error();
-        if (code == ErrorCode::OK) {
-            code = ErrorCode::PROTOCOL_ENCODE_FAILED;
-        }
-        LOG_CONN_FAIL("[conn={}] VMessOutbound: request body encode failed: {}",
-                      ctx.conn_id, ErrorCodeToString(code));
-        stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : code);
-    } else if (!initial_payload.empty()) {
-        stats.AddBytesOut(initial_payload.size());
-        ctx.traffic.bytes_up = initial_payload.size();
-    }
-
     LOG_CONN_DEBUG(ctx, "[VMess] Process OK");
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
     stream->ClearPhaseDeadline();
 
-    uint64_t prewritten_bytes = initial_payload.size();
+    VMessOutboundEndpoint target_endpoint(vmess_session, *stream);
     if (buf::TotalLen(first_payload) > 0) {
-        const size_t first_payload_size = buf::TotalLen(first_payload);
-        prewritten_bytes += first_payload_size;
-        co_await vmess_session.EncodeRequestBody(*stream, std::move(first_payload));
-        first_payload.clear();
-        stats.AddBytesOut(first_payload_size);
-        ctx.traffic.bytes_up = prewritten_bytes;
-    }
-
-    auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = prewritten_bytes;
-        while (true) {
-            try {
-                buf::MultiBuffer mb = co_await inbound.reader->ReadMultiBuffer();
-                if (mb.empty()) {
-                    co_return std::make_pair(bytes, ErrorCode::OK);
-                }
-                const size_t n = buf::TotalLen(mb);
-                co_await vmess_session.EncodeRequestBody(*stream, std::move(mb));
-                bytes += n;
-                ctx.traffic.bytes_up = bytes;
-                stats.AddBytesOut(n);
-            } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
-            } catch (...) {
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-            }
+        if (inbound.control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                target_endpoint, ctx, stats, first_payload, relay_config);
         }
-    };
-
-    auto download = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
-        uint64_t bytes = 0;
-        while (true) {
-            try {
-                if (!co_await vmess_session.DecodeResponseHeader(*stream)) {
-                    ThrowVMessWriteError("VMess client read response header failed");
-                }
-                buf::MultiBuffer mb = co_await vmess_session.DecodeResponseBody(*stream);
-                if (mb.empty()) {
-                    co_return std::make_pair(bytes, ErrorCode::OK);
-                }
-                const size_t n = buf::TotalLen(mb);
-                co_await inbound.writer->WriteMultiBuffer(std::move(mb));
-                bytes += n;
-                ctx.traffic.bytes_down = bytes;
-                stats.AddBytesIn(n);
-            } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
-            } catch (...) {
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-            }
+        co_return co_await DoRelayLinkWithFirstPacket(
+            io_context, *inbound.reader, *inbound.writer, target_endpoint,
+            ctx, stats, first_payload, relay_config);
+    }
+    if (!initial_payload.empty()) {
+        if (inbound.control) {
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                target_endpoint, ctx, stats, initial_payload, relay_config);
         }
-    };
-
-    using namespace net::experimental::awaitable_operators;
-    auto [up, down] = co_await (upload() && download());
-
-    RelayResult result;
-    result.bytes_up = up.first;
-    result.bytes_down = down.first;
-    result.client_closed_first = up.second != ErrorCode::OK;
-    if (up.second != ErrorCode::OK) {
-        result.error = up.second;
-    } else if (down.second != ErrorCode::OK) {
-        result.error = down.second;
+        co_return co_await DoRelayLinkWithFirstPacket(
+            io_context, *inbound.reader, *inbound.writer, target_endpoint,
+            ctx, stats, initial_payload, relay_config);
     }
-    ctx.traffic.bytes_up = result.bytes_up;
-    ctx.traffic.bytes_down = result.bytes_down;
-
-    if (result.error != ErrorCode::OK) {
-        stream->Cancel();
-    } else {
-        try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
-        try { co_await vmess_session.EncodeRequestBodyEOF(*stream); } catch (...) {}
-        stream->Cancel();
+    if (inbound.control) {
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer, *inbound.control,
+            target_endpoint, ctx, stats, relay_config);
     }
-    co_return result;
+    co_return co_await DoRelayLink(
+        io_context, *inbound.reader, *inbound.writer,
+        target_endpoint, ctx, stats, relay_config);
 }
 
 }  // namespace

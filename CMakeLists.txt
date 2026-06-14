@@ -431,6 +431,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_outbound_link_control_bypass.cmake
 )
 
+add_test(
+    NAME no_protocol_outbound_custom_relay
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_protocol_outbound_custom_relay.cmake
+)
+
 
 add_test(
     NAME no_dispatcher_protocol_includes
