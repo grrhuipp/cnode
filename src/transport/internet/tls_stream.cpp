@@ -632,7 +632,9 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
 
     while (remaining > 0) {
-        int ret = SSL_write(ssl_, data + total_written, static_cast<int>(remaining));
+        const auto to_write = static_cast<int>(
+            std::min<std::size_t>(remaining, kTlsIoBufferSize));
+        int ret = SSL_write(ssl_, data + total_written, to_write);
 
         if (ret > 0) {
             total_written += ret;
