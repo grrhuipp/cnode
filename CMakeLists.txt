@@ -1434,6 +1434,13 @@ add_test(
 )
 
 add_test(
+    NAME no_anytls_physical_session_cancel_only
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_anytls_physical_session_cancel_only.cmake
+)
+
+add_test(
     NAME no_tls_read_multibuffer_prealloc
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

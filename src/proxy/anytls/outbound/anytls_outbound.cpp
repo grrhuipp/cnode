@@ -269,7 +269,7 @@ struct Handler::ClientSession {
             logical_streams.clear();
         }
         if (stream) {
-            stream->Cancel();
+            stream->Close();
         }
     }
 
