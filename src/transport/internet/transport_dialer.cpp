@@ -84,7 +84,7 @@ net::awaitable<DialResult> DialOutboundTransport(
     }
 
     tcp_result.stream->SetIdleTimeout(target.timeout);
-    auto transport_deadline = tcp_result.stream->StartPhaseDeadline(target.timeout);
+    (void)tcp_result.stream->StartPhaseDeadline(target.timeout);
 
     auto build_result = co_await BuildOutboundTransport(
         std::move(tcp_result.stream),
@@ -92,9 +92,7 @@ net::awaitable<DialResult> DialOutboundTransport(
         target.server_name,
         ctx.conn_id);
     if (!build_result) {
-        const ErrorCode code = transport_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : build_result.error();
+        const ErrorCode code = build_result.error();
         co_return DialResult::Fail(
             code,
             std::string("outbound transport build failed: ") + std::string(ErrorCodeToString(code)));

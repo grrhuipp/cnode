@@ -857,6 +857,7 @@ Worker 不负责：
   - 本地 `external_protocol_traffic.ps1` 已区分 sing-box client/server 路由默认值：客户端配置 `route.final=proxy`，服务端配置 `route.final=direct`，避免真实请求矩阵被 sing-box 客户端直连或服务端误路由掩盖。
   - 本地 outbound 方向已修复并验证：Shadowsocks outbound 不再在上传首包前等待服务端响应，避免 HTTP 目标互等；Trojan outbound 按 `streamSettings.tlsSettings` 保留 xray-core 的 `serverName` / `allowInsecure`，且不再抢读并取消 VMess ingress body；AnyTLS outbound 将 `auth + auth padding` 合并为同一次 TLS 写出，兼容 mihomo / sing-box 服务端首读 auth padding 的实现。
   - 最终回归验证已通过：`external_protocol_matrix.ps1` 配置矩阵 17/17 通过；本地 `external_protocol_traffic.ps1 -KeepGoing` 真实请求矩阵 24/24 通过；远端 `remote_cnode_inbound_traffic.ps1 -KeepGoing` 真实请求矩阵 12/12 通过；远端 `remote_cnode_outbound_traffic.ps1 -KeepGoing` 真实请求矩阵 12/12 通过；全量 `ctest` 共 141 项全部通过。
+  - VPS core dump 根因定位到 outbound transport build 失败路径：`DialOutboundTransport` 在把 TCP stream 所有权移交给 `BuildOutboundTransport` 后仍查询 phase deadline handle，失败返回时 stream 可能已析构导致悬空解引用。已改为 build 失败直接使用 `BuildOutboundTransport` 返回错误码，并新增 `no_transport_deadline_after_stream_move` 结构门防止回退。
 
 ## 12. 验收标准
 

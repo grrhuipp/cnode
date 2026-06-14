@@ -1336,6 +1336,13 @@ add_test(
 )
 
 add_test(
+    NAME no_transport_deadline_after_stream_move
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_transport_deadline_after_stream_move.cmake
+)
+
+add_test(
     NAME no_source_bound_context_loss
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
