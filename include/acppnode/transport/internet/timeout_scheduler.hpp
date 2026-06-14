@@ -25,6 +25,7 @@ struct TimeoutToken {
 // 目标：
 //   - 用每分片 1 个 steady_timer 承载大量连接的 deadline/timeout
 //   - 避免 TcpStream 每连接常驻多个 timer 对象
+//   - 固定 tick 惰性扫描 deadline，避免高 churn 下反复重挂 timer
 //   - 分片内 Schedule/Cancel/OnTimer 在对应 io_context 线程执行，不做热路径锁同步
 // ============================================================================
 class TimeoutScheduler {
