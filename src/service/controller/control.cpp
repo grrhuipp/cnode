@@ -100,7 +100,8 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
             inbound.sniff,
             limiter,
             std::string{},
-            inbound.proxy_protocol);
+            inbound.proxy_protocol,
+            inbound.tag);
 
         worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
     }

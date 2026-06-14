@@ -32,6 +32,9 @@ struct ReceiverSettings {
     bool             has_fixed_outbound = false;       // fixed_outbound_tag 是否非空
     // 非空时跳过路由；dispatcher 通过 outbound manager 按 tag 获取 handler。
     std::string      fixed_outbound_tag;
+    bool             has_route_fallback_outbound = false;
+    // 非空时不跳过路由，只作为 routing.json 未命中时的默认 outbound。
+    std::string      route_fallback_outbound_tag;
     ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
@@ -47,7 +50,8 @@ struct ReceiverSettings {
     SniffConfig sniff_config,
     ConnectionLimiter* limiter,
     std::string fixed_outbound = {},
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto) {
+    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto,
+    std::string route_fallback_outbound = {}) {
     ReceiverSettings settings;
     settings.inbound_tag     = std::move(inbound_tag);
     settings.inbound_tags    = std::move(inbound_tags);
@@ -62,6 +66,8 @@ struct ReceiverSettings {
           settings.inbound_tags.front() == settings.inbound_tag);
     settings.has_fixed_outbound = !fixed_outbound.empty();
     settings.fixed_outbound_tag = std::move(fixed_outbound);
+    settings.has_route_fallback_outbound = !route_fallback_outbound.empty();
+    settings.route_fallback_outbound_tag = std::move(route_fallback_outbound);
     settings.limiter         = limiter;
     return settings;
 }

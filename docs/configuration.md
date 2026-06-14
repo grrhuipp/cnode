@@ -24,8 +24,11 @@ options are ignored instead of being translated into a cnode-only schema.
 Routing rules follow xray-core matching semantics: a rule without `inboundTag`
 matches traffic from every inbound, while `inboundTag` only restricts matching
 when it is explicitly present. Static and panel-created inbounds both enter the
-same router path; panel-created freedom outbounds are not an implicit bypass for
-`routing.json`.
+same router path. For panel-created inbounds, the panel-created freedom outbound
+is the fallback when no routing rule matches, so unmatched traffic keeps
+strict source-in/source-out behavior: traffic entering a local address uses the
+same local address as the outbound source. If that bind fails, cnode reports the
+dial failure instead of retrying with a different system-selected source.
 
 ## Panel example
 

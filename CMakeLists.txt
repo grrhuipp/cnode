@@ -1329,6 +1329,13 @@ add_test(
 )
 
 add_test(
+    NAME no_auto_bind_system_fallback
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_auto_bind_system_fallback.cmake
+)
+
+add_test(
     NAME no_panel_client_hot_path_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

@@ -812,7 +812,16 @@ Router::Router(Router&&) noexcept = default;
 Router& Router::operator=(Router&&) noexcept = default;
 
 std::string_view Router::Route(const session::Context& ctx) const {
+    return Route(ctx, impl_->default_outbound_tag);
+}
+
+std::string_view Router::Route(
+    const session::Context& ctx,
+    std::string_view default_outbound_tag) const {
     const auto& target = ctx.outbound.target;
+    if (default_outbound_tag.empty()) {
+        default_outbound_tag = impl_->default_outbound_tag;
+    }
 
     // 顺序检查复合规则（AND 语义）
     for (const auto& rule : impl_->compound_rules) {
@@ -825,8 +834,8 @@ std::string_view Router::Route(const session::Context& ctx) const {
 
     // 无匹配，返回默认出站
     LOG_ACCESS_DEBUG("Router: {} -> {} (default)",
-              target, impl_->default_outbound_tag);
-    return impl_->default_outbound_tag;
+              target, default_outbound_tag);
+    return default_outbound_tag;
 }
 
 void Router::Configure(

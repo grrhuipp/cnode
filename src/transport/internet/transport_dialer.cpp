@@ -11,24 +11,6 @@ namespace acpp {
 
 namespace {
 
-bool ShouldRetryWithoutBind(
-    OutboundTransportTarget::BindMode bind_mode,
-    bool attempted_bind,
-    ErrorCode error) {
-    if (!attempted_bind || bind_mode != OutboundTransportTarget::BindMode::Auto) {
-        return false;
-    }
-
-    switch (error) {
-        case ErrorCode::SOCKET_BIND_FAILED:
-        case ErrorCode::DIAL_NETWORK_UNREACHABLE:
-        case ErrorCode::DIAL_HOST_UNREACHABLE:
-            return true;
-        default:
-            return false;
-    }
-}
-
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
     const OutboundTransportTarget& target,
@@ -40,16 +22,6 @@ net::awaitable<DialResult> DialSingleCandidate(
     if (bind_local) {
         tcp_result = co_await TcpStream::ConnectWithBind(
             io_context, *bind_local, candidate.endpoint, target.timeout);
-        if (!tcp_result.Ok() && ShouldRetryWithoutBind(
-                target.bind_mode, true, tcp_result.error)) {
-            LOG_WARN("DialOutboundTransport: auto bind {} -> {}:{} failed ({}), retrying with system bind",
-                     bind_local->to_string(),
-                     candidate.endpoint.address().to_string(),
-                     candidate.endpoint.port(),
-                     tcp_result.error_msg);
-            tcp_result = co_await TcpStream::Connect(
-                io_context, candidate.endpoint, target.timeout);
-        }
     } else {
         tcp_result = co_await TcpStream::Connect(
             io_context, candidate.endpoint, target.timeout);

@@ -33,6 +33,9 @@ public:
 
     // Hot path: return the selected outbound tag, or the configured default tag.
     [[nodiscard]] std::string_view Route(const session::Context& ctx) const;
+    [[nodiscard]] std::string_view Route(
+        const session::Context& ctx,
+        std::string_view default_outbound_tag) const;
 
     [[nodiscard]] std::string_view DefaultOutbound() const;
 

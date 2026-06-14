@@ -5,7 +5,7 @@ if(controller_cpp MATCHES "limiter,[ \t\r\n]*inbound\\.tag,[ \t\r\n]*inbound\\.p
         "Panel inbounds must not use their generated outbound as a fixed outbound")
 endif()
 
-if(NOT controller_cpp MATCHES "limiter,[ \t\r\n]*std::string\\{\\},[ \t\r\n]*inbound\\.proxy_protocol")
+if(NOT controller_cpp MATCHES "limiter,[ \t\r\n]*std::string\\{\\},[ \t\r\n]*inbound\\.proxy_protocol,[ \t\r\n]*inbound\\.tag")
     message(FATAL_ERROR
-        "Panel inbounds should leave fixed outbound empty so routing.json is applied")
+        "Panel inbounds should route first and use their generated outbound as the fallback")
 endif()

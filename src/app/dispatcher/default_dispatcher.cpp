@@ -348,7 +348,9 @@ routing::DispatchResult DefaultDispatcher::Route(
         LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
                        ctx.outbound.target, ctx.outbound.tag);
     } else if (router_) {
-        outbound_tag = router_->Route(ctx);
+        outbound_tag = receiver.has_route_fallback_outbound
+            ? router_->Route(ctx, receiver.route_fallback_outbound_tag)
+            : router_->Route(ctx);
         ctx.outbound.tag = outbound_tag;
         LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
                        ctx.outbound.target, ctx.outbound.tag);
