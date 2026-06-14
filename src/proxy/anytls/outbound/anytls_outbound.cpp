@@ -17,13 +17,13 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
-#include <coroutine>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -31,14 +31,41 @@ namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
 
-void ResumeWaiter(acpp::net::io_context& io_context, std::coroutine_handle<>& waiter) noexcept {
-    if (auto handle = std::exchange(waiter, {}); handle) {
+struct PendingWait {
+    virtual ~PendingWait() = default;
+    virtual void Complete() noexcept = 0;
+};
+
+template <typename Handler>
+struct PendingWaitOp final : PendingWait {
+    template <typename H>
+    explicit PendingWaitOp(H&& h) : handler(std::forward<H>(h)) {}
+
+    void Complete() noexcept override {
         try {
-            acpp::net::post(io_context, [handle]() mutable {
-                handle.resume();
+            std::move(handler)();
+        } catch (...) {}
+    }
+
+    Handler handler;
+};
+
+template <typename Handler>
+std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
+    using StoredHandler = std::decay_t<Handler>;
+    return std::make_unique<PendingWaitOp<StoredHandler>>(
+        std::forward<Handler>(handler));
+}
+
+void ResumeWaiter(acpp::net::io_context& io_context,
+                  std::unique_ptr<PendingWait>& waiter) noexcept {
+    if (auto pending = std::exchange(waiter, {}); pending) {
+        try {
+            acpp::net::post(io_context, [pending = std::move(pending)]() mutable {
+                pending->Complete();
             });
         } catch (...) {
-            handle.resume();
+            pending->Complete();
         }
     }
 }
@@ -206,7 +233,7 @@ struct Handler::ClientSession {
                     queue_.pop_front();
                     co_return std::move(mb);
                 }
-                co_await PayloadWaiter{*this};
+                co_await AsyncWaitPayload(net::use_awaitable);
             }
             if (!queue_.empty()) {
                 buf::MultiBuffer mb = std::move(queue_.front());
@@ -229,26 +256,22 @@ struct Handler::ClientSession {
             WakePayloadReader();
         }
 
-        struct PayloadWaiter {
-            LogicalStream& self;
-
-            [[nodiscard]] bool await_ready() const noexcept {
-                return self.closed_ || !self.queue_.empty();
-            }
-
-            void await_suspend(std::coroutine_handle<> handle) noexcept {
-                self.payload_waiter_ = handle;
-            }
-
-            void await_resume() const noexcept {}
-        };
+        template <typename CompletionToken>
+        auto AsyncWaitPayload(CompletionToken&& token) {
+            return net::async_initiate<CompletionToken, void()>(
+                [this](auto&& handler) {
+                    payload_waiter_ = MakePendingWait(
+                        std::forward<decltype(handler)>(handler));
+                },
+                token);
+        }
 
         void WakePayloadReader() noexcept {
             ResumeWaiter(io_context_, payload_waiter_);
         }
 
         net::io_context& io_context_;
-        std::coroutine_handle<> payload_waiter_{};
+        std::unique_ptr<PendingWait> payload_waiter_;
         std::unique_ptr<net::steady_timer> syn_timer_;
         uint32_t sid_ = 0;
         std::deque<buf::MultiBuffer> queue_;

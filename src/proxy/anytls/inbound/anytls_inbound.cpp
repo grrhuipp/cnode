@@ -16,13 +16,13 @@
 #include <asio/steady_timer.hpp>
 #include <algorithm>
 #include <array>
-#include <coroutine>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -33,14 +33,41 @@ namespace {
 
 constexpr size_t kMaxSubStreamQueuedPayloadBytes = buf::Buffer::kSize * 4;
 
-void ResumeWaiter(net::io_context& io_context, std::coroutine_handle<>& waiter) noexcept {
-    if (auto handle = std::exchange(waiter, {}); handle) {
+struct PendingWait {
+    virtual ~PendingWait() = default;
+    virtual void Complete() noexcept = 0;
+};
+
+template <typename Handler>
+struct PendingWaitOp final : PendingWait {
+    template <typename H>
+    explicit PendingWaitOp(H&& h) : handler(std::forward<H>(h)) {}
+
+    void Complete() noexcept override {
         try {
-            net::post(io_context, [handle]() mutable {
-                handle.resume();
+            std::move(handler)();
+        } catch (...) {}
+    }
+
+    Handler handler;
+};
+
+template <typename Handler>
+std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
+    using StoredHandler = std::decay_t<Handler>;
+    return std::make_unique<PendingWaitOp<StoredHandler>>(
+        std::forward<Handler>(handler));
+}
+
+void ResumeWaiter(net::io_context& io_context,
+                  std::unique_ptr<PendingWait>& waiter) noexcept {
+    if (auto pending = std::exchange(waiter, {}); pending) {
+        try {
+            net::post(io_context, [pending = std::move(pending)]() mutable {
+                pending->Complete();
             });
         } catch (...) {
-            handle.resume();
+            pending->Complete();
         }
     }
 }
@@ -403,7 +430,7 @@ public:
             if (input_done_) {
                 co_return buf::MultiBuffer{};
             }
-            co_await InputWaiter{*this};
+            co_await AsyncWaitInput(net::use_awaitable);
         }
         co_return buf::MultiBuffer{};
     }
@@ -412,25 +439,21 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
-    struct InputWaiter {
-        AnyTLSSubStream& self;
-
-        [[nodiscard]] bool await_ready() const noexcept {
-            return self.cancelled_ || self.input_done_ || !self.input_queue_.empty();
-        }
-
-        void await_suspend(std::coroutine_handle<> handle) noexcept {
-            self.input_waiter_ = handle;
-        }
-
-        void await_resume() const noexcept {}
-    };
+    template <typename CompletionToken>
+    auto AsyncWaitInput(CompletionToken&& token) {
+        return net::async_initiate<CompletionToken, void()>(
+            [this](auto&& handler) {
+                input_waiter_ = MakePendingWait(
+                    std::forward<decltype(handler)>(handler));
+            },
+            token);
+    }
 
     void WakeInputReader() noexcept {
         ResumeWaiter(io_context_, input_waiter_);
     }
 
-    std::coroutine_handle<> input_waiter_{};
+    std::unique_ptr<PendingWait> input_waiter_;
     net::io_context& io_context_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;

@@ -1,11 +1,11 @@
 file(READ "${PROJECT_SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp" inbound_source)
 file(READ "${PROJECT_SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp" outbound_source)
 
-if(NOT inbound_source MATCHES "struct[ \t\r\n]+InputWaiter")
-    message(FATAL_ERROR "AnyTLS inbound sub-stream reads must use a lightweight waiter")
+if(NOT inbound_source MATCHES "AsyncWaitInput")
+    message(FATAL_ERROR "AnyTLS inbound sub-stream reads must use a lightweight async waiter")
 endif()
 
-if(NOT inbound_source MATCHES "std::coroutine_handle<>[ \t\r\n]+input_waiter_")
+if(NOT inbound_source MATCHES "std::unique_ptr<PendingWait>[ \t\r\n]+input_waiter_")
     message(FATAL_ERROR "AnyTLS inbound sub-stream reads must not keep a per-sub-stream timer")
 endif()
 
@@ -17,11 +17,11 @@ if(inbound_source MATCHES "input_timer_\\.expires_after\\(std::chrono::hours\\(2
     message(FATAL_ERROR "AnyTLS inbound sub-stream queue waits must not be implemented as long timers")
 endif()
 
-if(NOT outbound_source MATCHES "struct[ \t\r\n]+PayloadWaiter")
-    message(FATAL_ERROR "AnyTLS outbound logical stream reads must use a lightweight waiter")
+if(NOT outbound_source MATCHES "AsyncWaitPayload")
+    message(FATAL_ERROR "AnyTLS outbound logical stream reads must use a lightweight async waiter")
 endif()
 
-if(NOT outbound_source MATCHES "std::coroutine_handle<>[ \t\r\n]+payload_waiter_")
+if(NOT outbound_source MATCHES "std::unique_ptr<PendingWait>[ \t\r\n]+payload_waiter_")
     message(FATAL_ERROR "AnyTLS outbound logical stream reads must not keep a per-logical-stream timer")
 endif()
 
