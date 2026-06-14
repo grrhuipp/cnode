@@ -540,6 +540,20 @@ add_test(
 )
 
 add_test(
+    NAME no_trojan_udp_multibuffer_ownership
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_trojan_udp_multibuffer_ownership.cmake
+)
+
+add_test(
+    NAME no_trojan_failure_graceful_tls_shutdown
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_trojan_failure_graceful_tls_shutdown.cmake
+)
+
+add_test(
     NAME no_udp_reply_queue_bytevector
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

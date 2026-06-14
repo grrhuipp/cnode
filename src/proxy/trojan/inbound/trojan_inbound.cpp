@@ -338,6 +338,7 @@ public:
                     framer_.Feed(rb->Bytes().data(), rb->Len());
                 }
             }
+            raw.clear();
         }
     }
 
@@ -370,6 +371,7 @@ public:
             enc->Produce(static_cast<uint32_t>(n));
             out.push_back(enc);
         }
+        mb.clear();
         if (!out.empty()) {
             co_await dst_.WriteMultiBuffer(std::move(out));
         }
@@ -413,6 +415,12 @@ proxy::trojan::inbound::Handler::Process(
         result.error = error;
         return result;
     };
+    auto fail_abortive = [&](ErrorCode error) {
+        if (stream) {
+            stream->CloseAbortive();
+        }
+        return fail(error);
+    };
 
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] Process start from {}", tag, client_ip);
 
@@ -420,13 +428,13 @@ proxy::trojan::inbound::Handler::Process(
         LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
-        co_return fail(ErrorCode::BLOCKED);
+        co_return fail_abortive(ErrorCode::BLOCKED);
     }
     std::optional<TrojanOnlineSession> user_session;
 
     buf::BufferGuard handshake_guard{buf::Buffer::New()};
     if (!handshake_guard) {
-        co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
     }
     uint8_t* handshake_buf = handshake_guard->Tail().data();
     const size_t handshake_capacity = handshake_guard->Available();
@@ -458,7 +466,7 @@ proxy::trojan::inbound::Handler::Process(
         co_return n;
     };
     auto read_result = co_await read_handshake();
-    if (!read_result) co_return fail(read_result.error());
+    if (!read_result) co_return fail_abortive(read_result.error());
     const size_t total_read = *read_result;
 
     size_t consumed = 0;
@@ -467,7 +475,7 @@ proxy::trojan::inbound::Handler::Process(
 
     if (!request) {
         LOG_CONN_FAIL("[{}] Trojan parse failed from {}", tag, client_ip);
-        co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     if (!user_manager_.Validate(tag, request->password_hash)) {
@@ -480,8 +488,7 @@ proxy::trojan::inbound::Handler::Process(
         if (limiter_ && ban_tracking_enabled_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
-        stats_->OnError();
-        co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     auto user_info = user_manager_.FindUser(tag, request->password_hash);
@@ -498,7 +505,7 @@ proxy::trojan::inbound::Handler::Process(
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 user_info->device_limit,
                 user_manager_.OnlineDeviceCount(tag, tracked_uid));
-            co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
         }
     }
 

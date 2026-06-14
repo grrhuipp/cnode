@@ -132,6 +132,12 @@ proxy::trojan::outbound::Handler::Process(
     auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
     LOG_ACCESS(FormatAccessLog(ctx));
+    auto fail_abortive = [&](ErrorCode error) {
+        if (stream) {
+            stream->CloseAbortive();
+        }
+        return std::unexpected(error);
+    };
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
     PhaseDeadlineHandle outbound_protocol_deadline =
@@ -143,15 +149,13 @@ proxy::trojan::outbound::Handler::Process(
         header.data(), header.size());
     if (header_len == 0) {
         LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: Handshake encode failed");
-        stream->Cancel();
-        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     try {
         if (!co_await WriteFull(*stream, header.data(), header_len)) {
             LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: Handshake write failed");
-            stream->Cancel();
-            co_return std::unexpected(outbound_protocol_deadline.Expired()
+            co_return fail_abortive(outbound_protocol_deadline.Expired()
                 ? ErrorCode::TIMEOUT
                 : ErrorCode::SOCKET_WRITE_FAILED);
         }
@@ -169,8 +173,7 @@ proxy::trojan::outbound::Handler::Process(
         if (!initial_payload.empty()) {
             if (!co_await WriteFull(*stream, initial_payload.data(), initial_payload.size())) {
                 LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: initial payload write failed");
-                stream->Cancel();
-                co_return std::unexpected(outbound_protocol_deadline.Expired()
+                co_return fail_abortive(outbound_protocol_deadline.Expired()
                     ? ErrorCode::TIMEOUT
                     : ErrorCode::SOCKET_WRITE_FAILED);
             }
@@ -198,13 +201,11 @@ proxy::trojan::outbound::Handler::Process(
         ctx.traffic.bytes_up = result.bytes_up;
         co_return result;
     } catch (const IoSystemError& e) {
-        stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
+        co_return fail_abortive(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : MapAsioError(e.code()));
     } catch (...) {
-        stream->Cancel();
-        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
     }
 }
 
