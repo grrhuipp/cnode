@@ -922,6 +922,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 logical->Close(ErrorCode::CANCELLED);
             }
         }
+
+        bool ConsumeIdleTimeout() noexcept { return false; }
+        bool ConsumeReadTimeout() noexcept { return false; }
+        bool ConsumeWriteTimeout() noexcept { return false; }
     };
 
     LogicalEndpoint target_endpoint(
