@@ -128,24 +128,31 @@ install_cnode() {
             ;;
     esac
 
-    # 获取远程 build_id
+    # 获取远程 build_id。GitHub API 在部分机房偶发不可达，API 失败时
+    # 回退到 release 直链下载，只跳过 build_id 强校验。
     RELEASE_TAG="${v:-master}"
-    RELEASE_INFO=$(curl -sf "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG")
-    if [ -z "$RELEASE_INFO" ]; then
-        echo "无法获取远程版本信息。"
-        exit 1
+    RELEASE_ASSET_BASE="https://github.com/$REPO/releases/download/$RELEASE_TAG"
+    RELEASE_INFO=$(curl -fsSL --connect-timeout 10 --retry 2 \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: cnode-installer" \
+        "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_TAG" 2>/dev/null || true)
+
+    REMOTE_ID=""
+    REMOTE_VERSION=""
+    if [ -n "$RELEASE_INFO" ]; then
+        REMOTE_ID=$(echo "$RELEASE_INFO" \
+            | jq -r '.body // ""' 2>/dev/null \
+            | sed -n 's/.*build_id: \([^[:space:]]*\).*/\1/p' \
+            | head -1)
+        if [ -n "$REMOTE_ID" ]; then
+            REMOTE_VERSION="release:$REMOTE_ID"
+        else
+            echo "警告: 无法解析远程 build_id，将跳过版本号校验。"
+        fi
+    else
+        echo "警告: 无法获取远程版本信息，回退到 release 直链下载。"
     fi
 
-    REMOTE_ID=$(echo "$RELEASE_INFO" \
-        | jq -r '.body // ""' \
-        | sed -n 's/.*build_id: \([^[:space:]]*\).*/\1/p' \
-        | head -1)
-    if [ -z "$REMOTE_ID" ]; then
-        echo "无法解析远程 build_id。"
-        exit 1
-    fi
-
-    REMOTE_VERSION="release:$REMOTE_ID"
     DEBUG_PATH="$INSTALL_DIR/cnode-linux-amd64.debug"
 
     # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
@@ -155,27 +162,32 @@ install_cnode() {
     fi
 
     NEED_BINARY_UPDATE=1
-    if [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
+    if [ -n "$REMOTE_VERSION" ] && [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
         NEED_BINARY_UPDATE=0
     fi
 
-    LATEST_URL=$(echo "$RELEASE_INFO" \
-        | jq -r --arg asset "cnode-linux-amd64" '.assets[] | select(.name == $asset) | .browser_download_url' \
-        | head -1)
+    LATEST_URL=""
+    if [ -n "$RELEASE_INFO" ]; then
+        LATEST_URL=$(echo "$RELEASE_INFO" \
+            | jq -r --arg asset "cnode-linux-amd64" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
+            | head -1)
+    fi
 
     if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
-        LATEST_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64"
+        LATEST_URL="$RELEASE_ASSET_BASE/cnode-linux-amd64"
     fi
 
     NEED_DEBUG_DOWNLOAD=0
     DEBUG_URL=""
     if [ "$DEBUG_FILE" = "true" ]; then
         NEED_DEBUG_DOWNLOAD=1
-        DEBUG_URL=$(echo "$RELEASE_INFO" \
-            | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' \
-            | head -1)
+        if [ -n "$RELEASE_INFO" ]; then
+            DEBUG_URL=$(echo "$RELEASE_INFO" \
+                | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
+                | head -1)
+        fi
         if [ -z "$DEBUG_URL" ] || [ "$DEBUG_URL" = "null" ]; then
-            DEBUG_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/cnode-linux-amd64.debug"
+            DEBUG_URL="$RELEASE_ASSET_BASE/cnode-linux-amd64.debug"
         fi
     fi
 
@@ -193,8 +205,12 @@ install_cnode() {
         pkill -f "$BIN_PATH" 2>/dev/null || true
         sleep 1
 
-        echo "更新 cnode: ${LOCAL_ID:-none} -> $REMOTE_VERSION"
-        if ! curl -sfL "$LATEST_URL" -o "$BIN_PATH"; then
+        UPDATE_TARGET="$REMOTE_VERSION"
+        if [ -z "$UPDATE_TARGET" ]; then
+            UPDATE_TARGET="release:$RELEASE_TAG"
+        fi
+        echo "更新 cnode: ${LOCAL_ID:-none} -> $UPDATE_TARGET"
+        if ! curl -fsSL --connect-timeout 10 --retry 3 "$LATEST_URL" -o "$BIN_PATH"; then
             echo "cnode 下载失败。"
             exit 1
         fi
@@ -202,18 +218,24 @@ install_cnode() {
 
         # 验证下载的版本
         NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
-        if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
-            echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
-            exit 1
+        if [ -n "$REMOTE_VERSION" ]; then
+            if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
+                echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
+                exit 1
+            fi
+            echo "cnode 已更新到 $REMOTE_VERSION"
+        elif [ -n "$NEW_ID" ]; then
+            echo "cnode 已更新: $NEW_ID"
+        else
+            echo "cnode 已更新: $BIN_PATH"
         fi
-        echo "cnode 已更新到 $REMOTE_VERSION"
     else
         echo "cnode 已是最新版本: $REMOTE_VERSION"
     fi
 
     if [ "$NEED_DEBUG_DOWNLOAD" -eq 1 ]; then
         echo "下载符号文件: $DEBUG_PATH"
-        if ! curl -sfL "$DEBUG_URL" -o "$DEBUG_PATH"; then
+        if ! curl -fsSL --connect-timeout 10 --retry 3 "$DEBUG_URL" -o "$DEBUG_PATH"; then
             echo ".debug 文件下载失败。"
             exit 1
         fi
@@ -314,6 +336,46 @@ EOF
 }
 
 # ============================================================================
+# 配置文件校验
+# ============================================================================
+
+ensure_config_json_valid() {
+    if [ ! -f "$CONFIG_JSON" ]; then
+        return 0
+    fi
+
+    # 校验现有 config.json 是否合法
+    if ! jq empty "$CONFIG_JSON" 2>/dev/null; then
+        echo "警告: config.json 格式损坏，尝试自动修复..."
+        # 用 python/sed 尝试修复常见问题（缺逗号等），若失败则重建
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import json, re, sys
+with open('$CONFIG_JSON') as f:
+    text = f.read()
+# 修复对象/数组元素之间缺少逗号: }{ -> },{  或 ]{ -> ],{
+text = re.sub(r'(\})\s*(\{)', r'\1,\2', text)
+text = re.sub(r'(\])\s*(\{)', r'\1,\2', text)
+try:
+    obj = json.loads(text)
+    with open('$CONFIG_JSON', 'w') as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    print('自动修复成功')
+except Exception as e:
+    print(f'自动修复失败: {e}', file=sys.stderr)
+    sys.exit(1)
+" || {
+                echo "错误: config.json 无法自动修复，请手动检查"
+                exit 1
+            }
+        else
+            echo "错误: config.json 格式损坏且无 python3 可用，请手动修复"
+            exit 1
+        fi
+    fi
+}
+
+# ============================================================================
 # 添加/覆盖 panel
 # ============================================================================
 
@@ -356,35 +418,7 @@ add_panel_json() {
              | if $key  != "" then .TLSKey  = $key  else . end')
     fi
 
-    # 校验现有 config.json 是否合法
-    if ! jq empty "$CONFIG_JSON" 2>/dev/null; then
-        echo "警告: config.json 格式损坏，尝试自动修复..."
-        # 用 python/sed 尝试修复常见问题（缺逗号等），若失败则重建
-        if command -v python3 >/dev/null 2>&1; then
-            python3 -c "
-import json, re, sys
-with open('$CONFIG_JSON') as f:
-    text = f.read()
-# 修复对象/数组元素之间缺少逗号: }{ → },{  或 ]{ → ],{
-text = re.sub(r'(\})\s*(\{)', r'\1,\2', text)
-text = re.sub(r'(\])\s*(\{)', r'\1,\2', text)
-try:
-    obj = json.loads(text)
-    with open('$CONFIG_JSON', 'w') as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    print('自动修复成功')
-except Exception as e:
-    print(f'自动修复失败: {e}', file=sys.stderr)
-    sys.exit(1)
-" || {
-                echo "错误: config.json 无法自动修复，请手动检查"
-                exit 1
-            }
-        else
-            echo "错误: config.json 格式损坏且无 python3 可用，请手动修复"
-            exit 1
-        fi
-    fi
+    ensure_config_json_valid
 
     # 先删除同名 panel（去重），再追加
     jq --arg name "$name" --argjson panel "$PANEL_JSON" \
