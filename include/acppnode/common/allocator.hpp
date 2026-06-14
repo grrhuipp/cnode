@@ -22,8 +22,8 @@ namespace acpp::memory {
 
 #ifdef USE_MIMALLOC
 
-inline constexpr long kMimallocPurgeDelayMs = 250;
-inline constexpr long kMimallocMinimalPurgeSizeKiB = 64;
+inline constexpr long kMimallocPurgeDelayMs = 50;
+inline constexpr long kMimallocMinimalPurgeSizeKiB = 16;
 
 namespace detail {
 

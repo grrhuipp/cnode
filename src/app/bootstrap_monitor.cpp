@@ -141,14 +141,14 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
 #ifdef USE_MIMALLOC
         constexpr uint32_t kForceCollectMinPrevConns = 4096;
-        constexpr uint32_t kForceCollectDropFactor = 8;
+        constexpr uint32_t kForceCollectDropFactor = 4;
         constexpr uint32_t kForceCollectConnFloor = 64;
-        constexpr auto kForceCollectCooldown = std::chrono::seconds(3);
-        constexpr uint32_t kSteadyCollectMinConns = 2048;
-        constexpr auto kSteadyCollectInterval = std::chrono::seconds(5);
-        constexpr uint32_t kRssGuardMinConns = 512;
+        constexpr auto kForceCollectCooldown = std::chrono::seconds(1);
+        constexpr uint32_t kSteadyCollectMinConns = 512;
+        constexpr auto kSteadyCollectInterval = std::chrono::seconds(2);
+        constexpr uint32_t kRssGuardMinConns = 256;
         constexpr size_t kTargetRssPerConnBytes = 50 * 1024;
-        constexpr auto kRssGuardForceCollectInterval = std::chrono::seconds(10);
+        constexpr auto kRssGuardForceCollectInterval = std::chrono::seconds(3);
 
         uint32_t total_conns = 0;
         for (const auto& worker_snapshot : worker_snapshots) {
