@@ -17,6 +17,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <coroutine>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -29,6 +30,18 @@
 namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
+
+void ResumeWaiter(acpp::net::io_context& io_context, std::coroutine_handle<>& waiter) noexcept {
+    if (auto handle = std::exchange(waiter, {}); handle) {
+        try {
+            acpp::net::post(io_context, [handle]() mutable {
+                handle.resume();
+            });
+        } catch (...) {
+            handle.resume();
+        }
+    }
+}
 
 std::optional<acpp::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
@@ -92,7 +105,7 @@ struct Handler::ClientSession {
     class LogicalStream final {
     public:
         LogicalStream(net::io_context& io_context, uint32_t stream_id)
-            : timer_(io_context), sid_(stream_id) {}
+            : io_context_(io_context), sid_(stream_id) {}
 
         ~LogicalStream() noexcept {
             Cancel();
@@ -122,7 +135,7 @@ struct Handler::ClientSession {
             }
             queue_.push_back(std::move(mb));
             queued_bytes_ += bytes;
-            timer_.cancel();
+            WakePayloadReader();
         }
 
         void Close(ErrorCode error = ErrorCode::OK) {
@@ -131,7 +144,10 @@ struct Handler::ClientSession {
             }
             closed_ = true;
             error_ = error;
-            timer_.cancel();
+            if (syn_timer_) {
+                syn_timer_->cancel();
+            }
+            WakePayloadReader();
         }
 
         void AckSyn(ErrorCode error = ErrorCode::OK) {
@@ -140,7 +156,9 @@ struct Handler::ClientSession {
             }
             syn_ack_done_ = true;
             syn_ack_error_ = error;
-            timer_.cancel();
+            if (syn_timer_) {
+                syn_timer_->cancel();
+            }
         }
 
         net::awaitable<std::expected<void, ErrorCode>> WaitSynAck(std::chrono::seconds timeout) {
@@ -150,8 +168,10 @@ struct Handler::ClientSession {
                 }
                 co_return std::unexpected(syn_ack_error_);
             }
-            timer_.expires_after(timeout);
-            auto [ec] = co_await timer_.async_wait(net::as_tuple(net::use_awaitable));
+            syn_timer_ = std::make_unique<net::steady_timer>(io_context_);
+            syn_timer_->expires_after(timeout);
+            auto [ec] = co_await syn_timer_->async_wait(net::as_tuple(net::use_awaitable));
+            syn_timer_.reset();
             if (syn_ack_done_) {
                 if (syn_ack_error_ == ErrorCode::OK) {
                     co_return std::expected<void, ErrorCode>{};
@@ -172,7 +192,10 @@ struct Handler::ClientSession {
             error_ = ErrorCode::CANCELLED;
             queue_.clear();
             queued_bytes_ = 0;
-            timer_.cancel();
+            if (syn_timer_) {
+                syn_timer_->cancel();
+            }
+            WakePayloadReader();
         }
 
         net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
@@ -183,11 +206,7 @@ struct Handler::ClientSession {
                     queue_.pop_front();
                     co_return std::move(mb);
                 }
-                timer_.expires_after(std::chrono::hours(24));
-                auto [ec] = co_await timer_.async_wait(net::as_tuple(net::use_awaitable));
-                if (ec == io_error::operation_aborted) {
-                    continue;
-                }
+                co_await PayloadWaiter{*this};
             }
             if (!queue_.empty()) {
                 buf::MultiBuffer mb = std::move(queue_.front());
@@ -204,10 +223,33 @@ struct Handler::ClientSession {
             error_ = error;
             queue_.clear();
             queued_bytes_ = 0;
-            timer_.cancel();
+            if (syn_timer_) {
+                syn_timer_->cancel();
+            }
+            WakePayloadReader();
         }
 
-        net::steady_timer timer_;
+        struct PayloadWaiter {
+            LogicalStream& self;
+
+            [[nodiscard]] bool await_ready() const noexcept {
+                return self.closed_ || !self.queue_.empty();
+            }
+
+            void await_suspend(std::coroutine_handle<> handle) noexcept {
+                self.payload_waiter_ = handle;
+            }
+
+            void await_resume() const noexcept {}
+        };
+
+        void WakePayloadReader() noexcept {
+            ResumeWaiter(io_context_, payload_waiter_);
+        }
+
+        net::io_context& io_context_;
+        std::coroutine_handle<> payload_waiter_{};
+        std::unique_ptr<net::steady_timer> syn_timer_;
         uint32_t sid_ = 0;
         std::deque<buf::MultiBuffer> queue_;
         size_t queued_bytes_ = 0;

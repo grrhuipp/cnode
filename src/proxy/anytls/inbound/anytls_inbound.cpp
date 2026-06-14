@@ -16,6 +16,7 @@
 #include <asio/steady_timer.hpp>
 #include <algorithm>
 #include <array>
+#include <coroutine>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -31,6 +32,18 @@ namespace acpp::anytls::inbound {
 namespace {
 
 constexpr size_t kMaxSubStreamQueuedPayloadBytes = buf::Buffer::kSize * 4;
+
+void ResumeWaiter(net::io_context& io_context, std::coroutine_handle<>& waiter) noexcept {
+    if (auto handle = std::exchange(waiter, {}); handle) {
+        try {
+            net::post(io_context, [handle]() mutable {
+                handle.resume();
+            });
+        } catch (...) {
+            handle.resume();
+        }
+    }
+}
 
 void CopySessionContext(const session::Context& source, session::Context& target) {
     target.conn_id = source.conn_id;
@@ -325,7 +338,7 @@ public:
     AnyTLSSubStream(net::io_context& io_context,
                     std::shared_ptr<AnyTLSDemuxSession> session,
                     uint32_t sid)
-        : input_timer_(io_context)
+        : io_context_(io_context)
         , session_(std::move(session))
         , sid_(sid) {}
 
@@ -357,7 +370,7 @@ public:
         }
         input_queue_.push_back(std::move(mb));
         queued_bytes_ += bytes;
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void CloseInput() {
@@ -365,7 +378,7 @@ public:
             return;
         }
         input_done_ = true;
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void Cancel() noexcept {
@@ -376,7 +389,7 @@ public:
         input_done_ = true;
         input_queue_.clear();
         queued_bytes_ = 0;
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -390,11 +403,7 @@ public:
             if (input_done_) {
                 co_return buf::MultiBuffer{};
             }
-            input_timer_.expires_after(std::chrono::hours(24));
-            auto [ec] = co_await input_timer_.async_wait(net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            co_await InputWaiter{*this};
         }
         co_return buf::MultiBuffer{};
     }
@@ -403,7 +412,26 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
-    net::steady_timer input_timer_;
+    struct InputWaiter {
+        AnyTLSSubStream& self;
+
+        [[nodiscard]] bool await_ready() const noexcept {
+            return self.cancelled_ || self.input_done_ || !self.input_queue_.empty();
+        }
+
+        void await_suspend(std::coroutine_handle<> handle) noexcept {
+            self.input_waiter_ = handle;
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    void WakeInputReader() noexcept {
+        ResumeWaiter(io_context_, input_waiter_);
+    }
+
+    std::coroutine_handle<> input_waiter_{};
+    net::io_context& io_context_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;
     std::deque<buf::MultiBuffer> input_queue_;
