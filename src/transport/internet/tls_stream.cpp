@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
 #include <openssl/x509.h>
@@ -290,6 +291,7 @@ TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_ser
     BIO_set_nbio(write_bio_, 1);
 
     SSL_set_bio(ssl_, read_bio_, write_bio_);
+    memory::OnTlsStreamNew();
 
     if (is_server_) {
         SSL_set_accept_state(ssl_);
@@ -300,6 +302,7 @@ TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_ser
 
 TlsStream::~TlsStream() {
     if (ssl_) {
+        memory::OnTlsStreamFree();
         SSL_free(ssl_);  // 这会自动释放关联的 BIO
     }
 }
@@ -321,6 +324,7 @@ TlsStream::TlsStream(TlsStream&& other) noexcept
 TlsStream& TlsStream::operator=(TlsStream&& other) noexcept {
     if (this != &other) {
         if (ssl_) {
+            memory::OnTlsStreamFree();
             SSL_free(ssl_);
         }
         inner_ = std::move(other.inner_);

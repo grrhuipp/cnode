@@ -272,14 +272,16 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
                      proc_mem.vm_rss / (1024.0 * 1024.0));
 #ifdef CNODE_MEMORY_STATS
             const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
-            LOG_INFO("mem-live: buffer={}/{} ({:.1f}MB live) async_stream={}/{} tcp_stream={}/{}",
+            LOG_INFO("mem-live: buffer={}/{} ({:.1f}MB live) async_stream={}/{} tcp_stream={}/{} tls_stream={}/{}",
                      runtime_mem.buffers_live,
                      runtime_mem.buffers_peak,
                      runtime_mem.buffers_live * sizeof(buf::Buffer) / (1024.0 * 1024.0),
                      runtime_mem.async_streams_live,
                      runtime_mem.async_streams_peak,
                      runtime_mem.tcp_streams_live,
-                     runtime_mem.tcp_streams_peak);
+                     runtime_mem.tcp_streams_peak,
+                     runtime_mem.tls_streams_live,
+                     runtime_mem.tls_streams_peak);
 #endif
         }
 

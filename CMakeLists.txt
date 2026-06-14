@@ -163,7 +163,7 @@ find_package(ZLIB REQUIRED)
 # 注意：mimalloc 与 ASan/MSan/TSan 不兼容，启用 Sanitizer 时自动禁用
 # ============================================================================
 option(USE_MIMALLOC "Use mimalloc as default memory allocator" ON)
-option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
+option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
 
 if(USE_MIMALLOC AND SANITIZER)
     message(WARNING "mimalloc is incompatible with sanitizers, disabling mimalloc")
@@ -1501,6 +1501,20 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_lazy_mimalloc_pool_shrink.cmake
+)
+
+add_test(
+    NAME no_disabled_runtime_memory_stats
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_disabled_runtime_memory_stats.cmake
+)
+
+add_test(
+    NAME no_tls_stream_memory_counter
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_tls_stream_memory_counter.cmake
 )
 
 
