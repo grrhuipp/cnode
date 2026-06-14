@@ -509,6 +509,78 @@ struct Handler::ClientSession {
     }
 };
 
+struct HalfCloseWatchState {
+    std::atomic_bool upload_done = false;
+    std::atomic_bool download_done = false;
+    std::atomic_bool finished = false;
+};
+
+template <typename LogicalStreamPtr>
+void SpawnLogicalCloseWatch(net::io_context& io_context,
+                            std::shared_ptr<HalfCloseWatchState> state,
+                            LogicalStreamPtr logical,
+                            std::chrono::seconds timeout) {
+    if (!state || !logical || state->download_done.load() || state->finished.load()) {
+        return;
+    }
+
+    if (timeout.count() <= 0) {
+        logical->Close(ErrorCode::RELAY_TIMEOUT);
+        return;
+    }
+
+    net::co_spawn(
+        io_context.get_executor(),
+        [state = std::move(state),
+         logical = std::move(logical),
+         timeout]() -> net::awaitable<void> {
+            auto executor = co_await net::this_coro::executor;
+            net::steady_timer timer(executor);
+            timer.expires_after(timeout);
+            auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+            if (!ec && !state->download_done.load() && !state->finished.load()) {
+                logical->Close(ErrorCode::RELAY_TIMEOUT);
+            }
+        },
+        net::detached);
+}
+
+void SpawnInboundCancelWatch(net::io_context& io_context,
+                             std::shared_ptr<HalfCloseWatchState> state,
+                             transport::MultiBufferReader* reader,
+                             std::chrono::seconds timeout) {
+    auto* stream = dynamic_cast<AsyncStream*>(reader);
+    if (!state || !stream || state->upload_done.load() || state->finished.load()) {
+        return;
+    }
+
+    auto cancel_stream = [state, stream]() {
+        if (!state->upload_done.load() && !state->finished.load()) {
+            stream->Cancel();
+        }
+    };
+
+    if (timeout.count() <= 0) {
+        cancel_stream();
+        return;
+    }
+
+    net::co_spawn(
+        io_context.get_executor(),
+        [state = std::move(state),
+         stream,
+         timeout]() -> net::awaitable<void> {
+            auto executor = co_await net::this_coro::executor;
+            net::steady_timer timer(executor);
+            timer.expires_after(timeout);
+            auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+            if (!ec && !state->upload_done.load() && !state->finished.load()) {
+                stream->Cancel();
+            }
+        },
+        net::detached);
+}
+
 void Handler::CloseSession(std::shared_ptr<ClientSession> session) noexcept {
     if (session && session->stream) {
         session->CloseAll(ErrorCode::CANCELLED);
@@ -604,7 +676,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const TimeoutsConfig& timeouts,
     transport::Link inbound,
     StatsShard& stats,
-    const RelayConfig& /*relay_config*/,
+    const RelayConfig& relay_config,
     std::span<const uint8_t> initial_payload,
     buf::MultiBuffer& first_payload,
     std::chrono::seconds /*relay_idle_timeout*/,
@@ -838,13 +910,24 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream.SetWriteTimeout(std::chrono::seconds(0));
     stream.ClearPhaseDeadline();
 
+    auto half_close_state = std::make_shared<HalfCloseWatchState>();
+
     auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
         uint64_t bytes = 0;
         while (true) {
             try {
                 auto mb = co_await inbound.reader->ReadMultiBuffer();
                 if (mb.empty()) {
-                    (void)co_await session->WriteFrameSerialized(kCmdFIN, sid, {});
+                    half_close_state->upload_done.store(true);
+                    if (auto ok = co_await session->WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
+                        logical->Close(ok.error());
+                        co_return std::make_pair(bytes, ok.error());
+                    }
+                    SpawnLogicalCloseWatch(
+                        io_context,
+                        half_close_state,
+                        logical,
+                        relay_config.downlink_only);
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
                 const size_t n = buf::TotalLen(mb);
@@ -859,16 +942,22 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                             sid,
                             buffer->Bytes());
                         if (!frame) {
+                            half_close_state->upload_done.store(true);
+                            logical->Close(frame.error());
                             co_return std::make_pair(bytes, frame.error());
                         }
                         packet.append(*frame);
                     }
                     mb.clear();
                     if (auto ok = co_await session->WriteUdpPacket(sid, std::move(packet)); !ok) {
+                        half_close_state->upload_done.store(true);
+                        logical->Close(ok.error());
                         co_return std::make_pair(bytes, ok.error());
                     }
                 } else {
                     if (auto ok = co_await session->WritePayloadFrames(sid, std::move(mb)); !ok) {
+                        half_close_state->upload_done.store(true);
+                        logical->Close(ok.error());
                         co_return std::make_pair(bytes, ok.error());
                     }
                 }
@@ -876,8 +965,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 ctx.traffic.bytes_up = bytes;
                 stats.AddBytesOut(n);
             } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
+                const ErrorCode error = MapAsioError(e.code());
+                half_close_state->upload_done.store(true);
+                logical->Close(error);
+                co_return std::make_pair(bytes, error);
             } catch (...) {
+                half_close_state->upload_done.store(true);
+                logical->Close(ErrorCode::RELAY_READ_FAILED);
                 co_return std::make_pair(bytes, ErrorCode::RELAY_READ_FAILED);
             }
         }
@@ -888,9 +982,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         while (true) {
             auto payload = co_await logical->ReadPayload();
             if (!payload) {
-                co_return std::make_pair(
-                    bytes,
-                    payload.error() == ErrorCode::OK ? ErrorCode::OK : payload.error());
+                half_close_state->download_done.store(true);
+                const ErrorCode error =
+                    payload.error() == ErrorCode::OK ? ErrorCode::OK : payload.error();
+                if (error == ErrorCode::OK) {
+                    SpawnInboundCancelWatch(
+                        io_context,
+                        half_close_state,
+                        inbound.reader,
+                        relay_config.uplink_only);
+                }
+                co_return std::make_pair(bytes, error);
             }
             const size_t n = buf::TotalLen(*payload);
             if (is_udp) {
@@ -903,8 +1005,21 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             try {
                 co_await inbound.writer->WriteMultiBuffer(std::move(*payload));
             } catch (const IoSystemError& e) {
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
+                const ErrorCode error = MapAsioError(e.code());
+                half_close_state->download_done.store(true);
+                SpawnInboundCancelWatch(
+                    io_context,
+                    half_close_state,
+                    inbound.reader,
+                    std::chrono::seconds(0));
+                co_return std::make_pair(bytes, error);
             } catch (...) {
+                half_close_state->download_done.store(true);
+                SpawnInboundCancelWatch(
+                    io_context,
+                    half_close_state,
+                    inbound.reader,
+                    std::chrono::seconds(0));
                 co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
             }
             bytes += n;
@@ -915,6 +1030,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     using namespace net::experimental::awaitable_operators;
     auto [up, down] = co_await (upload() && download());
+    half_close_state->finished.store(true);
 
     RelayResult result;
     result.bytes_up = up.first;
