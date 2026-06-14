@@ -1350,6 +1350,13 @@ add_test(
 )
 
 add_test(
+    NAME no_quadratic_user_list_diff
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_quadratic_user_list_diff.cmake
+)
+
+add_test(
     NAME no_deployment_legacy_config_layout
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}

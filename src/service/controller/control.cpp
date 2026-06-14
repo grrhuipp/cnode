@@ -293,22 +293,68 @@ struct UserListDiff {
         && a.Enabled == b.Enabled;
 }
 
-[[nodiscard]] bool ContainsUser(const std::vector<api::UserInfo>& users,
-                                const api::UserInfo& needle) {
-    return std::any_of(users.begin(), users.end(),
-        [&](const api::UserInfo& user) { return SameUserInfo(user, needle); });
+template <typename T>
+void HashCombine(std::size_t& seed, const T& value) {
+    seed ^= std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL +
+            (seed << 6) + (seed >> 2);
+}
+
+struct UserInfoRef {
+    const api::UserInfo* user = nullptr;
+};
+
+struct UserInfoRefHash {
+    std::size_t operator()(const UserInfoRef& ref) const {
+        const auto& user = *ref.user;
+        std::size_t seed = 0;
+        HashCombine(seed, user.UID);
+        HashCombine(seed, user.Email);
+        HashCombine(seed, user.Passwd);
+        HashCombine(seed, user.Port);
+        HashCombine(seed, user.Method);
+        HashCombine(seed, user.SpeedLimit);
+        HashCombine(seed, user.DeviceLimit);
+        HashCombine(seed, user.Protocol);
+        HashCombine(seed, user.ProtocolParam);
+        HashCombine(seed, user.Obfs);
+        HashCombine(seed, user.ObfsParam);
+        HashCombine(seed, user.UUID);
+        HashCombine(seed, user.AlterID);
+        HashCombine(seed, user.Enabled);
+        return seed;
+    }
+};
+
+struct UserInfoRefEqual {
+    bool operator()(const UserInfoRef& a, const UserInfoRef& b) const {
+        return SameUserInfo(*a.user, *b.user);
+    }
+};
+
+using UserInfoSet = std::unordered_set<UserInfoRef, UserInfoRefHash, UserInfoRefEqual>;
+
+[[nodiscard]] UserInfoSet BuildUserInfoSet(const std::vector<api::UserInfo>& users) {
+    UserInfoSet result;
+    result.reserve(users.size());
+    for (const auto& user : users) {
+        result.insert(UserInfoRef{&user});
+    }
+    return result;
 }
 
 [[nodiscard]] UserListDiff CompareUserList(const std::vector<api::UserInfo>& old_users,
                                            const std::vector<api::UserInfo>& new_users) {
     UserListDiff diff;
+    const auto old_set = BuildUserInfoSet(old_users);
+    const auto new_set = BuildUserInfoSet(new_users);
+
     for (const auto& old_user : old_users) {
-        if (!ContainsUser(new_users, old_user)) {
+        if (!new_set.contains(UserInfoRef{&old_user})) {
             diff.deleted.push_back(old_user);
         }
     }
     for (const auto& new_user : new_users) {
-        if (!ContainsUser(old_users, new_user)) {
+        if (!old_set.contains(UserInfoRef{&new_user})) {
             diff.added.push_back(new_user);
         }
     }
