@@ -417,6 +417,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_relay_wrapper_api.cmake
 )
 
+add_test(
+    NAME no_half_close_phase_deadline_as_eof
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_half_close_phase_deadline_as_eof.cmake
+)
+
 
 add_test(
     NAME no_dispatcher_protocol_includes

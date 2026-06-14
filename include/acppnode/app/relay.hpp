@@ -336,9 +336,9 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             }
 
             if (mb.empty()) {
-                if (ConsumeReadSideTimeoutSignal(from_control)) {
+                if (ConsumeRelayTimeoutSignals(from_control, to_control)) {
                     error = ErrorCode::RELAY_TIMEOUT;
-                    LOG_CONN_DEBUG(ctx, "[relay] {} idle/read timeout, transferred={}B",
+                    LOG_CONN_DEBUG(ctx, "[relay] {} relay timeout, transferred={}B",
                                    is_upload ? "up" : "down", total_bytes);
                     break;
                 }
