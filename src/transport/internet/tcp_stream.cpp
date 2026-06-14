@@ -29,7 +29,7 @@ namespace {
 constexpr int kSocketBufferSizeLow  = 8 * 1024;
 constexpr int kSocketBufferSizeMid  = 16 * 1024;
 constexpr int kSocketBufferSizeHigh = 32 * 1024;
-constexpr uint32_t kMaxReadAllocBuffers = 1;
+constexpr uint32_t kMaxReadAllocBuffers = 2;
 constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
 constexpr uint8_t kReadGrowStreakRequired = 2;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
@@ -302,7 +302,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 //
 // 自适应散读（仿 Xray ReadVReader allocStrategy）：
 //   - 低流量 / 启动：单 Buffer 快速路径，零额外堆分配
-//   - RSS 优先：不升到 scatter-read，限制高并发时挂起读常驻 payload
+//   - 连续大包后升到 2 个 Buffer，限制高并发时挂起读常驻 payload
 //   - 未读满则收缩到实际使用数，避免浪费
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
@@ -366,20 +366,16 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 
         buf->Produce(static_cast<uint32_t>(n));
         TouchActivity();
-        if constexpr (kMaxReadAllocBuffers > 1) {
-            // 读满或连续"大包"读命中时，提前切换到 scatter-read。
-            if (n == buf::Buffer::kSize || n >= kReadGrowThreshold) {
-                if (impl_->read_grow_streak < 0xff) {
-                    ++impl_->read_grow_streak;
-                }
-                if (impl_->read_grow_streak >= kReadGrowStreakRequired) {
-                    impl_->read_alloc_count = std::min(2u, kMaxReadAllocBuffers);
-                    impl_->read_grow_streak = 0;
-                }
-            } else {
+        // 读满或连续"大包"读命中时，提前切换到 scatter-read。
+        if (n == buf::Buffer::kSize || n >= kReadGrowThreshold) {
+            if (impl_->read_grow_streak < 0xff) {
+                ++impl_->read_grow_streak;
+            }
+            if (impl_->read_grow_streak >= kReadGrowStreakRequired) {
+                impl_->read_alloc_count = 2;
                 impl_->read_grow_streak = 0;
             }
-        } else if (impl_->read_grow_streak != 0) {
+        } else {
             impl_->read_grow_streak = 0;
         }
         co_return buf::MultiBuffer{buf.release()};
