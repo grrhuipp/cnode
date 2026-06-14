@@ -1405,6 +1405,13 @@ add_test(
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_anytls_outbound_custom_relay.cmake
 )
 
+add_test(
+    NAME no_tls_read_multibuffer_prealloc
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_tls_read_multibuffer_prealloc.cmake
+)
+
 
 # 平台链接库
 if(WIN32)

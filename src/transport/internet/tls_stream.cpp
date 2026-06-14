@@ -510,23 +510,88 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
     std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
 
     while (true) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            co_return buf::MultiBuffer{};
+        if (SSL_pending(ssl_) <= 0 && BIO_pending(read_bio_) <= 0) {
+            bool need_encrypted_read = true;
+            std::array<uint8_t, 1> probe{};
+            const int peek = SSL_peek(ssl_, probe.data(), static_cast<int>(probe.size()));
+            if (peek > 0) {
+                // Application data is already decryptable; fall through and
+                // read it into a relay Buffer without consuming the probe byte.
+                need_encrypted_read = false;
+            } else {
+                const int peek_err = SSL_get_error(ssl_, peek);
+                if (peek_err == SSL_ERROR_ZERO_RETURN) {
+                    co_return buf::MultiBuffer{};
+                }
+                if (peek_err == SSL_ERROR_WANT_WRITE) {
+                    if (!co_await FlushWriteBio()) {
+                        ThrowTlsReadError("TLS flush write BIO failed");
+                    }
+                    continue;
+                }
+                if (peek_err != SSL_ERROR_WANT_READ) {
+                    ThrowTlsReadError("TLS read failed");
+                }
+            }
+
+            if (need_encrypted_read) {
+                if (!co_await FlushWriteBio()) {
+                    ThrowTlsReadError("TLS flush write BIO failed");
+                }
+
+                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
+                if (n == 0) {
+                    ThrowTlsReadError("TLS peer closed without close_notify");
+                }
+
+                const int written = BIO_write(
+                    read_bio_,
+                    read_buffer.data(),
+                    static_cast<int>(std::min<std::size_t>(
+                        n,
+                        static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+                if (written <= 0 || static_cast<std::size_t>(written) != n) {
+                    ThrowTlsReadError("TLS read BIO write failed");
+                }
+            }
         }
 
-        int ret = SSL_read(ssl_, out->Tail().data(), static_cast<int>(out->Available()));
-        if (ret > 0) {
-            out->Produce(static_cast<uint32_t>(ret));
-            co_return buf::MultiBuffer{out.release()};
+        bool want_read = false;
+        bool want_write = false;
+        {
+            buf::BufferGuard out{buf::Buffer::New()};
+            if (!out) {
+                co_return buf::MultiBuffer{};
+            }
+
+            int ret = SSL_read(ssl_, out->Tail().data(), static_cast<int>(out->Available()));
+            if (ret > 0) {
+                out->Produce(static_cast<uint32_t>(ret));
+                co_return buf::MultiBuffer{out.release()};
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                co_return buf::MultiBuffer{};
+            }
+
+            if (err == SSL_ERROR_WANT_READ) {
+                want_read = true;
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                want_write = true;
+            } else {
+                ThrowTlsReadError("TLS read failed");
+            }
         }
 
-        int err = SSL_get_error(ssl_, ret);
-        if (err == SSL_ERROR_ZERO_RETURN) {
-            co_return buf::MultiBuffer{};
+        if (want_write) {
+            if (!co_await FlushWriteBio()) {
+                ThrowTlsReadError("TLS flush write BIO failed");
+            }
+            continue;
         }
 
-        if (err == SSL_ERROR_WANT_READ) {
+        if (want_read) {
             if (!co_await FlushWriteBio()) {
                 ThrowTlsReadError("TLS flush write BIO failed");
             }
@@ -547,15 +612,6 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
             }
             continue;
         }
-
-        if (err == SSL_ERROR_WANT_WRITE) {
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsReadError("TLS flush write BIO failed");
-            }
-            continue;
-        }
-
-        ThrowTlsReadError("TLS read failed");
     }
 }
 
