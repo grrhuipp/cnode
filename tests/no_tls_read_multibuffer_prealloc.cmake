@@ -1,8 +1,8 @@
 file(READ "${PROJECT_SOURCE_DIR}/src/transport/internet/tls_stream.cpp" tls_source)
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/transport/internet/tls_stream.hpp" tls_header)
 
-if(NOT tls_header MATCHES "kTlsIoBufferSize[ \t\r\n]*=[ \t\r\n]*2048")
-    message(FATAL_ERROR "TlsStream per-read encrypted scratch must stay at 2KB to limit idle TLS RSS")
+if(NOT tls_header MATCHES "kTlsIoBufferSize[ \t\r\n]*=[ \t\r\n]*4096")
+    message(FATAL_ERROR "TlsStream per-read encrypted scratch must stay at 4KB")
 endif()
 
 if(NOT tls_source MATCHES "kFlushBufSize[ \t\r\n]*=[ \t\r\n]*4[ \t\r\n]*\\*[ \t\r\n]*1024")
