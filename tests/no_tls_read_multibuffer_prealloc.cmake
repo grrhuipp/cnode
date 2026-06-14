@@ -1,4 +1,13 @@
 file(READ "${PROJECT_SOURCE_DIR}/src/transport/internet/tls_stream.cpp" tls_source)
+file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/transport/internet/tls_stream.hpp" tls_header)
+
+if(NOT tls_header MATCHES "kTlsIoBufferSize[ \t\r\n]*=[ \t\r\n]*2048")
+    message(FATAL_ERROR "TlsStream per-read encrypted scratch must stay at 2KB to limit idle TLS RSS")
+endif()
+
+if(NOT tls_source MATCHES "kFlushBufSize[ \t\r\n]*=[ \t\r\n]*4[ \t\r\n]*\\*[ \t\r\n]*1024")
+    message(FATAL_ERROR "TlsStream write BIO flush scratch must stay at 4KB or below")
+endif()
 
 set(function_name "net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer()")
 string(FIND "${tls_source}" "${function_name}" function_pos)

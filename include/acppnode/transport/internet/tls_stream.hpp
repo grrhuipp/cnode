@@ -110,7 +110,7 @@ private:
 
     // TLS 底层 I/O pump 的临时缓冲大小。缓冲本体放在执行中的 awaitable 内，
     // 避免每个 TLS stream 对象常驻一块 scratch。
-    static constexpr size_t kTlsIoBufferSize = 4096;
+    static constexpr size_t kTlsIoBufferSize = 2048;
 };
 
 // ============================================================================
