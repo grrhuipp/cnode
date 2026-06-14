@@ -18,7 +18,7 @@ constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
 constexpr size_t kVMessBodyMaxChunkSize = 16 * 1024;
-constexpr size_t kStreamFlushBufferCount = 8;
+constexpr size_t kStreamFlushBufferCount = 2;
 constexpr size_t kStreamFlushBytes = buf::Buffer::kSize * kStreamFlushBufferCount;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {

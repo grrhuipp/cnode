@@ -132,18 +132,24 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
     net::steady_timer timer(ctx.main_ctx);
 #ifdef USE_MIMALLOC
     uint32_t last_sample_total_conns = 0;
+    uint64_t last_force_collect_total_connections = 0;
+    bool churn_collect_baseline_set = false;
     auto last_force_collect_at = steady_clock::time_point{};
     auto last_steady_collect_at = steady_clock::time_point{};
 #endif
     while (state.running) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
-        ctx.stats.SampleNow(AggregateWorkerStats(worker_snapshots));
+        auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
+        ctx.stats.SampleNow(aggregate_stats);
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
 #ifdef USE_MIMALLOC
         constexpr uint32_t kForceCollectMinPrevConns = 4096;
         constexpr uint32_t kForceCollectDropFactor = 4;
         constexpr uint32_t kForceCollectConnFloor = 64;
         constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
+        constexpr uint64_t kChurnForceCollectConnections = 8192;
+        constexpr uint32_t kChurnForceCollectMinConns = 512;
+        constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
         constexpr uint32_t kSteadyCollectMinConns = 512;
         constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
 
@@ -165,15 +171,29 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
         const bool cooldown_ok =
             last_force_collect_at.time_since_epoch().count() == 0 ||
             now - last_force_collect_at >= kForceCollectCooldown;
+        if (!churn_collect_baseline_set) {
+            last_force_collect_total_connections = aggregate_stats.connections_total;
+            churn_collect_baseline_set = true;
+        }
+        const uint64_t churn_since_force =
+            aggregate_stats.connections_total >= last_force_collect_total_connections
+                ? aggregate_stats.connections_total - last_force_collect_total_connections
+                : 0;
+        const bool churn_collect_due =
+            total_conns >= kChurnForceCollectMinConns &&
+            churn_since_force >= kChurnForceCollectConnections &&
+            (last_force_collect_at.time_since_epoch().count() == 0 ||
+             now - last_force_collect_at >= kChurnForceCollectCooldown);
         const bool steady_collect_due =
             total_conns >= kSteadyCollectMinConns &&
             (last_steady_collect_at.time_since_epoch().count() == 0 ||
              now - last_steady_collect_at >= kSteadyCollectInterval);
 
-        if ((burst_drain || newly_idle) && cooldown_ok) {
+        if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
             co_await CollectWorkerHeaps(ctx, true);
             last_force_collect_at = now;
             last_steady_collect_at = now;
+            last_force_collect_total_connections = aggregate_stats.connections_total;
         } else if (steady_collect_due) {
             co_await CollectWorkerHeaps(ctx, false);
             last_steady_collect_at = now;

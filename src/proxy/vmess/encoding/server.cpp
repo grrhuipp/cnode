@@ -59,7 +59,7 @@ bool ParseDecryptedHeader(const uint8_t* data,
                           VMessRequest& request);
 
 namespace {
-constexpr size_t kStreamFlushBufferCount = 8;
+constexpr size_t kStreamFlushBufferCount = 2;
 constexpr size_t kStreamFlushBytes = buf::Buffer::kSize * kStreamFlushBufferCount;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {

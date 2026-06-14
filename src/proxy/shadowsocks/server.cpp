@@ -12,7 +12,7 @@ namespace acpp::ss {
 
 namespace {
 
-constexpr size_t kStreamFlushBufferCount = 8;
+constexpr size_t kStreamFlushBufferCount = 2;
 constexpr size_t kStreamFlushBytes = buf::Buffer::kSize * kStreamFlushBufferCount;
 constexpr size_t kStreamChunkPayloadSize =
     buf::Buffer::kSize - 2 - SsAeadCipher::kTagSize;

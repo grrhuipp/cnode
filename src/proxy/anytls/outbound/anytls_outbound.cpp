@@ -28,6 +28,8 @@
 
 namespace {
 
+constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
+
 std::optional<acpp::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
     acpp::anytls::outbound::Settings result;
@@ -108,7 +110,18 @@ struct Handler::ClientSession {
                 mb.clear();
                 return;
             }
+            const size_t bytes = buf::TotalLen(mb);
+            if (bytes == 0) {
+                mb.clear();
+                return;
+            }
+            if (queued_bytes_ + bytes > kMaxLogicalQueuedPayloadBytes) {
+                Fail(ErrorCode::RESOURCE_EXHAUSTED);
+                mb.clear();
+                return;
+            }
             queue_.push_back(std::move(mb));
+            queued_bytes_ += bytes;
             timer_.cancel();
         }
 
@@ -158,6 +171,7 @@ struct Handler::ClientSession {
             closed_ = true;
             error_ = ErrorCode::CANCELLED;
             queue_.clear();
+            queued_bytes_ = 0;
             timer_.cancel();
         }
 
@@ -165,6 +179,7 @@ struct Handler::ClientSession {
             while (!closed_) {
                 if (!queue_.empty()) {
                     buf::MultiBuffer mb = std::move(queue_.front());
+                    queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
                     queue_.pop_front();
                     co_return std::move(mb);
                 }
@@ -176,6 +191,7 @@ struct Handler::ClientSession {
             }
             if (!queue_.empty()) {
                 buf::MultiBuffer mb = std::move(queue_.front());
+                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
                 queue_.pop_front();
                 co_return std::move(mb);
             }
@@ -183,9 +199,18 @@ struct Handler::ClientSession {
         }
 
     private:
+        void Fail(ErrorCode error) noexcept {
+            closed_ = true;
+            error_ = error;
+            queue_.clear();
+            queued_bytes_ = 0;
+            timer_.cancel();
+        }
+
         net::steady_timer timer_;
         uint32_t sid_ = 0;
         std::deque<buf::MultiBuffer> queue_;
+        size_t queued_bytes_ = 0;
         ErrorCode error_ = ErrorCode::OK;
         ErrorCode syn_ack_error_ = ErrorCode::OK;
         bool closed_ = false;

@@ -14,6 +14,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/steady_timer.hpp>
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <deque>
@@ -28,6 +29,8 @@
 namespace acpp::anytls::inbound {
 
 namespace {
+
+constexpr size_t kMaxSubStreamQueuedPayloadBytes = buf::Buffer::kSize * 4;
 
 void CopySessionContext(const session::Context& source, session::Context& target) {
     target.conn_id = source.conn_id;
@@ -342,7 +345,18 @@ public:
             mb.clear();
             return;
         }
+        const size_t bytes = buf::TotalLen(mb);
+        if (bytes == 0) {
+            mb.clear();
+            return;
+        }
+        if (queued_bytes_ + bytes > kMaxSubStreamQueuedPayloadBytes) {
+            Cancel();
+            mb.clear();
+            return;
+        }
         input_queue_.push_back(std::move(mb));
+        queued_bytes_ += bytes;
         input_timer_.cancel();
     }
 
@@ -361,6 +375,7 @@ public:
         cancelled_ = true;
         input_done_ = true;
         input_queue_.clear();
+        queued_bytes_ = 0;
         input_timer_.cancel();
     }
 
@@ -368,6 +383,7 @@ public:
         while (!cancelled_) {
             if (!input_queue_.empty()) {
                 buf::MultiBuffer mb = std::move(input_queue_.front());
+                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
                 input_queue_.pop_front();
                 co_return mb;
             }
@@ -391,6 +407,7 @@ private:
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;
     std::deque<buf::MultiBuffer> input_queue_;
+    size_t queued_bytes_ = 0;
     bool input_done_ = false;
     bool cancelled_ = false;
 };

@@ -1434,6 +1434,20 @@ add_test(
 )
 
 add_test(
+    NAME no_large_protocol_write_flush_batch
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_large_protocol_write_flush_batch.cmake
+)
+
+add_test(
+    NAME no_unbounded_anytls_substream_queue
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_unbounded_anytls_substream_queue.cmake
+)
+
+add_test(
     NAME no_lazy_mimalloc_pool_shrink
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
