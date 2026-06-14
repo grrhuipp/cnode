@@ -14,6 +14,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #ifdef USE_MIMALLOC
 #include <mimalloc.h>
 #endif
@@ -66,6 +70,12 @@ inline std::pmr::memory_resource* GetThreadLocalHeapResource() noexcept {
 }
 
 inline void ConfigureProcessAllocator() noexcept {
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    // VPS kernels often run THP in "always" mode. For a proxy with many small
+    // churned objects, 2MB anonymous huge pages amplify RSS retention.
+    (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
+
     // RSS matters more than virtual retention for long-running proxy workloads.
     // Allow purged pages to be decommitted so connection churn returns memory to
     // the OS instead of keeping it resident in worker heaps.

@@ -9,6 +9,10 @@ if(NOT allocator_header MATCHES "kMimallocMinimalPurgeSizeKiB[ \t\r\n]*=[ \t\r\n
     message(FATAL_ERROR "mimalloc minimal purge size must stay small for RSS shrink")
 endif()
 
+if(NOT allocator_header MATCHES "PR_SET_THP_DISABLE")
+    message(FATAL_ERROR "process-level THP must stay disabled to avoid RSS amplification under churn")
+endif()
+
 if(NOT monitor_source MATCHES "kSteadyCollectMinConns[ \t\r\n]*=[ \t\r\n]*512")
     message(FATAL_ERROR "steady mimalloc collection must start at moderate connection counts")
 endif()
