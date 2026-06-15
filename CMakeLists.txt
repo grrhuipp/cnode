@@ -43,9 +43,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # LTO（链接时优化）— Release / Profile 模式启用
 #
 # 效果：跨翻译单元 devirtualize final 类虚调用、内联、死代码消除
-# Sanitizer 模式自动跳过（LTO 与 ASan/TSan 诊断信息冲突）
 # ============================================================================
-if(NOT SANITIZER AND NOT CNODE_HEAPTRACK_BUILD)
+if(NOT CNODE_HEAPTRACK_BUILD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
     # Profile 模式也启用 LTO
     if(CMAKE_BUILD_TYPE STREQUAL "Profile")
@@ -74,91 +73,11 @@ if(CNODE_HEAPTRACK_BUILD)
     )
 endif()
 
-# ============================================================================
-# ISSUE-02-01: Sanitizer 支持（ASan / UBSan / TSan）
-#
-# 使用方法：
-#   cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=asan ..
-#   cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=ubsan ..
-#   cmake -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=tsan ..
-#   cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSANITIZER=asan ..
-#
-# 压测命令：
-#   ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 ./cnode -c config.json
-#   运行 >= 30 分钟，确保 ASan/UBSan 零报错
-# ============================================================================
-set(SANITIZER "" CACHE STRING "Enable sanitizer (asan, ubsan, tsan, msan)")
-
-if(SANITIZER)
-    message(STATUS "Sanitizer enabled: ${SANITIZER}")
-
-    # 定义调试宏
-    add_compile_definitions(ACPP_DEBUG)
-
-    if(SANITIZER STREQUAL "asan")
-        # AddressSanitizer: 检测内存错误（UAF、堆溢出、栈溢出、内存泄漏）
-        if(MSVC)
-            add_compile_options(/fsanitize=address /Zi)
-            add_link_options(/fsanitize=address)
-        else()
-            add_compile_options(-fsanitize=address -fno-omit-frame-pointer -fno-optimize-sibling-calls -g)
-            add_link_options(-fsanitize=address)
-        endif()
-        message(STATUS "  - ASan: Use-After-Free, heap/stack overflow, memory leak detection")
-        message(STATUS "  - Run with: ASAN_OPTIONS=detect_leaks=1:abort_on_error=1")
-
-    elseif(SANITIZER STREQUAL "ubsan")
-        # UndefinedBehaviorSanitizer: 检测未定义行为（MSVC 不支持 UBSan）
-        if(MSVC)
-            message(WARNING "UBSan is not supported by MSVC, ignoring")
-        else()
-            add_compile_options(-fsanitize=undefined -fsanitize=float-divide-by-zero -fsanitize=integer -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
-            add_link_options(-fsanitize=undefined)
-        endif()
-        message(STATUS "  - UBSan: signed overflow, null pointer, misaligned access, etc.")
-        message(STATUS "  - Run with: UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
-
-    elseif(SANITIZER STREQUAL "tsan")
-        # ThreadSanitizer: 检测数据竞争（MSVC 不支持 TSan）
-        if(MSVC)
-            message(WARNING "TSan is not supported by MSVC, ignoring")
-        else()
-            add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
-            add_link_options(-fsanitize=thread)
-        endif()
-        message(STATUS "  - TSan: data race detection")
-        message(STATUS "  - Run with: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
-
-    elseif(SANITIZER STREQUAL "msan")
-        # MemorySanitizer: 检测未初始化内存读取（仅 Clang 支持）
-        if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-            add_compile_options(
-                -fsanitize=memory
-                -fsanitize-memory-track-origins=2
-                -fno-omit-frame-pointer
-                -g
-            )
-            add_link_options(-fsanitize=memory)
-            message(STATUS "  - MSan: uninitialized memory read detection")
-        else()
-            message(WARNING "MSan is only supported by Clang, ignoring")
-        endif()
-
-    else()
-        message(WARNING "Unknown sanitizer: ${SANITIZER}, ignoring")
-    endif()
-endif()
-
 option(USE_MIMALLOC "Use mimalloc as default memory allocator" ON)
 option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
 
 if(CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC)
     message(STATUS "heaptrack variant: disabling mimalloc")
-    set(USE_MIMALLOC OFF)
-endif()
-
-if(USE_MIMALLOC AND SANITIZER)
-    message(WARNING "mimalloc is incompatible with sanitizers, disabling mimalloc")
     set(USE_MIMALLOC OFF)
 endif()
 
@@ -203,11 +122,9 @@ FetchContent_Declare(
     zlib
     GIT_REPOSITORY https://github.com/madler/zlib.git
     GIT_TAG v1.3.1
+    SOURCE_SUBDIR cnode-no-upstream-cmake
 )
-FetchContent_GetProperties(zlib)
-if(NOT zlib_POPULATED)
-    FetchContent_Populate(zlib)
-endif()
+FetchContent_MakeAvailable(zlib)
 
 add_library(cnode_zlib STATIC
     ${zlib_SOURCE_DIR}/adler32.c
@@ -245,11 +162,7 @@ if(USE_MIMALLOC)
     message(STATUS "Using mimalloc via FetchContent")
 else()
     set(HAS_MIMALLOC FALSE)
-    if(SANITIZER)
-        message(STATUS "mimalloc: DISABLED (incompatible with ${SANITIZER})")
-    else()
-        message(STATUS "mimalloc: DISABLED (using system allocator)")
-    endif()
+    message(STATUS "mimalloc: DISABLED (using system allocator)")
 endif()
 
 # ============================================================================
@@ -1672,10 +1585,5 @@ if(CMAKE_INTERPROCEDURAL_OPTIMIZATION OR CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELE
     message(STATUS "  LTO:          enabled")
 else()
     message(STATUS "  LTO:          disabled")
-endif()
-if(SANITIZER)
-    message(STATUS "  Sanitizer:    ${SANITIZER}")
-else()
-    message(STATUS "  Sanitizer:    disabled")
 endif()
 message(STATUS "")

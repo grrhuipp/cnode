@@ -53,7 +53,9 @@ foreach(pattern IN ITEMS
         "apk add --no-cache"
         "sudo apt-get install -y"
         "perl nasm"
-        "save-always: true"
+        "actions/cache/restore@v4"
+        "actions/cache/save@v4"
+        "if: always\\(\\)"
         "path: build-musl/_deps"
         "path: build-heaptrack/_deps"
         "-DCNODE_HEAPTRACK_BUILD=ON"
@@ -61,6 +63,21 @@ foreach(pattern IN ITEMS
         "name: cnode-glibc-assets")
     if(NOT ci_workflow MATCHES "${pattern}")
         message(FATAL_ERROR "CI must install AWS-LC tools and publish both binary variants: ${pattern}")
+    endif()
+endforeach()
+
+string(CONCAT deprecated_cache_input "save" "-always")
+string(CONCAT deprecated_fetchcontent_api "FetchContent" "_Populate")
+string(CONCAT removed_sanitizer_option "SANI" "TIZER")
+string(CONCAT removed_sanitizer_label "Sani" "tizer")
+
+foreach(pattern IN ITEMS
+        "${deprecated_cache_input}"
+        "${deprecated_fetchcontent_api}"
+        "${removed_sanitizer_option}"
+        "${removed_sanitizer_label}")
+    if(cmake_source MATCHES "${pattern}" OR ci_workflow MATCHES "${pattern}")
+        message(FATAL_ERROR "CMake/CI warning cleanup regressed: ${pattern}")
     endif()
 endforeach()
 
