@@ -5,7 +5,7 @@
 # 每次执行添加/覆盖一个 panel 到同一个 cnode 实例；已有 config.json 不会被覆盖，
 # 指定 URL 的 sidecar 文件会覆盖下载。
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v debug_file"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v variant debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
@@ -39,6 +39,7 @@ usage() {
     echo "  -route_url <url>       远程 routing.json 下载地址（指定则覆盖下载）"
     echo "  -inbound_url <url>     远程 inbounds.json 下载地址（指定则覆盖下载）"
     echo "  -v <version>           指定 release tag（默认 cnode-latest；latest 表示 GitHub latest）"
+    echo "  -variant <name>        二进制变体：default、musl、glibc、musl-io_uring、glibc-io_uring"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
 }
@@ -129,6 +130,20 @@ install_cnode() {
             ;;
     esac
 
+    VARIANT="${variant:-default}"
+    case "$VARIANT" in
+        default)
+            ASSET_NAME="cnode-linux-amd64"
+            ;;
+        musl|glibc|musl-io_uring|glibc-io_uring)
+            ASSET_NAME="cnode-linux-amd64-$VARIANT"
+            ;;
+        *)
+            echo "无效的 variant: $VARIANT（支持 default/musl/glibc/musl-io_uring/glibc-io_uring）"
+            exit 1
+            ;;
+    esac
+
     # 获取远程 build_id。GitHub API 在部分机房偶发不可达，API 失败时
     # 回退到 release 直链下载，只跳过 build_id 强校验。
     RELEASE_TAG="${v:-cnode-latest}"
@@ -160,28 +175,35 @@ install_cnode() {
         echo "警告: 无法获取远程版本信息，回退到 release 直链下载。"
     fi
 
-    DEBUG_PATH="$INSTALL_DIR/cnode-linux-amd64.debug"
+    DEBUG_PATH="$INSTALL_DIR/$ASSET_NAME.debug"
+    INSTALLED_ASSET_PATH="$INSTALL_DIR/.cnode-asset"
 
     # 比对本地版本，相同则跳过（早期版本不支持 -v，用 timeout 防止挂起）
     LOCAL_ID=""
     if [ -x "$BIN_PATH" ]; then
         LOCAL_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
     fi
+    LOCAL_ASSET=""
+    if [ -f "$INSTALLED_ASSET_PATH" ]; then
+        LOCAL_ASSET=$(cat "$INSTALLED_ASSET_PATH" 2>/dev/null || true)
+    elif [ "$ASSET_NAME" = "cnode-linux-amd64" ]; then
+        LOCAL_ASSET="$ASSET_NAME"
+    fi
 
     NEED_BINARY_UPDATE=1
-    if [ -n "$REMOTE_VERSION" ] && [ "$LOCAL_ID" = "$REMOTE_VERSION" ]; then
+    if [ -n "$REMOTE_VERSION" ] && [ "$LOCAL_ID" = "$REMOTE_VERSION" ] && [ "$LOCAL_ASSET" = "$ASSET_NAME" ]; then
         NEED_BINARY_UPDATE=0
     fi
 
     LATEST_URL=""
     if [ -n "$RELEASE_INFO" ]; then
         LATEST_URL=$(echo "$RELEASE_INFO" \
-            | jq -r --arg asset "cnode-linux-amd64" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
+            | jq -r --arg asset "$ASSET_NAME" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
             | head -1)
     fi
 
     if [ -z "$LATEST_URL" ] || [ "$LATEST_URL" = "null" ]; then
-        LATEST_URL="$RELEASE_ASSET_BASE/cnode-linux-amd64"
+        LATEST_URL="$RELEASE_ASSET_BASE/$ASSET_NAME"
     fi
 
     NEED_DEBUG_DOWNLOAD=0
@@ -190,11 +212,11 @@ install_cnode() {
         NEED_DEBUG_DOWNLOAD=1
         if [ -n "$RELEASE_INFO" ]; then
             DEBUG_URL=$(echo "$RELEASE_INFO" \
-                | jq -r --arg asset "cnode-linux-amd64.debug" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
+                | jq -r --arg asset "$ASSET_NAME.debug" '.assets[] | select(.name == $asset) | .browser_download_url' 2>/dev/null \
                 | head -1)
         fi
         if [ -z "$DEBUG_URL" ] || [ "$DEBUG_URL" = "null" ]; then
-            DEBUG_URL="$RELEASE_ASSET_BASE/cnode-linux-amd64.debug"
+            DEBUG_URL="$RELEASE_ASSET_BASE/$ASSET_NAME.debug"
         fi
     fi
 
@@ -216,7 +238,7 @@ install_cnode() {
         if [ -z "$UPDATE_TARGET" ]; then
             UPDATE_TARGET="release:$RELEASE_TAG"
         fi
-        echo "更新 cnode: ${LOCAL_ID:-none} -> $UPDATE_TARGET"
+        echo "更新 cnode: ${LOCAL_ID:-none} (${LOCAL_ASSET:-unknown}) -> $UPDATE_TARGET ($ASSET_NAME)"
         if ! curl -fsSL --connect-timeout 10 --retry 3 "$LATEST_URL" -o "$BIN_PATH"; then
             echo "cnode 下载失败。"
             exit 1
@@ -236,8 +258,9 @@ install_cnode() {
         else
             echo "cnode 已更新: $BIN_PATH"
         fi
+        echo "$ASSET_NAME" > "$INSTALLED_ASSET_PATH"
     else
-        echo "cnode 已是最新版本: $REMOTE_VERSION"
+        echo "cnode 已是最新版本: $REMOTE_VERSION ($ASSET_NAME)"
     fi
 
     if [ "$NEED_DEBUG_DOWNLOAD" -eq 1 ]; then

@@ -104,6 +104,8 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("  I/O backend:    kqueue (macOS)");
 #elif defined(_WIN32)
     LOG_CONSOLE("  I/O backend:    IOCP (Windows)");
+#elif defined(CNODE_IO_URING_ENABLED)
+    LOG_CONSOLE("  I/O backend:    io_uring (Linux)");
 #else
     LOG_CONSOLE("  I/O backend:    epoll (Linux)");
 #endif

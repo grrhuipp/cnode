@@ -45,13 +45,27 @@ jobs:
           echo "BUILD_ID=${build_id}"
 
   build-musl:
-    name: Release (musl static system allocator)
+    name: Release (musl ${{ matrix.backend }})
     runs-on: ubuntu-24.04
     needs: build-metadata
     container:
       image: alpine:3.20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: epoll
+            cmake_io_uring: OFF
+            asset_suffix: musl
+            default_alias: true
+          - backend: io_uring
+            cmake_io_uring: ON
+            asset_suffix: musl-io_uring
+            default_alias: false
     env:
       BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
+      BUILD_DIR: build-musl-${{ matrix.backend }}
+      ASSET_NAME: cnode-linux-amd64-${{ matrix.asset_suffix }}
 
     steps:
       - name: Install Alpine build tools
@@ -67,40 +81,44 @@ jobs:
         id: cache-musl
         uses: actions/cache/restore@v5.0.5
         with:
-          path: build-musl/_deps
-          key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cmake-deps-musl-${{ runner.os }}-
+          path: ${{ env.BUILD_DIR }}/_deps
+          key: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-
 
       - name: Configure
         run: |
-          cmake -B build-musl -G Ninja \
+          cmake -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_MEMORY_STATS=ON \
+            -DCNODE_IO_URING=${{ matrix.cmake_io_uring }} \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ env.BUILD_ID }}
 
       - name: Build
-        run: cmake --build build-musl --parallel $(nproc)
+        run: cmake --build "$BUILD_DIR" --parallel $(nproc)
 
       - name: Verify & package musl binary
         run: |
-          file build-musl/cnode
-          ldd build-musl/cnode 2>&1 && exit 1 || true
+          file "$BUILD_DIR/cnode"
+          "$BUILD_DIR/cnode" -v
+          ldd "$BUILD_DIR/cnode" 2>&1 && exit 1 || true
           mkdir -p release-assets
-          objcopy --only-keep-debug build-musl/cnode build-musl/cnode-linux-amd64-musl.debug
-          strip build-musl/cnode
-          objcopy --add-gnu-debuglink=build-musl/cnode-linux-amd64-musl.debug build-musl/cnode
-          cp build-musl/cnode release-assets/cnode-linux-amd64-musl
-          cp build-musl/cnode-linux-amd64-musl.debug release-assets/cnode-linux-amd64-musl.debug
-          cp build-musl/cnode release-assets/cnode-linux-amd64
-          cp build-musl/cnode-linux-amd64-musl.debug release-assets/cnode-linux-amd64.debug
+          objcopy --only-keep-debug "$BUILD_DIR/cnode" "$BUILD_DIR/$ASSET_NAME.debug"
+          strip "$BUILD_DIR/cnode"
+          objcopy --add-gnu-debuglink="$BUILD_DIR/$ASSET_NAME.debug" "$BUILD_DIR/cnode"
+          cp "$BUILD_DIR/cnode" "release-assets/$ASSET_NAME"
+          cp "$BUILD_DIR/$ASSET_NAME.debug" "release-assets/$ASSET_NAME.debug"
+          if [ "${{ matrix.default_alias }}" = "true" ]; then
+            cp "$BUILD_DIR/cnode" release-assets/cnode-linux-amd64
+            cp "$BUILD_DIR/$ASSET_NAME.debug" release-assets/cnode-linux-amd64.debug
+          fi
           ls -lh release-assets
 
       - name: Upload musl artifacts
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: cnode-musl-assets
+          name: cnode-musl-${{ matrix.backend }}-assets
           path: release-assets/*
           if-no-files-found: error
 
@@ -108,15 +126,27 @@ jobs:
         if: always() && steps.cache-musl.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5.0.5
         with:
-          path: build-musl/_deps
-          key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          path: ${{ env.BUILD_DIR }}/_deps
+          key: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
   build-glibc:
-    name: Release (glibc heaptrack system allocator)
+    name: Release (glibc ${{ matrix.backend }})
     runs-on: ubuntu-24.04
     needs: build-metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: epoll
+            cmake_io_uring: OFF
+            asset_suffix: glibc
+          - backend: io_uring
+            cmake_io_uring: ON
+            asset_suffix: glibc-io_uring
     env:
       BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
+      BUILD_DIR: build-glibc-${{ matrix.backend }}
+      ASSET_NAME: cnode-linux-amd64-${{ matrix.asset_suffix }}
 
     steps:
       - name: Install build tools
@@ -124,7 +154,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential binutils cmake ninja-build git curl \
-            zip unzip tar pkg-config perl nasm file
+            zip unzip tar pkg-config perl nasm file linux-libc-dev
 
       - uses: actions/checkout@v6.0.3
 
@@ -132,37 +162,37 @@ jobs:
         id: cache-glibc
         uses: actions/cache/restore@v5.0.5
         with:
-          path: build-heaptrack/_deps
-          key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cmake-deps-glibc-${{ runner.os }}-
+          path: ${{ env.BUILD_DIR }}/_deps
+          key: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-
 
-      - name: Build glibc heaptrack variant
+      - name: Build glibc release variant
         run: |
-          cmake -S . -B build-heaptrack -G Ninja \
-            -DCMAKE_BUILD_TYPE=Profile \
+          cmake -S . -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_MEMORY_STATS=ON \
-            -DCNODE_HEAPTRACK_BUILD=ON \
+            -DCNODE_IO_URING=${{ matrix.cmake_io_uring }} \
             -DBUILD_ID=${{ env.BUILD_ID }}
-          cmake --build build-heaptrack --parallel $(nproc)
-          build-heaptrack/cnode -v
+          cmake --build "$BUILD_DIR" --parallel $(nproc)
+          "$BUILD_DIR/cnode" -v
 
       - name: Package glibc binary
         run: |
-          file build-heaptrack/cnode
-          ldd build-heaptrack/cnode
+          file "$BUILD_DIR/cnode"
+          ldd "$BUILD_DIR/cnode"
           mkdir -p glibc-assets
-          objcopy --only-keep-debug build-heaptrack/cnode build-heaptrack/cnode-linux-amd64-glibc.debug
-          strip build-heaptrack/cnode
-          objcopy --add-gnu-debuglink=build-heaptrack/cnode-linux-amd64-glibc.debug build-heaptrack/cnode
-          cp build-heaptrack/cnode glibc-assets/cnode-linux-amd64-glibc
-          cp build-heaptrack/cnode-linux-amd64-glibc.debug glibc-assets/cnode-linux-amd64-glibc.debug
+          objcopy --only-keep-debug "$BUILD_DIR/cnode" "$BUILD_DIR/$ASSET_NAME.debug"
+          strip "$BUILD_DIR/cnode"
+          objcopy --add-gnu-debuglink="$BUILD_DIR/$ASSET_NAME.debug" "$BUILD_DIR/cnode"
+          cp "$BUILD_DIR/cnode" "glibc-assets/$ASSET_NAME"
+          cp "$BUILD_DIR/$ASSET_NAME.debug" "glibc-assets/$ASSET_NAME.debug"
           ls -lh glibc-assets
 
       - name: Upload glibc artifacts
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: cnode-glibc-assets
+          name: cnode-glibc-${{ matrix.backend }}-assets
           path: glibc-assets/*
           if-no-files-found: error
 
@@ -170,8 +200,8 @@ jobs:
         if: always() && steps.cache-glibc.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5.0.5
         with:
-          path: build-heaptrack/_deps
-          key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          path: ${{ env.BUILD_DIR }}/_deps
+          key: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
   publish-release:
     name: Publish GitHub Release
@@ -186,17 +216,12 @@ jobs:
       contents: write
 
     steps:
-      - name: Download musl artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v8.0.1
         with:
           path: release-assets
-          name: cnode-musl-assets
-
-      - name: Download glibc artifacts
-        uses: actions/download-artifact@v8.0.1
-        with:
-          path: release-assets
-          name: cnode-glibc-assets
+          pattern: cnode-*-assets
+          merge-multiple: true
 
       - name: Publish release assets
         run: |
@@ -206,7 +231,7 @@ jobs:
           build_id: $BUILD_ID
           release_time: $RELEASE_TIME
           commit: ${{ github.sha }}
-          variants: musl+system-allocator, glibc+system-allocator
+          variants: musl+epoll, musl+io_uring, glibc+epoll, glibc+io_uring
           EOF
 
           tag_ref="tags/${{ env.RELEASE_TAG }}"

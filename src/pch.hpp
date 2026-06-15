@@ -28,10 +28,20 @@
 #include <asio.hpp>
 #include <asio/as_tuple.hpp>
 #include <asio/awaitable.hpp>
+#include <asio/buffer.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/connect.hpp>
 #include <asio/detached.hpp>
+#include <asio/executor_work_guard.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
+#include <asio/experimental/channel.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/address.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/ip/udp.hpp>
+#include <asio/read.hpp>
+#include <asio/read_until.hpp>
+#include <asio/signal_set.hpp>
 #ifdef _MSC_VER
 #  pragma warning(push)
 #  pragma warning(disable : 4996)
@@ -41,6 +51,8 @@
 #  pragma warning(pop)
 #endif
 #include <asio/steady_timer.hpp>
+#include <asio/system_error.hpp>
+#include <asio/write.hpp>
 
 // Windows 宏污染清理
 #ifdef _WIN32

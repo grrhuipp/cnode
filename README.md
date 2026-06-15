@@ -16,7 +16,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
 - 默认按多 Worker 运行，每个 Worker 持有自己的事件循环和热路径资源。
-- 部署脚本 `scripts/cnode.sh` 不带参数时只更新线上二进制；`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
+- 部署脚本 `scripts/cnode.sh` 不带参数时只更新默认线上二进制；`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 架构总览
 
@@ -138,6 +138,26 @@ geosite.dat
 ```
 
 `-c, --config <path>` 会自动判断路径是文件还是目录；`--config-file` 用于只接受配置文件路径；`-C, --config-dir` 用于只接受配置目录路径。目录模式只读取上述固定文件名，不回退到 YAML 入口，也不读取旧 sidecar path 字段。
+
+## Release 产物
+
+GitHub Release 发布正常 Release 二进制和独立 `.debug` 符号文件。默认兼容资产 `cnode-linux-amd64` 指向 `musl+epoll`；显式资产包括：
+
+```text
+cnode-linux-amd64-musl
+cnode-linux-amd64-musl-io_uring
+cnode-linux-amd64-glibc
+cnode-linux-amd64-glibc-io_uring
+```
+
+对应符号文件使用同名 `.debug` 后缀。需要 heaptrack、perf 或 core dump 符号时，优先使用 glibc 变体和匹配的 `.debug` 文件；不需要单独 heaptrack release channel。
+
+部署脚本默认仍下载 `cnode-linux-amd64`。如需选择后端或 libc 变体：
+
+```sh
+bash scripts/cnode.sh -variant musl-io_uring
+bash scripts/cnode.sh -variant glibc -debug_file true
+```
 
 配置进入 Worker 前必须完成归一化。Worker 热路径只读取不可变 runtime snapshot；控制面更新时以原子替换快照的方式发布，新旧连接按生命周期自然释放。
 

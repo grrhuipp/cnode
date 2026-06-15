@@ -10,6 +10,14 @@ include(FetchContent)
 
 option(CNODE_HEAPTRACK_BUILD "Build a heaptrack-friendly glibc/system-allocator variant" OFF)
 option(CNODE_AWSLC_NO_ASM "Disable AWS-LC assembly for local toolchains without nasm/perl" OFF)
+option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
+option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
+option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
+set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
+
+if(CNODE_IO_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "CNODE_IO_URING is only supported on Linux")
+endif()
 
 if(CNODE_HEAPTRACK_BUILD)
     execute_process(
@@ -42,6 +50,19 @@ if(NOT CNODE_HEAPTRACK_BUILD)
     if(CMAKE_BUILD_TYPE STREQUAL "Profile")
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
     endif()
+endif()
+
+if(CNODE_RELEASE_DEBUG_SYMBOLS)
+    add_compile_options(
+        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:MSVC>>:/Zi>
+        $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-g>
+    )
+endif()
+
+if(CNODE_RELEASE_FRAME_POINTERS)
+    add_compile_options(
+        $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-fno-omit-frame-pointer>
+    )
 endif()
 
 # Profile 模式：Release 优化 + 保留符号（用于 perf/FlameGraph 性能分析）
@@ -84,6 +105,44 @@ target_include_directories(asio_standalone INTERFACE
     ${asio_SOURCE_DIR}/asio/include
 )
 target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE)
+
+if(CNODE_IO_URING)
+    FetchContent_Declare(
+        liburing
+        GIT_REPOSITORY https://github.com/axboe/liburing.git
+        GIT_TAG ${CNODE_LIBURING_TAG}
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_GetProperties(liburing)
+    if(NOT liburing_POPULATED)
+        FetchContent_Populate(liburing)
+    endif()
+
+    find_program(CNODE_MAKE_EXECUTABLE NAMES make gmake REQUIRED)
+    set(CNODE_LIBURING_LIBRARY "${liburing_SOURCE_DIR}/src/liburing.a")
+    set(CNODE_LIBURING_BUILD_STAMP "${liburing_BINARY_DIR}/cnode-liburing.stamp")
+    add_custom_command(
+        OUTPUT "${CNODE_LIBURING_LIBRARY}" "${CNODE_LIBURING_BUILD_STAMP}"
+        COMMAND /bin/sh ./configure
+            --use-libc
+            "--cc=${CMAKE_C_COMPILER}"
+            "--cxx=${CMAKE_CXX_COMPILER}"
+        COMMAND "${CNODE_MAKE_EXECUTABLE}" -C "${liburing_SOURCE_DIR}" library ENABLE_SHARED=0
+        COMMAND "${CMAKE_COMMAND}" -E touch "${CNODE_LIBURING_BUILD_STAMP}"
+        WORKING_DIRECTORY "${liburing_SOURCE_DIR}"
+        COMMENT "Building static liburing (${CNODE_LIBURING_TAG})"
+        VERBATIM
+    )
+    add_custom_target(cnode_liburing_static DEPENDS "${CNODE_LIBURING_BUILD_STAMP}")
+
+    target_include_directories(asio_standalone INTERFACE
+        "${liburing_SOURCE_DIR}/src/include"
+    )
+    target_compile_definitions(asio_standalone INTERFACE
+        ASIO_HAS_IO_URING
+        ASIO_DISABLE_EPOLL
+    )
+endif()
 
 set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
 set(BUILD_TOOL OFF CACHE BOOL "Disable AWS-LC bssl tool" FORCE)
@@ -295,6 +354,12 @@ target_link_libraries(cnode PRIVATE
     cnode_zlib
 )
 
+if(CNODE_IO_URING)
+    target_compile_definitions(cnode PRIVATE CNODE_IO_URING_ENABLED)
+    add_dependencies(cnode cnode_liburing_static)
+    target_link_libraries(cnode PRIVATE "${CNODE_LIBURING_LIBRARY}")
+endif()
+
 # 构建版本号：优先使用外部传入的 BUILD_ID，否则使用 UTC 时间戳
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(TIMESTAMP BUILD_ID "%Y%m%dT%H%M%SZ" UTC)
@@ -370,6 +435,16 @@ else()
     set(CNODE_LTO_SUMMARY "disabled")
 endif()
 
+if(WIN32)
+    set(CNODE_IO_BACKEND_SUMMARY "IOCP")
+elseif(APPLE)
+    set(CNODE_IO_BACKEND_SUMMARY "kqueue")
+elseif(CNODE_IO_URING)
+    set(CNODE_IO_BACKEND_SUMMARY "io_uring")
+else()
+    set(CNODE_IO_BACKEND_SUMMARY "epoll")
+endif()
+
 # ============================================================================
 # 打印配置摘要
 # ============================================================================
@@ -382,12 +457,13 @@ message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Network:      standalone Asio")
 message(STATUS "  Crypto:       AWS-LC")
-if(WIN32)
-    message(STATUS "  I/O Backend:  IOCP")
-else()
-    message(STATUS "  I/O Backend:  epoll")
+message(STATUS "  I/O Backend:  ${CNODE_IO_BACKEND_SUMMARY}")
+if(CNODE_IO_URING)
+    message(STATUS "  liburing:     ${CNODE_LIBURING_TAG} (FetchContent, static)")
 endif()
 message(STATUS "  Allocator:    system")
 message(STATUS "  MemoryStats:  ${CNODE_MEMORY_STATS}")
+message(STATUS "  DebugSymbols: ${CNODE_RELEASE_DEBUG_SYMBOLS}")
+message(STATUS "  FramePointer: ${CNODE_RELEASE_FRAME_POINTERS}")
 message(STATUS "  LTO:          ${CNODE_LTO_SUMMARY}")
 message(STATUS "")
