@@ -1168,6 +1168,32 @@ bool GeoManager::MatchGeoSite(std::string_view tag, std::string_view domain) con
     return impl_->geosite_loader->Match(tag, domain);
 }
 
+GeoManager::GeoIPTagHandle GeoManager::ResolveGeoIPTag(std::string_view tag) const {
+    if (!impl_->geoip_loader) {
+        return {};
+    }
+    const auto lower_tag = LowerTag(tag);
+    return GeoIPTagHandle{impl_->geoip_loader->Get(lower_tag)};
+}
+
+GeoManager::GeoSiteTagHandle GeoManager::ResolveGeoSiteTag(std::string_view tag) const {
+    if (!impl_->geosite_loader) {
+        return {};
+    }
+    const auto lower_tag = LowerTag(tag);
+    return GeoSiteTagHandle{impl_->geosite_loader->Get(lower_tag)};
+}
+
+bool GeoManager::MatchGeoIP(GeoIPTagHandle handle, const net::ip::address& ip) const {
+    const auto* data = static_cast<const GeoIPData*>(handle.data);
+    return data && data->Match(ip);
+}
+
+bool GeoManager::MatchGeoSite(GeoSiteTagHandle handle, std::string_view domain) const {
+    const auto* data = static_cast<const GeoSiteData*>(handle.data);
+    return data && data->Match(domain);
+}
+
 GeoManager::Stats GeoManager::GetStats() const {
     Stats stats{};
 

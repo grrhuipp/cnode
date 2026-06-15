@@ -99,15 +99,6 @@ void MaskIPv6Network(net::ip::address_v6::bytes_type& bytes, uint8_t prefix) {
 
 using StringVector = memory::ThreadLocalVector<std::string>;
 
-StringVector ToRuntimeStrings(std::vector<std::string> values) {
-    StringVector runtime;
-    runtime.reserve(values.size());
-    for (auto& value : values) {
-        runtime.emplace_back(std::move(value));
-    }
-    return runtime;
-}
-
 void SortUniqueStrings(StringVector& values) {
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -285,14 +276,16 @@ private:
 
 class GeoSiteCondition {
 public:
-    explicit GeoSiteCondition(std::vector<std::string> tags);
+    GeoSiteCondition(
+        std::vector<std::string> tags,
+        const ::acpp::geo::GeoManager* geo);
 
     [[nodiscard]] bool Match(
         const session::Context& ctx,
         const ::acpp::geo::GeoManager* geo) const;
 
 private:
-    StringVector tags_;
+    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoSiteTagHandle> handles_;
 };
 
 class IPCondition {
@@ -315,14 +308,16 @@ private:
 
 class GeoIPCondition {
 public:
-    explicit GeoIPCondition(std::vector<std::string> tags);
+    GeoIPCondition(
+        std::vector<std::string> tags,
+        const ::acpp::geo::GeoManager* geo);
 
     [[nodiscard]] bool Match(
         const session::Context& ctx,
         const ::acpp::geo::GeoManager* geo) const;
 
 private:
-    StringVector tags_;
+    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoIPTagHandle> handles_;
 };
 
 class SourceIPCondition {
@@ -954,11 +949,11 @@ void Router::Configure(
         }
 
         if (!rc.geosite.empty()) {
-            compound.conditions.push_back(GeoSiteCondition{rc.geosite});
+            compound.conditions.push_back(GeoSiteCondition{rc.geosite, geo_manager});
         }
 
         if (!rc.geoip.empty()) {
-            compound.conditions.push_back(GeoIPCondition{rc.geoip});
+            compound.conditions.push_back(GeoIPCondition{rc.geoip, geo_manager});
         }
 
         if (compound.HasAnyCondition()) {
@@ -984,16 +979,25 @@ bool GeoSiteCondition::Match(
     const ::acpp::geo::GeoManager* geo) const {
     const auto& target = ctx.outbound.target;
     if (!geo || !target.IsDomain()) return false;
-    for (const auto& tag : tags_) {
-        if (geo->MatchGeoSite(tag, target.host)) return true;
+    for (const auto& handle : handles_) {
+        if (geo->MatchGeoSite(handle, target.host)) return true;
     }
     return false;
 }
 
-GeoSiteCondition::GeoSiteCondition(std::vector<std::string> tags)
-    : tags_(ToRuntimeStrings(std::move(tags))) {
-    for (auto& tag : tags_) {
+GeoSiteCondition::GeoSiteCondition(
+    std::vector<std::string> tags,
+    const ::acpp::geo::GeoManager* geo) {
+    if (!geo) {
+        return;
+    }
+    handles_.reserve(tags.size());
+    for (auto& tag : tags) {
         ToLowerInPlace(tag);
+        auto handle = geo->ResolveGeoSiteTag(tag);
+        if (handle.Valid()) {
+            handles_.push_back(handle);
+        }
     }
 }
 
@@ -1002,16 +1006,25 @@ bool GeoIPCondition::Match(
     const ::acpp::geo::GeoManager* geo) const {
     const auto& target = ctx.outbound.target;
     if (!geo || !target.resolved_addr) return false;
-    for (const auto& tag : tags_) {
-        if (geo->MatchGeoIP(tag, *target.resolved_addr)) return true;
+    for (const auto& handle : handles_) {
+        if (geo->MatchGeoIP(handle, *target.resolved_addr)) return true;
     }
     return false;
 }
 
-GeoIPCondition::GeoIPCondition(std::vector<std::string> tags)
-    : tags_(ToRuntimeStrings(std::move(tags))) {
-    for (auto& tag : tags_) {
+GeoIPCondition::GeoIPCondition(
+    std::vector<std::string> tags,
+    const ::acpp::geo::GeoManager* geo) {
+    if (!geo) {
+        return;
+    }
+    handles_.reserve(tags.size());
+    for (auto& tag : tags) {
         ToLowerInPlace(tag);
+        auto handle = geo->ResolveGeoIPTag(tag);
+        if (handle.Valid()) {
+            handles_.push_back(handle);
+        }
     }
 }
 

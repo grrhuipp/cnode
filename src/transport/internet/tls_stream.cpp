@@ -97,6 +97,27 @@ struct AutoSignState {
         if (pkey) EVP_PKEY_free(pkey);
     }
 
+    bool EnsureKey() {
+        std::lock_guard lock(mu);
+        if (pkey) {
+            return true;
+        }
+
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+        EVP_PKEY* generated = nullptr;
+        if (!pctx ||
+            EVP_PKEY_keygen_init(pctx) <= 0 ||
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0 ||
+            EVP_PKEY_keygen(pctx, &generated) <= 0) {
+            if (pctx) EVP_PKEY_CTX_free(pctx);
+            if (generated) EVP_PKEY_free(generated);
+            return false;
+        }
+        EVP_PKEY_CTX_free(pctx);
+        pkey = generated;
+        return true;
+    }
+
     // 为指定域名生成或获取缓存的证书
     X509* GetOrCreate(const std::string& cn) {
         std::lock_guard lock(mu);
@@ -177,7 +198,21 @@ int AutoSignSniCallback(SSL* ssl, int* /*ad*/, void* /*arg*/) {
     std::string wildcard = sni ? ToWildcard(sni) : "localhost";
 
     auto& state = GetAutoSignState();
-    X509* cert = state.GetOrCreate(wildcard);
+    thread_local AutoSignState* last_state = nullptr;
+    thread_local std::string last_wildcard;
+    thread_local X509* last_cert = nullptr;
+
+    X509* cert = nullptr;
+    if (last_state == &state && last_cert && last_wildcard == wildcard) {
+        cert = last_cert;
+    } else {
+        cert = state.GetOrCreate(wildcard);
+        if (cert) {
+            last_state = &state;
+            last_wildcard = std::move(wildcard);
+            last_cert = cert;
+        }
+    }
     if (!cert) return SSL_TLSEXT_ERR_ALERT_FATAL;
 
     SSL_use_certificate(ssl, cert);
@@ -191,19 +226,9 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     auto& state = GetAutoSignState();
 
     // 只在首次调用时生成 EC P-256 密钥
-    if (!state.pkey) {
-        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
-        EVP_PKEY* pkey = nullptr;
-        if (!pctx ||
-            EVP_PKEY_keygen_init(pctx) <= 0 ||
-            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0 ||
-            EVP_PKEY_keygen(pctx, &pkey) <= 0) {
-            if (pctx) EVP_PKEY_CTX_free(pctx);
-            LOG_ERROR("EC P-256 密钥生成失败");
-            return nullptr;
-        }
-        EVP_PKEY_CTX_free(pctx);
-        state.pkey = pkey;
+    if (!state.EnsureKey()) {
+        LOG_ERROR("EC P-256 密钥生成失败");
+        return nullptr;
     }
 
     // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
@@ -412,31 +437,65 @@ net::awaitable<bool> TlsStream::Handshake() {
 }
 
 net::awaitable<bool> TlsStream::FlushWriteBio() {
-    // 固定缓冲循环 flush，避免大证书链/多 record pending 时临时 vector 分配。
-    alignas(64) std::array<uint8_t, kTlsIoBufferSize> buf{};
-
     try {
+        int pending = static_cast<int>(BIO_pending(write_bio_));
+        if (pending <= 0) {
+            co_return true;
+        }
+
+        if (static_cast<size_t>(pending) <= kTlsIoBufferSize) {
+            alignas(64) std::array<uint8_t, kTlsIoBufferSize> buf{};
+            while (pending > 0) {
+                const int to_read = static_cast<int>(
+                    std::min<size_t>(static_cast<size_t>(pending), buf.size()));
+                int read = BIO_read(write_bio_, buf.data(), to_read);
+                if (read > 0) {
+                    size_t written = co_await inner_.AsyncWrite(net::buffer(buf.data(), read));
+                    if (written != static_cast<size_t>(read)) {
+                        co_return false;
+                    }
+                    pending = static_cast<int>(BIO_pending(write_bio_));
+                    continue;
+                }
+                if (read < 0 && BIO_should_retry(write_bio_)) {
+                    co_return true;
+                }
+                co_return false;
+            }
+            co_return true;
+        }
+
+        buf::MultiBuffer mb;
+        mb.reserve((static_cast<size_t>(pending) + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
         while (true) {
-            const int pending = static_cast<int>(BIO_pending(write_bio_));
+            pending = static_cast<int>(BIO_pending(write_bio_));
             if (pending <= 0) {
-                co_return true;
+                break;
             }
 
-            const int to_read = static_cast<int>(
-                std::min<size_t>(static_cast<size_t>(pending), buf.size()));
-            int read = BIO_read(write_bio_, buf.data(), to_read);
+            buf::BufferGuard out{buf::Buffer::New()};
+            if (!out) {
+                co_return false;
+            }
+            const int to_read = static_cast<int>(std::min<size_t>(
+                static_cast<size_t>(pending),
+                static_cast<size_t>(out->Available())));
+            int read = BIO_read(write_bio_, out->Tail().data(), to_read);
             if (read > 0) {
-                size_t written = co_await inner_.AsyncWrite(net::buffer(buf.data(), read));
-                if (written != static_cast<size_t>(read)) {
-                    co_return false;
-                }
+                out->Produce(static_cast<uint32_t>(read));
+                mb.push_back(out.release());
                 continue;
             }
             if (read < 0 && BIO_should_retry(write_bio_)) {
-                co_return true;
+                break;
             }
             co_return false;
         }
+
+        if (!mb.empty()) {
+            co_await inner_.WriteMultiBuffer(std::move(mb));
+        }
+        co_return true;
     } catch (...) {
         co_return false;
     }
@@ -671,6 +730,68 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     }
 
     co_return total_written;
+}
+
+net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
+    if (!handshake_done_) {
+        if (!co_await Handshake()) {
+            ThrowTlsWriteError("TLS handshake failed during write");
+        }
+    }
+
+    if (mb.empty()) {
+        co_return;
+    }
+
+    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
+
+    for (const auto* buffer : mb) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+
+        auto bytes = buffer->Bytes();
+        const uint8_t* data = bytes.data();
+        size_t remaining = bytes.size();
+
+        while (remaining > 0) {
+            const auto to_write = static_cast<int>(
+                std::min<std::size_t>(remaining, kTlsIoBufferSize));
+            int ret = SSL_write(ssl_, data, to_write);
+
+            if (ret > 0) {
+                data += ret;
+                remaining -= static_cast<size_t>(ret);
+                if (static_cast<size_t>(BIO_pending(write_bio_)) >= kTlsIoBufferSize * 8) {
+                    if (!co_await FlushWriteBio()) {
+                        ThrowTlsWriteError("TLS flush write BIO failed");
+                    }
+                }
+                continue;
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+            if (err == SSL_ERROR_WANT_WRITE) {
+                if (!co_await FlushWriteBio()) {
+                    ThrowTlsWriteError("TLS flush write BIO failed");
+                }
+            } else if (err == SSL_ERROR_WANT_READ) {
+                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
+                if (n > 0) {
+                    BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
+                } else {
+                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
+                }
+            } else {
+                ThrowTlsWriteError("TLS write failed");
+            }
+        }
+    }
+
+    if (!co_await FlushWriteBio()) {
+        ThrowTlsWriteError("TLS flush write BIO failed");
+    }
+    co_return;
 }
 
 void TlsStream::ShutdownRead() {

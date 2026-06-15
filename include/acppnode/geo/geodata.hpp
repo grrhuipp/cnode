@@ -16,6 +16,18 @@ namespace acpp::geo {
 // ============================================================================
 class GeoManager {
 public:
+    struct GeoIPTagHandle {
+        const void* data = nullptr;
+
+        [[nodiscard]] bool Valid() const noexcept { return data != nullptr; }
+    };
+
+    struct GeoSiteTagHandle {
+        const void* data = nullptr;
+
+        [[nodiscard]] bool Valid() const noexcept { return data != nullptr; }
+    };
+
     GeoManager();
     ~GeoManager();
 
@@ -35,6 +47,13 @@ public:
 
     bool MatchGeoIP(std::string_view tag, const net::ip::address& ip) const;
     bool MatchGeoSite(std::string_view tag, std::string_view domain) const;
+
+    // Cold path: resolve route geo tags to immutable loaded datasets. Hot path
+    // can then skip tag normalization and hash lookups.
+    [[nodiscard]] GeoIPTagHandle ResolveGeoIPTag(std::string_view tag) const;
+    [[nodiscard]] GeoSiteTagHandle ResolveGeoSiteTag(std::string_view tag) const;
+    bool MatchGeoIP(GeoIPTagHandle handle, const net::ip::address& ip) const;
+    bool MatchGeoSite(GeoSiteTagHandle handle, std::string_view domain) const;
 
     struct Stats {
         size_t geoip_tags_loaded;
