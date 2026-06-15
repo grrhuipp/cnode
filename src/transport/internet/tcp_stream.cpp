@@ -118,7 +118,6 @@ struct TcpStream::Impl {
     tcp::socket socket;
     TimeoutScheduler* timeout_scheduler = nullptr;
     buf::MultiBuffer pending_data;
-    std::chrono::steady_clock::time_point last_io_time;
     TimeoutToken idle_timer_token;
     TimeoutToken read_deadline_token;
     TimeoutToken write_deadline_token;
@@ -132,6 +131,7 @@ struct TcpStream::Impl {
     uint32_t read_timeout_sec = 0;
     uint32_t write_timeout_sec = 0;
     uint32_t phase_deadline_generation = 0;
+    uint64_t idle_activity_epoch = 0;
     bool write_deadline_active = false;
 };
 
@@ -169,7 +169,6 @@ TcpStream::TcpStream(tcp::socket socket)
 TcpStream::TcpStream(TcpStream&& other) noexcept
     : impl_(std::make_unique<Impl>(std::move(other.impl_->socket))) {
     impl_->pending_data = std::move(other.impl_->pending_data);
-    impl_->last_io_time = other.impl_->last_io_time;
     impl_->idle_timer_token = other.impl_->idle_timer_token;
     impl_->read_deadline_token = other.impl_->read_deadline_token;
     impl_->write_deadline_token = other.impl_->write_deadline_token;
@@ -183,6 +182,7 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     impl_->read_timeout_sec = other.impl_->read_timeout_sec;
     impl_->write_timeout_sec = other.impl_->write_timeout_sec;
     impl_->phase_deadline_generation = other.impl_->phase_deadline_generation;
+    impl_->idle_activity_epoch = other.impl_->idle_activity_epoch;
     other.CancelIdleTimer();
     other.CancelReadDeadline();
     other.CancelWriteDeadline();
@@ -211,7 +211,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         ReleasePendingData();
         impl_->timeout_scheduler = &TimeoutScheduler::ForIoContext(SocketIoContext(impl_->socket));
         impl_->pending_data = std::move(other.impl_->pending_data);
-        impl_->last_io_time = other.impl_->last_io_time;
         impl_->idle_timer_token = other.impl_->idle_timer_token;
         impl_->read_deadline_token = other.impl_->read_deadline_token;
         impl_->write_deadline_token = other.impl_->write_deadline_token;
@@ -226,6 +225,7 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         impl_->phase_deadline_generation = other.impl_->phase_deadline_generation;
         impl_->write_deadline_at = other.impl_->write_deadline_at;
         impl_->write_deadline_active = other.impl_->write_deadline_active;
+        impl_->idle_activity_epoch = other.impl_->idle_activity_epoch;
         other.impl_->write_deadline_active = false;
         other.CancelIdleTimer();
         other.CancelReadDeadline();
@@ -872,7 +872,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
 void TcpStream::SetIdleTimeout(std::chrono::seconds timeout) {
     impl_->idle_timeout_sec = SecondsToU32(timeout);
     if (impl_->idle_timeout_sec > 0) {
-        impl_->last_io_time = steady_clock::now();
+        ++impl_->idle_activity_epoch;
         impl_->SetFlag(kIdleTimedOut, false);
         ScheduleIdleCheck();
     } else {
@@ -981,54 +981,46 @@ void TcpStream::ReleasePendingData() noexcept {
     impl_->pending_data.clear();
 }
 
-// 每次成功 I/O 后调用——仅写一个时间戳，零 epoll 操作
+// 每次成功 I/O 后调用。idle timeout 只需要判断“期间是否发生过 I/O”，
+// 用递增序号避免热路径每包读取 steady_clock。
 void TcpStream::TouchActivity() {
     if (impl_->idle_timeout_sec == 0) return;
-    impl_->last_io_time = steady_clock::now();
+    ++impl_->idle_activity_epoch;
     impl_->SetFlag(kIdleTimedOut, false);
 }
 
-// 启动/续调惰性 idle 检查。定时器到期后检查 impl_->last_io_time，
-// 若真超时则 cancel socket，否则按剩余时间重新调度。
+// 启动/续调惰性 idle 检查。定时器到期后比较活动序号；
+// 若期间没有 I/O 则 cancel socket，否则重新调度一个完整 idle 周期。
 // 安全性：通过 token 从共享调度器撤销事件；析构路径先 cancel token 再释放对象。
 void TcpStream::ScheduleIdleCheck() {
     if (impl_->idle_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
 
     CancelIdleTimer();
 
-    // 计算距离预期超时的剩余时间
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        steady_clock::now() - impl_->last_io_time);
     const auto timeout = SecondsFromU32(impl_->idle_timeout_sec);
-    const auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-    auto remaining = timeout_ms - elapsed;
-    if (remaining <= std::chrono::milliseconds::zero()) {
-        remaining = std::chrono::milliseconds(1);
-    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+    const auto observed_epoch = impl_->idle_activity_epoch;
 
     // 捕获 this——timer 是成员，析构前自动 cancel，安全
     TcpStream* self = this;
-    impl_->idle_timer_token = impl_->timeout_scheduler->ScheduleAfter(remaining, [self]() {
+    impl_->idle_timer_token = impl_->timeout_scheduler->ScheduleAfter(remaining, [self, observed_epoch]() {
         if (!self->impl_->socket.is_open()) return;
-        auto elapsed = steady_clock::now() - self->impl_->last_io_time;
-        const auto idle_timeout = SecondsFromU32(self->impl_->idle_timeout_sec);
-        if (elapsed >= idle_timeout) {
+        if (self->impl_->idle_activity_epoch == observed_epoch) {
             self->impl_->SetFlag(kIdleTimedOut);
             // 记录触发 idle timeout 的连接端点，辅助排查断连
             if (Log::ShouldLog(LogLevel::DEBUG)) {
                 IoErrorCode ep_ec;
                 auto remote = self->impl_->socket.remote_endpoint(ep_ec);
-                auto idle_sec = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
                 const std::string_view label = self->StreamLabel();
                 if (!ep_ec) {
-                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] remote={}:{} idle={}s limit={}s",
+                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] remote={}:{} limit={}s",
                                     label.empty() ? "?" : label,
                                     remote.address().to_string(), remote.port(),
-                                    idle_sec, self->impl_->idle_timeout_sec);
+                                    self->impl_->idle_timeout_sec);
                 } else {
-                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] idle={}s limit={}s",
+                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] limit={}s",
                                     label.empty() ? "?" : label,
-                                    idle_sec, self->impl_->idle_timeout_sec);
+                                    self->impl_->idle_timeout_sec);
                 }
             }
             IoErrorCode cancel_ec;

@@ -96,7 +96,7 @@ private:
         bool peek = false);
     void SetPendingData(std::span<const uint8_t> data);
 
-    void TouchActivity();          // 记录 I/O 活动时间（极轻量，替代原 ResetIdleTimer）
+    void TouchActivity();          // 记录 I/O 活动序号（极轻量，替代原 ResetIdleTimer）
     void ScheduleIdleCheck();      // 启动/续调 idle 检查定时器
     void CancelIdleTimer() noexcept;
     void ArmReadDeadline();
