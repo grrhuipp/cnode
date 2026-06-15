@@ -61,14 +61,16 @@ std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
 
 void ResumeWaiter(acpp::net::io_context& io_context,
                   std::unique_ptr<PendingWait>& waiter) noexcept {
-    if (auto pending = std::exchange(waiter, {}); pending) {
-        try {
-            acpp::net::post(io_context, [pending = std::move(pending)]() mutable {
-                pending->Complete();
-            });
-        } catch (...) {
+    auto pending = std::shared_ptr<PendingWait>(std::exchange(waiter, {}).release());
+    if (!pending) {
+        return;
+    }
+    try {
+        acpp::net::post(io_context, [pending]() {
             pending->Complete();
-        }
+        });
+    } catch (...) {
+        pending->Complete();
     }
 }
 
@@ -703,6 +705,8 @@ Handler::Handler(std::string tag,
         OutboundStreamDefaults{
             .require_tls = true,
             .fallback_server_name = settings_.address,
+            .allow_insecure = false,
+            .alpn = {},
         });
 }
 
@@ -1123,6 +1127,8 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     acpp::OutboundStreamDefaults{
                         .require_tls = true,
                         .fallback_server_name = settings.address,
+                        .allow_insecure = false,
+                        .alpn = {},
                     });
                 return std::make_unique<acpp::anytls::outbound::Handler>(
                     tag,

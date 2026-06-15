@@ -112,6 +112,7 @@ void SetupTestMode(
     StaticUserConfig test_user_config;
     test_user_config.clients.push_back(StaticUser{
         .id = std::string(constants::test::kTestVmessUuid),
+        .password = {},
         .email = "test@example.com",
     });
     auto test_users =

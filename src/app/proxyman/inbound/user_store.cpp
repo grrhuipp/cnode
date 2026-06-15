@@ -168,14 +168,6 @@ size_t TagSize(const TagMap& map, std::string_view tag) {
     return it == map.end() || !it->second ? 0 : it->second->size();
 }
 
-bool SameShadowsocksIdentity(const PreparedShadowsocksUser& a,
-                             const UserStore::ShadowsocksCredential& b) noexcept {
-    if (a.profile.user_id != 0 && b.profile && b.profile->user_id != 0) {
-        return a.profile.user_id == b.profile->user_id;
-    }
-    return a.password == b.password;
-}
-
 bool SameShadowsocksIdentity(const UserStore::ShadowsocksCredential& a,
                              const PreparedShadowsocksUser& b) noexcept {
     if (a.profile && a.profile->user_id != 0 && b.profile.user_id != 0) {

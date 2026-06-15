@@ -232,7 +232,12 @@ proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
     stream_settings_ = config_.stream_settings;
     NormalizeOutboundStreamSettings(
         stream_settings_,
-        OutboundStreamDefaults{.fallback_server_name = config_.address});
+        OutboundStreamDefaults{
+            .require_tls = false,
+            .fallback_server_name = config_.address,
+            .allow_insecure = false,
+            .alpn = {},
+        });
 }
 
 }  // namespace acpp
@@ -277,7 +282,12 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         ss_config.send_through = cfg.send_through;
         acpp::NormalizeOutboundStreamSettings(
             ss_config.stream_settings,
-            acpp::OutboundStreamDefaults{.fallback_server_name = ss_config.address});
+            acpp::OutboundStreamDefaults{
+                .require_tls = false,
+                .fallback_server_name = ss_config.address,
+                .allow_insecure = false,
+                .alpn = {},
+            });
 
         if (ss_config.address.empty() || ss_config.password.empty()) {
             return std::nullopt;

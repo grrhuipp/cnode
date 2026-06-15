@@ -116,7 +116,12 @@ proxy::vmess::outbound::Handler::Handler(const VMessOutboundConfig& config,
 
     NormalizeOutboundStreamSettings(
         config_.stream_settings,
-        OutboundStreamDefaults{.fallback_server_name = config_.address});
+        OutboundStreamDefaults{
+            .require_tls = false,
+            .fallback_server_name = config_.address,
+            .allow_insecure = false,
+            .alpn = {},
+        });
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
               config_.tag, config_.address, config_.port,
               config_.stream_settings.network,
@@ -303,7 +308,12 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         vmess_config.send_through = cfg.send_through;
         acpp::NormalizeOutboundStreamSettings(
             vmess_config.stream_settings,
-            acpp::OutboundStreamDefaults{.fallback_server_name = vmess_config.address});
+            acpp::OutboundStreamDefaults{
+                .require_tls = false,
+                .fallback_server_name = vmess_config.address,
+                .allow_insecure = false,
+                .alpn = {},
+            });
 
         if (vmess_config.address.empty() || vmess_config.uuid.empty()) {
             return std::nullopt;  // 配置不完整

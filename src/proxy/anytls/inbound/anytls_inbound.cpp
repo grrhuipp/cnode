@@ -94,14 +94,16 @@ std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
 
 void ResumeWaiter(net::io_context& io_context,
                   std::unique_ptr<PendingWait>& waiter) noexcept {
-    if (auto pending = std::exchange(waiter, {}); pending) {
-        try {
-            net::post(io_context, [pending = std::move(pending)]() mutable {
-                pending->Complete();
-            });
-        } catch (...) {
+    auto pending = std::shared_ptr<PendingWait>(std::exchange(waiter, {}).release());
+    if (!pending) {
+        return;
+    }
+    try {
+        net::post(io_context, [pending]() {
             pending->Complete();
-        }
+        });
+    } catch (...) {
+        pending->Complete();
     }
 }
 

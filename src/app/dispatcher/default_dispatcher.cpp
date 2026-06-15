@@ -430,7 +430,9 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     }
 
     if (!router_) {
-        return RouteSelection{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
+        RouteSelection selection;
+        selection.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND;
+        return selection;
     }
 
     app::router::RouteDecision decision;

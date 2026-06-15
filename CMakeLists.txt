@@ -148,6 +148,9 @@ add_library(cnode_zlib STATIC
     ${zlib_SOURCE_DIR}/zutil.c
 )
 target_include_directories(cnode_zlib PUBLIC ${zlib_SOURCE_DIR})
+if(UNIX)
+    target_compile_definitions(cnode_zlib PRIVATE Z_HAVE_UNISTD_H)
+endif()
 
 find_package(Threads REQUIRED)
 message(STATUS "Allocator: system")
