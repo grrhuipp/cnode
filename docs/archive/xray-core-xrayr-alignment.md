@@ -795,7 +795,7 @@ Worker 不负责：
 
 - stats / traffic 统一。
 - deployment config layout 对齐新配置。
-- README、示例配置、脚本和 Docker 行为同步。
+- README、示例配置和部署脚本行为同步。
 - 添加 no_legacy / no_wrapper / no_cross_layer 结构测试。
 - 当前已登记结构门：
   - `no_deployment_legacy_config_layout`
@@ -804,11 +804,11 @@ Worker 不负责：
   - `no_final_wrapper_cross_layer_regression`
 - 本阶段当前进展：
   - 部署脚本 JSON 分支按最终 panel schema 字段 `Name` 去重并覆盖同名 panel，不再使用旧/小写 `.name` 字段判断。
-  - `docs/configuration.md` 只描述最终 `ProxyProtocol` 字符串三态 schema，不再宣传旧 boolean 兼容写法；部署文档、示例配置、脚本和 Docker 由结构门防止重新出现旧 XrayR sidecar path 字段或 `newV2board` 命名。
+  - `docs/configuration.md` 只描述最终 `ProxyProtocol` 字符串三态 schema，不再宣传旧 boolean 兼容写法；部署文档、示例配置和脚本由结构门防止重新出现旧 XrayR sidecar path 字段或 `newV2board` 命名。
   - `config_loader` 已删除 `dnsConfigPath` / `inboundConfigPath` / `outboundConfigPath` / `routeConfigPath` 旧 sidecar path 兼容读取，默认补充配置只按最终布局扫描 `inbounds.json`、`outbounds.json` 和 `routing.json`。
   - stats / traffic 边界已固化为 app 层 `traffic_types.hpp` DTO、`SessionTrackingState` PImpl 和 `worker_stats.hpp` 运行态 stats DTO；Panel API/client 不依赖 app stats/traffic 热路径类型，Controller control plane 负责从 Worker snapshot 汇总并转换成 `api::UserTraffic` 上报。
   - 最终 no_legacy / no_wrapper / no_cross_layer 汇总结构门已登记，覆盖旧 panel/config 公开残留、公开 V2Board concrete client、relay wrapper / 协议命名泄漏、Dispatcher/Router/Worker 跨层耦合回归。
-  - 当前仓库根目录不存在 README 文件；已存在的配置文档、示例配置、部署脚本和 Dockerfile 已由阶段 6 部署结构门覆盖。
+  - 配置文档、示例配置和部署脚本已由阶段 6 部署结构门覆盖。
 - 阶段 6 当前门禁已通过；收尾验收结论：
   - 完整 configure / build / ctest 已通过，当前 `ctest` 共 141 项全部通过。
   - `CMakeLists.txt` 当前登记 141 个真实存在的 `tests/*.cmake` 脚本，缺失测试检查为 0。
@@ -847,7 +847,7 @@ Worker 不负责：
   - AnyTLS / Mux 等协议子流不再丢失 accepted TCP local endpoint；Worker 在 accept 时写入 session context，dispatcher 与 Mux 子会话继续把该 endpoint 传给 outbound，使未命中 routing fallback 的 panel freedom outbound 能真正做到哪个 IP 进哪个 IP 出。新增 `no_source_bound_context_loss` 结构门防止回退。
   - 默认配置入口已改为 JSON 布局：CLI、部署配置文档和阶段 4 对齐约束均明确 `config.json` 是默认主配置文件；`config_loader` 已删除 `.yml` / `.yaml` 主配置解析兼容，并新增 `default_config_json_layout` 防止回退到 XrayR 式 YAML 默认入口或 YAML 解析入口。
   - Trojan inbound 修复后已重新执行本地 Windows 增量构建、远端 Linux x86_64 Release 构建、远端 inbound / outbound 真实请求矩阵和全量 `ctest`：`ctest` 共 141 项全部通过，远端 inbound 真实请求 12/12 通过，远端 outbound 真实请求 12/12 通过。
-  - 远端 Linux x86_64 Release 构建已在 `node-02.11.9527app.site` 完成，当前部署二进制为 `/opt/cnode-e2e/bin/cnode`，构建产物为 `/opt/cnode-e2e/build/cnode`；使用远端 Debian 13 / GCC 14.2 / CMake / Ninja / `/root/vcpkg` 构建。构建过程中发现并删除了 `ParseDnsConfigValue`、`FirstBytes`、`DomainMatcher::AddRegex`、`DomainMatcher::Clear`、`DomainTrie::Clear`、`IPMatcher::Clear` 等未使用内部 helper，并修正 `Worker::RuntimeState` 初始化顺序，Linux 增量构建不再产生这些 warning。
+  - 远端 Linux x86_64 Release 构建已在 `node-02.11.9527app.site` 完成，当前部署二进制为 `/opt/cnode-e2e/bin/cnode`，构建产物为 `/opt/cnode-e2e/build/cnode`；使用远端 Debian 13 / GCC 14.2 / CMake / Ninja 构建。构建过程中发现并删除了 `ParseDnsConfigValue`、`FirstBytes`、`DomainMatcher::AddRegex`、`DomainMatcher::Clear`、`DomainTrie::Clear`、`IPMatcher::Clear` 等未使用内部 helper，并修正 `Worker::RuntimeState` 初始化顺序，Linux 增量构建不再产生这些 warning。
   - 新增 `tests/e2e/remote_cnode_inbound_traffic.ps1`，用于把 cnode 部署到远端后，由本机 xray-core AnyTLS PR 版、mihomo `v1.19.27`、sing-box `1.13.13` 作为客户端发起真实请求。远端 cnode 仍按目录加载 `config.json` 主配置和 `inbounds.json` / `outbounds.json` / `routing.json` sidecar 内容。
   - 新增 `tests/e2e/remote_cnode_outbound_traffic.ps1`，用于验证远端 cnode 的 outbound 方向：VPS 上运行 cnode VMess ingress + 被测 outbound，本机运行 xray-core AnyTLS PR 版、mihomo `v1.19.27`、sing-box `1.13.13` 协议服务端和 HTTP 目标服务，并通过 SSH reverse forward 让 VPS outbound 连接这些外部实现。
   - 远端公网 IPv4 高端口 `46201-46204` 在服务器本机 `INPUT ACCEPT`、cnode 已监听 `0.0.0.0` 的情况下从本机不可达，判断为云侧入站策略限制；脚本会自动回退到 SSH local forward，仍由本机三套客户端发起完整协议握手和 HTTP 请求。

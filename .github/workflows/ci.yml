@@ -5,134 +5,152 @@ on:
     branches: [master, main]
     paths:
       - '.github/workflows/ci.yml'
+      - '.gitignore'
       - 'CMakeLists.txt'
+      - 'README.md'
       - 'scripts/**/*.sh'
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
       - 'tests/**/*.cmake'
-      - 'vcpkg.json'
   pull_request:
     paths:
       - '.github/workflows/ci.yml'
+      - '.gitignore'
       - 'CMakeLists.txt'
+      - 'README.md'
       - 'scripts/**/*.sh'
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
       - 'tests/**/*.cmake'
-      - 'vcpkg.json'
 
 env:
-  VCPKG_ROOT: /root/vcpkg
   BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
   RELEASE_TAG: cnode-latest
 
 jobs:
-  build:
-    name: Release (musl static)
+  build-musl:
+    name: Release (musl static mimalloc)
     runs-on: ubuntu-24.04
     container:
       image: alpine:3.20
-
-    env:
-      VCPKG_BINARY_SOURCES: "clear;files,/root/vcpkg-cache,readwrite"
-      VCPKG_FORCE_SYSTEM_BINARIES: 1
 
     steps:
       - name: Install Alpine build tools
         run: |
           apk add --no-cache \
-            build-base binutils cmake samurai git curl \
+            build-base binutils cmake ninja git curl \
             zip unzip tar pkgconf linux-headers musl-dev \
-            perl bash python3 \
-            autoconf automake libtool \
-            go nasm \
-            nodejs
-          # samurai 是 ninja 的轻量替代，vcpkg/cmake 需要 ninja 命令
-          ln -sf /usr/bin/samu /usr/bin/ninja
+            perl nasm
 
       - uses: actions/checkout@v4
 
-      - name: Cache vcpkg tool
-        id: cache-vcpkg
+      - name: Cache CMake dependency builds
         uses: actions/cache@v4
         with:
-          path: ${{ env.VCPKG_ROOT }}
-          key: vcpkg-tool-alpine-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-tool-alpine-
-
-      - name: Setup vcpkg
-        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
-        run: |
-          rm -rf "$VCPKG_ROOT"
-          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
-          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
-
-      - name: Cache vcpkg binary packages
-        uses: actions/cache@v4
-        with:
-          path: /root/vcpkg-cache
-          key: vcpkg-binary-alpine-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-binary-alpine-
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: build/vcpkg_installed
-          key: vcpkg-installed-alpine-release-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            vcpkg-installed-alpine-release-
-            vcpkg-installed-alpine-
+          path: build-musl/_deps
+          key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-deps-musl-${{ runner.os }}-
 
       - name: Configure
         run: |
-          cmake -B build -G Ninja \
+          cmake -B build-musl -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DBUILD_SHARED_LIBS=OFF \
+            -DUSE_MIMALLOC=ON \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ env.BUILD_ID }}
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: cmake --build build-musl --parallel $(nproc)
 
-      - name: Verify & package binary
+      - name: Verify & package musl binary
         run: |
-          file build/cnode
-          ldd build/cnode 2>&1 && echo "WARNING: not fully static" || echo "OK: fully static binary"
+          file build-musl/cnode
+          ldd build-musl/cnode 2>&1 && exit 1 || true
           mkdir -p release-assets
-          objcopy --only-keep-debug build/cnode build/cnode-linux-amd64.debug
-          strip build/cnode
-          objcopy --add-gnu-debuglink=build/cnode-linux-amd64.debug build/cnode
-          cp build/cnode release-assets/cnode-linux-amd64
-          cp build/cnode-linux-amd64.debug release-assets/cnode-linux-amd64.debug
+          objcopy --only-keep-debug build-musl/cnode build-musl/cnode-linux-amd64-musl.debug
+          strip build-musl/cnode
+          objcopy --add-gnu-debuglink=build-musl/cnode-linux-amd64-musl.debug build-musl/cnode
+          cp build-musl/cnode release-assets/cnode-linux-amd64-musl
+          cp build-musl/cnode-linux-amd64-musl.debug release-assets/cnode-linux-amd64-musl.debug
+          cp build-musl/cnode release-assets/cnode-linux-amd64
+          cp build-musl/cnode-linux-amd64-musl.debug release-assets/cnode-linux-amd64.debug
           ls -lh release-assets
 
-      - name: Upload artifact
+      - name: Upload musl artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cnode-release-assets
+          name: cnode-musl-assets
           path: release-assets/*
+          if-no-files-found: error
+
+  build-glibc:
+    name: Release (glibc heaptrack system allocator)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential binutils cmake ninja-build git curl \
+            zip unzip tar pkg-config perl nasm file
+
+      - uses: actions/checkout@v4
+
+      - name: Cache CMake dependency builds
+        uses: actions/cache@v4
+        with:
+          path: build-heaptrack/_deps
+          key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-deps-glibc-${{ runner.os }}-
+
+      - name: Build glibc heaptrack variant
+        run: BUILD_ID=${{ env.BUILD_ID }} scripts/build-heaptrack.sh
+
+      - name: Package glibc binary
+        run: |
+          file build-heaptrack/cnode
+          ldd build-heaptrack/cnode
+          mkdir -p glibc-assets
+          objcopy --only-keep-debug build-heaptrack/cnode build-heaptrack/cnode-linux-amd64-glibc.debug
+          strip build-heaptrack/cnode
+          objcopy --add-gnu-debuglink=build-heaptrack/cnode-linux-amd64-glibc.debug build-heaptrack/cnode
+          cp build-heaptrack/cnode glibc-assets/cnode-linux-amd64-glibc
+          cp build-heaptrack/cnode-linux-amd64-glibc.debug glibc-assets/cnode-linux-amd64-glibc.debug
+          ls -lh glibc-assets
+
+      - name: Upload glibc artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnode-glibc-assets
+          path: glibc-assets/*
           if-no-files-found: error
 
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: build
+    needs: [build-musl, build-glibc]
     if: github.event_name == 'push'
 
     permissions:
       contents: write
 
     steps:
-      - name: Download build artifacts
+      - name: Download musl artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
-          name: cnode-release-assets
+          name: cnode-musl-assets
+
+      - name: Download glibc artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          name: cnode-glibc-assets
 
       - name: Publish release assets
         run: |
@@ -141,6 +159,7 @@ jobs:
           branch: ${{ github.ref_name }}
           build_id: ${{ env.BUILD_ID }}
           commit: ${{ github.sha }}
+          variants: musl+mimalloc, glibc+system-allocator
           EOF
 
           tag_ref="tags/${{ env.RELEASE_TAG }}"

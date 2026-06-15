@@ -1,10 +1,8 @@
 # Build output
 build/
+build-*/
 out/
 cmake-build-*/
-
-# vcpkg installed packages (大，由 vcpkg 自动还原)
-vcpkg_installed/
 
 # IDE
 .vscode/

@@ -14,7 +14,7 @@
 - **嗅探** — TLS SNI + HTTP Host 自动嗅探
 - **密码学** — AWS-LC（BoringSSL 分支），AEAD、SHAKE128 XOF
 - **内存分配** — mimalloc 高性能分配器
-- **部署** — 一键脚本 / Docker / systemd，自动版本检测增量更新
+- **部署** — 一键脚本 / systemd，自动版本检测增量更新
 
 ## 架构
 
@@ -93,15 +93,6 @@ systemctl status cnode      # 查看状态
 systemctl restart cnode     # 重启
 systemctl stop cnode        # 停止
 journalctl -u cnode -f      # 实时日志
-```
-
-## Docker
-
-```bash
-docker run -d --name cnode \
-  -v /path/to/config:/etc/cnode \
-  --network host \
-  ghcr.io/grrhuipp/cnode:latest
 ```
 
 ## 配置格式
@@ -209,20 +200,29 @@ docker run -d --name cnode \
 ## 构建
 
 ```bash
-# 依赖: CMake 3.20+, vcpkg, C++23 编译器 (GCC 14+ / MSVC 19.40+)
-cmake -B build -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+# 依赖: CMake 3.20+, Ninja, nasm, perl, C++23 编译器 (GCC 14+ / MSVC 19.40+)
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+依赖由 CMake FetchContent 拉取。若本地没有 `nasm`/`perl`，可临时加
+`-DCNODE_AWSLC_NO_ASM=ON` 关闭 AWS-LC 汇编路径；CI 默认保留汇编构建。
+
+### Release 变体
+
+| 资产 | 用途 |
+|------|------|
+| `cnode-linux-amd64-musl` | 线上默认版本，musl 静态二进制，启用 mimalloc |
+| `cnode-linux-amd64` | 兼容部署脚本的默认资产，内容同 musl 版本 |
+| `cnode-linux-amd64-glibc` | heaptrack/RSS 分析版本，glibc + system allocator，第三方依赖静态链接 |
+
+VPS 上只拉取 CI/release 产物运行分析，不在 VPS 上编译。
 
 ### 依赖
 
 | 库 | 用途 |
 |-----|------|
-| Boost.Asio | 异步 I/O |
-| Boost.Cobalt | C++20 协程 |
-| Boost.Beast | WebSocket |
-| Boost.JSON | 配置解析 |
+| standalone Asio | 异步 I/O |
 | AWS-LC | 密码学（AES-GCM, ChaCha20-Poly1305, SHAKE128, EC P-256） |
 | mimalloc | 高性能内存分配 |
 | zlib | CRC32 |

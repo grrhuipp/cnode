@@ -100,14 +100,14 @@ bool DeriveSubkey(const uint8_t* key, size_t key_size,
     size_t out_len = key_size;
     const bool ok =
         EVP_PKEY_derive_init(ctx) == 1 &&
-        EVP_PKEY_CTX_set_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND) == 1 &&
+        EVP_PKEY_CTX_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND) == 1 &&
         EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha1()) == 1 &&
-        EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, static_cast<int>(salt_size)) == 1 &&
-        EVP_PKEY_CTX_set1_hkdf_key(ctx, key, static_cast<int>(key_size)) == 1 &&
+        EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, salt_size) == 1 &&
+        EVP_PKEY_CTX_set1_hkdf_key(ctx, key, key_size) == 1 &&
         EVP_PKEY_CTX_add1_hkdf_info(
             ctx,
             reinterpret_cast<const uint8_t*>(info),
-            static_cast<int>(info_size)) == 1 &&
+            info_size) == 1 &&
         EVP_PKEY_derive(ctx, out_subkey, &out_len) == 1 &&
         out_len == key_size;
 

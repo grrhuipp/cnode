@@ -1,7 +1,0 @@
-build/
-.git/
-.github/
-.claude/
-config/
-vcpkg/
-*.md

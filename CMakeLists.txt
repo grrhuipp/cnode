@@ -3,28 +3,28 @@ cmake_minimum_required(VERSION 3.20)
 # 抑制第三方依赖的 cmake_minimum_required 过旧警告
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 
-# ============================================================================
-# vcpkg 自动集成（须在 project() 之前）
-# ============================================================================
-if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-endif()
-
-# vcpkg triplet - 完全静态链接
-if(NOT DEFINED VCPKG_TARGET_TRIPLET)
-    if(DEFINED ENV{VCPKG_DEFAULT_TRIPLET})
-        set(VCPKG_TARGET_TRIPLET "$ENV{VCPKG_DEFAULT_TRIPLET}" CACHE STRING "")
-    elseif(WIN32)
-        set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
-    endif()
-endif()
-if(DEFINED ENV{VCPKG_DEFAULT_HOST_TRIPLET} AND NOT DEFINED VCPKG_HOST_TRIPLET)
-    set(VCPKG_HOST_TRIPLET "$ENV{VCPKG_DEFAULT_HOST_TRIPLET}" CACHE STRING "")
-endif()
-
 project(cnode VERSION 1.0.0 LANGUAGES CXX)
 
 enable_testing()
+
+include(FetchContent)
+
+option(CNODE_HEAPTRACK_BUILD "Build a heaptrack-friendly glibc/system-allocator variant" OFF)
+option(CNODE_AWSLC_NO_ASM "Disable AWS-LC assembly for local toolchains without nasm/perl" OFF)
+
+if(CNODE_HEAPTRACK_BUILD)
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -dumpmachine
+        OUTPUT_VARIABLE CNODE_COMPILER_MACHINE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(CNODE_COMPILER_MACHINE MATCHES "musl" OR
+       CMAKE_CXX_COMPILER MATCHES "musl")
+        message(FATAL_ERROR "CNODE_HEAPTRACK_BUILD requires a glibc toolchain, not musl")
+    endif()
+    message(STATUS "heaptrack variant: glibc/system allocator build")
+endif()
 
 # ============================================================================
 # C++ 标准与编译选项
@@ -45,7 +45,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 效果：跨翻译单元 devirtualize final 类虚调用、内联、死代码消除
 # Sanitizer 模式自动跳过（LTO 与 ASan/TSan 诊断信息冲突）
 # ============================================================================
-if(NOT SANITIZER)
+if(NOT SANITIZER AND NOT CNODE_HEAPTRACK_BUILD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
     # Profile 模式也启用 LTO
     if(CMAKE_BUILD_TYPE STREQUAL "Profile")
@@ -64,6 +64,14 @@ if(CMAKE_BUILD_TYPE STREQUAL "Profile")
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-omit-frame-pointer>
     )
     add_compile_definitions(NDEBUG)
+endif()
+
+if(CNODE_HEAPTRACK_BUILD)
+    add_compile_options(
+        $<$<CXX_COMPILER_ID:MSVC>:/Zi>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-g>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-omit-frame-pointer>
+    )
 endif()
 
 # ============================================================================
@@ -141,39 +149,78 @@ if(SANITIZER)
     endif()
 endif()
 
-# ============================================================================
-# 依赖查找
-# ============================================================================
-
-# standalone Asio（via vcpkg）
-find_package(asio CONFIG REQUIRED)
-
-# Threads
-find_package(Threads REQUIRED)
-
-# OpenSSL（via vcpkg）
-find_package(OpenSSL REQUIRED)
-message(STATUS "Using OpenSSL via vcpkg")
-
-# zlib (用于 CRC32)（via vcpkg）
-find_package(ZLIB REQUIRED)
-
-# ============================================================================
-# mimalloc 高性能内存分配器（via vcpkg）
-# 注意：mimalloc 与 ASan/MSan/TSan 不兼容，启用 Sanitizer 时自动禁用
-# ============================================================================
 option(USE_MIMALLOC "Use mimalloc as default memory allocator" ON)
 option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
+
+if(CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC)
+    message(STATUS "heaptrack variant: disabling mimalloc")
+    set(USE_MIMALLOC OFF)
+endif()
 
 if(USE_MIMALLOC AND SANITIZER)
     message(WARNING "mimalloc is incompatible with sanitizers, disabling mimalloc")
     set(USE_MIMALLOC OFF)
 endif()
 
+# ============================================================================
+# 依赖（FetchContent）
+# ============================================================================
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Do not update already-populated FetchContent deps")
+
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG asio-1-32-0
+)
+FetchContent_MakeAvailable(asio)
+
+add_library(asio_standalone INTERFACE)
+add_library(asio::asio ALIAS asio_standalone)
+target_include_directories(asio_standalone INTERFACE
+    ${asio_SOURCE_DIR}/asio/include
+)
+target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE)
+
+set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
+set(BUILD_TOOL OFF CACHE BOOL "Disable AWS-LC bssl tool" FORCE)
+set(DISABLE_GO ON CACHE BOOL "Disable AWS-LC Go helpers" FORCE)
+if(CNODE_AWSLC_NO_ASM)
+    set(OPENSSL_NO_ASM ON CACHE BOOL "Disable AWS-LC assembly" FORCE)
+    set(DISABLE_PERL ON CACHE BOOL "Disable AWS-LC Perl assembly generation" FORCE)
+else()
+    set(DISABLE_PERL OFF CACHE BOOL "Enable AWS-LC Perl assembly generation" FORCE)
+endif()
+
+FetchContent_Declare(
+    aws_lc
+    GIT_REPOSITORY https://github.com/aws/aws-lc.git
+    GIT_TAG v1.73.0
+)
+FetchContent_MakeAvailable(aws_lc)
+message(STATUS "Using AWS-LC via FetchContent")
+
+FetchContent_Declare(
+    zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG v1.3.1
+)
+FetchContent_MakeAvailable(zlib)
+
+find_package(Threads REQUIRED)
+
 if(USE_MIMALLOC)
-    find_package(mimalloc CONFIG REQUIRED)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "Disable mimalloc shared library" FORCE)
+    set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc static library" FORCE)
+    set(MI_BUILD_OBJECT OFF CACHE BOOL "Disable mimalloc object library" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests" FORCE)
+    FetchContent_Declare(
+        mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG v3.2.8
+    )
+    FetchContent_MakeAvailable(mimalloc)
     set(HAS_MIMALLOC TRUE)
-    message(STATUS "Found mimalloc ${mimalloc_VERSION}")
+    message(STATUS "Using mimalloc via FetchContent")
 else()
     set(HAS_MIMALLOC FALSE)
     if(SANITIZER)
@@ -321,19 +368,27 @@ target_include_directories(cnode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+if(HAS_MIMALLOC)
+    target_link_libraries(cnode PRIVATE mimalloc-static)
+    target_compile_definitions(cnode PRIVATE USE_MIMALLOC)
+    message(STATUS "Linking mimalloc-static for malloc override")
+endif()
+
 target_link_libraries(cnode PRIVATE
     asio::asio
     Threads::Threads
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ZLIB::ZLIB
+    ssl
+    crypto
+    zlibstatic
 )
 
 # 构建版本号：优先使用外部传入的 BUILD_ID，否则生成随机 hex
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(RANDOM LENGTH 12 ALPHABET "0123456789abcdef" BUILD_ID)
 endif()
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+if(CNODE_HEAPTRACK_BUILD)
+    set(BUILD_CHANNEL "heaptrack")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(BUILD_CHANNEL "debug")
 else()
     set(BUILD_CHANNEL "release")
@@ -346,14 +401,7 @@ if(CNODE_MEMORY_STATS)
     target_compile_definitions(cnode PRIVATE CNODE_MEMORY_STATS)
 endif()
 
-# 条件链接 mimalloc（必须早于其他库以覆盖 malloc/new）
-if(HAS_MIMALLOC)
-    target_link_libraries(cnode PRIVATE mimalloc-static)
-    target_compile_definitions(cnode PRIVATE USE_MIMALLOC)
-    message(STATUS "Linking mimalloc-static for malloc override")
-endif()
-
-# 预编译头（PCH）- 加速 Asio/OpenSSL/标准库模板的编译
+# 预编译头（PCH）- 加速 Asio/AWS-LC/标准库模板的编译
 target_precompile_headers(cnode PRIVATE src/pch.hpp)
 
 # 为我们自己的代码添加警告
@@ -1414,6 +1462,27 @@ add_test(
 )
 
 add_test(
+    NAME fetchcontent_dependencies
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/fetchcontent_dependencies.cmake
+)
+
+add_test(
+    NAME no_docker_artifacts
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_docker_artifacts.cmake
+)
+
+add_test(
+    NAME heaptrack_variant_ci
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/heaptrack_variant_ci.cmake
+)
+
+add_test(
     NAME no_stats_traffic_cross_layer_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
@@ -1565,14 +1634,14 @@ message(STATUS "  Build Type:   ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Network:      standalone Asio")
-message(STATUS "  Crypto:       OpenSSL (vcpkg)")
+message(STATUS "  Crypto:       AWS-LC")
 if(WIN32)
     message(STATUS "  I/O Backend:  IOCP")
 else()
     message(STATUS "  I/O Backend:  epoll")
 endif()
 if(HAS_MIMALLOC)
-    message(STATUS "  Allocator:    mimalloc ${mimalloc_VERSION}")
+    message(STATUS "  Allocator:    mimalloc")
 else()
     message(STATUS "  Allocator:    system")
 endif()

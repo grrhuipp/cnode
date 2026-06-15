@@ -2,7 +2,6 @@ set(scan_files
     "${PROJECT_SOURCE_DIR}/docs/configuration.md"
     "${PROJECT_SOURCE_DIR}/config/config.json.example"
     "${PROJECT_SOURCE_DIR}/scripts/cnode.sh"
-    "${PROJECT_SOURCE_DIR}/Dockerfile"
 )
 
 foreach(file IN LISTS scan_files)

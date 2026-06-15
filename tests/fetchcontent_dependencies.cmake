@@ -1,0 +1,65 @@
+file(READ "${PROJECT_SOURCE_DIR}/CMakeLists.txt" cmake_source)
+file(READ "${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml" ci_workflow)
+file(READ "${PROJECT_SOURCE_DIR}/scripts/build-heaptrack.sh" heaptrack_script)
+file(READ "${PROJECT_SOURCE_DIR}/README.md" readme)
+file(READ "${PROJECT_SOURCE_DIR}/.gitignore" gitignore)
+
+if(EXISTS "${PROJECT_SOURCE_DIR}/vcpkg.json")
+    message(FATAL_ERROR "vcpkg manifest must not reappear; dependencies are provided by CMake FetchContent")
+endif()
+
+foreach(content_name IN ITEMS cmake_source ci_workflow heaptrack_script readme gitignore)
+    if("${${content_name}}" MATCHES "[Vv][Cc][Pp][Kk][Gg]")
+        message(FATAL_ERROR "Repository build surface must not reference vcpkg: ${content_name}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS
+        "include\\(FetchContent\\)"
+        "FetchContent_Declare\\([ \t\r\n]*asio"
+        "GIT_REPOSITORY https://github\\.com/chriskohlhoff/asio\\.git"
+        "FetchContent_Declare\\([ \t\r\n]*aws_lc"
+        "GIT_REPOSITORY https://github\\.com/aws/aws-lc\\.git"
+        "GIT_TAG v1\\.73\\.0"
+        "FetchContent_Declare\\([ \t\r\n]*zlib"
+        "GIT_REPOSITORY https://github\\.com/madler/zlib\\.git"
+        "FetchContent_Declare\\([ \t\r\n]*mimalloc"
+        "GIT_REPOSITORY https://github\\.com/microsoft/mimalloc\\.git"
+        "CNODE_AWSLC_NO_ASM"
+        "Using AWS-LC via FetchContent")
+    if(NOT cmake_source MATCHES "${pattern}")
+        message(FATAL_ERROR "CMake must keep FetchContent dependency wiring: ${pattern}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS
+        "find_package\\(OpenSSL"
+        "OpenSSL::SSL"
+        "OpenSSL::Crypto"
+        "find_package\\(asio"
+        "find_package\\(ZLIB"
+        "find_package\\(mimalloc")
+    if(cmake_source MATCHES "${pattern}")
+        message(FATAL_ERROR "CMake must not use package-manager OpenSSL/asio/zlib/mimalloc lookups: ${pattern}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS
+        "apk add --no-cache"
+        "sudo apt-get install -y"
+        "perl nasm"
+        "scripts/build-heaptrack.sh"
+        "name: cnode-musl-assets"
+        "name: cnode-glibc-assets")
+    if(NOT ci_workflow MATCHES "${pattern}")
+        message(FATAL_ERROR "CI must install AWS-LC tools and publish both binary variants: ${pattern}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS
+        "CMAKE_TOOLCHAIN_FILE"
+        "VCPKG_TARGET_TRIPLET")
+    if(ci_workflow MATCHES "${pattern}" OR heaptrack_script MATCHES "${pattern}")
+        message(FATAL_ERROR "CI/scripts must not pass vcpkg toolchain settings: ${pattern}")
+    endif()
+endforeach()
