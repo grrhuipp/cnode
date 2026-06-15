@@ -25,11 +25,9 @@ std::vector<std::string> SetupStaticInbounds(
         return static_inbound_tags;
     }
 
-    LOG_CONSOLE("Static Inbounds:");
-
     for (const auto& inbound : runtime_inbounds) {
         if (!proxyman::inbound::HasProxy(inbound.protocol)) {
-            LOG_WARN("Static inbound '{}': unsupported protocol '{}', skipped",
+            LOG_WARN("static_inbound skipped tag={} protocol={} reason=unsupported",
                      inbound.tag, inbound.protocol);
             continue;
         }
@@ -75,7 +73,7 @@ std::vector<std::string> SetupStaticInbounds(
                 true);
         }
         static_inbound_tags.push_back(inbound.tag);
-        LOG_CONSOLE("  - {} port={} protocol={} network={}",
+        LOG_CONSOLE("static_inbound ready tag={} port={} protocol={} network={}",
                     inbound.tag,
                     inbound.port,
                     inbound.protocol,
@@ -91,7 +89,7 @@ void SetupTestMode(
     const std::string protocol = std::string(constants::protocol::kDefaultNodeProtocol);
 
     LOG_CONSOLE("");
-    LOG_CONSOLE("Test mode: port={}, UUID={}",
+    LOG_CONSOLE("test_mode enabled port={} uuid={}",
                 constants::test::kTestPort,
                 constants::test::kTestVmessUuid);
 
@@ -118,7 +116,7 @@ void SetupTestMode(
     auto test_users =
         proxyman::inbound::BuildStaticUsers(protocol, kTestTag, test_user_config);
     if (!test_users) {
-        LOG_WARN("Test mode: failed to build vmess test user");
+        LOG_WARN("test_mode failed reason=build_vmess_test_user");
         return;
     }
     proxyman::inbound::UserStore::ApplyUsers(protocol, kTestTag, *test_users);

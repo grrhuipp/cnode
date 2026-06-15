@@ -14,7 +14,16 @@
 #include <exception>
 #include <filesystem>
 #include <optional>
+#include <string_view>
 #include <system_error>
+
+#ifndef BUILD_CHANNEL
+#define BUILD_CHANNEL "unknown"
+#endif
+
+#ifndef BUILD_ID
+#define BUILD_ID "unknown"
+#endif
 
 namespace acpp {
 
@@ -48,6 +57,18 @@ std::optional<Config> LoadConfigFromCli(
     }
 
     return Config::LoadFromFile(config_path);
+}
+
+constexpr std::string_view IoBackendName() noexcept {
+#if defined(__APPLE__)
+    return "kqueue";
+#elif defined(_WIN32)
+    return "IOCP";
+#elif defined(CNODE_IO_URING_ENABLED)
+    return "io_uring";
+#else
+    return "epoll";
+#endif
 }
 
 }  // namespace
@@ -93,24 +114,9 @@ int RunFromCommandLine(int argc, char* argv[]) {
         return 1;
     }
 
-    LOG_CONSOLE("╔═══════════════════════════════════════════════════════════╗");
-    LOG_CONSOLE("║              acppnode v1.0.0 - VMess Proxy                ║");
-    LOG_CONSOLE("║  C++23 / standalone Asio / SO_REUSEPORT / system malloc   ║");
-    LOG_CONSOLE("╚═══════════════════════════════════════════════════════════╝");
-    LOG_CONSOLE("");
-    LOG_CONSOLE("Configuration:");
-    LOG_CONSOLE("  Workers:        {}", config.GetWorkers());
-#if defined(__APPLE__)
-    LOG_CONSOLE("  I/O backend:    kqueue (macOS)");
-#elif defined(_WIN32)
-    LOG_CONSOLE("  I/O backend:    IOCP (Windows)");
-#elif defined(CNODE_IO_URING_ENABLED)
-    LOG_CONSOLE("  I/O backend:    io_uring (Linux)");
-#else
-    LOG_CONSOLE("  I/O backend:    epoll (Linux)");
-#endif
-    LOG_CONSOLE("  Accept model:   SO_REUSEPORT per-worker");
-    LOG_CONSOLE("  Allocator:      system");
+    LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
+    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=system",
+                config.GetWorkers(), IoBackendName());
 
     if (!config.Validate()) {
         std::cerr << "Invalid configuration\n";

@@ -180,7 +180,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     inbound_started_.erase(panel);
                     node_stats_.erase(stats_key);
 
-                    LOG_CONSOLE("Node {}/{} removed, stopped inbound {}",
+                    LOG_CONSOLE("node removed panel={} node={} inbound={}",
                                 panel_name, node_id, old_tag);
                 }
                 co_return;
@@ -203,7 +203,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 need_create = true;
             } else if (!need_create && ConfigChanged(node_configs_[panel], fetched_config)) {
                 need_recreate = true;
-                LOG_CONSOLE("Node {}/{} config changed, recreating", panel_name, node_id);
+                LOG_CONSOLE("node config_changed panel={} node={} action=recreate",
+                            panel_name, node_id);
             }
 
             if (need_recreate) {
@@ -219,7 +220,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     inbound_started_[panel] = false;
                 } else {
                     co_await removeOutbound(old_tag);
-                    LOG_CONSOLE("Node {}/{} config changed, updating in place", panel_name, node_id);
+                    LOG_CONSOLE("node config_changed panel={} node={} action=update_in_place",
+                                panel_name, node_id);
                 }
             }
 
@@ -254,7 +256,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     for (const auto& worker : workers_) {
                         worker->EnableBanTrackingAsync(tag);
                     }
-                    LOG_CONSOLE("Node {}/{}: IP ban tracking enabled for {}",
+                    LOG_CONSOLE("node ban_tracking=enabled panel={} node={} tag={}",
                                 panel_name, node_id, tag);
                 }
             } else {

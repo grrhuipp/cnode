@@ -18,7 +18,6 @@ void SetupPanels(net::io_context& main_ctx,
         return;
     }
 
-    LOG_CONSOLE("Panels:");
     for (const auto& panel_config : config.GetPanels()) {
         if (!panel_config.Validate()) {
             throw std::runtime_error("invalid panel config");
@@ -43,7 +42,7 @@ void SetupPanels(net::io_context& main_ctx,
             if (i > 0) node_ids_str += ", ";
             node_ids_str += std::to_string(panel_config.NodeIDs[i]);
         }
-        LOG_CONSOLE("  - {} [{}] ({}): nodes=[{}]",
+        LOG_CONSOLE("panel ready name={} type={} host={} nodes=[{}]",
                     panel_config.Name, panel_config.NodeType,
                     panel_config.APIHost, node_ids_str);
     }

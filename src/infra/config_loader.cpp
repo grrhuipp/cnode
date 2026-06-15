@@ -36,7 +36,8 @@ std::optional<json::value> LoadJsonFile(const std::filesystem::path& path) {
                             std::istreambuf_iterator<char>());
         return ParseConfigContent(path, content);
     } catch (const std::exception& e) {
-        LOG_CONSOLE("  ERROR: Failed to parse {}: {}", path.filename().string(), e.what());
+        LOG_ERROR("config.parse_failed file={} error={}",
+                  path.filename().string(), e.what());
         return std::nullopt;
     }
 }
@@ -73,7 +74,7 @@ std::optional<proxyman::outbound::PreparedOutboundConfig> PrepareOutboundForLoad
     proxyman::outbound::OutboundSourceConfig raw_config) {
     auto prepared = proxyman::outbound::PrepareOutboundConfig(raw_config);
     if (!prepared) {
-        LOG_WARN("  Skipped outbound '{}' with unsupported protocol '{}'",
+        LOG_WARN("config.outbound_skipped tag={} protocol={} reason=unsupported",
                  raw_config.tag, raw_config.protocol);
         return std::nullopt;
     }
@@ -88,7 +89,7 @@ void LoadInboundItems(
     LoadConfigItems(value, [&](const json::object& item) {
         inbounds.push_back(StaticInboundConfig::FromJson(item));
     });
-    LOG_CONSOLE("  Loaded: {} ({} inbounds)",
+    LOG_CONSOLE("config.sidecar loaded file={} inbounds={}",
                 source_name,
                 inbounds.size() - count_before);
 }
@@ -105,7 +106,7 @@ void LoadOutboundItems(
             outbounds.push_back(std::move(*prepared));
         }
     });
-    LOG_CONSOLE("  Loaded: {} ({} outbounds)",
+    LOG_CONSOLE("config.sidecar loaded file={} outbounds={}",
                 source_name,
                 outbounds.size() - count_before);
 }
@@ -116,20 +117,20 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     std::filesystem::path config_dir;
     json::value main_config;
 
-    LOG_CONSOLE("Loading configuration from: {}", path.string());
+    LOG_CONSOLE("config loading source={}", path.string());
 
     if (std::filesystem::is_directory(path)) {
         config_dir = path;
-        LOG_CONSOLE("  Mode: directory");
-        LOG_CONSOLE("  Config directory: {}", config_dir.string());
+        LOG_CONSOLE("config mode=directory dir={}", config_dir.string());
 
         auto config_path = path / constants::paths::kDefaultConfigFile;
         if (auto j = LoadJsonFile(config_path)) {
             main_config = std::move(*j);
-            LOG_CONSOLE("  Loaded: {}", config_path.filename().string());
+            LOG_CONSOLE("config.main loaded file={}", config_path.filename().string());
         } else {
             main_config = json::object{};
-            LOG_CONSOLE("  {} not found, using defaults", constants::paths::kDefaultConfigFile);
+            LOG_CONSOLE("config.main missing file={} using_defaults=true",
+                        constants::paths::kDefaultConfigFile);
         }
     } else {
         auto file_path = path;
@@ -138,12 +139,11 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         if (config_dir.empty()) {
             config_dir = ".";
         }
-        LOG_CONSOLE("  Mode: file");
-        LOG_CONSOLE("  Config directory: {}", config_dir.string());
+        LOG_CONSOLE("config mode=file dir={}", config_dir.string());
 
         std::ifstream file(file_path);
         if (!file.is_open()) {
-            LOG_ERROR("Failed to open config file: {}", path.string());
+            LOG_ERROR("config.open_failed file={}", path.string());
             return std::nullopt;
         }
 
@@ -151,9 +151,10 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             std::string content((std::istreambuf_iterator<char>(file)),
                                 std::istreambuf_iterator<char>());
             main_config = *ParseConfigContent(file_path, content);
-            LOG_CONSOLE("  Loaded: {}", file_path.filename().string());
+            LOG_CONSOLE("config.main loaded file={}", file_path.filename().string());
         } catch (const std::exception& e) {
-            LOG_ERROR("Failed to parse config file: {}", e.what());
+            LOG_ERROR("config.parse_failed file={} error={}",
+                      file_path.filename().string(), e.what());
             return std::nullopt;
         }
     }
@@ -167,8 +168,6 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     Config& cfg = *cfg_opt;
     cfg.config_dir_ = config_dir;
 
-    LOG_CONSOLE("  Scanning for additional config files...");
-
     const auto default_inbound_path = config_dir / constants::paths::kInboundFile;
     if (auto j = LoadJsonFile(default_inbound_path)) {
         try {
@@ -177,7 +176,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
                 SelectConfigList(*j, "inbounds"),
                 constants::paths::kInboundFile);
         } catch (const std::exception& e) {
-            LOG_WARN("  Failed to parse {}: {}", constants::paths::kInboundFile, e.what());
+            LOG_WARN("config.sidecar_parse_failed file={} error={}",
+                     constants::paths::kInboundFile, e.what());
         }
     }
 
@@ -189,7 +189,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
                 SelectConfigList(*j, "outbounds"),
                 constants::paths::kOutboundFile);
         } catch (const std::exception& e) {
-            LOG_WARN("  Failed to parse {}: {}", constants::paths::kOutboundFile, e.what());
+            LOG_WARN("config.sidecar_parse_failed file={} error={}",
+                     constants::paths::kOutboundFile, e.what());
         }
     }
 
@@ -197,11 +198,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     if (auto j = LoadJsonFile(default_route_path)) {
         try {
             cfg.routing_ = ParseRoutingConfigValue(*j);
-            LOG_CONSOLE("  Loaded: {} ({} rules)",
+            LOG_CONSOLE("config.sidecar loaded file={} rules={}",
                         constants::paths::kRouteFile,
                         cfg.routing_.rules.size());
         } catch (const std::exception& e) {
-            LOG_WARN("  Failed to parse {}: {}", constants::paths::kRouteFile, e.what());
+            LOG_WARN("config.sidecar_parse_failed file={} error={}",
+                     constants::paths::kRouteFile, e.what());
         }
     }
 
@@ -220,7 +222,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         if (prepared) {
             cfg.prepared_outbounds_.insert(cfg.prepared_outbounds_.begin(), std::move(*prepared));
         }
-        LOG_CONSOLE("  Added built-in outbound: {} (sendThrough: {})",
+        LOG_CONSOLE("config.outbound builtin tag={} sendThrough={}",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
 
@@ -232,29 +234,26 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         if (prepared) {
             cfg.prepared_outbounds_.push_back(std::move(*prepared));
         }
-        LOG_CONSOLE("  Added built-in outbound: {}", constants::protocol::kBlackhole);
+        LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
     }
 
     auto geoip_path = config_dir / constants::paths::kGeoIpFile;
     auto geosite_path = config_dir / constants::paths::kGeoSiteFile;
     if (std::filesystem::exists(geoip_path)) {
-        LOG_CONSOLE("  Found: {}", constants::paths::kGeoIpFile);
+        LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoIpFile);
     }
     if (std::filesystem::exists(geosite_path)) {
-        LOG_CONSOLE("  Found: {}", constants::paths::kGeoSiteFile);
+        LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoSiteFile);
     }
 
-    LOG_CONSOLE("Configuration summary:");
-    LOG_CONSOLE("  Workers: {}", cfg.workers_);
-    LOG_CONSOLE("  Inbounds: {}", cfg.static_inbounds_.size());
-    LOG_CONSOLE("  Outbounds: {}", cfg.prepared_outbounds_.size());
-    LOG_CONSOLE("  Route rules: {}", cfg.routing_.rules.size());
-    LOG_CONSOLE("  Default outbound: {}",
+    LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} default_outbound={} panels={}",
+                cfg.workers_,
+                cfg.static_inbounds_.size(),
+                cfg.prepared_outbounds_.size(),
+                cfg.routing_.rules.size(),
                 cfg.prepared_outbounds_.empty() ? std::string(constants::protocol::kDirect)
-                                                : cfg.prepared_outbounds_.front().tag);
-    if (!cfg.panels_.empty()) {
-        LOG_CONSOLE("  Panels: {}", cfg.panels_.size());
-    }
+                                                : cfg.prepared_outbounds_.front().tag,
+                cfg.panels_.size());
 
     return cfg;
 }
@@ -262,7 +261,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 std::optional<Config> Config::LoadFromDirectory(const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
-        LOG_ERROR("Config path is not a directory: {}", dir.string());
+        LOG_ERROR("config.invalid_path dir={} reason=not_directory", dir.string());
         return std::nullopt;
     }
 

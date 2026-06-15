@@ -44,6 +44,18 @@ uint16_t g_max_days = 15;
 constexpr size_t kAsyncLogQueueSize = 65536;
 constexpr auto kLogIdleSleep = 1ms;
 
+std::string_view LevelName(LogLevel level) noexcept {
+    switch (level) {
+        case LogLevel::TRACE: return "trace";
+        case LogLevel::DEBUG: return "debug";
+        case LogLevel::INFO:  return "info";
+        case LogLevel::WARN:  return "warn";
+        case LogLevel::ERROR: return "error";
+        case LogLevel::NONE:  return "none";
+    }
+    return "?";
+}
+
 std::string TodayDateString() {
     return FormatLocalTime(std::chrono::system_clock::now(), "%Y-%m-%d");
 }
@@ -121,6 +133,12 @@ std::filesystem::path ResolveLogPath(
         std::filesystem::create_directories(parent);
     }
     return configured_path;
+}
+
+void WriteStderrFallback(LogLevel level, const std::string& msg) {
+    std::lock_guard lock(g_console_mutex);
+    std::cerr << '[' << LogLocalNow() << "] [" << LevelName(level) << "] "
+              << msg << std::endl;
 }
 
 LogLevel ParseLevel(std::string_view level) {
@@ -296,36 +314,37 @@ bool Log::Init(const std::string& level,
                 CleanupOldFiles();
             }
 
-            if (!g_async_log_backend.Start(ResolveLogPath(g_error_path, "error"),
-                                           ResolveLogPath(g_access_path, "access"))) {
+            const auto resolved_error_path = ResolveLogPath(g_error_path, "error");
+            const auto resolved_access_path = ResolveLogPath(g_access_path, "access");
+
+            if (!g_async_log_backend.Start(resolved_error_path, resolved_access_path)) {
                 std::cerr << "Log initialization failed: cannot open access/error log files"
                           << std::endl;
                 return false;
             }
 
             initialized_.store(true, std::memory_order_release);
+            WriteConsole(std::format(
+                "logging level={} access={} error={} rotation={} retention={}d",
+                level,
+                resolved_access_path.string(),
+                resolved_error_path.string(),
+                uses_daily_fallback ? "daily" : "external",
+                max_days));
+            WriteApp(LogLevel::INFO, std::format(
+                "logging initialized level={} access={} error={} dir={} rotation={} retention_days={}",
+                level,
+                resolved_access_path.string(),
+                resolved_error_path.string(),
+                log_dir.string(),
+                uses_daily_fallback ? "daily" : "external",
+                max_days));
         } catch (const std::exception& e) {
             std::cerr << "Log initialization failed: " << e.what() << std::endl;
             g_async_log_backend.Stop();
             return false;
         }
     }
-
-    WriteConsole("Log system initialized");
-    WriteConsole(std::format("  Level:     {}", level));
-    WriteConsole(std::format("  Directory: {}", log_dir.string()));
-    WriteConsole(std::format("  Retention: {} days (daily rotation)", max_days));
-    WriteConsole(std::format("  AccessPath: {}",
-                             g_access_path.empty() ? "(daily access_YYYY-MM-DD.log)" : g_access_path.string()));
-    WriteConsole(std::format("  ErrorPath:  {}",
-                             g_error_path.empty() ? "(daily error_YYYY-MM-DD.log)" : g_error_path.string()));
-
-    WriteApp(LogLevel::INFO, std::format(
-        "Log system initialized, level={}, access_path={}, error_path={}, dir={}, max_days={}",
-        level,
-        g_access_path.empty() ? std::string("(daily)") : g_access_path.string(),
-        g_error_path.empty() ? std::string("(daily)") : g_error_path.string(),
-        log_dir.string(), max_days));
 
     return true;
 }
@@ -351,7 +370,12 @@ void Log::Flush() {
 
 void Log::WriteApp(LogLevel level, std::string msg) {
     if (!ShouldLog(level)) return;
-    if (!initialized_.load(std::memory_order_acquire)) return;
+    if (!initialized_.load(std::memory_order_acquire)) {
+        if (level >= LogLevel::WARN) {
+            WriteStderrFallback(level, msg);
+        }
+        return;
+    }
 
     g_async_log_backend.Enqueue(LogChannel::App, level, std::move(msg));
 }
@@ -363,9 +387,18 @@ void Log::WriteAccess(std::string msg) {
     g_async_log_backend.Enqueue(LogChannel::Access, LogLevel::INFO, std::move(msg));
 }
 
-void Log::WriteConsole(const std::string& msg) {
+void Log::WriteConsole(std::string msg) {
+    WriteConsole(LogLevel::INFO, std::move(msg));
+}
+
+void Log::WriteConsole(LogLevel level, std::string msg) {
     std::lock_guard lock(g_console_mutex);
-    std::cout << '[' << LogLocalNow() << "] [info] " << msg << std::endl;
+    if (msg.empty()) {
+        std::cout << std::endl;
+        return;
+    }
+    std::cout << '[' << LogLocalNow() << "] [" << LevelName(level) << "] "
+              << msg << std::endl;
 }
 
 bool Log::ShouldLog(LogLevel level) noexcept {

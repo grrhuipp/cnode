@@ -126,7 +126,7 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
         registered_tags_.push_back(inbound.tag);
     }
 
-    LOG_CONSOLE("Inbound {} on port {} ({}): {} workers (SO_REUSEPORT)",
+    LOG_CONSOLE("inbound ready tag={} port={} protocol={} workers={} accept=SO_REUSEPORT",
                 inbound.tag, node_config.Port, inbound.protocol, workers_.size());
     co_return true;
 }

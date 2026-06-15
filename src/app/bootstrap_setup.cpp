@@ -66,10 +66,10 @@ std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
     if (geo_manager->Init(geoip_path, geosite_path)) {
         geo_manager->PreloadTags(config.GetUsedGeoIPTags(), config.GetUsedGeoSiteTags());
         auto gs = geo_manager->GetStats();
-        LOG_CONSOLE("GeoData: {} geoip tags, {} geosite tags",
+        LOG_CONSOLE("geodata ready geoip_tags={} geosite_tags={}",
                     gs.geoip_tags_loaded, gs.geosite_tags_loaded);
     } else {
-        LOG_WARN("Failed to initialize GeoManager");
+        LOG_WARN("geodata init_failed");
         geo_manager.reset();
     }
     return geo_manager;

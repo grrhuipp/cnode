@@ -17,7 +17,7 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
 
     signals->async_wait([&state, &ctx](
                             const IoErrorCode&, int signo) {
-        LOG_CONSOLE("Received signal {}, shutting down...", signo);
+        LOG_CONSOLE("shutdown signal={} status=stopping", signo);
         state.running = false;
 
         ctx.controller.Stop();

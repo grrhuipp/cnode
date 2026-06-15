@@ -68,11 +68,9 @@ std::string FormatAccessLog(
         }
     }
 
-    std::string resolved_str;
+    std::string remote_str = "-";
     if (resolved_ip && !resolved_ip->is_unspecified()) {
-        resolved_str = iputil::NormalizeAddressString(*resolved_ip);
-        resolved_str.insert(resolved_str.begin(), '(');
-        resolved_str.push_back(')');
+        remote_str = iputil::NormalizeAddressString(*resolved_ip);
     }
 
     std::string local_storage;
@@ -113,9 +111,21 @@ std::string FormatAccessLog(
         ? std::string_view("-")
         : ctx.outbound.tag;
 
-    return std::format("{} from {} accepted {}:{}{}:{} [{} -> {}] via {} email:{} dns:{} sniff:{}",
-        timestamp, src, net_str, target_host, resolved_str, t.port,
-        in_tag, out_tag, local_str, user_str, dns_str, sniff_str);
+    return std::format(
+        "{} level=info event=accepted conn={} worker={} inbound={} outbound={} network={} src={} target={} remote={} local={} user={} dns={} sniff={}",
+        timestamp,
+        ctx.conn_id,
+        ctx.worker_id,
+        in_tag,
+        out_tag,
+        net_str,
+        src,
+        iputil::FormatEndpointForLog(target_host, t.port),
+        remote_str,
+        local_str,
+        user_str,
+        dns_str,
+        sniff_str);
 }
 
 // 格式化时间戳（本地时区，跨平台）

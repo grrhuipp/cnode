@@ -90,7 +90,8 @@ public:
     // 写入各通道
     static void WriteApp(LogLevel level, std::string msg);
     static void WriteAccess(std::string msg);
-    static void WriteConsole(const std::string& msg);
+    static void WriteConsole(std::string msg);
+    static void WriteConsole(LogLevel level, std::string msg);
 
     // 检查日志级别
     [[nodiscard]] static bool ShouldLog(LogLevel level) noexcept;
@@ -150,29 +151,29 @@ private:
 #define LOG_CONN_TRACE(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::TRACE)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][trace] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=trace conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 #define LOG_CONN_DEBUG(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][debug] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=debug conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 #define LOG_CONN_INFO(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::INFO)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=info conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 #define LOG_CONN_WARN(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][warn] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=warn conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 #define LOG_CONN_ERROR(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::ERROR)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}][error] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=error conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 // ============================================================================
@@ -193,17 +194,17 @@ private:
 #define LOG_ACCESS_TRACE(fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::TRACE)) \
-            acpp::Log::WriteAccess(std::format("{} [trace] " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=trace " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 #define LOG_ACCESS_DEBUG(fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::DEBUG)) \
-            acpp::Log::WriteAccess(std::format("{} [debug] " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=debug " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 #define LOG_ACCESS_WARN(fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
-            acpp::Log::WriteAccess(std::format("{} [warn] " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=warn " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 // ============================================================================
@@ -212,12 +213,12 @@ private:
 #define LOG_CONN_FAIL(fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
-            acpp::Log::WriteAccess(std::format("{} " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=warn " fmt_str, acpp::LogLocalNow() __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 #define LOG_CONN_FAIL_CTX(ctx, fmt_str, ...) \
     do { \
         if (acpp::Log::ShouldLog(acpp::LogLevel::WARN)) \
-            acpp::Log::WriteAccess(std::format("{} [conn={}][w={}][tag={}] " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
+            acpp::Log::WriteAccess(std::format("{} level=warn conn={} worker={} inbound={} " fmt_str, acpp::LogLocalNow(), ctx.conn_id, ctx.worker_id, ctx.inbound.tag __VA_OPT__(,) __VA_ARGS__)); \
     } while(0)
 
 }  // namespace acpp

@@ -251,56 +251,65 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
 
         double mem_mb = co_await GetMemoryMBAsync();
 
-        LOG_INFO("conn={} mem={:.1f}MB in={} out={} rate={}↓/{}↑ dns={:.0f}%",
-                 total_conns, mem_mb,
-                 acpp::FormatBytes(snapshot.bytes_in),
-                 acpp::FormatBytes(snapshot.bytes_out),
-                 FormatRate(snapshot.bytes_in_rate),
-                 FormatRate(snapshot.bytes_out_rate),
-                 dns_hit_rate);
-
-        {
-            size_t total_udp_sessions = 0;
-            auto proc_mem = ProcessMemory::Read();
-            for (const auto& worker_snapshot : worker_snapshots) {
-                total_udp_sessions += worker_snapshot.memory.udp_sessions;
-            }
-            const auto user_stats = proxyman::inbound::UserStore::GetStats();
-            LOG_INFO("state: dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={} | RSS={:.1f}MB",
-                     dns_l1_stats.entries,
-                     dns_l1_stats.capacity,
-                     dns_l2_stats.entries,
-                     dns_l2_stats.capacity,
-                     total_udp_sessions,
-                     user_stats.TotalUsers(),
-                     proc_mem.vm_rss / (1024.0 * 1024.0));
-#ifdef CNODE_MEMORY_STATS
-            const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
-            LOG_INFO("mem-live: async_stream={}/{} tcp_stream={}/{} tls_stream={}/{}",
-                     runtime_mem.async_streams_live,
-                     runtime_mem.async_streams_peak,
-                     runtime_mem.tcp_streams_live,
-                     runtime_mem.tcp_streams_peak,
-                     runtime_mem.tls_streams_live,
-                     runtime_mem.tls_streams_peak);
-#endif
+        size_t total_udp_sessions = 0;
+        for (const auto& worker_snapshot : worker_snapshots) {
+            total_udp_sessions += worker_snapshot.memory.udp_sessions;
         }
+        const auto user_stats = proxyman::inbound::UserStore::GetStats();
+        LOG_INFO(
+            "runtime conn={} mem={:.1f}MB traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
+            total_conns,
+            mem_mb,
+            acpp::FormatBytes(snapshot.bytes_in),
+            acpp::FormatBytes(snapshot.bytes_out),
+            FormatRate(snapshot.bytes_in_rate),
+            FormatRate(snapshot.bytes_out_rate),
+            dns_hit_rate,
+            dns_l1_stats.entries,
+            dns_l1_stats.capacity,
+            dns_l2_stats.entries,
+            dns_l2_stats.capacity,
+            total_udp_sessions,
+            user_stats.TotalUsers());
+
+#ifdef CNODE_MEMORY_STATS
+        const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
+        LOG_DEBUG("runtime.memory async_stream={}/{} tcp_stream={}/{} tls_stream={}/{}",
+                  runtime_mem.async_streams_live,
+                  runtime_mem.async_streams_peak,
+                  runtime_mem.tcp_streams_live,
+                  runtime_mem.tcp_streams_peak,
+                  runtime_mem.tls_streams_live,
+                  runtime_mem.tls_streams_peak);
+#endif
 
         auto node_stats = ctx.controller.GetNodeStats();
         if (!node_stats.empty()) {
-            LOG_INFO("┌────────────┬───────┬─────────┬────────┬────────┬──────────┬──────────┐");
-            LOG_INFO("│ Node       │ Port  │ Network │ Users  │ Online │ ↑ Up     │ ↓ Down   │");
-            LOG_INFO("├────────────┼───────┼─────────┼────────┼────────┼──────────┼──────────┤");
+            size_t node_users = 0;
+            size_t node_online = 0;
+            uint64_t node_up = 0;
+            uint64_t node_down = 0;
             for (const auto& ns : node_stats) {
-                std::string name = naming::BuildPanelNodeStatsKey(ns.panel_name, ns.node_id);
-                if (name.size() > 10) name = name.substr(0, 10);
-                LOG_INFO("│ {:<10} │ {:>5} │ {:<7} │ {:>6} │ {:>6} │ {:>8} │ {:>8} │",
-                         name, ns.port, ns.network, ns.total_users,
-                         ns.online_users,
-                         acpp::FormatBytes(ns.bytes_up),
-                         acpp::FormatBytes(ns.bytes_down));
+                node_users += ns.total_users;
+                node_online += ns.online_users;
+                node_up += ns.bytes_up;
+                node_down += ns.bytes_down;
+                LOG_DEBUG(
+                    "runtime.node name={} port={} network={} users={} online={} upload={} download={}",
+                    naming::BuildPanelNodeStatsKey(ns.panel_name, ns.node_id),
+                    ns.port,
+                    ns.network,
+                    ns.total_users,
+                    ns.online_users,
+                    acpp::FormatBytes(ns.bytes_up),
+                    acpp::FormatBytes(ns.bytes_down));
             }
-            LOG_INFO("└────────────┴───────┴─────────┴────────┴────────┴──────────┴──────────┘");
+            LOG_INFO("runtime.nodes count={} users={} online={} upload={} download={}",
+                     node_stats.size(),
+                     node_users,
+                     node_online,
+                     acpp::FormatBytes(node_up),
+                     acpp::FormatBytes(node_down));
         }
 
         timer.expires_after(std::chrono::seconds(defaults::kStatsOutputInterval));

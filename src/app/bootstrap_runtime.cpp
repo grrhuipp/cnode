@@ -27,8 +27,8 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
     }
 
     LOG_CONSOLE("");
-    LOG_CONSOLE("Server started with {} workers (SO_REUSEPORT)", ctx.workers.size());
-    LOG_CONSOLE("Press Ctrl+C to stop");
+    LOG_CONSOLE("server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
+    LOG_CONSOLE("shutdown shortcut=Ctrl+C");
 
     if (ctx.enable_controller) {
         ctx.controller.Start();
@@ -48,7 +48,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
     ctx.main_ctx.run_for(std::chrono::milliseconds(100));
     TimeoutScheduler::ReleaseForIoContext(ctx.main_ctx);
 
-    LOG_CONSOLE("=== acppnode stopped ===");
+    LOG_CONSOLE("cnode stopped");
     Log::Shutdown();
 }
 

@@ -424,10 +424,11 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
                       [](std::exception_ptr) {});
 
         ++bound_count;
-        LOG_INFO("Worker[{}]: listening {} tag={} protocol={} (SO_REUSEPORT)",
-                 worker.id_,
-                 iputil::FormatEndpointForLog(listen_addr, binding.port),
-                 binding.tag, binding.protocol);
+        LOG_DEBUG("worker.listener ready worker={} endpoint={} tag={} protocol={} accept=SO_REUSEPORT",
+                  worker.id_,
+                  iputil::FormatEndpointForLog(listen_addr, binding.port),
+                  binding.tag,
+                  binding.protocol);
     }
 
     if (bound_count == 0) {
@@ -453,8 +454,8 @@ void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag
         tcp_listener_tags.erase(listener_key);
     }
     MaybeShrinkHashContainer(tcp_listener_tags, 8);
-    LOG_INFO("Worker[{}]: stopped listening tag={} sockets={}",
-             worker.id_, tag, listener_keys.size());
+    LOG_DEBUG("worker.listener stopped worker={} tag={} sockets={}",
+              worker.id_, tag, listener_keys.size());
 }
 
 proxyman::inbound::UdpWorker*
@@ -1168,11 +1169,11 @@ void Worker::ListenerState::StartUdpListening(
                       [](std::exception_ptr) {});
 
         ++bound_count;
-        LOG_INFO("Worker[{}]: UDP listening {} tag={} protocol={} (SO_REUSEPORT)",
-                 worker.id_,
-                 iputil::FormatEndpointForLog(listen_addr, binding.port),
-                 binding.tag,
-                 binding.protocol);
+        LOG_DEBUG("worker.udp_listener ready worker={} endpoint={} tag={} protocol={} accept=SO_REUSEPORT",
+                  worker.id_,
+                  iputil::FormatEndpointForLog(listen_addr, binding.port),
+                  binding.tag,
+                  binding.protocol);
     }
 
     if (bound_count == 0) {
