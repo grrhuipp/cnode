@@ -26,7 +26,6 @@ on:
 env:
   BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
   RELEASE_TAG: cnode-latest
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-musl:
@@ -43,11 +42,11 @@ jobs:
             zip unzip tar pkgconf linux-headers musl-dev \
             perl nasm
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Restore CMake dependency builds
         id: cache-musl
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: build-musl/_deps
           key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -80,7 +79,7 @@ jobs:
           ls -lh release-assets
 
       - name: Upload musl artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cnode-musl-assets
           path: release-assets/*
@@ -88,7 +87,7 @@ jobs:
 
       - name: Save CMake dependency builds
         if: always() && steps.cache-musl.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: build-musl/_deps
           key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -105,11 +104,11 @@ jobs:
             build-essential binutils cmake ninja-build git curl \
             zip unzip tar pkg-config perl nasm file
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Restore CMake dependency builds
         id: cache-glibc
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: build-heaptrack/_deps
           key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -139,7 +138,7 @@ jobs:
           ls -lh glibc-assets
 
       - name: Upload glibc artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cnode-glibc-assets
           path: glibc-assets/*
@@ -147,7 +146,7 @@ jobs:
 
       - name: Save CMake dependency builds
         if: always() && steps.cache-glibc.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: build-heaptrack/_deps
           key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
@@ -163,13 +162,13 @@ jobs:
 
     steps:
       - name: Download musl artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           name: cnode-musl-assets
 
       - name: Download glibc artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           name: cnode-glibc-assets
