@@ -81,10 +81,11 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
             co_return attempt;
         }
 
-        LOG_DEBUG("DialOutboundTransport: candidate {}:{} failed: {}",
-                  candidate.endpoint.address().to_string(),
-                  candidate.endpoint.port(),
-                  attempt.error_msg);
+        LOG_CONN_DEBUG(ctx,
+                       "DIAL_CANDIDATE_FAILED endpoint={}:{} error={}",
+                       candidate.endpoint.address().to_string(),
+                       candidate.endpoint.port(),
+                       attempt.error_msg);
         last_result = std::move(attempt);
     }
 

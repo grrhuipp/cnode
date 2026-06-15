@@ -736,20 +736,18 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         if (!proxy_read.ok()) {
             switch (proxy_read.status) {
                 case ProxyProtocolReadStatus::TimedOut:
-                    LOG_WARN("Worker[{}]: PROXY protocol pre-read timed out tag={} client={}",
-                             worker.id_, ctx.inbound.tag, ctx.inbound.source_ip);
+                    LOG_CONN_FAIL_CTX(ctx,
+                                      "PROXY_PROTOCOL_TIMEOUT client={}",
+                                      ctx.inbound.source_ip);
                     break;
                 case ProxyProtocolReadStatus::Truncated:
-                    LOG_WARN("Worker[{}]: truncated PROXY protocol header tag={}",
-                             worker.id_, ctx.inbound.tag);
+                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_TRUNCATED");
                     break;
                 case ProxyProtocolReadStatus::TooLarge:
-                    LOG_WARN("Worker[{}]: PROXY protocol header exceeded {} bytes tag={}",
-                             worker.id_, 2048, ctx.inbound.tag);
+                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_TOO_LARGE limit={}B", 2048);
                     break;
                 case ProxyProtocolReadStatus::Invalid:
-                    LOG_WARN("Worker[{}]: invalid PROXY protocol header tag={}",
-                             worker.id_, ctx.inbound.tag);
+                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_INVALID");
                     break;
                 case ProxyProtocolReadStatus::Ok:
                     break;
@@ -760,8 +758,9 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 
         if (listener.proxy_protocol == ProxyProtocolMode::On &&
             proxy_read.result.status != ProxyProtocolParseStatus::Success) {
-            LOG_WARN("Worker[{}]: missing required PROXY protocol header tag={} client={}",
-                     worker.id_, ctx.inbound.tag, ctx.inbound.source_ip);
+            LOG_CONN_FAIL_CTX(ctx,
+                              "PROXY_PROTOCOL_REQUIRED_MISSING client={}",
+                              ctx.inbound.source_ip);
             tcp_stream->Close();
             co_return;
         }
