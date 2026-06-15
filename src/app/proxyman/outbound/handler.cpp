@@ -1,7 +1,5 @@
 #include "acppnode/app/proxyman/outbound/handler.hpp"
 
-#include "acppnode/app/relay.hpp"
-#include "acppnode/common/mux/mux_relay.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
@@ -64,44 +62,6 @@ net::awaitable<std::optional<RelayResult>> Handler::Dispatch(
     LOG_CONN_DEBUG(ctx, "[Outbound] outbound.Process ok via {}", ctx.outbound.tag);
 
     co_return std::optional<RelayResult>{std::move(*process_result)};
-}
-
-net::awaitable<RelayResult> Handler::DispatchMux(
-    net::io_context& io_context,
-    AsyncStream& inbound_stream,
-    session::Context& ctx,
-    const UDPRelayConfig& relay_config) {
-    if (!proxy_) {
-        LOG_CONN_FAIL_CTX(ctx, "OUTBOUND_HANDLER_EMPTY {} -> {} via {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, tag_);
-        RelayResult result;
-        result.error = ErrorCode::OUTBOUND_CONNECTION_FAILED;
-        co_return result;
-    }
-
-    co_return co_await mux::DoMuxRelay(
-        io_context, inbound_stream, *this, ctx, relay_config);
-}
-
-net::awaitable<UDPSession*> Handler::DispatchUDP(
-    session::Context& ctx) {
-    if (!proxy_) {
-        LOG_CONN_FAIL_CTX(ctx, "OUTBOUND_HANDLER_EMPTY {} -> {} via {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, tag_);
-        co_return nullptr;
-    }
-
-    LOG_CONN_DEBUG(ctx, "[Outbound] UDP dial start -> {} via {}",
-                   ctx.outbound.target, ctx.outbound.tag);
-    UDPSession* session = co_await proxy_->DialUDP(ctx);
-    if (!session) {
-        LOG_CONN_DEBUG(ctx, "[Outbound] UDP dial failed/unsupported via {}", ctx.outbound.tag);
-        co_return nullptr;
-    }
-    LOG_CONN_DEBUG(ctx, "[Outbound] UDP dial ok via {}", ctx.outbound.tag);
-    LOG_ACCESS(FormatAccessLog(ctx));
-
-    co_return session;
 }
 
 }  // namespace acpp::proxyman::outbound

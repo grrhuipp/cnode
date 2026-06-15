@@ -150,20 +150,21 @@ DNS::Impl::Impl(net::io_context& io_context, const Config& config)
     : io_context(io_context)
     , config(config)
     , cache(config.cache_size, config.min_ttl, config.max_ttl) {
+    constexpr net::ip::port_type kDnsPort = 53;
     servers.reserve(config.servers.size());
     for (const auto& server : config.servers) {
         IoErrorCode ec;
         auto addr = net::ip::make_address(server, ec);
         if (!ec) {
-            servers.emplace_back(addr, 53);
+            servers.emplace_back(addr, kDnsPort);
         } else {
             LOG_WARN("Invalid DNS server address: {}", server);
         }
     }
 
     if (servers.empty()) {
-        servers.emplace_back(net::ip::make_address("8.8.8.8"), 53);
-        servers.emplace_back(net::ip::make_address("1.1.1.1"), 53);
+        servers.emplace_back(net::ip::make_address("8.8.8.8"), kDnsPort);
+        servers.emplace_back(net::ip::make_address("1.1.1.1"), kDnsPort);
     }
 
     std::random_device rd;

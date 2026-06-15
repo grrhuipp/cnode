@@ -14,7 +14,6 @@
 
 namespace acpp {
 
-class UDPSession;
 struct StatsShard;
 struct TimeoutsConfig;
 
@@ -34,13 +33,6 @@ using OutboundProcessResult = std::expected<RelayResult, ErrorCode>;
 class Outbound {
 public:
     virtual ~Outbound() noexcept = default;
-
-    // UDP 拨号（Full Cone）：返回当前 Worker 的 UDPSession*（nullptr=不支持/失败）。
-    // 仅服务 datagram 入站（原生 SS UDP 监听、Mux UDP 子会话）；UDP-over-TCP 隧道
-    // 走 Process。出站实现只使用 Worker 私有资源，不接收 executor。
-    virtual net::awaitable<UDPSession*> DialUDP(session::Context& ctx) {
-        co_return nullptr;
-    }
 
     // 获取出站标识
     [[nodiscard]] virtual std::string_view Tag() const noexcept = 0;

@@ -61,10 +61,6 @@ public:
         session::Context& ctx,
         const proxyman::inbound::ReceiverSettings& receiver) const noexcept = 0;
     [[nodiscard]] virtual DispatchResult Route(session::Context& ctx) const noexcept = 0;
-
-    [[nodiscard]] virtual net::awaitable<UDPSession*> DispatchUDP(
-        session::Context& ctx,
-        const proxyman::inbound::ReceiverSettings* receiver = nullptr) = 0;
 };
 
 }  // namespace routing

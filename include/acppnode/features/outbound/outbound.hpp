@@ -47,17 +47,6 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) = 0;
 
-    [[nodiscard]] virtual net::awaitable<RelayResult> DispatchMux(
-        net::io_context& io_context,
-        AsyncStream& inbound_stream,
-        session::Context& ctx,
-        const UDPRelayConfig& relay_config) = 0;
-
-    // datagram UDP 拨号：返回 Worker 的 UDPSession*（nullptr=失败/不支持）。
-    // 仅服务原生 SS UDP 监听与 Mux UDP 子会话；UDP-over-TCP 隧道走 Dispatch。
-    [[nodiscard]] virtual net::awaitable<UDPSession*> DispatchUDP(
-        session::Context& ctx) = 0;
-
 };
 
 // ============================================================================

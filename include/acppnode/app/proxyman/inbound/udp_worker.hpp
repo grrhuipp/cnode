@@ -4,6 +4,7 @@
 #include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
+#include "acppnode/transport/link.hpp"
 
 #include <chrono>
 #include <memory>
@@ -13,7 +14,6 @@
 
 namespace acpp {
 struct TargetAddress;
-class UDPSession;
 }  // namespace acpp
 
 namespace acpp::proxyman::inbound {
@@ -28,17 +28,15 @@ namespace acpp::proxyman::inbound {
 class UdpWorker final {
 public:
     class PendingUdpReply;
+    class ClientSession;
+    using ClientSessionPtr = std::shared_ptr<ClientSession>;
+    using ReplyCallback = ::acpp::PacketCallback;
+
     struct PendingUdpReplyDeleter {
         void operator()(PendingUdpReply* reply) const noexcept;
     };
     using PendingUdpReplyPtr =
         std::unique_ptr<PendingUdpReply, PendingUdpReplyDeleter>;
-
-    struct UdpClientSendResult {
-        ErrorCode error = ErrorCode::OUTBOUND_CONNECTION_FAILED;
-        bool found = false;
-        int64_t user_id = 0;
-    };
 
     UdpWorker(std::string tag, std::unique_ptr<UdpHandler> proxy);
     ~UdpWorker() noexcept;
@@ -70,19 +68,21 @@ public:
 
     [[nodiscard]] bool HasClientSession(const std::string& socket_key,
                                         const UdpEndpointKey& client_key) const noexcept;
-    void UpsertClientSession(const std::string& socket_key,
-                             const UdpEndpointKey& client_key,
-                             UDPSession& session,
-                             uint64_t response_callback,
-                             int64_t user_id,
-                             std::chrono::steady_clock::time_point now);
-    [[nodiscard]] net::awaitable<UdpClientSendResult>
-    SendToClientSession(const std::string& socket_key,
-                        const UdpEndpointKey& client_key,
-                        const TargetAddress& target,
-                        buf::MultiBuffer payload,
-                        std::chrono::steady_clock::time_point now,
-                        std::chrono::seconds idle_timeout);
+    [[nodiscard]] ClientSessionPtr FindClientSession(
+        const std::string& socket_key,
+        const UdpEndpointKey& client_key) const noexcept;
+    [[nodiscard]] ClientSessionPtr CreateClientSession(
+        const std::string& socket_key,
+        const UdpEndpointKey& client_key,
+        net::io_context& io_context,
+        ReplyCallback reply_callback,
+        int64_t user_id,
+        std::chrono::steady_clock::time_point now);
+    [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
+                                         const UdpEndpointKey& client_key,
+                                         const TargetAddress& target,
+                                         buf::MultiBuffer payload,
+                                         std::chrono::steady_clock::time_point now);
     void CleanupIdleClientSessions(const std::string& socket_key,
                                    std::chrono::steady_clock::time_point now,
                                    std::chrono::seconds idle_timeout);
@@ -96,6 +96,32 @@ public:
     [[nodiscard]] std::vector<std::string> SocketKeys() const;
     void CloseSocket(const std::string& socket_key) noexcept;
     void CloseAllSockets() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class UdpWorker::ClientSession final
+    : public transport::MultiBufferReader,
+      public transport::MultiBufferWriter {
+public:
+    ClientSession(net::io_context& io_context,
+                  ReplyCallback reply_callback,
+                  int64_t user_id);
+    ~ClientSession() noexcept override;
+
+    ClientSession(const ClientSession&) = delete;
+    ClientSession& operator=(const ClientSession&) = delete;
+
+    [[nodiscard]] int64_t UserId() const noexcept;
+    [[nodiscard]] bool Closed() const noexcept;
+
+    void Push(const TargetAddress& target, buf::MultiBuffer payload);
+    void Close() noexcept;
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
 
 private:
     struct Impl;

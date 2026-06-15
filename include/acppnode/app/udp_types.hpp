@@ -113,9 +113,8 @@ private:
     void (*destroy_)(void*) = nullptr;
 };
 
-// UDP 拨号不再有独立结果壳：UDP-capable 出站的 DialUDP/DispatchUDP 直接返回
-// 当前 Worker 的 `UDPSession*`（nullptr 表示拨号失败）。datagram 入站（原生 SS
-// UDP 监听、Mux UDP 子会话）直接在该 session 上 SendTo/RegisterCallback。
+// datagram 入站与 Mux UDP 子会话通过 transport::Link 进入 dispatcher；
+// UDP-capable 出站在自己的 Process 内准备 Worker-local UDP 资源并进入 relay。
 
 // ============================================================================
 // UDP Relay 结果

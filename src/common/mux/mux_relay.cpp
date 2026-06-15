@@ -1,10 +1,10 @@
 #include "acppnode/common/mux/mux_relay.hpp"
-#include "acppnode/features/outbound/outbound.hpp"
+#include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/session.hpp"
-#include "acppnode/proxy/outbound.hpp"
+#include "acppnode/infra/config_types.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/udp_types.hpp"
-#include "acppnode/app/udp_session.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -144,7 +144,7 @@ struct ReplyQueueState {
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
-    uint32_t active_tcp_loops = 0;
+    uint32_t active_sub_loops = 0;
     bool running = true;
     bool tcp_overflowed = false;
     uint64_t udp_dropped = 0;
@@ -204,54 +204,6 @@ struct ReplyQueueState {
     }
 };
 
-// 可跨 Mux 连接共享的 UDP 拨号状态（GlobalID 复用）。dial 是 Worker 的
-// UDPSessionManager 拥有的 UDPSession，非占有指针。
-struct SharedUdpDial {
-    UDPSession* dial = nullptr;
-    std::array<uint8_t, 8> global_id{};
-    uint64_t global_key = 0;
-    uint32_t refs = 0;
-};
-
-// 当前 DoMuxRelay 持有的 UDP 子会话句柄
-struct UdpSubInfo {
-    SharedUdpDial* shared = nullptr;
-    SharedUdpDial local;
-    uint64_t callback_id = 0;   // 注册在本 Mux 连接上的回调 ID
-    TargetAddress last_target;  // 最近发送的目标（KEEP 帧可能复用）
-
-    UdpSubInfo() = default;
-    UdpSubInfo(const UdpSubInfo&) = delete;
-    UdpSubInfo& operator=(const UdpSubInfo&) = delete;
-
-    UdpSubInfo(UdpSubInfo&& other) noexcept {
-        MoveFrom(std::move(other));
-    }
-
-    UdpSubInfo& operator=(UdpSubInfo&& other) noexcept {
-        if (this != &other) {
-            MoveFrom(std::move(other));
-        }
-        return *this;
-    }
-
-    [[nodiscard]] bool UsesGlobalRegistry() const noexcept {
-        return shared != nullptr && shared != &local && shared->global_key != 0;
-    }
-
-private:
-    void MoveFrom(UdpSubInfo&& other) noexcept {
-        const bool uses_local = other.shared == &other.local;
-        local = std::move(other.local);
-        shared = uses_local ? &local : other.shared;
-        callback_id = other.callback_id;
-        last_target = std::move(other.last_target);
-
-        other.shared = nullptr;
-        other.callback_id = 0;
-    }
-};
-
 class TcpSubState final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
@@ -305,8 +257,8 @@ public:
     void MarkDispatchDone() {
         dispatch_done_ = true;
         PushEnd();
-        if (reply_queue_.active_tcp_loops > 0) {
-            --reply_queue_.active_tcp_loops;
+        if (reply_queue_.active_sub_loops > 0) {
+            --reply_queue_.active_sub_loops;
         }
     }
 
@@ -426,100 +378,265 @@ private:
 
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
 
-// ============================================================================
-// thread_local GlobalID 映射（per-Worker，接受跨 Worker 无法复用的限制）
-// ============================================================================
-thread_local memory::ThreadLocalUnorderedMap<uint64_t, SharedUdpDial>
-    g_global_id_map;
+class UdpSubState final
+    : public transport::MultiBufferReader
+    , public transport::MultiBufferWriter {
+public:
+    UdpSubState(
+        net::io_context& io_context,
+        uint16_t session_id,
+        ReplyQueueState& reply_queue,
+        uint64_t parent_conn_id)
+        : input_timer_(io_context)
+        , session_id_(session_id)
+        , reply_queue_(reply_queue)
+        , parent_conn_id_(parent_conn_id) {}
 
-void CleanupGlobalIdMap() {
-    // 每次新建 UDP 子会话时清理无引用条目（频率不高，无需限流）。
-    bool removed_idle = false;
-    for (auto it = g_global_id_map.begin(); it != g_global_id_map.end(); ) {
-        if (it->second.refs == 0) {
-            it = g_global_id_map.erase(it);
-            removed_idle = true;
-        } else {
-            ++it;
+    ~UdpSubState() noexcept override {
+        Cancel();
+    }
+
+    UdpSubState(const UdpSubState&) = delete;
+    UdpSubState& operator=(const UdpSubState&) = delete;
+
+    [[nodiscard]] bool PushClientPayload(
+        const TargetAddress& target,
+        std::span<const uint8_t> payload) {
+        if (payload.empty()) {
+            return true;
+        }
+        buf::MultiBuffer mb;
+        mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+        if (!AppendSpanToMultiBuffer(payload, mb)) {
+            return false;
+        }
+        for (buf::Buffer* buffer : mb) {
+            if (buffer && !buffer->IsEmpty()) {
+                buffer->SetUDP(target);
+            }
+        }
+        PushClientPayload(std::move(mb));
+        return true;
+    }
+
+    void PushClientPayload(buf::MultiBuffer mb) {
+        const size_t bytes = buf::TotalLen(mb);
+        if (cancelled_ || input_done_ || bytes == 0) {
+            mb.clear();
+            return;
+        }
+        if (queued_bytes_ + bytes > kMuxQueueEmergencyBytes) {
+            mb.clear();
+            Cancel();
+            return;
+        }
+        queued_bytes_ += bytes;
+        input_queue_.push_back(std::move(mb));
+        input_timer_.cancel();
+    }
+
+    void CloseClientInput() {
+        if (input_done_) {
+            return;
+        }
+        input_done_ = true;
+        input_timer_.cancel();
+    }
+
+    void MarkDispatchDone() {
+        dispatch_done_ = true;
+        PushEnd();
+        if (reply_queue_.active_sub_loops > 0) {
+            --reply_queue_.active_sub_loops;
         }
     }
-    if (removed_idle) {
-        MaybeShrinkHashContainer(g_global_id_map, 64);
-    }
-}
 
-SharedUdpDial* AcquireGlobalUdpDial(uint64_t key) {
-    auto it = g_global_id_map.find(key);
-    if (it == g_global_id_map.end()) {
-        return nullptr;
+    [[nodiscard]] bool DispatchDone() const noexcept {
+        return dispatch_done_;
     }
-    ++it->second.refs;
-    return &it->second;
-}
 
-SharedUdpDial* InsertGlobalUdpDial(uint64_t key,
-                                   std::array<uint8_t, 8> global_id,
-                                   UDPSession* dial) {
-    auto [it, inserted] = g_global_id_map.try_emplace(key);
-    (void)inserted;
-    it->second.dial = dial;
-    it->second.global_id = global_id;
-    it->second.global_key = key;
-    it->second.refs = 1;
-    return &it->second;
-}
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        while (!cancelled_) {
+            if (!input_queue_.empty()) {
+                buf::MultiBuffer mb = std::move(input_queue_.front());
+                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                input_queue_.pop_front();
+                if (input_queue_.empty()) {
+                    TryShrinkSequence(input_queue_);
+                }
+                co_return mb;
+            }
+            if (input_done_) {
+                co_return buf::MultiBuffer{};
+            }
 
-void ReleaseUdpSub(UdpSubInfo& sub) {
-    if (!sub.shared) {
-        return;
-    }
-    if (sub.callback_id != 0) {
-        if (sub.shared->dial) {
-            sub.shared->dial->UnregisterCallback(sub.callback_id);
+            input_timer_.expires_after(std::chrono::hours(24));
+            auto [ec] = co_await input_timer_.async_wait(
+                net::as_tuple(net::use_awaitable));
+            if (ec == io_error::operation_aborted) {
+                continue;
+            }
         }
-        sub.callback_id = 0;
+        co_return buf::MultiBuffer{};
     }
-    if (sub.UsesGlobalRegistry() && sub.shared->refs > 0) {
-        --sub.shared->refs;
-        if (sub.shared->refs == 0) {
-            g_global_id_map.erase(sub.shared->global_key);
-            MaybeShrinkHashContainer(g_global_id_map, 64);
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (cancelled_ || !reply_queue_.running) {
+            mb.clear();
+            co_return;
+        }
+
+        for (buf::Buffer*& buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
+                continue;
+            }
+            if (!buffer->HasUDP()) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
+                continue;
+            }
+
+            const size_t payload_bytes = buffer->Len();
+            if (!reply_queue_.CanPushUdp(payload_bytes)) {
+                const uint64_t dropped = ++reply_queue_.udp_dropped;
+                if (dropped % 100 == 1) {
+                    LOG_ACCESS_DEBUG(
+                        "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
+                        parent_conn_id_, dropped);
+                }
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
+                continue;
+            }
+
+            MuxReply reply;
+            reply.session_id = session_id_;
+            reply.is_end = false;
+            reply.is_udp = true;
+            reply.udp_src = buffer->udp;
+            reply.payload.push_back(buffer);
+            buffer = nullptr;
+            reply_queue_.PushUdpPrepared(
+                std::move(reply), payload_bytes + kMuxReplyOverhead);
+        }
+        mb.clear();
+        co_return;
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        PushEnd();
+        co_return;
+    }
+
+    void Cancel() noexcept {
+        if (cancelled_) {
+            return;
+        }
+        cancelled_ = true;
+        input_done_ = true;
+        input_timer_.cancel();
+        input_queue_.clear();
+        queued_bytes_ = 0;
+    }
+
+    void Close() {
+        Cancel();
+    }
+
+    session::Context ctx;
+
+private:
+    void PushEnd() {
+        if (end_sent_ || !reply_queue_.running) {
+            return;
+        }
+        MuxReply reply;
+        reply.session_id = session_id_;
+        reply.is_end = true;
+        end_sent_ = true;
+        if (!reply_queue_.PushTcp(std::move(reply))) {
+            reply_queue_.tcp_overflowed = true;
+            Cancel();
         }
     }
-    sub.shared = nullptr;
-    sub.local = SharedUdpDial{};
-}
+
+    net::steady_timer input_timer_;
+    uint16_t session_id_ = 0;
+    ReplyQueueState& reply_queue_;
+    uint64_t parent_conn_id_ = 0;
+    memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
+    size_t queued_bytes_ = 0;
+    bool input_done_ = false;
+    bool cancelled_ = false;
+    bool end_sent_ = false;
+    bool dispatch_done_ = false;
+};
+
+using UdpSubInfo = std::unique_ptr<UdpSubState>;
 
 net::awaitable<void> RunTcpSubDispatch(
     net::io_context& io_context,
-    ::acpp::features::outbound::Handler& outbound_handler,
+    routing::Dispatcher& dispatcher,
+    const proxyman::inbound::ReceiverSettings& receiver,
     TcpSubState* sub,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout,
     UDPRelayConfig config)
 {
-    TimeoutsConfig timeouts;
-    RelayConfig relay_config;
-    relay_config.uplink_only = timeouts.UplinkOnlyTimeout();
-    relay_config.downlink_only = timeouts.DownlinkOnlyTimeout();
-    relay_config.speed_limit = config.speed_limit;
-
+    (void)config;
     transport::Link link{
         static_cast<transport::MultiBufferReader*>(sub),
         static_cast<transport::MultiBufferWriter*>(sub)
     };
-    buf::MultiBuffer first_payload;
 
     try {
-        (void)co_await outbound_handler.Dispatch(
+        (void)co_await dispatcher.Dispatch(
             io_context,
-            sub->ctx.inbound.local_endpoint ? &*sub->ctx.inbound.local_endpoint : nullptr,
-            sub->ctx,
-            timeouts,
+            receiver,
+            nullptr,
             link,
-            relay_config,
-            std::span<const uint8_t>{},
-            first_payload,
-            timeouts.StreamIdleTimeout(),
-            timeouts.WriteTimeout());
+            InitialPayload{},
+            sub->ctx,
+            stats,
+            timeouts,
+            pressure_idle_timeout);
+    } catch (...) {
+        sub->Cancel();
+    }
+
+    sub->MarkDispatchDone();
+}
+
+net::awaitable<void> RunUdpSubDispatch(
+    net::io_context& io_context,
+    routing::Dispatcher& dispatcher,
+    const proxyman::inbound::ReceiverSettings& receiver,
+    UdpSubState* sub,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout,
+    UDPRelayConfig config)
+{
+    (void)config;
+    transport::Link link{
+        static_cast<transport::MultiBufferReader*>(sub),
+        static_cast<transport::MultiBufferWriter*>(sub)
+    };
+
+    try {
+        (void)co_await dispatcher.Dispatch(
+            io_context,
+            receiver,
+            nullptr,
+            link,
+            InitialPayload{},
+            sub->ctx,
+            stats,
+            timeouts,
+            pressure_idle_timeout);
     } catch (...) {
         sub->Cancel();
     }
@@ -537,11 +654,22 @@ net::awaitable<void> RunTcpSubDispatch(
 // ============================================================================
 net::awaitable<RelayResult> DoMuxRelay(
     net::io_context& io_context,
-    AsyncStream& client_stream,
-    ::acpp::features::outbound::Handler& outbound_handler,
+    transport::Link client_link,
+    AsyncStream* client_control,
+    routing::Dispatcher& dispatcher,
+    const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& parent_ctx,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout,
     const UDPRelayConfig& config)
 {
+    if (!client_link.Valid()) {
+        RelayResult error;
+        error.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+        co_return error;
+    }
+
     // 回包队列：单线程，无锁；running 保护回调不在 DoMuxRelay 退出后继续推送。
     ReplyQueueState reply_queue;
 
@@ -560,7 +688,6 @@ net::awaitable<RelayResult> DoMuxRelay(
     // 轮询定时器（100ms 打断读，回到循环排空回包队列）
     net::steady_timer timer(io_context);
     const uint64_t parent_conn_id = parent_ctx.conn_id;
-    AsyncStream* client_ptr = &client_stream;
 
     struct ReadPollState {
         bool timed_out = false;
@@ -606,14 +733,14 @@ net::awaitable<RelayResult> DoMuxRelay(
                     co_return false;
                 }
 
-                co_await client_stream.WriteMultiBuffer(std::move(frame_mb));
+                co_await client_link.writer->WriteMultiBuffer(std::move(frame_mb));
                 frame_mb.clear();
                 parent_ctx.traffic.bytes_down += frame_size;
                 result.bytes_down += frame_size;
                 release_write_frame();
                 co_return true;
             } catch (const IoSystemError&) {
-                if (ConsumeWriteSideTimeout(client_stream)) {
+                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
                     result.error = ErrorCode::RELAY_TIMEOUT;
                 }
                 release_write_frame();
@@ -636,8 +763,9 @@ net::awaitable<RelayResult> DoMuxRelay(
                 mux::EncodeEndTo(write_frame, reply.session_id);
                 // 子会话已结束，清理本地记录
                 if (auto udp_it = udp_subs.find(reply.session_id); udp_it != udp_subs.end()) {
-                    ReleaseUdpSub(udp_it->second);
-                    udp_subs.erase(udp_it);
+                    if (udp_it->second->DispatchDone()) {
+                        udp_subs.erase(udp_it);
+                    }
                 }
                 if (auto tcp_it = tcp_subs.find(reply.session_id); tcp_it != tcp_subs.end() &&
                     tcp_it->second->DispatchDone()) {
@@ -686,18 +814,18 @@ net::awaitable<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         read_poll.Reset();
         timer.expires_after(std::chrono::milliseconds(100));
-        timer.async_wait([&read_poll, client_ptr](
+        timer.async_wait([&read_poll, client_control](
                               const IoErrorCode& ec) {
-            if (!ec && read_poll.TakeActive()) {
+            if (!ec && client_control && read_poll.TakeActive()) {
                 read_poll.timed_out = true;
-                client_ptr->Cancel();
+                client_control->Cancel();
             }
         });
 
         buf::MultiBuffer read_mb;
         size_t read_bytes = 0;
         try {
-            read_mb = co_await client_stream.ReadMultiBuffer();
+            read_mb = co_await client_link.reader->ReadMultiBuffer();
             read_bytes = buf::TotalLen(read_mb);
             read_poll.MarkInactive();
             timer.cancel();
@@ -705,7 +833,7 @@ net::awaitable<RelayResult> DoMuxRelay(
             read_poll.MarkInactive();
             timer.cancel();
             if (read_poll.timed_out) {
-                if (ConsumeReadSideTimeout(client_stream)) {
+                if (client_control && ConsumeReadSideTimeout(*client_control)) {
                     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                     result.error = ErrorCode::RELAY_TIMEOUT;
                     running = false;
@@ -714,7 +842,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                 // 100ms 超时：继续排空回包队列
                 continue;
             }
-            if (ConsumeReadSideTimeout(client_stream)) {
+            if (client_control && ConsumeReadSideTimeout(*client_control)) {
                 LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                 result.error = ErrorCode::RELAY_TIMEOUT;
             }
@@ -724,7 +852,7 @@ net::awaitable<RelayResult> DoMuxRelay(
         }
 
         if (read_poll.timed_out && read_bytes == 0) {
-            if (ConsumeReadSideTimeout(client_stream)) {
+            if (client_control && ConsumeReadSideTimeout(*client_control)) {
                 LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                 result.error = ErrorCode::RELAY_TIMEOUT;
                 running = false;
@@ -734,7 +862,7 @@ net::awaitable<RelayResult> DoMuxRelay(
         }
 
         if (read_bytes == 0) {
-            if (ConsumeReadSideTimeout(client_stream)) {
+            if (client_control && ConsumeReadSideTimeout(*client_control)) {
                 LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                 result.error = ErrorCode::RELAY_TIMEOUT;
             }
@@ -791,115 +919,61 @@ net::awaitable<RelayResult> DoMuxRelay(
                     // ---- 新建 UDP 子会话 ----
                     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New UDP sid={}", hdr.session_id);
 
-                    // GlobalID 复用检查
-                    SharedUdpDial* shared = nullptr;
-                    SharedUdpDial local_udp;
-                    bool use_local_udp = false;
-                    if (hdr.has_global_id && !mux::IsNullGlobalId(hdr.global_id)) {
-                        CleanupGlobalIdMap();
-                        uint64_t gid_key = mux::GlobalIdToKey(hdr.global_id);
-                        shared = AcquireGlobalUdpDial(gid_key);
+                    uint16_t sid = hdr.session_id;
+                    if (!hdr.has_target || udp_subs.find(sid) != udp_subs.end()) {
+                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                        (void)co_await write_frame_to_client(write_frame);
+                        break;
                     }
 
-                    if (!shared) {
-                        // 新建 UDP 拨号
-                        UDPSession* udp_dial = co_await outbound_handler.DispatchUDP(parent_ctx);
-                        if (!udp_dial) {
-                            LOG_CONN_DEBUG(parent_ctx,
-                                "[MuxRelay] UDP dial failed sid={}", hdr.session_id);
-                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(write_frame);
-                            break;
-                        }
-                        if (hdr.has_global_id && !mux::IsNullGlobalId(hdr.global_id)) {
-                            shared = InsertGlobalUdpDial(
-                                mux::GlobalIdToKey(hdr.global_id),
-                                hdr.global_id,
-                                udp_dial);
-                        } else {
-                            local_udp.dial = udp_dial;
-                            shared = &local_udp;
-                            use_local_udp = true;
-                        }
+                    auto sub_state = std::make_unique<UdpSubState>(
+                        io_context, sid, reply_queue, parent_conn_id);
+                    auto& sub_ctx = sub_state->ctx;
+                    sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
+                    sub_ctx.worker_id                = parent_ctx.worker_id;
+                    sub_ctx.inbound.source_addr      = parent_ctx.inbound.source_addr;
+                    sub_ctx.inbound.source_port      = parent_ctx.inbound.source_port;
+                    sub_ctx.inbound.source_ip        = parent_ctx.inbound.source_ip;
+                    sub_ctx.inbound.local_endpoint   = parent_ctx.inbound.local_endpoint;
+                    sub_ctx.inbound.tag              = parent_ctx.inbound.tag;
+                    sub_ctx.inbound.tags             = parent_ctx.inbound.tags;
+                    sub_ctx.inbound.user_id          = parent_ctx.inbound.user_id;
+                    sub_ctx.inbound.user_email       = parent_ctx.inbound.user_email;
+                    sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
+                    sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
+                    sub_ctx.content.network          = Network::UDP;
+                    sub_ctx.outbound.original_target = hdr.target;
+                    sub_ctx.outbound.target          = hdr.target;
+
+                    if (payload && hdr.data_len > 0 &&
+                        !sub_state->PushClientPayload(
+                            hdr.target,
+                            std::span<const uint8_t>(payload, hdr.data_len))) {
+                        LOG_CONN_DEBUG(parent_ctx,
+                            "[MuxRelay] UDP payload buffer allocation failed sid={}", sid);
+                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                        (void)co_await write_frame_to_client(write_frame);
+                        break;
                     }
 
-                    // 注册回包回调，推入 reply_queue。
-                    // ReplyQueueState 自带 running 标志，退出时阻止继续推送。
-                    uint16_t sid       = hdr.session_id;
-                    auto*    rq        = &reply_queue;
-                    uint64_t cb_id = shared->dial->RegisterCallback(
-                        [rq, sid, parent_conn_id](UDPPacketView pkt) {
-                            if (!rq->running) return;
-                            LOG_ACCESS_DEBUG("[conn={}] [MuxRelay] UDP recv sid={} {}B",
-                                      parent_conn_id, sid, pkt.data.size());
-                            if (!rq->CanPushUdp(pkt.data.size())) {
-                                const uint64_t dropped = ++rq->udp_dropped;
-                                if (dropped % 100 == 1) {
-                                    LOG_ACCESS_DEBUG(
-                                        "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
-                                        parent_conn_id, dropped);
-                                }
-                                return;
-                            }
-                            MuxReply reply;
-                            reply.session_id = sid;
-                            reply.is_end     = false;
-                            reply.is_udp     = true;
-                            reply.udp_src    = pkt.target;
-                            if (pkt.data.size() <= buf::Buffer::kSize) {
-                                buf::BufferGuard payload_buf{buf::Buffer::New()};
-                                if (!payload_buf) {
-                                    const uint64_t dropped = ++rq->udp_dropped;
-                                    if (dropped % 100 == 1) {
-                                        LOG_ACCESS_DEBUG(
-                                            "[conn={}] [MuxRelay] UDP reply buffer alloc failed, dropped {} packets",
-                                            parent_conn_id, dropped);
-                                    }
-                                    return;
-                                }
-                                std::memcpy(payload_buf->Tail().data(), pkt.data.data(), pkt.data.size());
-                                payload_buf->Produce(static_cast<uint32_t>(pkt.data.size()));
-                                reply.payload.push_back(payload_buf.release());
-                            } else {
-                                if (!AppendSpanToMultiBuffer(pkt.data, reply.payload)) {
-                                    const uint64_t dropped = ++rq->udp_dropped;
-                                    if (dropped % 100 == 1) {
-                                        LOG_ACCESS_DEBUG(
-                                            "[conn={}] [MuxRelay] UDP reply buffer alloc failed, dropped {} packets",
-                                            parent_conn_id, dropped);
-                                    }
-                                    return;
-                                }
-                            }
-                            rq->PushUdpPrepared(
-                                std::move(reply),
-                                pkt.data.size() + kMuxReplyOverhead);
-                        });
+                    auto [insert_it, inserted] = udp_subs.try_emplace(
+                        sid,
+                        std::move(sub_state));
+                    (void)inserted;
+                    UdpSubState* sub_ptr = insert_it->second.get();
 
-                    UdpSubInfo sub;
-                    if (use_local_udp) {
-                        sub.local = std::move(local_udp);
-                        sub.shared = &sub.local;
-                    } else {
-                        sub.shared = shared;
-                    }
-                    sub.callback_id = cb_id;
-                    if (hdr.has_target) sub.last_target = hdr.target;
-
-                    // 转发首包数据
-                    if (payload && hdr.data_len > 0 && hdr.has_target) {
-                        try {
-                            co_await sub.shared->dial->SendTo(
-                                hdr.target, payload, hdr.data_len, cb_id);
-                        }
-                        catch (...) {}
-                    }
-
-                    if (auto old = udp_subs.find(hdr.session_id); old != udp_subs.end()) {
-                        ReleaseUdpSub(old->second);
-                        udp_subs.erase(old);
-                    }
-                    udp_subs.emplace(hdr.session_id, std::move(sub));
+                    ++reply_queue.active_sub_loops;
+                    net::co_spawn(io_context.get_executor(),
+                        RunUdpSubDispatch(
+                            io_context,
+                            dispatcher,
+                            receiver,
+                            sub_ptr,
+                            stats,
+                            timeouts,
+                            pressure_idle_timeout,
+                            config),
+                        net::detached);
 
                 } else {
                     // ---- 新建 TCP 子会话 ----
@@ -924,7 +998,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                     auto sub_state = std::make_unique<TcpSubState>(
                         io_context, sid, reply_queue);
                     auto& sub_ctx = sub_state->ctx;
-                    sub_ctx.conn_id                  = parent_ctx.conn_id;
+                    sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
                     sub_ctx.worker_id                = parent_ctx.worker_id;
                     sub_ctx.inbound.source_addr      = parent_ctx.inbound.source_addr;
                     sub_ctx.inbound.source_port      = parent_ctx.inbound.source_port;
@@ -958,12 +1032,19 @@ net::awaitable<RelayResult> DoMuxRelay(
                     (void)inserted;
                     TcpSubState* sub_ptr = insert_it->second.get();
 
-                    // 启动 outbound.Process；DoMuxRelay 退出前等待 active_tcp_loops
+                    // 启动 dispatcher.Dispatch；DoMuxRelay 退出前等待 active_sub_loops
                     // 归零，保证 TcpSubState 生命周期覆盖 detached coroutine。
-                    ++reply_queue.active_tcp_loops;
+                    ++reply_queue.active_sub_loops;
                     net::co_spawn(io_context.get_executor(),
                         RunTcpSubDispatch(
-                            io_context, outbound_handler, sub_ptr, config),
+                            io_context,
+                            dispatcher,
+                            receiver,
+                            sub_ptr,
+                            stats,
+                            timeouts,
+                            pressure_idle_timeout,
+                            config),
                         net::detached);
                 }
                 break;
@@ -975,14 +1056,11 @@ net::awaitable<RelayResult> DoMuxRelay(
                     // UDP 数据包（携带目标/源地址）
                     auto it = udp_subs.find(hdr.session_id);
                     if (it != udp_subs.end() && payload && hdr.data_len > 0) {
-                        it->second.last_target = hdr.target;
-                        try {
-                            co_await it->second.shared->dial->SendTo(
+                        if (!it->second->PushClientPayload(
                                 hdr.target,
-                                payload,
-                                hdr.data_len,
-                                it->second.callback_id);
-                        } catch (...) {}
+                                std::span<const uint8_t>(payload, hdr.data_len))) {
+                            it->second->Cancel();
+                        }
                     }
                 } else {
                     // TCP 数据
@@ -1012,8 +1090,10 @@ net::awaitable<RelayResult> DoMuxRelay(
                 // 注销 UDP 子会话
                 auto udp_it = udp_subs.find(sid);
                 if (udp_it != udp_subs.end()) {
-                    ReleaseUdpSub(udp_it->second);
-                    udp_subs.erase(udp_it);
+                    udp_it->second->CloseClientInput();
+                    if (udp_it->second->DispatchDone()) {
+                        udp_subs.erase(udp_it);
+                    }
                 }
 
                 // 取消 TCP 子会话
@@ -1060,12 +1140,12 @@ net::awaitable<RelayResult> DoMuxRelay(
         udp_subs.size(), tcp_subs.size());
 
     for (auto& [sid, udp_sub] : udp_subs) {
-        ReleaseUdpSub(udp_sub);
+        udp_sub->Cancel();
     }
     for (auto& [sid, tcp_sub] : tcp_subs) {
         tcp_sub->Cancel();
     }
-    while (reply_queue.active_tcp_loops > 0) {
+    while (reply_queue.active_sub_loops > 0) {
         co_await net::post(io_context.get_executor(), net::use_awaitable);
     }
 

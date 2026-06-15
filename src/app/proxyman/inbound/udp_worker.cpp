@@ -1,9 +1,9 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
 
-#include "acppnode/app/udp_session.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 
+#include <asio/steady_timer.hpp>
 #include <deque>
 #include <unordered_map>
 
@@ -40,8 +40,7 @@ struct UdpReplyQueueState {
 };
 
 struct UdpClientSession {
-    UDPSession* udp_dial = nullptr;
-    uint64_t callback_id = 0;
+    UdpWorker::ClientSessionPtr link;
     int64_t user_id = 0;
     std::chrono::steady_clock::time_point last_active;
 };
@@ -65,6 +64,133 @@ struct UdpSocketDeleter {
 using UdpSocketPtr = std::unique_ptr<udp::socket, UdpSocketDeleter>;
 
 }  // namespace
+
+struct UdpWorker::ClientSession::Impl {
+    Impl(net::io_context& io_context,
+         ReplyCallback reply_callback,
+         int64_t user_id)
+        : wake(io_context)
+        , reply_callback(std::move(reply_callback))
+        , user_id(user_id) {
+        wake.expires_at(net::steady_timer::time_point::max());
+    }
+
+    net::steady_timer wake;
+    ReplyCallback reply_callback;
+    std::deque<buf::MultiBuffer> input_queue;
+    size_t queued_bytes = 0;
+    bool shrink_queue_on_drain = false;
+    bool closed = false;
+    int64_t user_id = 0;
+};
+
+UdpWorker::ClientSession::ClientSession(
+    net::io_context& io_context,
+    ReplyCallback reply_callback,
+    int64_t user_id)
+    : impl_(std::make_unique<Impl>(
+          io_context, std::move(reply_callback), user_id)) {}
+
+UdpWorker::ClientSession::~ClientSession() noexcept {
+    Close();
+}
+
+int64_t UdpWorker::ClientSession::UserId() const noexcept {
+    return impl_->user_id;
+}
+
+bool UdpWorker::ClientSession::Closed() const noexcept {
+    return impl_->closed;
+}
+
+void UdpWorker::ClientSession::Push(
+    const TargetAddress& target,
+    buf::MultiBuffer payload) {
+    const size_t payload_size = buf::TotalLen(payload);
+    if (impl_->closed || payload_size == 0) {
+        payload.clear();
+        return;
+    }
+    if (impl_->queued_bytes + payload_size > 512 * 1024) {
+        payload.clear();
+        return;
+    }
+
+    for (buf::Buffer* buffer : payload) {
+        if (buffer && !buffer->IsEmpty()) {
+            buffer->SetUDP(target);
+        }
+    }
+
+    impl_->queued_bytes += payload_size;
+    impl_->input_queue.push_back(std::move(payload));
+    if (impl_->input_queue.size() >= 64 || impl_->queued_bytes >= 256 * 1024) {
+        impl_->shrink_queue_on_drain = true;
+    }
+    impl_->wake.cancel();
+}
+
+void UdpWorker::ClientSession::Close() noexcept {
+    if (impl_->closed) {
+        return;
+    }
+    impl_->closed = true;
+    impl_->input_queue.clear();
+    impl_->queued_bytes = 0;
+    IoErrorCode ec;
+    impl_->wake.cancel(ec);
+}
+
+net::awaitable<buf::MultiBuffer>
+UdpWorker::ClientSession::ReadMultiBuffer() {
+    while (true) {
+        if (!impl_->input_queue.empty()) {
+            buf::MultiBuffer mb = std::move(impl_->input_queue.front());
+            impl_->queued_bytes -= std::min(
+                impl_->queued_bytes, buf::TotalLen(mb));
+            impl_->input_queue.pop_front();
+            if (impl_->input_queue.empty() && impl_->shrink_queue_on_drain) {
+                TryShrinkSequence(impl_->input_queue);
+                impl_->shrink_queue_on_drain = false;
+            }
+            co_return mb;
+        }
+
+        if (impl_->closed) {
+            co_return buf::MultiBuffer{};
+        }
+
+        impl_->wake.expires_at(net::steady_timer::time_point::max());
+        auto [ec] = co_await impl_->wake.async_wait(
+            net::as_tuple(net::use_awaitable));
+        if (ec == io_error::operation_aborted) {
+            continue;
+        }
+        if (ec) {
+            co_return buf::MultiBuffer{};
+        }
+    }
+}
+
+net::awaitable<void>
+UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
+    if (impl_->closed || !impl_->reply_callback) {
+        mb.clear();
+        co_return;
+    }
+
+    for (buf::Buffer* buffer : mb) {
+        if (!buffer || buffer->IsEmpty() || !buffer->HasUDP()) {
+            continue;
+        }
+        impl_->reply_callback(UDPPacketView{
+            buffer->udp,
+            buffer->Bytes(),
+        });
+    }
+    mb.clear();
+    co_return;
+}
 
 struct UdpWorker::Impl {
     using UdpSocketMap =
@@ -211,64 +337,65 @@ void UdpWorker::ClearReplyQueue(const std::string& socket_key) {
 
 bool UdpWorker::HasClientSession(const std::string& socket_key,
                                  const UdpEndpointKey& client_key) const noexcept {
-    auto sessions_it = impl_->client_sessions.find(socket_key);
-    if (sessions_it == impl_->client_sessions.end()) {
-        return false;
-    }
-    auto session_it = sessions_it->second.find(client_key);
-    return session_it != sessions_it->second.end() &&
-           session_it->second.udp_dial != nullptr;
+    auto session = FindClientSession(socket_key, client_key);
+    return session && !session->Closed();
 }
 
-void UdpWorker::UpsertClientSession(
+UdpWorker::ClientSessionPtr UdpWorker::FindClientSession(
+    const std::string& socket_key,
+    const UdpEndpointKey& client_key) const noexcept {
+    auto sessions_it = impl_->client_sessions.find(socket_key);
+    if (sessions_it == impl_->client_sessions.end()) {
+        return nullptr;
+    }
+    auto session_it = sessions_it->second.find(client_key);
+    if (session_it == sessions_it->second.end()) {
+        return nullptr;
+    }
+    return session_it->second.link;
+}
+
+UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
     const std::string& socket_key,
     const UdpEndpointKey& client_key,
-    UDPSession& session,
-    uint64_t response_callback,
+    net::io_context& io_context,
+    ReplyCallback reply_callback,
     int64_t user_id,
     std::chrono::steady_clock::time_point now) {
+    auto session = std::make_shared<ClientSession>(
+        io_context, std::move(reply_callback), user_id);
     auto& sessions = impl_->client_sessions[socket_key];
     sessions.insert_or_assign(client_key, UdpClientSession{
-        .udp_dial = &session,
-        .callback_id = response_callback,
+        .link = session,
         .user_id = user_id,
         .last_active = now,
     });
+    return session;
 }
 
-net::awaitable<UdpWorker::UdpClientSendResult>
-UdpWorker::SendToClientSession(
+bool UdpWorker::PushClientPayload(
     const std::string& socket_key,
     const UdpEndpointKey& client_key,
     const TargetAddress& target,
     buf::MultiBuffer payload,
-    std::chrono::steady_clock::time_point now,
-    std::chrono::seconds idle_timeout) {
+    std::chrono::steady_clock::time_point now) {
     auto sessions_it = impl_->client_sessions.find(socket_key);
     if (sessions_it == impl_->client_sessions.end()) {
         payload.clear();
-        co_return UdpClientSendResult{};
+        return false;
     }
     auto session_it = sessions_it->second.find(client_key);
-    if (session_it == sessions_it->second.end() || !session_it->second.udp_dial) {
+    if (session_it == sessions_it->second.end() ||
+        !session_it->second.link ||
+        session_it->second.link->Closed()) {
         payload.clear();
-        co_return UdpClientSendResult{};
+        return false;
     }
 
     auto& session = session_it->second;
     session.last_active = now;
-    UdpClientSendResult result;
-    result.found = true;
-    result.user_id = session.user_id;
-    result.error = co_await session.udp_dial->SendTo(
-        target,
-        std::move(payload),
-        session.callback_id);
-    if (result.error != ErrorCode::OK && result.error != ErrorCode::SUCCESS &&
-        idle_timeout.count() > 0) {
-        session.last_active -= idle_timeout;
-    }
-    co_return result;
+    session.link->Push(target, std::move(payload));
+    return true;
 }
 
 void UdpWorker::CleanupIdleClientSessions(
@@ -287,8 +414,8 @@ void UdpWorker::CleanupIdleClientSessions(
     bool removed_idle_session = false;
     for (auto it = sessions_it->second.begin(); it != sessions_it->second.end();) {
         if (now - it->second.last_active > idle_timeout) {
-            if (it->second.callback_id && it->second.udp_dial) {
-                it->second.udp_dial->UnregisterCallback(it->second.callback_id);
+            if (it->second.link) {
+                it->second.link->Close();
             }
             it = sessions_it->second.erase(it);
             removed_idle_session = true;
@@ -309,8 +436,8 @@ void UdpWorker::CleanupClientSessions(const std::string& socket_key) {
 
     for (auto& [client_key, session] : sessions_it->second) {
         (void)client_key;
-        if (session.callback_id && session.udp_dial) {
-            session.udp_dial->UnregisterCallback(session.callback_id);
+        if (session.link) {
+            session.link->Close();
         }
     }
 

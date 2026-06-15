@@ -46,15 +46,6 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    [[nodiscard]] net::awaitable<RelayResult> DispatchMux(
-        net::io_context& io_context,
-        AsyncStream& inbound_stream,
-        session::Context& ctx,
-        const UDPRelayConfig& relay_config) override;
-
-    [[nodiscard]] net::awaitable<UDPSession*> DispatchUDP(
-        session::Context& ctx) override;
-
 private:
     std::string tag_;
     std::unique_ptr<Outbound> proxy_;

@@ -16,6 +16,7 @@
 #include <vector>
 
 namespace acpp {
+class UDPSession;
 class UDPSessionManager;
 
 namespace app::dns {
@@ -60,9 +61,6 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    // UDP 拨号（Full Cone NAT）：返回 Worker 的 UDPSession*（nullptr=失败）。
-    net::awaitable<::acpp::UDPSession*> DialUDP(session::Context& ctx) override;
-
     std::string_view Tag() const noexcept override { return tag_; }
 
     enum class DomainStrategy : uint8_t {
@@ -89,8 +87,8 @@ private:
         const tcp::endpoint* inbound_local_addr,
         const net::ip::address& remote_addr);
 
-    // 取得（或创建）当前 Worker 的 Full Cone UDP socket。Process 的 UDP 数据面
-    // 与 Mux 用的 DialUDP 共用同一获取逻辑；返回 nullptr 表示拨号失败。
+    // 取得（或创建）当前 Worker 的 Full Cone UDP socket。仅由 Process 的
+    // UDP 数据面调用；返回 nullptr 表示拨号失败。
     ::acpp::UDPSession* AcquireUdpSession(session::Context& ctx);
 
     std::string tag_;

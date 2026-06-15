@@ -1148,12 +1148,11 @@ void Worker::ListenerState::StartUdpListening(
 // ============================================================================
 // UdpReceiveLoop — 通用 UDP 数据报收发主循环（协议无关）
 //
-// 设计参考 Xray Cone 模式：
-//   - 每个客户端 (IP:port) 维护一个出站 UDPSession（首包建立，后续复用）
-//   - 协议解码/ban 检查/认证失败记录 完全委托给 Shadowsocks inbound Handler
-//     （直接调用）
-//   - 回包编码所需的 key/cipher 由 Decode 结果携带，Worker 无需感知协议细节
-//   - 会话空闲超过配置的 session idle 后下次收包时懒清理
+// 设计参考 xray-core transport/internet/udp.Dispatcher：
+//   - Worker 只做 UDP socket 收发与 inbound UDP datagram decode/encode。
+//   - 每个客户端 (IP:port) 维护一个 transport::Link，首包创建后交给
+//     dispatcher.Dispatch；路由、出站选择和 UDP relay 均在主链路内完成。
+//   - 会话空闲超过配置的 session idle 后关闭 link，relay 自然退出。
 // ============================================================================
 
 net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
@@ -1221,83 +1220,119 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
         bool need_new_session = !udp_worker->HasClientSession(socket_key, client_key);
 
         if (need_new_session) {
-            // 路由决策
-            session::Context ctx;
-            ctx.conn_id = session::NewID(worker.id_);
-            ctx.worker_id = worker.id_;
-            ctx.inbound.tag      = tag;
-            if (listener) {
-                ctx.inbound.tags = listener->RouteInboundTags();
+            if (!decoded->response_context) {
+                LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
+                                 worker.id_, client_key_log());
+                continue;
             }
-            ctx.inbound.source_ip        = client_ip;
-            ctx.inbound.source_addr      = normalized_client_addr;
-            ctx.inbound.source_port      = client_ep.port();
+
+            auto receiver = std::make_shared<proxyman::inbound::ReceiverSettings>();
+            if (listener) {
+                *receiver = *listener;
+            } else {
+                receiver->inbound_tag = tag;
+                receiver->inbound_tags = {tag};
+            }
+
+            auto ctx = std::make_shared<session::Context>();
+            ctx->conn_id = session::NewID(worker.id_);
+            ctx->worker_id = worker.id_;
+            ctx->inbound.tag = receiver->inbound_tag.empty()
+                ? std::string_view(tag)
+                : std::string_view(receiver->inbound_tag);
+            ctx->inbound.tags = receiver->RouteInboundTags();
+            ctx->inbound.source_ip        = client_ip;
+            ctx->inbound.source_addr      = normalized_client_addr;
+            ctx->inbound.source_port      = client_ep.port();
             if (sock) {
                 IoErrorCode local_ec;
                 const auto local_ep = sock->local_endpoint(local_ec);
                 if (!local_ec && !local_ep.address().is_unspecified()) {
                     const auto local_addr = iputil::NormalizeAddress(local_ep.address());
-                    ctx.inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
+                    ctx->inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
                 }
             }
-            ctx.content.network          = Network::UDP;
-            ctx.outbound.original_target           = decoded->target;
-            ctx.outbound.target                    = decoded->target;
-            ctx.inbound.user_id          = decoded->user_id;
-            ctx.inbound.user_email       = decoded->user_email;
-            ctx.content.speed_limit      = decoded->speed_limit;
+            ctx->content.network          = Network::UDP;
+            ctx->outbound.original_target = decoded->target;
+            ctx->outbound.target          = decoded->target;
+            ctx->inbound.user_id          = decoded->user_id;
+            ctx->inbound.user_email       = decoded->user_email;
+            ctx->content.speed_limit      = decoded->speed_limit;
 
-            UDPSession* udp_result = co_await worker.runtime_->dispatcher->DispatchUDP(ctx, listener);
-            if (!udp_result) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP DialUDP failed for client={}", worker.id_, client_key_log());
-                continue;
-            }
-
-            // ── 注册回包回调：协议编码后 send_to 客户端 ──────────────────
-            // response_context 为协议私有不透明对象，Worker 只负责回传给 handler。
             auto response_context = decoded->response_context;
-            if (!response_context) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
-                                 worker.id_, client_key_log());
-                continue;
-            }
             udp::endpoint ep_copy  = client_ep;
-            // 回调在 StopUdpListening 清理客户端会话时注销，生命周期短于本接收协程的 socket_key。
-            const std::string* socket_key_ref = &socket_key;
+            std::string socket_key_copy = socket_key;
             const uint32_t worker_id = worker.id_;
 
-            uint64_t cb_id = 0;
-            auto reply_cb = [this, socket_key_ref, sock, ep_copy,
+            auto reply_cb = [this, socket_key_copy = std::move(socket_key_copy), sock, ep_copy,
                              handler, response_context, worker_id](UDPPacketView pkt) {
                 auto payload = handler->EncodeUdpResponse(pkt, *response_context);
                 if (payload.empty()) return;
-                EnqueueUdpReply(*socket_key_ref, sock, ep_copy, std::move(payload), worker_id);
+                EnqueueUdpReply(socket_key_copy, sock, ep_copy, std::move(payload), worker_id);
             };
 
-            cb_id = udp_result->RegisterCallback(std::move(reply_cb));
+            auto client_session = udp_worker->CreateClientSession(
+                socket_key,
+                client_key,
+                worker.runtime_->io_context,
+                std::move(reply_cb),
+                decoded->user_id,
+                now);
 
-            LOG_ACCESS(FormatAccessLog(ctx));
-
-            udp_worker->UpsertClientSession(
-                socket_key, client_key, *udp_result, cb_id, decoded->user_id, now);
+            auto dispatcher = worker.runtime_->dispatcher.get();
+            auto runtime_snapshot_for_dispatch = runtime_snapshot;
+            auto& io_context = worker.runtime_->io_context;
+            auto& stats = worker.runtime_->stats;
+            const uint32_t dispatch_worker_id = worker.id_;
+            net::co_spawn(
+                io_context.get_executor(),
+                [dispatcher,
+                 &io_context,
+                 &stats,
+                 receiver,
+                 ctx,
+                 client_session,
+                 runtime_snapshot_for_dispatch,
+                 dispatch_worker_id]() -> net::awaitable<void> {
+                    try {
+                        RelayResult relay_result = co_await dispatcher->Dispatch(
+                            io_context,
+                            *receiver,
+                            nullptr,
+                            transport::Link{client_session.get(), client_session.get()},
+                            InitialPayload{},
+                            *ctx,
+                            stats,
+                            runtime_snapshot_for_dispatch->timeouts,
+                            0);
+                        if (relay_result.error != ErrorCode::OK) {
+                            auto& log_ctx = *ctx;
+                            LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",
+                                           ErrorCodeToString(relay_result.error),
+                                           relay_result.bytes_up,
+                                           relay_result.bytes_down);
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
+                                  dispatch_worker_id, e.what());
+                    } catch (...) {
+                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
+                                  dispatch_worker_id);
+                    }
+                    client_session->Close();
+                    co_return;
+                },
+                net::detached);
         }
 
-        // ── 发往出站 ──────────────────────────────────────────────────────
-        const size_t payload_size = buf::TotalLen(decoded->payload);
-        auto send_result = co_await udp_worker->SendToClientSession(
+        if (!udp_worker->PushClientPayload(
             socket_key,
             client_key,
             decoded->target,
             std::move(decoded->payload),
-            now,
-            session_idle_timeout);
-        auto send_ec = send_result.error;
-        if (send_ec != ErrorCode::OK && send_ec != ErrorCode::SUCCESS) {
-            LOG_ACCESS_DEBUG("Worker[{}]: UDP send failed for client={}", worker.id_, client_key_log());
-        } else {
-            // 流量统计（上行：客户端发送的原始载荷）
-            worker.AddUserTraffic(tag, send_result.user_id,
-                                  static_cast<uint64_t>(payload_size), 0);
+            now)) {
+            LOG_ACCESS_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
+                             worker.id_, client_key_log());
         }
     }
 }

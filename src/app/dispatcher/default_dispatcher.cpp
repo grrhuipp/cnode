@@ -11,6 +11,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/app/router/router.hpp"
+#include "acppnode/common/mux/mux_relay.hpp"
 #include "acppnode/sniff/sniffer.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
@@ -184,6 +185,42 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
 
+    if (ctx.content.network == Network::MUX) {
+        LOG_ACCESS(FormatAccessLog(ctx));
+
+        const auto relay_idle_timeout = ResolveRelayIdleTimeout(
+            timeouts, pressure_idle_timeout);
+        if (inbound_endpoint) {
+            inbound_endpoint->SetIdleTimeout(relay_idle_timeout);
+            inbound_endpoint->SetReadTimeout(std::chrono::seconds(0));
+            inbound_endpoint->SetWriteTimeout(
+                std::min(timeouts.WriteTimeout(), relay_idle_timeout));
+        }
+
+        UDPRelayConfig mux_cfg;
+        mux_cfg.speed_limit = ctx.content.speed_limit;
+
+        ActiveSessionScope relay_scope{ctx, session_tracking_};
+        auto relay_result = co_await mux::DoMuxRelay(
+            io_context,
+            transport::Link{inbound_reader, inbound_writer, inbound_control},
+            inbound_control,
+            *this,
+            receiver,
+            ctx,
+            stats,
+            timeouts,
+            pressure_idle_timeout,
+            mux_cfg);
+        if (relay_result.error != ErrorCode::OK) {
+            LOG_CONN_DEBUG(ctx, "[Session] Mux relay end: {} up={}B down={}B target={}",
+                           ErrorCodeToString(relay_result.error),
+                           ctx.traffic.bytes_up, ctx.traffic.bytes_down,
+                           ctx.outbound.target);
+        }
+        co_return relay_result;
+    }
+
     std::span<const uint8_t> sniff_data;
     memory::ByteVector sniff_scratch;
     if (receiver.sniff_config.enabled && !first_packet.empty()) {
@@ -261,41 +298,6 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> outbound.Process -> relay。
     // UDP 数据面（Full Cone + framer）下沉到 UDP-capable 出站的 Process，由下方
     // 通用路径设置入站 idle/write timeout 并调用 outbound_handler->Dispatch。
-
-    if (ctx.content.network == Network::MUX) {
-        LOG_ACCESS(FormatAccessLog(ctx));
-
-        if (has_protocol_link) {
-            stats.OnError();
-            co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-
-        std::unique_ptr<AsyncStream> wrapped_in = std::move(inbound);
-        if (!wrapped_in) {
-            stats.OnError();
-            co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        const auto relay_idle_timeout = ResolveRelayIdleTimeout(
-            timeouts, pressure_idle_timeout);
-        wrapped_in->SetIdleTimeout(relay_idle_timeout);
-        wrapped_in->SetReadTimeout(std::chrono::seconds(0));
-        wrapped_in->SetWriteTimeout(
-            std::min(timeouts.WriteTimeout(), relay_idle_timeout));
-
-        UDPRelayConfig mux_cfg;
-        mux_cfg.speed_limit = ctx.content.speed_limit;
-
-        ActiveSessionScope relay_scope{ctx, session_tracking_};
-        auto relay_result = co_await outbound_handler->DispatchMux(
-            io_context, *wrapped_in, ctx, mux_cfg);
-        if (relay_result.error != ErrorCode::OK) {
-            LOG_CONN_DEBUG(ctx, "[Session] Mux relay end: {} up={}B down={}B target={}",
-                           ErrorCodeToString(relay_result.error),
-                           ctx.traffic.bytes_up, ctx.traffic.bytes_down,
-                           ctx.outbound.target);
-        }
-        co_return relay_result;
-    }
 
     std::optional<tcp::endpoint> inbound_local_addr =
         inbound_endpoint ? inbound_endpoint->LocalEndpoint() : std::nullopt;
@@ -513,16 +515,6 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
         co_return FinishRoute(ctx, select_with_addresses(addresses));
     }
     co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
-}
-
-net::awaitable<UDPSession*> DefaultDispatcher::DispatchUDP(
-    session::Context& ctx,
-    const proxyman::inbound::ReceiverSettings* receiver) {
-    const routing::DispatchResult dispatch = co_await RouteAsync(ctx, receiver);
-    if (dispatch.error != ErrorCode::OK || !dispatch.handler) {
-        co_return nullptr;
-    }
-    co_return co_await dispatch.handler->DispatchUDP(ctx);
 }
 
 }  // namespace acpp::app::dispatcher

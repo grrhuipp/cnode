@@ -68,10 +68,6 @@ public:
         const proxyman::inbound::ReceiverSettings& receiver) const noexcept override;
     [[nodiscard]] routing::DispatchResult Route(session::Context& ctx) const noexcept override;
 
-    [[nodiscard]] net::awaitable<UDPSession*> DispatchUDP(
-        session::Context& ctx,
-        const proxyman::inbound::ReceiverSettings* receiver = nullptr) override;
-
 private:
     struct RouteSelection {
         std::string_view outbound_tag;

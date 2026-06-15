@@ -382,20 +382,6 @@ UDPSession* Handler::AcquireUdpSession(session::Context& ctx) {
     return session;
 }
 
-// DialUDP 仅服务 Mux 的多路 UDP 子会话拨号（common/mux）。主 UDP 数据面已通过
-// Process -> DoUDPRelayLink 收敛；Mux UDP-over-Process 是后续切片。
-net::awaitable<UDPSession*> Handler::DialUDP(session::Context& ctx) {
-    if (!settings_.enable_udp) {
-        co_return nullptr;
-    }
-    try {
-        co_return AcquireUdpSession(ctx);
-    } catch (const std::exception& e) {
-        LOG_CONN_FAIL("Freedom UDP dial failed: {}", e.what());
-        co_return nullptr;
-    }
-}
-
 net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
 Handler::ResolveTargets(session::Context& ctx) {
     const auto& target = ctx.outbound.target;

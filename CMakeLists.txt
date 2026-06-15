@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # 抑制第三方依赖的 cmake_minimum_required 过旧警告
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
 project(cnode VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -96,6 +97,8 @@ target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE)
 set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
 set(BUILD_TOOL OFF CACHE BOOL "Disable AWS-LC bssl tool" FORCE)
 set(DISABLE_GO ON CACHE BOOL "Disable AWS-LC Go helpers" FORCE)
+unset(ENABLE_PRE_SONAME_BUILD CACHE)
+unset(ENABLE_PRE_SONAME_BUILD)
 if(CNODE_AWSLC_NO_ASM)
     set(OPENSSL_NO_ASM ON CACHE BOOL "Disable AWS-LC assembly" FORCE)
     set(DISABLE_PERL ON CACHE BOOL "Disable AWS-LC Perl assembly generation" FORCE)

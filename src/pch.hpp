@@ -32,7 +32,14 @@
 #include <asio/detached.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/ip/udp.hpp>
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
+#endif
 #include <asio/ssl.hpp>
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 #include <asio/steady_timer.hpp>
 
 // Windows 宏污染清理

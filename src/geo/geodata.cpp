@@ -706,8 +706,7 @@ bool GeoIPLoader::LoadIndex() {
                     auto [cc_data, cc_len] = ReadLengthDelimited(entry_ptr, entry_end);
                     country_code.assign(unsafe::ptr_cast<const char>(cc_data), cc_len);
                     // 转小写
-                    std::transform(country_code.begin(), country_code.end(),
-                                   country_code.begin(), ::tolower);
+                    std::ranges::transform(country_code, country_code.begin(), LowerAscii);
                 } else if (sub_field == 2 && sub_wire == 2) {
                     // CIDR (skip for now, just record position)
                     SkipField(entry_ptr, entry_end, sub_wire);
@@ -733,8 +732,7 @@ bool GeoIPLoader::LoadIndex() {
 }
 
 GeoIPData* GeoIPLoader::Get(const std::string& tag) {
-    std::string lower_tag = tag;
-    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+    std::string lower_tag = LowerTag(tag);
 
     // 快速路径：启动预加载完成后不需要锁
     if (finalized_) {
@@ -861,8 +859,7 @@ bool GeoIPLoader::HasTag(const std::string& tag) {
         LoadIndex();
     }
 
-    std::string lower_tag = tag;
-    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+    std::string lower_tag = LowerTag(tag);
     return tag_index_.count(lower_tag) > 0;
 }
 
@@ -935,8 +932,7 @@ bool GeoSiteLoader::LoadIndex() {
                 if (sub_field == 1 && sub_wire == 2) {
                     auto [cc_data, cc_len] = ReadLengthDelimited(entry_ptr, entry_end);
                     country_code.assign(unsafe::ptr_cast<const char>(cc_data), cc_len);
-                    std::transform(country_code.begin(), country_code.end(),
-                                   country_code.begin(), ::tolower);
+                    std::ranges::transform(country_code, country_code.begin(), LowerAscii);
                 } else {
                     SkipField(entry_ptr, entry_end, sub_wire);
                 }
@@ -959,8 +955,7 @@ bool GeoSiteLoader::LoadIndex() {
 }
 
 GeoSiteData* GeoSiteLoader::Get(const std::string& tag) {
-    std::string lower_tag = tag;
-    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+    std::string lower_tag = LowerTag(tag);
 
     // 快速路径：启动预加载完成后不需要锁
     if (finalized_) {
@@ -1083,8 +1078,7 @@ bool GeoSiteLoader::HasTag(const std::string& tag) {
         LoadIndex();
     }
 
-    std::string lower_tag = tag;
-    std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+    std::string lower_tag = LowerTag(tag);
     return tag_index_.count(lower_tag) > 0;
 }
 
