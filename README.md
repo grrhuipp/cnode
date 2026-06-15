@@ -104,6 +104,33 @@ geosite.dat
 
 仓库 `config/*.json.example` 只作为样例文件；实际部署和目录模式读取的文件名不带 `.example`，固定为 `config.json`、`inbounds.json`、`outbounds.json`、`routing.json`。
 
+推荐的部署目录组织方式：
+
+```text
+/opt/cnode/
+  cnode
+  config/
+    config.json
+    inbounds.json
+    outbounds.json
+    routing.json
+    geoip.dat
+    geosite.dat
+  log/
+    access.log
+    error.log
+```
+
+启动命令可以显式指定文件或目录：
+
+```sh
+./cnode --config-file /opt/cnode/config/config.json
+./cnode --config-dir /opt/cnode/config
+./cnode -c /opt/cnode/config
+```
+
+`-c, --config <path>` 会自动判断路径是文件还是目录；`--config-file` 用于只接受配置文件路径；`-C, --config-dir` 用于只接受配置目录路径。目录模式只读取上述固定文件名，不回退到 YAML 入口，也不读取旧 sidecar path 字段。
+
 配置进入 Worker 前必须完成归一化。Worker 热路径只读取不可变 runtime snapshot；控制面更新时以原子替换快照的方式发布，新旧连接按生命周期自然释放。
 
 ## 关键语义

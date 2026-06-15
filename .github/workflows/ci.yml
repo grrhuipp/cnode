@@ -24,15 +24,34 @@ on:
       - 'include/**/*.hpp'
 
 env:
-  BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
   RELEASE_TAG: cnode-latest
 
 jobs:
+  build-metadata:
+    name: Build metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      build_id: ${{ steps.time.outputs.build_id }}
+      release_time: ${{ steps.time.outputs.release_time }}
+
+    steps:
+      - name: Generate timestamp build id
+        id: time
+        run: |
+          build_id="$(date -u +'%Y%m%dT%H%M%SZ')"
+          release_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
+          echo "release_time=${release_time}" >> "$GITHUB_OUTPUT"
+          echo "BUILD_ID=${build_id}"
+
   build-musl:
     name: Release (musl static system allocator)
     runs-on: ubuntu-24.04
+    needs: build-metadata
     container:
       image: alpine:3.20
+    env:
+      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
 
     steps:
       - name: Install Alpine build tools
@@ -95,6 +114,9 @@ jobs:
   build-glibc:
     name: Release (glibc heaptrack system allocator)
     runs-on: ubuntu-24.04
+    needs: build-metadata
+    env:
+      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
 
     steps:
       - name: Install build tools
@@ -154,8 +176,11 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: [build-musl, build-glibc]
+    needs: [build-metadata, build-musl, build-glibc]
     if: github.event_name == 'push'
+    env:
+      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
+      RELEASE_TIME: ${{ needs.build-metadata.outputs.release_time }}
 
     permissions:
       contents: write
@@ -178,7 +203,8 @@ jobs:
           set -euo pipefail
           cat > release-notes.md <<EOF
           branch: ${{ github.ref_name }}
-          build_id: ${{ env.BUILD_ID }}
+          build_id: $BUILD_ID
+          release_time: $RELEASE_TIME
           commit: ${{ github.sha }}
           variants: musl+system-allocator, glibc+system-allocator
           EOF
@@ -195,20 +221,17 @@ jobs:
           fi
 
           if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release edit "${{ env.RELEASE_TAG }}" \
+            gh release delete "${{ env.RELEASE_TAG }}" \
               --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "${{ env.RELEASE_TAG }}" \
-              --notes-file release-notes.md \
-              --latest
-          else
-            gh release create "${{ env.RELEASE_TAG }}" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "${{ env.RELEASE_TAG }}" \
-              --notes-file release-notes.md \
-              --latest
+              --yes
           fi
+
+          gh release create "${{ env.RELEASE_TAG }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ env.RELEASE_TAG }}" \
+            --notes-file release-notes.md \
+            --latest
 
           gh release upload "${{ env.RELEASE_TAG }}" release-assets/* \
             --repo "${{ github.repository }}" \

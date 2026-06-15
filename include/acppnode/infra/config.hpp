@@ -13,10 +13,10 @@ namespace acpp {
 // ============================================================================
 class Config {
 public:
-    // 从单个文件加载
+    // 从配置路径加载。为兼容命令行入口，path 可以是 config.json 文件或配置目录。
     static std::optional<Config> LoadFromFile(const std::filesystem::path& path);
 
-    // 从目录加载（cnode 主配置 config.json，加 xray-core 形状 sidecar）
+    // 从目录加载：固定读取 config.json，以及同目录 inbounds/outbounds/routing sidecar。
     static std::optional<Config> LoadFromDirectory(const std::filesystem::path& dir);
 
     // 从 JSON 加载配置

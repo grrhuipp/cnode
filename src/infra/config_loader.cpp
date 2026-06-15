@@ -6,6 +6,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -259,6 +260,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 }
 
 std::optional<Config> Config::LoadFromDirectory(const std::filesystem::path& dir) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        LOG_ERROR("Config path is not a directory: {}", dir.string());
+        return std::nullopt;
+    }
+
     return LoadFromFile(dir);
 }
 

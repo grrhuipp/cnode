@@ -2,7 +2,8 @@
 
 # cnode 一键部署脚本
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
-# 每次执行添加/覆盖一个 panel 到同一个 cnode 实例，已有配置文件不会被覆盖
+# 每次执行添加/覆盖一个 panel 到同一个 cnode 实例；已有 config.json 不会被覆盖，
+# 指定 URL 的 sidecar 文件会覆盖下载。
 
 ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
@@ -34,9 +35,9 @@ usage() {
     echo "  -tls_enable true       启用 TLS（trojan 需要）"
     echo "  -tls_cert <path>       TLS 证书路径"
     echo "  -tls_key <path>        TLS 私钥路径"
-    echo "  -outbound_url <url>    远程 outbounds.json 下载地址（文件已存在则跳过）"
-    echo "  -route_url <url>       远程 routing.json 下载地址（文件已存在则跳过）"
-    echo "  -inbound_url <url>     远程 inbounds.json 下载地址（文件已存在则跳过）"
+    echo "  -outbound_url <url>    远程 outbounds.json 下载地址（指定则覆盖下载）"
+    echo "  -route_url <url>       远程 routing.json 下载地址（指定则覆盖下载）"
+    echo "  -inbound_url <url>     远程 inbounds.json 下载地址（指定则覆盖下载）"
     echo "  -v <version>           指定 release tag（默认 cnode-latest；latest 表示 GitHub latest）"
     echo "  -debug_file true       额外下载 release 对应的 .debug 符号文件"
     exit 1
@@ -262,7 +263,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BIN_PATH -c $CONFIG_DIR
+ExecStart=$BIN_PATH --config-dir $CONFIG_DIR
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576

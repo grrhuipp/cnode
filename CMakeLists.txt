@@ -6,7 +6,6 @@ set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
 project(cnode VERSION 1.0.0 LANGUAGES C CXX)
 
-
 include(FetchContent)
 
 option(CNODE_HEAPTRACK_BUILD "Build a heaptrack-friendly glibc/system-allocator variant" OFF)
@@ -33,27 +32,19 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# 编译选项：使用 generator expression 区分编译器
-# 警告选项移到 target_compile_options(cnode) 中，这里只设置全局优化选项
-
-# Release 优化由 CMake 自动处理（MSVC: /O2 /Ob2 /DNDEBUG，GCC/Clang: -O3 -DNDEBUG）
+get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 
 # ============================================================================
 # LTO（链接时优化）— Release / Profile 模式启用
-#
-# 效果：跨翻译单元 devirtualize final 类虚调用、内联、死代码消除
 # ============================================================================
 if(NOT CNODE_HEAPTRACK_BUILD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-    # Profile 模式也启用 LTO
     if(CMAKE_BUILD_TYPE STREQUAL "Profile")
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
     endif()
 endif()
 
 # Profile 模式：Release 优化 + 保留符号（用于 perf/FlameGraph 性能分析）
-# 注意：每个 flag 必须单独一个 generator expression，不能在一个表达式里放多个 flag
 if(CMAKE_BUILD_TYPE STREQUAL "Profile")
     add_compile_options(
         $<$<CXX_COMPILER_ID:MSVC>:/O2>
@@ -304,20 +295,20 @@ target_link_libraries(cnode PRIVATE
     cnode_zlib
 )
 
-# 构建版本号：优先使用外部传入的 BUILD_ID，否则生成随机 hex
+# 构建版本号：优先使用外部传入的 BUILD_ID，否则使用 UTC 时间戳
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
-    string(RANDOM LENGTH 12 ALPHABET "0123456789abcdef" BUILD_ID)
+    string(TIMESTAMP BUILD_ID "%Y%m%dT%H%M%SZ" UTC)
 endif()
 if(CNODE_HEAPTRACK_BUILD)
-    set(BUILD_CHANNEL "heaptrack")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(BUILD_CHANNEL "debug")
+    set(CNODE_BUILD_CHANNEL "heaptrack")
 else()
-    set(BUILD_CHANNEL "release")
+    set(CNODE_BUILD_CHANNEL "$<IF:$<CONFIG:Debug>,debug,release>")
 endif()
-target_compile_definitions(cnode PRIVATE BUILD_ID="${BUILD_ID}" BUILD_CHANNEL="${BUILD_CHANNEL}")
+target_compile_definitions(cnode PRIVATE
+    BUILD_ID="${BUILD_ID}"
+    BUILD_CHANNEL="${CNODE_BUILD_CHANNEL}"
+)
 message(STATUS "Build ID: ${BUILD_ID}")
-message(STATUS "Build Channel: ${BUILD_CHANNEL}")
 
 if(CNODE_MEMORY_STATS)
     target_compile_definitions(cnode PRIVATE CNODE_MEMORY_STATS)
@@ -352,13 +343,41 @@ elseif(UNIX AND NOT APPLE)
     endif()
 endif()
 
+if(CNODE_IS_MULTI_CONFIG)
+    string(REPLACE ";" ", " CNODE_BUILD_TYPE_SUMMARY "${CMAKE_CONFIGURATION_TYPES}")
+    set(CNODE_BUILD_TYPE_SUMMARY "multi-config (${CNODE_BUILD_TYPE_SUMMARY})")
+else()
+    set(CNODE_BUILD_TYPE_SUMMARY "${CMAKE_BUILD_TYPE}")
+endif()
+
+if(CNODE_HEAPTRACK_BUILD)
+    set(CNODE_BUILD_CHANNEL_SUMMARY "heaptrack")
+elseif(CNODE_IS_MULTI_CONFIG)
+    set(CNODE_BUILD_CHANNEL_SUMMARY "per-config (Debug=debug, others=release)")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CNODE_BUILD_CHANNEL_SUMMARY "debug")
+else()
+    set(CNODE_BUILD_CHANNEL_SUMMARY "release")
+endif()
+
+if(CNODE_HEAPTRACK_BUILD)
+    set(CNODE_LTO_SUMMARY "disabled")
+elseif(CNODE_IS_MULTI_CONFIG)
+    set(CNODE_LTO_SUMMARY "Release config")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "Profile")
+    set(CNODE_LTO_SUMMARY "enabled")
+else()
+    set(CNODE_LTO_SUMMARY "disabled")
+endif()
+
 # ============================================================================
 # 打印配置摘要
 # ============================================================================
 message(STATUS "")
 message(STATUS "=== cnode Build Configuration ===")
 message(STATUS "  Version:      ${PROJECT_VERSION}")
-message(STATUS "  Build Type:   ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Build Type:   ${CNODE_BUILD_TYPE_SUMMARY}")
+message(STATUS "  Build Channel: ${CNODE_BUILD_CHANNEL_SUMMARY}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Network:      standalone Asio")
@@ -370,9 +389,5 @@ else()
 endif()
 message(STATUS "  Allocator:    system")
 message(STATUS "  MemoryStats:  ${CNODE_MEMORY_STATS}")
-if(CMAKE_INTERPROCEDURAL_OPTIMIZATION OR CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE)
-    message(STATUS "  LTO:          enabled")
-else()
-    message(STATUS "  LTO:          disabled")
-endif()
+message(STATUS "  LTO:          ${CNODE_LTO_SUMMARY}")
 message(STATUS "")

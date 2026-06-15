@@ -12,8 +12,45 @@
 
 #include <iostream>
 #include <exception>
+#include <filesystem>
+#include <optional>
+#include <system_error>
 
 namespace acpp {
+
+namespace {
+
+std::optional<Config> LoadConfigFromCli(
+    const CommandLineOptions& cli,
+    std::ostream& err,
+    bool& error_reported) {
+    const std::filesystem::path config_path(cli.config_path);
+
+    if (cli.config_mode == ConfigPathMode::Directory) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(config_path, ec)) {
+            err << "--config-dir expects an existing directory: "
+                << cli.config_path << "\n";
+            error_reported = true;
+            return std::nullopt;
+        }
+        return Config::LoadFromDirectory(config_path);
+    }
+
+    if (cli.config_mode == ConfigPathMode::File) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(config_path, ec)) {
+            err << "--config-file expects a file, got directory: "
+                << cli.config_path << "\n";
+            error_reported = true;
+            return std::nullopt;
+        }
+    }
+
+    return Config::LoadFromFile(config_path);
+}
+
+}  // namespace
 
 // ============================================================================
 // RunFromCommandLine
@@ -31,10 +68,18 @@ int RunFromCommandLine(int argc, char* argv[]) {
         PrintVersion(std::cout);
         return 0;
     }
+    if (cli.action == CommandLineAction::Error) {
+        std::cerr << cli.error << "\n";
+        PrintUsage(std::cerr, argv[0]);
+        return 2;
+    }
 
-    auto config_opt = Config::LoadFromFile(cli.config_path);
+    bool config_error_reported = false;
+    auto config_opt = LoadConfigFromCli(cli, std::cerr, config_error_reported);
     if (!config_opt) {
-        std::cerr << "Failed to load config from: " << cli.config_path << "\n";
+        if (!config_error_reported) {
+            std::cerr << "Failed to load config from: " << cli.config_path << "\n";
+        }
         return 1;
     }
     const Config& config = *config_opt;
