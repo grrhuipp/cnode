@@ -20,25 +20,29 @@ Validator::~Validator() = default;
 Validator::Validator(Validator&&) noexcept = default;
 Validator& Validator::operator=(Validator&&) noexcept = default;
 
-void Validator::UpdateUsersForTag(const std::string& tag,
-                                  const std::vector<SsUserInfo>& users) {
+void Validator::ApplyUsers(std::string_view tag,
+                           const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
     set.ss_users = users;
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
-void Validator::AddUsersForTag(const std::string& tag,
-                               const std::vector<SsUserInfo>& users) {
+void Validator::AddUsers(std::string_view tag,
+                         const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
     set.ss_users = users;
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
-void Validator::RemoveUsersForTag(const std::string& tag,
-                                  const std::vector<SsUserInfo>& users) {
+void Validator::RemoveUsers(std::string_view tag,
+                            const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
     set.ss_users = users;
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kShadowsocks, tag, set);
+}
+
+void Validator::ClearUsers(std::string_view tag) {
+    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kShadowsocks, tag);
 }
 
 proxyman::inbound::UserStore::ShadowsocksUsersView
@@ -88,6 +92,11 @@ std::optional<SsUserInfo> Validator::FindUserById(std::string_view tag,
 
 size_t Validator::Size() const {
     return proxyman::inbound::UserStore::GetStats().shadowsocks_users;
+}
+
+size_t Validator::SizeForTag(std::string_view tag) const {
+    return proxyman::inbound::UserStore::SizeForProtocolTag(
+        constants::protocol::kShadowsocks, tag);
 }
 
 void Validator::OnUserConnected(std::string_view tag,

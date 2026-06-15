@@ -45,10 +45,10 @@ public:
 
     // ── 用户存储 ─────────────────────────────────────────────────────────────
 
-    // 增量更新指定 tag 的用户列表（无空窗期）
-    void UpdateUsersForTag(const std::string& tag, const std::vector<TrojanUserInfo>& new_users);
-    void AddUsersForTag(const std::string& tag, const std::vector<TrojanUserInfo>& users);
-    void RemoveUsersForTag(const std::string& tag, const std::vector<TrojanUserInfo>& users);
+    void ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
+    void AddUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
+    void RemoveUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
+    void ClearUsers(std::string_view tag);
 
     // ── 认证与查找 ───────────────────────────────────────────────────────────
 

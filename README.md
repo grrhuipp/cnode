@@ -22,6 +22,8 @@ inbound.Process
   -> relay
 ```
 
+原生 datagram、UDP-over-TCP 和 Mux/子流允许使用必要的窄 helper，例如 UDP framer、`DispatchUDP` 或 `DialUDP`，但 helper 只表达主链路的实现分支：inbound 仍负责协议解析和 metadata，dispatcher 仍负责路由，outbound 仍负责出站资源准备，relay 仍以协议无关方式搬运数据。它们不能发展为协议私有请求链路或绕过 dispatcher / outbound / relay 的第二套架构。
+
 运行时主链路：
 
 ```text
@@ -46,6 +48,18 @@ service/controller
   -> config normalization
   -> prepared inbound / outbound / routing runtime
   -> atomic Worker runtime snapshot replace
+```
+
+用户存储链路：
+
+```text
+api/* panel users
+  -> api::UserInfo
+  -> controller RuntimeUser normalization
+  -> proxy/<protocol> user builder registration
+  -> proxyman::inbound::UserSet
+  -> UserStore immutable RCU snapshot
+  -> inbound validator read-only auth
 ```
 
 ## 模块职责
@@ -77,6 +91,8 @@ geosite.dat
 
 `inbounds.json` 可以是入站对象数组，也可以是 `{ "inbounds": [...] }`；`outbounds.json` 同理支持 `{ "outbounds": [...] }`；`routing.json` 可以直接是 routing 对象，也可以是 `{ "routing": { ... } }`。不支持的 xray-core 字段可以被忽略，但不能为了支持已有能力再引入第二套 cnode-only schema。
 
+仓库 `config/*.json.example` 只作为样例文件；实际部署和目录模式读取的文件名不带 `.example`，固定为 `config.json`、`inbounds.json`、`outbounds.json`、`routing.json`。
+
 配置进入 Worker 前必须完成归一化。Worker 热路径只读取不可变 runtime snapshot；控制面更新时以原子替换快照的方式发布，新旧连接按生命周期自然释放。
 
 ## 关键语义
@@ -88,7 +104,17 @@ geosite.dat
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
+- Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
+- `Buffer` / `MultiBuffer` 可以沿当前请求链路 move 转移所有权，但不能作为跨 Worker 缓存、池对象或长期共享状态；消费结束后应在所属资源边界释放或归还。
 - AnyTLS 按 xray-core wire model 实现：TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写、`settings.users` 和 `settings.paddingScheme` 语义。
+
+## 用户存储设计
+
+面板用户、静态用户和测试用户最终进入同一套认证存储模型。面板客户端只把原始响应解析为 `api::UserInfo`；Controller 只做字段归一化、差量对比和发布触发，把用户转换为协议无关的 `RuntimeUser`。协议私有凭据构建由 `proxy/<protocol>` 注册的 `build_users` / `build_static_users` 完成，输出统一的 `UserSet`。
+
+`UserStore` 是进程级认证用户 RCU 快照，按 `protocol + tag` 保存不可变用户容器。冷路径复制构建并原子发布新快照；热路径 validator 只加载只读视图做认证，不解析 JSON、不读取面板字段、不持有面板原始用户结构。VMess、Trojan、Shadowsocks、AnyTLS 的用户更新接口统一为 `ApplyUsers` / `AddUsers` / `RemoveUsers` / `ClearUsers`。
+
+在线设备、连接计数和设备限制检查属于 Worker-local tracker，由各协议 validator 在当前 Worker 内维护；这些状态不进入全局 `UserStore`，也不能通过裸指针、引用或 lock-free 对象跨 Worker 共享。
 
 ## 开发规范
 
@@ -110,9 +136,13 @@ geosite.dat
 - Panel/client/controller 不进入热路径，不修改 live handler 内部状态。
 - 出站处理不能读取面板原始字段；所有字段必须在冷路径归一化。
 - 配置热更新只能替换 runtime snapshot，不能原地修改正在使用的对象图。
+- 禁止跨线程或跨 Worker 直接访问无锁热路径对象；无锁不代表任意线程可读写。
+- 禁止把 Worker-local 裸指针、引用、buffer provider、allocator、handler、manager、UDPSession 或 AsyncStream 保存到其他 Worker。
+- 禁止用 lock-free / atomic 共享 live handler、manager、连接对象或 buffer pool 来绕过 Worker 所有权。
 - 禁止把 legacy、compat、adapter、wrapper、old 或旧面板私有命名作为最终公开设计保留。
 - 禁止协议、transport、relay、panel 各自维护长期私有大 buffer pool。
 - 禁止为了局部方便绕过 `inbound.Process -> dispatcher.Dispatch -> outbound.Process -> relay` 主链路。
+- 禁止 controller、panel client、dispatcher、router、relay 或 Worker 按具体协议构建认证用户凭据；面板用户必须经过 `RuntimeUser -> UserSet -> UserStore` 链路。
 
 ## 代码组织
 

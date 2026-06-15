@@ -124,13 +124,19 @@ void Manager::ClearUsers(std::string_view protocol, std::string_view tag) {
 
 std::vector<::acpp::OnlineDevice>
 Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
+    if (protocol == constants::protocol::kVmess) {
+        return impl_->vmess_validator.GetOnlineDevices(tag);
+    }
     if (protocol == constants::protocol::kTrojan) {
         return impl_->trojan_validator.GetOnlineDevices(tag);
     }
     if (protocol == constants::protocol::kShadowsocks) {
         return impl_->ss_validator.GetOnlineDevices(tag);
     }
-    return impl_->vmess_validator.GetOnlineDevices(tag);
+    if (protocol == constants::protocol::kAnyTLS) {
+        return impl_->anytls_validator.GetOnlineDevices(tag);
+    }
+    return {};
 }
 
 Manager::UserMemoryStats Manager::GetUserMemoryStats() const noexcept {

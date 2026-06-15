@@ -609,6 +609,31 @@ const bool kTrojanInboundRegistered = [] {
             return result;
         };
 
+    reg.build_users =
+        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
+           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+            -> std::optional<acpp::proxyman::inbound::UserSet> {
+            std::vector<acpp::trojan::TrojanUserInfo> users;
+            users.reserve(runtime_users.size());
+
+            for (const auto& runtime_user : runtime_users) {
+                if (runtime_user.password.empty()) {
+                    continue;
+                }
+                acpp::trojan::TrojanUserInfo info;
+                info.password_hash = acpp::trojan::HashPassword(runtime_user.password);
+                info.profile.email = runtime_user.email;
+                info.profile.user_id = runtime_user.user_id;
+                info.profile.speed_limit = runtime_user.speed_limit;
+                info.profile.device_limit = runtime_user.device_limit;
+                users.push_back(std::move(info));
+            }
+
+            acpp::proxyman::inbound::UserSet result;
+            result.trojan_users = std::move(users);
+            return result;
+        };
+
     acpp::proxyman::inbound::RegisterProxy(
         acpp::constants::protocol::kTrojan, std::move(reg));
     return true;

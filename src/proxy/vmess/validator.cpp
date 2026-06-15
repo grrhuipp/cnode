@@ -92,7 +92,7 @@ TimedUserValidator::~TimedUserValidator() = default;
 TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
 TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
 
-void TimedUserValidator::UpdateUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
+void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
     set.vmess_accounts = users;
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kVmess, tag, set);
@@ -100,7 +100,7 @@ void TimedUserValidator::UpdateUsersForTag(const std::string& tag, const std::ve
     impl_->hot_users.reset();
 }
 
-void TimedUserValidator::AddUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
+void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
     set.vmess_accounts = users;
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kVmess, tag, set);
@@ -108,7 +108,7 @@ void TimedUserValidator::AddUsersForTag(const std::string& tag, const std::vecto
     impl_->hot_users.reset();
 }
 
-void TimedUserValidator::RemoveUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
+void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
     set.vmess_accounts = users;
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kVmess, tag, set);
@@ -116,7 +116,7 @@ void TimedUserValidator::RemoveUsersForTag(const std::string& tag, const std::ve
     impl_->hot_users.reset();
 }
 
-void TimedUserValidator::ClearTag(const std::string& tag) {
+void TimedUserValidator::ClearUsers(std::string_view tag) {
     proxyman::inbound::UserStore::ClearUsers(constants::protocol::kVmess, tag);
     impl_->hot_cache.Clear();
     impl_->hot_users.reset();

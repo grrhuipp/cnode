@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <expected>
+#include <span>
 #include <utility>
 
 namespace acpp {
@@ -295,6 +296,29 @@ const bool kVmessInboundRegistered = [] {
                 }
                 if (auto user = acpp::vmess::MemoryAccount::FromUUID(
                         client.id, 0, client.email, 0)) {
+                    users.push_back(*user);
+                }
+            }
+
+            acpp::proxyman::inbound::UserSet result;
+            result.vmess_accounts = std::move(users);
+            return result;
+        };
+
+    reg.build_users =
+        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
+           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+            -> std::optional<acpp::proxyman::inbound::UserSet> {
+            std::vector<acpp::vmess::MemoryAccount> users;
+            users.reserve(runtime_users.size());
+
+            for (const auto& runtime_user : runtime_users) {
+                if (auto user = acpp::vmess::MemoryAccount::FromUUID(
+                        runtime_user.uuid,
+                        runtime_user.user_id,
+                        runtime_user.email,
+                        runtime_user.speed_limit,
+                        runtime_user.device_limit)) {
                     users.push_back(*user);
                 }
             }

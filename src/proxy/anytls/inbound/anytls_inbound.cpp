@@ -20,6 +20,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <type_traits>
@@ -32,6 +33,38 @@ namespace acpp::anytls::inbound {
 namespace {
 
 constexpr size_t kMaxSubStreamQueuedPayloadBytes = buf::Buffer::kSize * 4;
+
+class AnyTLSOnlineSession {
+public:
+    AnyTLSOnlineSession(Validator& validator,
+                        std::string_view tag,
+                        uint64_t user_id,
+                        std::string_view client_ip)
+        : validator_(&validator)
+        , tag_(tag)
+        , user_id_(user_id)
+        , client_ip_(client_ip) {}
+
+    ~AnyTLSOnlineSession() noexcept {
+        if (!validator_ || user_id_ == 0) {
+            return;
+        }
+        try {
+            validator_->OnUserDisconnected(tag_, user_id_, client_ip_);
+        } catch (...) {}
+    }
+
+    AnyTLSOnlineSession(const AnyTLSOnlineSession&) = delete;
+    AnyTLSOnlineSession& operator=(const AnyTLSOnlineSession&) = delete;
+    AnyTLSOnlineSession(AnyTLSOnlineSession&&) = delete;
+    AnyTLSOnlineSession& operator=(AnyTLSOnlineSession&&) = delete;
+
+private:
+    Validator* validator_;
+    std::string tag_;
+    uint64_t user_id_;
+    std::string client_ip_;
+};
 
 struct PendingWait {
     virtual ~PendingWait() = default;
@@ -974,10 +1007,33 @@ Handler::Process(
         co_return result;
     }
 
+    std::optional<AnyTLSOnlineSession> user_session;
     if (user->profile) {
-        ctx.inbound.user_email = user->profile->email;
-        ctx.inbound.user_id = user->profile->user_id;
-        ctx.content.speed_limit = user->profile->speed_limit;
+        const auto& profile = *user->profile;
+        ctx.inbound.user_email = profile.email;
+        ctx.inbound.user_id = profile.user_id;
+        ctx.content.speed_limit = profile.speed_limit;
+
+        const uint64_t uid = static_cast<uint64_t>(profile.user_id);
+        if (uid != 0) {
+            if (!validator_->CanAcceptDevice(
+                    ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
+                LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+                    FormatTimestamp(ctx.accept_time_us),
+                    ctx.inbound.source_ip,
+                    ctx.inbound.source_port,
+                    ctx.inbound.tag,
+                    ctx.inbound.user_email,
+                    profile.device_limit,
+                    validator_->OnlineDeviceCount(ctx.inbound.tag, uid));
+                stats_->OnError();
+                RelayResult result;
+                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                co_return result;
+            }
+            validator_->OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);
+            user_session.emplace(*validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
+        }
     }
 
     auto demux = std::make_shared<AnyTLSDemuxSession>(
@@ -1025,6 +1081,29 @@ const bool kInboundRegistered = [] {
                 acpp::anytls::UserInfo info;
                 info.password_hash = acpp::anytls::PasswordHash(password);
                 info.profile.email = client.email.empty() ? std::string(tag) : client.email;
+                users.push_back(std::move(info));
+            }
+            acpp::proxyman::inbound::UserSet result;
+            result.anytls_users = std::move(users);
+            return result;
+        };
+
+    reg.build_users =
+        [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
+           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+            -> std::optional<acpp::proxyman::inbound::UserSet> {
+            std::vector<acpp::anytls::UserInfo> users;
+            users.reserve(runtime_users.size());
+            for (const auto& runtime_user : runtime_users) {
+                if (runtime_user.password.empty()) {
+                    continue;
+                }
+                acpp::anytls::UserInfo info;
+                info.password_hash = acpp::anytls::PasswordHash(runtime_user.password);
+                info.profile.email = runtime_user.email;
+                info.profile.user_id = runtime_user.user_id;
+                info.profile.speed_limit = runtime_user.speed_limit;
+                info.profile.device_limit = runtime_user.device_limit;
                 users.push_back(std::move(info));
             }
             acpp::proxyman::inbound::UserSet result;

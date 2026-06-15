@@ -68,16 +68,6 @@ struct Controller::Impl {
     [[nodiscard]] std::string BuildUserTag(std::string_view tag,
                                            const api::UserInfo& user) const;
     [[nodiscard]] uint32_t DeviceLimitOf(const api::UserInfo& user) const noexcept;
-    [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildVmessUsers(
-        std::string_view tag,
-        const std::vector<api::UserInfo>& api_users) const;
-    [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildTrojanUsers(
-        std::string_view tag,
-        const std::vector<api::UserInfo>& api_users) const;
-    [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildShadowsocksUsers(
-        std::string_view tag,
-        const api::NodeInfo& node_config,
-        const std::vector<api::UserInfo>& api_users) const;
     [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildUsersForInbound(
         std::string_view protocol,
         std::string_view tag,

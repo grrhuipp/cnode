@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -61,11 +62,14 @@ struct ProxyRegistration {
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req) = nullptr;
 
-    // 静态配置用户构建属于冷路径，结果再投递到 Worker 本地表。
+    // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。
     std::optional<UserSet> (*build_static_users)(
         std::string_view tag,
         const ::acpp::StaticUserConfig& config) = nullptr;
 
+    std::optional<UserSet> (*build_users)(
+        const BuildRequest& req,
+        std::span<const RuntimeUser> users) = nullptr;
 };
 
 bool RegisterProxy(std::string_view protocol, ProxyRegistration registration);
@@ -90,5 +94,10 @@ bool RegisterProxy(std::string_view protocol, ProxyRegistration registration);
     std::string_view protocol,
     std::string_view tag,
     const ::acpp::StaticUserConfig& config);
+
+[[nodiscard]] std::optional<UserSet> BuildUsers(
+    std::string_view protocol,
+    const BuildRequest& req,
+    std::span<const RuntimeUser> users);
 
 }  // namespace acpp::proxyman::inbound

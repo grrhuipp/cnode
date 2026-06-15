@@ -34,10 +34,10 @@ public:
     Validator(Validator&&) noexcept;
     Validator& operator=(Validator&&) noexcept;
 
-    void UpdateUsersForTag(const std::string& tag,
-                           const std::vector<SsUserInfo>& users);
-    void AddUsersForTag(const std::string& tag, const std::vector<SsUserInfo>& users);
-    void RemoveUsersForTag(const std::string& tag, const std::vector<SsUserInfo>& users);
+    void ApplyUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
+    void AddUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
+    void RemoveUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
+    void ClearUsers(std::string_view tag);
 
     [[nodiscard]] proxyman::inbound::UserStore::ShadowsocksUsersView
     FindUsersForTag(std::string_view tag) const;
@@ -47,6 +47,7 @@ public:
                                                          int64_t user_id) const;
 
     [[nodiscard]] size_t Size() const;
+    [[nodiscard]] size_t SizeForTag(std::string_view tag) const;
 
     void OnUserConnected(std::string_view tag,
                          int64_t user_id,

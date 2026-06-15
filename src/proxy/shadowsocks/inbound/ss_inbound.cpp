@@ -18,6 +18,7 @@
 #include <openssl/rand.h>
 #include <algorithm>
 #include <cstring>
+#include <span>
 #include <utility>
 
 namespace acpp {
@@ -423,6 +424,45 @@ const bool kSsInboundRegistered = [] {
                 info.salt_size   = cipher_info->salt_size;
                 info.derived_key = acpp::ss::DeriveKey(client.password, cipher_info->key_size);
                 info.profile.email = client.email;
+                users.push_back(std::move(info));
+            }
+
+            acpp::proxyman::inbound::UserSet result;
+            result.ss_users = std::move(users);
+            return result;
+        };
+
+    reg.build_users =
+        [](const acpp::proxyman::inbound::BuildRequest& req,
+           std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
+            -> std::optional<acpp::proxyman::inbound::UserSet> {
+            const std::string method = req.cipher_method.empty()
+                ? std::string(acpp::constants::protocol::kAes256Gcm)
+                : req.cipher_method;
+            auto cipher_info = acpp::ss::ParseCipherMethod(method);
+            if (!cipher_info) {
+                LOG_WARN("Inbound '{}': unknown SS cipher '{}'", req.tag, method);
+                return std::nullopt;
+            }
+
+            std::vector<acpp::ss::SsUserInfo> users;
+            users.reserve(runtime_users.size());
+
+            for (const auto& runtime_user : runtime_users) {
+                if (runtime_user.password.empty()) {
+                    continue;
+                }
+                acpp::ss::SsUserInfo info;
+                info.password = runtime_user.password;
+                info.profile.email = runtime_user.email;
+                info.profile.user_id = runtime_user.user_id;
+                info.profile.speed_limit = runtime_user.speed_limit;
+                info.profile.device_limit = runtime_user.device_limit;
+                info.cipher_type = cipher_info->type;
+                info.key_size = cipher_info->key_size;
+                info.salt_size = cipher_info->salt_size;
+                info.derived_key = acpp::ss::DeriveKey(
+                    runtime_user.password, cipher_info->key_size);
                 users.push_back(std::move(info));
             }
 

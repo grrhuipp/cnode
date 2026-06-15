@@ -19,24 +19,28 @@ Validator::~Validator() = default;
 Validator::Validator(Validator&&) noexcept = default;
 Validator& Validator::operator=(Validator&&) noexcept = default;
 
-void Validator::UpdateUsersForTag(const std::string& tag, const std::vector<TrojanUserInfo>& new_users) {
+void Validator::ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.trojan_users = new_users;
+    set.trojan_users = users;
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kTrojan, tag, set);
 }
 
-void Validator::AddUsersForTag(const std::string& tag,
-                                       const std::vector<TrojanUserInfo>& users) {
+void Validator::AddUsers(std::string_view tag,
+                         const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
     set.trojan_users = users;
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kTrojan, tag, set);
 }
 
-void Validator::RemoveUsersForTag(const std::string& tag,
-                                          const std::vector<TrojanUserInfo>& users) {
+void Validator::RemoveUsers(std::string_view tag,
+                            const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
     set.trojan_users = users;
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kTrojan, tag, set);
+}
+
+void Validator::ClearUsers(std::string_view tag) {
+    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kTrojan, tag);
 }
 
 bool Validator::Validate(std::string_view tag, std::string_view hash) const {

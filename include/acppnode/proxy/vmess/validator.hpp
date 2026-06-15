@@ -45,12 +45,10 @@ public:
 
     // ── 用户存储 ─────────────────────────────────────────────────────────────
 
-    // 按 tag 批量更新用户（不同 tag 独立存储）
-    void UpdateUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users);
-    void AddUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users);
-    void RemoveUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users);
-
-    void ClearTag(const std::string& tag);
+    void ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
+    void AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
+    void RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
+    void ClearUsers(std::string_view tag);
     void Clear();
 
     size_t Size() const;

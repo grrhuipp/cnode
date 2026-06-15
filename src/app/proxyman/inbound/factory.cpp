@@ -78,4 +78,16 @@ std::optional<UserSet> BuildStaticUsers(
     return it->second.build_static_users(tag, config);
 }
 
+std::optional<UserSet> BuildUsers(
+    std::string_view protocol,
+    const BuildRequest& req,
+    std::span<const RuntimeUser> users) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    if (it == registrations.end() || !it->second.build_users) {
+        return std::nullopt;
+    }
+    return it->second.build_users(req, users);
+}
+
 }  // namespace acpp::proxyman::inbound
