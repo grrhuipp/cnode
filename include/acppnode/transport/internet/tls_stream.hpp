@@ -110,8 +110,8 @@ private:
     bool shutdown_initiated_ = false;  // 防止多次 SSL_shutdown
 
     // TLS 底层 I/O pump 的临时缓冲大小。缓冲本体放在执行中的 awaitable 内，
-    // 避免每个 TLS stream 对象常驻一块 scratch。
-    static constexpr size_t kTlsIoBufferSize = 4096;
+    // 避免每个 TLS stream 对象常驻一块 scratch，并与 relay Buffer 对齐。
+    static constexpr size_t kTlsIoBufferSize = buf::Buffer::kSize;
 };
 
 // ============================================================================

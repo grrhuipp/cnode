@@ -26,15 +26,11 @@
 namespace acpp {
 
 namespace {
-constexpr int kSocketBufferSizeLow  = 8 * 1024;
-constexpr int kSocketBufferSizeMid  = 16 * 1024;
-constexpr int kSocketBufferSizeHigh = 32 * 1024;
 constexpr uint32_t kMaxReadAllocBuffers = 2;
 constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
 constexpr uint8_t kReadGrowStreakRequired = 2;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
 constexpr size_t kProxyProbeBytes = 256;
-thread_local uint32_t g_active_tcp_streams = 0;
 using std::chrono::steady_clock;
 
 struct PendingOperationState {
@@ -49,13 +45,6 @@ struct PendingOperationState {
         return true;
     }
 };
-
-int SelectSocketBufferSize() noexcept {
-    const uint32_t active = g_active_tcp_streams;
-    if (active >= 40000) return kSocketBufferSizeLow;
-    if (active >= 12000) return kSocketBufferSizeMid;
-    return kSocketBufferSizeHigh;
-}
 
 net::io_context& SocketIoContext(tcp::socket& socket) {
     return static_cast<net::io_context&>(socket.get_executor().context());
@@ -172,7 +161,6 @@ TcpStream::TcpStream(tcp::socket socket)
     : impl_(std::make_unique<Impl>(std::move(socket))) {
     if (impl_->socket.is_open()) {
         impl_->SetFlag(kCountedActive);
-        ++g_active_tcp_streams;
         memory::OnTcpStreamNew();
         SetupConnectedSocket(impl_->socket);
     }
@@ -1155,7 +1143,6 @@ void TcpStream::CancelPhaseDeadline() noexcept {
 
 void TcpStream::ReleaseActiveCounter() noexcept {
     if (!impl_->HasFlag(kCountedActive)) return;
-    --g_active_tcp_streams;
     memory::OnTcpStreamFree();
     impl_->SetFlag(kCountedActive, false);
 }
@@ -1187,11 +1174,6 @@ void SetupConnectedSocket(tcp::socket& sock) {
     ka.keepalivetime = 60000;     // 60秒空闲后开始探测 (毫秒)
     ka.keepaliveinterval = 10000; // 探测间隔 10秒 (毫秒)
     WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes_returned, nullptr, nullptr);
-
-    // 高连接数场景按并发档位自适应内核收发缓冲，降低每连接常驻内存。
-    int bufsize = SelectSocketBufferSize();
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
 #else
     // TCP keepalive 参数按平台能力设置；Linux 与 macOS 的宏名不同。
     int keepidle = 60;
@@ -1219,10 +1201,6 @@ void SetupConnectedSocket(tcp::socket& sock) {
     setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
 
-    // 高连接数场景按并发档位自适应内核收发缓冲，降低每连接常驻内存。
-    int bufsize = SelectSocketBufferSize();
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 #endif
 }
 }  // namespace

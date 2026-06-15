@@ -16,8 +16,8 @@ bool Config::Validate() const {
         return false;
     }
 
-    if (limits_.buffer_size < 1024) {
-        LOG_ERROR("Buffer size must be at least 1KB");
+    if (dns_.min_ttl > dns_.max_ttl) {
+        LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
     }
 

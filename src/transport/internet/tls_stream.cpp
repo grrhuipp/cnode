@@ -413,8 +413,7 @@ net::awaitable<bool> TlsStream::Handshake() {
 
 net::awaitable<bool> TlsStream::FlushWriteBio() {
     // 固定缓冲循环 flush，避免大证书链/多 record pending 时临时 vector 分配。
-    static constexpr size_t kFlushBufSize = 4 * 1024;
-    alignas(64) std::array<uint8_t, kFlushBufSize> buf{};
+    alignas(64) std::array<uint8_t, kTlsIoBufferSize> buf{};
 
     try {
         while (true) {

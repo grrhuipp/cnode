@@ -5,7 +5,6 @@
 #include "acppnode/infra/json.hpp"
 
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,7 +17,6 @@ namespace acpp {
 struct LimitsConfig {
     uint32_t max_connections = defaults::kMaxConnections;
     uint32_t max_connections_per_ip = defaults::kMaxConnectionsPerIP;
-    size_t buffer_size = defaults::kBufferSize;
 
     static LimitsConfig FromJson(const json::object& j);
 };

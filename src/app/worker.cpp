@@ -1015,7 +1015,7 @@ Worker::GetDetectResultTask(std::string tag) {
 }
 
 // ============================================================================
-// 运行时统计（近似，仅通过 Worker executor 上的收集任务读取）
+// 运行时资源计数，仅通过 Worker executor 上的收集任务读取。
 // ============================================================================
 
 Worker::MemoryStats Worker::GetMemoryStats() const {
@@ -1023,13 +1023,8 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
 
     auto dns_stats       = runtime_->dns_service->GetCacheStats();
     stats.dns_entries    = dns_stats.entries;
-    stats.dns_estimated_bytes = dns_stats.entries * 256;
 
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
-    stats.udp_estimated_bytes = stats.udp_sessions * 1024;
-
-    stats.total_estimated_bytes = stats.dns_estimated_bytes
-                                + stats.udp_estimated_bytes;
     return stats;
 }
 

@@ -102,7 +102,6 @@ LimitsConfig LimitsConfig::FromJson(const json::object& j) {
     LimitsConfig cfg;
     cfg.max_connections        = static_cast<uint32_t>(jint(j, "maxConnections",      cfg.max_connections));
     cfg.max_connections_per_ip = static_cast<uint32_t>(jint(j, "maxConnectionsPerIP", cfg.max_connections_per_ip));
-    cfg.buffer_size            = static_cast<size_t>(jint(j, "bufferSize",            static_cast<int64_t>(cfg.buffer_size)));
     return cfg;
 }
 

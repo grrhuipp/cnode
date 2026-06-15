@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstddef>
 
 namespace acpp {
 namespace defaults {
@@ -9,8 +8,6 @@ namespace defaults {
 // 资源限制
 constexpr uint32_t kMaxConnections = 0;            // 最大并发连接数（0=不限制）
 constexpr uint32_t kMaxConnectionsPerIP = 0;       // 单 IP 最大连接数（0=不限制）
-constexpr size_t kBufferSize = 24 * 1024;      // 24KB
-constexpr size_t kMaxHeaderSize = 4 * 1024;    // 4KB
 
 // 超时配置（秒）—— 对齐 Xray policy.SessionDefault()
 constexpr uint32_t kHandshakeTimeout = 60;    // 握手阶段超时（对齐 Nginx client_header_timeout，防时序指纹）
