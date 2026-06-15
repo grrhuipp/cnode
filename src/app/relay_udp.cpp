@@ -274,9 +274,12 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             while (sent_batch < 32 && state.pop(pkt)) {
                 bool ok = co_await send_reply(pkt);
                 if (!ok) {
+                    if (result.error == ErrorCode::OK) {
+                        result.error = ErrorCode::RELAY_WRITE_FAILED;
+                    }
                     state.running = false;
                     state.WakeReplyReader();
-                    co_return;
+                    throw IoSystemError(io_error::operation_aborted);
                 }
                 ++sent_batch;
             }
@@ -290,11 +293,19 @@ net::awaitable<RelayResult> DoUDPRelayLink(
 
             auto [ec] = co_await state.reply_signal.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
+            if (ec) {
+                state.running = false;
+                co_return;
+            }
         }
     };
 
-    co_await (upload() && download());
+    try {
+        co_await (upload() && download());
+    } catch (...) {
+        state.running = false;
+        state.WakeReplyReader();
+    }
 
     state.running = false;
     state.WakeReplyReader();

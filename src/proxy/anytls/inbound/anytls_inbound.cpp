@@ -66,47 +66,6 @@ private:
     std::string client_ip_;
 };
 
-struct PendingWait {
-    virtual ~PendingWait() = default;
-    virtual void Complete() noexcept = 0;
-};
-
-template <typename Handler>
-struct PendingWaitOp final : PendingWait {
-    template <typename H>
-    explicit PendingWaitOp(H&& h) : handler(std::forward<H>(h)) {}
-
-    void Complete() noexcept override {
-        try {
-            std::move(handler)();
-        } catch (...) {}
-    }
-
-    Handler handler;
-};
-
-template <typename Handler>
-std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
-    using StoredHandler = std::decay_t<Handler>;
-    return std::make_unique<PendingWaitOp<StoredHandler>>(
-        std::forward<Handler>(handler));
-}
-
-void ResumeWaiter(net::io_context& io_context,
-                  std::unique_ptr<PendingWait>& waiter) noexcept {
-    auto pending = std::shared_ptr<PendingWait>(std::exchange(waiter, {}).release());
-    if (!pending) {
-        return;
-    }
-    try {
-        net::post(io_context, [pending]() {
-            pending->Complete();
-        });
-    } catch (...) {
-        pending->Complete();
-    }
-}
-
 void CopySessionContext(const session::Context& source, session::Context& target) {
     target.conn_id = source.conn_id;
     target.inbound = source.inbound;
@@ -400,7 +359,7 @@ public:
     AnyTLSSubStream(net::io_context& io_context,
                     std::shared_ptr<AnyTLSDemuxSession> session,
                     uint32_t sid)
-        : io_context_(io_context)
+        : input_signal_(io_context, 1)
         , session_(std::move(session))
         , sid_(sid) {}
 
@@ -454,16 +413,6 @@ public:
         WakeInputReader();
     }
 
-    template <typename CompletionToken>
-    auto AsyncWaitInput(CompletionToken&& token) {
-        return net::async_initiate<CompletionToken, void()>(
-            [this](auto&& handler) {
-                input_waiter_ = MakePendingWait(
-                    std::forward<decltype(handler)>(handler));
-            },
-            token);
-    }
-
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
@@ -475,7 +424,11 @@ public:
             if (input_done_) {
                 co_return buf::MultiBuffer{};
             }
-            co_await AsyncWaitInput(net::use_awaitable);
+            auto [ec] = co_await input_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                co_return buf::MultiBuffer{};
+            }
         }
         co_return buf::MultiBuffer{};
     }
@@ -485,11 +438,10 @@ public:
 
 private:
     void WakeInputReader() noexcept {
-        ResumeWaiter(io_context_, input_waiter_);
+        (void)input_signal_.try_send(IoErrorCode{});
     }
 
-    std::unique_ptr<PendingWait> input_waiter_;
-    net::io_context& io_context_;
+    net::experimental::channel<void(IoErrorCode)> input_signal_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;
     std::deque<buf::MultiBuffer> input_queue_;
@@ -577,7 +529,9 @@ public:
         while (write_busy_ && !cancelled_) {
             auto [ec] = co_await write_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
+            if (ec) {
+                co_return std::unexpected(ErrorCode::CANCELLED);
+            }
         }
         if (cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);

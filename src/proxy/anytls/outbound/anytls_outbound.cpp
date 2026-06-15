@@ -33,47 +33,6 @@ namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
 
-struct PendingWait {
-    virtual ~PendingWait() = default;
-    virtual void Complete() noexcept = 0;
-};
-
-template <typename Handler>
-struct PendingWaitOp final : PendingWait {
-    template <typename H>
-    explicit PendingWaitOp(H&& h) : handler(std::forward<H>(h)) {}
-
-    void Complete() noexcept override {
-        try {
-            std::move(handler)();
-        } catch (...) {}
-    }
-
-    Handler handler;
-};
-
-template <typename Handler>
-std::unique_ptr<PendingWait> MakePendingWait(Handler&& handler) {
-    using StoredHandler = std::decay_t<Handler>;
-    return std::make_unique<PendingWaitOp<StoredHandler>>(
-        std::forward<Handler>(handler));
-}
-
-void ResumeWaiter(acpp::net::io_context& io_context,
-                  std::unique_ptr<PendingWait>& waiter) noexcept {
-    auto pending = std::shared_ptr<PendingWait>(std::exchange(waiter, {}).release());
-    if (!pending) {
-        return;
-    }
-    try {
-        acpp::net::post(io_context, [pending]() {
-            pending->Complete();
-        });
-    } catch (...) {
-        pending->Complete();
-    }
-}
-
 std::optional<acpp::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
     acpp::anytls::outbound::Settings result;
@@ -136,9 +95,9 @@ struct Handler::ClientSession {
     class LogicalStream final {
     public:
         LogicalStream(net::io_context& io_context, uint32_t stream_id)
-            : io_context_(io_context)
-            , timeout_scheduler_(TimeoutScheduler::ForIoContext(io_context))
+            : timeout_scheduler_(TimeoutScheduler::ForIoContext(io_context))
             , syn_signal_(io_context, 1)
+            , payload_signal_(io_context, 1)
             , sid_(stream_id) {}
 
         ~LogicalStream() noexcept {
@@ -211,9 +170,11 @@ struct Handler::ClientSession {
                 });
             auto [ec] = co_await syn_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
             syn_waiting_ = false;
             timeout_scheduler_.Cancel(syn_timeout_token_);
+            if (ec) {
+                co_return std::unexpected(ErrorCode::CANCELLED);
+            }
             if (syn_ack_done_) {
                 if (syn_ack_error_ == ErrorCode::OK) {
                     co_return std::expected<void, ErrorCode>{};
@@ -238,16 +199,6 @@ struct Handler::ClientSession {
             WakePayloadReader();
         }
 
-        template <typename CompletionToken>
-        auto AsyncWaitPayload(CompletionToken&& token) {
-            return net::async_initiate<CompletionToken, void()>(
-                [this](auto&& handler) {
-                    payload_waiter_ = MakePendingWait(
-                        std::forward<decltype(handler)>(handler));
-                },
-                token);
-        }
-
         net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
             while (!closed_) {
                 if (!queue_.empty()) {
@@ -256,7 +207,11 @@ struct Handler::ClientSession {
                     queue_.pop_front();
                     co_return std::move(mb);
                 }
-                co_await AsyncWaitPayload(net::use_awaitable);
+                auto [ec] = co_await payload_signal_.async_receive(
+                    net::as_tuple(net::use_awaitable));
+                if (ec) {
+                    co_return std::unexpected(ErrorCode::CANCELLED);
+                }
             }
             if (!queue_.empty()) {
                 buf::MultiBuffer mb = std::move(queue_.front());
@@ -285,14 +240,13 @@ struct Handler::ClientSession {
         }
 
         void WakePayloadReader() noexcept {
-            ResumeWaiter(io_context_, payload_waiter_);
+            (void)payload_signal_.try_send(IoErrorCode{});
         }
 
-        net::io_context& io_context_;
         TimeoutScheduler& timeout_scheduler_;
-        std::unique_ptr<PendingWait> payload_waiter_;
         TimeoutToken syn_timeout_token_;
         net::experimental::channel<void(IoErrorCode)> syn_signal_;
+        net::experimental::channel<void(IoErrorCode)> payload_signal_;
         uint32_t sid_ = 0;
         std::deque<buf::MultiBuffer> queue_;
         size_t queued_bytes_ = 0;
@@ -364,7 +318,9 @@ struct Handler::ClientSession {
         while (write_busy && !closed.load()) {
             auto [ec] = co_await write_signal.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
+            if (ec) {
+                co_return std::unexpected(ErrorCode::CANCELLED);
+            }
         }
         if (closed.load() || !stream) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);

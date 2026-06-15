@@ -40,6 +40,51 @@ void MarkAbortiveCloseIfSupported(Endpoint& endpoint) {
     }
 }
 
+template <typename Endpoint>
+void CancelIfSupported(Endpoint& endpoint) noexcept {
+    if constexpr (requires { endpoint.Cancel(); }) {
+        try {
+            endpoint.Cancel();
+        } catch (...) {
+        }
+    }
+}
+
+template <typename FromControl, typename ToControl>
+void CancelRelayControls(FromControl& from, ToControl& to) noexcept {
+    CancelIfSupported(from);
+    if constexpr (std::is_same_v<std::remove_cvref_t<FromControl>,
+                                 std::remove_cvref_t<ToControl>>) {
+        if (std::addressof(from) != std::addressof(to)) {
+            CancelIfSupported(to);
+        }
+    } else {
+        CancelIfSupported(to);
+    }
+}
+
+inline ErrorCode SelectRelayError(ErrorCode up, ErrorCode down) noexcept {
+    if (up == ErrorCode::OK) {
+        return down;
+    }
+    if (down == ErrorCode::OK) {
+        return up;
+    }
+    if (up == ErrorCode::CANCELLED && down != ErrorCode::CANCELLED) {
+        return down;
+    }
+    return up;
+}
+
+inline bool ClientSideErrorFirst(ErrorCode up, ErrorCode down) noexcept {
+    if (up == ErrorCode::OK) {
+        return false;
+    }
+    return !(up == ErrorCode::CANCELLED &&
+             down != ErrorCode::OK &&
+             down != ErrorCode::CANCELLED);
+}
+
 inline int64_t ToSteadyNs(SteadyClock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         tp.time_since_epoch()).count();
@@ -310,6 +355,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                 error = ErrorCode::RELAY_TIMEOUT;
                 LOG_CONN_DEBUG(ctx, "[relay] {} absolute half-close timeout, transferred={}B",
                                is_upload ? "up" : "down", total_bytes);
+                CancelRelayControls(from_control, to_control);
                 break;
             }
 
@@ -338,6 +384,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                     error = ErrorCode::RELAY_TIMEOUT;
                     LOG_CONN_DEBUG(ctx, "[relay] {} relay timeout, transferred={}B",
                                    is_upload ? "up" : "down", total_bytes);
+                    CancelRelayControls(from_control, to_control);
                     break;
                 }
 
@@ -428,6 +475,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                                is_upload ? "up" : "down",
                                ErrorCodeToString(error), e.what(), total_bytes);
             }
+            CancelRelayControls(from_control, to_control);
             break;
         }
     }
@@ -510,12 +558,9 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_up = bytes_up;
     ctx.traffic.bytes_down = bytes_down;
 
-    if (error_up != ErrorCode::OK) {
-        result.error = error_up;
-        result.client_closed_first = true;
-    } else if (error_down != ErrorCode::OK) {
-        result.error = error_down;
-    }
+    result.error = relay_detail::SelectRelayError(error_up, error_down);
+    result.client_closed_first =
+        relay_detail::ClientSideErrorFirst(error_up, error_down);
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -656,12 +701,9 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_up = bytes_up;
     ctx.traffic.bytes_down = bytes_down;
 
-    if (error_up != ErrorCode::OK) {
-        result.error = error_up;
-        result.client_closed_first = true;
-    } else if (error_down != ErrorCode::OK) {
-        result.error = error_down;
-    }
+    result.error = relay_detail::SelectRelayError(error_up, error_down);
+    result.client_closed_first =
+        relay_detail::ClientSideErrorFirst(error_up, error_down);
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -718,6 +760,18 @@ net::awaitable<RelayResult> DoRelayLink(
                    config.speed_limit > 0 ?
                    std::format("{}MB/s", config.speed_limit / 1024 / 1024) : "unlimited");
 
+    std::pair<uint64_t, ErrorCode> up_result{0, ErrorCode::OK};
+    std::pair<uint64_t, ErrorCode> down_result{0, ErrorCode::OK};
+    ErrorCode first_error = ErrorCode::OK;
+    bool first_error_from_client = false;
+
+    auto remember_error = [&](ErrorCode error, bool from_client) {
+        if (error != ErrorCode::OK && first_error == ErrorCode::OK) {
+            first_error = error;
+            first_error_from_client = from_client;
+        }
+    };
+
     auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
         uint64_t bytes = 0;
         LocalStatsAccumulator stats_acc;
@@ -738,10 +792,17 @@ net::awaitable<RelayResult> DoRelayLink(
                 }
             } catch (const IoSystemError& e) {
                 relay_detail::FlushRelayStats(&stats, stats_acc);
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
+                const ErrorCode error = MapAsioError(e.code());
+                up_result = std::make_pair(bytes, error);
+                remember_error(error, true);
+                relay_detail::CancelIfSupported(target);
+                throw;
             } catch (...) {
                 relay_detail::FlushRelayStats(&stats, stats_acc);
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
+                up_result = std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
+                remember_error(ErrorCode::RELAY_WRITE_FAILED, true);
+                relay_detail::CancelIfSupported(target);
+                throw;
             }
         }
     };
@@ -766,24 +827,43 @@ net::awaitable<RelayResult> DoRelayLink(
                 }
             } catch (const IoSystemError& e) {
                 relay_detail::FlushRelayStats(&stats, stats_acc);
-                co_return std::make_pair(bytes, MapAsioError(e.code()));
+                const ErrorCode error = MapAsioError(e.code());
+                down_result = std::make_pair(bytes, error);
+                remember_error(error, false);
+                relay_detail::CancelIfSupported(target);
+                throw;
             } catch (...) {
                 relay_detail::FlushRelayStats(&stats, stats_acc);
-                co_return std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
+                down_result = std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
+                remember_error(ErrorCode::RELAY_WRITE_FAILED, false);
+                relay_detail::CancelIfSupported(target);
+                throw;
             }
         }
     };
 
-    auto [up, down] = co_await (upload() && download());
+    try {
+        auto [up, down] = co_await (upload() && download());
+        up_result = up;
+        down_result = down;
+    } catch (...) {
+        if (first_error == ErrorCode::OK) {
+            first_error = ErrorCode::INTERNAL;
+        }
+    }
 
     RelayResult result;
-    result.bytes_up = up.first;
-    result.bytes_down = down.first;
-    result.client_closed_first = up.second != ErrorCode::OK;
-    if (up.second != ErrorCode::OK) {
-        result.error = up.second;
-    } else if (down.second != ErrorCode::OK) {
-        result.error = down.second;
+    result.bytes_up = first_error == ErrorCode::OK ? up_result.first : ctx.traffic.bytes_up;
+    result.bytes_down = first_error == ErrorCode::OK ? down_result.first : ctx.traffic.bytes_down;
+    result.client_closed_first = first_error != ErrorCode::OK
+        ? first_error_from_client
+        : relay_detail::ClientSideErrorFirst(up_result.second, down_result.second);
+    if (first_error != ErrorCode::OK) {
+        result.error = first_error;
+    } else if (up_result.second != ErrorCode::OK) {
+        result.error = up_result.second;
+    } else if (down_result.second != ErrorCode::OK) {
+        result.error = down_result.second;
     }
     ctx.traffic.bytes_up = result.bytes_up;
     ctx.traffic.bytes_down = result.bytes_down;
