@@ -30,8 +30,44 @@ net::awaitable<DialResult> DialSingleCandidate(
     co_return tcp_result;
 }
 
-net::awaitable<DialResult> DialCandidatesSequential(
+net::awaitable<DialResult> DialAndBuildSingleCandidate(
     net::io_context& io_context,
+    session::Context& ctx,
+    const OutboundTransportTarget& target,
+    const OutboundDialCandidate& candidate) {
+
+    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
+    if (!tcp_result.Ok()) {
+        co_return tcp_result;
+    }
+
+    tcp_result.stream->SetIdleTimeout(target.timeout);
+    (void)tcp_result.stream->StartPhaseDeadline(target.timeout);
+
+    auto build_result = co_await BuildOutboundTransport(
+        std::move(tcp_result.stream),
+        *target.stream_settings,
+        target.server_name,
+        ctx.conn_id);
+    if (!build_result) {
+        const ErrorCode code = build_result.error();
+        co_return DialResult::Fail(
+            code,
+            std::string("outbound transport build failed: ") +
+                std::string(ErrorCodeToString(code)));
+    }
+
+    auto stream = std::move(*build_result);
+    stream->ClearPhaseDeadline();
+    // 后续 outbound handler / relay 阶段会重新设置 idle/read/write timeout。
+    stream->SetIdleTimeout(std::chrono::seconds(0));
+
+    co_return DialResult::Success(std::move(stream));
+}
+
+net::awaitable<DialResult> DialAndBuildCandidatesSequential(
+    net::io_context& io_context,
+    session::Context& ctx,
     const OutboundTransportTarget& target,
     std::span<const OutboundDialCandidate> candidates) {
 
@@ -39,13 +75,13 @@ net::awaitable<DialResult> DialCandidatesSequential(
         DialResult::Fail(ErrorCode::DIAL_CONNECT_FAILED, "all dial candidates failed");
 
     for (const auto& candidate : candidates) {
-        auto attempt = co_await DialSingleCandidate(
-            io_context, target, candidate);
+        auto attempt = co_await DialAndBuildSingleCandidate(
+            io_context, ctx, target, candidate);
         if (attempt.Ok()) {
             co_return attempt;
         }
 
-        LOG_DEBUG("DialOutboundTransport: connect {}:{} failed: {}",
+        LOG_DEBUG("DialOutboundTransport: candidate {}:{} failed: {}",
                   candidate.endpoint.address().to_string(),
                   candidate.endpoint.port(),
                   attempt.error_msg);
@@ -66,44 +102,16 @@ net::awaitable<DialResult> DialOutboundTransport(
         co_return DialResult::Fail(ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
     }
 
-    DialResult tcp_result =
-        DialResult::Fail(ErrorCode::DIAL_CONNECT_FAILED, "all dial candidates failed");
     if (target.single_candidate) {
-        tcp_result = co_await DialSingleCandidate(
-            io_context, target, *target.single_candidate);
-    } else if (target.candidates.size() == 1) {
-        tcp_result = co_await DialSingleCandidate(
-            io_context, target, target.candidates.front());
-    } else {
-        tcp_result = co_await DialCandidatesSequential(
-            io_context, target, target.candidates);
+        co_return co_await DialAndBuildSingleCandidate(
+            io_context, ctx, target, *target.single_candidate);
     }
-
-    if (!tcp_result.Ok()) {
-        co_return tcp_result;
+    if (target.candidates.size() == 1) {
+        co_return co_await DialAndBuildSingleCandidate(
+            io_context, ctx, target, target.candidates.front());
     }
-
-    tcp_result.stream->SetIdleTimeout(target.timeout);
-    (void)tcp_result.stream->StartPhaseDeadline(target.timeout);
-
-    auto build_result = co_await BuildOutboundTransport(
-        std::move(tcp_result.stream),
-        *target.stream_settings,
-        target.server_name,
-        ctx.conn_id);
-    if (!build_result) {
-        const ErrorCode code = build_result.error();
-        co_return DialResult::Fail(
-            code,
-            std::string("outbound transport build failed: ") + std::string(ErrorCodeToString(code)));
-    }
-    auto stream = std::move(*build_result);
-
-    stream->ClearPhaseDeadline();
-    // 后续 outbound handler / relay 阶段会重新设置 idle/read/write timeout。
-    stream->SetIdleTimeout(std::chrono::seconds(0));
-
-    co_return DialResult::Success(std::move(stream));
+    co_return co_await DialAndBuildCandidatesSequential(
+        io_context, ctx, target, target.candidates);
 }
 
 }  // namespace acpp
