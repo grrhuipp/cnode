@@ -1,28 +1,35 @@
 # cnode
 
-cnode 是面向 V2Board 面板的高性能代理节点服务端。项目以 C++23、Asio 协程和 Worker-local 资源模型实现，目标是在保持 xray-core 配置语义的同时，把面板同步、配置归一化、协议处理和流量转发拆成清晰的职责边界。
+cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C++23、Asio 协程和 Worker-local 资源模型实现，在保留 xray-core 配置语义的同时，把面板同步、配置归一化、协议处理和流量转发拆成清晰的运行边界。
+
+## 文档分工
+
+- `README.md` 面向使用者和贡献者，说明项目定位、运行架构、配置入口、关键语义和代码组织。
+- `AGENTS.md` 面向代码修改和自动化协作者，记录必须遵守的职责边界、禁止项、审查清单和硬性删除规则。
+
+如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
 
 ## 项目定位
 
 - 支持 VMess、Trojan、Shadowsocks、AnyTLS、Freedom、Blackhole。
-- 支持 TCP、TLS、WebSocket、PROXY protocol 和 UDP-over-TCP 等传输形态。
+- 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
 - 默认按多 Worker 运行，每个 Worker 持有自己的事件循环和热路径资源。
 - 部署脚本 `scripts/cnode.sh` 不带参数时只更新线上二进制；`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
-## 总体架构
+## 架构总览
 
-所有 TCP 和 UDP 请求都必须进入同一条数据链路：
+所有 TCP / UDP 请求最终只能经过一条数据链路：
 
 ```text
-inbound.Process
-  -> dispatcher.Dispatch
-  -> outbound.Process
-  -> relay
+Inbound Handler::Process
+  -> Dispatcher::Dispatch
+  -> Outbound Handler::Process
+  -> Relay
 ```
 
-原生 datagram、UDP-over-TCP 和 Mux/子流允许使用必要的窄 helper，例如 UDP framer、`DispatchUDP` 或 `DialUDP`，但 helper 只表达主链路的实现分支：inbound 仍负责协议解析和 metadata，dispatcher 仍负责路由，outbound 仍负责出站资源准备，relay 仍以协议无关方式搬运数据。它们不能发展为协议私有请求链路或绕过 dispatcher / outbound / relay 的第二套架构。
+原生 datagram、UDP-over-TCP 和 Mux/子流可以有必要的窄 helper，例如 UDP framer、`DispatchUDP` 或 `DialUDP`。这些 helper 只服务主链路语义：inbound 解析并生成 metadata，dispatcher 做路由，outbound 准备 Worker-local 出站资源，relay 以协议无关方式搬运数据。
 
 运行时主链路：
 
@@ -72,18 +79,19 @@ Worker DNS service
   -> publish DNS result snapshot
 ```
 
-## 模块职责
+## 职责速览
 
-- `proxy/<protocol>` 只负责协议认证、解析、编码、握手和协议私有 helper。
-- `app/dispatcher` 负责从入站 session metadata 进入路由和出站选择，不能包含协议特判。
-- `app/router` 只做路由决策，输入归一化 metadata，输出 outbound tag。
-- `app/proxyman` 负责 prepared inbound/outbound handler 的构建和持有。
-- `transport/internet` 只负责 TCP、TLS、WebSocket、PROXY protocol、dialer 和 transport stack。
-- `app/relay` 与 `common/mux` 只搬运已经准备好的数据，不解析协议，不选择路由。
-- `service/controller` 与 `api/*` 只属于控制面，负责面板同步、用户/节点/规则拉取和流量上报。
-- `infra` 负责日志、JSON、配置加载、配置校验和冷路径归一化。
-- `common/buf`、`common/allocator`、`app/worker*` 共同维护 Worker-local buffer、统计和运行时资源边界。
-- `app/dns` 中 DNS service、inflight resolve、UDP socket 和 timeout 归属当前 Worker；进程级 `GlobalDnsCache` 只保存 DNS 结果的不可变分片快照。
+| 层级 | 负责 | 不负责 |
+| --- | --- | --- |
+| inbound | 认证、入站协议解析、用户识别、目标地址解析、session metadata、调用 dispatcher | 路由选择、出站连接、relay 细节、访问 outbound manager 内部结构 |
+| dispatcher | 接收 session / context / link，调用 router，选择 outbound handler，调用 outbound.Process | 解析协议、创建协议专属对象、协议特判、执行 relay、读取 panel 字段 |
+| router | 基于归一化 metadata 输出 outbound tag / route decision | 创建连接、访问 relay、访问协议实现、理解 Worker 资源 |
+| outbound | 建立目标连接或下一跳连接，执行出站协议握手和编码，交给 relay | 路由决策、读取 panel 原始配置、绕过 dispatcher |
+| relay | TCP / UDP / Mux 数据搬运和流量统计打点 | 解析协议、选择 outbound、访问 panel、暴露 wrapper API |
+| Worker | 事件循环、accept 生命周期、运行态组件持有、thread-local allocator / buffer provider | 协议解析、路由、panel 同步、理解具体 validator 或 outbound 类型 |
+| control plane | 面板同步、配置归一化、runtime 构建、快照发布、状态与流量上报 | 进入热路径、直接改 live handler、访问 Worker buffer provider |
+
+更完整的边界规则、禁止项和删除标准见 `AGENTS.md`。
 
 ## 配置设计
 
@@ -104,7 +112,7 @@ geosite.dat
 
 仓库 `config/*.json.example` 只作为样例文件；实际部署和目录模式读取的文件名不带 `.example`，固定为 `config.json`、`inbounds.json`、`outbounds.json`、`routing.json`。
 
-推荐的部署目录组织方式：
+推荐部署目录：
 
 ```text
 /opt/cnode/
@@ -142,55 +150,15 @@ geosite.dat
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
-- Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
-- DNS 的 `cacheSize` 表示进程级 L2 结果缓存容量；每个 Worker 只派生一份小型 L1 cache。L2 cache 使用分片 RCU snapshot，热路径只做 atomic load 和只读查询，真实解析成功或 negative cacheable 结果再发布新分片快照。
-- `Buffer` / `MultiBuffer` 可以沿当前请求链路 move 转移所有权，但不能作为跨 Worker 缓存、池对象或长期共享状态；消费结束后应在所属资源边界释放或归还。
 - AnyTLS 按 xray-core wire model 实现：TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写、`settings.users` 和 `settings.paddingScheme` 语义。
 
-## 用户存储设计
+## 运行时状态
 
-面板用户、静态用户和测试用户最终进入同一套认证存储模型。面板客户端只把原始响应解析为 `api::UserInfo`；Controller 只做字段归一化、差量对比和发布触发，把用户转换为协议无关的 `RuntimeUser`。协议私有凭据构建由 `proxy/<protocol>` 注册的 `build_users` / `build_static_users` 完成，输出统一的 `UserSet`。
+面板用户、静态用户和测试用户最终进入同一套认证存储模型。面板客户端只把原始响应解析为 `api::UserInfo`；Controller 只做字段归一化、差量对比和发布触发；协议私有凭据构建由 `proxy/<protocol>` 注册的 user builder 完成，输出统一的 `UserSet`。热路径 validator 只加载 `UserStore` 的不可变视图做认证。
 
-`UserStore` 是进程级认证用户 RCU 快照，按 `protocol + tag` 保存不可变用户容器。冷路径复制构建并原子发布新快照；热路径 validator 只加载只读视图做认证，不解析 JSON、不读取面板字段、不持有面板原始用户结构。VMess、Trojan、Shadowsocks、AnyTLS 的用户更新接口统一为 `ApplyUsers` / `AddUsers` / `RemoveUsers` / `ClearUsers`。
+DNS service 不是全局共享对象。每个 Worker 持有绑定自身 `io_context` 的 DNS service、inflight resolve 表、UDP socket、timeout scheduler 和 L1 cache。进程级 `GlobalDnsCache` 只保存 DNS 结果的不可变分片快照，热路径只做 atomic load 和只读查询。
 
-在线设备、连接计数和设备限制检查属于 Worker-local tracker，由各协议 validator 在当前 Worker 内维护；这些状态不进入全局 `UserStore`，也不能通过裸指针、引用或 lock-free 对象跨 Worker 共享。
-
-## DNS 缓存设计
-
-DNS service 不是全局共享对象。每个 Worker 持有绑定自身 `io_context` 的 DNS service，内部的 `inflight_resolves`、UDP socket、timeout scheduler 和 L1 cache 都只在所属 Worker 线程访问。
-
-`GlobalDnsCache` 是进程级 DNS 结果 L2 cache，只保存域名解析结果和过期时间。它按分片持有 `shared_ptr<const ShardSnapshot>`，更新时复制目标分片、合并结果、清理过期项并 CAS 发布；读取时只加载不可变 snapshot，不更新 LRU、不移动节点、不触碰 Worker-local 对象。
-
-全局 L2 不承担 DNS 请求生命周期，也不做跨 Worker inflight 去重。它只是减少多 Worker 重复解析的只读结果层；真正的可写 LRU、协程等待和网络查询仍留在 Worker-local DNS service 内。
-
-## 开发规范
-
-- 先分析现有代码和配置，再决定修改方式。
-- 新代码优先沿用现有目录、命名、RAII、协程和错误处理风格。
-- 冷路径可以使用 factory、builder、registry、JSON 解析和兼容归一化。
-- 热路径只消费预构建结构，避免 JSON 解析、面板字段判断、临时协议分支、重复分配和重复拷贝。
-- 公共头文件保持窄接口，避免传播运行时存储、完整配置类型、协议私有 helper 或 umbrella 依赖。
-- 协议实现统一暴露 `Handler::Process` 风格入口，reader、writer、codec、crypto helper 留在协议私有实现内。
-- MultiBuffer / Buffer 必须保持清晰所有权，move 即转移所有权，消费后及时归还或释放。
-- 统计由统一 stats / traffic 层聚合；relay 可以打点，但不能理解面板或协议私有细节。
-
-## 开发约束
-
-- Worker 不直接理解协议 validator、outbound 具体类型或 panel 字段。
-- Dispatcher 不 include 具体协议，不直接执行 relay，不读取 panel 配置。
-- Router 不创建连接，不访问 relay，不依赖 proxyman 具体实现。
-- Relay 不解析 VMess、Trojan、Shadowsocks、AnyTLS，也不选择 outbound。
-- Panel/client/controller 不进入热路径，不修改 live handler 内部状态。
-- 出站处理不能读取面板原始字段；所有字段必须在冷路径归一化。
-- 配置热更新只能替换 runtime snapshot，不能原地修改正在使用的对象图。
-- 禁止跨线程或跨 Worker 直接访问无锁热路径对象；无锁不代表任意线程可读写。
-- 禁止把 Worker-local 裸指针、引用、buffer provider、allocator、handler、manager、UDPSession 或 AsyncStream 保存到其他 Worker。
-- 禁止用 lock-free / atomic 共享 live handler、manager、连接对象或 buffer pool 来绕过 Worker 所有权。
-- 禁止把 DNS service、inflight resolve、UDP socket、timeout scheduler 或 Worker L1 DNS cache 提升为跨 Worker 共享对象；跨 Worker 只能共享不可变 DNS 结果 snapshot。
-- 禁止把 legacy、compat、adapter、wrapper、old 或旧面板私有命名作为最终公开设计保留。
-- 禁止协议、transport、relay、panel 各自维护长期私有大 buffer pool。
-- 禁止为了局部方便绕过 `inbound.Process -> dispatcher.Dispatch -> outbound.Process -> relay` 主链路。
-- 禁止 controller、panel client、dispatcher、router、relay 或 Worker 按具体协议构建认证用户凭据；面板用户必须经过 `RuntimeUser -> UserSet -> UserStore` 链路。
+Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
 
 ## 代码组织
 
@@ -203,8 +171,17 @@ src/service/          控制面 controller
 src/api/              面板 API client
 src/infra/            配置、JSON、日志、校验
 src/common/           通用类型、buffer、allocator、session、mux
+src/geo/              geoip / geosite 数据读取
+src/sniff/            HTTP / TLS sniffing
 config/               示例配置
 scripts/              部署与更新脚本
 ```
 
 仓库结构应表达最终职责，而不是表达迁移历史。删除或替换一个协议时，不应影响 dispatcher、router、relay、Worker 的结构；替换面板实现时，不应影响协议热路径；替换路由规则时，不应影响 inbound/outbound 协议实现。
+
+## 开发提示
+
+- 变更前先分析现有代码和配置，再决定修改方式。
+- 新代码优先沿用现有目录、命名、RAII、协程和错误处理风格。
+- 新增行为要同步考虑静态配置、面板配置、热更新、TCP、UDP、Mux/子流和源进源出语义。
+- 涉及架构边界、热路径、用户存储、DNS、Worker-local 状态或配置归一化时，必须按 `AGENTS.md` 的硬约束审查。
