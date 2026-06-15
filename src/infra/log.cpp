@@ -10,10 +10,13 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace acpp {
 
@@ -35,14 +38,23 @@ struct LogRecord {
     std::string message;
 };
 
+struct LogTarget {
+    std::string fallback_prefix;
+    std::filesystem::path configured_path;
+    std::filesystem::path active_path;
+};
+
+struct DailyLogSpec {
+    std::filesystem::path directory;
+    std::string stem;
+    std::string extension{".log"};
+};
+
 std::mutex g_lifecycle_mutex;
 std::mutex g_console_mutex;
-std::filesystem::path g_log_dir;
-std::filesystem::path g_access_path;
-std::filesystem::path g_error_path;
-uint16_t g_max_days = 15;
 constexpr size_t kAsyncLogQueueSize = 65536;
 constexpr auto kLogIdleSleep = 1ms;
+constexpr auto kRotationCheckInterval = 1s;
 
 std::string_view LevelName(LogLevel level) noexcept {
     switch (level) {
@@ -56,8 +68,65 @@ std::string_view LevelName(LogLevel level) noexcept {
     return "?";
 }
 
+std::string DateString(std::chrono::system_clock::time_point now) {
+    return FormatLocalTime(now, "%Y-%m-%d");
+}
+
 std::string TodayDateString() {
-    return FormatLocalTime(std::chrono::system_clock::now(), "%Y-%m-%d");
+    return DateString(std::chrono::system_clock::now());
+}
+
+bool IsDateString(std::string_view value) noexcept {
+    if (value.size() != 10) return false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (i == 4 || i == 7) {
+            if (value[i] != '-') return false;
+            continue;
+        }
+        if (value[i] < '0' || value[i] > '9') return false;
+    }
+    return true;
+}
+
+int ParseDigits(std::string_view value, size_t offset, size_t length) noexcept {
+    int parsed = 0;
+    for (size_t i = 0; i < length; ++i) {
+        parsed = parsed * 10 + (value[offset + i] - '0');
+    }
+    return parsed;
+}
+
+std::optional<std::chrono::sys_days> ParseDateDays(std::string_view value) {
+    if (!IsDateString(value)) return std::nullopt;
+
+    const int year = ParseDigits(value, 0, 4);
+    const int month = ParseDigits(value, 5, 2);
+    const int day = ParseDigits(value, 8, 2);
+    const auto ymd = std::chrono::year{year} /
+        std::chrono::month{static_cast<unsigned>(month)} /
+        std::chrono::day{static_cast<unsigned>(day)};
+    if (!ymd.ok()) return std::nullopt;
+    return std::chrono::sys_days{ymd};
+}
+
+std::optional<int64_t> DateAgeDays(std::string_view file_date,
+                                   std::string_view today) {
+    const auto file_days = ParseDateDays(file_date);
+    const auto today_days = ParseDateDays(today);
+    if (!file_days || !today_days) return std::nullopt;
+    return (*today_days - *file_days).count();
+}
+
+void EnsureParentDirectory(const std::filesystem::path& path) {
+    if (auto parent = path.parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent);
+    }
+}
+
+bool RemovePath(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return !ec;
 }
 
 bool GzipFile(const std::filesystem::path& src) {
@@ -67,72 +136,183 @@ bool GzipFile(const std::filesystem::path& src) {
     std::ifstream in(src, std::ios::binary);
     if (!in) return false;
 
+    std::error_code ec;
+    std::filesystem::remove(dst, ec);
+    if (ec) return false;
+
     gzFile gz = gzopen(dst.string().c_str(), "wb6");
     if (!gz) return false;
 
+    auto fail = [&]() {
+        gzclose(gz);
+        RemovePath(dst);
+        return false;
+    };
+
     std::array<char, 64 * 1024> buf{};
-    while (in.read(buf.data(), static_cast<std::streamsize>(buf.size())) || in.gcount() > 0) {
-        if (gzwrite(gz, buf.data(), static_cast<unsigned>(in.gcount())) <= 0) {
-            gzclose(gz);
-            std::filesystem::remove(dst);
-            return false;
+    while (in.read(buf.data(), static_cast<std::streamsize>(buf.size())) ||
+           in.gcount() > 0) {
+        const auto count = in.gcount();
+        if (count <= 0) continue;
+        const int written = gzwrite(gz, buf.data(), static_cast<unsigned>(count));
+        if (written != static_cast<int>(count)) {
+            return fail();
         }
     }
 
-    gzclose(gz);
+    if (in.bad()) return fail();
+
+    const int close_result = gzclose(gz);
+    gz = nullptr;
+    if (close_result != Z_OK) {
+        RemovePath(dst);
+        return false;
+    }
+
     in.close();
-    std::filesystem::remove(src);
+    if (!RemovePath(src)) {
+        return false;
+    }
     return true;
 }
 
-void CleanupOldFiles() {
-    if (g_log_dir.empty()) return;
+std::string LogStem(const std::filesystem::path& configured_path,
+                    std::string_view fallback_prefix) {
+    if (configured_path.empty()) {
+        return std::string(fallback_prefix);
+    }
 
+    auto path_for_stem = configured_path;
+    if (path_for_stem.extension() == ".gz") {
+        path_for_stem = path_for_stem.stem();
+    }
+
+    auto stem = path_for_stem.stem().string();
+    if (stem.empty()) {
+        stem = std::string(fallback_prefix);
+    }
+    return stem;
+}
+
+std::string LogExtension(const std::filesystem::path& configured_path) {
+    if (configured_path.empty()) {
+        return ".log";
+    }
+
+    auto path_for_extension = configured_path;
+    if (path_for_extension.extension() == ".gz") {
+        path_for_extension = path_for_extension.stem();
+    }
+
+    auto extension = path_for_extension.extension().string();
+    return extension.empty() ? ".log" : extension;
+}
+
+DailyLogSpec MakeDailySpec(const std::filesystem::path& log_dir,
+                           const std::filesystem::path& configured_path,
+                           std::string_view fallback_prefix) {
+    DailyLogSpec spec;
+    spec.directory = configured_path.empty()
+        ? log_dir
+        : configured_path.parent_path();
+    spec.stem = LogStem(configured_path, fallback_prefix);
+    spec.extension = LogExtension(configured_path);
+    return spec;
+}
+
+std::filesystem::path MakeDailyLogPath(const DailyLogSpec& spec,
+                                       std::string_view date) {
+    const auto filename = std::format("{}_{}{}", spec.stem, date, spec.extension);
+    if (spec.directory.empty()) {
+        return std::filesystem::path(filename);
+    }
+    return spec.directory / filename;
+}
+
+std::filesystem::path ResolveFixedLogPath(
+    const std::filesystem::path& log_dir,
+    const std::filesystem::path& configured_path,
+    std::string_view fallback_prefix) {
+    if (!configured_path.empty()) {
+        return configured_path;
+    }
+    return log_dir / std::format("{}.log", fallback_prefix);
+}
+
+std::filesystem::path ResolveLogPath(
+    const std::filesystem::path& log_dir,
+    const std::filesystem::path& configured_path,
+    std::string_view fallback_prefix,
+    bool rotate_daily,
+    std::string_view date) {
+    if (!rotate_daily) {
+        return ResolveFixedLogPath(log_dir, configured_path, fallback_prefix);
+    }
+    return MakeDailyLogPath(
+        MakeDailySpec(log_dir, configured_path, fallback_prefix), date);
+}
+
+std::optional<std::string> ExtractDailyDate(std::string_view filename,
+                                            const DailyLogSpec& spec) {
+    const std::string prefix = spec.stem + "_";
+    if (!filename.starts_with(prefix)) return std::nullopt;
+
+    const std::string plain_suffix = spec.extension;
+    const std::string gzip_suffix = spec.extension + ".gz";
+    std::string_view date;
+
+    if (filename.ends_with(gzip_suffix)) {
+        date = filename.substr(
+            prefix.size(), filename.size() - prefix.size() - gzip_suffix.size());
+    } else if (filename.ends_with(plain_suffix)) {
+        date = filename.substr(
+            prefix.size(), filename.size() - prefix.size() - plain_suffix.size());
+    } else {
+        return std::nullopt;
+    }
+
+    if (!IsDateString(date)) return std::nullopt;
+    return std::string(date);
+}
+
+void CleanupManagedFiles(const std::vector<DailyLogSpec>& specs,
+                         std::string_view today,
+                         uint16_t max_days,
+                         bool gzip_enabled) {
     try {
-        const auto now = std::filesystem::file_time_type::clock::now();
-        const auto today = TodayDateString();
-        const auto today_error_log = std::format("error_{}.log", today);
-        const auto today_access_log = std::format("access_{}.log", today);
-
-        for (const auto& entry : std::filesystem::directory_iterator(g_log_dir)) {
-            if (!entry.is_regular_file()) continue;
-
-            const auto name = entry.path().filename().string();
-            const bool is_log = name.rfind("error_", 0) == 0 || name.rfind("access_", 0) == 0;
-            if (!is_log) continue;
-
-            if (g_max_days > 0) {
-                const auto age = now - entry.last_write_time();
-                const auto days = std::chrono::duration_cast<std::chrono::hours>(age).count() / 24;
-                if (days > g_max_days) {
-                    std::filesystem::remove(entry.path());
-                    continue;
-                }
+        for (const auto& spec : specs) {
+            const auto dir = spec.directory.empty()
+                ? std::filesystem::path(".")
+                : spec.directory;
+            if (!std::filesystem::exists(dir) ||
+                !std::filesystem::is_directory(dir)) {
+                continue;
             }
 
-            if (name.ends_with(".log") && name != today_error_log && name != today_access_log) {
-                GzipFile(entry.path());
+            for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                if (!entry.is_regular_file()) continue;
+
+                const auto name = entry.path().filename().string();
+                const auto file_date = ExtractDailyDate(name, spec);
+                if (!file_date) continue;
+
+                if (max_days > 0) {
+                    const auto age_days = DateAgeDays(*file_date, today);
+                    if (age_days && *age_days > max_days) {
+                        RemovePath(entry.path());
+                        continue;
+                    }
+                }
+
+                if (gzip_enabled &&
+                    *file_date != today &&
+                    name.ends_with(spec.extension)) {
+                    GzipFile(entry.path());
+                }
             }
         }
     } catch (...) {
     }
-}
-
-std::filesystem::path DailyLogPath(std::string_view prefix) {
-    return g_log_dir / std::format("{}_{}.log", prefix, TodayDateString());
-}
-
-std::filesystem::path ResolveLogPath(
-    const std::filesystem::path& configured_path,
-    std::string_view fallback_prefix) {
-    if (configured_path.empty()) {
-        return DailyLogPath(fallback_prefix);
-    }
-
-    if (auto parent = configured_path.parent_path(); !parent.empty()) {
-        std::filesystem::create_directories(parent);
-    }
-    return configured_path;
 }
 
 void WriteStderrFallback(LogLevel level, const std::string& msg) {
@@ -163,13 +343,31 @@ public:
     AsyncLogBackend(const AsyncLogBackend&) = delete;
     AsyncLogBackend& operator=(const AsyncLogBackend&) = delete;
 
-    [[nodiscard]] bool Start(const std::filesystem::path& error_path,
-                             const std::filesystem::path& access_path) {
+    [[nodiscard]] bool Start(const std::filesystem::path& log_dir,
+                             const std::filesystem::path& error_path,
+                             const std::filesystem::path& access_path,
+                             uint16_t max_days,
+                             bool rotate_daily,
+                             bool gzip_enabled) {
         Stop();
 
-        error_file_.open(error_path, std::ios::out | std::ios::app);
-        access_file_.open(access_path, std::ios::out | std::ios::app);
-        if (!error_file_ || !access_file_) {
+        log_dir_ = log_dir;
+        max_days_ = max_days;
+        rotate_daily_ = rotate_daily;
+        gzip_enabled_ = gzip_enabled;
+        current_date_ = TodayDateString();
+        next_rotation_check_ = std::chrono::steady_clock::now() +
+            kRotationCheckInterval;
+        error_target_ = LogTarget{"error", error_path};
+        access_target_ = LogTarget{"access", access_path};
+
+        if (rotate_daily_) {
+            CleanupManagedFiles(DailySpecs(), current_date_, max_days_, gzip_enabled_);
+        }
+
+        const auto resolved_error_path = ResolveTargetPath(error_target_, current_date_);
+        const auto resolved_access_path = ResolveTargetPath(access_target_, current_date_);
+        if (!OpenFiles(resolved_error_path, resolved_access_path)) {
             CloseFiles();
             return false;
         }
@@ -207,9 +405,52 @@ public:
         flush_requested_.store(true, std::memory_order_release);
     }
 
+    const std::filesystem::path& ErrorPath() const noexcept {
+        return error_target_.active_path;
+    }
+
+    const std::filesystem::path& AccessPath() const noexcept {
+        return access_target_.active_path;
+    }
+
 private:
+    std::vector<DailyLogSpec> DailySpecs() const {
+        return {
+            MakeDailySpec(
+                log_dir_, error_target_.configured_path, error_target_.fallback_prefix),
+            MakeDailySpec(
+                log_dir_, access_target_.configured_path, access_target_.fallback_prefix),
+        };
+    }
+
+    std::filesystem::path ResolveTargetPath(
+        const LogTarget& target,
+        std::string_view date) const {
+        return ResolveLogPath(
+            log_dir_, target.configured_path, target.fallback_prefix, rotate_daily_, date);
+    }
+
+    [[nodiscard]] bool OpenFiles(const std::filesystem::path& error_path,
+                                 const std::filesystem::path& access_path) {
+        EnsureParentDirectory(error_path);
+        EnsureParentDirectory(access_path);
+
+        std::ofstream error_file(error_path, std::ios::out | std::ios::app);
+        std::ofstream access_file(access_path, std::ios::out | std::ios::app);
+        if (!error_file || !access_file) {
+            return false;
+        }
+
+        error_file_ = std::move(error_file);
+        access_file_ = std::move(access_file);
+        error_target_.active_path = error_path;
+        access_target_.active_path = access_path;
+        return true;
+    }
+
     void Run() {
         while (running_.load(std::memory_order_acquire)) {
+            MaybeRotate();
             const bool wrote = DrainAvailable();
             ReportDrops();
             if (flush_requested_.exchange(false, std::memory_order_acq_rel)) {
@@ -223,6 +464,69 @@ private:
         DrainUntilEmpty();
         ReportDrops();
         FlushFiles();
+    }
+
+    void MaybeRotate() {
+        if (!rotate_daily_) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_rotation_check_) return;
+        next_rotation_check_ = now + kRotationCheckInterval;
+
+        const auto today = TodayDateString();
+        if (today != current_date_) {
+            RotateToDate(today);
+        }
+    }
+
+    void RotateToDate(std::string_view date) {
+        const auto old_error_path = error_target_.active_path;
+        const auto old_access_path = access_target_.active_path;
+        const auto new_error_path = ResolveTargetPath(error_target_, date);
+        const auto new_access_path = ResolveTargetPath(access_target_, date);
+
+        FlushFiles();
+        CloseFiles();
+
+        if (!OpenFiles(new_error_path, new_access_path)) {
+            WriteStderrFallback(
+                LogLevel::ERROR,
+                std::format("log rotation failed date={} access={} error={}",
+                            date, new_access_path.string(), new_error_path.string()));
+            if (!OpenFiles(old_error_path, old_access_path)) {
+                WriteStderrFallback(
+                    LogLevel::ERROR,
+                    std::format("log reopen failed access={} error={}",
+                                old_access_path.string(), old_error_path.string()));
+            }
+            return;
+        }
+
+        current_date_ = std::string(date);
+        WriteBackendLine(
+            LogLevel::INFO,
+            std::format("logging rotated date={} access={} error={}",
+                        date, new_access_path.string(), new_error_path.string()));
+
+        CompressClosedFile(old_error_path);
+        if (old_access_path != old_error_path) {
+            CompressClosedFile(old_access_path);
+        }
+        CleanupManagedFiles(DailySpecs(), current_date_, max_days_, gzip_enabled_);
+    }
+
+    void CompressClosedFile(const std::filesystem::path& path) {
+        if (!gzip_enabled_ || path.empty()) return;
+        if (path == error_target_.active_path || path == access_target_.active_path) return;
+
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec) || ec) return;
+
+        if (!GzipFile(path)) {
+            WriteBackendLine(
+                LogLevel::WARN,
+                std::format("log gzip failed file={}", path.string()));
+        }
     }
 
     bool DrainAvailable() {
@@ -259,6 +563,18 @@ private:
         }
     }
 
+    void WriteBackendLine(LogLevel level, std::string msg) {
+        if (error_file_) {
+            error_file_ << '[' << LogLocalNow() << "] [" << level << "] "
+                        << msg << '\n';
+            if (level >= LogLevel::WARN) {
+                error_file_.flush();
+            }
+            return;
+        }
+        WriteStderrFallback(level, msg);
+    }
+
     void ReportDrops() {
         const auto dropped = dropped_.exchange(0, std::memory_order_acq_rel);
         if (dropped == 0 || !error_file_) return;
@@ -284,6 +600,14 @@ private:
     std::atomic_bool flush_requested_{false};
     std::atomic<uint64_t> dropped_{0};
     std::thread writer_;
+    std::filesystem::path log_dir_;
+    uint16_t max_days_{15};
+    bool rotate_daily_{true};
+    bool gzip_enabled_{true};
+    std::string current_date_;
+    std::chrono::steady_clock::time_point next_rotation_check_{};
+    LogTarget error_target_{"error"};
+    LogTarget access_target_{"access"};
     std::ofstream error_file_;
     std::ofstream access_file_;
 };
@@ -296,48 +620,45 @@ bool Log::Init(const std::string& level,
                const std::filesystem::path& log_dir,
                uint16_t max_days,
                const std::filesystem::path& access_path,
-               const std::filesystem::path& error_path) {
+               const std::filesystem::path& error_path,
+               bool rotate_daily,
+               bool gzip) {
     {
         std::lock_guard lock(g_lifecycle_mutex);
         if (initialized_.load(std::memory_order_acquire)) return true;
 
         min_level_.store(ParseLevel(level), std::memory_order_release);
-        g_log_dir = log_dir;
-        g_access_path = access_path;
-        g_error_path = error_path;
-        g_max_days = max_days;
 
         try {
-            const bool uses_daily_fallback = g_access_path.empty() || g_error_path.empty();
-            if (uses_daily_fallback) {
-                std::filesystem::create_directories(g_log_dir);
-                CleanupOldFiles();
-            }
-
-            const auto resolved_error_path = ResolveLogPath(g_error_path, "error");
-            const auto resolved_access_path = ResolveLogPath(g_access_path, "access");
-
-            if (!g_async_log_backend.Start(resolved_error_path, resolved_access_path)) {
+            if (!g_async_log_backend.Start(
+                    log_dir, error_path, access_path, max_days, rotate_daily, gzip)) {
                 std::cerr << "Log initialization failed: cannot open access/error log files"
                           << std::endl;
                 return false;
             }
 
+            const auto resolved_error_path = g_async_log_backend.ErrorPath();
+            const auto resolved_access_path = g_async_log_backend.AccessPath();
+            const auto rotation = rotate_daily ? "daily" : "fixed";
+            const auto compression = (rotate_daily && gzip) ? "gzip" : "none";
+
             initialized_.store(true, std::memory_order_release);
             WriteConsole(std::format(
-                "logging level={} access={} error={} rotation={} retention={}d",
+                "logging level={} access={} error={} rotation={} compression={} retention={}d",
                 level,
                 resolved_access_path.string(),
                 resolved_error_path.string(),
-                uses_daily_fallback ? "daily" : "external",
+                rotation,
+                compression,
                 max_days));
             WriteApp(LogLevel::INFO, std::format(
-                "logging initialized level={} access={} error={} dir={} rotation={} retention_days={}",
+                "logging initialized level={} access={} error={} dir={} rotation={} compression={} retention_days={}",
                 level,
                 resolved_access_path.string(),
                 resolved_error_path.string(),
                 log_dir.string(),
-                uses_daily_fallback ? "daily" : "external",
+                rotation,
+                compression,
                 max_days));
         } catch (const std::exception& e) {
             std::cerr << "Log initialization failed: " << e.what() << std::endl;

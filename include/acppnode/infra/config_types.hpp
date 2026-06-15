@@ -23,6 +23,8 @@ struct LogConfig {
     std::filesystem::path access_path;
     std::filesystem::path error_path;
     uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）
+    bool rotate_daily = true;                         // 按本地日期切割日志
+    bool gzip = true;                                 // 历史日志 gzip 压缩
 
     static LogConfig FromJson(const json::object& j);
 };

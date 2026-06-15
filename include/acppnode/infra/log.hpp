@@ -6,8 +6,9 @@
 //
 // 日志输出说明：
 // - 控制台:     只打印配置信息和状态统计
-// - error.log:  程序状态与错误日志（对齐 XrayR ErrorPath）
-// - access.log: 所有连接相关日志（访问记录、连接失败、认证失败等）
+// - error_YYYY-MM-DD.log:  程序状态与错误日志（对齐 XrayR ErrorPath）
+// - access_YYYY-MM-DD.log: 所有连接相关日志（访问记录、连接失败、认证失败等）
+// - 历史每日日志在轮转后压缩为 .gz
 //
 // ============================================================================
 
@@ -79,7 +80,9 @@ public:
                                    const std::filesystem::path& log_dir,
                                    uint16_t max_days = 15,
                                    const std::filesystem::path& access_path = {},
-                                   const std::filesystem::path& error_path = {});
+                                   const std::filesystem::path& error_path = {},
+                                   bool rotate_daily = true,
+                                   bool gzip = true);
 
     // 关闭日志系统
     static void Shutdown();
@@ -110,7 +113,7 @@ private:
 #define LOG_CONSOLE(fmt_str, ...) acpp::Log::WriteConsole(std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
 // ============================================================================
-// 应用日志（写入 error.log/ErrorPath，不输出到控制台）
+// 应用日志（写入 error 通道，不输出到控制台）
 // 由运行时 level 配置控制是否输出，不在编译期裁剪
 // ============================================================================
 
@@ -146,7 +149,7 @@ private:
 
 // ============================================================================
 // 带连接上下文的日志
-//   TRACE/DEBUG/INFO/WARN/ERROR → access.log（连接访问轨迹，按运行时级别过滤）
+//   TRACE/DEBUG/INFO/WARN/ERROR → access 通道（连接访问轨迹，按运行时级别过滤）
 // ============================================================================
 #define LOG_CONN_TRACE(ctx, fmt_str, ...) \
     do { \
@@ -177,7 +180,7 @@ private:
     } while(0)
 
 // ============================================================================
-// 访问日志（写入 access.log）
+// 访问日志（写入 access 通道）
 // ============================================================================
 #define LOG_ACCESS(msg) \
     do { \
@@ -208,7 +211,7 @@ private:
     } while(0)
 
 // ============================================================================
-// 连接失败日志（写入 access.log）
+// 连接失败日志（写入 access 通道）
 // ============================================================================
 #define LOG_CONN_FAIL(fmt_str, ...) \
     do { \

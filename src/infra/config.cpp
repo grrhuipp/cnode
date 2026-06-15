@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 
@@ -75,7 +76,13 @@ LogConfig LogConfig::FromJson(const json::object& j) {
     if (!error_path.empty()) cfg.error_path = error_path;
 
     auto days = jint(j, "maxDays", cfg.max_days);
+    days = std::clamp<int64_t>(
+        days, 0, std::numeric_limits<uint16_t>::max());
     cfg.max_days = static_cast<uint16_t>(days);
+
+    cfg.rotate_daily = jbool(j, "rotateDaily", cfg.rotate_daily);
+    cfg.gzip = jbool(j, "gzip", cfg.gzip);
+    cfg.gzip = jbool(j, "compress", cfg.gzip);
     return cfg;
 }
 

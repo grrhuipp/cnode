@@ -125,8 +125,10 @@ geosite.dat
     geoip.dat
     geosite.dat
   log/
-    access.log
-    error.log
+    access_YYYY-MM-DD.log
+    error_YYYY-MM-DD.log
+    access_YYYY-MM-DD.log.gz
+    error_YYYY-MM-DD.log.gz
 ```
 
 启动命令可以显式指定文件或目录：
@@ -166,6 +168,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - `ProxyProtocol` 是 cnode 自有三态设置：`"off"`、`"auto"`、`"on"`。省略 `ProxyProtocol` 时默认使用 `"auto"`。
 - `SendIP: "auto"` 表示 direct outbound 优先绑定入站连接命中的本地 IP，用于多 IP 服务器源进源出。
 - `EnableDNS` 默认值为 `true`。
+- 日志默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。

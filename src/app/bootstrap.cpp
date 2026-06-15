@@ -109,7 +109,9 @@ int RunFromCommandLine(int argc, char* argv[]) {
                    config.GetLog().log_dir,
                    config.GetLog().max_days,
                    config.GetLog().access_path,
-                   config.GetLog().error_path)) {
+                   config.GetLog().error_path,
+                   config.GetLog().rotate_daily,
+                   config.GetLog().gzip)) {
         std::cerr << "Failed to initialize logging\n";
         return 1;
     }
