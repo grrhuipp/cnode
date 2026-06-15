@@ -2,6 +2,7 @@
 
 #include "../anytls_codec.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
@@ -28,7 +29,14 @@
 #include <unordered_set>
 #include <utility>
 
-namespace acpp::anytls::inbound {
+namespace acpp::proxy::anytls::inbound {
+
+// 协议核心 codec/validator 位于 acpp::anytls（对应 vmess core=acpp::vmess）。
+// 迁移到 acpp::proxy::anytls::inbound 后，别名让既有的 anytls::* 限定引用、
+// using-directive 让非限定 codec 符号（ParsePaddingScheme/Validator 等）
+// 继续解析到核心命名空间，无需逐处改写。
+namespace anytls = ::acpp::anytls;
+using namespace ::acpp::anytls;
 
 namespace {
 
@@ -80,16 +88,16 @@ void CopySessionContext(const session::Context& source, session::Context& target
 
 }  // namespace
 
-Handler::Handler(StatsShard& stats,
-                 Validator& validator,
+Handler::Handler(Validator& validator,
+                 StatsShard& stats,
                  ConnectionLimiterPtr limiter,
                  std::string padding_scheme)
-    : stats_(&stats)
-    , validator_(&validator)
+    : validator_(validator)
+    , stats_(&stats)
+    , limiter_(limiter)
 {
-    (void)limiter;
     if (!padding_scheme.empty()) {
-        auto parsed = ParsePaddingScheme(padding_scheme);
+        auto parsed = anytls::ParsePaddingScheme(padding_scheme);
         if (parsed) {
             padding_scheme_raw_ = std::move(parsed->raw);
             padding_scheme_md5_ = std::move(parsed->md5);
@@ -943,13 +951,6 @@ Handler::Process(
         co_return result;
     }
 
-    if (!validator_) {
-        stats_->OnError();
-        RelayResult result;
-        result.error = ErrorCode::PROTOCOL_AUTH_FAILED;
-        co_return result;
-    }
-
     std::array<uint8_t, 32> auth_hash{};
     if (auto ok = co_await ReadAuth(*stream, auth_hash); !ok) {
         stats_->OnError();
@@ -957,8 +958,11 @@ Handler::Process(
         result.error = ok.error();
         co_return result;
     }
-    auto user = validator_->Validate(ctx.inbound.tag, auth_hash);
+    auto user = validator_.Validate(ctx.inbound.tag, auth_hash);
     if (!user) {
+        if (limiter_ && ban_tracking_enabled_) {
+            limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+        }
         stats_->OnError();
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_AUTH_FAILED;
@@ -974,7 +978,7 @@ Handler::Process(
 
         const uint64_t uid = static_cast<uint64_t>(profile.user_id);
         if (uid != 0) {
-            if (!validator_->CanAcceptDevice(
+            if (!validator_.CanAcceptDevice(
                     ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
                 LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                     FormatTimestamp(ctx.accept_time_us),
@@ -983,14 +987,14 @@ Handler::Process(
                     ctx.inbound.tag,
                     ctx.inbound.user_email,
                     profile.device_limit,
-                    validator_->OnlineDeviceCount(ctx.inbound.tag, uid));
+                    validator_.OnlineDeviceCount(ctx.inbound.tag, uid));
                 stats_->OnError();
                 RelayResult result;
                 result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 co_return result;
             }
-            validator_->OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);
-            user_session.emplace(*validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
+            validator_.OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);
+            user_session.emplace(validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
         }
     }
 
@@ -1008,7 +1012,7 @@ Handler::Process(
     co_return co_await demux->Run();
 }
 
-}  // namespace acpp::anytls::inbound
+}  // namespace acpp::proxy::anytls::inbound
 
 namespace {
 const bool kInboundRegistered = [] {
@@ -1022,8 +1026,8 @@ const bool kInboundRegistered = [] {
             if (!deps.stats || !validator) {
                 return nullptr;
             }
-            return std::make_unique<acpp::anytls::inbound::Handler>(
-                *deps.stats, *validator, limiter, req.anytls_padding_scheme);
+            return std::make_unique<acpp::proxy::anytls::inbound::Handler>(
+                *validator, *deps.stats, limiter, req.anytls_padding_scheme);
         };
 
     reg.build_static_users =

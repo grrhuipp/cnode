@@ -24,7 +24,7 @@ class DNS;
 }  // namespace app::dns
 }  // namespace acpp
 
-namespace acpp::freedom::outbound {
+namespace acpp::proxy::freedom::outbound {
 
 // ============================================================================
 // Freedom 出站设置
@@ -106,4 +106,4 @@ private:
     StreamSettings stream_settings_;          // 默认 tcp/none
 };
 
-}  // namespace acpp::freedom::outbound
+}  // namespace acpp::proxy::freedom::outbound

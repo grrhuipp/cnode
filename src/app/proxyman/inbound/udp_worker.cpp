@@ -56,9 +56,8 @@ struct UdpClientSession {
 
 using UdpClientSessionMap =
     std::unordered_map<
-        UdpEndpointKey,
-        UdpClientSession,
-        UdpEndpointKeyHash>;
+        std::string,
+        UdpClientSession>;
 
 struct UdpSocketDeleter {
     void operator()(udp::socket* socket) const noexcept {
@@ -261,15 +260,17 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         return;
     }
 
-    const UdpEndpointKey client_key{
-        normalized_client_addr,
-        datagram.client_endpoint.port(),
-    };
     auto client_key_log = [&]() {
         return iputil::FormatEndpointForLog(client_ip, datagram.client_endpoint.port());
     };
+    std::string client_session_key;
+    if (!decoded->session_key.empty()) {
+        client_session_key = decoded->session_key;
+    } else {
+        client_session_key = client_key_log();
+    }
 
-    const bool need_new_session = !HasClientSession(socket_key, client_key);
+    const bool need_new_session = !HasClientSession(socket_key, client_session_key);
 
     if (need_new_session) {
         if (!decoded->response_context) {
@@ -335,7 +336,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
 
         auto client_session = CreateClientSession(
             socket_key,
-            client_key,
+            client_session_key,
             datagram.io_context,
             std::move(reply_cb),
             decoded->user_id,
@@ -388,7 +389,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
 
     if (!PushClientPayload(
         socket_key,
-        client_key,
+        client_session_key,
         decoded->target,
         std::move(decoded->payload),
         now)) {
@@ -496,14 +497,14 @@ void UdpWorker::ClearReplyQueue(const std::string& socket_key) {
 }
 
 bool UdpWorker::HasClientSession(const std::string& socket_key,
-                                 const UdpEndpointKey& client_key) const noexcept {
+                                 const std::string& client_key) const noexcept {
     auto session = FindClientSession(socket_key, client_key);
     return session && !session->Closed();
 }
 
 UdpWorker::ClientSessionPtr UdpWorker::FindClientSession(
     const std::string& socket_key,
-    const UdpEndpointKey& client_key) const noexcept {
+    const std::string& client_key) const noexcept {
     auto sessions_it = impl_->client_sessions.find(socket_key);
     if (sessions_it == impl_->client_sessions.end()) {
         return nullptr;
@@ -517,7 +518,7 @@ UdpWorker::ClientSessionPtr UdpWorker::FindClientSession(
 
 UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
     const std::string& socket_key,
-    const UdpEndpointKey& client_key,
+    const std::string& client_key,
     net::io_context& io_context,
     ReplyCallback reply_callback,
     int64_t user_id,
@@ -535,7 +536,7 @@ UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
 
 bool UdpWorker::PushClientPayload(
     const std::string& socket_key,
-    const UdpEndpointKey& client_key,
+    const std::string& client_key,
     const TargetAddress& target,
     buf::MultiBuffer payload,
     std::chrono::steady_clock::time_point now) {

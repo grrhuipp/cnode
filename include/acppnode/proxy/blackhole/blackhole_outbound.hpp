@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::blackhole::outbound {
+namespace acpp::proxy::blackhole::outbound {
 
 // ============================================================================
 // Blackhole 出站设置
@@ -45,4 +45,4 @@ private:
     BlackholeSettings settings_;
 };
 
-}  // namespace acpp::blackhole::outbound
+}  // namespace acpp::proxy::blackhole::outbound

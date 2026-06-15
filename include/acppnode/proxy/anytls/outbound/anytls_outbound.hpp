@@ -20,7 +20,9 @@ namespace app::dns {
 class DNS;
 }  // namespace app::dns
 
-namespace anytls::outbound {
+// 协议核心 codec/validator 位于 acpp::anytls；handler 与其它协议一致归于
+// acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
+namespace proxy::anytls::outbound {
 
 struct Settings {
     std::string address;
@@ -85,5 +87,5 @@ private:
     size_t min_idle_sessions_ = 0;
 };
 
-}  // namespace anytls::outbound
+}  // namespace proxy::anytls::outbound
 }  // namespace acpp

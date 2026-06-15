@@ -343,22 +343,29 @@ protected:
 
     size_t PopPendingData(uint8_t* dst, size_t max_len) {
         size_t copied = 0;
-        while (copied < max_len && !pending_data_.empty()) {
-            buf::Buffer* buffer = *pending_data_.begin();
+        // 统计已完全消费的头部前缀，最后一次性 drop_front，避免每个 Buffer
+        // 都做一次 O(size) 的 pop_front 搬移。
+        size_t drained = 0;
+        for (buf::Buffer* buffer : pending_data_) {
+            if (copied >= max_len) {
+                break;
+            }
             if (!buffer || buffer->IsEmpty()) {
-                buf::Buffer::Free(pending_data_.pop_front());
+                ++drained;
                 continue;
             }
-
             const size_t n = std::min(max_len - copied,
                                       static_cast<size_t>(buffer->Len()));
             std::memcpy(dst + copied, buffer->Bytes().data(), n);
             buffer->Advance(static_cast<uint32_t>(n));
             copied += n;
             if (buffer->IsEmpty()) {
-                buf::Buffer::Free(pending_data_.pop_front());
+                ++drained;
+            } else {
+                break;  // 部分消费，保留该 Buffer 及其后的剩余数据
             }
         }
+        pending_data_.drop_front(drained);
         return copied;
     }
 

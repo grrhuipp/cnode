@@ -19,6 +19,7 @@ struct BuildRequest {
     std::string tag;
     std::string protocol;
     std::string cipher_method;  // SS uses this; other protocols may ignore it.
+    std::string ss_identity_password;
     std::string anytls_padding_scheme;
 };
 
@@ -59,6 +60,9 @@ enum class PreparedAeadCipher : uint8_t {
     AES_128_GCM = 0,
     AES_256_GCM = 1,
     CHACHA20_POLY1305 = 2,
+    AES_128_GCM_2022 = 3,
+    AES_256_GCM_2022 = 4,
+    CHACHA20_POLY1305_2022 = 5,
 };
 
 struct PreparedVmessUser {
@@ -78,6 +82,7 @@ struct PreparedTrojanUser {
 struct PreparedShadowsocksUser {
     std::string password;
     PreparedKeyBytes derived_key;
+    PreparedKeyBytes identity_key;
     PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
     size_t key_size = 32;
     size_t salt_size = 32;

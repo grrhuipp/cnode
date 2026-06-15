@@ -51,6 +51,7 @@ struct StaticUser {
 
 struct StaticUserConfig {
     std::string method = std::string(constants::protocol::kAes256Gcm);
+    std::string identity_password;
     std::string padding_scheme;
     std::vector<StaticUser> clients;
 };

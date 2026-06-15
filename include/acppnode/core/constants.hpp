@@ -67,6 +67,9 @@ inline constexpr std::string_view kV2Board = "V2board";
 inline constexpr std::string_view kAes128Gcm = "aes-128-gcm";
 inline constexpr std::string_view kAes256Gcm = "aes-256-gcm";
 inline constexpr std::string_view kChacha20IetfPoly1305 = "chacha20-ietf-poly1305";
+inline constexpr std::string_view kSs2022Blake3Aes128Gcm = "2022-blake3-aes-128-gcm";
+inline constexpr std::string_view kSs2022Blake3Aes256Gcm = "2022-blake3-aes-256-gcm";
+inline constexpr std::string_view kSs2022Blake3Chacha20Poly1305 = "2022-blake3-chacha20-poly1305";
 }  // namespace protocol
 
 namespace panel {

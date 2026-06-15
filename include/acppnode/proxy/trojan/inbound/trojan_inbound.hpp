@@ -16,7 +16,7 @@ namespace acpp::proxy::trojan::inbound {
 // ============================================================================
 class Handler final : public ::acpp::Inbound {
 public:
-    Handler(::acpp::trojan::Validator& user_manager,
+    Handler(::acpp::trojan::Validator& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter);
 
@@ -35,7 +35,7 @@ public:
     }
 
 private:
-    ::acpp::trojan::Validator& user_manager_;
+    ::acpp::trojan::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
     bool ban_tracking_enabled_ = false;

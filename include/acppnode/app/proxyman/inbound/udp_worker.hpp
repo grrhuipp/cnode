@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/app/udp_endpoint_key.hpp"
 #include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
@@ -56,8 +55,7 @@ struct UdpDatagramContext {
 // UdpWorker - per-Worker UDP inbound worker
 //
 // 对齐 xray-core app/proxyman/inbound udpWorker 的职责起点：绑定 tag 和
-// Shadowsocks inbound Handler 实例。SO_REUSEPORT socket 与回包队列会继续从
-// Worker 迁入这里；当前先把协议实例生命周期从 Worker map 中抽离。
+// inbound UDP handler 实例。SO_REUSEPORT socket 与回包队列归属当前 Worker。
 // ============================================================================
 class UdpWorker final {
 public:
@@ -103,19 +101,19 @@ public:
     void ClearReplyQueue(const std::string& socket_key);
 
     [[nodiscard]] bool HasClientSession(const std::string& socket_key,
-                                        const UdpEndpointKey& client_key) const noexcept;
+                                        const std::string& client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr FindClientSession(
         const std::string& socket_key,
-        const UdpEndpointKey& client_key) const noexcept;
+        const std::string& client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr CreateClientSession(
         const std::string& socket_key,
-        const UdpEndpointKey& client_key,
+        const std::string& client_key,
         net::io_context& io_context,
         ReplyCallback reply_callback,
         int64_t user_id,
         std::chrono::steady_clock::time_point now);
     [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
-                                         const UdpEndpointKey& client_key,
+                                         const std::string& client_key,
                                          const TargetAddress& target,
                                          buf::MultiBuffer payload,
                                          std::chrono::steady_clock::time_point now);

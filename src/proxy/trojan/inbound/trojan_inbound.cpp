@@ -389,10 +389,10 @@ private:
 // ============================================================================
 
 proxy::trojan::inbound::Handler::Handler(
-    ::acpp::trojan::Validator& user_manager,
+    ::acpp::trojan::Validator& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter)
-    : user_manager_(user_manager)
+    : validator_(validator)
     , stats_(&stats)
     , limiter_(std::move(limiter))
 {}
@@ -478,14 +478,14 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto user_info = user_manager_.FindUser(tag, request->password_hash);
+    auto user_info = validator_.FindUser(tag, request->password_hash);
     if (!user_info) {
         LOG_CONN_FAIL("[{}] Trojan auth failed from {} hash={}...{} store_size={} tag_size={}",
                       tag, client_ip,
                       request->password_hash.substr(0, 8),
                       request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0),
-                      user_manager_.Size(),
-                      user_manager_.SizeForTag(tag));
+                      validator_.Size(),
+                      validator_.SizeForTag(tag));
         if (limiter_ && ban_tracking_enabled_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
@@ -499,20 +499,20 @@ proxy::trojan::inbound::Handler::Process(
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
         tracked_uid = static_cast<uint64_t>(profile.user_id);
-        if (!user_manager_.CanAcceptDevice(
+        if (!validator_.CanAcceptDevice(
                 tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
             LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,
-                user_manager_.OnlineDeviceCount(tag, tracked_uid));
+                validator_.OnlineDeviceCount(tag, tracked_uid));
             co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
         }
     }
 
     // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-    user_manager_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
-    user_session.emplace(user_manager_, tag, tracked_uid, ctx.inbound.source_ip);
+    validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
+    user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
 
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] auth ok: {} -> {} user={}",
                    tag, client_ip, request->target, ctx.inbound.user_email);

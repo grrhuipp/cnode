@@ -83,10 +83,10 @@ private:
 // ============================================================================
 
 proxy::vmess::inbound::Handler::Handler(
-    ::acpp::vmess::TimedUserValidator& user_manager,
+    ::acpp::vmess::TimedUserValidator& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter)
-    : validator_(user_manager)
+    : validator_(validator)
     , stats_(&stats)
     , limiter_(std::move(limiter))
 {}

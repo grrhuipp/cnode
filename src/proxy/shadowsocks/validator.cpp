@@ -19,6 +19,12 @@ proxyman::inbound::PreparedAeadCipher ToPreparedCipher(SsCipherType type) {
             return Prepared::AES_256_GCM;
         case SsCipherType::CHACHA20_POLY1305:
             return Prepared::CHACHA20_POLY1305;
+        case SsCipherType::AES_128_GCM_2022:
+            return Prepared::AES_128_GCM_2022;
+        case SsCipherType::AES_256_GCM_2022:
+            return Prepared::AES_256_GCM_2022;
+        case SsCipherType::CHACHA20_POLY1305_2022:
+            return Prepared::CHACHA20_POLY1305_2022;
     }
     return Prepared::AES_256_GCM;
 }
@@ -32,6 +38,12 @@ SsCipherType ToSsCipher(proxyman::inbound::PreparedAeadCipher type) {
             return SsCipherType::AES_256_GCM;
         case Prepared::CHACHA20_POLY1305:
             return SsCipherType::CHACHA20_POLY1305;
+        case Prepared::AES_128_GCM_2022:
+            return SsCipherType::AES_128_GCM_2022;
+        case Prepared::AES_256_GCM_2022:
+            return SsCipherType::AES_256_GCM_2022;
+        case Prepared::CHACHA20_POLY1305_2022:
+            return SsCipherType::CHACHA20_POLY1305_2022;
     }
     return SsCipherType::AES_256_GCM;
 }
@@ -56,6 +68,7 @@ ToPreparedUsers(const std::vector<SsUserInfo>& users) {
         prepared.push_back(proxyman::inbound::PreparedShadowsocksUser{
             .password = user.password,
             .derived_key = ToPreparedKey(user.derived_key),
+            .identity_key = ToPreparedKey(user.identity_key),
             .cipher_type = ToPreparedCipher(user.cipher_type),
             .key_size = user.key_size,
             .salt_size = user.salt_size,
@@ -120,6 +133,7 @@ std::vector<SsUserInfo> Validator::GetUsersForTag(std::string_view tag) const {
         SsUserInfo user;
         user.password = credential.password;
         user.derived_key = ToSsKey(credential.derived_key);
+        user.identity_key = ToSsKey(credential.identity_key);
         user.cipher_type = ToSsCipher(credential.cipher_type);
         user.key_size = credential.key_size;
         user.salt_size = credential.salt_size;
@@ -140,6 +154,7 @@ std::optional<SsUserInfo> Validator::FindUserById(std::string_view tag,
     SsUserInfo user;
     user.password = credential->password;
     user.derived_key = ToSsKey(credential->derived_key);
+    user.identity_key = ToSsKey(credential->identity_key);
     user.cipher_type = ToSsCipher(credential->cipher_type);
     user.key_size = credential->key_size;
     user.salt_size = credential->salt_size;

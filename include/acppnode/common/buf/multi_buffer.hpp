@@ -13,6 +13,16 @@
 
 namespace acpp::buf {
 
+struct Buffer;
+
+namespace detail {
+// Worker-local 8KB Buffer 回收缓存的两个原语（定义在 Buffer 之后，需要完整类型）。
+// 严格 thread_local = 单 Worker 私有，绝不跨 Worker 共享，符合 AGENTS 对
+// “thread-local allocator / buffer provider” 的约束。
+[[nodiscard]] inline void* BufferRecyclePop() noexcept;
+[[nodiscard]] inline bool  BufferRecyclePush(void* raw) noexcept;
+}  // namespace detail
+
 // ============================================================================
 // Buffer - relay/MultiBuffer 固定 8KB 数据块（对应 Xray buf.Buffer）
 //
@@ -77,11 +87,15 @@ struct Buffer {
     }
     [[nodiscard]] bool HasUDP() const noexcept { return has_udp; }
 
-    // 从 allocator 获取；仅初始化游标，payload 保持未初始化以避免热路径无谓 memset。
+    // 从 Worker-local 回收缓存或 allocator 获取；仅初始化游标，payload 保持
+    // 未初始化以避免热路径无谓 memset。命中回收缓存时省去 8KB 全局分配。
     [[nodiscard]] static Buffer* New() noexcept {
-        void* raw = memory::AllocateRaw(sizeof(Buffer), alignof(Buffer));
+        void* raw = detail::BufferRecyclePop();
         if (!raw) {
-            return nullptr;
+            raw = memory::AllocateRaw(sizeof(Buffer), alignof(Buffer));
+            if (!raw) {
+                return nullptr;
+            }
         }
         auto* b = ::new (raw) Buffer;
         b->start = 0;
@@ -90,16 +104,65 @@ struct Buffer {
         return b;
     }
 
-    // 归还到 pool。Buffer 现在含非平凡成员（udp），必须先析构再回收原始内存。
+    // 归还。Buffer 含非平凡成员（udp），先析构；裸内存优先回收到 Worker-local
+    // 缓存，缓存满才真正还给 allocator。
     static void Free(Buffer* b) noexcept {
         if (!b) {
             return;
         }
         memory::OnBufferFree();
         b->~Buffer();
-        memory::DeallocateRaw(b, sizeof(Buffer), alignof(Buffer));
+        if (!detail::BufferRecyclePush(b)) {
+            memory::DeallocateRaw(b, sizeof(Buffer), alignof(Buffer));
+        }
     }
 };
+
+namespace detail {
+
+// 每 Worker 最多缓存的 8KB 块数（16 块 = 128KB）。relay 收发 ping-pong 在
+// 最热路径反复 New/Free，小容量回收即可吸收，又不显著抬高空闲 RSS。
+inline constexpr size_t kBufferRecycleCap = 16;
+
+struct BufferRecycleCache {
+    void* slots[kBufferRecycleCap];
+    size_t count = 0;
+
+    BufferRecycleCache() noexcept = default;
+    BufferRecycleCache(const BufferRecycleCache&) = delete;
+    BufferRecycleCache& operator=(const BufferRecycleCache&) = delete;
+
+    ~BufferRecycleCache() {
+        // Worker 线程退出时把缓存的裸块还给 allocator，不泄漏。
+        while (count > 0) {
+            memory::DeallocateRaw(slots[--count], sizeof(Buffer), alignof(Buffer));
+        }
+    }
+};
+
+inline BufferRecycleCache& TlsBufferRecycle() noexcept {
+    thread_local BufferRecycleCache cache;
+    return cache;
+}
+
+[[nodiscard]] inline void* BufferRecyclePop() noexcept {
+    auto& cache = TlsBufferRecycle();
+    if (cache.count == 0) {
+        return nullptr;
+    }
+    return cache.slots[--cache.count];
+}
+
+[[nodiscard]] inline bool BufferRecyclePush(void* raw) noexcept {
+    auto& cache = TlsBufferRecycle();
+    if (cache.count >= kBufferRecycleCap) {
+        return false;
+    }
+    cache.slots[cache.count++] = raw;
+    return true;
+}
+
+}  // namespace detail
 
 // RAII 守卫：离开作用域时自动释放单个 Buffer
 struct BufferGuard {
@@ -223,6 +286,39 @@ public:
         }
         inline_buffers_[--size_] = nullptr;
         return out;
+    }
+
+    // 释放并移除最前面的 n 个 Buffer，单次搬移（O(size) 而非 n 次 pop_front 的
+    // O(n·size)）。用于 pending 数据消费：调用方按前缀计数，一次性丢弃已消费的
+    // 头部 Buffer。
+    void drop_front(size_t n) noexcept {
+        const size_t cur = size();
+        if (n == 0) {
+            return;
+        }
+        if (n >= cur) {
+            clear();
+            return;
+        }
+        if (using_spill_) {
+            for (size_t i = 0; i < n; ++i) {
+                Buffer::Free(spill_[i]);
+            }
+            spill_.erase(spill_.begin(),
+                         spill_.begin() + static_cast<std::ptrdiff_t>(n));
+            return;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            Buffer::Free(inline_buffers_[i]);
+        }
+        const size_t rest = size_ - n;
+        for (size_t i = 0; i < rest; ++i) {
+            inline_buffers_[i] = inline_buffers_[i + n];
+        }
+        for (size_t i = rest; i < size_; ++i) {
+            inline_buffers_[i] = nullptr;
+        }
+        size_ = rest;
     }
 
     Buffer** insert(Buffer** pos, Buffer* buffer) {

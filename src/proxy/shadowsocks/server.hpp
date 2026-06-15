@@ -20,6 +20,7 @@ struct ReadTCPSessionResult {
     TargetAddress target;
     InitialPayload initial_payload;
     std::unique_ptr<transport::MultiBufferReader> body_reader;
+    KeyBytes request_salt;
 
     void SetUser(
         std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> value) noexcept {
@@ -38,6 +39,8 @@ ReadTCPSession(AsyncStream& stream,
 
 [[nodiscard]] std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode>
 WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+                 const SsCipherInfo& cipher_info,
+                 const KeyBytes& request_salt,
                  AsyncStream& stream);
 
 }  // namespace acpp::ss

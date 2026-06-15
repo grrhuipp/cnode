@@ -398,24 +398,25 @@ StaticUserConfig ParseStaticUserConfig(
         }
     }
 
+    const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
+    StaticUser top_level_user;
     if (protocol == constants::protocol::kShadowsocks) {
-        StaticUser user;
         if (const auto* password = settings.if_contains("password");
                 password && password->is_string()) {
-            user.password = std::string(password->as_string());
+            top_level_user.password = std::string(password->as_string());
+            config.identity_password = top_level_user.password;
         }
         if (const auto* email = settings.if_contains("email");
                 email && email->is_string()) {
-            user.email = std::string(email->as_string());
-        }
-        if (!user.password.empty()) {
-            config.clients.push_back(std::move(user));
+            top_level_user.email = std::string(email->as_string());
         }
     }
 
     const auto user_array_key = StaticUserArrayKeyForProtocol(protocol);
+    bool saw_user_array = false;
     if (const auto* users = settings.if_contains(user_array_key);
             users && users->is_array()) {
+        saw_user_array = !users->as_array().empty();
         for (const auto& client : users->as_array()) {
             if (!client.is_object()) {
                 continue;
@@ -437,6 +438,12 @@ StaticUserConfig ParseStaticUserConfig(
             }
             config.clients.push_back(std::move(user));
         }
+    }
+
+    if (protocol == constants::protocol::kShadowsocks &&
+        !top_level_user.password.empty() &&
+        (!ss2022_method || !saw_user_array)) {
+        config.clients.insert(config.clients.begin(), std::move(top_level_user));
     }
 
     return config;

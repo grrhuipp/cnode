@@ -4,7 +4,7 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 
-namespace acpp::blackhole::outbound {
+namespace acpp::proxy::blackhole::outbound {
 
 // ============================================================================
 // Handler 实现
@@ -32,7 +32,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     co_return std::unexpected(ErrorCode::BLOCKED);
 }
 
-}  // namespace acpp::blackhole::outbound
+}  // namespace acpp::proxy::blackhole::outbound
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
@@ -42,7 +42,7 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kBlackhole,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
-        acpp::blackhole::outbound::BlackholeSettings settings;
+        acpp::proxy::blackhole::outbound::BlackholeSettings settings;
         if (const auto* p = cfg.settings.if_contains("response")) {
             // Xray 格式: {"response": {"type": "http"}}
             if (p->is_object()) {
@@ -61,7 +61,7 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 acpp::app::dns::DNS& /*dns*/,
                 acpp::UDPSessionManager* /*udp_mgr*/,
                 std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::blackhole::outbound::Handler>(tag, settings);
+                return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(tag, settings);
             };
         return prepared;
     }), true);

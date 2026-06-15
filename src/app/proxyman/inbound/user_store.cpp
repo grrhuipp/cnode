@@ -118,6 +118,7 @@ BuildShadowsocksCredential(const PreparedShadowsocksUser& user) {
     return UserStore::ShadowsocksCredential{
         .password = user.password,
         .derived_key = user.derived_key,
+        .identity_key = user.identity_key,
         .cipher_type = user.cipher_type,
         .key_size = user.key_size,
         .salt_size = user.salt_size,

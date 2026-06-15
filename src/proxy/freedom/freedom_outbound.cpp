@@ -11,7 +11,7 @@
 
 #include <cctype>
 
-namespace acpp::freedom::outbound {
+namespace acpp::proxy::freedom::outbound {
 
 namespace {
 
@@ -478,7 +478,7 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
     return explicit_send_through_addr_;
 }
 
-}  // namespace acpp::freedom::outbound
+}  // namespace acpp::proxy::freedom::outbound
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
@@ -489,7 +489,7 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
         const auto& s = cfg.settings;
-        acpp::freedom::outbound::FreedomSettings settings;
+        acpp::proxy::freedom::outbound::FreedomSettings settings;
 
         settings.send_through = std::string(acpp::constants::binding::kAuto);
         if (const auto* v = s.if_contains("sendThrough"); v && v->is_string()) {
@@ -517,7 +517,7 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* udp_mgr,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::freedom::outbound::Handler>(
+                return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
                     tag, settings, dns, udp_mgr, timeout);
             };
         return prepared;

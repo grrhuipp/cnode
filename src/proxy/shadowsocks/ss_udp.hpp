@@ -6,6 +6,8 @@
 #include "acppnode/proxy/shadowsocks/validator.hpp"
 #include "acppnode/common/target_address.hpp"
 
+#include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -27,10 +29,19 @@ namespace acpp::ss {
 //   - 无 chunk 分帧（整包一次性 AEAD）
 // ============================================================================
 
+struct Ss2022UdpSessionState {
+    SsCipherInfo cipher_info{};
+    KeyBytes key;
+    std::array<uint8_t, 8> client_session_id{};
+    std::array<uint8_t, 8> server_session_id{};
+    uint64_t next_packet_id = 0;
+};
+
 // SS UDP 解码结果
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
+    memory::ThreadLocalString session_key;
     size_t               user_index = 0;   // 匹配用户在 users 列表中的下标
     // reply_* 由 UDP 接收侧直接拿来编码回包，不再经过额外回调包装
     int64_t              user_id = 0;
@@ -38,6 +49,7 @@ struct SsUdpDecodeResult {
     uint64_t             speed_limit = 0;
     KeyBytes             reply_key;
     SsCipherInfo         cipher_info{};
+    std::shared_ptr<Ss2022UdpSessionState> ss2022_session;
 };
 
 // ============================================================================
@@ -76,5 +88,40 @@ struct SsUdpDecodeResult {
     size_t                      salt_size,
     uint8_t*                    output,
     size_t                      output_size);
+
+[[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
+    const uint8_t* datagram,
+    size_t datagram_len,
+    std::span<const uint8_t> master_key,
+    SsCipherType cipher_type,
+    size_t key_size,
+    size_t salt_size);
+
+[[nodiscard]] bool Init2022UdpSessionState(
+    Ss2022UdpSessionState& state,
+    const SsCipherInfo& cipher_info,
+    const KeyBytes& key);
+
+[[nodiscard]] size_t Encode2022UdpRequestPacketTo(
+    const TargetAddress& target,
+    const uint8_t* payload,
+    size_t payload_len,
+    Ss2022UdpSessionState& state,
+    std::span<const KeyBytes> psk_chain,
+    uint8_t* output,
+    size_t output_size);
+
+[[nodiscard]] size_t Encode2022UdpResponsePacketTo(
+    const TargetAddress& target,
+    const uint8_t* payload,
+    size_t payload_len,
+    Ss2022UdpSessionState& state,
+    uint8_t* output,
+    size_t output_size);
+
+[[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
+    const uint8_t* datagram,
+    size_t datagram_len,
+    Ss2022UdpSessionState& state);
 
 }  // namespace acpp::ss

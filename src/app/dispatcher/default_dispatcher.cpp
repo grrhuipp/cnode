@@ -221,17 +221,24 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         co_return relay_result;
     }
 
+    // 嗅探只需首部若干字节即可解析 TLS ClientHello SNI / HTTP Host；
+    // 首包很大（例如客户端把大块 body pipeline 进首包）时无需整包拷贝。
+    static constexpr size_t kSniffMaxBytes = 4096;
     std::span<const uint8_t> sniff_data;
     memory::ByteVector sniff_scratch;
     if (receiver.sniff_config.enabled && !first_packet.empty()) {
         if (first_packet.IsContiguous()) {
             sniff_data = first_packet.span();
+            if (sniff_data.size() > kSniffMaxBytes) {
+                sniff_data = sniff_data.first(kSniffMaxBytes);
+            }
         } else {
-            sniff_scratch.resize(first_packet.size());
-            if (first_packet.CopyTo(sniff_scratch.data(), sniff_scratch.size()) ==
-                sniff_scratch.size()) {
-                sniff_data = std::span<const uint8_t>(
-                    sniff_scratch.data(), sniff_scratch.size());
+            const size_t want = std::min(first_packet.size(), kSniffMaxBytes);
+            sniff_scratch.resize(want);
+            const size_t got = first_packet.CopyPrefixTo(
+                sniff_scratch.data(), sniff_scratch.size());
+            if (got > 0) {
+                sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
             }
         }
     }
@@ -393,12 +400,17 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
     }
 
     if (rule_manager_ && ctx.inbound.user_id > 0 &&
-        rule_manager_->HasRule(ctx.inbound.tag) &&
-        rule_manager_->Detect(
-            ctx.inbound.tag,
-            ctx.outbound.target.ToString(),
-            std::string_view(ctx.inbound.user_email.data(), ctx.inbound.user_email.size()))) {
-        return routing::DispatchResult{.error = ErrorCode::BLOCKED};
+        rule_manager_->HasRule(ctx.inbound.tag)) {
+        // Worker-local 复用 destination scratch，省去每连接的 target 串分配。
+        thread_local std::string rule_dest;
+        ctx.outbound.target.ToStringInto(rule_dest);
+        if (rule_manager_->Detect(
+                ctx.inbound.tag,
+                rule_dest,
+                std::string_view(ctx.inbound.user_email.data(),
+                                 ctx.inbound.user_email.size()))) {
+            return routing::DispatchResult{.error = ErrorCode::BLOCKED};
+        }
     }
 
     auto* handler = ResolveOutboundHandler(selection.outbound_tag);

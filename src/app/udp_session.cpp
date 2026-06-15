@@ -110,7 +110,7 @@ struct UDPSession::Impl {
         , next_target_prune_at(steady_clock::now() + kTargetPruneInterval) {}
 
     void Touch() { last_active = std::chrono::steady_clock::now(); }
-    void DoReceive();
+    net::awaitable<void> DoReceive();
     void AddTargetMapping(const UdpEndpointKey& target_key, uint64_t callback_id);
     void MaybePruneTargetMappings(steady_clock::time_point now);
     void RefreshTargetMapping(const UdpEndpointKey& target_key,
@@ -339,7 +339,10 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
 
 void UDPSession::StartReceive() {
     if (!impl_->running) return;
-    impl_->DoReceive();
+    net::co_spawn(
+        impl_->io_context.get_executor(),
+        impl_->DoReceive(),
+        [](std::exception_ptr) {});
 }
 
 // Per-Worker 简化版：无需 executor 参数
@@ -379,97 +382,93 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
     }
 }
 
-void UDPSession::Impl::DoReceive() {
-    if (!running) {
-        return;
-    }
+net::awaitable<void> UDPSession::Impl::DoReceive() {
+    while (running) {
+        buf::BufferGuard recv_guard{buf::Buffer::New()};
+        if (!recv_guard) {
+            co_return;
+        }
 
-    // 从当前 Worker thread-local heap 借一块 8KB 接收 buffer；完成回调在所有
-    // 退出路径都必须归还，避免泄漏，也不把 scratch 挂在会话生命周期里。
-    buf::Buffer* rb = buf::Buffer::New();
-    if (!rb) {
-        return;
-    }
-
-    socket.async_receive_from(
-        net::buffer(rb->data, buf::Buffer::kSize),
-        sender_endpoint,
-        [this, rb](IoErrorCode ec, size_t bytes) {
-            buf::BufferGuard recv_guard{rb};
-            if (ec) {
-                if (ec != io_error::operation_aborted) {
-                    LOG_ACCESS_DEBUG("UDP session {} receive error: {} ({})",
+        auto [ec, bytes] = co_await socket.async_receive_from(
+            net::buffer(recv_guard->data, buf::Buffer::kSize),
+            sender_endpoint,
+            net::as_tuple(net::use_awaitable));
+        if (ec == io_error::operation_aborted) {
+            co_return;
+        }
+        if (ec) {
+            LOG_ACCESS_DEBUG("UDP session {} receive error: {} ({})",
                              session_id, ec.message(), ec.value());
+            continue;
+        }
+        if (bytes == 0) {
+            continue;
+        }
+
+        const UdpEndpointKey sender_key = MakeEndpointKey(
+            sender_endpoint.address(), sender_endpoint.port());
+        const auto now = steady_clock::now();
+        MaybePruneTargetMappings(now);
+
+        LOG_ACCESS_DEBUG("UDP session {} received {} bytes from {}",
+                         session_id, bytes, EndpointKeyToString(sender_key));
+
+        packets_received++;
+        bytes_received += bytes;
+        Touch();
+
+        TargetAddress source;
+        source.type = sender_endpoint.address().is_v6()
+            ? AddressType::IPv6
+            : AddressType::IPv4;
+        source.resolved_addr = sender_endpoint.address();
+        source.port = sender_endpoint.port();
+
+        UDPPacketView packet_view{
+            source,
+            std::span<const uint8_t>(recv_guard->data, bytes)};
+
+        bool delivered = false;
+
+        auto t_it = target_to_callbacks.find(sender_key);
+        if (t_it != target_to_callbacks.end()) {
+            const auto& callbacks = t_it->second;
+            auto deliver = [&](uint64_t cb_id) {
+                auto cb_it = registered_callbacks.find(cb_id);
+                if (cb_it != registered_callbacks.end()) {
+                    RefreshTargetMapping(sender_key, cb_id, now);
+                    cb_it->second.callback(packet_view);
+                    delivered = true;
                 }
-                if (running && ec != io_error::operation_aborted) {
-                    DoReceive();
-                }
-                return;
+            };
+
+            if (callbacks.first != 0) {
+                deliver(callbacks.first);
             }
-
-            const UdpEndpointKey sender_key = MakeEndpointKey(
-                sender_endpoint.address(), sender_endpoint.port());
-            const auto now = steady_clock::now();
-            MaybePruneTargetMappings(now);
-
-            LOG_ACCESS_DEBUG("UDP session {} received {} bytes from {}",
-                     session_id, bytes, EndpointKeyToString(sender_key));
-
-            if (bytes > 0) {
-                packets_received++;
-                bytes_received += bytes;
-                Touch();
-
-                TargetAddress source;
-                source.type = sender_endpoint.address().is_v6()
-                    ? AddressType::IPv6
-                    : AddressType::IPv4;
-                source.resolved_addr = sender_endpoint.address();
-                source.port = sender_endpoint.port();
-
-                UDPPacketView packet_view{
-                    source,
-                    std::span<const uint8_t>(rb->data, bytes)};
-
-                bool delivered = false;
-
-                auto t_it = target_to_callbacks.find(sender_key);
-                if (t_it != target_to_callbacks.end()) {
-                    const auto& callbacks = t_it->second;
-                    auto deliver = [&](uint64_t cb_id) {
-                        auto cb_it = registered_callbacks.find(cb_id);
-                        if (cb_it != registered_callbacks.end()) {
-                            RefreshTargetMapping(sender_key, cb_id, now);
-                            cb_it->second.callback(packet_view);
-                            delivered = true;
-                        }
-                    };
-
-                    if (callbacks.first != 0) {
-                        deliver(callbacks.first);
-                    }
-                    for (uint64_t cb_id : callbacks.overflow) {
-                        deliver(cb_id);
-                    }
-                } else {
-                    std::string known_keys;
-                    for (const auto& [key, _] : target_to_callbacks) {
-                        if (!known_keys.empty()) known_keys += ", ";
-                        known_keys += EndpointKeyToString(key);
-                    }
-                    LOG_ACCESS_DEBUG("UDP session {} sender_key={} not found, known keys: [{}]",
+            for (uint64_t cb_id : callbacks.overflow) {
+                deliver(cb_id);
+            }
+        } else if (registered_callbacks.size() == 1) {
+            auto cb_it = registered_callbacks.begin();
+            RefreshTargetMapping(sender_key, cb_it->first, now);
+            cb_it->second.callback(packet_view);
+            delivered = true;
+        } else {
+            std::string known_keys;
+            for (const auto& [key, _] : target_to_callbacks) {
+                if (!known_keys.empty()) known_keys += ", ";
+                known_keys += EndpointKeyToString(key);
+            }
+            LOG_ACCESS_DEBUG("UDP session {} sender_key={} not found, known keys: [{}]",
                              session_id, EndpointKeyToString(sender_key), known_keys);
-                }
+        }
 
-                if (!delivered) {
-                    LOG_ACCESS_DEBUG("UDP session {} no callback for {}",
-                                     session_id, EndpointKeyToString(sender_key));
-                }
-            }
-
-            // 继续接收
-            DoReceive();
-        });
+        if (!delivered) {
+            LOG_ACCESS_DEBUG("UDP session {} no callback for {}",
+                             session_id, EndpointKeyToString(sender_key));
+        }
+    }
+    co_return;
 }
 
 void UDPSession::Impl::AddTargetMapping(const UdpEndpointKey& target_key, uint64_t callback_id) {

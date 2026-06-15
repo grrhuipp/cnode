@@ -309,33 +309,33 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return pending;
     }
 
-    // 先等 fd 可读，再申请 relay Buffer。这样大量空闲连接挂读时不常驻 8KB
-    // payload 块；Buffer 只覆盖真正的 read_some 生命周期。
-    ArmReadDeadline();
-    auto [wait_ec] = co_await impl_->socket.async_wait(
-        tcp::socket::wait_read,
-        net::as_tuple(net::use_awaitable));
-
-    if (wait_ec) {
-        CancelReadDeadline();
-        if (wait_ec == io_error::operation_aborted) {
-            co_return buf::MultiBuffer{};
-        }
-        if (wait_ec == io_error::connection_reset ||
-            wait_ec == io_error::broken_pipe) {
-            LOG_ACCESS_DEBUG("ReadMultiBuffer(wait): {} (fd={})", wait_ec.message(), NativeHandle());
-            co_return buf::MultiBuffer{};
-        }
-        throw IoSystemError(wait_ec);
-    }
-
-    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
-        CancelReadDeadline();
-        co_return buf::MultiBuffer{};
-    }
-
     // ── 快速路径：单 Buffer（低流量 / 启动阶段，零额外分配）─────────────
+    // 先等 fd 可读再申请 relay Buffer：大量空闲连接挂读时不常驻 8KB payload，
+    // Buffer 只覆盖真正的 read_some 生命周期。
     if (impl_->read_alloc_count == 1) {
+        ArmReadDeadline();
+        auto [wait_ec] = co_await impl_->socket.async_wait(
+            tcp::socket::wait_read,
+            net::as_tuple(net::use_awaitable));
+
+        if (wait_ec) {
+            CancelReadDeadline();
+            if (wait_ec == io_error::operation_aborted) {
+                co_return buf::MultiBuffer{};
+            }
+            if (wait_ec == io_error::connection_reset ||
+                wait_ec == io_error::broken_pipe) {
+                LOG_ACCESS_DEBUG("ReadMultiBuffer(wait): {} (fd={})", wait_ec.message(), NativeHandle());
+                co_return buf::MultiBuffer{};
+            }
+            throw IoSystemError(wait_ec);
+        }
+
+        if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+            CancelReadDeadline();
+            co_return buf::MultiBuffer{};
+        }
+
         buf::BufferGuard buf{buf::Buffer::New()};
         if (!buf) {
             CancelReadDeadline();
@@ -375,7 +375,11 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return buf::MultiBuffer{buf.release()};
     }
 
-    // ── 散读路径：n_alloc 个 Buffer，单次 readv / WSARecv ───────────────
+    // ── 散读路径：已证明活跃，跳过 pre-wait，直接预分配并散读 ──────────
+    // read_alloc_count>=2 表示连接连续命中大包；省去 async_wait 的额外一次
+    // reactor 往返，直接 readv / WSARecv。转空闲后下方自适应会收回 alloc_count，
+    // 自动退回上面的 wait-first 低流量档。
+    ArmReadDeadline();
     const uint32_t n_alloc = impl_->read_alloc_count;
 
     // 在协程帧上分配（co_await 期间保持有效），最多 kMaxReadAllocBuffers 个。
@@ -954,25 +958,32 @@ size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
     auto* out = static_cast<uint8_t*>(target.data());
     size_t remaining = target.size();
     size_t copied = 0;
+    auto& pending = impl_->pending_data;
 
-    while (remaining > 0 && !impl_->pending_data.empty()) {
-        buf::Buffer* buffer = *impl_->pending_data.begin();
+    // 顺序消费头部 Buffer，统计已完全消费的前缀，最后一次性 drop_front，
+    // 避免每个 Buffer 都做一次 O(size) 的 pop_front 搬移。
+    size_t drained = 0;
+    for (buf::Buffer* buffer : pending) {
+        if (remaining == 0) {
+            break;
+        }
         if (!buffer || buffer->IsEmpty()) {
-            buf::Buffer::Free(impl_->pending_data.pop_front());
+            ++drained;
             continue;
         }
-
         const auto bytes = buffer->Bytes();
         const size_t n = std::min(remaining, bytes.size());
         std::memcpy(out + copied, bytes.data(), n);
         buffer->Advance(static_cast<uint32_t>(n));
         copied += n;
         remaining -= n;
-
         if (buffer->IsEmpty()) {
-            buf::Buffer::Free(impl_->pending_data.pop_front());
+            ++drained;
+        } else {
+            break;  // 部分消费，保留该 Buffer 及其后的剩余数据
         }
     }
+    pending.drop_front(drained);
 
     return copied;
 }

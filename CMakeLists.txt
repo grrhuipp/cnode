@@ -58,13 +58,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 
 # ============================================================================
-# LTO（链接时优化）— Release / Profile 模式启用
+# LTO（链接时优化）— Release 模式启用
 # ============================================================================
 if(NOT CNODE_HEAPTRACK_BUILD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-    if(CMAKE_BUILD_TYPE STREQUAL "Profile")
-        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-    endif()
 endif()
 
 if(CNODE_RELEASE_DEBUG_SYMBOLS)
@@ -78,18 +75,6 @@ if(CNODE_RELEASE_FRAME_POINTERS)
     add_compile_options(
         $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-fno-omit-frame-pointer>
     )
-endif()
-
-# Profile 模式：Release 优化 + 保留符号（用于 perf/FlameGraph 性能分析）
-if(CMAKE_BUILD_TYPE STREQUAL "Profile")
-    add_compile_options(
-        $<$<CXX_COMPILER_ID:MSVC>:/O2>
-        $<$<CXX_COMPILER_ID:MSVC>:/Zi>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O3>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-g>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fno-omit-frame-pointer>
-    )
-    add_compile_definitions(NDEBUG)
 endif()
 
 if(CNODE_HEAPTRACK_BUILD)
@@ -197,6 +182,29 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(concurrentqueue)
 message(STATUS "Using moodycamel ConcurrentQueue via FetchContent")
+
+FetchContent_Declare(
+    blake3
+    GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
+    GIT_TAG 1.8.5
+)
+FetchContent_GetProperties(blake3)
+if(NOT blake3_POPULATED)
+    FetchContent_Populate(blake3)
+endif()
+add_library(cnode_blake3 STATIC
+    ${blake3_SOURCE_DIR}/c/blake3.c
+    ${blake3_SOURCE_DIR}/c/blake3_dispatch.c
+    ${blake3_SOURCE_DIR}/c/blake3_portable.c
+)
+target_include_directories(cnode_blake3 PUBLIC ${blake3_SOURCE_DIR}/c)
+target_compile_definitions(cnode_blake3 PRIVATE
+    BLAKE3_NO_SSE2
+    BLAKE3_NO_SSE41
+    BLAKE3_NO_AVX2
+    BLAKE3_NO_AVX512
+)
+message(STATUS "Using BLAKE3 via FetchContent")
 
 if(CNODE_USE_MIMALLOC)
     set(MI_OVERRIDE ON CACHE BOOL "Override malloc/free so C++ new/delete reaches mimalloc through libstdc++" FORCE)
@@ -393,6 +401,7 @@ target_link_libraries(cnode PRIVATE
     Threads::Threads
     ssl
     crypto
+    cnode_blake3
     cnode_zlib
 )
 
@@ -475,7 +484,7 @@ if(CNODE_HEAPTRACK_BUILD)
     set(CNODE_LTO_SUMMARY "disabled")
 elseif(CNODE_IS_MULTI_CONFIG)
     set(CNODE_LTO_SUMMARY "Release config")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "Profile")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CNODE_LTO_SUMMARY "enabled")
 else()
     set(CNODE_LTO_SUMMARY "disabled")

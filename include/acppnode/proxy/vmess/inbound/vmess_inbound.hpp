@@ -16,7 +16,7 @@ namespace acpp::proxy::vmess::inbound {
 // ============================================================================
 class Handler final : public ::acpp::Inbound {
 public:
-    Handler(::acpp::vmess::TimedUserValidator& user_manager,
+    Handler(::acpp::vmess::TimedUserValidator& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter);
 

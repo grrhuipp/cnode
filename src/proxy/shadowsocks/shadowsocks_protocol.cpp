@@ -2,14 +2,17 @@
 
 #include "acppnode/core/constants.hpp"
 
+#include <blake3.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
+#include <openssl/sha.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace acpp::ss {
 
@@ -32,7 +35,49 @@ std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
         lower == "chacha20-poly1305") {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
+    if (lower == std::string(constants::protocol::kSs2022Blake3Aes128Gcm)) {
+        return SsCipherInfo{SsCipherType::AES_128_GCM_2022, 16, 16};
+    }
+    if (lower == std::string(constants::protocol::kSs2022Blake3Aes256Gcm)) {
+        return SsCipherInfo{SsCipherType::AES_256_GCM_2022, 32, 32};
+    }
+    if (lower == std::string(constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
+        return SsCipherInfo{SsCipherType::CHACHA20_POLY1305_2022, 32, 32};
+    }
     return std::nullopt;
+}
+
+bool Is2022Cipher(SsCipherType type) noexcept {
+    switch (type) {
+        case SsCipherType::AES_128_GCM_2022:
+        case SsCipherType::AES_256_GCM_2022:
+        case SsCipherType::CHACHA20_POLY1305_2022:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool Is2022Cipher(const SsCipherInfo& info) noexcept {
+    return Is2022Cipher(info.type);
+}
+
+bool Is2022AesCipher(SsCipherType type) noexcept {
+    return type == SsCipherType::AES_128_GCM_2022 ||
+           type == SsCipherType::AES_256_GCM_2022;
+}
+
+SsCipherType BaseCipherType(SsCipherType type) noexcept {
+    switch (type) {
+        case SsCipherType::AES_128_GCM_2022:
+            return SsCipherType::AES_128_GCM;
+        case SsCipherType::AES_256_GCM_2022:
+            return SsCipherType::AES_256_GCM;
+        case SsCipherType::CHACHA20_POLY1305_2022:
+            return SsCipherType::CHACHA20_POLY1305;
+        default:
+            return type;
+    }
 }
 
 // ============================================================================
@@ -74,6 +119,111 @@ KeyBytes DeriveKey(const std::string& password, size_t key_size) {
 
     key.size = key_size;
     return key;
+}
+
+KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
+    KeyBytes key;
+    if (key_size == 0 || key_size > KeyBytes::kMaxSize) {
+        return key;
+    }
+
+    std::string encoded;
+    encoded.reserve(password.size() + 3);
+    for (const char ch : password) {
+        if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
+            continue;
+        }
+        if (ch == '-') {
+            encoded.push_back('+');
+        } else if (ch == '_') {
+            encoded.push_back('/');
+        } else {
+            encoded.push_back(ch);
+        }
+    }
+    if (encoded.empty() || encoded.size() % 4 == 1) {
+        return key;
+    }
+    while (encoded.size() % 4 != 0) {
+        encoded.push_back('=');
+    }
+
+    std::vector<uint8_t> decoded((encoded.size() / 4) * 3);
+    const int decoded_len = EVP_DecodeBlock(
+        decoded.data(),
+        reinterpret_cast<const uint8_t*>(encoded.data()),
+        static_cast<int>(encoded.size()));
+    if (decoded_len < 0) {
+        return key;
+    }
+    size_t plain_len = static_cast<size_t>(decoded_len);
+    while (!encoded.empty() && encoded.back() == '=') {
+        --plain_len;
+        encoded.pop_back();
+    }
+    if (plain_len < key_size) {
+        return key;
+    }
+
+    if (plain_len == key_size) {
+        key.assign(std::span<const uint8_t>(decoded.data(), plain_len));
+        return key;
+    }
+
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(decoded.data(), plain_len, digest.data());
+    key.assign(std::span<const uint8_t>(digest.data(), key_size));
+    return key;
+}
+
+KeyBytes BuildMasterKey(std::string_view password, const SsCipherInfo& info) {
+    if (Is2022Cipher(info)) {
+        return Decode2022Psk(password, info.key_size);
+    }
+    return DeriveKey(std::string(password), info.key_size);
+}
+
+bool Derive2022Subkey(const uint8_t* key, size_t key_size,
+                      const uint8_t* salt, size_t salt_size,
+                      uint8_t* out_subkey) {
+    if (!key || !salt || !out_subkey ||
+        key_size == 0 || key_size > KeyBytes::kMaxSize ||
+        salt_size == 0 || salt_size > KeyBytes::kMaxSize) {
+        return false;
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init_derive_key(&hasher, "shadowsocks 2022 session subkey");
+    blake3_hasher_update(&hasher, key, key_size);
+    blake3_hasher_update(&hasher, salt, salt_size);
+    blake3_hasher_finalize(&hasher, out_subkey, key_size);
+    return true;
+}
+
+bool Derive2022IdentitySubkey(const uint8_t* key, size_t key_size,
+                              const uint8_t* salt, size_t salt_size,
+                              uint8_t* out_key) {
+    if (!key || !salt || !out_key ||
+        key_size == 0 || key_size > KeyBytes::kMaxSize ||
+        salt_size == 0 || salt_size > KeyBytes::kMaxSize) {
+        return false;
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init_derive_key(&hasher, "shadowsocks 2022 identity subkey");
+    blake3_hasher_update(&hasher, key, key_size);
+    blake3_hasher_update(&hasher, salt, salt_size);
+    blake3_hasher_finalize(&hasher, out_key, key_size);
+    return true;
+}
+
+bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) {
+    if (key.empty()) {
+        return false;
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, key.data(), key.size());
+    blake3_hasher_finalize(&hasher, out_hash.data(), out_hash.size());
+    return true;
 }
 
 // ============================================================================
@@ -159,12 +309,12 @@ SsAeadCipher& SsAeadCipher::operator=(SsAeadCipher&& other) noexcept {
 }
 
 static const EVP_CIPHER* GetCipher(SsCipherType type) noexcept {
-    switch (type) {
+    switch (BaseCipherType(type)) {
         case SsCipherType::AES_128_GCM:       return EVP_aes_128_gcm();
         case SsCipherType::AES_256_GCM:       return EVP_aes_256_gcm();
         case SsCipherType::CHACHA20_POLY1305:  return EVP_chacha20_poly1305();
+        default:                              return nullptr;
     }
-    return nullptr;
 }
 
 bool SsAeadCipher::Encrypt(const uint8_t* nonce,

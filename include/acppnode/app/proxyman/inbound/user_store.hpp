@@ -50,6 +50,7 @@ public:
     struct ShadowsocksCredential {
         std::string password;
         PreparedKeyBytes derived_key;
+        PreparedKeyBytes identity_key;
         PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
         size_t key_size = 32;
         size_t salt_size = 32;

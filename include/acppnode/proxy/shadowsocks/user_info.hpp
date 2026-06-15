@@ -12,6 +12,7 @@ struct SsUserInfo {
     std::string password;
     ::acpp::UserProfile profile;
     KeyBytes derived_key;
+    KeyBytes identity_key;
     SsCipherType cipher_type = SsCipherType::AES_256_GCM;
     size_t key_size = 32;
     size_t salt_size = 32;

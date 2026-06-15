@@ -102,6 +102,33 @@ public:
         }
         return offset;
     }
+    // 复制最多 out_size 字节的前缀到 out，返回实际复制量。用于嗅探：只需首部
+    // 若干字节即可解析 TLS ClientHello SNI / HTTP Host，无需拷贝整个首包。
+    [[nodiscard]] size_t CopyPrefixTo(uint8_t* out, size_t out_size) const {
+        if (!out || out_size == 0) {
+            return 0;
+        }
+        const size_t want = std::min(out_size, size_);
+        if (overflow_.empty()) {
+            std::memcpy(out, inline_.data(), want);
+            return want;
+        }
+        size_t offset = 0;
+        for (const auto* buffer : overflow_) {
+            if (offset >= want) {
+                break;
+            }
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            const size_t n = std::min(bytes.size(), want - offset);
+            std::memcpy(out + offset, bytes.data(), n);
+            offset += n;
+        }
+        return offset;
+    }
+
     [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() {
         if (!overflow_.empty()) {
             size_ = 0;

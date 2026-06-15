@@ -70,6 +70,9 @@ public:
         : reply_key_(std::move(reply_key))
         , cipher_info_(cipher_info) {}
 
+    ShadowsocksUdpResponseContext(std::shared_ptr<ss::Ss2022UdpSessionState> session)
+        : ss2022_session_(std::move(session)) {}
+
     [[nodiscard]] const ss::KeyBytes& ReplyKey() const noexcept {
         return reply_key_;
     }
@@ -78,9 +81,14 @@ public:
         return cipher_info_;
     }
 
+    [[nodiscard]] ss::Ss2022UdpSessionState* Ss2022Session() const noexcept {
+        return ss2022_session_.get();
+    }
+
 private:
     ss::KeyBytes reply_key_;
     ss::SsCipherInfo cipher_info_;
+    std::shared_ptr<ss::Ss2022UdpSessionState> ss2022_session_;
 };
 
 [[nodiscard]] const ShadowsocksUdpResponseContext* AsShadowsocksUdpContext(
@@ -233,7 +241,8 @@ proxy::shadowsocks::inbound::Handler::Process(
     ctx.content.network = Network::TCP;
 
     auto request_reader = std::move(session_result->body_reader);
-    auto response_writer_result = ss::WriteTCPResponse(*matched, *stream);
+    auto response_writer_result = ss::WriteTCPResponse(
+        *matched, cipher_info_, session_result->request_salt, *stream);
     if (!request_reader) {
         co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -288,12 +297,18 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     proxyman::inbound::UdpDecodeResult result;
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
+    result.session_key = std::string(decoded->session_key.begin(), decoded->session_key.end());
     result.user_id = profile.user_id;
     result.user_email = profile.email;
     result.speed_limit = profile.speed_limit;
-    result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
-        ToSsKey(user.derived_key),
-        cipher_info_);
+    if (decoded->ss2022_session) {
+        result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
+            std::move(decoded->ss2022_session));
+    } else {
+        result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
+            ToSsKey(user.derived_key),
+            cipher_info_);
+    }
     return result;
 }
 
@@ -304,6 +319,57 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
     if (!ss_context) {
         return {};
     }
+    if (auto* session = ss_context->Ss2022Session()) {
+        const size_t encoded_len = ss::Encode2022UdpResponsePacketTo(
+            packet.target,
+            packet.data.data(),
+            packet.data.size(),
+            *session,
+            nullptr,
+            0);
+        if (encoded_len == 0) {
+            return {};
+        }
+
+        if (encoded_len <= buf::Buffer::kSize) {
+            buf::BufferGuard payload{buf::Buffer::New()};
+            if (!payload) {
+                return {};
+            }
+            const size_t written = ss::Encode2022UdpResponsePacketTo(
+                packet.target,
+                packet.data.data(),
+                packet.data.size(),
+                *session,
+                payload->Tail().data(),
+                payload->Available());
+            if (written != encoded_len) {
+                return {};
+            }
+            payload->Produce(static_cast<uint32_t>(written));
+            return buf::MultiBuffer{payload.release()};
+        }
+
+        memory::ByteVector scratch(encoded_len);
+        const size_t written = ss::Encode2022UdpResponsePacketTo(
+            packet.target,
+            packet.data.data(),
+            packet.data.size(),
+            *session,
+            scratch.data(),
+            scratch.size());
+        if (written != encoded_len) {
+            return {};
+        }
+
+        buf::MultiBuffer payload;
+        payload.reserve((encoded_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+        if (!AppendSpanToMultiBuffer(scratch, payload)) {
+            return {};
+        }
+        return payload;
+    }
+
     const auto& reply_key = ss_context->ReplyKey();
     const auto& cipher = ss_context->CipherInfo();
     const size_t encoded_len = ss::EncodeUdpPacketTo(
@@ -380,6 +446,12 @@ acpp::proxyman::inbound::PreparedAeadCipher ToPreparedCipher(acpp::ss::SsCipherT
             return Prepared::AES_256_GCM;
         case acpp::ss::SsCipherType::CHACHA20_POLY1305:
             return Prepared::CHACHA20_POLY1305;
+        case acpp::ss::SsCipherType::AES_128_GCM_2022:
+            return Prepared::AES_128_GCM_2022;
+        case acpp::ss::SsCipherType::AES_256_GCM_2022:
+            return Prepared::AES_256_GCM_2022;
+        case acpp::ss::SsCipherType::CHACHA20_POLY1305_2022:
+            return Prepared::CHACHA20_POLY1305_2022;
     }
     return Prepared::AES_256_GCM;
 }
@@ -438,6 +510,21 @@ const bool kSsInboundRegistered = [] {
 
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             int64_t synthetic_uid = -1;
+            acpp::proxyman::inbound::PreparedKeyBytes identity_key;
+            const bool use_identity =
+                acpp::ss::Is2022Cipher(*cipher_info) &&
+                !config.identity_password.empty() &&
+                (config.clients.size() > 1 ||
+                 (config.clients.size() == 1 &&
+                  config.clients.front().password != config.identity_password));
+            if (use_identity) {
+                identity_key = ToPreparedKey(
+                    acpp::ss::BuildMasterKey(config.identity_password, *cipher_info));
+                if (identity_key.empty()) {
+                    LOG_WARN("Static inbound '{}': invalid SS2022 identity password", tag);
+                    return std::nullopt;
+                }
+            }
 
             for (const auto& client : config.clients) {
                 if (client.password.empty()) {
@@ -450,7 +537,13 @@ const bool kSsInboundRegistered = [] {
                 info.key_size    = cipher_info->key_size;
                 info.salt_size   = cipher_info->salt_size;
                 info.derived_key = ToPreparedKey(
-                    acpp::ss::DeriveKey(client.password, cipher_info->key_size));
+                    acpp::ss::BuildMasterKey(client.password, *cipher_info));
+                info.identity_key = identity_key;
+                if (info.derived_key.empty()) {
+                    LOG_WARN("Static inbound '{}': invalid SS password for user '{}'",
+                             tag, client.email);
+                    continue;
+                }
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
@@ -475,6 +568,16 @@ const bool kSsInboundRegistered = [] {
 
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(runtime_users.size());
+            acpp::proxyman::inbound::PreparedKeyBytes identity_key;
+            if (acpp::ss::Is2022Cipher(*cipher_info) &&
+                !req.ss_identity_password.empty()) {
+                identity_key = ToPreparedKey(
+                    acpp::ss::BuildMasterKey(req.ss_identity_password, *cipher_info));
+                if (identity_key.empty()) {
+                    LOG_WARN("Inbound '{}': invalid SS2022 identity password", req.tag);
+                    return std::nullopt;
+                }
+            }
 
             for (const auto& runtime_user : runtime_users) {
                 if (runtime_user.password.empty()) {
@@ -489,8 +592,14 @@ const bool kSsInboundRegistered = [] {
                 info.cipher_type = ToPreparedCipher(cipher_info->type);
                 info.key_size = cipher_info->key_size;
                 info.salt_size = cipher_info->salt_size;
-                info.derived_key = ToPreparedKey(acpp::ss::DeriveKey(
-                    runtime_user.password, cipher_info->key_size));
+                info.derived_key = ToPreparedKey(acpp::ss::BuildMasterKey(
+                    runtime_user.password, *cipher_info));
+                info.identity_key = identity_key;
+                if (info.derived_key.empty()) {
+                    LOG_WARN("Inbound '{}': invalid SS password for user '{}'",
+                             req.tag, runtime_user.email);
+                    continue;
+                }
                 users.push_back(std::move(info));
             }
 

@@ -16,6 +16,8 @@
 #include <vector>
 
 namespace acpp {
+class UDPSession;
+class UDPSessionManager;
 
 namespace app::dns {
 class DNS;
@@ -45,7 +47,8 @@ namespace proxy::shadowsocks::outbound {
 class Handler final : public ::acpp::Outbound {
 public:
     Handler(const ::acpp::SsOutboundConfig& config,
-            ::acpp::app::dns::DNS& dns_service);
+            ::acpp::app::dns::DNS& dns_service,
+            ::acpp::UDPSessionManager* udp_session_manager);
 
     ~Handler() noexcept override = default;
 
@@ -67,8 +70,10 @@ public:
 private:
     ::acpp::SsOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
+    ::acpp::UDPSessionManager* udp_session_manager_ = nullptr;
     ::acpp::ss::SsCipherInfo cipher_info_;
     ::acpp::ss::KeyBytes master_key_;
+    std::vector<::acpp::ss::KeyBytes> psk_chain_;
     ::acpp::StreamSettings stream_settings_;
 };
 

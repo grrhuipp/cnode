@@ -581,9 +581,14 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
         return;
     }
 
+    const auto& send_buffers =
+        proxyman::inbound::UdpWorker::ReplySendBuffers(*packet);
+    const auto endpoint =
+        proxyman::inbound::UdpWorker::ReplyEndpoint(*packet);
+
     sock->async_send_to(
-        proxyman::inbound::UdpWorker::ReplySendBuffers(*packet),
-        proxyman::inbound::UdpWorker::ReplyEndpoint(*packet),
+        send_buffers,
+        endpoint,
         [this, tag, sock, packet = std::move(packet), worker_id](IoErrorCode ec, size_t /*bytes_sent*/) {
             auto* udp_worker = FindUdpWorkerBySocketKey(tag);
             if (!udp_worker) {
@@ -1041,7 +1046,8 @@ Worker::CollectRuntimeStatsTask() const {
 // ============================================================================
 // UDP 监听（SO_REUSEPORT，与 TCP acceptor 同端口）
 //
-// 具体的解码/认证/ban 逻辑委托给 Shadowsocks inbound Handler（直接调用，无虚分派）。
+// 具体的解码、认证和 ban 逻辑委托给 inbound UdpHandler；Worker 只维护监听
+// socket 与当前 Worker-local UdpWorker 生命周期。
 // ============================================================================
 
 void Worker::AddUdpListenerAsync(const PortBinding& binding,
@@ -1196,18 +1202,16 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
 
     auto* udp_worker = FindUdpWorkerBySocketKey(socket_key);
-    if (!udp_worker) co_return;
+    if (!udp_worker) {
+        co_return;
+    }
     udp::socket* sock = udp_worker->FindSocket(socket_key);
-    if (!sock) co_return;
+    if (!sock) {
+        co_return;
+    }
 
     while (true) {
         udp::endpoint client_ep;
-        auto [wait_ec] = co_await sock->async_wait(
-            udp::socket::wait_read,
-            net::as_tuple(net::use_awaitable));
-        if (wait_ec == io_error::operation_aborted) co_return;
-        if (wait_ec) continue;
-
         buf::BufferGuard recv_buf{buf::Buffer::New()};
         if (!recv_buf) {
             LOG_ERROR("Worker[{}]: UDP receive buffer allocation failed tag={}", worker.id_, tag);
@@ -1218,7 +1222,9 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             net::as_tuple(net::use_awaitable));
 
         if (ec == io_error::operation_aborted) co_return;
-        if (ec || n == 0) continue;
+        if (ec || n == 0) {
+            continue;
+        }
 
         // ── 懒清理空闲会话 ────────────────────────────────────────────────
         const auto now = std::chrono::steady_clock::now();

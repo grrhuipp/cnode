@@ -77,6 +77,16 @@ struct TargetAddress {
         return iputil::FormatEndpointForLog(std::string_view(host.data(), host.size()), port);
     }
 
+    // 写入调用方提供的 out（复用其容量），语义与 ToString() 完全一致。
+    // 用于按连接复用 scratch 的热路径，省去每次的 destination 串分配。
+    void ToStringInto(std::string& out) const {
+        if (host.empty() && resolved_addr) {
+            iputil::FormatEndpointForLogInto(out, resolved_addr->to_string(), port);
+            return;
+        }
+        iputil::FormatEndpointForLogInto(out, std::string_view(host.data(), host.size()), port);
+    }
+
     // 从字符串解析
     [[nodiscard]]
     static std::optional<TargetAddress> Parse(std::string_view addr);

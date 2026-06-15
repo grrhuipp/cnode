@@ -33,9 +33,9 @@ namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
 
-std::optional<acpp::anytls::outbound::Settings> ParseSettings(
+std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
-    acpp::anytls::outbound::Settings result;
+    acpp::proxy::anytls::outbound::Settings result;
 
     if (const auto* value = settings.if_contains("address"); value && value->is_string()) {
         result.address = std::string(value->as_string());
@@ -89,7 +89,12 @@ std::optional<acpp::anytls::outbound::Settings> ParseSettings(
 
 }  // namespace
 
-namespace acpp::anytls::outbound {
+namespace acpp::proxy::anytls::outbound {
+
+// 协议核心 codec/validator 位于 acpp::anytls（对应 vmess core=acpp::vmess）。
+// using-directive 让迁移到 acpp::proxy::anytls::outbound 后，本文件内既有的
+// 非限定 codec 符号（WriteFrame/kCmd*/PaddingScheme 等）继续解析到核心命名空间。
+using namespace ::acpp::anytls;
 
 struct Handler::ClientSession {
     class LogicalStream final {
@@ -1054,7 +1059,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     co_return result;
 }
 
-}  // namespace acpp::anytls::outbound
+}  // namespace acpp::proxy::anytls::outbound
 
 namespace {
 const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
@@ -1086,7 +1091,7 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                         .allow_insecure = false,
                         .alpn = {},
                     });
-                return std::make_unique<acpp::anytls::outbound::Handler>(
+                return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
                     tag,
                     settings,
                     runtime_stream_settings,

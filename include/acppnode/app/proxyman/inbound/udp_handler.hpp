@@ -19,6 +19,9 @@ public:
 struct UdpDecodeResult {
     TargetAddress target;
     buf::MultiBuffer payload;
+    // Optional protocol-provided opaque session key. Empty means "use client endpoint".
+    // UdpWorker does not inspect the value; it only uses it to group datagrams.
+    std::string session_key;
     int64_t user_id = 0;
     std::string user_email;
     uint64_t speed_limit = 0;
