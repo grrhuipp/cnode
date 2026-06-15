@@ -15,6 +15,20 @@ namespace acpp::vmess::encoding {
 
 using VMessHandshakeResult = std::expected<void, ErrorCode>;
 
+struct EncodeRequestBodyState final {
+    std::optional<VMessCipher> cipher;
+    std::optional<ShakeMask> mask;
+    bool global_padding = false;
+    bool eof_sent = false;
+};
+
+struct DecodeResponseBodyState final {
+    std::optional<VMessCipher> cipher;
+    std::optional<ShakeMask> mask;
+    bool global_padding = false;
+    bool eof = false;
+};
+
 class ClientSession final {
 public:
     ClientSession(const MemoryAccount& user,
@@ -47,7 +61,8 @@ private:
     std::array<uint8_t, 16> request_iv_{};
     bool sent_ = false;
     bool response_header_initialized_ = false;
-    bool eof_sent_ = false;
+    EncodeRequestBodyState request_body_state_;
+    DecodeResponseBodyState response_body_state_;
 };
 
 }  // namespace acpp::vmess::encoding

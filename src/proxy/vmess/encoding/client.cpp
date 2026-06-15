@@ -121,25 +121,11 @@ struct EncodeRequestHeaderState final {
     uint8_t options = 0;
 };
 
-struct EncodeRequestBodyState final {
-    std::optional<VMessCipher> cipher;
-    std::optional<ShakeMask> mask;
-    bool global_padding = false;
-    bool eof_sent = false;
-};
-
 struct DecodeResponseHeaderState final {
     std::array<uint8_t, 16> response_key{};
     std::array<uint8_t, 16> response_iv{};
     uint8_t response_header = 0;
     bool received = false;
-};
-
-struct DecodeResponseBodyState final {
-    std::optional<VMessCipher> cipher;
-    std::optional<ShakeMask> mask;
-    bool global_padding = false;
-    bool eof = false;
 };
 
 }  // namespace
@@ -802,6 +788,18 @@ ClientSession::ClientSession(const MemoryAccount& user,
     if (options_ == 0) {
         options_ = Option::CHUNK_STREAM | Option::CHUNK_MASKING | Option::GLOBAL_PADDING;
     }
+
+    request_body_state_.cipher.emplace(security_, request_key_.data(), request_iv_.data());
+    request_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0;
+    if ((options_ & Option::CHUNK_MASKING) != 0) {
+        request_body_state_.mask.emplace(request_body_iv_.data());
+    }
+
+    response_body_state_.cipher.emplace(security_, response_key_.data(), response_iv_.data());
+    response_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0;
+    if ((options_ & Option::CHUNK_MASKING) != 0) {
+        response_body_state_.mask.emplace(response_iv_.data());
+    }
 }
 
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStream& stream) {
@@ -826,36 +824,21 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     std::span<const uint8_t> payload) {
-    EncodeRequestBodyState state;
-    state.cipher.emplace(security_, request_key_.data(), request_iv_.data());
-    state.mask.emplace(request_body_iv_.data());
-    state.global_padding = true;
-    state.eof_sent = eof_sent_;
-    auto result = co_await ::acpp::vmess::encoding::EncodeRequestBody(state, stream, payload);
-    eof_sent_ = state.eof_sent;
+    auto result = co_await ::acpp::vmess::encoding::EncodeRequestBody(
+        request_body_state_, stream, payload);
     co_return result;
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     buf::MultiBuffer mb) {
-    EncodeRequestBodyState state;
-    state.cipher.emplace(security_, request_key_.data(), request_iv_.data());
-    state.mask.emplace(request_body_iv_.data());
-    state.global_padding = true;
-    state.eof_sent = eof_sent_;
-    co_await ::acpp::vmess::encoding::EncodeRequestBody(state, stream, std::move(mb));
-    eof_sent_ = state.eof_sent;
+    co_await ::acpp::vmess::encoding::EncodeRequestBody(
+        request_body_state_, stream, std::move(mb));
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
-    EncodeRequestBodyState state;
-    state.cipher.emplace(security_, request_key_.data(), request_iv_.data());
-    state.mask.emplace(request_body_iv_.data());
-    state.global_padding = true;
-    state.eof_sent = eof_sent_;
-    co_await ::acpp::vmess::encoding::EncodeRequestBodyEOF(state, stream);
-    eof_sent_ = state.eof_sent;
+    co_await ::acpp::vmess::encoding::EncodeRequestBodyEOF(
+        request_body_state_, stream);
 }
 
 net::awaitable<bool> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
@@ -870,11 +853,8 @@ net::awaitable<bool> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
 }
 
 net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponseBody(AsyncStream& stream) {
-    DecodeResponseBodyState state;
-    state.cipher.emplace(security_, response_key_.data(), response_iv_.data());
-    state.mask.emplace(response_iv_.data());
-    state.global_padding = true;
-    auto mb = co_await ::acpp::vmess::encoding::DecodeResponseBody(state, stream);
+    auto mb = co_await ::acpp::vmess::encoding::DecodeResponseBody(
+        response_body_state_, stream);
     co_return mb;
 }
 
