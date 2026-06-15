@@ -4,6 +4,8 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/core/constants.hpp"
 
+#include <algorithm>
+
 namespace acpp {
 
 namespace {
@@ -65,6 +67,19 @@ void AppendCandidate(
     candidate.endpoint = tcp::endpoint(remote_addr, port);
     candidate.bind_local = SelectBindAddress(bind, inbound_local_addr, remote_addr);
     target.candidates.push_back(std::move(candidate));
+}
+
+bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_addr) noexcept {
+    if (bind.mode == OutboundTransportTarget::BindMode::Explicit) {
+        return bind.explicit_addr && bind.explicit_addr->is_v6();
+    }
+    if (!inbound_local_addr) {
+        return false;
+    }
+    const auto inbound_local =
+        iputil::NormalizeAddress(inbound_local_addr->address());
+    return inbound_local.is_v6() && !inbound_local.is_unspecified() &&
+           !inbound_local.is_loopback();
 }
 
 }  // namespace
@@ -162,8 +177,43 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     if (!dns_result.Ok()) {
         co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
-    if (dns_result.addresses.size() == 1) {
-        append_single(dns_result.addresses.front());
+    const bool wants_v6 = WantsIPv6(bind, options.inbound_local_addr);
+    const bool has_v4 = std::ranges::any_of(
+        dns_result.addresses,
+        [](const net::ip::address& addr) { return addr.is_v4(); });
+
+    if (wants_v6) {
+        for (const auto& addr : dns_result.addresses) {
+            if (addr.is_v6()) {
+                append_single(addr);
+                co_return target;
+            }
+        }
+        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+    }
+
+    if (has_v4) {
+        size_t v4_count = 0;
+        const net::ip::address* first_v4 = nullptr;
+        for (const auto& addr : dns_result.addresses) {
+            if (!addr.is_v4()) {
+                continue;
+            }
+            ++v4_count;
+            if (!first_v4) {
+                first_v4 = &addr;
+            }
+        }
+        if (v4_count == 1) {
+            append_single(*first_v4);
+            co_return target;
+        }
+        target.candidates.reserve(v4_count);
+        for (const auto& addr : dns_result.addresses) {
+            if (addr.is_v4()) {
+                AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
+            }
+        }
         co_return target;
     }
 
