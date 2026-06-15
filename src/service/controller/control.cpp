@@ -1,5 +1,7 @@
 #include "controller_impl.hpp"
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
+
 #include "inboundbuilder.hpp"
 #include "outboundbuilder.hpp"
 
@@ -444,9 +446,7 @@ void Controller::Impl::clearUsers(const std::string& tag, const std::string& pro
         return;
     }
 
-    for (const auto& worker : workers_) {
-        worker->ClearInboundUsersAsync(protocol, tag);
-    }
+    proxyman::inbound::UserStore::ClearUsers(protocol, tag);
 }
 
 void Controller::Impl::removeUsers(const std::string& tag,
@@ -467,9 +467,7 @@ void Controller::Impl::removeUsers(const std::string& tag,
         LOG_WARN("removeUsers: build users failed for protocol '{}'", protocol);
         return;
     }
-    for (const auto& worker : workers_) {
-        worker->RemoveInboundUsersAsync(protocol, tag, *user_set);
-    }
+    proxyman::inbound::UserStore::RemoveUsers(protocol, tag, *user_set);
 }
 
 void Controller::Impl::addNewUser(api::API* panel,
@@ -504,9 +502,7 @@ void Controller::Impl::addNewUser(api::API* panel,
         LOG_WARN("addNewUser: build users failed for protocol '{}'", protocol);
         return;
     }
-    for (const auto& worker : workers_) {
-        worker->AddInboundUsersAsync(protocol, tag, *user_set);
-    }
+    proxyman::inbound::UserStore::AddUsers(protocol, tag, *user_set);
 }
 
 void Controller::Impl::syncUserList(api::API* panel,

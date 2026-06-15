@@ -55,10 +55,10 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildTrojanUsers(
 
         trojan::TrojanUserInfo info;
         info.password_hash = trojan::HashPassword(password);
-        info.email         = BuildUserTag(tag, user_info);
-        info.user_id       = user_info.UID;
-        info.speed_limit   = user_info.SpeedLimit;
-        info.device_limit  = DeviceLimitOf(user_info);
+        info.profile.email = BuildUserTag(tag, user_info);
+        info.profile.user_id = user_info.UID;
+        info.profile.speed_limit = user_info.SpeedLimit;
+        info.profile.device_limit = DeviceLimitOf(user_info);
         users.push_back(std::move(info));
     }
 
@@ -90,10 +90,10 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildShadowsocksUser
 
         ss::SsUserInfo info;
         info.password     = password;
-        info.email        = BuildUserTag(tag, user_info);
-        info.user_id      = user_info.UID;
-        info.speed_limit  = user_info.SpeedLimit;
-        info.device_limit = DeviceLimitOf(user_info);
+        info.profile.email = BuildUserTag(tag, user_info);
+        info.profile.user_id = user_info.UID;
+        info.profile.speed_limit = user_info.SpeedLimit;
+        info.profile.device_limit = DeviceLimitOf(user_info);
         info.cipher_type  = cipher_info->type;
         info.key_size     = cipher_info->key_size;
         info.salt_size    = cipher_info->salt_size;
@@ -128,10 +128,10 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
                 user_info.Passwd.empty() ? user_info.UUID : user_info.Passwd;
             anytls::UserInfo info;
             info.password_hash = anytls::PasswordHash(password);
-            info.email = BuildUserTag(tag, user_info);
-            info.user_id = user_info.UID;
-            info.speed_limit = user_info.SpeedLimit;
-            info.device_limit = DeviceLimitOf(user_info);
+            info.profile.email = BuildUserTag(tag, user_info);
+            info.profile.user_id = user_info.UID;
+            info.profile.speed_limit = user_info.SpeedLimit;
+            info.profile.device_limit = DeviceLimitOf(user_info);
             users.push_back(std::move(info));
         }
         proxyman::inbound::UserSet result;

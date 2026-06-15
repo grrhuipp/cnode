@@ -8,6 +8,11 @@ if(NOT runtime_header MATCHES "std::vector[ \t\r\n]*<[ \t\r\n]*StaticInboundRunt
         "WorkerRuntimeConfig must carry prepared static inbound runtime entries in the immutable runtime snapshot")
 endif()
 
+if(runtime_header MATCHES "UserSet[ \t\r\n]+users")
+    message(FATAL_ERROR
+        "Static inbound runtime entries must not retain inbound user sets; users are published to global UserStore")
+endif()
+
 if(NOT bootstrap_setup MATCHES "BuildStaticInboundRuntimeEntries[ \t\r\n]*\\([ \t\r\n]*config\\.GetStaticInbounds\\(")
     message(FATAL_ERROR
         "Bootstrap cold path must build prepared static inbound entries while constructing WorkerRuntimeConfig")

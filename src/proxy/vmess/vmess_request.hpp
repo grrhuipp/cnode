@@ -11,6 +11,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/proxy/vmess/types.hpp"
 #include <array>
 #include <cstdint>
@@ -97,9 +98,6 @@ enum class VMessHandshakeFailReason {
 // VMess 请求头（Process 解析后填充，VMess Link 读取）
 // ============================================================================
 
-// 前向声明（MemoryAccount 在 account.hpp 中定义）
-struct MemoryAccount;
-
 struct VMessRequest {
     VMessRequest() = default;
     ~VMessRequest() noexcept = default;
@@ -114,7 +112,8 @@ struct VMessRequest {
         , security(other.security)
         , command(other.command)
         , target(other.target)
-        , user(other.user) {
+        , user_ref(other.user_ref)
+        , user(user_ref ? user_ref.get() : other.user) {
         if (other.HasPendingData()) {
             SetPendingData(other.PendingDataSpan());
         }
@@ -133,7 +132,8 @@ struct VMessRequest {
         security = other.security;
         command = other.command;
         target = other.target;
-        user = other.user;
+        user_ref = other.user_ref;
+        user = user_ref ? user_ref.get() : other.user;
         if (other.HasPendingData()) {
             SetPendingData(other.PendingDataSpan());
         } else {
@@ -152,12 +152,14 @@ struct VMessRequest {
         , security(other.security)
         , command(other.command)
         , target(std::move(other.target))
-        , user(other.user)
+        , user_ref(std::move(other.user_ref))
+        , user(user_ref ? user_ref.get() : other.user)
         , pending_buffer_(std::move(other.pending_buffer_))
         , pending_offset_(other.pending_offset_)
         , pending_size_(other.pending_size_) {
         other.pending_offset_ = 0;
         other.pending_size_ = 0;
+        other.user = nullptr;
     }
 
     VMessRequest& operator=(VMessRequest&& other) noexcept {
@@ -173,12 +175,14 @@ struct VMessRequest {
         security = other.security;
         command = other.command;
         target = std::move(other.target);
-        user = other.user;
+        user_ref = std::move(other.user_ref);
+        user = user_ref ? user_ref.get() : other.user;
         pending_buffer_ = std::move(other.pending_buffer_);
         pending_offset_ = other.pending_offset_;
         pending_size_ = other.pending_size_;
         other.pending_offset_ = 0;
         other.pending_size_ = 0;
+        other.user = nullptr;
         return *this;
     }
 
@@ -192,7 +196,14 @@ struct VMessRequest {
     Command  command        = Command::TCP;
     TargetAddress target;
 
-    const MemoryAccount* user = nullptr;
+    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user_ref;
+    const proxyman::inbound::UserStore::VmessCredential* user = nullptr;
+
+    void SetUser(
+        std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> account) noexcept {
+        user_ref = std::move(account);
+        user = user_ref.get();
+    }
 
     [[nodiscard]] bool HasPendingData() const noexcept {
         return pending_buffer_ && pending_size_ > 0;

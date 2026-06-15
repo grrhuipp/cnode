@@ -15,7 +15,6 @@ namespace acpp {
 namespace proxyman::inbound {
 struct BuildRequest;
 struct ReceiverSettings;
-struct UserSet;
 class UdpHandler;
 }
 namespace proxyman::outbound {
@@ -94,12 +93,6 @@ public:
     // 动态出站（线程安全）：XrayR Controller 面板节点 addOutbound/removeOutbound。
     void AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config);
     void RemoveOutboundAsync(std::string tag);
-
-    // 将冷路径构建好的用户集应用到本 Worker 本地表。
-    void ApplyInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users);
-    void AddInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users);
-    void RemoveInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users);
-    void ClearInboundUsersAsync(std::string protocol, std::string tag);
 
     // 注销监听上下文（线程安全）
     void UnregisterListenerAsync(std::string tag);

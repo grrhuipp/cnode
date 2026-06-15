@@ -20,7 +20,6 @@ struct StaticInboundRuntimeEntry {
     SniffConfig sniffing;
     std::string outbound_tag;
     proxyman::inbound::BuildRequest build_request;
-    proxyman::inbound::UserSet users;
 };
 
 }  // namespace acpp

@@ -1,6 +1,7 @@
 #include "acppnode/app/static_inbound_runtime.hpp"
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
@@ -43,7 +44,7 @@ std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
         LOG_WARN("Static inbound '{}': load users failed, skipped", entry.tag);
         return std::nullopt;
     }
-    entry.users = std::move(*users);
+    proxyman::inbound::UserStore::ApplyUsers(entry.protocol, entry.tag, *users);
 
     return entry;
 }

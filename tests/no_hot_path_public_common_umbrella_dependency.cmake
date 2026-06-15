@@ -200,10 +200,11 @@ if(NOT trojan_validator_header MATCHES "struct[ \t\r\n]+Impl;" OR
 endif()
 
 if(NOT trojan_validator_source MATCHES "struct[ \t\r\n]+Validator::Impl" OR
-   NOT trojan_validator_source MATCHES "ThreadLocalUnorderedMap<std::string" OR
-   NOT trojan_validator_source MATCHES "UserOnlineTracker[ \t\r\n]+stats")
+   NOT trojan_validator_source MATCHES "UserStore::FindTrojanUser" OR
+   NOT trojan_validator_source MATCHES "UserOnlineTracker[ \t\r\n]+stats" OR
+   trojan_validator_source MATCHES "ThreadLocalUnorderedMap<std::string")
     message(FATAL_ERROR
-        "Trojan validator implementation should privately own Worker-local user maps and online tracking")
+        "Trojan validator implementation should read global UserStore credentials and keep only online tracking locally")
 endif()
 
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/proxy/shadowsocks/validator.hpp" ss_validator_header)
@@ -214,18 +215,19 @@ if(ss_validator_header MATCHES "#include[ \t]+\"acppnode/common/(allocator|shard
         "Shadowsocks validator public header must not expose Worker-local user lists or online-tracker storage")
 endif()
 
-if(NOT ss_validator_header MATCHES "std::span[ \t\r\n]*<[ \t\r\n]*const[ \t\r\n]+SsUserInfo[ \t\r\n]*>[ \t\r\n]+FindUsersForTag" OR
+if(NOT ss_validator_header MATCHES "ShadowsocksUsersView[ \t\r\n]+FindUsersForTag" OR
    NOT ss_validator_header MATCHES "struct[ \t\r\n]+Impl;" OR
    NOT ss_validator_header MATCHES "std::unique_ptr[ \t\r\n]*<[ \t\r\n]*Impl[ \t\r\n]*>[ \t\r\n]+impl_")
     message(FATAL_ERROR
-        "Shadowsocks validator should expose ordinary span/user DTO boundaries and hide storage behind an implementation pointer")
+        "Shadowsocks validator should expose an immutable UserStore view and hide online-tracker storage behind an implementation pointer")
 endif()
 
 if(NOT ss_validator_source MATCHES "struct[ \t\r\n]+Validator::Impl" OR
-   NOT ss_validator_source MATCHES "ThreadLocalVector<SsUserInfo>" OR
-   NOT ss_validator_source MATCHES "UserOnlineTracker[ \t\r\n]+stats")
+   NOT ss_validator_source MATCHES "UserStore::ShadowsocksUsers" OR
+   NOT ss_validator_source MATCHES "UserOnlineTracker[ \t\r\n]+stats" OR
+   ss_validator_source MATCHES "ThreadLocalVector<SsUserInfo>")
     message(FATAL_ERROR
-        "Shadowsocks validator implementation should privately own Worker-local user lists and online tracking")
+        "Shadowsocks validator implementation should read global UserStore credentials and keep only online tracking locally")
 endif()
 
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/proxy/vmess/validator.hpp" vmess_validator_header)
@@ -244,11 +246,12 @@ if(NOT vmess_validator_header MATCHES "struct[ \t\r\n]+Impl;" OR
 endif()
 
 if(NOT vmess_validator_source MATCHES "struct[ \t\r\n]+TimedUserValidator::Impl" OR
-   NOT vmess_validator_source MATCHES "ThreadLocalUnorderedMap<std::string" OR
+   NOT vmess_validator_source MATCHES "UserStore::VmessUsers" OR
+   NOT vmess_validator_source MATCHES "std::shared_ptr[ \t\r\n]*<[ \t\r\n]*const[ \t\r\n]+proxyman::inbound::UserStore::VmessUserMap[ \t\r\n]*>[ \t\r\n]+hot_users" OR
    NOT vmess_validator_source MATCHES "HotUserCache" OR
    NOT vmess_validator_source MATCHES "UserOnlineTracker[ \t\r\n]+stats")
     message(FATAL_ERROR
-        "VMess validator implementation should privately own Worker-local user maps, hot auth cache, and online tracking")
+        "VMess validator implementation should read global UserStore credentials and keep only hot auth cache plus online tracking locally")
 endif()
 
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/app/proxyman/inbound/tcp_worker.hpp" tcp_worker_header)

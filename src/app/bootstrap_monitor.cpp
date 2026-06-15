@@ -6,6 +6,7 @@
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_stats.hpp"
@@ -263,8 +264,9 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
                 const auto& m = worker_snapshot.memory;
                 total_mem.dns_estimated_bytes   += m.dns_estimated_bytes;
                 total_mem.udp_estimated_bytes   += m.udp_estimated_bytes;
-                total_mem.users_estimated_bytes += m.users_estimated_bytes;
             }
+            const auto user_stats = proxyman::inbound::UserStore::GetStats();
+            total_mem.users_estimated_bytes = user_stats.TotalUsers() * 512;
             LOG_INFO("mem: dns={:.0f}KB udp={:.0f}KB usr={:.0f}KB | RSS={:.1f}MB",
                      total_mem.dns_estimated_bytes / 1024.0,
                      total_mem.udp_estimated_bytes / 1024.0,

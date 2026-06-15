@@ -974,9 +974,11 @@ Handler::Process(
         co_return result;
     }
 
-    ctx.inbound.user_email = user->email;
-    ctx.inbound.user_id = user->user_id;
-    ctx.content.speed_limit = user->speed_limit;
+    if (user->profile) {
+        ctx.inbound.user_email = user->profile->email;
+        ctx.inbound.user_id = user->profile->user_id;
+        ctx.content.speed_limit = user->profile->speed_limit;
+    }
 
     auto demux = std::make_shared<AnyTLSDemuxSession>(
         std::move(stream),
@@ -1022,38 +1024,12 @@ const bool kInboundRegistered = [] {
                 }
                 acpp::anytls::UserInfo info;
                 info.password_hash = acpp::anytls::PasswordHash(password);
-                info.email = client.email.empty() ? std::string(tag) : client.email;
+                info.profile.email = client.email.empty() ? std::string(tag) : client.email;
                 users.push_back(std::move(info));
             }
             acpp::proxyman::inbound::UserSet result;
             result.anytls_users = std::move(users);
             return result;
-        };
-
-    reg.apply_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (deps.anytls_validator) deps.anytls_validator->ApplyUsers(tag, users.anytls_users);
-        };
-
-    reg.add_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (deps.anytls_validator) deps.anytls_validator->AddUsers(tag, users.anytls_users);
-        };
-
-    reg.remove_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (deps.anytls_validator) deps.anytls_validator->RemoveUsers(tag, users.anytls_users);
-        };
-
-    reg.clear_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps, std::string_view tag) {
-            if (deps.anytls_validator) deps.anytls_validator->ClearUsers(tag);
         };
 
     acpp::proxyman::inbound::RegisterProxy(

@@ -224,6 +224,7 @@ set(CNODE_SOURCES
     src/app/proxyman/inbound/manager.cpp
     src/app/proxyman/inbound/tcp_worker.cpp
     src/app/proxyman/inbound/udp_worker.cpp
+    src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
     src/app/proxyman/outbound/source_config.cpp
     src/app/proxyman/outbound/handler.cpp
@@ -958,7 +959,7 @@ add_test(
 )
 
 add_test(
-    NAME no_dynamic_inbound_users_outside_runtime_snapshot
+    NAME no_worker_local_inbound_user_copies
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_dynamic_inbound_users_outside_runtime_snapshot.cmake

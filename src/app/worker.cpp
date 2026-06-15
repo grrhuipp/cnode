@@ -190,157 +190,8 @@ std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint
     return key;
 }
 
-[[nodiscard]] bool SameInboundUsersEntry(
-    const InboundUsersRuntimeEntry& entry,
-    std::string_view protocol,
-    std::string_view tag) {
-    return entry.protocol == protocol && entry.tag == tag;
-}
-
-[[nodiscard]] bool EmptyUserSet(const proxyman::inbound::UserSet& users) noexcept {
-    return users.vmess_accounts.empty() &&
-           users.trojan_users.empty() &&
-           users.ss_users.empty();
-}
-
-template <typename User, typename SameIdentity>
-void AddOrReplaceUsers(
-    std::vector<User>& current,
-    const std::vector<User>& incoming,
-    SameIdentity same_identity) {
-    current.reserve(current.size() + incoming.size());
-    for (const auto& user : incoming) {
-        auto it = std::find_if(current.begin(), current.end(),
-            [&](const User& existing) { return same_identity(existing, user); });
-        if (it == current.end()) {
-            current.push_back(user);
-        } else {
-            *it = user;
-        }
-    }
-}
-
-template <typename User, typename SameIdentity>
-void RemoveUsersByIdentity(
-    std::vector<User>& current,
-    const std::vector<User>& removing,
-    SameIdentity same_identity) {
-    std::erase_if(current, [&](const User& existing) {
-        return std::any_of(removing.begin(), removing.end(),
-            [&](const User& user) { return same_identity(existing, user); });
-    });
-}
-
-void AddInboundUsersToSnapshot(
-    std::vector<InboundUsersRuntimeEntry>& entries,
-    std::string_view protocol,
-    std::string_view tag,
-    const proxyman::inbound::UserSet& users) {
-    auto it = std::find_if(entries.begin(), entries.end(),
-        [&](const InboundUsersRuntimeEntry& entry) {
-            return SameInboundUsersEntry(entry, protocol, tag);
-        });
-    if (it == entries.end()) {
-        entries.push_back(InboundUsersRuntimeEntry{
-            std::string(protocol),
-            std::string(tag),
-            users,
-        });
-        return;
-    }
-
-    AddOrReplaceUsers(
-        it->users.vmess_accounts,
-        users.vmess_accounts,
-        [](const vmess::MemoryAccount& a, const vmess::MemoryAccount& b) {
-            return a.uuid == b.uuid;
-        });
-    AddOrReplaceUsers(
-        it->users.trojan_users,
-        users.trojan_users,
-        [](const trojan::TrojanUserInfo& a, const trojan::TrojanUserInfo& b) {
-            return a.password_hash == b.password_hash;
-        });
-    AddOrReplaceUsers(
-        it->users.ss_users,
-        users.ss_users,
-        [](const ss::SsUserInfo& a, const ss::SsUserInfo& b) {
-            if (a.user_id != 0 && b.user_id != 0) {
-                return a.user_id == b.user_id;
-            }
-            return a.password == b.password;
-        });
-}
-
-void ApplyInboundUsersToSnapshot(
-    std::vector<InboundUsersRuntimeEntry>& entries,
-    std::string_view protocol,
-    std::string_view tag,
-    const proxyman::inbound::UserSet& users) {
-    std::erase_if(entries, [&](const InboundUsersRuntimeEntry& entry) {
-        return SameInboundUsersEntry(entry, protocol, tag);
-    });
-    entries.push_back(InboundUsersRuntimeEntry{
-        std::string(protocol),
-        std::string(tag),
-        users,
-    });
-}
-
-void RemoveInboundUsersFromSnapshot(
-    std::vector<InboundUsersRuntimeEntry>& entries,
-    std::string_view protocol,
-    std::string_view tag,
-    const proxyman::inbound::UserSet& users) {
-    auto it = std::find_if(entries.begin(), entries.end(),
-        [&](const InboundUsersRuntimeEntry& entry) {
-            return SameInboundUsersEntry(entry, protocol, tag);
-        });
-    if (it == entries.end()) {
-        return;
-    }
-
-    RemoveUsersByIdentity(
-        it->users.vmess_accounts,
-        users.vmess_accounts,
-        [](const vmess::MemoryAccount& a, const vmess::MemoryAccount& b) {
-            return a.uuid == b.uuid;
-        });
-    RemoveUsersByIdentity(
-        it->users.trojan_users,
-        users.trojan_users,
-        [](const trojan::TrojanUserInfo& a, const trojan::TrojanUserInfo& b) {
-            return a.password_hash == b.password_hash;
-        });
-    RemoveUsersByIdentity(
-        it->users.ss_users,
-        users.ss_users,
-        [](const ss::SsUserInfo& a, const ss::SsUserInfo& b) {
-            if (a.user_id != 0 && b.user_id != 0) {
-                return a.user_id == b.user_id;
-            }
-            return a.password == b.password;
-        });
-
-    if (EmptyUserSet(it->users)) {
-        entries.erase(it);
-    }
-}
-
-void ClearInboundUsersFromSnapshot(
-    std::vector<InboundUsersRuntimeEntry>& entries,
-    std::string_view protocol,
-    std::string_view tag) {
-    std::erase_if(entries, [&](const InboundUsersRuntimeEntry& entry) {
-        return SameInboundUsersEntry(entry, protocol, tag);
-    });
-}
-
 void RemoveInboundRuntimeFromSnapshot(WorkerRuntimeConfig& snapshot, std::string_view tag) {
     std::erase_if(snapshot.static_inbounds, [&](const StaticInboundRuntimeEntry& entry) {
-        return entry.tag == tag;
-    });
-    std::erase_if(snapshot.inbound_users, [&](const InboundUsersRuntimeEntry& entry) {
         return entry.tag == tag;
     });
 }
@@ -1047,59 +898,6 @@ void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
     worker.runtime_->outbound_manager->DrainRetiredHandlers();
 }
 
-void Worker::ApplyInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
-    net::post(runtime_->io_context,
-        [this,
-         protocol = std::move(protocol),
-         tag = std::move(tag),
-         users = std::move(users)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->inbound_manager->ApplyUsers(protocol, tag, users);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            ApplyInboundUsersToSnapshot(next_snapshot->inbound_users, protocol, tag, users);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-        });
-}
-
-void Worker::AddInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
-    net::post(runtime_->io_context,
-        [this,
-         protocol = std::move(protocol),
-         tag = std::move(tag),
-         users = std::move(users)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->inbound_manager->AddUsers(protocol, tag, users);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            AddInboundUsersToSnapshot(next_snapshot->inbound_users, protocol, tag, users);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-        });
-}
-
-void Worker::RemoveInboundUsersAsync(std::string protocol, std::string tag, proxyman::inbound::UserSet users) {
-    net::post(runtime_->io_context,
-        [this,
-         protocol = std::move(protocol),
-         tag = std::move(tag),
-         users = std::move(users)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->inbound_manager->RemoveUsers(protocol, tag, users);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            RemoveInboundUsersFromSnapshot(next_snapshot->inbound_users, protocol, tag, users);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-        });
-}
-
-void Worker::ClearInboundUsersAsync(std::string protocol, std::string tag) {
-    net::post(runtime_->io_context,
-        [this, protocol = std::move(protocol), tag = std::move(tag)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->inbound_manager->ClearUsers(protocol, tag);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            ClearInboundUsersFromSnapshot(next_snapshot->inbound_users, protocol, tag);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-        });
-}
-
 void Worker::UnregisterListenerAsync(std::string tag) {
     net::post(runtime_->io_context,
         [this, t = std::move(tag)] {
@@ -1182,15 +980,8 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
     stats.udp_estimated_bytes = stats.udp_sessions * 1024;
 
-    const auto user_stats = runtime_->inbound_manager->GetUserMemoryStats();
-    stats.vmess_accounts = user_stats.vmess_accounts;
-    stats.trojan_users = user_stats.trojan_users;
-    stats.users_estimated_bytes =
-        (user_stats.vmess_accounts + user_stats.trojan_users + user_stats.shadowsocks_users) * 512;
-
     stats.total_estimated_bytes = stats.dns_estimated_bytes
-                                + stats.udp_estimated_bytes
-                                + stats.users_estimated_bytes;
+                                + stats.udp_estimated_bytes;
     return stats;
 }
 

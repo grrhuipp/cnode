@@ -3,6 +3,7 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/app/proxyman/inbound/udp_handler.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/online_device.hpp"
@@ -106,19 +107,19 @@ void Manager::DrainRetiredHandlers() {
 }
 
 void Manager::ApplyUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    ApplyWorkerUsers(protocol, impl_->Deps(), tag, users);
+    UserStore::ApplyUsers(protocol, tag, users);
 }
 
 void Manager::AddUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    AddWorkerUsers(protocol, impl_->Deps(), tag, users);
+    UserStore::AddUsers(protocol, tag, users);
 }
 
 void Manager::RemoveUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    RemoveWorkerUsers(protocol, impl_->Deps(), tag, users);
+    UserStore::RemoveUsers(protocol, tag, users);
 }
 
 void Manager::ClearUsers(std::string_view protocol, std::string_view tag) {
-    ClearWorkerUsers(protocol, impl_->Deps(), tag);
+    UserStore::ClearUsers(protocol, tag);
 }
 
 std::vector<::acpp::OnlineDevice>
@@ -133,10 +134,12 @@ Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const
 }
 
 Manager::UserMemoryStats Manager::GetUserMemoryStats() const noexcept {
+    const auto stats = UserStore::GetStats();
     return UserMemoryStats{
-        impl_->vmess_validator.Size(),
-        impl_->trojan_validator.Size(),
-        impl_->ss_validator.Size(),
+        stats.vmess_accounts,
+        stats.trojan_users,
+        stats.shadowsocks_users,
+        stats.anytls_users,
     };
 }
 

@@ -3,6 +3,7 @@
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/udp_handler.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/static_inbound_prepared_config.hpp"
 #include "acppnode/app/worker.hpp"
@@ -32,7 +33,6 @@ std::vector<std::string> SetupStaticInbounds(
         for (const auto& worker : workers) {
             auto* connection_limiter = connection_limiters[worker->Id()].get();
 
-            worker->ApplyInboundUsersAsync(inbound.protocol, inbound.tag, inbound.users);
             auto handler = worker->NewInboundHandler(
                 inbound.protocol, connection_limiter, inbound.build_request);
             if (!handler) {
@@ -122,6 +122,7 @@ void SetupTestMode(
 
     proxyman::inbound::UserSet test_users;
     test_users.vmess_accounts.push_back(*test_user);
+    proxyman::inbound::UserStore::ApplyUsers(protocol, kTestTag, test_users);
 
     proxyman::inbound::BuildRequest req;
     req.tag = kTestTag;
@@ -130,7 +131,6 @@ void SetupTestMode(
     for (const auto& worker : workers) {
         auto* connection_limiter = connection_limiters[worker->Id()].get();
 
-        worker->ApplyInboundUsersAsync(protocol, kTestTag, test_users);
         auto handler = worker->NewInboundHandler(
             protocol, connection_limiter, req);
         if (!handler) {

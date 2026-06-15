@@ -46,7 +46,7 @@ struct DecodeRequestBodyState final {
 
 bool ParseRequestHeader(const uint8_t* data,
                         size_t len,
-                        const MemoryAccount* user,
+                        const proxyman::inbound::UserStore::VmessCredential* user,
                         const uint8_t* auth_id,
                         const uint8_t* connection_nonce,
                         uint64_t trace_conn_id,
@@ -654,7 +654,7 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     const uint8_t* auth_id = data;
 
     int64_t timestamp;
-    const MemoryAccount* user = validator.FindByAuthIDForTag(tag, auth_id, timestamp);
+    auto user = validator.FindByAuthIDForTag(tag, auth_id, timestamp);
 
     if (!user) {
         LOG_ACCESS_DEBUG("VMess: user not found by auth_id (tag={}, users={})",
@@ -671,10 +671,11 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const int64_t skew = now - timestamp;
 
-    LOG_ACCESS_DEBUG("VMess: found user {} by auth_id", user->email);
+    const auto& profile = *user->profile;
+    LOG_ACCESS_DEBUG("VMess: found user {} by auth_id", profile.email);
     LOG_ACCESS_TRACE("[conn={}] VMess: auth ok user={} tag={} ts={} skew={}s auth_id={}",
                      trace_conn_id,
-                     user->email,
+                     profile.email,
                      tag,
                      timestamp,
                      skew,
@@ -685,30 +686,30 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     VMessRequest request;
     size_t consumed = 0;
 
-    if (!ParseRequestHeader(data + 16, len - 16, user, auth_id, connection_nonce,
-                            trace_conn_id, request, consumed)) {
+    if (!ParseRequestHeader(data + 16, len - 16, user.get(), auth_id, connection_nonce,
+                        trace_conn_id, request, consumed)) {
         LOG_ACCESS_DEBUG("VMess: failed to parse request header");
         LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequestHeader failed user={} nonce={}",
                          trace_conn_id,
-                         user->email,
+                         profile.email,
                          FormatHexPrefix(connection_nonce, 8, 8));
         return {std::nullopt, 0};
     }
 
-    request.user = user;
-
     LOG_ACCESS_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
                      trace_conn_id,
-                     user->email,
+                     profile.email,
                      16 + consumed,
                      len > (16 + consumed) ? (len - (16 + consumed)) : 0);
+
+    request.SetUser(std::move(user));
 
     return {request, 16 + consumed};
 }
 
 bool ParseRequestHeader(const uint8_t* data,
                         size_t len,
-                        const MemoryAccount* user,
+                        const proxyman::inbound::UserStore::VmessCredential* user,
                         const uint8_t* auth_id,
                         const uint8_t* connection_nonce,
                         uint64_t trace_conn_id,
@@ -754,7 +755,7 @@ bool ParseRequestHeader(const uint8_t* data,
         LOG_ACCESS_DEBUG("VMess: header length decrypt failed");
         LOG_ACCESS_TRACE("[conn={}] VMess: header length decrypt failed user={} auth_id={} nonce={}",
                          trace_conn_id,
-                         user ? user->email : "",
+                         user && user->profile ? user->profile->email : "",
                          FormatHexPrefix(auth_id, 16, 8),
                          FormatHexPrefix(connection_nonce, 8, 8));
         return false;
@@ -765,7 +766,7 @@ bool ParseRequestHeader(const uint8_t* data,
     LOG_ACCESS_TRACE("[conn={}] VMess: header_len={} user={} nonce={}",
                      trace_conn_id,
                      header_len,
-                     user ? user->email : "",
+                     user && user->profile ? user->profile->email : "",
                      FormatHexPrefix(connection_nonce, 8, 8));
 
     size_t needed = 18 + 8 + static_cast<size_t>(header_len) + 16;
@@ -807,7 +808,7 @@ bool ParseRequestHeader(const uint8_t* data,
         LOG_ACCESS_DEBUG("VMess: header decrypt failed");
         LOG_ACCESS_TRACE("[conn={}] VMess: header decrypt failed user={} header_len={} nonce={} enc_prefix={}",
                          trace_conn_id,
-                         user ? user->email : "",
+                         user && user->profile ? user->profile->email : "",
                          header_len,
                          FormatHexPrefix(connection_nonce, 8, 8),
                          FormatHexPrefix(header_enc, header_len + 16, 16));

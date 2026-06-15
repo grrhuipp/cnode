@@ -4,13 +4,14 @@
 // validator.hpp — VMess TimedUserValidator
 //
 // 职责（协议特有）：
-//   - Worker 本地账户存储
+//   - 全局 RCU 账户快照
 //   - 热点账户缓存
 //
 // 通用能力：
 //   - 在线用户追踪
 // ============================================================================
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/proxy/vmess/account.hpp"
 
 #include <cstdint>
@@ -28,8 +29,8 @@ namespace vmess {
 // TimedUserValidator — 用户验证器
 //
 // 线程模型：
-//   - 每个 Worker 拥有自己的本地用户表，认证路径不加锁
-//   - 面板/静态更新在冷路径构建用户集后投递到 Worker 本地表
+//   - 认证用户表为进程级单份 RCU 快照，认证路径只做 atomic load
+//   - 面板/静态更新在冷路径构建新快照后无锁发布
 //   - 在线追踪为 Worker 私有状态
 // ============================================================================
 class TimedUserValidator {
@@ -56,9 +57,10 @@ public:
     size_t SizeForTag(std::string_view tag) const;
 
     // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
-    const MemoryAccount* FindByAuthIDForTag(std::string_view tag,
-                                            const uint8_t* auth_id,
-                                            int64_t& out_timestamp) const;
+    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
+    FindByAuthIDForTag(std::string_view tag,
+                       const uint8_t* auth_id,
+                       int64_t& out_timestamp) const;
 
     // ── 在线追踪 ─────────────────────────────────────────────────────────────
 

@@ -200,18 +200,19 @@ proxy::vmess::inbound::Handler::Process(
 
     // 填充用户信息
     if (request->user) {
-        ctx.inbound.user_id = request->user->user_id;
-        ctx.inbound.user_email = request->user->email;
-        ctx.content.speed_limit = request->user->speed_limit;
+        const auto& profile = *request->user->profile;
+        ctx.inbound.user_id = profile.user_id;
+        ctx.inbound.user_email = profile.email;
+        ctx.content.speed_limit = profile.speed_limit;
 
         // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-        uint64_t uid = static_cast<uint64_t>(request->user->user_id);
+        uint64_t uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(
-                tag, uid, ctx.inbound.source_ip, request->user->device_limit)) {
+                tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
             LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                request->user->device_limit,
+                profile.device_limit,
                 validator_.OnlineDeviceCount(tag, uid));
             co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
         }
@@ -222,7 +223,7 @@ proxy::vmess::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
                    tag, client_ip, request->target,
-                   request->user ? request->user->email : "");
+                   request->user && request->user->profile ? request->user->profile->email : "");
 
     // 在 move 之前提取所有需要的字段
     TargetAddress target = request->target;
@@ -302,39 +303,6 @@ const bool kVmessInboundRegistered = [] {
             result.vmess_accounts = std::move(users);
             return result;
         };
-
-    reg.apply_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.vmess_validator) return;
-            deps.vmess_validator->UpdateUsersForTag(
-                std::string(tag), users.vmess_accounts);
-        };
-
-    reg.add_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.vmess_validator) return;
-            deps.vmess_validator->AddUsersForTag(
-                std::string(tag), users.vmess_accounts);
-        };
-
-    reg.remove_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.vmess_validator) return;
-            deps.vmess_validator->RemoveUsersForTag(
-                std::string(tag), users.vmess_accounts);
-        };
-
-    reg.clear_worker_users = [](const acpp::proxyman::inbound::ProtocolDeps& deps, std::string_view tag) {
-        if (deps.vmess_validator) {
-            deps.vmess_validator->UpdateUsersForTag(std::string(tag), {});
-        }
-    };
 
     acpp::proxyman::inbound::RegisterProxy(
         acpp::constants::protocol::kVmess, std::move(reg));

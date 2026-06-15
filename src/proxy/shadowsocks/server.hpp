@@ -10,14 +10,22 @@
 #include <expected>
 #include <memory>
 #include <string_view>
+#include <utility>
 
 namespace acpp::ss {
 
 struct ReadTCPSessionResult {
-    const SsUserInfo* user = nullptr;
+    std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user_ref;
+    const proxyman::inbound::UserStore::ShadowsocksCredential* user = nullptr;
     TargetAddress target;
     InitialPayload initial_payload;
     std::unique_ptr<transport::MultiBufferReader> body_reader;
+
+    void SetUser(
+        std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> value) noexcept {
+        user_ref = std::move(value);
+        user = user_ref.get();
+    }
 };
 
 // xray-core proxy/shadowsocks/server.go 对应的服务器端握手与 body reader/writer 入口。
@@ -29,6 +37,7 @@ ReadTCPSession(AsyncStream& stream,
                size_t& last_matched_index);
 
 [[nodiscard]] std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode>
-WriteTCPResponse(const SsUserInfo& user, AsyncStream& stream);
+WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+                 AsyncStream& stream);
 
 }  // namespace acpp::ss

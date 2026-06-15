@@ -303,7 +303,8 @@ private:
 
 class ResponseBodyWriter final : public transport::MultiBufferWriter {
 public:
-    ResponseBodyWriter(const SsUserInfo& user, AsyncStream& stream)
+    ResponseBodyWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+                       AsyncStream& stream)
         : cipher_type_(user.cipher_type)
         , key_size_(user.key_size)
         , salt_size_(user.salt_size) {
@@ -483,7 +484,9 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     ReadTCPSessionResult result;
     uint8_t len_plain[2]{};
 
-    auto try_user = [&](const SsUserInfo& user, std::array<uint8_t, 64>& read_subkey) -> bool {
+    auto try_user = [&](
+        const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+        std::array<uint8_t, 64>& read_subkey) -> bool {
         if (!DeriveSubkey(user.derived_key.data(), key_size,
                           salt.data(), salt_size,
                           read_subkey.data())) {
@@ -497,12 +500,12 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     std::array<uint8_t, 64> read_subkey{};
     const size_t hint = last_matched_index;
     if (hint < users.size() && try_user(users[hint], read_subkey)) {
-        result.user = &users[hint];
+        result.SetUser(users.Share(users[hint]));
     } else {
         for (size_t i = 0; i < users.size(); ++i) {
             if (i == hint) continue;
             if (try_user(users[i], read_subkey)) {
-                result.user = &users[i];
+                result.SetUser(users.Share(users[i]));
                 last_matched_index = i;
                 break;
             }
@@ -625,7 +628,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
 }
 
 std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCPResponse(
-    const SsUserInfo& user,
+    const proxyman::inbound::UserStore::ShadowsocksCredential& user,
     AsyncStream& stream) {
     try {
         return std::make_unique<ResponseBodyWriter>(user, stream);

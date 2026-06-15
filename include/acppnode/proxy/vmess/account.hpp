@@ -4,9 +4,11 @@
 // account.hpp — VMess MemoryAccount 定义
 //
 // 职责：
-//   - 账户身份数据、预计算密钥、限速字段
+//   - VMess 账户身份数据和预计算密钥
 //   - 仅做冷路径账户构造，不包含验证器或查找逻辑
 // ============================================================================
+
+#include "acppnode/common/user_profile.hpp"
 
 #include <array>
 #include <cstdint>
@@ -29,12 +31,8 @@ struct MemoryAccount {
     std::array<uint8_t, 16> uuid_bytes;
     std::array<uint8_t, 16> cmd_key;
     std::array<uint8_t, 16> auth_key;
-    int64_t                 user_id      = 0;
-    std::string             email;
-    uint64_t                speed_limit  = 0;
-    uint32_t                device_limit = 0;
-
     CachedAESKey cached_auth_aes_key;
+    ::acpp::UserProfile profile;
 
     static std::optional<MemoryAccount> FromUUID(
         const std::string& uuid_str,

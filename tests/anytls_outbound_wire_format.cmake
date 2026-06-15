@@ -8,6 +8,7 @@ file(READ "${PROJECT_SOURCE_DIR}/src/service/controller/userbuilder.cpp" user_bu
 file(READ "${PROJECT_SOURCE_DIR}/src/infra/config.cpp" config_source)
 file(READ "${PROJECT_SOURCE_DIR}/src/app/static_inbound_runtime.cpp" static_runtime_source)
 file(READ "${PROJECT_SOURCE_DIR}/include/acppnode/app/proxyman/inbound/prepared_config.hpp" prepared_config_header)
+file(READ "${PROJECT_SOURCE_DIR}/src/service/controller/control.cpp" controller_source)
 
 foreach(pattern IN ITEMS
     "kCmdWaste[ \t\r\n]*=[ \t\r\n]*0"
@@ -160,12 +161,20 @@ foreach(pattern IN ITEMS
     "padding_scheme_md5_"
     "kCmdUpdatePaddingScheme"
     "transport::Link\\{&reader,[ \t\r\n]*sub\\.get\\(\\)\\}"
-    "anytls_validator->ApplyUsers"
-    "anytls_validator->AddUsers"
-    "anytls_validator->RemoveUsers"
-    "anytls_validator->ClearUsers")
+    "profile")
     if(NOT inbound_source MATCHES "${pattern}")
         message(FATAL_ERROR "AnyTLS inbound must authenticate users and hand a frame stream to dispatcher: ${pattern}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS
+    "UserStore::ApplyUsers"
+    "UserStore::AddUsers"
+    "UserStore::RemoveUsers"
+    "UserStore::ClearUsers")
+    if(NOT static_runtime_source MATCHES "${pattern}" AND
+       NOT controller_source MATCHES "${pattern}")
+        message(FATAL_ERROR "AnyTLS users must be published through the global UserStore: ${pattern}")
     endif()
 endforeach()
 

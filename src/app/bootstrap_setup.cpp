@@ -107,14 +107,6 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(const Config& config) {
     runtime_config.limits = config.GetLimits();
     runtime_config.routing = config.GetRouting();
     runtime_config.static_inbounds = BuildStaticInboundRuntimeEntries(config.GetStaticInbounds());
-    runtime_config.inbound_users.reserve(runtime_config.static_inbounds.size());
-    for (const auto& inbound : runtime_config.static_inbounds) {
-        runtime_config.inbound_users.push_back(InboundUsersRuntimeEntry{
-            inbound.protocol,
-            inbound.tag,
-            inbound.users,
-        });
-    }
     runtime_config.outbounds = config.GetPreparedOutbounds();
     runtime_config.workers = config.GetWorkers();
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);

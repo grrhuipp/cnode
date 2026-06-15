@@ -12,19 +12,12 @@
 
 namespace acpp {
 
-struct InboundUsersRuntimeEntry {
-    std::string protocol;
-    std::string tag;
-    proxyman::inbound::UserSet users;
-};
-
 struct WorkerRuntimeConfig {
     ::acpp::app::dns::Config dns;
     TimeoutsConfig timeouts;
     LimitsConfig limits;
     RoutingConfig routing;
     std::vector<StaticInboundRuntimeEntry> static_inbounds;
-    std::vector<InboundUsersRuntimeEntry> inbound_users;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
     uint32_t workers = 1;
     uint32_t pressure_threshold = 1;

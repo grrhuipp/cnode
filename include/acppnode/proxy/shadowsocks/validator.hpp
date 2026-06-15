@@ -1,11 +1,11 @@
 #pragma once
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/proxy/shadowsocks/user_info.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,10 +17,10 @@ struct OnlineDevice;
 namespace acpp::ss {
 
 // ============================================================================
-// Validator - Shadowsocks Worker 本地用户表
+// Validator - Shadowsocks user validator
 //
 // 对齐 xray-core proxy/shadowsocks/validator.go：
-//   - 按 tag 维护用户快照
+//   - 认证用户读取全局 RCU 快照
 //   - 提供按 tag / user_id 查找
 //   - 承载 Worker 本地在线设备追踪
 // ============================================================================
@@ -39,7 +39,8 @@ public:
     void AddUsersForTag(const std::string& tag, const std::vector<SsUserInfo>& users);
     void RemoveUsersForTag(const std::string& tag, const std::vector<SsUserInfo>& users);
 
-    [[nodiscard]] std::span<const SsUserInfo> FindUsersForTag(std::string_view tag) const;
+    [[nodiscard]] proxyman::inbound::UserStore::ShadowsocksUsersView
+    FindUsersForTag(std::string_view tag) const;
     [[nodiscard]] std::vector<SsUserInfo> GetUsersForTag(std::string_view tag) const;
 
     [[nodiscard]] std::optional<SsUserInfo> FindUserById(std::string_view tag,

@@ -17,13 +17,18 @@ foreach(pattern IN ITEMS
     "struct[ \t\r\n]+WorkerRuntimeConfig;"
     "struct[ \t\r\n]+RoutingConfig;"
     "struct[ \t\r\n]+BuildRequest;"
-    "struct[ \t\r\n]+UserSet;"
     "struct[ \t\r\n]+PreparedOutboundConfig;")
     if(NOT worker_header MATCHES "${pattern}")
         message(FATAL_ERROR
             "worker.hpp should expose runtime/prepared config only through forward declarations: ${pattern}")
     endif()
 endforeach()
+
+if(worker_header MATCHES "struct[ \t\r\n]+UserSet;" OR
+   worker_header MATCHES "InboundUsers")
+    message(FATAL_ERROR
+        "worker.hpp must not expose inbound user sets or inbound-user update APIs")
+endif()
 
 if(NOT worker_cpp MATCHES "app/worker_runtime_config\\.hpp")
     message(FATAL_ERROR

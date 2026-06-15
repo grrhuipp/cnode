@@ -187,7 +187,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         co_return fail(error);
     }
 
-    const ss::SsUserInfo* matched = session_result->user;
+    const auto* matched = session_result->user;
     if (!matched) {
         LOG_CONN_FAIL("[{}] SS auth failed from {}", tag, client_ip);
         if (limiter_ && ban_tracking_enabled_) {
@@ -196,19 +196,20 @@ proxy::shadowsocks::inbound::Handler::Process(
         stats_->OnError();
         co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
+    const auto& profile = *matched->profile;
 
     // ── 6. 填充上下文 ─────────────────────────────────────────────────────────
-    ctx.inbound.user_id = matched->user_id;
-    ctx.inbound.user_email = matched->email;
-    ctx.content.speed_limit = matched->speed_limit;
+    ctx.inbound.user_id = profile.user_id;
+    ctx.inbound.user_email = profile.email;
+    ctx.content.speed_limit = profile.speed_limit;
 
     // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-    int64_t uid = matched->user_id;
-    if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, matched->device_limit)) {
+    int64_t uid = profile.user_id;
+    if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
         LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-            matched->device_limit,
+            profile.device_limit,
             validator_.OnlineDeviceCount(tag, uid));
         co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
     }
@@ -274,14 +275,15 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
         return std::nullopt;
     }
 
-    const ss::SsUserInfo& user = users[decoded->user_index];
+    const auto& user = users[decoded->user_index];
+    const auto& profile = *user.profile;
 
     proxyman::inbound::UdpDecodeResult result;
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
-    result.user_id = user.user_id;
-    result.user_email = user.email;
-    result.speed_limit = user.speed_limit;
+    result.user_id = profile.user_id;
+    result.user_email = profile.email;
+    result.speed_limit = profile.speed_limit;
     result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
         user.derived_key,
         cipher_info_);
@@ -415,12 +417,12 @@ const bool kSsInboundRegistered = [] {
                 }
                 acpp::ss::SsUserInfo info;
                 info.password    = client.password;
-                info.user_id     = synthetic_uid--;
+                info.profile.user_id = synthetic_uid--;
                 info.cipher_type = cipher_info->type;
                 info.key_size    = cipher_info->key_size;
                 info.salt_size   = cipher_info->salt_size;
                 info.derived_key = acpp::ss::DeriveKey(client.password, cipher_info->key_size);
-                info.email       = client.email;
+                info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
 
@@ -428,36 +430,6 @@ const bool kSsInboundRegistered = [] {
             result.ss_users = std::move(users);
             return result;
         };
-
-    reg.apply_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.ss_validator) return;
-            deps.ss_validator->UpdateUsersForTag(std::string(tag), users.ss_users);
-        };
-
-    reg.add_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.ss_validator) return;
-            deps.ss_validator->AddUsersForTag(std::string(tag), users.ss_users);
-        };
-
-    reg.remove_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.ss_validator) return;
-            deps.ss_validator->RemoveUsersForTag(std::string(tag), users.ss_users);
-        };
-
-    reg.clear_worker_users = [](const acpp::proxyman::inbound::ProtocolDeps& deps, std::string_view tag) {
-        if (deps.ss_validator) {
-            deps.ss_validator->UpdateUsersForTag(std::string(tag), {});
-        }
-    };
 
     acpp::proxyman::inbound::RegisterProxy(
         acpp::constants::protocol::kShadowsocks, std::move(reg));

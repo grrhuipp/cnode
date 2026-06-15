@@ -478,7 +478,8 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (!user_manager_.Validate(tag, request->password_hash)) {
+    auto user_info = user_manager_.FindUser(tag, request->password_hash);
+    if (!user_info) {
         LOG_CONN_FAIL("[{}] Trojan auth failed from {} hash={}...{} store_size={} tag_size={}",
                       tag, client_ip,
                       request->password_hash.substr(0, 8),
@@ -491,19 +492,19 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
-    auto user_info = user_manager_.FindUser(tag, request->password_hash);
     uint64_t tracked_uid = 0;
-    if (user_info) {
-        ctx.inbound.user_id = user_info->user_id;
-        ctx.inbound.user_email = user_info->email;
-        ctx.content.speed_limit = user_info->speed_limit;
-        tracked_uid = static_cast<uint64_t>(user_info->user_id);
+    if (user_info->profile) {
+        const auto& profile = *user_info->profile;
+        ctx.inbound.user_id = profile.user_id;
+        ctx.inbound.user_email = profile.email;
+        ctx.content.speed_limit = profile.speed_limit;
+        tracked_uid = static_cast<uint64_t>(profile.user_id);
         if (!user_manager_.CanAcceptDevice(
-                tag, tracked_uid, ctx.inbound.source_ip, user_info->device_limit)) {
+                tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
             LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                user_info->device_limit,
+                profile.device_limit,
                 user_manager_.OnlineDeviceCount(tag, tracked_uid));
             co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
         }
@@ -599,7 +600,7 @@ const bool kTrojanInboundRegistered = [] {
                 }
                 acpp::trojan::TrojanUserInfo info;
                 info.password_hash = acpp::trojan::HashPassword(client.password);
-                info.email = client.email;
+                info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
 
@@ -607,39 +608,6 @@ const bool kTrojanInboundRegistered = [] {
             result.trojan_users = std::move(users);
             return result;
         };
-
-    reg.apply_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.validator) return;
-            deps.validator->UpdateUsersForTag(
-                std::string(tag), users.trojan_users);
-        };
-
-    reg.add_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.validator) return;
-            deps.validator->AddUsersForTag(
-                std::string(tag), users.trojan_users);
-        };
-
-    reg.remove_worker_users =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
-           std::string_view tag,
-           const acpp::proxyman::inbound::UserSet& users) {
-            if (!deps.validator) return;
-            deps.validator->RemoveUsersForTag(
-                std::string(tag), users.trojan_users);
-        };
-
-    reg.clear_worker_users = [](const acpp::proxyman::inbound::ProtocolDeps& deps, std::string_view tag) {
-        if (deps.validator) {
-            deps.validator->UpdateUsersForTag(std::string(tag), {});
-        }
-    };
 
     acpp::proxyman::inbound::RegisterProxy(
         acpp::constants::protocol::kTrojan, std::move(reg));

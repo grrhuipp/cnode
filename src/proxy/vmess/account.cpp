@@ -25,10 +25,10 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
     MemoryAccount account;
     account.uuid = uuid_str;
     account.uuid_bytes = *uuid_bytes;
-    account.user_id = user_id;
-    account.email = email;
-    account.speed_limit = speed_limit;
-    account.device_limit = device_limit;
+    account.profile.user_id = user_id;
+    account.profile.email = email;
+    account.profile.speed_limit = speed_limit;
+    account.profile.device_limit = device_limit;
 
     std::array<uint8_t, 16 + kVmessMagicLen> key_material{};
     std::memcpy(key_material.data(), account.uuid_bytes.data(), account.uuid_bytes.size());

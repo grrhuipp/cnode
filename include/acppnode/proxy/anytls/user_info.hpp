@@ -1,8 +1,9 @@
 #pragma once
 
+#include "acppnode/common/user_profile.hpp"
+
 #include <array>
 #include <cstdint>
-#include <string>
 #include <string_view>
 
 namespace acpp::anytls {
@@ -11,10 +12,7 @@ namespace acpp::anytls {
 
 struct UserInfo {
     std::array<uint8_t, 32> password_hash{};
-    std::string email;
-    uint64_t user_id = 0;
-    uint64_t speed_limit = 0;
-    uint32_t device_limit = 0;
+    ::acpp::UserProfile profile;
 };
 
 }  // namespace acpp::anytls

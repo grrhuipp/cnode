@@ -1,7 +1,10 @@
 #include "acppnode/proxy/vmess/validator.hpp"
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/common/string_hash.hpp"
+#include "acppnode/core/constants.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
 
@@ -13,15 +16,11 @@ namespace acpp {
 namespace vmess {
 
 struct TimedUserValidator::Impl {
-    using UserMap = memory::ThreadLocalUnorderedMap<std::string,
-                                                    MemoryAccount,
-                                                    TransparentStringHash,
-                                                    TransparentStringEq>;
-
     struct alignas(64) HotUserCache {
         static constexpr size_t kMaxEntries = 8192;
         static constexpr int64_t kWindowSeconds = 300;
-        using ActiveList = memory::ThreadLocalList<const MemoryAccount*>;
+        using Credential = proxyman::inbound::UserStore::VmessCredential;
+        using ActiveList = memory::ThreadLocalList<const Credential*>;
 
         struct Entry {
             memory::ThreadLocalString tag;
@@ -29,10 +28,10 @@ struct TimedUserValidator::Impl {
             ActiveList::iterator order_it;
         };
 
-        memory::ThreadLocalUnorderedMap<const MemoryAccount*, Entry> entries;
+        memory::ThreadLocalUnorderedMap<const Credential*, Entry> entries;
         ActiveList active_order;
 
-        void Touch(const MemoryAccount* user, std::string_view tag, int64_t now) {
+        void Touch(const Credential* user, std::string_view tag, int64_t now) {
             auto it = entries.find(user);
             if (it != entries.end()) {
                 it->second.tag.assign(tag.data(), tag.size());
@@ -72,7 +71,7 @@ struct TimedUserValidator::Impl {
             active_order.clear();
         }
 
-        void UpdateTime(const MemoryAccount* user, int64_t now) {
+        void UpdateTime(const Credential* user, int64_t now) {
             auto it = entries.find(user);
             if (it != entries.end()) {
                 it->second.timestamp = now;
@@ -80,11 +79,8 @@ struct TimedUserValidator::Impl {
         }
     };
 
-    memory::ThreadLocalUnorderedMap<std::string,
-                                    UserMap,
-                                    TransparentStringHash,
-                                    TransparentStringEq> users_by_tag;
     mutable HotUserCache hot_cache;
+    mutable std::shared_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
     mutable int64_t last_hot_cache_cleanup = 0;
     UserOnlineTracker stats;
 };
@@ -97,85 +93,51 @@ TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
 TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
 
 void TimedUserValidator::UpdateUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
-    // 获取或创建该 tag 的用户 map
-    auto& tag_users = impl_->users_by_tag[tag];
-    tag_users.reserve(users.size());
-
-    // 构建新用户集合
-    memory::ThreadLocalUnorderedSet<std::string, TransparentStringHash, TransparentStringEq> new_uuids;
-    new_uuids.reserve(users.size());
-    for (const auto& user : users) {
-        new_uuids.insert(user.uuid);
-    }
-
-    // 删除不在新列表中的用户
-    for (auto it = tag_users.begin(); it != tag_users.end(); ) {
-        if (new_uuids.find(it->first) == new_uuids.end()) {
-            it = tag_users.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    // 添加或更新用户
-    for (const auto& user : users) {
-        tag_users[user.uuid] = user;
-    }
-
-    // 清空热点缓存（用户指针可能已失效）
+    proxyman::inbound::UserSet set;
+    set.vmess_accounts = users;
+    proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->hot_users.reset();
 }
 
 void TimedUserValidator::AddUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
-    auto& tag_users = impl_->users_by_tag[tag];
-    tag_users.reserve(tag_users.size() + users.size());
-    for (const auto& user : users) {
-        tag_users[user.uuid] = user;
-    }
+    proxyman::inbound::UserSet set;
+    set.vmess_accounts = users;
+    proxyman::inbound::UserStore::AddUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->hot_users.reset();
 }
 
 void TimedUserValidator::RemoveUsersForTag(const std::string& tag, const std::vector<MemoryAccount>& users) {
-    auto it = impl_->users_by_tag.find(tag);
-    if (it == impl_->users_by_tag.end()) {
-        return;
-    }
-    for (const auto& user : users) {
-        it->second.erase(user.uuid);
-    }
-    if (it->second.empty()) {
-        impl_->users_by_tag.erase(it);
-    }
+    proxyman::inbound::UserSet set;
+    set.vmess_accounts = users;
+    proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->hot_users.reset();
 }
 
 void TimedUserValidator::ClearTag(const std::string& tag) {
-    impl_->users_by_tag.erase(tag);
+    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kVmess, tag);
     impl_->hot_cache.Clear();
+    impl_->hot_users.reset();
 }
 
 void TimedUserValidator::Clear() {
-    impl_->users_by_tag.clear();
+    proxyman::inbound::UserStore::ClearProtocol(constants::protocol::kVmess);
     impl_->hot_cache.Clear();
+    impl_->hot_users.reset();
 }
 
 size_t TimedUserValidator::Size() const {
-    size_t total = 0;
-    for (const auto& [tag, users] : impl_->users_by_tag) {
-        total += users.size();
-    }
-    return total;
+    return proxyman::inbound::UserStore::GetStats().vmess_accounts;
 }
 
 size_t TimedUserValidator::SizeForTag(std::string_view tag) const {
-    auto it = impl_->users_by_tag.find(tag);
-    if (it != impl_->users_by_tag.end()) {
-        return it->second.size();
-    }
-    return 0;
+    return proxyman::inbound::UserStore::SizeForProtocolTag(constants::protocol::kVmess, tag);
 }
 
-const MemoryAccount* TimedUserValidator::FindByAuthIDForTag(
+std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
+TimedUserValidator::FindByAuthIDForTag(
     std::string_view tag,
     const uint8_t* auth_id,
     int64_t& out_timestamp) const {
@@ -183,7 +145,7 @@ const MemoryAccount* TimedUserValidator::FindByAuthIDForTag(
     int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    auto tryUser = [&](const MemoryAccount& user) -> bool {
+    auto tryUser = [&](const proxyman::inbound::UserStore::VmessCredential& user) -> bool {
         std::array<uint8_t, 16> plaintext;
         user.cached_auth_aes_key.ECBDecrypt(auth_id, plaintext.data());
 
@@ -209,13 +171,19 @@ const MemoryAccount* TimedUserValidator::FindByAuthIDForTag(
         return false;
     };
 
+    auto view = proxyman::inbound::UserStore::VmessUsers(tag);
+    if (view.users.get() != impl_->hot_users.get()) {
+        impl_->hot_cache.Clear();
+        impl_->hot_users = view.users;
+    }
+
     if (now - impl_->last_hot_cache_cleanup > 60) {
         impl_->last_hot_cache_cleanup = now;
         impl_->hot_cache.Cleanup(now);
     }
 
     {
-        std::array<const MemoryAccount*, 32> candidates{};
+        std::array<const proxyman::inbound::UserStore::VmessCredential*, 32> candidates{};
         size_t candidate_count = 0;
         for (const auto* user : impl_->hot_cache.active_order) {
             auto it = impl_->hot_cache.entries.find(user);
@@ -233,24 +201,23 @@ const MemoryAccount* TimedUserValidator::FindByAuthIDForTag(
             const auto* user = candidates[i];
             if (tryUser(*user)) {
                 impl_->hot_cache.UpdateTime(user, now);
-                return user;
+                return view.Share(*user);
             }
         }
     }
 
-    auto tag_it = impl_->users_by_tag.find(tag);
-    if (tag_it == impl_->users_by_tag.end()) {
-        return nullptr;
+    if (!view.users) {
+        return {};
     }
 
-    for (const auto& [uuid, user] : tag_it->second) {
+    for (const auto& [uuid, user] : *view.users) {
         if (tryUser(user)) {
             impl_->hot_cache.Touch(&user, tag, now);
-            return &user;
+            return view.Share(user);
         }
     }
 
-    return nullptr;
+    return {};
 }
 
 void TimedUserValidator::OnUserConnected(std::string_view tag,

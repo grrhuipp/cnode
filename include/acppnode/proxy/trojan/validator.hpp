@@ -4,7 +4,7 @@
 // validator.hpp — Trojan 用户管理
 //
 // 职责（协议特有）：
-//   - 用户存储：password_hash → TrojanUserInfo
+//   - 认证：password_hash → 全局 UserStore credential
 //   - 验证：SHA224 哈希比对
 //   - 按 tag 独立管理（面板多入站场景）
 //
@@ -12,6 +12,7 @@
 //   - 在线追踪：OnUserConnected / OnUserDisconnected / GetOnlineDevices 等
 // ============================================================================
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/proxy/trojan/user_info.hpp"
 
 #include <cstdint>
@@ -53,7 +54,8 @@ public:
 
     bool Validate(std::string_view tag, std::string_view hash) const;
 
-    std::optional<TrojanUserInfo> FindUser(std::string_view tag, std::string_view hash) const;
+    std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential>
+    FindUser(std::string_view tag, std::string_view hash) const;
 
     size_t Size() const;
     size_t SizeForTag(std::string_view tag) const;

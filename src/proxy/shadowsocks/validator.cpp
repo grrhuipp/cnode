@@ -1,20 +1,14 @@
 #include "acppnode/proxy/shadowsocks/validator.hpp"
 
-#include "acppnode/common/allocator.hpp"
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/string_hash.hpp"
+#include "acppnode/core/constants.hpp"
 
 #include <algorithm>
-#include <span>
 
 namespace acpp::ss {
 
 struct Validator::Impl {
-    using UserList = memory::ThreadLocalVector<SsUserInfo>;
-    memory::ThreadLocalUnorderedMap<std::string,
-                                    UserList,
-                                    TransparentStringHash,
-                                    TransparentStringEq> users_by_tag;
     UserOnlineTracker stats;
 };
 
@@ -28,88 +22,72 @@ Validator& Validator::operator=(Validator&&) noexcept = default;
 
 void Validator::UpdateUsersForTag(const std::string& tag,
                                   const std::vector<SsUserInfo>& users) {
-    auto& tag_users = impl_->users_by_tag[tag];
-    tag_users.clear();
-    tag_users.reserve(users.size());
-    tag_users.insert(tag_users.end(), users.begin(), users.end());
+    proxyman::inbound::UserSet set;
+    set.ss_users = users;
+    proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
 void Validator::AddUsersForTag(const std::string& tag,
                                const std::vector<SsUserInfo>& users) {
-    auto& tag_users = impl_->users_by_tag[tag];
-    tag_users.reserve(tag_users.size() + users.size());
-
-    auto same_identity = [](const SsUserInfo& a, const SsUserInfo& b) {
-        if (a.user_id != 0 && b.user_id != 0) {
-            return a.user_id == b.user_id;
-        }
-        return a.password == b.password;
-    };
-
-    for (const auto& user : users) {
-        auto it = std::find_if(tag_users.begin(), tag_users.end(),
-            [&](const SsUserInfo& existing) { return same_identity(existing, user); });
-        if (it != tag_users.end()) {
-            *it = user;
-        } else {
-            tag_users.push_back(user);
-        }
-    }
+    proxyman::inbound::UserSet set;
+    set.ss_users = users;
+    proxyman::inbound::UserStore::AddUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
 void Validator::RemoveUsersForTag(const std::string& tag,
                                   const std::vector<SsUserInfo>& users) {
-    auto it = impl_->users_by_tag.find(tag);
-    if (it == impl_->users_by_tag.end()) {
-        return;
-    }
-
-    auto& tag_users = it->second;
-    auto should_remove = [&](const SsUserInfo& existing) {
-        return std::any_of(users.begin(), users.end(), [&](const SsUserInfo& user) {
-            if (existing.user_id != 0 && user.user_id != 0) {
-                return existing.user_id == user.user_id;
-            }
-            return existing.password == user.password;
-        });
-    };
-
-    tag_users.erase(
-        std::remove_if(tag_users.begin(), tag_users.end(), should_remove),
-        tag_users.end());
-    if (tag_users.empty()) {
-        impl_->users_by_tag.erase(it);
-    }
+    proxyman::inbound::UserSet set;
+    set.ss_users = users;
+    proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
-std::span<const SsUserInfo> Validator::FindUsersForTag(std::string_view tag) const {
-    auto it = impl_->users_by_tag.find(tag);
-    if (it == impl_->users_by_tag.end()) {
-        return {};
-    }
-    return std::span<const SsUserInfo>(it->second.data(), it->second.size());
+proxyman::inbound::UserStore::ShadowsocksUsersView
+Validator::FindUsersForTag(std::string_view tag) const {
+    return proxyman::inbound::UserStore::ShadowsocksUsers(tag);
 }
 
 std::vector<SsUserInfo> Validator::GetUsersForTag(std::string_view tag) const {
     const auto users = FindUsersForTag(tag);
-    return std::vector<SsUserInfo>(users.begin(), users.end());
+    if (!users.users) {
+        return {};
+    }
+    std::vector<SsUserInfo> result;
+    result.reserve(users.users->size());
+    for (const auto& credential : *users.users) {
+        SsUserInfo user;
+        user.password = credential.password;
+        user.derived_key = credential.derived_key;
+        user.cipher_type = credential.cipher_type;
+        user.key_size = credential.key_size;
+        user.salt_size = credential.salt_size;
+        if (credential.profile) {
+            user.profile = *credential.profile;
+        }
+        result.push_back(std::move(user));
+    }
+    return result;
 }
 
 std::optional<SsUserInfo> Validator::FindUserById(std::string_view tag,
                                                    int64_t user_id) const {
-    const auto tag_users = FindUsersForTag(tag);
-    for (const auto& user : tag_users)
-        if (user.user_id == user_id) return user;
-    return std::nullopt;
+    auto credential = proxyman::inbound::UserStore::FindShadowsocksUserById(tag, user_id);
+    if (!credential) {
+        return std::nullopt;
+    }
+    SsUserInfo user;
+    user.password = credential->password;
+    user.derived_key = credential->derived_key;
+    user.cipher_type = credential->cipher_type;
+    user.key_size = credential->key_size;
+    user.salt_size = credential->salt_size;
+    if (credential->profile) {
+        user.profile = *credential->profile;
+    }
+    return user;
 }
 
 size_t Validator::Size() const {
-    size_t total = 0;
-    for (const auto& [tag, users] : impl_->users_by_tag) {
-        (void)tag;
-        total += users.size();
-    }
-    return total;
+    return proxyman::inbound::UserStore::GetStats().shadowsocks_users;
 }
 
 void Validator::OnUserConnected(std::string_view tag,

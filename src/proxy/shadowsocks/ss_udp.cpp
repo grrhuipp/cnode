@@ -145,7 +145,7 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
 std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
     size_t                       datagram_len,
-    std::span<const SsUserInfo>  users,
+    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size)

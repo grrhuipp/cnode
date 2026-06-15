@@ -1,12 +1,13 @@
 #pragma once
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/proxy/anytls/user_info.hpp"
 
 #include <array>
-#include <optional>
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace acpp::anytls {
@@ -18,19 +19,13 @@ public:
     void RemoveUsers(std::string_view tag, const std::vector<UserInfo>& users);
     void ClearUsers(std::string_view tag);
 
-    [[nodiscard]] std::optional<UserInfo> Validate(
+    [[nodiscard]] std::shared_ptr<const proxyman::inbound::UserStore::AnyTlsCredential> Validate(
         std::string_view tag,
         const std::array<uint8_t, 32>& password_hash) const;
 
     [[nodiscard]] size_t Size() const noexcept;
 
 private:
-    struct Hash {
-        size_t operator()(const std::array<uint8_t, 32>& value) const noexcept;
-    };
-
-    using UserMap = std::unordered_map<std::array<uint8_t, 32>, UserInfo, Hash>;
-    std::unordered_map<std::string, UserMap> users_;
 };
 
 }  // namespace acpp::anytls
