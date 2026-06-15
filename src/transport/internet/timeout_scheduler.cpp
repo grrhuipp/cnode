@@ -1,6 +1,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/common/allocator.hpp"
 
+#include <algorithm>
 #include <asio/steady_timer.hpp>
 #include <mutex>
 #include <unordered_map>
@@ -16,28 +17,61 @@ struct TimeoutScheduler::Impl {
         Callback cb;
     };
 
+    struct HeapEntry {
+        std::chrono::steady_clock::time_point deadline;
+        uint64_t id = 0;
+    };
+
+    struct HeapCompare {
+        bool operator()(const HeapEntry& lhs, const HeapEntry& rhs) const noexcept {
+            if (lhs.deadline == rhs.deadline) {
+                return lhs.id > rhs.id;
+            }
+            return lhs.deadline > rhs.deadline;
+        }
+    };
+
     net::steady_timer timer;
     using TimeoutEventMap = memory::ThreadLocalUnorderedMap<uint64_t, Event>;
 
     TimeoutEventMap events;
+    memory::ThreadLocalVector<HeapEntry> deadline_heap;
     memory::ThreadLocalVector<Callback> ready_callbacks;
     uint64_t next_id = 1;
     uint64_t timer_generation = 0;
     bool timer_armed = false;
     std::chrono::steady_clock::time_point armed_deadline{};
 
+    void PushHeap(HeapEntry entry) {
+        deadline_heap.push_back(entry);
+        std::push_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
+    }
+
+    HeapEntry PopHeap() {
+        std::pop_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
+        auto entry = deadline_heap.back();
+        deadline_heap.pop_back();
+        return entry;
+    }
+
+    void PruneHeapTop() {
+        while (!deadline_heap.empty()) {
+            const auto& top = deadline_heap.front();
+            auto it = events.find(top.id);
+            if (it != events.end() && it->second.deadline == top.deadline) {
+                return;
+            }
+            (void)PopHeap();
+        }
+    }
+
     void ArmTimer() {
-        if (events.empty()) {
+        PruneHeapTop();
+        if (deadline_heap.empty()) {
             return;
         }
 
-        auto next_deadline = events.begin()->second.deadline;
-        for (const auto& [id, event] : events) {
-            (void)id;
-            if (event.deadline < next_deadline) {
-                next_deadline = event.deadline;
-            }
-        }
+        const auto next_deadline = deadline_heap.front().deadline;
 
         if (timer_armed && next_deadline >= armed_deadline) {
             return;
@@ -63,14 +97,19 @@ struct TimeoutScheduler::Impl {
         ready.clear();
 
         const auto now = std::chrono::steady_clock::now();
-        for (auto it = events.begin(); it != events.end();) {
-            if (it->second.deadline > now) {
-                ++it;
-                continue;
+        while (true) {
+            PruneHeapTop();
+            if (deadline_heap.empty() || deadline_heap.front().deadline > now) {
+                break;
             }
 
+            const auto entry = PopHeap();
+            auto it = events.find(entry.id);
+            if (it == events.end() || it->second.deadline != entry.deadline) {
+                continue;
+            }
             ready.push_back(std::move(it->second.cb));
-            it = events.erase(it);
+            events.erase(it);
         }
 
         for (auto& cb : ready) {
@@ -154,7 +193,8 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
     token.id = impl_->next_id++;
     const auto deadline = std::chrono::steady_clock::now() + delay;
 
-    impl_->events.insert_or_assign(token.id, Impl::Event{deadline, std::move(cb)});
+    impl_->events.emplace(token.id, Impl::Event{deadline, std::move(cb)});
+    impl_->PushHeap(Impl::HeapEntry{deadline, token.id});
     impl_->ArmTimer();
 
     return token;
