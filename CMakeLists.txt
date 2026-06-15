@@ -73,13 +73,8 @@ if(CNODE_HEAPTRACK_BUILD)
     )
 endif()
 
-option(USE_MIMALLOC "Use mimalloc as default memory allocator" ON)
 option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
 
-if(CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC)
-    message(STATUS "heaptrack/glibc variant: forcing system allocator (mimalloc disabled)")
-    set(USE_MIMALLOC OFF CACHE BOOL "Use mimalloc as default memory allocator" FORCE)
-endif()
 
 # ============================================================================
 # 依赖（FetchContent）
@@ -154,24 +149,7 @@ add_library(cnode_zlib STATIC
 target_include_directories(cnode_zlib PUBLIC ${zlib_SOURCE_DIR})
 
 find_package(Threads REQUIRED)
-
-if(USE_MIMALLOC)
-    set(MI_BUILD_SHARED OFF CACHE BOOL "Disable mimalloc shared library" FORCE)
-    set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc static library" FORCE)
-    set(MI_BUILD_OBJECT OFF CACHE BOOL "Disable mimalloc object library" FORCE)
-    set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests" FORCE)
-    FetchContent_Declare(
-        mimalloc
-        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
-        GIT_TAG v3.2.8
-    )
-    FetchContent_MakeAvailable(mimalloc)
-    set(HAS_MIMALLOC TRUE)
-    message(STATUS "Using mimalloc via FetchContent")
-else()
-    set(HAS_MIMALLOC FALSE)
-    message(STATUS "mimalloc: DISABLED (using system allocator)")
-endif()
+message(STATUS "Allocator: system")
 
 # ============================================================================
 # 源文件收集
@@ -312,11 +290,6 @@ target_include_directories(cnode PRIVATE
     ${concurrentqueue_SOURCE_DIR}
 )
 
-if(HAS_MIMALLOC)
-    target_link_libraries(cnode PRIVATE mimalloc-static)
-    target_compile_definitions(cnode PRIVATE USE_MIMALLOC)
-    message(STATUS "Linking mimalloc-static for malloc override")
-endif()
 
 target_link_libraries(cnode PRIVATE
     asio::asio
@@ -1511,10 +1484,10 @@ add_test(
 )
 
 add_test(
-    NAME no_lazy_mimalloc_pool_shrink
+    NAME no_external_allocator_dependency
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_lazy_mimalloc_pool_shrink.cmake
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_external_allocator_dependency.cmake
 )
 
 add_test(
@@ -1605,11 +1578,7 @@ if(WIN32)
 else()
     message(STATUS "  I/O Backend:  epoll")
 endif()
-if(HAS_MIMALLOC)
-    message(STATUS "  Allocator:    mimalloc")
-else()
-    message(STATUS "  Allocator:    system")
-endif()
+message(STATUS "  Allocator:    system")
 message(STATUS "  MemoryStats:  ${CNODE_MEMORY_STATS}")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION OR CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE)
     message(STATUS "  LTO:          enabled")

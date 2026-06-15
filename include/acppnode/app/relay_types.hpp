@@ -12,8 +12,7 @@ namespace acpp {
 // Relay 配置
 //
 // Buffer 管理已移至 buf::MultiBuffer（multi_buffer.hpp）：
-//   - relay 数据面固定 8KB Buffer，交给当前构建选择的 allocator 管理
-//   - mimalloc release 走 Worker thread-local heap；glibc 诊断版走 system allocator
+//   - relay 数据面固定 8KB Buffer，交给 system allocator 管理
 //   - 小对象和短生命周期 scratch 走 allocator 的合适尺寸桶，用完归还/收缩
 //   - 不再需要协议私有 pool / buffer_size / upload_hint / download_hint
 // ============================================================================

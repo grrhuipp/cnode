@@ -50,11 +50,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
 
     LOG_CONSOLE("╔═══════════════════════════════════════════════════════════╗");
     LOG_CONSOLE("║              acppnode v1.0.0 - VMess Proxy                ║");
-#ifdef USE_MIMALLOC
-    LOG_CONSOLE("║     C++23 / standalone Asio / SO_REUSEPORT / mimalloc     ║");
-#else
     LOG_CONSOLE("║  C++23 / standalone Asio / SO_REUSEPORT / system malloc   ║");
-#endif
     LOG_CONSOLE("╚═══════════════════════════════════════════════════════════╝");
     LOG_CONSOLE("");
     LOG_CONSOLE("Configuration:");
@@ -67,11 +63,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("  I/O backend:    epoll (Linux)");
 #endif
     LOG_CONSOLE("  Accept model:   SO_REUSEPORT per-worker");
-#ifdef USE_MIMALLOC
-    LOG_CONSOLE("  Allocator:      mimalloc");
-#else
     LOG_CONSOLE("  Allocator:      system");
-#endif
 
     if (!config.Validate()) {
         std::cerr << "Invalid configuration\n";

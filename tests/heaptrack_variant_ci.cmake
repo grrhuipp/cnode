@@ -8,9 +8,7 @@ endif()
 foreach(pattern IN ITEMS
         "option\\(CNODE_HEAPTRACK_BUILD"
         "CNODE_HEAPTRACK_BUILD requires a glibc toolchain, not musl"
-        "CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC"
-        "set\\(USE_MIMALLOC OFF CACHE BOOL"
-        "FORCE\\)"
+        "heaptrack variant: glibc/system allocator build"
         "set\\(BUILD_CHANNEL \"heaptrack\"\\)")
     if(NOT cmake_source MATCHES "${pattern}")
         message(FATAL_ERROR "CMake heaptrack variant guard is missing: ${pattern}")
@@ -33,7 +31,6 @@ foreach(pattern IN ITEMS
         "runs-on: ubuntu-24.04"
         "perl nasm"
         "-DCNODE_HEAPTRACK_BUILD=ON"
-        "-DUSE_MIMALLOC=OFF"
         "name: cnode-glibc-assets"
         "cnode-linux-amd64-glibc")
     if(NOT glibc_job MATCHES "${pattern}")
@@ -45,6 +42,7 @@ foreach(pattern IN ITEMS
         "container:"
         "image: alpine"
         "-DCMAKE_EXE_LINKER_FLAGS=\"-static\""
+        "USE_MIMALLOC"
         "scripts/build-heaptrack.sh")
     if(glibc_job MATCHES "${pattern}")
         message(FATAL_ERROR "CI glibc heaptrack job must not use musl/static/script settings: ${pattern}")
@@ -59,10 +57,15 @@ math(EXPR musl_len "${glibc_pos} - ${musl_pos}")
 string(SUBSTRING "${ci_workflow}" ${musl_pos} ${musl_len} musl_job)
 foreach(pattern IN ITEMS
         "image: alpine"
-        "-DUSE_MIMALLOC=ON"
         "-DCMAKE_EXE_LINKER_FLAGS=\"-static\""
         "cnode-linux-amd64-musl")
     if(NOT musl_job MATCHES "${pattern}")
-        message(FATAL_ERROR "CI musl job must keep the static mimalloc release variant: ${pattern}")
+        message(FATAL_ERROR "CI musl job must keep the static system-allocator release variant: ${pattern}")
+    endif()
+endforeach()
+
+foreach(pattern IN ITEMS "USE_MIMALLOC" "mimalloc")
+    if(cmake_source MATCHES "${pattern}" OR ci_workflow MATCHES "${pattern}")
+        message(FATAL_ERROR "mimalloc must not reappear in CMake/CI: ${pattern}")
     endif()
 endforeach()

@@ -18,8 +18,8 @@ namespace acpp::buf {
 //
 // 设计原则：
 //   - relay 数据面固定 8KB，与 Xray 保持一致，消除转发循环里的多档大小选择
-//   - mimalloc release 使用 Worker thread-local heap；glibc 诊断版使用 system allocator
-//   - 握手、小对象和短 scratch 不占用 relay Buffer，走当前 allocator 的合适尺寸桶
+//   - 所有 release/诊断构建都使用 system allocator
+//   - 握手、小对象和短 scratch 不占用 relay Buffer，走 allocator 的合适尺寸桶
 //   - start/end 游标：Advance() 消费数据无需 memmove，Produce() 记录写入量
 //   - New()/Free() 直接走 allocator 原语，避免每次分配都把整块 8KB 清零
 // ============================================================================

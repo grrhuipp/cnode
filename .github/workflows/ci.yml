@@ -31,7 +31,7 @@ env:
 
 jobs:
   build-musl:
-    name: Release (musl static mimalloc)
+    name: Release (musl static system allocator)
     runs-on: ubuntu-24.04
     container:
       image: alpine:3.20
@@ -59,7 +59,6 @@ jobs:
           cmake -B build-musl -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
-            -DUSE_MIMALLOC=ON \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ env.BUILD_ID }}
@@ -124,7 +123,6 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCNODE_HEAPTRACK_BUILD=ON \
-            -DUSE_MIMALLOC=OFF \
             -DBUILD_ID=${{ env.BUILD_ID }}
           cmake --build build-heaptrack --parallel $(nproc)
           build-heaptrack/cnode -v
@@ -184,7 +182,7 @@ jobs:
           branch: ${{ github.ref_name }}
           build_id: ${{ env.BUILD_ID }}
           commit: ${{ github.sha }}
-          variants: musl+mimalloc, glibc+system-allocator
+          variants: musl+system-allocator, glibc+system-allocator
           EOF
 
           tag_ref="tags/${{ env.RELEASE_TAG }}"

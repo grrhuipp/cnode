@@ -13,7 +13,7 @@
 - **路由** — 兼容 Xray 配置格式，geoip / geosite 规则，域名/IP/端口/协议/用户条件匹配
 - **嗅探** — TLS SNI + HTTP Host 自动嗅探
 - **密码学** — AWS-LC（BoringSSL 分支），AEAD、SHAKE128 XOF
-- **内存分配** — mimalloc 高性能分配器
+- **内存分配** — system allocator，glibc 构建启用 RSS retention 抑制
 - **部署** — 一键脚本 / systemd，自动版本检测增量更新
 
 ## 架构
@@ -212,7 +212,7 @@ cmake --build build
 
 | 资产 | 用途 |
 |------|------|
-| `cnode-linux-amd64-musl` | 线上默认版本，musl 静态二进制，启用 mimalloc |
+| `cnode-linux-amd64-musl` | 线上默认版本，musl 静态二进制，system allocator |
 | `cnode-linux-amd64` | 兼容部署脚本的默认资产，内容同 musl 版本 |
 | `cnode-linux-amd64-glibc` | heaptrack/RSS 分析版本，glibc + system allocator，第三方依赖静态链接 |
 
@@ -224,5 +224,4 @@ VPS 上只拉取 CI/release 产物运行分析，不在 VPS 上编译。
 |-----|------|
 | standalone Asio | 异步 I/O |
 | AWS-LC | 密码学（AES-GCM, ChaCha20-Poly1305, SHAKE128, EC P-256） |
-| mimalloc | 高性能内存分配 |
 | zlib | CRC32 |

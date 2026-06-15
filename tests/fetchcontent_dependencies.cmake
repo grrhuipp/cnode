@@ -31,8 +31,6 @@ foreach(pattern IN ITEMS
         "FetchContent_Declare\\([ \t\r\n]*concurrentqueue"
         "GIT_REPOSITORY https://github\\.com/cameron314/concurrentqueue\\.git"
         "GIT_TAG v1\\.0\\.5"
-        "FetchContent_Declare\\([ \t\r\n]*mimalloc"
-        "GIT_REPOSITORY https://github\\.com/microsoft/mimalloc\\.git"
         "CNODE_AWSLC_NO_ASM"
         "Using AWS-LC via FetchContent"
         "Using moodycamel ConcurrentQueue via FetchContent")
@@ -47,10 +45,15 @@ foreach(pattern IN ITEMS
         "OpenSSL::Crypto"
         "find_package\\(asio"
         "find_package\\(ZLIB"
-        "find_package\\(concurrentqueue"
-        "find_package\\(mimalloc")
+        "find_package\\(concurrentqueue")
     if(cmake_source MATCHES "${pattern}")
-        message(FATAL_ERROR "CMake must not use package-manager OpenSSL/asio/zlib/mimalloc lookups: ${pattern}")
+        message(FATAL_ERROR "CMake must not use package-manager OpenSSL/asio/zlib/concurrentqueue lookups: ${pattern}")
+    endif()
+endforeach()
+
+foreach(content_name IN ITEMS cmake_source ci_workflow readme)
+    if("${${content_name}}" MATCHES "[Mm][Ii][Mm][Aa][Ll][Ll][Oo][Cc]")
+        message(FATAL_ERROR "mimalloc dependency must not reappear: ${content_name}")
     endif()
 endforeach()
 
