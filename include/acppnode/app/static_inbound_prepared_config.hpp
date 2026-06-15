@@ -18,7 +18,7 @@ struct StaticInboundRuntimeEntry {
     std::string listen;
     StreamSettings stream_settings;
     SniffConfig sniffing;
-    std::string outbound_tag;
+    bool routing_enabled = false;
     proxyman::inbound::BuildRequest build_request;
 };
 

@@ -22,7 +22,7 @@ std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
     entry.listen = source.listen;
     entry.stream_settings = source.stream_settings;
     entry.sniffing = source.sniffing;
-    entry.outbound_tag = source.outbound_tag;
+    entry.routing_enabled = source.routing_enabled;
 
     if (!proxyman::inbound::HasProxy(entry.protocol)) {
         LOG_WARN("Static inbound '{}': unsupported protocol '{}', skipped",

@@ -63,7 +63,7 @@ struct StaticInboundConfig {
     StaticUserConfig static_users;
     StreamSettings stream_settings;
     SniffConfig sniffing;
-    std::string outbound_tag;
+    bool routing_enabled = false;
 
     static StaticInboundConfig FromJson(const json::object& j);
 };

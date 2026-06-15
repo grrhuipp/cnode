@@ -42,6 +42,11 @@ std::vector<std::string> SetupStaticInbounds(
             }
             handler->SetBanTrackingEnabled(true);
 
+            auto route_policy = inbound.routing_enabled
+                ? proxyman::inbound::RoutePolicy::RouteWithFallback(
+                      std::string(constants::protocol::kDirect))
+                : proxyman::inbound::RoutePolicy::Fixed(
+                      std::string(constants::protocol::kDirect));
             auto receiver = proxyman::inbound::MakeReceiverSettings(
                 inbound.tag,
                 inbound.all_tags,
@@ -50,7 +55,7 @@ std::vector<std::string> SetupStaticInbounds(
                 inbound.sniffing,
                 connection_limiter,
                 ProxyProtocolMode::Auto,
-                proxyman::inbound::RoutePolicy::Fixed(inbound.outbound_tag));
+                std::move(route_policy));
             worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
         }
 

@@ -499,10 +499,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     };
     parse_sniffing("sniffing");
 
-    if (j.contains("outbound") && j.at("outbound").is_string())
-        cfg.outbound_tag = std::string(j.at("outbound").as_string());
-    else if (j.contains("outboundTag") && j.at("outboundTag").is_string())
-        cfg.outbound_tag = std::string(j.at("outboundTag").as_string());
+    cfg.routing_enabled = jbool(j, "routingEnabled", cfg.routing_enabled);
 
     return cfg;
 }
