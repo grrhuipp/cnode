@@ -13,13 +13,16 @@ option(CNODE_AWSLC_NO_ASM "Disable AWS-LC assembly for local toolchains without 
 option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
+option(CNODE_MIMALLOC_MUSL "Use mimalloc for global C++ new/delete in musl builds" ON)
 set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
 
 if(CNODE_IO_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "CNODE_IO_URING is only supported on Linux")
 endif()
 
-if(CNODE_HEAPTRACK_BUILD)
+set(CNODE_COMPILER_MACHINE "")
+set(CNODE_TARGET_IS_MUSL OFF)
+if(UNIX AND NOT APPLE)
     execute_process(
         COMMAND ${CMAKE_CXX_COMPILER} -dumpmachine
         OUTPUT_VARIABLE CNODE_COMPILER_MACHINE
@@ -28,6 +31,17 @@ if(CNODE_HEAPTRACK_BUILD)
     )
     if(CNODE_COMPILER_MACHINE MATCHES "musl" OR
        CMAKE_CXX_COMPILER MATCHES "musl")
+        set(CNODE_TARGET_IS_MUSL ON)
+    endif()
+endif()
+
+set(CNODE_USE_MIMALLOC OFF)
+if(CNODE_MIMALLOC_MUSL AND CNODE_TARGET_IS_MUSL AND NOT CNODE_HEAPTRACK_BUILD)
+    set(CNODE_USE_MIMALLOC ON)
+endif()
+
+if(CNODE_HEAPTRACK_BUILD)
+    if(CNODE_TARGET_IS_MUSL)
         message(FATAL_ERROR "CNODE_HEAPTRACK_BUILD requires a glibc toolchain, not musl")
     endif()
     message(STATUS "heaptrack variant: glibc/system allocator build")
@@ -180,6 +194,25 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(concurrentqueue)
 message(STATUS "Using moodycamel ConcurrentQueue via FetchContent")
 
+if(CNODE_USE_MIMALLOC)
+    set(MI_OVERRIDE ON CACHE BOOL "Override malloc/free so C++ new/delete reaches mimalloc through libstdc++" FORCE)
+    set(MI_LIBC_MUSL ON CACHE BOOL "Build mimalloc for musl libc" FORCE)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "Disable mimalloc shared library" FORCE)
+    set(MI_BUILD_STATIC ON CACHE BOOL "Build mimalloc static library" FORCE)
+    set(MI_BUILD_OBJECT OFF CACHE BOOL "Disable mimalloc object library" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "Disable mimalloc tests" FORCE)
+    FetchContent_Declare(
+        mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG v2.1.7
+    )
+    FetchContent_MakeAvailable(mimalloc)
+    if(NOT TARGET mimalloc-static)
+        message(FATAL_ERROR "mimalloc-static target is required for CNODE_USE_MIMALLOC")
+    endif()
+    message(STATUS "Using mimalloc MI_OVERRIDE on musl")
+endif()
+
 add_library(cnode_zlib STATIC
     ${zlib_SOURCE_DIR}/adler32.c
     ${zlib_SOURCE_DIR}/compress.c
@@ -203,7 +236,12 @@ if(UNIX)
 endif()
 
 find_package(Threads REQUIRED)
-message(STATUS "Allocator: system")
+if(CNODE_USE_MIMALLOC)
+    set(CNODE_ALLOCATOR_SUMMARY "mimalloc (MI_OVERRIDE)")
+else()
+    set(CNODE_ALLOCATOR_SUMMARY "system")
+endif()
+message(STATUS "Allocator: ${CNODE_ALLOCATOR_SUMMARY}")
 
 # ============================================================================
 # 源文件收集
@@ -354,6 +392,10 @@ target_link_libraries(cnode PRIVATE
     cnode_zlib
 )
 
+if(CNODE_USE_MIMALLOC)
+    target_link_libraries(cnode PRIVATE mimalloc-static)
+endif()
+
 if(CNODE_IO_URING)
     target_compile_definitions(cnode PRIVATE CNODE_IO_URING_ENABLED)
     add_dependencies(cnode cnode_liburing_static)
@@ -461,7 +503,7 @@ message(STATUS "  I/O Backend:  ${CNODE_IO_BACKEND_SUMMARY}")
 if(CNODE_IO_URING)
     message(STATUS "  liburing:     ${CNODE_LIBURING_TAG} (FetchContent, static)")
 endif()
-message(STATUS "  Allocator:    system")
+message(STATUS "  Allocator:    ${CNODE_ALLOCATOR_SUMMARY}")
 message(STATUS "  MemoryStats:  ${CNODE_MEMORY_STATS}")
 message(STATUS "  DebugSymbols: ${CNODE_RELEASE_DEBUG_SYMBOLS}")
 message(STATUS "  FramePointer: ${CNODE_RELEASE_FRAME_POINTERS}")
