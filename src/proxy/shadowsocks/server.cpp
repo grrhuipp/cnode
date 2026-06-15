@@ -46,6 +46,19 @@ net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
     return nonce;
 }
 
+SsCipherType ToSsCipher(proxyman::inbound::PreparedAeadCipher type) {
+    using Prepared = proxyman::inbound::PreparedAeadCipher;
+    switch (type) {
+        case Prepared::AES_128_GCM:
+            return SsCipherType::AES_128_GCM;
+        case Prepared::AES_256_GCM:
+            return SsCipherType::AES_256_GCM;
+        case Prepared::CHACHA20_POLY1305:
+            return SsCipherType::CHACHA20_POLY1305;
+    }
+    return SsCipherType::AES_256_GCM;
+}
+
 class SsAeadStreamDecryptor {
 public:
     explicit SsAeadStreamDecryptor(const SsAeadCipher& cipher)
@@ -305,7 +318,7 @@ class ResponseBodyWriter final : public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
                        AsyncStream& stream)
-        : cipher_type_(user.cipher_type)
+        : cipher_type_(ToSsCipher(user.cipher_type))
         , key_size_(user.key_size)
         , salt_size_(user.salt_size) {
         if (user.derived_key.size <= master_key_.size()) {

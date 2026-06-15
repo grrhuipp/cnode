@@ -74,7 +74,7 @@ std::shared_ptr<const UserStore::Profile> ShareProfile(const ::acpp::UserProfile
 }
 
 UserStore::VmessCredential
-BuildVmessCredential(const ::acpp::vmess::MemoryAccount& user) {
+BuildVmessCredential(const PreparedVmessUser& user) {
     return UserStore::VmessCredential{
         .uuid = user.uuid,
         .uuid_bytes = user.uuid_bytes,
@@ -86,7 +86,7 @@ BuildVmessCredential(const ::acpp::vmess::MemoryAccount& user) {
 }
 
 std::shared_ptr<const UserStore::VmessUserMap>
-BuildVmessUsers(const std::vector<::acpp::vmess::MemoryAccount>& users) {
+BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
     auto map = std::make_shared<UserStore::VmessUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
@@ -96,7 +96,7 @@ BuildVmessUsers(const std::vector<::acpp::vmess::MemoryAccount>& users) {
 }
 
 UserStore::TrojanCredential
-BuildTrojanCredential(const ::acpp::trojan::TrojanUserInfo& user) {
+BuildTrojanCredential(const PreparedTrojanUser& user) {
     return UserStore::TrojanCredential{
         .password_hash = user.password_hash,
         .profile = ShareProfile(user.profile),
@@ -104,7 +104,7 @@ BuildTrojanCredential(const ::acpp::trojan::TrojanUserInfo& user) {
 }
 
 std::shared_ptr<const UserStore::TrojanUserMap>
-BuildTrojanUsers(const std::vector<::acpp::trojan::TrojanUserInfo>& users) {
+BuildTrojanUsers(const std::vector<PreparedTrojanUser>& users) {
     auto map = std::make_shared<UserStore::TrojanUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
@@ -114,7 +114,7 @@ BuildTrojanUsers(const std::vector<::acpp::trojan::TrojanUserInfo>& users) {
 }
 
 UserStore::ShadowsocksCredential
-BuildShadowsocksCredential(const ::acpp::ss::SsUserInfo& user) {
+BuildShadowsocksCredential(const PreparedShadowsocksUser& user) {
     return UserStore::ShadowsocksCredential{
         .password = user.password,
         .derived_key = user.derived_key,
@@ -126,7 +126,7 @@ BuildShadowsocksCredential(const ::acpp::ss::SsUserInfo& user) {
 }
 
 std::shared_ptr<const UserStore::ShadowsocksUserList>
-BuildShadowsocksUsers(const std::vector<::acpp::ss::SsUserInfo>& users) {
+BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
     auto list = std::make_shared<UserStore::ShadowsocksUserList>();
     list->reserve(users.size());
     for (const auto& user : users) {
@@ -136,7 +136,7 @@ BuildShadowsocksUsers(const std::vector<::acpp::ss::SsUserInfo>& users) {
 }
 
 UserStore::AnyTlsCredential
-BuildAnyTlsCredential(const ::acpp::anytls::UserInfo& user) {
+BuildAnyTlsCredential(const PreparedAnyTlsUser& user) {
     return UserStore::AnyTlsCredential{
         .password_hash = user.password_hash,
         .profile = ShareProfile(user.profile),
@@ -144,7 +144,7 @@ BuildAnyTlsCredential(const ::acpp::anytls::UserInfo& user) {
 }
 
 std::shared_ptr<const UserStore::AnyTlsUserMap>
-BuildAnyTlsUsers(const std::vector<::acpp::anytls::UserInfo>& users) {
+BuildAnyTlsUsers(const std::vector<PreparedAnyTlsUser>& users) {
     auto map = std::make_shared<UserStore::AnyTlsUserMap>();
     map->reserve(users.size());
     for (const auto& user : users) {
@@ -168,7 +168,7 @@ size_t TagSize(const TagMap& map, std::string_view tag) {
     return it == map.end() || !it->second ? 0 : it->second->size();
 }
 
-bool SameShadowsocksIdentity(const ::acpp::ss::SsUserInfo& a,
+bool SameShadowsocksIdentity(const PreparedShadowsocksUser& a,
                              const UserStore::ShadowsocksCredential& b) noexcept {
     if (a.profile.user_id != 0 && b.profile && b.profile->user_id != 0) {
         return a.profile.user_id == b.profile->user_id;
@@ -177,7 +177,7 @@ bool SameShadowsocksIdentity(const ::acpp::ss::SsUserInfo& a,
 }
 
 bool SameShadowsocksIdentity(const UserStore::ShadowsocksCredential& a,
-                             const ::acpp::ss::SsUserInfo& b) noexcept {
+                             const PreparedShadowsocksUser& b) noexcept {
     if (a.profile && a.profile->user_id != 0 && b.profile.user_id != 0) {
         return a.profile->user_id == b.profile.user_id;
     }

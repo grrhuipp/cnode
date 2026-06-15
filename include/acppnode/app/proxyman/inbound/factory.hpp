@@ -16,19 +16,6 @@ class Inbound;
 struct StaticUserConfig;
 struct StatsShard;
 
-namespace vmess {
-class TimedUserValidator;
-}
-namespace trojan {
-class Validator;
-}
-namespace ss {
-class Validator;
-}
-namespace anytls {
-class Validator;
-}
-
 }  // namespace acpp
 
 namespace acpp::proxyman::inbound {
@@ -39,11 +26,13 @@ class UdpHandler;
 // ProtocolDeps - 入站协议构建依赖（由 inbound manager 提供）
 // ============================================================================
 struct ProtocolDeps {
-    ::acpp::vmess::TimedUserValidator*  vmess_validator  = nullptr;
-    ::acpp::trojan::Validator* validator = nullptr;
-    ::acpp::ss::Validator*            ss_validator        = nullptr;
-    ::acpp::anytls::Validator*        anytls_validator    = nullptr;
-    ::acpp::StatsShard*               stats               = nullptr;
+    void* validator = nullptr;
+    ::acpp::StatsShard* stats = nullptr;
+
+    template <typename T>
+    [[nodiscard]] T* ValidatorAs() const noexcept {
+        return static_cast<T*>(validator);
+    }
 };
 
 // ============================================================================

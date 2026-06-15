@@ -24,6 +24,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
@@ -48,7 +49,7 @@ struct Worker::ListenerSlot {
     std::unique_ptr<proxyman::inbound::TcpWorker> tcp_worker;
 };
 
-struct Worker::ListenerState {
+struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     using ListenerSlotMap =
         memory::ThreadLocalUnorderedMap<std::string, ListenerSlot>;
 
@@ -85,7 +86,6 @@ struct Worker::ListenerState {
         Worker& worker,
         std::string socket_key,
         std::string tag,
-        const proxyman::inbound::UdpHandler* handler,
         ListenerSlot* listener_slot);
 
     [[nodiscard]] proxyman::inbound::UdpWorker*
@@ -102,7 +102,7 @@ struct Worker::ListenerState {
                          udp::socket* sock,
                          udp::endpoint endpoint,
                          buf::MultiBuffer payload,
-                         uint32_t worker_id);
+                         uint32_t worker_id) override;
     void EnqueueUdpReply(const std::string& tag,
                          udp::socket* sock,
                          udp::endpoint endpoint,
@@ -227,20 +227,6 @@ void ApplyProxyProtocolResult(
 }
 
 }  // namespace
-
-std::unique_ptr<Inbound> Worker::NewInboundHandler(
-    std::string_view protocol,
-    ConnectionLimiterPtr limiter,
-    const proxyman::inbound::BuildRequest& req) {
-    return runtime_->inbound_manager->NewHandler(protocol, std::move(limiter), req);
-}
-
-std::unique_ptr<proxyman::inbound::UdpHandler> Worker::NewUdpInboundHandler(
-    std::string_view protocol,
-    ConnectionLimiterPtr limiter,
-    const proxyman::inbound::BuildRequest& req) {
-    return runtime_->inbound_manager->NewUdpHandler(protocol, std::move(limiter), req);
-}
 
 // ============================================================================
 // Worker 构造 / 析构
@@ -645,9 +631,9 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
                 ? kAcceptResourceBackoff
                 : kAcceptErrorBackoff;
-            net::steady_timer timer(worker.runtime_->io_context);
-            timer.expires_after(backoff);
-            (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+            ScheduledSleep sleep(worker.runtime_->io_context);
+            co_await sleep.WaitFor(
+                std::chrono::duration_cast<std::chrono::milliseconds>(backoff));
             continue;
         }
 
@@ -810,28 +796,66 @@ void Worker::ShutdownListenersAsync(std::vector<std::string> tags,
         });
 }
 
-void Worker::RegisterListenerAsync(proxyman::inbound::ReceiverSettings&& receiver,
-                                   std::unique_ptr<Inbound> handler) {
+bool Worker::RegisterInboundOnWorkerThread(
+    std::string_view protocol,
+    ConnectionLimiterPtr limiter,
+    const proxyman::inbound::BuildRequest& req,
+    proxyman::inbound::ReceiverSettings receiver,
+    bool ban_tracking_enabled) {
+    auto handler = runtime_->inbound_manager->NewHandler(protocol, limiter, req);
+    if (!handler) {
+        LOG_WARN("Worker[{}]: failed to create inbound handler tag={} protocol={}",
+                 id_, receiver.inbound_tag, protocol);
+        return false;
+    }
+    handler->SetBanTrackingEnabled(ban_tracking_enabled);
+
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->RetireInboundHandler(*this, receiver.inbound_tag);
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    auto inbound_handler =
+        std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(handler));
+    auto& settings = inbound_handler->ReceiverSettings();
+    if (settings.route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound &&
+        !runtime_->outbound_manager->GetHandler(settings.route_policy.outbound_tag)) {
+        LOG_WARN("Worker[{}]: listener tag={} fixed outbound '{}' not found",
+                 id_, settings.inbound_tag, settings.route_policy.outbound_tag);
+    }
+    const std::string key(settings.inbound_tag);
+    auto* registered = runtime_->inbound_manager->AddHandler(std::move(inbound_handler));
+    if (!registered) {
+        LOG_WARN("Worker[{}]: failed to add inbound handler tag={}", id_, key);
+        return false;
+    }
+    runtime_->listener_state->listener_slots[key].handler = registered;
+    return true;
+}
+
+net::awaitable<bool> Worker::RegisterInboundTask(
+    std::string protocol,
+    ConnectionLimiterPtr limiter,
+    proxyman::inbound::BuildRequest req,
+    proxyman::inbound::ReceiverSettings receiver,
+    bool ban_tracking_enabled) {
+    co_return RegisterInboundOnWorkerThread(
+        protocol, limiter, req, std::move(receiver), ban_tracking_enabled);
+}
+
+void Worker::RegisterInboundAsync(
+    std::string protocol,
+    ConnectionLimiterPtr limiter,
+    proxyman::inbound::BuildRequest req,
+    proxyman::inbound::ReceiverSettings receiver,
+    bool ban_tracking_enabled) {
     net::post(runtime_->io_context,
-        [this, receiver = std::move(receiver), h = std::move(handler)]() mutable {
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-            runtime_->listener_state->RetireInboundHandler(*this, receiver.inbound_tag);
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-            auto inbound_handler =
-                std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(h));
-            auto& settings = inbound_handler->ReceiverSettings();
-            if (settings.route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound &&
-                !runtime_->outbound_manager->GetHandler(settings.route_policy.outbound_tag)) {
-                LOG_WARN("Worker[{}]: listener tag={} fixed outbound '{}' not found",
-                         id_, settings.inbound_tag, settings.route_policy.outbound_tag);
-            }
-            const std::string key(settings.inbound_tag);
-            auto* registered = runtime_->inbound_manager->AddHandler(std::move(inbound_handler));
-            if (!registered) {
-                LOG_WARN("Worker[{}]: failed to add inbound handler tag={}", id_, key);
-                return;
-            }
-            runtime_->listener_state->listener_slots[key].handler = registered;
+        [this,
+         p = std::move(protocol),
+         limiter,
+         r = std::move(req),
+         receiver = std::move(receiver),
+         ban_tracking_enabled]() mutable {
+            (void)RegisterInboundOnWorkerThread(
+                p, limiter, r, std::move(receiver), ban_tracking_enabled);
         });
 }
 
@@ -991,7 +1015,7 @@ Worker::GetDetectResultTask(std::string tag) {
 }
 
 // ============================================================================
-// 内存统计（近似，主线程 runtime_->statscoro 读取）
+// 运行时统计（近似，仅通过 Worker executor 上的收集任务读取）
 // ============================================================================
 
 Worker::MemoryStats Worker::GetMemoryStats() const {
@@ -1026,10 +1050,23 @@ Worker::CollectRuntimeStatsTask() const {
 // ============================================================================
 
 void Worker::AddUdpListenerAsync(const PortBinding& binding,
-                                 std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
+                                 std::string protocol,
+                                 ConnectionLimiterPtr limiter,
+                                 proxyman::inbound::BuildRequest req,
+                                 bool ban_tracking_enabled) {
     net::post(runtime_->io_context,
-        [this, b = binding, h = std::move(handler)]() mutable {
-            runtime_->listener_state->StartUdpListening(*this, b, std::move(h));
+        [this,
+         b = binding,
+         p = std::move(protocol),
+         limiter,
+         r = std::move(req),
+         ban_tracking_enabled]() mutable {
+            auto handler = runtime_->inbound_manager->NewUdpHandler(p, limiter, r);
+            if (!handler) {
+                return;
+            }
+            handler->SetBanTrackingEnabled(ban_tracking_enabled);
+            runtime_->listener_state->StartUdpListening(*this, b, std::move(handler));
         });
 }
 
@@ -1045,7 +1082,6 @@ void Worker::ListenerState::StartUdpListening(
         StopUdpListening(worker, binding.tag);
     }
 
-    const auto* udp_handler = handler.get();
     auto udp_worker =
         std::make_unique<proxyman::inbound::UdpWorker>(binding.tag, std::move(handler));
     udp_workers[binding.tag] = std::move(udp_worker);
@@ -1127,7 +1163,7 @@ void Worker::ListenerState::StartUdpListening(
         udp_socket_tags[socket_key] = binding.tag;
 
         net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      UdpReceiveLoop(worker, socket_key, binding.tag, udp_handler, &listener_slot),
+                      UdpReceiveLoop(worker, socket_key, binding.tag, &listener_slot),
                       [](std::exception_ptr) {});
 
         ++bound_count;
@@ -1149,9 +1185,9 @@ void Worker::ListenerState::StartUdpListening(
 // UdpReceiveLoop — 通用 UDP 数据报收发主循环（协议无关）
 //
 // 设计参考 xray-core transport/internet/udp.Dispatcher：
-//   - Worker 只做 UDP socket 收发与 inbound UDP datagram decode/encode。
-//   - 每个客户端 (IP:port) 维护一个 transport::Link，首包创建后交给
-//     dispatcher.Dispatch；路由、出站选择和 UDP relay 均在主链路内完成。
+//   - Worker 只做 UDP socket 收发；inbound UDP datagram 处理下沉到 UdpWorker。
+//   - 每个客户端 (IP:port) 由 UdpWorker 维护一个 transport::Link，首包创建后
+//     交给 dispatcher.Dispatch；路由、出站选择和 UDP relay 均在主链路内完成。
 //   - 会话空闲超过配置的 session idle 后关闭 link，relay 自然退出。
 // ============================================================================
 
@@ -1159,7 +1195,6 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
     std::string socket_key,
     std::string tag,
-    const proxyman::inbound::UdpHandler* handler,
     ListenerSlot* listener_slot) {
     constexpr size_t kRecvBufSize = buf::Buffer::kSize;
     const auto runtime_snapshot = worker.runtime_->Snapshot();
@@ -1194,146 +1229,24 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
         const auto now = std::chrono::steady_clock::now();
         udp_worker->CleanupIdleClientSessions(socket_key, now, session_idle_timeout);
 
-        // ── 协议解码（ban 检查 + 用户匹配 + 认证失败记录 均在协议层处理）──
-        if (!handler) {
-            continue;
-        }
-
         const proxyman::inbound::ReceiverSettings* listener =
             listener_slot && listener_slot->handler
                 ? &listener_slot->handler->ReceiverSettings()
                 : nullptr;
 
-        const std::string client_ip =
-            iputil::NormalizeAddressString(client_ep.address());
-        const auto normalized_client_addr =
-            iputil::NormalizeAddress(client_ep.address());
-        auto decoded = handler->DecodeUdp(tag, client_ip, recv_buf->Tail().data(), n);
-        if (!decoded) continue;
-
-        // ── 找到或创建客户端会话 ──────────────────────────────────────────
-        const UdpEndpointKey client_key{normalized_client_addr, client_ep.port()};
-        auto client_key_log = [&]() {
-            return iputil::FormatEndpointForLog(client_ip, client_ep.port());
-        };
-
-        bool need_new_session = !udp_worker->HasClientSession(socket_key, client_key);
-
-        if (need_new_session) {
-            if (!decoded->response_context) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
-                                 worker.id_, client_key_log());
-                continue;
-            }
-
-            auto receiver = std::make_shared<proxyman::inbound::ReceiverSettings>();
-            if (listener) {
-                *receiver = *listener;
-            } else {
-                receiver->inbound_tag = tag;
-                receiver->inbound_tags = {tag};
-            }
-
-            auto ctx = std::make_shared<session::Context>();
-            ctx->conn_id = session::NewID(worker.id_);
-            ctx->worker_id = worker.id_;
-            ctx->inbound.tag = receiver->inbound_tag.empty()
-                ? std::string_view(tag)
-                : std::string_view(receiver->inbound_tag);
-            ctx->inbound.tags = receiver->RouteInboundTags();
-            ctx->inbound.source_ip        = client_ip;
-            ctx->inbound.source_addr      = normalized_client_addr;
-            ctx->inbound.source_port      = client_ep.port();
-            if (sock) {
-                IoErrorCode local_ec;
-                const auto local_ep = sock->local_endpoint(local_ec);
-                if (!local_ec && !local_ep.address().is_unspecified()) {
-                    const auto local_addr = iputil::NormalizeAddress(local_ep.address());
-                    ctx->inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
-                }
-            }
-            ctx->content.network          = Network::UDP;
-            ctx->outbound.original_target = decoded->target;
-            ctx->outbound.target          = decoded->target;
-            ctx->inbound.user_id          = decoded->user_id;
-            ctx->inbound.user_email       = decoded->user_email;
-            ctx->content.speed_limit      = decoded->speed_limit;
-
-            auto response_context = decoded->response_context;
-            udp::endpoint ep_copy  = client_ep;
-            std::string socket_key_copy = socket_key;
-            const uint32_t worker_id = worker.id_;
-
-            auto reply_cb = [this, socket_key_copy = std::move(socket_key_copy), sock, ep_copy,
-                             handler, response_context, worker_id](UDPPacketView pkt) {
-                auto payload = handler->EncodeUdpResponse(pkt, *response_context);
-                if (payload.empty()) return;
-                EnqueueUdpReply(socket_key_copy, sock, ep_copy, std::move(payload), worker_id);
-            };
-
-            auto client_session = udp_worker->CreateClientSession(
-                socket_key,
-                client_key,
-                worker.runtime_->io_context,
-                std::move(reply_cb),
-                decoded->user_id,
-                now);
-
-            auto dispatcher = worker.runtime_->dispatcher.get();
-            auto runtime_snapshot_for_dispatch = runtime_snapshot;
-            auto& io_context = worker.runtime_->io_context;
-            auto& stats = worker.runtime_->stats;
-            const uint32_t dispatch_worker_id = worker.id_;
-            net::co_spawn(
-                io_context.get_executor(),
-                [dispatcher,
-                 &io_context,
-                 &stats,
-                 receiver,
-                 ctx,
-                 client_session,
-                 runtime_snapshot_for_dispatch,
-                 dispatch_worker_id]() -> net::awaitable<void> {
-                    try {
-                        RelayResult relay_result = co_await dispatcher->Dispatch(
-                            io_context,
-                            *receiver,
-                            nullptr,
-                            transport::Link{client_session.get(), client_session.get()},
-                            InitialPayload{},
-                            *ctx,
-                            stats,
-                            runtime_snapshot_for_dispatch->timeouts,
-                            0);
-                        if (relay_result.error != ErrorCode::OK) {
-                            auto& log_ctx = *ctx;
-                            LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",
-                                           ErrorCodeToString(relay_result.error),
-                                           relay_result.bytes_up,
-                                           relay_result.bytes_down);
-                        }
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
-                                  dispatch_worker_id, e.what());
-                    } catch (...) {
-                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
-                                  dispatch_worker_id);
-                    }
-                    client_session->Close();
-                    co_return;
-                },
-                net::detached);
-        }
-
-        if (!udp_worker->PushClientPayload(
-            socket_key,
-            client_key,
-            decoded->target,
-            std::move(decoded->payload),
-            now)) {
-            LOG_ACCESS_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
-                             worker.id_, client_key_log());
-        }
+        udp_worker->ProcessDatagram(proxyman::inbound::UdpDatagramContext{
+            .socket_key = socket_key,
+            .sock = sock,
+            .client_endpoint = client_ep,
+            .payload = std::span<const uint8_t>(recv_buf->Tail().data(), n),
+            .receiver = listener,
+            .io_context = worker.runtime_->io_context,
+            .dispatcher = *worker.runtime_->dispatcher,
+            .stats = worker.runtime_->stats,
+            .timeouts = runtime_snapshot->timeouts,
+            .worker_id = worker.id_,
+            .reply_sink = *this,
+        });
     }
 }
 

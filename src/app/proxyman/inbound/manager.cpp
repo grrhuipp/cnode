@@ -26,13 +26,20 @@ struct Manager::Impl {
     explicit Impl(StatsShard& stats) noexcept
         : stats(stats) {}
 
-    [[nodiscard]] ProtocolDeps Deps() noexcept {
+    [[nodiscard]] ProtocolDeps Deps(std::string_view protocol) noexcept {
+        void* validator = nullptr;
+        if (protocol == constants::protocol::kVmess) {
+            validator = &vmess_validator;
+        } else if (protocol == constants::protocol::kTrojan) {
+            validator = &trojan_validator;
+        } else if (protocol == constants::protocol::kShadowsocks) {
+            validator = &ss_validator;
+        } else if (protocol == constants::protocol::kAnyTLS) {
+            validator = &anytls_validator;
+        }
         return ProtocolDeps{
-            &vmess_validator,
-            &trojan_validator,
-            &ss_validator,
-            &anytls_validator,
-            &stats,
+            .validator = validator,
+            .stats = &stats,
         };
     }
 
@@ -65,7 +72,7 @@ std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     return ::acpp::proxyman::inbound::NewHandler(
-        protocol, impl_->Deps(), std::move(limiter), req);
+        protocol, impl_->Deps(protocol), std::move(limiter), req);
 }
 
 std::unique_ptr<UdpHandler> Manager::NewUdpHandler(
@@ -73,7 +80,7 @@ std::unique_ptr<UdpHandler> Manager::NewUdpHandler(
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     return ::acpp::proxyman::inbound::NewUdpHandler(
-        protocol, impl_->Deps(), std::move(limiter), req);
+        protocol, impl_->Deps(protocol), std::move(limiter), req);
 }
 
 Handler* Manager::AddHandler(std::unique_ptr<Handler> handler) noexcept {

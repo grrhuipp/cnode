@@ -8,8 +8,11 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
+
+#include <asio/experimental/channel.hpp>
 
 #include <unordered_map>
 #include <deque>
@@ -18,8 +21,6 @@
 #include <chrono>
 #include <cstring>
 #include <vector>
-
-#include <asio/steady_timer.hpp>
 
 namespace acpp::mux {
 
@@ -141,10 +142,14 @@ struct MuxReply {
 };
 
 struct ReplyQueueState {
+    explicit ReplyQueueState(net::io_context& io_context)
+        : sub_done_signal(io_context, 1) {}
+
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
+    net::experimental::channel<void(IoErrorCode)> sub_done_signal;
     bool running = true;
     bool tcp_overflowed = false;
     uint64_t udp_dropped = 0;
@@ -202,6 +207,17 @@ struct ReplyQueueState {
     bool TcpReadWindowOpen() const noexcept {
         return tcp_queued_bytes <= kMuxQueueLowWaterBytes;
     }
+
+    void AddSubLoop() noexcept {
+        ++active_sub_loops;
+    }
+
+    void MarkSubLoopDone() noexcept {
+        if (active_sub_loops > 0) {
+            --active_sub_loops;
+        }
+        (void)sub_done_signal.try_send(IoErrorCode{});
+    }
 };
 
 class TcpSubState final
@@ -212,8 +228,9 @@ public:
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue)
-        : input_timer_(io_context)
-        , output_timer_(io_context)
+        : io_context_(io_context)
+        , output_sleep_(io_context)
+        , input_signal_(io_context, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue) {}
 
@@ -243,7 +260,7 @@ public:
             return;
         }
         input_queue_.push_back(std::move(mb));
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void CloseClientInput() {
@@ -251,15 +268,13 @@ public:
             return;
         }
         input_done_ = true;
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void MarkDispatchDone() {
         dispatch_done_ = true;
         PushEnd();
-        if (reply_queue_.active_sub_loops > 0) {
-            --reply_queue_.active_sub_loops;
-        }
+        reply_queue_.MarkSubLoopDone();
     }
 
     [[nodiscard]] bool DispatchDone() const noexcept {
@@ -280,12 +295,9 @@ public:
                 co_return buf::MultiBuffer{};
             }
 
-            input_timer_.expires_after(std::chrono::hours(24));
-            auto [ec] = co_await input_timer_.async_wait(
+            auto [ec] = co_await input_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            (void)ec;
         }
         co_return buf::MultiBuffer{};
     }
@@ -293,12 +305,7 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         while (!cancelled_ && reply_queue_.running &&
                reply_queue_.ShouldBackpressureTcpReads()) {
-            output_timer_.expires_after(std::chrono::milliseconds(10));
-            auto [ec] = co_await output_timer_.async_wait(
-                net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            co_await output_sleep_.WaitFor(std::chrono::milliseconds(10));
         }
 
         if (cancelled_ || !reply_queue_.running) {
@@ -339,8 +346,8 @@ public:
         }
         cancelled_ = true;
         input_done_ = true;
-        input_timer_.cancel();
-        output_timer_.cancel();
+        output_sleep_.Cancel();
+        WakeInputReader();
         input_queue_.clear();
     }
 
@@ -351,6 +358,10 @@ public:
     session::Context ctx;
 
 private:
+    void WakeInputReader() noexcept {
+        (void)input_signal_.try_send(IoErrorCode{});
+    }
+
     void PushEnd() {
         if (end_sent_ || !reply_queue_.running) {
             return;
@@ -365,8 +376,9 @@ private:
         }
     }
 
-    net::steady_timer input_timer_;
-    net::steady_timer output_timer_;
+    net::io_context& io_context_;
+    ScheduledSleep output_sleep_;
+    net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
@@ -387,7 +399,8 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id)
-        : input_timer_(io_context)
+        : io_context_(io_context)
+        , input_signal_(io_context, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue)
         , parent_conn_id_(parent_conn_id) {}
@@ -432,7 +445,7 @@ public:
         }
         queued_bytes_ += bytes;
         input_queue_.push_back(std::move(mb));
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void CloseClientInput() {
@@ -440,15 +453,13 @@ public:
             return;
         }
         input_done_ = true;
-        input_timer_.cancel();
+        WakeInputReader();
     }
 
     void MarkDispatchDone() {
         dispatch_done_ = true;
         PushEnd();
-        if (reply_queue_.active_sub_loops > 0) {
-            --reply_queue_.active_sub_loops;
-        }
+        reply_queue_.MarkSubLoopDone();
     }
 
     [[nodiscard]] bool DispatchDone() const noexcept {
@@ -470,12 +481,9 @@ public:
                 co_return buf::MultiBuffer{};
             }
 
-            input_timer_.expires_after(std::chrono::hours(24));
-            auto [ec] = co_await input_timer_.async_wait(
+            auto [ec] = co_await input_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            (void)ec;
         }
         co_return buf::MultiBuffer{};
     }
@@ -536,7 +544,7 @@ public:
         }
         cancelled_ = true;
         input_done_ = true;
-        input_timer_.cancel();
+        WakeInputReader();
         input_queue_.clear();
         queued_bytes_ = 0;
     }
@@ -548,6 +556,10 @@ public:
     session::Context ctx;
 
 private:
+    void WakeInputReader() noexcept {
+        (void)input_signal_.try_send(IoErrorCode{});
+    }
+
     void PushEnd() {
         if (end_sent_ || !reply_queue_.running) {
             return;
@@ -562,7 +574,8 @@ private:
         }
     }
 
-    net::steady_timer input_timer_;
+    net::io_context& io_context_;
+    net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     uint64_t parent_conn_id_ = 0;
@@ -671,7 +684,7 @@ net::awaitable<RelayResult> DoMuxRelay(
     }
 
     // 回包队列：单线程，无锁；running 保护回调不在 DoMuxRelay 退出后继续推送。
-    ReplyQueueState reply_queue;
+    ReplyQueueState reply_queue{io_context};
 
     // 子会话集合
     memory::ThreadLocalUnorderedMap<uint16_t, UdpSubInfo> udp_subs;
@@ -685,8 +698,8 @@ net::awaitable<RelayResult> DoMuxRelay(
     parent_ctx.traffic.bytes_up = 0;
     parent_ctx.traffic.bytes_down = 0;
 
-    // 轮询定时器（100ms 打断读，回到循环排空回包队列）
-    net::steady_timer timer(io_context);
+    auto& timeout_scheduler = TimeoutScheduler::ForIoContext(io_context);
+    TimeoutToken read_poll_token;
     const uint64_t parent_conn_id = parent_ctx.conn_id;
 
     struct ReadPollState {
@@ -813,10 +826,10 @@ net::awaitable<RelayResult> DoMuxRelay(
         // 2. 从客户端读取（100ms 轮询：超时则回到步骤 1 排空回包队列）
         // --------------------------------------------------------------------
         read_poll.Reset();
-        timer.expires_after(std::chrono::milliseconds(100));
-        timer.async_wait([&read_poll, client_control](
-                              const IoErrorCode& ec) {
-            if (!ec && client_control && read_poll.TakeActive()) {
+        read_poll_token = timeout_scheduler.ScheduleAfter(
+            std::chrono::milliseconds(100),
+            [&read_poll, client_control]() {
+            if (client_control && read_poll.TakeActive()) {
                 read_poll.timed_out = true;
                 client_control->Cancel();
             }
@@ -828,10 +841,10 @@ net::awaitable<RelayResult> DoMuxRelay(
             read_mb = co_await client_link.reader->ReadMultiBuffer();
             read_bytes = buf::TotalLen(read_mb);
             read_poll.MarkInactive();
-            timer.cancel();
+            timeout_scheduler.Cancel(read_poll_token);
         } catch (const IoSystemError&) {
             read_poll.MarkInactive();
-            timer.cancel();
+            timeout_scheduler.Cancel(read_poll_token);
             if (read_poll.timed_out) {
                 if (client_control && ConsumeReadSideTimeout(*client_control)) {
                     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
@@ -962,7 +975,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                     (void)inserted;
                     UdpSubState* sub_ptr = insert_it->second.get();
 
-                    ++reply_queue.active_sub_loops;
+                    reply_queue.AddSubLoop();
                     net::co_spawn(io_context.get_executor(),
                         RunUdpSubDispatch(
                             io_context,
@@ -1034,7 +1047,7 @@ net::awaitable<RelayResult> DoMuxRelay(
 
                     // 启动 dispatcher.Dispatch；DoMuxRelay 退出前等待 active_sub_loops
                     // 归零，保证 TcpSubState 生命周期覆盖 detached coroutine。
-                    ++reply_queue.active_sub_loops;
+                    reply_queue.AddSubLoop();
                     net::co_spawn(io_context.get_executor(),
                         RunTcpSubDispatch(
                             io_context,
@@ -1133,7 +1146,7 @@ net::awaitable<RelayResult> DoMuxRelay(
     // 先标记停止，阻止回调继续推送到 reply_queue
     reply_queue.running = false;
     read_poll.MarkInactive();
-    timer.cancel();
+    timeout_scheduler.Cancel(read_poll_token);
     co_await net::post(io_context.get_executor(), net::use_awaitable);
 
     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: UDP={} TCP={}",
@@ -1146,7 +1159,9 @@ net::awaitable<RelayResult> DoMuxRelay(
         tcp_sub->Cancel();
     }
     while (reply_queue.active_sub_loops > 0) {
-        co_await net::post(io_context.get_executor(), net::use_awaitable);
+        auto [ec] = co_await reply_queue.sub_done_signal.async_receive(
+            net::as_tuple(net::use_awaitable));
+        (void)ec;
     }
 
 #ifndef NDEBUG

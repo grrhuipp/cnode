@@ -4,10 +4,12 @@
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include <asio/steady_timer.hpp>
+#include <asio/experimental/channel.hpp>
+
 #include <cstring>
 #include <deque>
 #include <format>
@@ -18,37 +20,6 @@ namespace acpp {
 namespace {
 
 constexpr uint64_t kUdpRelayStatsFlushBytes = 64 * 1024;
-
-class UdpRateTimerGuard {
-public:
-    explicit UdpRateTimerGuard(net::io_context& io_context) noexcept
-        : io_context_(io_context) {}
-
-    ~UdpRateTimerGuard() noexcept {
-        if (!timer_) {
-            return;
-        }
-        std::destroy_at(timer_);
-        memory::ThreadLocalAllocator<net::steady_timer> alloc;
-        alloc.deallocate(timer_, 1);
-    }
-
-    UdpRateTimerGuard(const UdpRateTimerGuard&) = delete;
-    UdpRateTimerGuard& operator=(const UdpRateTimerGuard&) = delete;
-
-    [[nodiscard]] net::steady_timer& Get() {
-        if (!timer_) {
-            memory::ThreadLocalAllocator<net::steady_timer> alloc;
-            timer_ = alloc.allocate(1);
-            std::construct_at(timer_, io_context_);
-        }
-        return *timer_;
-    }
-
-private:
-    net::io_context& io_context_;
-    net::steady_timer* timer_ = nullptr;
-};
 
 void FlushUdpRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
     if (acc.bytes_in == 0 && acc.bytes_out == 0) {
@@ -116,12 +87,21 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             }
         };
 
+        explicit SharedState(net::io_context& io_context)
+            : io_context(io_context)
+            , reply_signal(io_context, 1) {}
+
+        net::io_context& io_context;
+        net::experimental::channel<void(IoErrorCode)> reply_signal;
         bool running = true;
         memory::ThreadLocalDeque<UdpRelayReply> reply_queue;
         size_t queued_bytes = 0;
         uint64_t total_replies = 0;
         bool shrink_queue_on_drain = false;
-        net::steady_timer* wake = nullptr;
+
+        void WakeReplyReader() {
+            (void)reply_signal.try_send(IoErrorCode{});
+        }
 
         void push(UdpRelayReply&& pkt) {
             const size_t pkt_bytes = pkt.Size();
@@ -130,9 +110,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             if (reply_queue.size() >= 64 || queued_bytes >= 256 * 1024) {
                 shrink_queue_on_drain = true;
             }
-            if (wake) {
-                wake->cancel();
-            }
+            WakeReplyReader();
         }
 
         void push(UDPPacketView pkt) {
@@ -158,10 +136,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
 
         bool empty() const { return reply_queue.empty(); }
     };
-    SharedState state;
-
-    net::steady_timer reply_wake(io_context);
-    state.wake = &reply_wake;
+    SharedState state{io_context};
 
     const uint64_t conn_id = ctx.conn_id;
     uint64_t callback_id = session.RegisterCallback(
@@ -177,8 +152,8 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     // 上行/下行各自独立的限速器与限速计时器，避免两个协程共享同一 timer。
     TokenBucket upload_limiter(config.speed_limit);
     TokenBucket download_limiter(config.speed_limit);
-    UdpRateTimerGuard upload_rate_timer(io_context);
-    UdpRateTimerGuard download_rate_timer(io_context);
+    ScheduledSleep upload_rate_sleep(io_context);
+    ScheduledSleep download_rate_sleep(io_context);
     LocalStatsAccumulator stats_acc;
 
     // 回包交给 client_writer：buffer 携带来源地址（buffer.udp），由入站
@@ -199,9 +174,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             // 下行限速
             auto wait_time = download_limiter.Consume(send_len);
             if (wait_time.count() > 0) {
-                auto& timer = download_rate_timer.Get();
-                timer.expires_after(wait_time);
-                co_await timer.async_wait(net::use_awaitable);
+                co_await download_rate_sleep.WaitFor(wait_time);
             }
 
             co_await client_writer.WriteMultiBuffer(std::move(packet.payload));
@@ -261,9 +234,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             {
                 auto wait_time = upload_limiter.Consume(read_bytes);
                 if (wait_time.count() > 0) {
-                    auto& timer = upload_rate_timer.Get();
-                    timer.expires_after(wait_time);
-                    co_await timer.async_wait(net::use_awaitable);
+                    co_await upload_rate_sleep.WaitFor(wait_time);
                 }
             }
 
@@ -291,7 +262,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
 
         // 上行结束：通知 download 收尾。
         state.running = false;
-        reply_wake.cancel();
+        state.WakeReplyReader();
         co_return;
     };
 
@@ -304,7 +275,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 bool ok = co_await send_reply(pkt);
                 if (!ok) {
                     state.running = false;
-                    reply_wake.cancel();
+                    state.WakeReplyReader();
                     co_return;
                 }
                 ++sent_batch;
@@ -317,19 +288,16 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 co_return;
             }
 
-            // 等待新回包；100ms 兜底轮询防止 push 唤醒竞态丢失。
-            reply_wake.expires_after(std::chrono::milliseconds(100));
-            try {
-                co_await reply_wake.async_wait(net::use_awaitable);
-            } catch (...) {
-            }
+            auto [ec] = co_await state.reply_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
         }
     };
 
     co_await (upload() && download());
 
     state.running = false;
-    reply_wake.cancel();
+    state.WakeReplyReader();
     session.UnregisterCallback(callback_id);
     LOG_CONN_DEBUG(ctx, "Unregistered Full Cone callback {}", callback_id);
     co_await net::post(io_context.get_executor(), net::use_awaitable);

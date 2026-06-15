@@ -8,15 +8,49 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace acpp {
 struct TargetAddress;
+struct StatsShard;
+struct TimeoutsConfig;
+
+namespace routing {
+class Dispatcher;
+}
 }  // namespace acpp
 
 namespace acpp::proxyman::inbound {
+
+struct ReceiverSettings;
+
+class UdpReplySink {
+public:
+    virtual ~UdpReplySink() noexcept = default;
+
+    virtual void EnqueueUdpReply(const std::string& socket_key,
+                                 udp::socket* sock,
+                                 udp::endpoint endpoint,
+                                 buf::MultiBuffer payload,
+                                 uint32_t worker_id) = 0;
+};
+
+struct UdpDatagramContext {
+    std::string_view socket_key;
+    udp::socket* sock = nullptr;
+    udp::endpoint client_endpoint;
+    std::span<const uint8_t> payload;
+    const ReceiverSettings* receiver = nullptr;
+    net::io_context& io_context;
+    routing::Dispatcher& dispatcher;
+    StatsShard& stats;
+    const TimeoutsConfig& timeouts;
+    uint32_t worker_id = 0;
+    UdpReplySink& reply_sink;
+};
 
 // ============================================================================
 // UdpWorker - per-Worker UDP inbound worker
@@ -51,6 +85,8 @@ public:
     void Close() noexcept;
 
     void SetBanTrackingEnabled(bool enabled) noexcept;
+
+    void ProcessDatagram(const UdpDatagramContext& datagram);
 
     [[nodiscard]] bool EnqueueReply(const std::string& socket_key,
                                     udp::endpoint endpoint,

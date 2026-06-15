@@ -12,6 +12,7 @@
 #include "acppnode/common/session.hpp"
 
 #include <algorithm>
+#include <array>
 #include <expected>
 #include <span>
 #include <utility>
@@ -276,11 +277,12 @@ const bool kVmessInboundRegistered = [] {
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            if (!deps.vmess_validator || !deps.stats) {
+            auto* validator = deps.ValidatorAs<acpp::vmess::TimedUserValidator>();
+            if (!validator || !deps.stats) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::vmess::inbound::Handler>(
-                *deps.vmess_validator,
+                *validator,
                 *deps.stats,
                 limiter);
         };
@@ -288,7 +290,7 @@ const bool kVmessInboundRegistered = [] {
     reg.build_static_users =
         [](std::string_view /*tag*/, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::vmess::MemoryAccount> users;
+            std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
 
             for (const auto& client : config.clients) {
                 if (client.id.empty()) {
@@ -296,7 +298,14 @@ const bool kVmessInboundRegistered = [] {
                 }
                 if (auto user = acpp::vmess::MemoryAccount::FromUUID(
                         client.id, 0, client.email, 0)) {
-                    users.push_back(*user);
+                    users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
+                        .uuid = user->uuid,
+                        .uuid_bytes = user->uuid_bytes,
+                        .cmd_key = user->cmd_key,
+                        .auth_key = user->auth_key,
+                        .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
+                        .profile = user->profile,
+                    });
                 }
             }
 
@@ -309,7 +318,7 @@ const bool kVmessInboundRegistered = [] {
         [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
            std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::vmess::MemoryAccount> users;
+            std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
             users.reserve(runtime_users.size());
 
             for (const auto& runtime_user : runtime_users) {
@@ -319,7 +328,14 @@ const bool kVmessInboundRegistered = [] {
                         runtime_user.email,
                         runtime_user.speed_limit,
                         runtime_user.device_limit)) {
-                    users.push_back(*user);
+                    users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
+                        .uuid = user->uuid,
+                        .uuid_bytes = user->uuid_bytes,
+                        .cmd_key = user->cmd_key,
+                        .auth_key = user->auth_key,
+                        .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
+                        .profile = user->profile,
+                    });
                 }
             }
 

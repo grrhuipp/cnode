@@ -8,6 +8,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/experimental/awaitable_operators.hpp>
 #include <chrono>
@@ -30,7 +31,7 @@ class UDPSession;
 namespace relay_detail {
 
 inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
-using SteadyClock = net::steady_timer::clock_type;
+using SteadyClock = std::chrono::steady_clock;
 
 template <typename Endpoint>
 void MarkAbortiveCloseIfSupported(Endpoint& endpoint) {
@@ -52,23 +53,20 @@ struct RelayDirectionState {
 class RateTimerGuard {
 public:
     explicit RateTimerGuard(net::io_context& io_context) noexcept
-        : io_context_(io_context) {}
+        : sleep_(io_context) {}
 
     ~RateTimerGuard() noexcept = default;
 
     RateTimerGuard(const RateTimerGuard&) = delete;
     RateTimerGuard& operator=(const RateTimerGuard&) = delete;
 
-    [[nodiscard]] net::steady_timer& Get() {
-        if (!timer_) {
-            timer_.emplace(io_context_);
-        }
-        return *timer_;
+    [[nodiscard]] net::awaitable<void> WaitFor(std::chrono::nanoseconds delay) {
+        return sleep_.WaitFor(
+            std::chrono::duration_cast<std::chrono::milliseconds>(delay));
     }
 
 private:
-    net::io_context& io_context_;
-    std::optional<net::steady_timer> timer_;
+    ScheduledSleep sleep_;
 };
 
 struct NoopRateLimiter {
@@ -391,9 +389,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             if constexpr (RateLimited) {
                 auto wait_time = rate_limiter.Consume(n);
                 if (wait_time.count() > 0) {
-                    auto& timer = rate_timer.Get();
-                    timer.expires_after(wait_time);
-                    co_await timer.async_wait(net::use_awaitable);
+                    co_await rate_timer.WaitFor(wait_time);
                 }
             }
 

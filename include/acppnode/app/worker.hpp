@@ -63,16 +63,6 @@ public:
     [[nodiscard]] uint32_t Id() const noexcept { return id_; }
     [[nodiscard]] net::io_context::executor_type GetExecutor();
 
-    [[nodiscard]] std::unique_ptr<Inbound> NewInboundHandler(
-        std::string_view protocol,
-        ConnectionLimiterPtr limiter,
-        const proxyman::inbound::BuildRequest& req);
-
-    [[nodiscard]] std::unique_ptr<proxyman::inbound::UdpHandler> NewUdpInboundHandler(
-        std::string_view protocol,
-        ConnectionLimiterPtr limiter,
-        const proxyman::inbound::BuildRequest& req);
-
     // ── 监听管理（线程安全，内部 net::post 到 Worker 线程）─────────────────
 
     // 添加监听：SO_REUSEPORT bind，为该 tag 启动一个独立 accept 协程
@@ -81,14 +71,29 @@ public:
     // 进程关闭冷路径：在 Worker 线程关闭一组监听，并在下一轮事件循环回调。
     void ShutdownListenersAsync(std::vector<std::string> tags, std::function<void()> on_done);
 
-    // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）
-    // handler 封装所有协议细节（SS AEAD 解密、ban 检查、认证失败记录）
-    void AddUdpListenerAsync(const PortBinding& binding,
-                             std::unique_ptr<proxyman::inbound::UdpHandler> handler);
+    // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行；
+    // Async 版本可从控制面直接调用，内部投递到 Worker 线程。
+    net::awaitable<bool> RegisterInboundTask(
+        std::string protocol,
+        ConnectionLimiterPtr limiter,
+        proxyman::inbound::BuildRequest req,
+        proxyman::inbound::ReceiverSettings receiver,
+        bool ban_tracking_enabled);
 
-    // 注册 receiver settings + 协议处理器（线程安全）
-    void RegisterListenerAsync(proxyman::inbound::ReceiverSettings&& receiver,
-                               std::unique_ptr<Inbound> handler);
+    void RegisterInboundAsync(
+        std::string protocol,
+        ConnectionLimiterPtr limiter,
+        proxyman::inbound::BuildRequest req,
+        proxyman::inbound::ReceiverSettings receiver,
+        bool ban_tracking_enabled);
+
+    // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）。协议 handler 在
+    // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
+    void AddUdpListenerAsync(const PortBinding& binding,
+                             std::string protocol,
+                             ConnectionLimiterPtr limiter,
+                             proxyman::inbound::BuildRequest req,
+                             bool ban_tracking_enabled);
 
     // 动态出站（线程安全）：XrayR Controller 面板节点 addOutbound/removeOutbound。
     void AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config);
@@ -124,18 +129,26 @@ public:
     void AddUserTraffic(std::string_view tag, int64_t user_id,
                         uint64_t upload, uint64_t download);
 
-    // ── 内存统计（近似，主线程 stats_coro 读取）──────────────────────────────
+    // ── 运行时统计（通过 CollectRuntimeStatsTask 投递到 Worker 线程读取）──
 
     using MemoryStats = WorkerMemoryStats;
     using RuntimeStatsSnapshot = WorkerRuntimeStatsSnapshot;
 
-    [[nodiscard]] MemoryStats GetMemoryStats() const;
     net::awaitable<RuntimeStatsSnapshot> CollectRuntimeStatsTask() const;
 
 private:
     struct ListenerSlot;
     struct ListenerState;
     struct RuntimeState;
+
+    [[nodiscard]] bool RegisterInboundOnWorkerThread(
+        std::string_view protocol,
+        ConnectionLimiterPtr limiter,
+        const proxyman::inbound::BuildRequest& req,
+        proxyman::inbound::ReceiverSettings receiver,
+        bool ban_tracking_enabled);
+
+    [[nodiscard]] MemoryStats GetMemoryStats() const;
 
     // ── 成员 ────────────────────────────────────────────────────────────────
 

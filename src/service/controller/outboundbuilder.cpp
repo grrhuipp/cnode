@@ -1,7 +1,9 @@
 #include "outboundbuilder.hpp"
 
 #include "acppnode/core/constants.hpp"
-#include "acppnode/proxy/freedom/freedom_outbound.hpp"
+#include "acppnode/infra/log.hpp"
+
+#include "../../app/proxyman/outbound/source_config.hpp"
 
 namespace acpp::controller {
 
@@ -23,23 +25,23 @@ proxyman::outbound::PreparedOutboundConfig OutboundBuilder(
         }
     }
 
-    freedom::outbound::FreedomSettings settings;
-    settings.send_through = std::move(send_through);
-    settings.domain_strategy = std::move(domain_strategy);
+    proxyman::outbound::OutboundSourceConfig source;
+    source.tag = tag;
+    source.protocol = std::string(constants::protocol::kFreedom);
+    source.send_through = std::move(send_through);
+    source.settings["domainStrategy"] = std::move(domain_strategy);
 
-    proxyman::outbound::PreparedOutboundConfig outbound;
-    outbound.tag = tag;
-    outbound.protocol = std::string(constants::protocol::kFreedom);
-    outbound.create =
-        [tag, settings = std::move(settings)](
-            net::io_context& /*io_context*/,
-            app::dns::DNS& dns,
-            UDPSessionManager* udp_mgr,
-            std::chrono::seconds dial_timeout) -> std::unique_ptr<Outbound> {
-            return std::make_unique<freedom::outbound::Handler>(
-                tag, settings, dns, udp_mgr, dial_timeout);
-        };
-    return outbound;
+    auto prepared = proxyman::outbound::PrepareOutboundConfig(source);
+    if (prepared) {
+        return std::move(*prepared);
+    }
+
+    LOG_WARN("OutboundBuilder: outbound protocol '{}' is not registered",
+             constants::protocol::kFreedom);
+    proxyman::outbound::PreparedOutboundConfig fallback;
+    fallback.tag = tag;
+    fallback.protocol = std::string(constants::protocol::kFreedom);
+    return fallback;
 }
 
 }  // namespace acpp::controller

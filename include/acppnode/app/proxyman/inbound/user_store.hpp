@@ -1,9 +1,8 @@
 #pragma once
 
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/common/user_profile.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
-#include "acppnode/proxy/vmess/account.hpp"
 
 #include <array>
 #include <cstddef>
@@ -39,7 +38,7 @@ public:
         std::array<uint8_t, 16> uuid_bytes{};
         std::array<uint8_t, 16> cmd_key{};
         std::array<uint8_t, 16> auth_key{};
-        ::acpp::vmess::CachedAESKey cached_auth_aes_key;
+        std::array<uint8_t, 16> cached_auth_aes_key{};
         std::shared_ptr<const Profile> profile;
     };
 
@@ -50,8 +49,8 @@ public:
 
     struct ShadowsocksCredential {
         std::string password;
-        ::acpp::ss::KeyBytes derived_key;
-        ::acpp::ss::SsCipherType cipher_type = ::acpp::ss::SsCipherType::AES_256_GCM;
+        PreparedKeyBytes derived_key;
+        PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
         size_t key_size = 32;
         size_t salt_size = 32;
         std::shared_ptr<const Profile> profile;

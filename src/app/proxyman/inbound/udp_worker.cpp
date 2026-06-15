@@ -1,9 +1,18 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
 
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/common/initial_payload.hpp"
+#include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/session.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
+#include "acppnode/features/routing/dispatcher.hpp"
+#include "acppnode/infra/config_types.hpp"
+#include "acppnode/infra/log.hpp"
+#include "acppnode/transport/async_stream.hpp"
 
-#include <asio/steady_timer.hpp>
+#include <asio/experimental/channel.hpp>
+
 #include <deque>
 #include <unordered_map>
 
@@ -69,13 +78,17 @@ struct UdpWorker::ClientSession::Impl {
     Impl(net::io_context& io_context,
          ReplyCallback reply_callback,
          int64_t user_id)
-        : wake(io_context)
+        : io_context(io_context)
+        , reader_signal(io_context, 1)
         , reply_callback(std::move(reply_callback))
-        , user_id(user_id) {
-        wake.expires_at(net::steady_timer::time_point::max());
+        , user_id(user_id) {}
+
+    void WakeReader() {
+        (void)reader_signal.try_send(IoErrorCode{});
     }
 
-    net::steady_timer wake;
+    net::io_context& io_context;
+    net::experimental::channel<void(IoErrorCode)> reader_signal;
     ReplyCallback reply_callback;
     std::deque<buf::MultiBuffer> input_queue;
     size_t queued_bytes = 0;
@@ -127,7 +140,7 @@ void UdpWorker::ClientSession::Push(
     if (impl_->input_queue.size() >= 64 || impl_->queued_bytes >= 256 * 1024) {
         impl_->shrink_queue_on_drain = true;
     }
-    impl_->wake.cancel();
+    impl_->WakeReader();
 }
 
 void UdpWorker::ClientSession::Close() noexcept {
@@ -137,8 +150,7 @@ void UdpWorker::ClientSession::Close() noexcept {
     impl_->closed = true;
     impl_->input_queue.clear();
     impl_->queued_bytes = 0;
-    IoErrorCode ec;
-    impl_->wake.cancel(ec);
+    impl_->WakeReader();
 }
 
 net::awaitable<buf::MultiBuffer>
@@ -160,15 +172,9 @@ UdpWorker::ClientSession::ReadMultiBuffer() {
             co_return buf::MultiBuffer{};
         }
 
-        impl_->wake.expires_at(net::steady_timer::time_point::max());
-        auto [ec] = co_await impl_->wake.async_wait(
+        auto [ec] = co_await impl_->reader_signal.async_receive(
             net::as_tuple(net::use_awaitable));
-        if (ec == io_error::operation_aborted) {
-            continue;
-        }
-        if (ec) {
-            co_return buf::MultiBuffer{};
-        }
+        (void)ec;
     }
 }
 
@@ -234,6 +240,160 @@ void UdpWorker::Close() noexcept {
 void UdpWorker::SetBanTrackingEnabled(bool enabled) noexcept {
     if (impl_->proxy) {
         impl_->proxy->SetBanTrackingEnabled(enabled);
+    }
+}
+
+void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
+    if (!impl_->proxy || !datagram.sock || datagram.payload.empty()) {
+        return;
+    }
+
+    const std::string socket_key(datagram.socket_key);
+    const auto now = std::chrono::steady_clock::now();
+
+    const std::string client_ip =
+        iputil::NormalizeAddressString(datagram.client_endpoint.address());
+    const auto normalized_client_addr =
+        iputil::NormalizeAddress(datagram.client_endpoint.address());
+    auto decoded = impl_->proxy->DecodeUdp(
+        impl_->tag, client_ip, datagram.payload.data(), datagram.payload.size());
+    if (!decoded) {
+        return;
+    }
+
+    const UdpEndpointKey client_key{
+        normalized_client_addr,
+        datagram.client_endpoint.port(),
+    };
+    auto client_key_log = [&]() {
+        return iputil::FormatEndpointForLog(client_ip, datagram.client_endpoint.port());
+    };
+
+    const bool need_new_session = !HasClientSession(socket_key, client_key);
+
+    if (need_new_session) {
+        if (!decoded->response_context) {
+            LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
+                             datagram.worker_id, client_key_log());
+            return;
+        }
+
+        auto receiver = std::make_shared<ReceiverSettings>();
+        if (datagram.receiver) {
+            *receiver = *datagram.receiver;
+        } else {
+            receiver->inbound_tag = impl_->tag;
+            receiver->inbound_tags = {impl_->tag};
+        }
+
+        auto ctx = std::make_shared<session::Context>();
+        ctx->conn_id = session::NewID(datagram.worker_id);
+        ctx->worker_id = datagram.worker_id;
+        ctx->inbound.tag = receiver->inbound_tag.empty()
+            ? std::string_view(impl_->tag)
+            : std::string_view(receiver->inbound_tag);
+        ctx->inbound.tags = receiver->RouteInboundTags();
+        ctx->inbound.source_ip = client_ip;
+        ctx->inbound.source_addr = normalized_client_addr;
+        ctx->inbound.source_port = datagram.client_endpoint.port();
+        IoErrorCode local_ec;
+        const auto local_ep = datagram.sock->local_endpoint(local_ec);
+        if (!local_ec && !local_ep.address().is_unspecified()) {
+            const auto local_addr = iputil::NormalizeAddress(local_ep.address());
+            ctx->inbound.local_endpoint = tcp::endpoint(local_addr, local_ep.port());
+        }
+        ctx->content.network = Network::UDP;
+        ctx->outbound.original_target = decoded->target;
+        ctx->outbound.target = decoded->target;
+        ctx->inbound.user_id = decoded->user_id;
+        ctx->inbound.user_email = decoded->user_email;
+        ctx->content.speed_limit = decoded->speed_limit;
+
+        auto response_context = decoded->response_context;
+        udp::endpoint endpoint = datagram.client_endpoint;
+        udp::socket* sock = datagram.sock;
+        auto& reply_sink = datagram.reply_sink;
+        const uint32_t worker_id = datagram.worker_id;
+
+        auto reply_cb = [this,
+                         socket_key,
+                         sock,
+                         endpoint,
+                         response_context = std::move(response_context),
+                         &reply_sink,
+                         worker_id](UDPPacketView pkt) mutable {
+            if (!impl_->proxy) {
+                return;
+            }
+            auto payload = impl_->proxy->EncodeUdpResponse(pkt, *response_context);
+            if (payload.empty()) {
+                return;
+            }
+            reply_sink.EnqueueUdpReply(
+                socket_key, sock, endpoint, std::move(payload), worker_id);
+        };
+
+        auto client_session = CreateClientSession(
+            socket_key,
+            client_key,
+            datagram.io_context,
+            std::move(reply_cb),
+            decoded->user_id,
+            now);
+
+        auto* dispatcher = &datagram.dispatcher;
+        auto* io_context = &datagram.io_context;
+        auto* stats = &datagram.stats;
+        auto timeouts = datagram.timeouts;
+        net::co_spawn(
+            io_context->get_executor(),
+            [dispatcher,
+             io_context,
+             stats,
+             receiver,
+             ctx,
+             client_session,
+             timeouts,
+             worker_id]() -> net::awaitable<void> {
+                try {
+                    RelayResult relay_result = co_await dispatcher->Dispatch(
+                        *io_context,
+                        *receiver,
+                        nullptr,
+                        transport::Link{client_session.get(), client_session.get()},
+                        InitialPayload{},
+                        *ctx,
+                        *stats,
+                        timeouts,
+                        0);
+                    if (relay_result.error != ErrorCode::OK) {
+                        auto& log_ctx = *ctx;
+                        LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",
+                                       ErrorCodeToString(relay_result.error),
+                                       relay_result.bytes_up,
+                                       relay_result.bytes_down);
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
+                              worker_id, e.what());
+                } catch (...) {
+                    LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
+                              worker_id);
+                }
+                client_session->Close();
+                co_return;
+            },
+            net::detached);
+    }
+
+    if (!PushClientPayload(
+        socket_key,
+        client_key,
+        decoded->target,
+        std::move(decoded->payload),
+        now)) {
+        LOG_ACCESS_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
+                         datagram.worker_id, client_key_log());
     }
 }
 

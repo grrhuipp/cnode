@@ -7,6 +7,23 @@
 
 namespace acpp::trojan {
 
+namespace {
+
+std::vector<proxyman::inbound::PreparedTrojanUser>
+ToPreparedUsers(const std::vector<TrojanUserInfo>& users) {
+    std::vector<proxyman::inbound::PreparedTrojanUser> prepared;
+    prepared.reserve(users.size());
+    for (const auto& user : users) {
+        prepared.push_back(proxyman::inbound::PreparedTrojanUser{
+            .password_hash = user.password_hash,
+            .profile = user.profile,
+        });
+    }
+    return prepared;
+}
+
+}  // namespace
+
 struct Validator::Impl {
     UserOnlineTracker stats;
 };
@@ -21,21 +38,21 @@ Validator& Validator::operator=(Validator&&) noexcept = default;
 
 void Validator::ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.trojan_users = users;
+    set.trojan_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kTrojan, tag, set);
 }
 
 void Validator::AddUsers(std::string_view tag,
                          const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.trojan_users = users;
+    set.trojan_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kTrojan, tag, set);
 }
 
 void Validator::RemoveUsers(std::string_view tag,
                             const std::vector<TrojanUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.trojan_users = users;
+    set.trojan_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kTrojan, tag, set);
 }
 

@@ -580,11 +580,12 @@ const bool kTrojanInboundRegistered = [] {
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            if (!deps.validator || !deps.stats) {
+            auto* validator = deps.ValidatorAs<acpp::trojan::Validator>();
+            if (!validator || !deps.stats) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::trojan::inbound::Handler>(
-                *deps.validator,
+                *validator,
                 *deps.stats,
                 limiter);
         };
@@ -592,13 +593,13 @@ const bool kTrojanInboundRegistered = [] {
     reg.build_static_users =
         [](std::string_view /*tag*/, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::trojan::TrojanUserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
 
             for (const auto& client : config.clients) {
                 if (client.password.empty()) {
                     continue;
                 }
-                acpp::trojan::TrojanUserInfo info;
+                acpp::proxyman::inbound::PreparedTrojanUser info;
                 info.password_hash = acpp::trojan::HashPassword(client.password);
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
@@ -613,14 +614,14 @@ const bool kTrojanInboundRegistered = [] {
         [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
            std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::trojan::TrojanUserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
             users.reserve(runtime_users.size());
 
             for (const auto& runtime_user : runtime_users) {
                 if (runtime_user.password.empty()) {
                     continue;
                 }
-                acpp::trojan::TrojanUserInfo info;
+                acpp::proxyman::inbound::PreparedTrojanUser info;
                 info.password_hash = acpp::trojan::HashPassword(runtime_user.password);
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;

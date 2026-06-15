@@ -2,6 +2,8 @@
 
 #include "acppnode/common/asio_types.hpp"
 
+#include <asio/experimental/channel.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -25,7 +27,7 @@ struct TimeoutToken {
 // 目标：
 //   - 用每分片 1 个 steady_timer 承载大量连接的 deadline/timeout
 //   - 避免 TcpStream 每连接常驻多个 timer 对象
-//   - 固定 tick 惰性扫描 deadline，避免高 churn 下反复重挂 timer
+//   - 只按最近 deadline 重挂共享 timer，避免每个连接独立 timer
 //   - 分片内 Schedule/Cancel/OnTimer 在对应 io_context 线程执行，不做热路径锁同步
 // ============================================================================
 class TimeoutScheduler {
@@ -51,6 +53,25 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+class ScheduledSleep {
+public:
+    explicit ScheduledSleep(net::io_context& io_context);
+    ~ScheduledSleep() noexcept;
+
+    ScheduledSleep(const ScheduledSleep&) = delete;
+    ScheduledSleep& operator=(const ScheduledSleep&) = delete;
+
+    [[nodiscard]] net::awaitable<void> WaitFor(std::chrono::milliseconds delay);
+    void Cancel() noexcept;
+
+private:
+    net::io_context& io_context_;
+    TimeoutScheduler& scheduler_;
+    TimeoutToken token_;
+    net::experimental::channel<void(IoErrorCode)> signal_;
+    bool waiting_ = false;
 };
 
 }  // namespace acpp

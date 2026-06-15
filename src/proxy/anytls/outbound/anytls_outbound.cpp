@@ -10,11 +10,12 @@
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
+#include <asio/experimental/channel.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
-#include <asio/steady_timer.hpp>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -133,7 +134,10 @@ struct Handler::ClientSession {
     class LogicalStream final {
     public:
         LogicalStream(net::io_context& io_context, uint32_t stream_id)
-            : io_context_(io_context), sid_(stream_id) {}
+            : io_context_(io_context)
+            , timeout_scheduler_(TimeoutScheduler::ForIoContext(io_context))
+            , syn_signal_(io_context, 1)
+            , sid_(stream_id) {}
 
         ~LogicalStream() noexcept {
             Cancel();
@@ -172,9 +176,7 @@ struct Handler::ClientSession {
             }
             closed_ = true;
             error_ = error;
-            if (syn_timer_) {
-                syn_timer_->cancel();
-            }
+            WakeSynWaiter();
             WakePayloadReader();
         }
 
@@ -184,9 +186,7 @@ struct Handler::ClientSession {
             }
             syn_ack_done_ = true;
             syn_ack_error_ = error;
-            if (syn_timer_) {
-                syn_timer_->cancel();
-            }
+            WakeSynWaiter();
         }
 
         net::awaitable<std::expected<void, ErrorCode>> WaitSynAck(std::chrono::seconds timeout) {
@@ -196,20 +196,32 @@ struct Handler::ClientSession {
                 }
                 co_return std::unexpected(syn_ack_error_);
             }
-            syn_timer_ = std::make_unique<net::steady_timer>(io_context_);
-            syn_timer_->expires_after(timeout);
-            auto [ec] = co_await syn_timer_->async_wait(net::as_tuple(net::use_awaitable));
-            syn_timer_.reset();
+            syn_waiting_ = true;
+            syn_timed_out_ = false;
+            syn_timeout_token_ = timeout_scheduler_.ScheduleAfter(
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+                [this]() {
+                    syn_timeout_token_.Reset();
+                    syn_timed_out_ = true;
+                    if (syn_waiting_) {
+                        (void)syn_signal_.try_send(IoErrorCode{});
+                    }
+                });
+            auto [ec] = co_await syn_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
+            syn_waiting_ = false;
+            timeout_scheduler_.Cancel(syn_timeout_token_);
             if (syn_ack_done_) {
                 if (syn_ack_error_ == ErrorCode::OK) {
                     co_return std::expected<void, ErrorCode>{};
                 }
                 co_return std::unexpected(syn_ack_error_);
             }
-            if (ec == io_error::operation_aborted) {
-                co_return std::expected<void, ErrorCode>{};
+            if (syn_timed_out_) {
+                co_return std::unexpected(ErrorCode::TIMEOUT);
             }
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return std::expected<void, ErrorCode>{};
         }
 
         void Cancel() noexcept {
@@ -220,9 +232,7 @@ struct Handler::ClientSession {
             error_ = ErrorCode::CANCELLED;
             queue_.clear();
             queued_bytes_ = 0;
-            if (syn_timer_) {
-                syn_timer_->cancel();
-            }
+            WakeSynWaiter();
             WakePayloadReader();
         }
 
@@ -261,10 +271,15 @@ struct Handler::ClientSession {
             error_ = error;
             queue_.clear();
             queued_bytes_ = 0;
-            if (syn_timer_) {
-                syn_timer_->cancel();
-            }
+            WakeSynWaiter();
             WakePayloadReader();
+        }
+
+        void WakeSynWaiter() noexcept {
+            timeout_scheduler_.Cancel(syn_timeout_token_);
+            if (syn_waiting_) {
+                (void)syn_signal_.try_send(IoErrorCode{});
+            }
         }
 
         void WakePayloadReader() noexcept {
@@ -272,8 +287,10 @@ struct Handler::ClientSession {
         }
 
         net::io_context& io_context_;
+        TimeoutScheduler& timeout_scheduler_;
         std::unique_ptr<PendingWait> payload_waiter_;
-        std::unique_ptr<net::steady_timer> syn_timer_;
+        TimeoutToken syn_timeout_token_;
+        net::experimental::channel<void(IoErrorCode)> syn_signal_;
         uint32_t sid_ = 0;
         std::deque<buf::MultiBuffer> queue_;
         size_t queued_bytes_ = 0;
@@ -281,11 +298,13 @@ struct Handler::ClientSession {
         ErrorCode syn_ack_error_ = ErrorCode::OK;
         bool closed_ = false;
         bool syn_ack_done_ = false;
+        bool syn_waiting_ = false;
+        bool syn_timed_out_ = false;
     };
 
     ClientSession(net::io_context& io_context, std::unique_ptr<AsyncStream> s)
         : stream(std::move(s))
-        , write_timer(io_context) {}
+        , write_signal(io_context, 1) {}
 
     std::unique_ptr<AsyncStream> stream;
     PaddingScheme padding_scheme = DefaultPaddingScheme();
@@ -294,7 +313,7 @@ struct Handler::ClientSession {
     bool settings_sent = false;
     uint8_t peer_version = 0;
     std::chrono::steady_clock::time_point idle_since{};
-    net::steady_timer write_timer;
+    net::experimental::channel<void(IoErrorCode)> write_signal;
     std::mutex streams_mu;
     std::unordered_map<uint32_t, std::weak_ptr<LogicalStream>> logical_streams;
     size_t active_streams = 0;
@@ -323,7 +342,7 @@ struct Handler::ClientSession {
 
     void CloseAll(ErrorCode error) {
         closed.store(true);
-        write_timer.cancel();
+        WakeWriter();
         {
             std::lock_guard lock(streams_mu);
             for (auto& [sid, weak] : logical_streams) {
@@ -341,11 +360,9 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>> WaitWriteTurn() {
         while (write_busy && !closed.load()) {
-            write_timer.expires_after(std::chrono::hours(24));
-            auto [ec] = co_await write_timer.async_wait(net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            auto [ec] = co_await write_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
         }
         if (closed.load() || !stream) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
@@ -356,7 +373,11 @@ struct Handler::ClientSession {
 
     void ReleaseWriteTurn() {
         write_busy = false;
-        write_timer.cancel();
+        WakeWriter();
+    }
+
+    void WakeWriter() noexcept {
+        (void)write_signal.try_send(IoErrorCode{});
     }
 
     net::awaitable<std::expected<void, ErrorCode>>

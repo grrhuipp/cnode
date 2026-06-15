@@ -8,6 +8,7 @@
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -599,8 +600,7 @@ struct UDPSessionManager::Impl {
          std::chrono::seconds session_timeout)
         : io_context(io_context)
         , dns_service(dns_service)
-        , session_timeout(session_timeout)
-        , cleanup_timer(io_context) {}
+        , session_timeout(session_timeout) {}
 
     struct SessionDeleter {
         void operator()(UDPSession* session) const noexcept;
@@ -612,7 +612,7 @@ struct UDPSessionManager::Impl {
     std::chrono::seconds session_timeout;
     memory::ThreadLocalUnorderedMap<std::string, SessionPtr> sessions;
     memory::ThreadLocalVector<SessionPtr> retired_sessions;
-    net::steady_timer cleanup_timer;
+    TimeoutToken cleanup_token;
     bool running = false;
     uint64_t total_packets_sent = 0;
     uint64_t total_packets_received = 0;
@@ -717,10 +717,11 @@ void UDPSessionManager::CleanupExpiredSessions() {
         MaybeShrinkHashContainer(impl_->sessions, 64);
     }
 
-    // 每 30 秒清理一次
-    impl_->cleanup_timer.expires_after(std::chrono::seconds(defaults::kUdpSessionCleanupInterval));
-    impl_->cleanup_timer.async_wait([this](IoErrorCode ec) {
-        if (!ec && impl_->running) {
+    impl_->cleanup_token = TimeoutScheduler::ForIoContext(impl_->io_context).ScheduleAfter(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::seconds(defaults::kUdpSessionCleanupInterval)),
+        [this]() {
+        if (impl_->running) {
             CleanupExpiredSessions();
         }
     });
@@ -728,7 +729,7 @@ void UDPSessionManager::CleanupExpiredSessions() {
 
 void UDPSessionManager::StopAll() {
     impl_->running = false;
-    impl_->cleanup_timer.cancel();
+    TimeoutScheduler::ForIoContext(impl_->io_context).Cancel(impl_->cleanup_token);
 
     for (const auto& [id, session] : impl_->sessions) {
         session->Stop();

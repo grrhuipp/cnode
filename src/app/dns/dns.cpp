@@ -1,7 +1,8 @@
 #include "cache_internal.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
-#include <asio/cancel_after.hpp>
+#include <asio/experimental/channel.hpp>
 #include <asio/ip/udp.hpp>
 
 #include <algorithm>
@@ -90,7 +91,14 @@ struct DNS::Impl {
     };
 
     struct ResolveWaiter {
-        net::steady_timer* timer = nullptr;
+        explicit ResolveWaiter(net::io_context& io_context)
+            : signal(io_context, 1) {}
+
+        void Notify() noexcept {
+            (void)signal.try_send(IoErrorCode{});
+        }
+
+        net::experimental::channel<void(IoErrorCode)> signal;
         DnsResult result;
         bool completed = false;
     };
@@ -202,13 +210,10 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
             co_return inflight->result;
         }
 
-        net::steady_timer wait_timer(io_context);
-        wait_timer.expires_at(net::steady_timer::time_point::max());
-        ResolveWaiter waiter;
-        waiter.timer = &wait_timer;
+        ResolveWaiter waiter(io_context);
         inflight->waiters.push_back(&waiter);
 
-        (void)co_await wait_timer.async_wait(
+        (void)co_await waiter.signal.async_receive(
             net::as_tuple(net::use_awaitable));
 
         if (waiter.completed) {
@@ -261,12 +266,12 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
     }
 
     for (auto* waiter : waiters) {
-        if (!waiter || !waiter->timer) {
+        if (!waiter) {
             continue;
         }
         waiter->result = result;
         waiter->completed = true;
-        waiter->timer->cancel();
+        waiter->Notify();
     }
 
     co_return result;
@@ -357,16 +362,20 @@ net::awaitable<DnsResult> DNS::Impl::QueryServer(
     }
 
     std::array<uint8_t, 512> response{};
-    net::steady_timer timeout_timer(io_context);
+    bool timed_out = false;
+    TimeoutToken timeout_token = TimeoutScheduler::ForIoContext(io_context).ScheduleAfter(
+        std::chrono::seconds(config.timeout_sec),
+        [&socket, &timed_out]() {
+            timed_out = true;
+            IoErrorCode ignored;
+            socket.cancel(ignored);
+        });
     auto [recv_ec, received] = co_await socket.async_receive(
         net::buffer(response),
-        net::cancel_after(
-            timeout_timer,
-            std::chrono::seconds(config.timeout_sec),
-            net::as_tuple(net::use_awaitable)));
+        net::as_tuple(net::use_awaitable));
+    TimeoutScheduler::ForIoContext(io_context).Cancel(timeout_token);
 
-    if (recv_ec == io_error::operation_aborted &&
-        timeout_timer.expiry() <= net::steady_timer::clock_type::now()) {
+    if (recv_ec == io_error::operation_aborted && timed_out) {
         result.error = ErrorCode::DNS_TIMEOUT;
         result.error_msg = "DNS query timed out";
         co_return result;

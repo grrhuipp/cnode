@@ -25,6 +25,12 @@ namespace acpp {
 
 namespace {
 
+ss::KeyBytes ToSsKey(const proxyman::inbound::PreparedKeyBytes& key) {
+    ss::KeyBytes out;
+    out.assign(key.span());
+    return out;
+}
+
 class ShadowsocksOnlineSession {
 public:
     ShadowsocksOnlineSession(ss::Validator& validator,
@@ -286,7 +292,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     result.user_email = profile.email;
     result.speed_limit = profile.speed_limit;
     result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
-        user.derived_key,
+        ToSsKey(user.derived_key),
         cipher_info_);
     return result;
 }
@@ -365,6 +371,25 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
+acpp::proxyman::inbound::PreparedAeadCipher ToPreparedCipher(acpp::ss::SsCipherType type) {
+    using Prepared = acpp::proxyman::inbound::PreparedAeadCipher;
+    switch (type) {
+        case acpp::ss::SsCipherType::AES_128_GCM:
+            return Prepared::AES_128_GCM;
+        case acpp::ss::SsCipherType::AES_256_GCM:
+            return Prepared::AES_256_GCM;
+        case acpp::ss::SsCipherType::CHACHA20_POLY1305:
+            return Prepared::CHACHA20_POLY1305;
+    }
+    return Prepared::AES_256_GCM;
+}
+
+acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) {
+    acpp::proxyman::inbound::PreparedKeyBytes prepared;
+    prepared.assign(key.span());
+    return prepared;
+}
+
 const bool kSsInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
 
@@ -372,14 +397,15 @@ const bool kSsInboundRegistered = [] {
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            if (!deps.ss_validator || !deps.stats) {
+            auto* validator = deps.ValidatorAs<acpp::ss::Validator>();
+            if (!validator || !deps.stats) {
                 return nullptr;
             }
             const std::string method = req.cipher_method.empty()
                 ? std::string(acpp::constants::protocol::kAes256Gcm)
                 : req.cipher_method;
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
-                *deps.ss_validator,
+                *validator,
                 *deps.stats,
                 limiter,
                 method);
@@ -390,14 +416,15 @@ const bool kSsInboundRegistered = [] {
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::proxyman::inbound::UdpHandler> {
-            if (!deps.ss_validator || !deps.stats) {
+            auto* validator = deps.ValidatorAs<acpp::ss::Validator>();
+            if (!validator || !deps.stats) {
                 return nullptr;
             }
             const std::string method = req.cipher_method.empty()
                 ? std::string(acpp::constants::protocol::kAes256Gcm)
                 : req.cipher_method;
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
-                *deps.ss_validator, *deps.stats, limiter, method);
+                *validator, *deps.stats, limiter, method);
         };
 
     reg.build_static_users =
@@ -409,20 +436,21 @@ const bool kSsInboundRegistered = [] {
                 return std::nullopt;
             }
 
-            std::vector<acpp::ss::SsUserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             int64_t synthetic_uid = -1;
 
             for (const auto& client : config.clients) {
                 if (client.password.empty()) {
                     continue;
                 }
-                acpp::ss::SsUserInfo info;
+                acpp::proxyman::inbound::PreparedShadowsocksUser info;
                 info.password    = client.password;
                 info.profile.user_id = synthetic_uid--;
-                info.cipher_type = cipher_info->type;
+                info.cipher_type = ToPreparedCipher(cipher_info->type);
                 info.key_size    = cipher_info->key_size;
                 info.salt_size   = cipher_info->salt_size;
-                info.derived_key = acpp::ss::DeriveKey(client.password, cipher_info->key_size);
+                info.derived_key = ToPreparedKey(
+                    acpp::ss::DeriveKey(client.password, cipher_info->key_size));
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
@@ -445,24 +473,24 @@ const bool kSsInboundRegistered = [] {
                 return std::nullopt;
             }
 
-            std::vector<acpp::ss::SsUserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(runtime_users.size());
 
             for (const auto& runtime_user : runtime_users) {
                 if (runtime_user.password.empty()) {
                     continue;
                 }
-                acpp::ss::SsUserInfo info;
+                acpp::proxyman::inbound::PreparedShadowsocksUser info;
                 info.password = runtime_user.password;
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;
                 info.profile.device_limit = runtime_user.device_limit;
-                info.cipher_type = cipher_info->type;
+                info.cipher_type = ToPreparedCipher(cipher_info->type);
                 info.key_size = cipher_info->key_size;
                 info.salt_size = cipher_info->salt_size;
-                info.derived_key = acpp::ss::DeriveKey(
-                    runtime_user.password, cipher_info->key_size);
+                info.derived_key = ToPreparedKey(acpp::ss::DeriveKey(
+                    runtime_user.password, cipher_info->key_size));
                 users.push_back(std::move(info));
             }
 

@@ -13,7 +13,7 @@
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
-#include <asio/steady_timer.hpp>
+#include <asio/experimental/channel.hpp>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -557,7 +557,7 @@ public:
         , pressure_idle_timeout_(pressure_idle_timeout)
         , padding_scheme_raw_(std::move(padding_scheme_raw))
         , padding_scheme_md5_(std::move(padding_scheme_md5))
-        , write_timer_(io_context) {
+        , write_signal_(io_context, 1) {
         CopySessionContext(base_ctx, base_ctx_);
     }
 
@@ -573,11 +573,9 @@ public:
     net::awaitable<std::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
         while (write_busy_ && !cancelled_) {
-            write_timer_.expires_after(std::chrono::hours(24));
-            auto [ec] = co_await write_timer_.async_wait(net::as_tuple(net::use_awaitable));
-            if (ec == io_error::operation_aborted) {
-                continue;
-            }
+            auto [ec] = co_await write_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
         }
         if (cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
@@ -589,7 +587,7 @@ public:
             [](void* p) {
                 auto* self = static_cast<AnyTLSDemuxSession*>(p);
                 self->write_busy_ = false;
-                self->write_timer_.cancel();
+                self->WakeWriter();
             }};
         (void)guard;
 
@@ -644,7 +642,7 @@ private:
             return;
         }
         cancelled_ = true;
-        write_timer_.cancel();
+        WakeWriter();
         for (auto& [sid, sub] : streams_) {
             (void)sid;
             if (sub) {
@@ -655,6 +653,10 @@ private:
         if (stream_) {
             stream_->CloseAbortive();
         }
+    }
+
+    void WakeWriter() noexcept {
+        (void)write_signal_.try_send(IoErrorCode{});
     }
 
     net::awaitable<void> StartDispatch(std::shared_ptr<AnyTLSSubStream> sub,
@@ -672,7 +674,7 @@ private:
     uint32_t pressure_idle_timeout_ = 0;
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
-    net::steady_timer write_timer_;
+    net::experimental::channel<void(IoErrorCode)> write_signal_;
     std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     std::unordered_map<uint32_t, StreamState> stream_states_;
     bool write_busy_ = false;
@@ -1060,17 +1062,18 @@ const bool kInboundRegistered = [] {
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            if (!deps.stats || !deps.anytls_validator) {
+            auto* validator = deps.ValidatorAs<acpp::anytls::Validator>();
+            if (!deps.stats || !validator) {
                 return nullptr;
             }
             return std::make_unique<acpp::anytls::inbound::Handler>(
-                *deps.stats, *deps.anytls_validator, limiter, req.anytls_padding_scheme);
+                *deps.stats, *validator, limiter, req.anytls_padding_scheme);
         };
 
     reg.build_static_users =
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::anytls::UserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
             users.reserve(config.clients.size());
             for (const auto& client : config.clients) {
                 const std::string& password =
@@ -1078,7 +1081,7 @@ const bool kInboundRegistered = [] {
                 if (password.empty()) {
                     continue;
                 }
-                acpp::anytls::UserInfo info;
+                acpp::proxyman::inbound::PreparedAnyTlsUser info;
                 info.password_hash = acpp::anytls::PasswordHash(password);
                 info.profile.email = client.email.empty() ? std::string(tag) : client.email;
                 users.push_back(std::move(info));
@@ -1092,13 +1095,13 @@ const bool kInboundRegistered = [] {
         [](const acpp::proxyman::inbound::BuildRequest& /*req*/,
            std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            std::vector<acpp::anytls::UserInfo> users;
+            std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
             users.reserve(runtime_users.size());
             for (const auto& runtime_user : runtime_users) {
                 if (runtime_user.password.empty()) {
                     continue;
                 }
-                acpp::anytls::UserInfo info;
+                acpp::proxyman::inbound::PreparedAnyTlsUser info;
                 info.password_hash = acpp::anytls::PasswordHash(runtime_user.password);
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;

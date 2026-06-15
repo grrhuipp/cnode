@@ -6,7 +6,6 @@
 #include "outboundbuilder.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/app/traffic_types.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/core/constants.hpp"
@@ -15,7 +14,6 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/serverstatus.hpp"
-#include "acppnode/proxy/inbound.hpp"
 
 #include <algorithm>
 #include <unordered_map>
@@ -82,18 +80,6 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
     for (const auto& worker : workers_) {
         auto* limiter = limiters_[worker->Id()].get();
 
-        auto handler = worker->NewInboundHandler(
-            inbound.protocol, limiter, inbound.handler_request);
-        if (!handler) {
-            LOG_WARN("Node {}/{}: create inbound handler failed, protocol={}",
-                     panel_name, node_id, inbound.protocol);
-            for (const auto& w : workers_) {
-                w->UnregisterListenerAsync(inbound.tag);
-            }
-            co_return false;
-        }
-        handler->SetBanTrackingEnabled(ban_tracking_enabled);
-
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
             std::vector<std::string>{inbound.tag, std::string(constants::protocol::kNode)},
@@ -104,19 +90,35 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
             inbound.proxy_protocol,
             proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag));
 
-        worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
+        const bool registered = co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->RegisterInboundTask(
+                inbound.protocol,
+                limiter,
+                inbound.handler_request,
+                std::move(receiver),
+                ban_tracking_enabled),
+            net::use_awaitable);
+
+        if (!registered) {
+            LOG_WARN("Node {}/{}: create inbound handler failed, protocol={}",
+                     panel_name, node_id, inbound.protocol);
+            for (const auto& w : workers_) {
+                w->UnregisterListenerAsync(inbound.tag);
+            }
+            co_return false;
+        }
     }
 
     for (const auto& worker : workers_) {
         worker->AddListenerAsync(inbound.binding);
         auto* limiter = limiters_[worker->Id()].get();
-
-        auto udp_handler = worker->NewUdpInboundHandler(
-            inbound.protocol, limiter, inbound.handler_request);
-        if (udp_handler) {
-            udp_handler->SetBanTrackingEnabled(ban_tracking_enabled);
-            worker->AddUdpListenerAsync(inbound.binding, std::move(udp_handler));
-        }
+        worker->AddUdpListenerAsync(
+            inbound.binding,
+            inbound.protocol,
+            limiter,
+            inbound.handler_request,
+            ban_tracking_enabled);
     }
 
     if (std::find(registered_tags_.begin(), registered_tags_.end(), inbound.tag)

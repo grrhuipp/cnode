@@ -8,6 +8,65 @@
 
 namespace acpp::ss {
 
+namespace {
+
+proxyman::inbound::PreparedAeadCipher ToPreparedCipher(SsCipherType type) {
+    using Prepared = proxyman::inbound::PreparedAeadCipher;
+    switch (type) {
+        case SsCipherType::AES_128_GCM:
+            return Prepared::AES_128_GCM;
+        case SsCipherType::AES_256_GCM:
+            return Prepared::AES_256_GCM;
+        case SsCipherType::CHACHA20_POLY1305:
+            return Prepared::CHACHA20_POLY1305;
+    }
+    return Prepared::AES_256_GCM;
+}
+
+SsCipherType ToSsCipher(proxyman::inbound::PreparedAeadCipher type) {
+    using Prepared = proxyman::inbound::PreparedAeadCipher;
+    switch (type) {
+        case Prepared::AES_128_GCM:
+            return SsCipherType::AES_128_GCM;
+        case Prepared::AES_256_GCM:
+            return SsCipherType::AES_256_GCM;
+        case Prepared::CHACHA20_POLY1305:
+            return SsCipherType::CHACHA20_POLY1305;
+    }
+    return SsCipherType::AES_256_GCM;
+}
+
+proxyman::inbound::PreparedKeyBytes ToPreparedKey(KeyBytes key) {
+    proxyman::inbound::PreparedKeyBytes prepared;
+    prepared.assign(key.span());
+    return prepared;
+}
+
+KeyBytes ToSsKey(const proxyman::inbound::PreparedKeyBytes& key) {
+    KeyBytes out;
+    out.assign(key.span());
+    return out;
+}
+
+std::vector<proxyman::inbound::PreparedShadowsocksUser>
+ToPreparedUsers(const std::vector<SsUserInfo>& users) {
+    std::vector<proxyman::inbound::PreparedShadowsocksUser> prepared;
+    prepared.reserve(users.size());
+    for (const auto& user : users) {
+        prepared.push_back(proxyman::inbound::PreparedShadowsocksUser{
+            .password = user.password,
+            .derived_key = ToPreparedKey(user.derived_key),
+            .cipher_type = ToPreparedCipher(user.cipher_type),
+            .key_size = user.key_size,
+            .salt_size = user.salt_size,
+            .profile = user.profile,
+        });
+    }
+    return prepared;
+}
+
+}  // namespace
+
 struct Validator::Impl {
     UserOnlineTracker stats;
 };
@@ -23,21 +82,21 @@ Validator& Validator::operator=(Validator&&) noexcept = default;
 void Validator::ApplyUsers(std::string_view tag,
                            const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.ss_users = users;
+    set.ss_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
 void Validator::AddUsers(std::string_view tag,
                          const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.ss_users = users;
+    set.ss_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
 void Validator::RemoveUsers(std::string_view tag,
                             const std::vector<SsUserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.ss_users = users;
+    set.ss_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kShadowsocks, tag, set);
 }
 
@@ -60,8 +119,8 @@ std::vector<SsUserInfo> Validator::GetUsersForTag(std::string_view tag) const {
     for (const auto& credential : *users.users) {
         SsUserInfo user;
         user.password = credential.password;
-        user.derived_key = credential.derived_key;
-        user.cipher_type = credential.cipher_type;
+        user.derived_key = ToSsKey(credential.derived_key);
+        user.cipher_type = ToSsCipher(credential.cipher_type);
         user.key_size = credential.key_size;
         user.salt_size = credential.salt_size;
         if (credential.profile) {
@@ -80,8 +139,8 @@ std::optional<SsUserInfo> Validator::FindUserById(std::string_view tag,
     }
     SsUserInfo user;
     user.password = credential->password;
-    user.derived_key = credential->derived_key;
-    user.cipher_type = credential->cipher_type;
+    user.derived_key = ToSsKey(credential->derived_key);
+    user.cipher_type = ToSsCipher(credential->cipher_type);
     user.key_size = credential->key_size;
     user.salt_size = credential->salt_size;
     if (credential->profile) {

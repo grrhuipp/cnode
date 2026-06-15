@@ -15,6 +15,31 @@
 namespace acpp {
 namespace vmess {
 
+namespace {
+
+proxyman::inbound::PreparedVmessUser ToPreparedUser(const MemoryAccount& user) {
+    return proxyman::inbound::PreparedVmessUser{
+        .uuid = user.uuid,
+        .uuid_bytes = user.uuid_bytes,
+        .cmd_key = user.cmd_key,
+        .auth_key = user.auth_key,
+        .cached_auth_aes_key = std::to_array(user.cached_auth_aes_key.key),
+        .profile = user.profile,
+    };
+}
+
+std::vector<proxyman::inbound::PreparedVmessUser>
+ToPreparedUsers(const std::vector<MemoryAccount>& users) {
+    std::vector<proxyman::inbound::PreparedVmessUser> prepared;
+    prepared.reserve(users.size());
+    for (const auto& user : users) {
+        prepared.push_back(ToPreparedUser(user));
+    }
+    return prepared;
+}
+
+}  // namespace
+
 struct TimedUserValidator::Impl {
     struct alignas(64) HotUserCache {
         static constexpr size_t kMaxEntries = 8192;
@@ -94,7 +119,7 @@ TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept
 
 void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
-    set.vmess_accounts = users;
+    set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
     impl_->hot_users.reset();
@@ -102,7 +127,7 @@ void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<Memo
 
 void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
-    set.vmess_accounts = users;
+    set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
     impl_->hot_users.reset();
@@ -110,7 +135,7 @@ void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<Memory
 
 void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
     proxyman::inbound::UserSet set;
-    set.vmess_accounts = users;
+    set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
     impl_->hot_users.reset();
@@ -147,7 +172,7 @@ TimedUserValidator::FindByAuthIDForTag(
 
     auto tryUser = [&](const proxyman::inbound::UserStore::VmessCredential& user) -> bool {
         std::array<uint8_t, 16> plaintext;
-        user.cached_auth_aes_key.ECBDecrypt(auth_id, plaintext.data());
+        AES128ECBDecrypt(user.cached_auth_aes_key.data(), auth_id, plaintext.data());
 
         int64_t timestamp = 0;
         for (int i = 0; i < 8; i++) {

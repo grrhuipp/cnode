@@ -9,6 +9,23 @@
 
 namespace acpp::anytls {
 
+namespace {
+
+std::vector<proxyman::inbound::PreparedAnyTlsUser>
+ToPreparedUsers(const std::vector<UserInfo>& users) {
+    std::vector<proxyman::inbound::PreparedAnyTlsUser> prepared;
+    prepared.reserve(users.size());
+    for (const auto& user : users) {
+        prepared.push_back(proxyman::inbound::PreparedAnyTlsUser{
+            .password_hash = user.password_hash,
+            .profile = user.profile,
+        });
+    }
+    return prepared;
+}
+
+}  // namespace
+
 std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
     std::array<uint8_t, 32> out{};
     unsigned int out_len = 0;
@@ -29,19 +46,19 @@ Validator& Validator::operator=(Validator&&) noexcept = default;
 
 void Validator::ApplyUsers(std::string_view tag, const std::vector<UserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.anytls_users = users;
+    set.anytls_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kAnyTLS, tag, set);
 }
 
 void Validator::AddUsers(std::string_view tag, const std::vector<UserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.anytls_users = users;
+    set.anytls_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kAnyTLS, tag, set);
 }
 
 void Validator::RemoveUsers(std::string_view tag, const std::vector<UserInfo>& users) {
     proxyman::inbound::UserSet set;
-    set.anytls_users = users;
+    set.anytls_users = ToPreparedUsers(users);
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kAnyTLS, tag, set);
 }
 

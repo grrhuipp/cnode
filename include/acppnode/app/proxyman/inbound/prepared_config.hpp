@@ -1,11 +1,12 @@
 #pragma once
 
-#include "acppnode/proxy/shadowsocks/user_info.hpp"
-#include "acppnode/proxy/anytls/user_info.hpp"
-#include "acppnode/proxy/trojan/user_info.hpp"
-#include "acppnode/proxy/vmess/account.hpp"
+#include "acppnode/common/user_profile.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,11 +31,69 @@ struct RuntimeUser {
     uint32_t device_limit = 0;
 };
 
+struct PreparedKeyBytes {
+    static constexpr size_t kMaxSize = 32;
+
+    std::array<uint8_t, kMaxSize> bytes{};
+    size_t size = 0;
+
+    [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
+    [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
+    [[nodiscard]] bool empty() const noexcept { return size == 0; }
+    [[nodiscard]] std::span<const uint8_t> span() const noexcept {
+        return {bytes.data(), size};
+    }
+
+    bool assign(std::span<const uint8_t> src) noexcept {
+        if (src.size() > bytes.size()) {
+            size = 0;
+            return false;
+        }
+        std::copy(src.begin(), src.end(), bytes.begin());
+        size = src.size();
+        return true;
+    }
+};
+
+enum class PreparedAeadCipher : uint8_t {
+    AES_128_GCM = 0,
+    AES_256_GCM = 1,
+    CHACHA20_POLY1305 = 2,
+};
+
+struct PreparedVmessUser {
+    std::string uuid;
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::array<uint8_t, 16> cmd_key{};
+    std::array<uint8_t, 16> auth_key{};
+    std::array<uint8_t, 16> cached_auth_aes_key{};
+    ::acpp::UserProfile profile;
+};
+
+struct PreparedTrojanUser {
+    std::string password_hash;
+    ::acpp::UserProfile profile;
+};
+
+struct PreparedShadowsocksUser {
+    std::string password;
+    PreparedKeyBytes derived_key;
+    PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
+    size_t key_size = 32;
+    size_t salt_size = 32;
+    ::acpp::UserProfile profile;
+};
+
+struct PreparedAnyTlsUser {
+    std::array<uint8_t, 32> password_hash{};
+    ::acpp::UserProfile profile;
+};
+
 struct UserSet {
-    std::vector<::acpp::vmess::MemoryAccount> vmess_accounts;
-    std::vector<::acpp::trojan::TrojanUserInfo> trojan_users;
-    std::vector<::acpp::ss::SsUserInfo> ss_users;
-    std::vector<::acpp::anytls::UserInfo> anytls_users;
+    std::vector<PreparedVmessUser> vmess_accounts;
+    std::vector<PreparedTrojanUser> trojan_users;
+    std::vector<PreparedShadowsocksUser> ss_users;
+    std::vector<PreparedAnyTlsUser> anytls_users;
 };
 
 }  // namespace acpp::proxyman::inbound
