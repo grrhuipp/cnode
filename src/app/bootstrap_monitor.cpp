@@ -86,7 +86,6 @@ CollectWorkerRuntimeStats(const RuntimeContext& ctx) {
     co_return snapshots;
 }
 
-#ifdef USE_MIMALLOC
 net::awaitable<void> CollectWorkerHeaps(const RuntimeContext& ctx, bool force) {
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
@@ -113,7 +112,6 @@ net::awaitable<void> CollectWorkerHeaps(const RuntimeContext& ctx, bool force) {
         memory::CollectSteady();
     }
 }
-#endif
 
 StatsSnapshot AggregateWorkerStats(
     const std::vector<Worker::RuntimeStatsSnapshot>& worker_snapshots) {
@@ -131,81 +129,79 @@ StatsSnapshot AggregateWorkerStats(
 
 net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState& state) {
     net::steady_timer timer(ctx.main_ctx);
-#ifdef USE_MIMALLOC
-    uint32_t last_sample_total_conns = 0;
-    uint64_t last_force_collect_total_connections = 0;
-    bool churn_collect_baseline_set = false;
-    auto last_force_collect_at = steady_clock::time_point{};
-    auto last_steady_collect_at = steady_clock::time_point{};
-#endif
+    [[maybe_unused]] uint32_t last_sample_total_conns = 0;
+    [[maybe_unused]] uint64_t last_force_collect_total_connections = 0;
+    [[maybe_unused]] bool churn_collect_baseline_set = false;
+    [[maybe_unused]] auto last_force_collect_at = steady_clock::time_point{};
+    [[maybe_unused]] auto last_steady_collect_at = steady_clock::time_point{};
     while (state.running) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
         auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
         ctx.stats.SampleNow(aggregate_stats);
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
-#ifdef USE_MIMALLOC
-        constexpr uint32_t kForceCollectMinPrevConns = 4096;
-        constexpr uint32_t kForceCollectDropFactor = 4;
-        constexpr uint32_t kForceCollectConnFloor = 64;
-        constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
-        constexpr uint64_t kChurnForceCollectConnections = 2048;
-        constexpr uint32_t kChurnForceCollectMinConns = 512;
-        constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
-        constexpr uint32_t kSteadyCollectMinConns = 512;
-        constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
+        if constexpr (memory::kAllocatorCollects) {
+            constexpr uint32_t kForceCollectMinPrevConns = 4096;
+            constexpr uint32_t kForceCollectDropFactor = 4;
+            constexpr uint32_t kForceCollectConnFloor = 64;
+            constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
+            constexpr uint64_t kChurnForceCollectConnections = 2048;
+            constexpr uint32_t kChurnForceCollectMinConns = 512;
+            constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
+            constexpr uint32_t kSteadyCollectMinConns = 512;
+            constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
 
-        uint32_t total_conns = 0;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            total_conns += worker_snapshot.active_connections;
+            uint32_t total_conns = 0;
+            for (const auto& worker_snapshot : worker_snapshots) {
+                total_conns += worker_snapshot.active_connections;
+            }
+
+            uint32_t force_threshold = last_sample_total_conns / kForceCollectDropFactor;
+            if (force_threshold < kForceCollectConnFloor) {
+                force_threshold = kForceCollectConnFloor;
+            }
+
+            const bool burst_drain =
+                last_sample_total_conns >= kForceCollectMinPrevConns &&
+                total_conns <= force_threshold;
+            const bool newly_idle = (total_conns == 0 && last_sample_total_conns > 0);
+            const auto now = steady_clock::now();
+            const bool cooldown_ok =
+                last_force_collect_at.time_since_epoch().count() == 0 ||
+                now - last_force_collect_at >= kForceCollectCooldown;
+            if (!churn_collect_baseline_set) {
+                last_force_collect_total_connections = aggregate_stats.connections_total;
+                churn_collect_baseline_set = true;
+            }
+            const uint64_t churn_since_force =
+                aggregate_stats.connections_total >= last_force_collect_total_connections
+                    ? aggregate_stats.connections_total - last_force_collect_total_connections
+                    : 0;
+            const bool churn_collect_due =
+                total_conns >= kChurnForceCollectMinConns &&
+                churn_since_force >= kChurnForceCollectConnections &&
+                (last_force_collect_at.time_since_epoch().count() == 0 ||
+                 now - last_force_collect_at >= kChurnForceCollectCooldown);
+            const bool steady_collect_due =
+                total_conns >= kSteadyCollectMinConns &&
+                (last_steady_collect_at.time_since_epoch().count() == 0 ||
+                 now - last_steady_collect_at >= kSteadyCollectInterval);
+
+            if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
+                const char* reason =
+                    churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
+                LOG_INFO("mem-collect force reason={} conn={} churn={}",
+                         reason, total_conns, churn_since_force);
+                co_await CollectWorkerHeaps(ctx, true);
+                last_force_collect_at = now;
+                last_steady_collect_at = now;
+                last_force_collect_total_connections = aggregate_stats.connections_total;
+            } else if (steady_collect_due) {
+                co_await CollectWorkerHeaps(ctx, false);
+                last_steady_collect_at = now;
+            }
+
+            last_sample_total_conns = total_conns;
         }
-
-        uint32_t force_threshold = last_sample_total_conns / kForceCollectDropFactor;
-        if (force_threshold < kForceCollectConnFloor) {
-            force_threshold = kForceCollectConnFloor;
-        }
-
-        const bool burst_drain =
-            last_sample_total_conns >= kForceCollectMinPrevConns &&
-            total_conns <= force_threshold;
-        const bool newly_idle = (total_conns == 0 && last_sample_total_conns > 0);
-        const auto now = steady_clock::now();
-        const bool cooldown_ok =
-            last_force_collect_at.time_since_epoch().count() == 0 ||
-            now - last_force_collect_at >= kForceCollectCooldown;
-        if (!churn_collect_baseline_set) {
-            last_force_collect_total_connections = aggregate_stats.connections_total;
-            churn_collect_baseline_set = true;
-        }
-        const uint64_t churn_since_force =
-            aggregate_stats.connections_total >= last_force_collect_total_connections
-                ? aggregate_stats.connections_total - last_force_collect_total_connections
-                : 0;
-        const bool churn_collect_due =
-            total_conns >= kChurnForceCollectMinConns &&
-            churn_since_force >= kChurnForceCollectConnections &&
-            (last_force_collect_at.time_since_epoch().count() == 0 ||
-             now - last_force_collect_at >= kChurnForceCollectCooldown);
-        const bool steady_collect_due =
-            total_conns >= kSteadyCollectMinConns &&
-            (last_steady_collect_at.time_since_epoch().count() == 0 ||
-             now - last_steady_collect_at >= kSteadyCollectInterval);
-
-        if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
-            const char* reason =
-                churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
-            LOG_INFO("mem-collect force reason={} conn={} churn={}",
-                     reason, total_conns, churn_since_force);
-            co_await CollectWorkerHeaps(ctx, true);
-            last_force_collect_at = now;
-            last_steady_collect_at = now;
-            last_force_collect_total_connections = aggregate_stats.connections_total;
-        } else if (steady_collect_due) {
-            co_await CollectWorkerHeaps(ctx, false);
-            last_steady_collect_at = now;
-        }
-
-        last_sample_total_conns = total_conns;
-#endif
         {
             static auto last_log_flush_at = steady_clock::time_point{};
             const auto flush_now = steady_clock::now();

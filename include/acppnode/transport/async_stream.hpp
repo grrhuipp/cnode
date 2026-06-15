@@ -63,8 +63,8 @@ private:
 class AsyncStream : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
     // Stream 对象是每连接常驻热路径状态。所有 AsyncStream 派生类的
-    // std::make_unique 分配都会落到当前 Worker ThreadScope 的 heap；
-    // 冷路径未进入 ThreadScope 时则回退到 mimalloc 默认线程 heap。
+    // std::make_unique 分配都会走当前构建选择的 allocator；mimalloc 构建
+    // 会落到 Worker ThreadScope，glibc 诊断构建则走 system allocator。
     [[nodiscard]] static void* operator new(std::size_t size);
     [[nodiscard]] static void* operator new(std::size_t size, std::align_val_t alignment);
     static void operator delete(void* ptr) noexcept;

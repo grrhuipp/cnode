@@ -9,7 +9,8 @@ foreach(pattern IN ITEMS
         "option\\(CNODE_HEAPTRACK_BUILD"
         "CNODE_HEAPTRACK_BUILD requires a glibc toolchain, not musl"
         "CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC"
-        "set\\(USE_MIMALLOC OFF\\)"
+        "set\\(USE_MIMALLOC OFF CACHE BOOL"
+        "FORCE\\)"
         "set\\(BUILD_CHANNEL \"heaptrack\"\\)")
     if(NOT cmake_source MATCHES "${pattern}")
         message(FATAL_ERROR "CMake heaptrack variant guard is missing: ${pattern}")

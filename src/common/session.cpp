@@ -4,6 +4,7 @@
 #include "acppnode/common/network.hpp"
 #include "acppnode/core/constants.hpp"
 
+#include <array>
 #include <chrono>
 #include <format>
 
@@ -120,8 +121,30 @@ std::string FormatAccessLog(
 // 格式化时间戳（本地时区，跨平台）
 std::string FormatTimestamp(int64_t timestamp_us) {
     using namespace std::chrono;
-    const auto tp = floor<seconds>(system_clock::time_point{microseconds{timestamp_us}});
-    return FormatLocalTime(tp, "%Y-%m-%d %H:%M:%S");
+    struct CachedTimestamp {
+        int64_t sec = -1;
+        std::string value;
+    };
+
+    constexpr size_t kTimestampCacheSize = 8;
+    thread_local std::array<CachedTimestamp, kTimestampCacheSize> cache;
+    thread_local size_t next_slot = 0;
+
+    const auto sec = duration_cast<seconds>(microseconds{timestamp_us}).count();
+    for (const auto& entry : cache) {
+        if (entry.sec == sec) {
+            return entry.value;
+        }
+    }
+
+    const auto tp = system_clock::time_point{seconds{sec}};
+    auto value = FormatLocalTime(tp, "%Y-%m-%d %H:%M:%S");
+    cache[next_slot] = CachedTimestamp{
+        .sec = sec,
+        .value = value,
+    };
+    next_slot = (next_slot + 1) % kTimestampCacheSize;
+    return value;
 }
 
 uint64_t GenerateWorkerConnId(uint32_t worker_id) {

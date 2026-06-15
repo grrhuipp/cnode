@@ -77,8 +77,8 @@ option(USE_MIMALLOC "Use mimalloc as default memory allocator" ON)
 option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
 
 if(CNODE_HEAPTRACK_BUILD AND USE_MIMALLOC)
-    message(STATUS "heaptrack variant: disabling mimalloc")
-    set(USE_MIMALLOC OFF)
+    message(STATUS "heaptrack/glibc variant: forcing system allocator (mimalloc disabled)")
+    set(USE_MIMALLOC OFF CACHE BOOL "Use mimalloc as default memory allocator" FORCE)
 endif()
 
 # ============================================================================
@@ -125,6 +125,14 @@ FetchContent_Declare(
     SOURCE_SUBDIR cnode-no-upstream-cmake
 )
 FetchContent_MakeAvailable(zlib)
+
+FetchContent_Declare(
+    concurrentqueue
+    GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+    GIT_TAG v1.0.5
+)
+FetchContent_MakeAvailable(concurrentqueue)
+message(STATUS "Using moodycamel ConcurrentQueue via FetchContent")
 
 add_library(cnode_zlib STATIC
     ${zlib_SOURCE_DIR}/adler32.c
@@ -301,6 +309,7 @@ add_executable(cnode ${CNODE_SOURCES})
 
 target_include_directories(cnode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${concurrentqueue_SOURCE_DIR}
 )
 
 if(HAS_MIMALLOC)
@@ -1506,6 +1515,27 @@ add_test(
     COMMAND ${CMAKE_COMMAND}
         -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_lazy_mimalloc_pool_shrink.cmake
+)
+
+add_test(
+    NAME no_glibc_allocator_rss_retention
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_glibc_allocator_rss_retention.cmake
+)
+
+add_test(
+    NAME no_uncached_access_timestamp_format
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_uncached_access_timestamp_format.cmake
+)
+
+add_test(
+    NAME no_sync_access_logger_hot_path
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_sync_access_logger_hot_path.cmake
 )
 
 add_test(

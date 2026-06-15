@@ -28,10 +28,14 @@ foreach(pattern IN ITEMS
         "FetchContent_Declare\\([ \t\r\n]*zlib"
         "GIT_REPOSITORY https://github\\.com/madler/zlib\\.git"
         "add_library\\(cnode_zlib STATIC"
+        "FetchContent_Declare\\([ \t\r\n]*concurrentqueue"
+        "GIT_REPOSITORY https://github\\.com/cameron314/concurrentqueue\\.git"
+        "GIT_TAG v1\\.0\\.5"
         "FetchContent_Declare\\([ \t\r\n]*mimalloc"
         "GIT_REPOSITORY https://github\\.com/microsoft/mimalloc\\.git"
         "CNODE_AWSLC_NO_ASM"
-        "Using AWS-LC via FetchContent")
+        "Using AWS-LC via FetchContent"
+        "Using moodycamel ConcurrentQueue via FetchContent")
     if(NOT cmake_source MATCHES "${pattern}")
         message(FATAL_ERROR "CMake must keep FetchContent dependency wiring: ${pattern}")
     endif()
@@ -43,6 +47,7 @@ foreach(pattern IN ITEMS
         "OpenSSL::Crypto"
         "find_package\\(asio"
         "find_package\\(ZLIB"
+        "find_package\\(concurrentqueue"
         "find_package\\(mimalloc")
     if(cmake_source MATCHES "${pattern}")
         message(FATAL_ERROR "CMake must not use package-manager OpenSSL/asio/zlib/mimalloc lookups: ${pattern}")

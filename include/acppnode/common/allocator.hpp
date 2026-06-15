@@ -18,16 +18,29 @@
 #include <sys/prctl.h>
 #endif
 
+#if !defined(USE_MIMALLOC) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #ifdef USE_MIMALLOC
 #include <mimalloc.h>
 #endif
 
 namespace acpp::memory {
 
+inline void DisableTransparentHugePages() noexcept {
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    // VPS kernels often run THP in "always" mode. Proxy workloads churn many
+    // small objects, and 2MB anonymous huge pages amplify RSS retention.
+    (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
+}
+
 #ifdef USE_MIMALLOC
 
 inline constexpr long kMimallocPurgeDelayMs = 50;
 inline constexpr long kMimallocMinimalPurgeSizeKiB = 16;
+inline constexpr bool kAllocatorCollects = true;
 
 namespace detail {
 
@@ -70,11 +83,7 @@ inline std::pmr::memory_resource* GetThreadLocalHeapResource() noexcept {
 }
 
 inline void ConfigureProcessAllocator() noexcept {
-#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
-    // VPS kernels often run THP in "always" mode. For a proxy with many small
-    // churned objects, 2MB anonymous huge pages amplify RSS retention.
-    (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
+    DisableTransparentHugePages();
 
     // RSS matters more than virtual retention for long-running proxy workloads.
     // Allow purged pages to be decommitted so connection churn returns memory to
@@ -303,7 +312,25 @@ using ByteVector = ThreadLocalVector<uint8_t>;
 
 #else
 
-inline void ConfigureProcessAllocator() noexcept {}
+inline constexpr bool kAllocatorCollects =
+#if defined(__GLIBC__)
+    true;
+#else
+    false;
+#endif
+
+inline constexpr int kGlibcArenaMax = 2;
+inline constexpr int kGlibcTrimThreshold = 64 * 1024;
+inline constexpr int kGlibcMmapThreshold = 64 * 1024;
+
+inline void ConfigureProcessAllocator() noexcept {
+    DisableTransparentHugePages();
+#if defined(__GLIBC__)
+    (void)::mallopt(M_ARENA_MAX, kGlibcArenaMax);
+    (void)::mallopt(M_TRIM_THRESHOLD, kGlibcTrimThreshold);
+    (void)::mallopt(M_MMAP_THRESHOLD, kGlibcMmapThreshold);
+#endif
+}
 inline void* AllocateRaw(size_t size,
                          size_t /*alignment*/ = alignof(std::max_align_t)) noexcept {
     return ::operator new(size, std::nothrow);
@@ -330,8 +357,16 @@ inline void DeallocateRaw(void* p,
     ::operator delete(p);
 }
 inline void CollectCurrentThread(bool /*force*/) noexcept {}
-inline void CollectSteady() noexcept {}
-inline void CollectBurst() noexcept {}
+inline void CollectSteady() noexcept {
+#if defined(__GLIBC__)
+    (void)::malloc_trim(0);
+#endif
+}
+inline void CollectBurst() noexcept {
+#if defined(__GLIBC__)
+    (void)::malloc_trim(0);
+#endif
+}
 inline void MarkThreadPoolThread() noexcept {}
 
 class ThreadScope final {
