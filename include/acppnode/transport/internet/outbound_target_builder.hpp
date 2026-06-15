@@ -35,7 +35,8 @@ struct OutboundTargetOptions {
     std::chrono::seconds timeout{defaults::kDialTimeout};
     std::string_view send_through;
     const tcp::endpoint* inbound_local_addr = nullptr;
-    std::string_view server_name;
+    std::string_view tls_server_name;
+    std::string_view ws_host;
 };
 
 [[nodiscard]] std::optional<net::ip::address> ParseLiteralAddress(
@@ -45,7 +46,7 @@ void NormalizeOutboundStreamSettings(
     StreamSettings& settings,
     const OutboundStreamDefaults& defaults = {});
 
-[[nodiscard]] std::string_view ResolveOutboundServerName(
+[[nodiscard]] std::string_view ResolveOutboundTlsServerName(
     const StreamSettings& settings,
     std::string_view fallback_server_name);
 

@@ -5,6 +5,7 @@
 #include "acppnode/core/constants.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 namespace acpp {
 
@@ -82,6 +83,47 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
            !inbound_local.is_loopback();
 }
 
+[[nodiscard]] char LowerAsciiChar(char ch) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+}
+
+[[nodiscard]] bool EqualsAsciiCI(std::string_view lhs, std::string_view rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (LowerAsciiChar(lhs[i]) != LowerAsciiChar(rhs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] std::string_view FindHttpHeaderCI(
+    const transport::internet::HttpHeaders& headers,
+    std::string_view name) {
+    for (const auto& [key, value] : headers) {
+        if (EqualsAsciiCI(key, name)) {
+            return value;
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] std::string BuildWsHostHeader(
+    const StreamSettings& settings,
+    std::string_view fallback_host,
+    uint16_t port) {
+    if (!settings.IsWs()) {
+        return {};
+    }
+    if (const std::string_view explicit_host = FindHttpHeaderCI(settings.ws.headers, "Host");
+        !explicit_host.empty()) {
+        return std::string(explicit_host);
+    }
+    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+}
+
 }  // namespace
 
 std::optional<net::ip::address> ParseLiteralAddress(std::string_view address) {
@@ -121,15 +163,9 @@ void NormalizeOutboundStreamSettings(
     settings.RecomputeModes();
 }
 
-std::string_view ResolveOutboundServerName(
+std::string_view ResolveOutboundTlsServerName(
     const StreamSettings& settings,
     std::string_view fallback_server_name) {
-    if (settings.IsWs()) {
-        const auto ws_host = settings.ws.headers.find("Host");
-        if (ws_host != settings.ws.headers.end() && !ws_host->second.empty()) {
-            return ws_host->second;
-        }
-    }
     if (!settings.tls.server_name.empty()) {
         return settings.tls.server_name;
     }
@@ -151,7 +187,11 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     target.bind_mode = bind.mode;
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
-    target.server_name = options.server_name;
+    target.tls_server_name = options.tls_server_name;
+    target.ws_host = BuildWsHostHeader(
+        *options.stream_settings,
+        options.ws_host.empty() ? options.address : options.ws_host,
+        options.port);
 
     auto append_single = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;

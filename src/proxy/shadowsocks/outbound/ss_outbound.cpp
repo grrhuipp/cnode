@@ -550,7 +550,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         .timeout = config_.timeout,
         .send_through = config_.send_through,
         .inbound_local_addr = inbound_local_addr,
-        .server_name = ResolveOutboundServerName(stream_settings_, config_.address),
+        .tls_server_name = ResolveOutboundTlsServerName(stream_settings_, config_.address),
+        .ws_host = config_.address,
     });
     if (!transport_target) {
         co_return std::unexpected(transport_target.error());

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -34,7 +35,8 @@ struct OutboundTransportTarget {
     std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配
     std::vector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
     BindMode bind_mode = BindMode::None;
-    std::string_view server_name;                   // TLS SNI / WS Host（冷路径配置视图，可空）
+    std::string_view tls_server_name;               // TLS SNI（冷路径配置视图，可空）
+    std::string ws_host;                            // WS Host header（已按端口格式化，仅 WS 使用）
     const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
     std::chrono::seconds timeout{defaults::kDialTimeout};
 };

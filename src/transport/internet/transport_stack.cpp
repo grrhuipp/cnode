@@ -491,7 +491,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
-    std::string_view server_name,
+    std::string_view tls_server_name,
+    std::string_view ws_host,
     uint64_t trace_conn_id)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
@@ -504,7 +505,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             co_return std::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
 
-        std::string sni = server_name.empty() ? s.tls.server_name : std::string(server_name);
+        std::string sni = tls_server_name.empty()
+            ? s.tls.server_name
+            : std::string(tls_server_name);
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
             LOG_ERROR("[Transport] BuildOutbound: TLS requested but base stream is not TcpStream");
@@ -526,7 +529,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_out = 1;
             conn_id = s_conn_counter_out++;
         }
-        std::string host = server_name.empty() ? s.tls.server_name : std::string(server_name);
+        std::string host = ws_host.empty()
+            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
+            : std::string(ws_host);
         auto ws = std::make_unique<WsClientStream>(std::move(stream), conn_id);
         auto ws_result = co_await ws->Handshake(
             host,

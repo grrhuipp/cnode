@@ -101,7 +101,9 @@ proxy::trojan::outbound::Handler::Process(
         .timeout = config_.timeout,
         .send_through = config_.send_through,
         .inbound_local_addr = inbound_local_addr,
-        .server_name = ResolveOutboundServerName(config_.stream_settings, config_.GetServerName()),
+        .tls_server_name = ResolveOutboundTlsServerName(
+            config_.stream_settings, config_.GetServerName()),
+        .ws_host = config_.address,
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {

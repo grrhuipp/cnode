@@ -731,7 +731,9 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             .timeout = dial_timeout_,
             .send_through = settings_.send_through,
             .inbound_local_addr = inbound_local_addr,
-            .server_name = ResolveOutboundServerName(stream_settings_, settings_.address),
+            .tls_server_name = ResolveOutboundTlsServerName(
+                stream_settings_, settings_.address),
+            .ws_host = settings_.address,
         });
         if (!transport_target) {
             if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {

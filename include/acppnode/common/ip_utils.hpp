@@ -19,6 +19,21 @@ inline bool IsWildcardBindAddress(std::string_view value) noexcept {
 
 inline net::ip::address NormalizeAddress(
     const net::ip::address& addr) {
+    if (addr.is_v6()) {
+        const auto bytes = addr.to_v6().to_bytes();
+        const bool is_v4_mapped =
+            bytes[0] == 0 && bytes[1] == 0 &&
+            bytes[2] == 0 && bytes[3] == 0 &&
+            bytes[4] == 0 && bytes[5] == 0 &&
+            bytes[6] == 0 && bytes[7] == 0 &&
+            bytes[8] == 0 && bytes[9] == 0 &&
+            bytes[10] == 0xff && bytes[11] == 0xff;
+        if (is_v4_mapped) {
+            net::ip::address_v4::bytes_type v4_bytes{
+                bytes[12], bytes[13], bytes[14], bytes[15]};
+            return net::ip::make_address_v4(v4_bytes);
+        }
+    }
     return addr;
 }
 

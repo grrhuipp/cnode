@@ -4,6 +4,7 @@
 
 #include <openssl/rand.h>
 #include <cctype>
+#include <string_view>
 
 namespace acpp {
 
@@ -21,21 +22,88 @@ namespace {
     return Base64Encode(sha1, sizeof(sha1));
 }
 
-[[nodiscard]] std::string_view ExtractHttpHeader(std::string_view response, std::string_view name) {
-    const size_t pos = response.find(name);
-    if (pos == std::string_view::npos) {
-        return {};
-    }
+[[nodiscard]] char LowerAsciiChar(char ch) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+}
 
-    size_t start = pos + name.size();
-    while (start < response.size() && (response[start] == ' ' || response[start] == '\t')) {
-        ++start;
+[[nodiscard]] bool EqualsAsciiCI(std::string_view lhs, std::string_view rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
     }
-    const size_t end = response.find("\r\n", start);
-    if (end == std::string_view::npos) {
-        return {};
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        if (LowerAsciiChar(lhs[i]) != LowerAsciiChar(rhs[i])) {
+            return false;
+        }
     }
-    return response.substr(start, end - start);
+    return true;
+}
+
+[[nodiscard]] std::string_view TrimAscii(std::string_view value) {
+    while (!value.empty() &&
+           (value.front() == ' ' || value.front() == '\t' ||
+            value.front() == '\r' || value.front() == '\n')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() &&
+           (value.back() == ' ' || value.back() == '\t' ||
+            value.back() == '\r' || value.back() == '\n')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+[[nodiscard]] std::string_view ExtractHttpHeaderCI(
+    std::string_view response,
+    std::string_view name) {
+    size_t line_start = 0;
+    while (line_start < response.size()) {
+        const size_t line_end = response.find("\r\n", line_start);
+        if (line_end == std::string_view::npos) {
+            break;
+        }
+        if (line_end == line_start) {
+            break;
+        }
+
+        const std::string_view line = response.substr(line_start, line_end - line_start);
+        if (const size_t colon = line.find(':'); colon != std::string_view::npos) {
+            if (EqualsAsciiCI(line.substr(0, colon), name)) {
+                size_t value_start = colon + 1;
+                while (value_start < line.size() &&
+                       (line[value_start] == ' ' || line[value_start] == '\t')) {
+                    ++value_start;
+                }
+                return TrimAscii(line.substr(value_start));
+            }
+        }
+        line_start = line_end + 2;
+    }
+    return {};
+}
+
+[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response) {
+    const size_t crlf = response.find("\r\n");
+    return crlf == std::string_view::npos ? response : response.substr(0, crlf);
+}
+
+[[nodiscard]] bool IsSwitchingProtocolsStatus(std::string_view status_line) {
+    if (!status_line.starts_with("HTTP/")) {
+        return false;
+    }
+    size_t pos = status_line.find(' ');
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    while (pos < status_line.size() && status_line[pos] == ' ') {
+        ++pos;
+    }
+    if (pos + 3 > status_line.size() ||
+        status_line[pos] != '1' ||
+        status_line[pos + 1] != '0' ||
+        status_line[pos + 2] != '1') {
+        return false;
+    }
+    return pos + 3 == status_line.size() || status_line[pos + 3] == ' ';
 }
 
 }  // namespace
@@ -134,18 +202,15 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
 
     const std::string_view response(response_data, response_len);
-    if (response.find("HTTP/1.1 101") == std::string_view::npos) {
-        auto crlf = response.find("\r\n");
-        std::string_view first_line = crlf != std::string_view::npos
-            ? response.substr(0, crlf)
-            : response.substr(0, std::min<size_t>(response.size(), 64));
+    const std::string_view first_line = ExtractStatusLine(response);
+    if (!IsSwitchingProtocolsStatus(first_line)) {
         LOG_ACCESS_DEBUG("[conn={}] WS client: server rejected upgrade: {}",
                   conn_id_,
                   first_line);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const std::string_view accept = ExtractHttpHeader(response, "Sec-WebSocket-Accept:");
+    const std::string_view accept = ExtractHttpHeaderCI(response, "Sec-WebSocket-Accept");
     if (accept.empty()) {
         LOG_ACCESS_DEBUG("[conn={}] WS client: missing Sec-WebSocket-Accept", conn_id_);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

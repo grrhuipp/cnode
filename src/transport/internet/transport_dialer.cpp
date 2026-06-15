@@ -47,7 +47,8 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     auto build_result = co_await BuildOutboundTransport(
         std::move(tcp_result.stream),
         *target.stream_settings,
-        target.server_name,
+        target.tls_server_name,
+        target.ws_host,
         ctx.conn_id);
     if (!build_result) {
         const ErrorCode code = build_result.error();

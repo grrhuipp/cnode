@@ -29,6 +29,8 @@ constexpr uint8_t RCODE_NAME_ERROR = 3;
 
 namespace {
 
+constexpr size_t kAddressQueryAttempts = 3;
+
 DnsResult MakeCachedResult(const DnsCacheEntry& entry) {
     DnsResult result;
     if (entry.negative) {
@@ -49,6 +51,16 @@ void StoreResult(DnsCache& cache,
         cache.Put(domain, result.addresses, result.ttl);
     } else if (result.error == ErrorCode::DNS_NO_RECORD) {
         cache.PutNegative(domain, 60);
+    }
+}
+
+void AppendUniqueAddresses(
+    std::vector<net::ip::address>& out,
+    std::span<const net::ip::address> addresses) {
+    for (const auto& address : addresses) {
+        if (std::ranges::find(out, address) == out.end()) {
+            out.push_back(address);
+        }
     }
 }
 
@@ -296,7 +308,26 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
     last_result.error_msg = "DNS server unavailable";
 
     for (const auto& server : servers) {
-        auto a_result = co_await QueryServer(server, domain, false);
+        DnsResult a_result;
+        a_result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        a_result.error_msg = "DNS A query failed";
+
+        for (size_t attempt = 0; attempt < kAddressQueryAttempts; ++attempt) {
+            auto attempt_result = co_await QueryServer(server, domain, false);
+            if (attempt_result.Ok()) {
+                if (!a_result.Ok()) {
+                    a_result = std::move(attempt_result);
+                } else {
+                    AppendUniqueAddresses(a_result.addresses, attempt_result.addresses);
+                    a_result.ttl = std::min(a_result.ttl, attempt_result.ttl);
+                }
+                continue;
+            }
+            if (!a_result.Ok()) {
+                a_result = std::move(attempt_result);
+            }
+        }
+
         auto aaaa_result = co_await QueryServer(server, domain, true);
 
         if (a_result.Ok() || aaaa_result.Ok()) {
@@ -308,15 +339,11 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
                 (aaaa_result.Ok() ? aaaa_result.addresses.size() : 0));
 
             if (a_result.Ok()) {
-                result.addresses.insert(result.addresses.end(),
-                                        a_result.addresses.begin(),
-                                        a_result.addresses.end());
+                AppendUniqueAddresses(result.addresses, a_result.addresses);
                 result.ttl = std::min(result.ttl, a_result.ttl);
             }
             if (aaaa_result.Ok()) {
-                result.addresses.insert(result.addresses.end(),
-                                        aaaa_result.addresses.begin(),
-                                        aaaa_result.addresses.end());
+                AppendUniqueAddresses(result.addresses, aaaa_result.addresses);
                 result.ttl = std::min(result.ttl, aaaa_result.ttl);
             }
             if (result.ttl == UINT32_MAX) {

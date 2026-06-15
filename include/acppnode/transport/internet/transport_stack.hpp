@@ -21,7 +21,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
-    std::string_view server_name = {},
+    std::string_view tls_server_name = {},
+    std::string_view ws_host = {},
     uint64_t trace_conn_id = 0);
 
 }  // namespace acpp
