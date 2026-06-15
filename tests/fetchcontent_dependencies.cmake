@@ -19,6 +19,7 @@ endforeach()
 
 foreach(pattern IN ITEMS
         "include\\(FetchContent\\)"
+        "project\\(cnode VERSION 1\\.0\\.0 LANGUAGES C CXX\\)"
         "FetchContent_Declare\\([ \t\r\n]*asio"
         "GIT_REPOSITORY https://github\\.com/chriskohlhoff/asio\\.git"
         "FetchContent_Declare\\([ \t\r\n]*aws_lc"
