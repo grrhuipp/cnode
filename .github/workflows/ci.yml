@@ -26,6 +26,7 @@ on:
 env:
   BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
   RELEASE_TAG: cnode-latest
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-musl:
