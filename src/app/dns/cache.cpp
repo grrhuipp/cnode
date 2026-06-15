@@ -3,13 +3,17 @@
 namespace acpp::app::dns {
 
 DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
-    : min_ttl_(min_ttl), max_ttl_(max_ttl) {
-    // 将总容量均分到各分片
-    size_t per_shard = (max_size + kNumShards - 1) / kNumShards;
+    : min_ttl_(min_ttl), max_ttl_(max_ttl), capacity_(max_size) {
+    // 精确分配总容量，避免 cacheSize 因分片向上取整而被放大。
+    const size_t base = max_size / kNumShards;
+    size_t remainder = max_size % kNumShards;
     for (auto& shard : shards_) {
-        shard.max_entries = per_shard;
-        if (per_shard > 0) {
-            shard.cache.reserve(per_shard);
+        shard.max_entries = base + (remainder > 0 ? 1 : 0);
+        if (remainder > 0) {
+            --remainder;
+        }
+        if (shard.max_entries > 0) {
+            shard.cache.reserve(shard.max_entries);
         }
     }
 }
@@ -51,6 +55,9 @@ void DnsCache::Put(std::string_view domain,
                    uint32_t ttl) {
     const CacheKeyRef cache_key{domain};
     auto& shard = GetShard(cache_key);
+    if (shard.max_entries == 0) {
+        return;
+    }
 
     // 限制 TTL 范围
     ttl = std::max(min_ttl_, std::min(max_ttl_, ttl));
@@ -103,6 +110,9 @@ void DnsCache::PutNegative(std::string_view domain,
                            uint32_t ttl) {
     const CacheKeyRef cache_key{domain};
     auto& shard = GetShard(cache_key);
+    if (shard.max_entries == 0) {
+        return;
+    }
 
     const auto now = steady_clock::now();
 
@@ -157,6 +167,7 @@ DnsCacheStats DnsCache::GetStats() const {
     stats.misses = misses_;
     stats.expired = expired_;
     stats.entries = total_entries_;
+    stats.capacity = capacity_;
 
     return stats;
 }

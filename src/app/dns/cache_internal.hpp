@@ -85,6 +85,7 @@ private:
     mutable std::array<Shard, kNumShards> shards_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;
+    uint64_t capacity_ = 0;
     mutable uint64_t hits_ = 0;
     mutable uint64_t misses_ = 0;
     uint64_t expired_ = 0;

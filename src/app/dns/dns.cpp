@@ -1,4 +1,5 @@
 #include "cache_internal.hpp"
+#include "global_cache.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
@@ -158,6 +159,11 @@ DNS::Impl::Impl(net::io_context& io_context, const Config& config)
     : io_context(io_context)
     , config(config)
     , cache(config.cache_size, config.min_ttl, config.max_ttl) {
+    GlobalDnsCache::Configure(
+        config.global_cache_size,
+        config.min_ttl,
+        config.max_ttl);
+
     constexpr net::ip::port_type kDnsPort = 53;
     servers.reserve(config.servers.size());
     for (const auto& server : config.servers) {
@@ -200,6 +206,11 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
 
     if (auto cached = cache.Get(domain)) {
         co_return MakeCachedResult(*cached);
+    }
+
+    if (auto cached = GlobalDnsCache::Lookup(domain)) {
+        StoreResult(cache, domain, *cached);
+        co_return *cached;
     }
 
     const std::string_view domain_ref(domain);
@@ -257,6 +268,7 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
     }
 
     StoreResult(cache, domain, result);
+    GlobalDnsCache::PublishResult(domain, result);
 
     inflight_ptr->completed = true;
     inflight_ptr->result = result;
@@ -664,6 +676,14 @@ DnsCacheStats DNS::GetCacheStats() const {
 
 void DNS::ClearCache() {
     impl_->ClearCache();
+}
+
+DnsCacheStats DNS::GetGlobalCacheStats() {
+    return GlobalDnsCache::GetStats();
+}
+
+void DNS::ClearGlobalCache() {
+    GlobalDnsCache::Clear();
 }
 
 net::awaitable<void> DNS::Prefetch(const std::vector<std::string>& domains) {

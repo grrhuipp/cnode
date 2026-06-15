@@ -39,6 +39,8 @@ public:
 
     DnsCacheStats GetCacheStats() const;
     void ClearCache();
+    [[nodiscard]] static DnsCacheStats GetGlobalCacheStats();
+    static void ClearGlobalCache();
 
     net::awaitable<void> Prefetch(const std::vector<std::string>& domains);
 

@@ -170,6 +170,7 @@ set(CNODE_SOURCES
     # App - DNS
     src/app/dns/dns.cpp
     src/app/dns/cache.cpp
+    src/app/dns/global_cache.cpp
 
     # Geo
     src/geo/geodata.cpp

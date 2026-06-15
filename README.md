@@ -62,6 +62,16 @@ api/* panel users
   -> inbound validator read-only auth
 ```
 
+DNS 缓存链路：
+
+```text
+Worker DNS service
+  -> Worker-local L1 cache
+  -> GlobalDnsCache sharded immutable RCU snapshot
+  -> upstream DNS query
+  -> publish DNS result snapshot
+```
+
 ## 模块职责
 
 - `proxy/<protocol>` 只负责协议认证、解析、编码、握手和协议私有 helper。
@@ -73,6 +83,7 @@ api/* panel users
 - `service/controller` 与 `api/*` 只属于控制面，负责面板同步、用户/节点/规则拉取和流量上报。
 - `infra` 负责日志、JSON、配置加载、配置校验和冷路径归一化。
 - `common/buf`、`common/allocator`、`app/worker*` 共同维护 Worker-local buffer、统计和运行时资源边界。
+- `app/dns` 中 DNS service、inflight resolve、UDP socket 和 timeout 归属当前 Worker；进程级 `GlobalDnsCache` 只保存 DNS 结果的不可变分片快照。
 
 ## 配置设计
 
@@ -105,6 +116,7 @@ geosite.dat
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
+- DNS 的 `cacheSize` 表示进程级 L2 结果缓存容量；每个 Worker 只派生一份小型 L1 cache。L2 cache 使用分片 RCU snapshot，热路径只做 atomic load 和只读查询，真实解析成功或 negative cacheable 结果再发布新分片快照。
 - `Buffer` / `MultiBuffer` 可以沿当前请求链路 move 转移所有权，但不能作为跨 Worker 缓存、池对象或长期共享状态；消费结束后应在所属资源边界释放或归还。
 - AnyTLS 按 xray-core wire model 实现：TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写、`settings.users` 和 `settings.paddingScheme` 语义。
 
@@ -115,6 +127,14 @@ geosite.dat
 `UserStore` 是进程级认证用户 RCU 快照，按 `protocol + tag` 保存不可变用户容器。冷路径复制构建并原子发布新快照；热路径 validator 只加载只读视图做认证，不解析 JSON、不读取面板字段、不持有面板原始用户结构。VMess、Trojan、Shadowsocks、AnyTLS 的用户更新接口统一为 `ApplyUsers` / `AddUsers` / `RemoveUsers` / `ClearUsers`。
 
 在线设备、连接计数和设备限制检查属于 Worker-local tracker，由各协议 validator 在当前 Worker 内维护；这些状态不进入全局 `UserStore`，也不能通过裸指针、引用或 lock-free 对象跨 Worker 共享。
+
+## DNS 缓存设计
+
+DNS service 不是全局共享对象。每个 Worker 持有绑定自身 `io_context` 的 DNS service，内部的 `inflight_resolves`、UDP socket、timeout scheduler 和 L1 cache 都只在所属 Worker 线程访问。
+
+`GlobalDnsCache` 是进程级 DNS 结果 L2 cache，只保存域名解析结果和过期时间。它按分片持有 `shared_ptr<const ShardSnapshot>`，更新时复制目标分片、合并结果、清理过期项并 CAS 发布；读取时只加载不可变 snapshot，不更新 LRU、不移动节点、不触碰 Worker-local 对象。
+
+全局 L2 不承担 DNS 请求生命周期，也不做跨 Worker inflight 去重。它只是减少多 Worker 重复解析的只读结果层；真正的可写 LRU、协程等待和网络查询仍留在 Worker-local DNS service 内。
 
 ## 开发规范
 
@@ -139,6 +159,7 @@ geosite.dat
 - 禁止跨线程或跨 Worker 直接访问无锁热路径对象；无锁不代表任意线程可读写。
 - 禁止把 Worker-local 裸指针、引用、buffer provider、allocator、handler、manager、UDPSession 或 AsyncStream 保存到其他 Worker。
 - 禁止用 lock-free / atomic 共享 live handler、manager、连接对象或 buffer pool 来绕过 Worker 所有权。
+- 禁止把 DNS service、inflight resolve、UDP socket、timeout scheduler 或 Worker L1 DNS cache 提升为跨 Worker 共享对象；跨 Worker 只能共享不可变 DNS 结果 snapshot。
 - 禁止把 legacy、compat、adapter、wrapper、old 或旧面板私有命名作为最终公开设计保留。
 - 禁止协议、transport、relay、panel 各自维护长期私有大 buffer pool。
 - 禁止为了局部方便绕过 `inbound.Process -> dispatcher.Dispatch -> outbound.Process -> relay` 主链路。

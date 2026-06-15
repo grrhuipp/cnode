@@ -7,11 +7,13 @@
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_stats.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 
@@ -223,18 +225,22 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
 
-        ::acpp::app::dns::DnsCacheStats dns_stats;
+        ::acpp::app::dns::DnsCacheStats dns_l1_stats;
         for (const auto& worker_snapshot : worker_snapshots) {
-            dns_stats.hits    += worker_snapshot.dns_cache.hits;
-            dns_stats.misses  += worker_snapshot.dns_cache.misses;
-            dns_stats.entries += worker_snapshot.dns_cache.entries;
-            dns_stats.expired += worker_snapshot.dns_cache.expired;
+            dns_l1_stats.hits    += worker_snapshot.dns_cache.hits;
+            dns_l1_stats.misses  += worker_snapshot.dns_cache.misses;
+            dns_l1_stats.entries += worker_snapshot.dns_cache.entries;
+            dns_l1_stats.capacity += worker_snapshot.dns_cache.capacity;
+            dns_l1_stats.expired += worker_snapshot.dns_cache.expired;
         }
+        const auto dns_l2_stats = app::dns::DNS::GetGlobalCacheStats();
 
         double dns_hit_rate = 0.0;
-        uint64_t dns_total = dns_stats.hits + dns_stats.misses;
+        uint64_t dns_total = dns_l1_stats.hits + dns_l1_stats.misses;
         if (dns_total > 0) {
-            dns_hit_rate = 100.0 * static_cast<double>(dns_stats.hits)
+            const uint64_t l2_hits_for_workers =
+                std::min(dns_l2_stats.hits, dns_l1_stats.misses);
+            dns_hit_rate = 100.0 * static_cast<double>(dns_l1_stats.hits + l2_hits_for_workers)
                                  / static_cast<double>(dns_total);
         }
 
@@ -254,19 +260,19 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
                  dns_hit_rate);
 
         {
-            Worker::MemoryStats total_mem{};
+            size_t total_udp_sessions = 0;
             auto proc_mem = ProcessMemory::Read();
             for (const auto& worker_snapshot : worker_snapshots) {
-                const auto& m = worker_snapshot.memory;
-                total_mem.dns_estimated_bytes   += m.dns_estimated_bytes;
-                total_mem.udp_estimated_bytes   += m.udp_estimated_bytes;
+                total_udp_sessions += worker_snapshot.memory.udp_sessions;
             }
             const auto user_stats = proxyman::inbound::UserStore::GetStats();
-            total_mem.users_estimated_bytes = user_stats.TotalUsers() * 512;
-            LOG_INFO("mem: dns={:.0f}KB udp={:.0f}KB usr={:.0f}KB | RSS={:.1f}MB",
-                     total_mem.dns_estimated_bytes / 1024.0,
-                     total_mem.udp_estimated_bytes / 1024.0,
-                     total_mem.users_estimated_bytes / 1024.0,
+            LOG_INFO("state: dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={} | RSS={:.1f}MB",
+                     dns_l1_stats.entries,
+                     dns_l1_stats.capacity,
+                     dns_l2_stats.entries,
+                     dns_l2_stats.capacity,
+                     total_udp_sessions,
+                     user_stats.TotalUsers(),
                      proc_mem.vm_rss / (1024.0 * 1024.0));
 #ifdef CNODE_MEMORY_STATS
             const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();

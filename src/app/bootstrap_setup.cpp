@@ -26,11 +26,28 @@ BootstrapEnvironment& BootstrapEnvironment::operator=(BootstrapEnvironment&&) no
 
 namespace {
 
+size_t ComputeWorkerDnsCacheSize(size_t global_cache_size, uint32_t workers) {
+    if (global_cache_size == 0) {
+        return 0;
+    }
+
+    constexpr size_t kMinWorkerCacheSize = 256;
+    constexpr size_t kMaxWorkerCacheSize = 1024;
+    const size_t per_worker =
+        (global_cache_size + std::max<uint32_t>(workers, 1) - 1) /
+        std::max<uint32_t>(workers, 1);
+    return std::min(
+        global_cache_size,
+        std::clamp(per_worker, kMinWorkerCacheSize, kMaxWorkerCacheSize));
+}
+
 ::acpp::app::dns::DNS::Config MakeDnsServiceConfig(const Config& config) {
     ::acpp::app::dns::DNS::Config dns_config;
+    const uint32_t workers = std::max<uint32_t>(1, config.GetWorkers());
     dns_config.servers     = config.GetDns().servers;
     dns_config.timeout_sec = config.GetDns().timeout;
-    dns_config.cache_size  = config.GetDns().cache_size;
+    dns_config.cache_size  = ComputeWorkerDnsCacheSize(config.GetDns().cache_size, workers);
+    dns_config.global_cache_size = config.GetDns().cache_size;
     dns_config.min_ttl     = config.GetDns().min_ttl;
     dns_config.max_ttl     = config.GetDns().max_ttl;
     return dns_config;

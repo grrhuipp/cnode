@@ -155,6 +155,7 @@ Worker-local 无锁设计只在所属 Worker 线程 / `io_context` 内成立。
 - Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只在所属 Worker 线程访问。
 - 跨线程控制面通过 `Worker::*Async`、`net::post` 或等价投递序列化到目标 Worker 线程。
 - 不可变 runtime snapshot 以 `shared_ptr<const ...>` / 原子替换方式发布，发布后只读。
+- DNS service、inflight resolve、UDP socket、timeout scheduler 和 Worker L1 DNS cache 归属当前 Worker；跨 Worker 只允许共享不可变 DNS 结果 snapshot。
 - 需要跨 Worker 聚合的数据先复制、快照化或通过明确同步结构进入冷路径。
 
 不允许：
@@ -162,8 +163,27 @@ Worker-local 无锁设计只在所属 Worker 线程 / `io_context` 内成立。
 - 直接从其他线程或其他 Worker 读写 Worker 私有对象，即使当前实现看似无锁或只有 atomic。
 - 把 `AsyncStream`、`UDPSession`、handler、manager、listener、thread-local allocator / buffer provider 的裸指针或引用保存到其他 Worker。
 - 将无锁容器、thread-local 缓存、Buffer / MultiBuffer 池作为跨 Worker 共享状态。
+- 将 DNS service、inflight resolve、UDP socket、timeout scheduler 或 Worker L1 DNS cache 作为跨 Worker 共享可变对象。
 - 发布后原地修改 runtime snapshot，或通过 `const_cast`、缓存内部指针等方式绕过快照不可变性。
 - 为了跨线程访问热路径状态临时加锁；需要跨线程协作时应改为投递、复制快照或冷路径同步。
+
+### DNS 缓存与解析快照
+
+DNS 解析采用 Worker-local service + 进程级只读结果快照的两级缓存。
+
+允许：
+
+- 每个 Worker 持有自己的 DNS service、inflight resolve 表、UDP socket、timeout scheduler 和 L1 cache。
+- `GlobalDnsCache` 按分片保存 `shared_ptr<const ShardSnapshot>`，读取只 atomic load 不可变结果。
+- DNS 真实解析成功或 negative cacheable 后，复制目标分片、合并结果、清理过期项并 CAS 发布。
+- `cacheSize` 表示进程级 L2 DNS 结果缓存容量；Worker L1 cache 只能是派生的小型本地缓存。
+
+不允许：
+
+- 把 DNS service 本身做成全局单例供多个 Worker 直接调用。
+- 在全局 DNS snapshot 上做读命中 LRU 移动、last_access 更新或其他热路径写入。
+- 让全局 DNS cache 持有 `io_context`、socket、协程 waiter、Worker-local allocator / buffer provider 或请求生命周期对象。
+- 用锁或 atomic 共享当前 Worker 的 DNS L1 cache、inflight resolve 表或 socket。
 
 ### control plane
 
@@ -230,6 +250,7 @@ api/* 拉取 panel 原始 users
 - Panel/client/controller 不进入热路径，不修改 live handler 内部状态。
 - 禁止跨线程或跨 Worker 直接访问无锁热路径对象；无锁的前提是单 Worker 所有权，不是任意线程可访问。
 - 禁止把 Worker-local 裸指针、引用、buffer provider、allocator、handler、manager、UDPSession 或 AsyncStream 逃逸到其他 Worker。
+- 禁止把 DNS service、inflight resolve、UDP socket、timeout scheduler 或 Worker L1 DNS cache 提升为跨 Worker 共享可变对象。
 - 禁止把 legacy、compat、adapter、wrapper、old 或旧面板私有命名作为最终公开设计保留。
 - 禁止协议、transport、relay、panel 维护长期私有大 buffer pool。
 - 配置热更新只能原子替换 runtime snapshot，不能原地改写正在运行的对象图。
@@ -269,6 +290,7 @@ api/* 拉取 panel 原始 users
 17. 用 lock-free / atomic 共享 live handler、manager、连接对象或 buffer pool 来绕过 Worker 所有权。
 18. controller 按协议构建认证用户凭据。
 19. 面板用户绕过 `RuntimeUser -> UserSet -> UserStore` 链路进入热路径。
+20. DNS service、inflight resolve、socket、timeout scheduler 或 Worker L1 DNS cache 跨 Worker 共享。
 
 ## 最终判断标准
 
