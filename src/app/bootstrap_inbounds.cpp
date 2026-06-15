@@ -49,7 +49,8 @@ std::vector<std::string> SetupStaticInbounds(
                 inbound.stream_settings,
                 inbound.sniffing,
                 connection_limiter,
-                inbound.outbound_tag);
+                ProxyProtocolMode::Auto,
+                proxyman::inbound::RoutePolicy::Fixed(inbound.outbound_tag));
             worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
         }
 

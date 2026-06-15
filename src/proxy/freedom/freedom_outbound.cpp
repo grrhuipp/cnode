@@ -400,9 +400,11 @@ net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
 Handler::ResolveTargets(session::Context& ctx) {
     const auto& target = ctx.outbound.target;
 
-    // 如果目标已经是 IP，直接返回
-    if (target.IsIP() && target.resolved_addr) {
-        ctx.content.dns_result = session::DnsResultState::None;
+    // 如果目标已经有解析结果，直接复用 dispatcher/router 阶段的 DNS 结果。
+    if (target.resolved_addr) {
+        if (target.IsIP()) {
+            ctx.content.dns_result = session::DnsResultState::None;
+        }
         std::vector<net::ip::address> addresses;
         addresses.reserve(1);
         addresses.push_back(*target.resolved_addr);

@@ -27,6 +27,9 @@ class Manager;
 }  // namespace rule
 namespace app {
 class SessionTrackingState;
+namespace dns {
+class DNS;
+}  // namespace dns
 }  // namespace app
 
 namespace app::dispatcher {
@@ -47,6 +50,7 @@ public:
     void BindOutboundManager(features::outbound::Manager& outbound_manager) noexcept;
     void BindRuleManager(rule::Manager& rule_manager) noexcept;
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
+    void BindDnsService(app::dns::DNS& dns_service) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
@@ -69,6 +73,13 @@ public:
         const proxyman::inbound::ReceiverSettings* receiver = nullptr) override;
 
 private:
+    struct RouteSelection {
+        std::string_view outbound_tag;
+        bool matched = false;
+        bool fixed = false;
+        ErrorCode error = ErrorCode::OK;
+    };
+
     net::awaitable<RelayResult> DispatchPreparedLink(
         net::io_context& io_context,
         const proxyman::inbound::ReceiverSettings& receiver,
@@ -81,11 +92,21 @@ private:
         uint32_t pressure_idle_timeout);
     [[nodiscard]] features::outbound::Handler* ResolveOutboundHandler(
         std::string_view tag) const noexcept;
+    [[nodiscard]] RouteSelection SelectRoute(
+        session::Context& ctx,
+        const proxyman::inbound::ReceiverSettings* receiver) const noexcept;
+    [[nodiscard]] routing::DispatchResult FinishRoute(
+        session::Context& ctx,
+        const RouteSelection& selection) const noexcept;
+    [[nodiscard]] net::awaitable<routing::DispatchResult> RouteAsync(
+        session::Context& ctx,
+        const proxyman::inbound::ReceiverSettings* receiver);
 
     app::router::Router* router_ = nullptr;
     features::outbound::Manager* outbound_manager_ = nullptr;
     rule::Manager* rule_manager_ = nullptr;
     app::SessionTrackingState* session_tracking_ = nullptr;
+    app::dns::DNS* dns_service_ = nullptr;
 };
 
 }  // namespace app::dispatcher

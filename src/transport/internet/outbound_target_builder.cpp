@@ -1,0 +1,177 @@
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
+
+#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/common/ip_utils.hpp"
+#include "acppnode/core/constants.hpp"
+
+namespace acpp {
+
+namespace {
+
+struct BindSelection {
+    OutboundTransportTarget::BindMode mode = OutboundTransportTarget::BindMode::None;
+    std::optional<net::ip::address> explicit_addr;
+};
+
+BindSelection ParseBindSelection(std::string_view send_through) {
+    BindSelection selection;
+    if (send_through.empty() || iputil::IsWildcardBindAddress(send_through)) {
+        return selection;
+    }
+    if (send_through == constants::binding::kAuto) {
+        selection.mode = OutboundTransportTarget::BindMode::Auto;
+        return selection;
+    }
+
+    IoErrorCode ec;
+    auto addr = net::ip::make_address(send_through, ec);
+    if (!ec) {
+        selection.mode = OutboundTransportTarget::BindMode::Explicit;
+        selection.explicit_addr = addr;
+    }
+    return selection;
+}
+
+std::optional<net::ip::address> SelectBindAddress(
+    const BindSelection& bind,
+    const tcp::endpoint* inbound_local_addr,
+    const net::ip::address& remote_addr) {
+    if (bind.mode == OutboundTransportTarget::BindMode::Explicit) {
+        return bind.explicit_addr;
+    }
+    if (bind.mode != OutboundTransportTarget::BindMode::Auto || !inbound_local_addr) {
+        return std::nullopt;
+    }
+
+    const auto inbound_local =
+        iputil::NormalizeAddress(inbound_local_addr->address());
+    if (inbound_local.is_unspecified() || inbound_local.is_loopback()) {
+        return std::nullopt;
+    }
+    if ((remote_addr.is_v4() && inbound_local.is_v4()) ||
+        (remote_addr.is_v6() && inbound_local.is_v6())) {
+        return inbound_local;
+    }
+    return std::nullopt;
+}
+
+void AppendCandidate(
+    OutboundTransportTarget& target,
+    const BindSelection& bind,
+    const tcp::endpoint* inbound_local_addr,
+    const net::ip::address& remote_addr,
+    uint16_t port) {
+    OutboundDialCandidate candidate;
+    candidate.endpoint = tcp::endpoint(remote_addr, port);
+    candidate.bind_local = SelectBindAddress(bind, inbound_local_addr, remote_addr);
+    target.candidates.push_back(std::move(candidate));
+}
+
+}  // namespace
+
+std::optional<net::ip::address> ParseLiteralAddress(std::string_view address) {
+    IoErrorCode ec;
+    auto parsed = net::ip::make_address(address, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+void NormalizeOutboundStreamSettings(
+    StreamSettings& settings,
+    const OutboundStreamDefaults& defaults) {
+    if (settings.network.empty()) {
+        settings.network = std::string(constants::protocol::kTcp);
+    }
+    if (settings.security.empty()) {
+        settings.security = std::string(constants::protocol::kNone);
+    }
+    if (defaults.require_tls) {
+        settings.security = std::string(constants::protocol::kTls);
+    }
+
+    settings.RecomputeModes();
+    if (settings.IsTls()) {
+        if (settings.tls.server_name.empty() && !defaults.fallback_server_name.empty()) {
+            settings.tls.server_name = std::string(defaults.fallback_server_name);
+        }
+        if (defaults.allow_insecure) {
+            settings.tls.allow_insecure = true;
+        }
+        if (settings.tls.alpn.empty() && !defaults.alpn.empty()) {
+            settings.tls.alpn.assign(defaults.alpn.begin(), defaults.alpn.end());
+        }
+    }
+    settings.RecomputeModes();
+}
+
+std::string_view ResolveOutboundServerName(
+    const StreamSettings& settings,
+    std::string_view fallback_server_name) {
+    if (settings.IsWs()) {
+        const auto ws_host = settings.ws.headers.find("Host");
+        if (ws_host != settings.ws.headers.end() && !ws_host->second.empty()) {
+            return ws_host->second;
+        }
+    }
+    if (!settings.tls.server_name.empty()) {
+        return settings.tls.server_name;
+    }
+    return fallback_server_name;
+}
+
+net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+BuildOutboundTransportTarget(OutboundTargetOptions options) {
+    if (!options.stream_settings || options.port == 0) {
+        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+    if (!options.literal_address && options.address.empty()) {
+        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+
+    const auto bind = ParseBindSelection(options.send_through);
+
+    OutboundTransportTarget target;
+    target.bind_mode = bind.mode;
+    target.timeout = options.timeout;
+    target.stream_settings = options.stream_settings;
+    target.server_name = options.server_name;
+
+    auto append_single = [&](const net::ip::address& remote_addr) {
+        OutboundDialCandidate candidate;
+        candidate.endpoint = tcp::endpoint(remote_addr, options.port);
+        candidate.bind_local =
+            SelectBindAddress(bind, options.inbound_local_addr, remote_addr);
+        target.single_candidate = std::move(candidate);
+    };
+
+    if (options.literal_address) {
+        append_single(*options.literal_address);
+        co_return target;
+    }
+    if (auto literal = ParseLiteralAddress(options.address)) {
+        append_single(*literal);
+        co_return target;
+    }
+    if (!options.dns_service) {
+        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+    }
+
+    auto dns_result = co_await options.dns_service->Resolve(options.address);
+    if (!dns_result.Ok()) {
+        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+    }
+    if (dns_result.addresses.size() == 1) {
+        append_single(dns_result.addresses.front());
+        co_return target;
+    }
+
+    target.candidates.reserve(dns_result.addresses.size());
+    for (const auto& addr : dns_result.addresses) {
+        AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
+    }
+    co_return target;
+}
+
+}  // namespace acpp

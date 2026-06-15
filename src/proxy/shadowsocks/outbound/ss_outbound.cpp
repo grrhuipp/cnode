@@ -7,6 +7,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -124,44 +125,28 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     buf::MultiBuffer& first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
-    (void)inbound_local_addr;
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto& target = ctx.outbound.target;
 
-    OutboundTransportTarget transport_target;
-    transport_target.timeout = config_.timeout;
-    transport_target.stream_settings = &stream_settings_;
-    if (config_.literal_address) {
-        transport_target.single_candidate = OutboundDialCandidate{
-            .endpoint = tcp::endpoint(*config_.literal_address, config_.port),
-            .bind_local = std::nullopt
-        };
-    } else {
-        auto dns_result = co_await dns_service_.Resolve(config_.address);
-        if (!dns_result.Ok()) {
-            co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
-        }
-
-        if (dns_result.addresses.size() == 1) {
-            transport_target.single_candidate = OutboundDialCandidate{
-                .endpoint = tcp::endpoint(dns_result.addresses.front(), config_.port),
-                .bind_local = std::nullopt
-            };
-        } else {
-            transport_target.candidates.reserve(dns_result.addresses.size());
-            for (const auto& addr : dns_result.addresses) {
-                transport_target.candidates.push_back(OutboundDialCandidate{
-                    .endpoint = tcp::endpoint(addr, config_.port),
-                    .bind_local = std::nullopt
-                });
-            }
-        }
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service_,
+        .address = config_.address,
+        .literal_address = config_.literal_address,
+        .port = config_.port,
+        .stream_settings = &stream_settings_,
+        .timeout = config_.timeout,
+        .send_through = config_.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .server_name = ResolveOutboundServerName(stream_settings_, config_.address),
+    });
+    if (!transport_target) {
+        co_return std::unexpected(transport_target.error());
     }
 
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_FAIL_CTX(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
@@ -231,11 +216,7 @@ proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
                                                ::acpp::app::dns::DNS& dns_service)
     : config_(config)
     , dns_service_(dns_service) {
-    IoErrorCode addr_ec;
-    auto literal_addr = net::ip::make_address(config_.address, addr_ec);
-    if (!addr_ec) {
-        config_.literal_address = literal_addr;
-    }
+    config_.literal_address = ParseLiteralAddress(config_.address);
 
     auto info = ss::ParseCipherMethod(config_.method);
     if (info) {
@@ -249,12 +230,9 @@ proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
 
     master_key_ = ss::DeriveKey(config_.password, cipher_info_.key_size);
     stream_settings_ = config_.stream_settings;
-    stream_settings_.RecomputeModes();
-    if (stream_settings_.network.empty()) {
-        stream_settings_.network = std::string(acpp::constants::protocol::kTcp);
-        stream_settings_.security = std::string(acpp::constants::protocol::kNone);
-        stream_settings_.RecomputeModes();
-    }
+    NormalizeOutboundStreamSettings(
+        stream_settings_,
+        OutboundStreamDefaults{.fallback_server_name = config_.address});
 }
 
 }  // namespace acpp
@@ -296,12 +274,10 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             ss_config.method = std::string(v->as_string());
         }
         ss_config.stream_settings = cfg.stream_settings;
-        ss_config.stream_settings.RecomputeModes();
-        if (ss_config.stream_settings.network.empty()) {
-            ss_config.stream_settings.network = std::string(acpp::constants::protocol::kTcp);
-            ss_config.stream_settings.security = std::string(acpp::constants::protocol::kNone);
-            ss_config.stream_settings.RecomputeModes();
-        }
+        ss_config.send_through = cfg.send_through;
+        acpp::NormalizeOutboundStreamSettings(
+            ss_config.stream_settings,
+            acpp::OutboundStreamDefaults{.fallback_server_name = ss_config.address});
 
         if (ss_config.address.empty() || ss_config.password.empty()) {
             return std::nullopt;

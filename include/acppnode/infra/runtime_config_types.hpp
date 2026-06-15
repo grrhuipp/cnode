@@ -96,7 +96,7 @@ struct RouteRuleConfig {
 };
 
 struct RoutingConfig {
-    std::string domain_strategy = std::string(constants::protocol::kAsIs);  // AsIs/IPIfNonMatch/IPOnDemand
+    std::string domain_strategy = std::string(constants::protocol::kAsIs);
     std::vector<RouteRuleConfig> rules;
 
     static RoutingConfig FromJson(const json::object& j);

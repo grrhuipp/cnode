@@ -12,9 +12,9 @@ if(worker_cpp MATCHES "InitRouter[ \t\r\n]*\\([^\\)]*runtime_snapshot->outbounds
 endif()
 
 if(NOT worker_cpp MATCHES "default_outbound_tag" OR
-   NOT worker_cpp MATCHES "runtime_snapshot->outbounds\\.front\\(\\)\\.tag")
+   NOT worker_cpp MATCHES "runtime_snapshot->default_outbound_tag")
     message(FATAL_ERROR
-        "Worker must derive the Router default outbound tag before calling InitRouter")
+        "Worker must use the normalized Router default outbound tag before calling InitRouter")
 endif()
 
 if(NOT worker_cpp MATCHES "router(\\.|->)Configure[ \t\r\n]*\\([ \t\r\n]*routing,[ \t\r\n]*default_outbound_tag")

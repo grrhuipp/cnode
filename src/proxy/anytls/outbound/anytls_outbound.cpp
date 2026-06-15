@@ -9,6 +9,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -673,7 +674,15 @@ Handler::Handler(std::string tag,
     idle_session_check_interval_ = settings_.idle_session_check_interval;
     idle_session_timeout_ = settings_.idle_session_timeout;
     min_idle_sessions_ = settings_.min_idle_sessions;
-    stream_settings_.RecomputeModes();
+    if (!settings_.literal_address) {
+        settings_.literal_address = ParseLiteralAddress(settings_.address);
+    }
+    NormalizeOutboundStreamSettings(
+        stream_settings_,
+        OutboundStreamDefaults{
+            .require_tls = true,
+            .fallback_server_name = settings_.address,
+        });
 }
 
 Handler::~Handler() noexcept {
@@ -690,7 +699,7 @@ Handler::~Handler() noexcept {
 
 net::awaitable<OutboundProcessResult> Handler::Process(
     net::io_context& io_context,
-    const tcp::endpoint* /*inbound_local_addr*/,
+    const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     transport::Link inbound,
@@ -727,41 +736,25 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     if (!session) {
-        OutboundTransportTarget transport_target;
-        transport_target.timeout = dial_timeout_;
-        transport_target.stream_settings = &stream_settings_;
-        transport_target.server_name = stream_settings_.tls.server_name.empty()
-            ? settings_.address
-            : stream_settings_.tls.server_name;
-
-        if (settings_.literal_address) {
-            transport_target.single_candidate = OutboundDialCandidate{
-                .endpoint = tcp::endpoint(*settings_.literal_address, settings_.port),
-                .bind_local = std::nullopt
-            };
-        } else {
-            auto dns_result = co_await dns_service_->Resolve(settings_.address);
-            if (!dns_result.Ok()) {
+        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+            .dns_service = dns_service_,
+            .address = settings_.address,
+            .literal_address = settings_.literal_address,
+            .port = settings_.port,
+            .stream_settings = &stream_settings_,
+            .timeout = dial_timeout_,
+            .send_through = settings_.send_through,
+            .inbound_local_addr = inbound_local_addr,
+            .server_name = ResolveOutboundServerName(stream_settings_, settings_.address),
+        });
+        if (!transport_target) {
+            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
                 LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", settings_.address);
-                co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
             }
-            if (dns_result.addresses.size() == 1) {
-                transport_target.single_candidate = OutboundDialCandidate{
-                    .endpoint = tcp::endpoint(dns_result.addresses.front(), settings_.port),
-                    .bind_local = std::nullopt
-                };
-            } else {
-                transport_target.candidates.reserve(dns_result.addresses.size());
-                for (const auto& addr : dns_result.addresses) {
-                    transport_target.candidates.push_back(OutboundDialCandidate{
-                        .endpoint = tcp::endpoint(addr, settings_.port),
-                        .bind_local = std::nullopt
-                    });
-                }
-            }
+            co_return std::unexpected(transport_target.error());
         }
 
-        auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
+        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
         if (!dial_result.Ok()) {
             LOG_CONN_FAIL_CTX(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
@@ -1091,6 +1084,7 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (!settings) {
             return std::nullopt;
         }
+        settings->send_through = cfg.send_through;
         acpp::proxyman::outbound::PreparedOutboundConfig prepared;
         prepared.tag = cfg.tag;
         prepared.protocol = cfg.protocol;
@@ -1103,14 +1097,12 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 acpp::UDPSessionManager* /*udp_mgr*/,
                 std::chrono::seconds dial_timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_stream_settings = stream_settings;
-                runtime_stream_settings.RecomputeModes();
-                if (!runtime_stream_settings.IsTls()) {
-                    runtime_stream_settings.security = std::string(acpp::constants::protocol::kTls);
-                    runtime_stream_settings.RecomputeModes();
-                }
-                if (runtime_stream_settings.tls.server_name.empty()) {
-                    runtime_stream_settings.tls.server_name = settings.address;
-                }
+                acpp::NormalizeOutboundStreamSettings(
+                    runtime_stream_settings,
+                    acpp::OutboundStreamDefaults{
+                        .require_tls = true,
+                        .fallback_server_name = settings.address,
+                    });
                 return std::make_unique<acpp::anytls::outbound::Handler>(
                     tag,
                     settings,

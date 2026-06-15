@@ -32,6 +32,7 @@ struct SsOutboundConfig {
     std::string            password;
     std::string            method  = std::string(constants::protocol::kAes256Gcm);
     StreamSettings         stream_settings;
+    std::string            send_through;
     std::chrono::seconds   timeout{10};
 };
 

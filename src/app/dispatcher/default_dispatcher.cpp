@@ -1,6 +1,7 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 
 #include "acppnode/app/session_tracking.hpp"
+#include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/rule.hpp"
@@ -15,6 +16,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 
 #include <algorithm>
+#include <vector>
 
 namespace acpp::app::dispatcher {
 
@@ -35,6 +37,30 @@ std::chrono::seconds ResolveRelayIdleTimeout(
             idle_timeout, std::chrono::seconds(pressure_idle_timeout));
     }
     return idle_timeout;
+}
+
+net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
+    app::dns::DNS& dns_service,
+    session::Context& ctx) {
+    const auto& target = ctx.outbound.target;
+    if (target.resolved_addr) {
+        co_return std::vector<net::ip::address>{*target.resolved_addr};
+    }
+    if (!target.IsDomain()) {
+        co_return std::vector<net::ip::address>{};
+    }
+
+    auto dns_result = co_await dns_service.Resolve(target.host);
+    if (!dns_result.Ok()) {
+        ctx.content.dns_result = session::DnsResultState::Failed;
+        LOG_CONN_DEBUG(ctx, "[Dispatcher] route DNS resolve failed for {}", target.host);
+        co_return std::vector<net::ip::address>{};
+    }
+
+    ctx.content.dns_result = dns_result.from_cache
+        ? session::DnsResultState::Cache
+        : session::DnsResultState::Resolve;
+    co_return std::move(dns_result.addresses);
 }
 
 struct ActiveSessionScope {
@@ -88,6 +114,10 @@ void DefaultDispatcher::BindRuleManager(rule::Manager& rule_manager) noexcept {
 void DefaultDispatcher::BindSessionTracking(
     app::SessionTrackingState& session_tracking) noexcept {
     session_tracking_ = &session_tracking;
+}
+
+void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
+    dns_service_ = &dns_service;
 }
 
 features::outbound::Handler* DefaultDispatcher::ResolveOutboundHandler(
@@ -213,7 +243,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
     }
 
-    const routing::DispatchResult dispatch = Route(ctx, receiver);
+    const routing::DispatchResult dispatch = co_await RouteAsync(ctx, &receiver);
     auto* outbound_handler = dispatch.handler;
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
@@ -342,27 +372,22 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     co_return relay_result;
 }
 
-routing::DispatchResult DefaultDispatcher::Route(
+routing::DispatchResult DefaultDispatcher::FinishRoute(
     session::Context& ctx,
-    const proxyman::inbound::ReceiverSettings& receiver) const noexcept {
-    std::string_view outbound_tag;
-
-    if (receiver.has_fixed_outbound) {
-        outbound_tag = receiver.fixed_outbound_tag;
-        ctx.outbound.tag = outbound_tag;
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
-                       ctx.outbound.target, ctx.outbound.tag);
-    } else if (router_) {
-        outbound_tag = receiver.has_route_fallback_outbound
-            ? router_->Route(ctx, receiver.route_fallback_outbound_tag)
-            : router_->Route(ctx);
-        ctx.outbound.tag = outbound_tag;
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
-                       ctx.outbound.target, ctx.outbound.tag);
-    } else {
+    const RouteSelection& selection) const noexcept {
+    if (selection.error != ErrorCode::OK) {
         LOG_CONN_FAIL_CTX(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
                           ctx.inbound.source_ip, ctx.outbound.target);
-        return routing::DispatchResult{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
+        return routing::DispatchResult{.error = selection.error};
+    }
+
+    ctx.outbound.tag = selection.outbound_tag;
+    if (selection.fixed) {
+        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
+                       ctx.outbound.target, ctx.outbound.tag);
+    } else {
+        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
+                       ctx.outbound.target, ctx.outbound.tag);
     }
 
     if (rule_manager_ && ctx.inbound.user_id > 0 &&
@@ -374,7 +399,7 @@ routing::DispatchResult DefaultDispatcher::Route(
         return routing::DispatchResult{.error = ErrorCode::BLOCKED};
     }
 
-    auto* handler = ResolveOutboundHandler(outbound_tag);
+    auto* handler = ResolveOutboundHandler(selection.outbound_tag);
     if (handler && ctx.outbound.tag.empty()) {
         const auto handler_tag = handler->Tag();
         ctx.outbound.tag = handler_tag;
@@ -389,47 +414,111 @@ routing::DispatchResult DefaultDispatcher::Route(
     };
 }
 
-routing::DispatchResult DefaultDispatcher::Route(session::Context& ctx) const noexcept {
+DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
+    session::Context& ctx,
+    const proxyman::inbound::ReceiverSettings* receiver) const noexcept {
+    if (receiver &&
+        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound) {
+        return RouteSelection{
+            .outbound_tag = receiver->route_policy.outbound_tag,
+            .matched = true,
+            .fixed = true,
+            .error = ErrorCode::OK,
+        };
+    }
+
     if (!router_) {
-        LOG_CONN_FAIL_CTX(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
-                          ctx.inbound.source_ip, ctx.outbound.target);
-        return routing::DispatchResult{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
+        return RouteSelection{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
     }
 
-    const std::string_view outbound_tag = router_->Route(ctx);
-    ctx.outbound.tag = outbound_tag;
-    LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
-                   ctx.outbound.target, ctx.outbound.tag);
-    if (rule_manager_ && ctx.inbound.user_id > 0 &&
-        rule_manager_->HasRule(ctx.inbound.tag) &&
-        rule_manager_->Detect(
-            ctx.inbound.tag,
-            ctx.outbound.target.ToString(),
-            std::string_view(ctx.inbound.user_email.data(), ctx.inbound.user_email.size()))) {
-        return routing::DispatchResult{.error = ErrorCode::BLOCKED};
+    app::router::RouteDecision decision;
+    if (receiver &&
+        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::RouteWithFallback) {
+        decision = router_->RouteDetailed(ctx, receiver->route_policy.outbound_tag);
+    } else {
+        decision = router_->RouteDetailed(ctx);
     }
 
-    auto* handler = ResolveOutboundHandler(outbound_tag);
-    if (handler && ctx.outbound.tag.empty()) {
-        const auto handler_tag = handler->Tag();
-        ctx.outbound.tag = handler_tag;
-    }
-    if (!handler) {
-        return routing::DispatchResult{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
-    }
-
-    return routing::DispatchResult{
-        .handler = handler,
+    return RouteSelection{
+        .outbound_tag = decision.outbound_tag,
+        .matched = decision.matched,
+        .fixed = false,
         .error = ErrorCode::OK,
     };
+}
+
+routing::DispatchResult DefaultDispatcher::Route(
+    session::Context& ctx,
+    const proxyman::inbound::ReceiverSettings& receiver) const noexcept {
+    return FinishRoute(ctx, SelectRoute(ctx, &receiver));
+}
+
+routing::DispatchResult DefaultDispatcher::Route(session::Context& ctx) const noexcept {
+    return FinishRoute(ctx, SelectRoute(ctx, nullptr));
+}
+
+net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
+    session::Context& ctx,
+    const proxyman::inbound::ReceiverSettings* receiver) {
+    if (!router_ ||
+        (receiver &&
+         receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound) ||
+        !ctx.outbound.target.IsDomain() ||
+        ctx.outbound.target.resolved_addr) {
+        co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
+    }
+
+    const auto strategy = router_->DomainStrategy();
+    if (strategy == app::router::RoutingDomainStrategy::AsIs || !dns_service_) {
+        co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
+    }
+
+    auto select_with_addresses =
+        [&](const std::vector<net::ip::address>& addresses) -> RouteSelection {
+            RouteSelection last;
+            for (const auto& addr : addresses) {
+                ctx.outbound.target.resolved_addr = addr;
+                if (ctx.outbound.route_target.IsDomain() &&
+                    ctx.outbound.route_target.host == ctx.outbound.target.host &&
+                    ctx.outbound.route_target.port == ctx.outbound.target.port) {
+                    ctx.outbound.route_target.resolved_addr = addr;
+                }
+                auto selection = SelectRoute(ctx, receiver);
+                last = selection;
+                if (selection.error != ErrorCode::OK || selection.fixed || selection.matched) {
+                    return selection;
+                }
+            }
+            if (!addresses.empty()) {
+                ctx.outbound.target.resolved_addr = addresses.front();
+            }
+            return last;
+        };
+
+    if (strategy == app::router::RoutingDomainStrategy::IPIfNonMatch) {
+        auto initial = SelectRoute(ctx, receiver);
+        if (initial.error != ErrorCode::OK || initial.fixed || initial.matched) {
+            co_return FinishRoute(ctx, initial);
+        }
+
+        auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
+        if (!addresses.empty()) {
+            co_return FinishRoute(ctx, select_with_addresses(addresses));
+        }
+        co_return FinishRoute(ctx, initial);
+    }
+
+    auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
+    if (!addresses.empty()) {
+        co_return FinishRoute(ctx, select_with_addresses(addresses));
+    }
+    co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
 }
 
 net::awaitable<UDPSession*> DefaultDispatcher::DispatchUDP(
     session::Context& ctx,
     const proxyman::inbound::ReceiverSettings* receiver) {
-    const routing::DispatchResult dispatch = receiver
-        ? Route(ctx, *receiver)
-        : Route(ctx);
+    const routing::DispatchResult dispatch = co_await RouteAsync(ctx, receiver);
     if (dispatch.error != ErrorCode::OK || !dispatch.handler) {
         co_return nullptr;
     }

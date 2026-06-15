@@ -27,6 +27,7 @@ struct Settings {
     uint16_t port = 0;
     std::string password;
     std::optional<net::ip::address> literal_address;
+    std::string send_through;
     std::chrono::seconds idle_session_check_interval{30};
     std::chrono::seconds idle_session_timeout{60};
     size_t min_idle_sessions = 0;

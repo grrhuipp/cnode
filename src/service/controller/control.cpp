@@ -101,9 +101,8 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
             inbound.stream_settings,
             inbound.sniff,
             limiter,
-            std::string{},
             inbound.proxy_protocol,
-            inbound.tag);
+            proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag));
 
         worker->RegisterListenerAsync(std::move(receiver), std::move(handler));
     }

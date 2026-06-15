@@ -35,6 +35,7 @@ struct VMessOutboundConfig {
 
     // 传输层配置（JSON 格式保持不变）
     StreamSettings stream_settings;
+    std::string send_through;
 
     // 传输层拨号/握手超时
     std::chrono::seconds timeout{defaults::kDialTimeout};

@@ -116,10 +116,12 @@ struct Worker::ListenerState {
 struct Worker::RuntimeState {
     RuntimeState(net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
-                 StatsShard& stats_ref)
+                 StatsShard& stats_ref,
+                 geo::GeoManager* geo_manager_ref)
         : io_context(io_context)
         , runtime_snapshot(std::make_shared<WorkerRuntimeConfig>(runtime_config))
         , stats(stats_ref)
+        , geo_manager(geo_manager_ref)
         , listener_state(std::make_unique<ListenerState>())
         , inbound_manager(std::make_unique<proxyman::inbound::Manager>(stats))
         , session_tracking(std::make_unique<app::SessionTrackingState>())
@@ -146,11 +148,12 @@ struct Worker::RuntimeState {
     void InitRouter(Worker& worker,
                     const RoutingConfig& routing,
                     std::string_view default_outbound_tag,
-                    geo::GeoManager* geo_manager);
+                    geo::GeoManager* geo_manager_ref);
 
     net::io_context& io_context;
     std::atomic<std::shared_ptr<const WorkerRuntimeConfig>> runtime_snapshot;
     StatsShard& stats;
+    geo::GeoManager* geo_manager = nullptr;
     uint32_t active_connections = 0;
 
     std::unique_ptr<ListenerState> listener_state;
@@ -247,19 +250,20 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
                const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
                geo::GeoManager* geo_manager)
     : id_(id)
-    , runtime_(std::make_unique<RuntimeState>(io_context, runtime_config, stats)) {
+    , runtime_(std::make_unique<RuntimeState>(io_context, runtime_config, stats, geo_manager)) {
 
     runtime_->dispatcher->BindRuleManager(*runtime_->rule_manager);
     runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
+    runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
     runtime_->udp_session_manager->StartCleanup();
     const auto runtime_snapshot = runtime_->Snapshot();
     LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
               id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
     runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
     runtime_->dispatcher->BindOutboundManager(*runtime_->outbound_manager);
-    const std::string_view default_outbound_tag = runtime_snapshot->outbounds.empty()
+    const std::string_view default_outbound_tag = runtime_snapshot->default_outbound_tag.empty()
         ? std::string_view(constants::protocol::kDirect)
-        : std::string_view(runtime_snapshot->outbounds.front().tag);
+        : std::string_view(runtime_snapshot->default_outbound_tag);
     runtime_->InitRouter(*this, runtime_snapshot->routing, default_outbound_tag, geo_manager);
 }
 
@@ -308,8 +312,8 @@ void Worker::RuntimeState::InitRouter(
     Worker& worker,
     const RoutingConfig& routing,
     std::string_view default_outbound_tag,
-    geo::GeoManager* geo_manager) {
-    router->Configure(routing, default_outbound_tag, geo_manager);
+    geo::GeoManager* geo_manager_ref) {
+    router->Configure(routing, default_outbound_tag, geo_manager_ref);
     dispatcher->BindRouter(*router);
 
     LOG_DEBUG("Worker[{}]: router initialized, {} rules, default='{}'",
@@ -816,10 +820,10 @@ void Worker::RegisterListenerAsync(proxyman::inbound::ReceiverSettings&& receive
             auto inbound_handler =
                 std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(h));
             auto& settings = inbound_handler->ReceiverSettings();
-            if (settings.has_fixed_outbound &&
-                !runtime_->outbound_manager->GetHandler(settings.fixed_outbound_tag)) {
+            if (settings.route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound &&
+                !runtime_->outbound_manager->GetHandler(settings.route_policy.outbound_tag)) {
                 LOG_WARN("Worker[{}]: listener tag={} fixed outbound '{}' not found",
-                         id_, settings.inbound_tag, settings.fixed_outbound_tag);
+                         id_, settings.inbound_tag, settings.route_policy.outbound_tag);
             }
             const std::string key(settings.inbound_tag);
             auto* registered = runtime_->inbound_manager->AddHandler(std::move(inbound_handler));
@@ -863,6 +867,16 @@ void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config)
             std::erase_if(next_snapshot->outbounds,
                           [&](const auto& outbound) { return outbound.tag == cfg.tag; });
             next_snapshot->outbounds.push_back(std::move(cfg));
+            if (next_snapshot->default_outbound_tag.empty()) {
+                next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
+                    ? std::string(constants::protocol::kDirect)
+                    : next_snapshot->outbounds.front().tag;
+            }
+            runtime_->InitRouter(
+                *this,
+                next_snapshot->routing,
+                next_snapshot->default_outbound_tag,
+                runtime_->geo_manager);
             runtime_->StoreSnapshot(std::move(next_snapshot));
         });
 }
@@ -875,6 +889,16 @@ void Worker::RemoveOutboundAsync(std::string tag) {
             auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
             std::erase_if(next_snapshot->outbounds,
                           [&](const auto& outbound) { return outbound.tag == t; });
+            if (next_snapshot->default_outbound_tag == t) {
+                next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
+                    ? std::string(constants::protocol::kDirect)
+                    : next_snapshot->outbounds.front().tag;
+            }
+            runtime_->InitRouter(
+                *this,
+                next_snapshot->routing,
+                next_snapshot->default_outbound_tag,
+                runtime_->geo_manager);
             runtime_->StoreSnapshot(std::move(next_snapshot));
             runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
         });

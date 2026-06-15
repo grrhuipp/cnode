@@ -183,6 +183,7 @@ set(CNODE_SOURCES
     src/transport/internet/ws_stream.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
+    src/transport/internet/outbound_target_builder.cpp
     src/transport/internet/proxy_protocol.cpp
 
     # App (Application layer)

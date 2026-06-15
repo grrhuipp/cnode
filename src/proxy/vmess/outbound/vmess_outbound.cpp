@@ -9,6 +9,7 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
+#include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include <chrono>
 #include <cstring>
 #include <openssl/rand.h>
@@ -106,18 +107,16 @@ proxy::vmess::outbound::Handler::Handler(const VMessOutboundConfig& config,
                                          ::acpp::app::dns::DNS& dns_service)
     : config_(config)
     , dns_service_(dns_service) {
-    IoErrorCode addr_ec;
-    auto literal_addr = net::ip::make_address(config_.address, addr_ec);
-    if (!addr_ec) {
-        config_.literal_address = literal_addr;
-    }
+    config_.literal_address = ParseLiteralAddress(config_.address);
 
     user_ = ::acpp::vmess::MemoryAccount::FromUUID(config_.uuid);
     if (!user_) {
         LOG_ERROR("VMess outbound '{}': invalid UUID", config_.tag);
     }
 
-    config_.stream_settings.RecomputeModes();
+    NormalizeOutboundStreamSettings(
+        config_.stream_settings,
+        OutboundStreamDefaults{.fallback_server_name = config_.address});
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
               config_.tag, config_.address, config_.port,
               config_.stream_settings.network,
@@ -137,7 +136,6 @@ proxy::vmess::outbound::Handler::Process(
     buf::MultiBuffer& first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
-    (void)inbound_local_addr;
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -147,53 +145,30 @@ proxy::vmess::outbound::Handler::Process(
 
     const auto& target = ctx.outbound.target;
 
-    OutboundTransportTarget transport_target;
-    transport_target.timeout = config_.timeout;
-    transport_target.stream_settings = &config_.stream_settings;
-    if (config_.literal_address) {
-        transport_target.single_candidate = OutboundDialCandidate{
-            .endpoint = tcp::endpoint(*config_.literal_address, config_.port),
-            .bind_local = std::nullopt
-        };
-    } else {
-        auto dns_result = co_await dns_service_.Resolve(config_.address);
-        if (!dns_result.Ok()) {
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service_,
+        .address = config_.address,
+        .literal_address = config_.literal_address,
+        .port = config_.port,
+        .stream_settings = &config_.stream_settings,
+        .timeout = config_.timeout,
+        .send_through = config_.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .server_name = ResolveOutboundServerName(config_.stream_settings, config_.address),
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
             LOG_CONN_FAIL_CTX(ctx, "[VMess] DNS resolve failed for {}", config_.address);
-            co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
         }
-
-        if (dns_result.addresses.size() == 1) {
-            transport_target.single_candidate = OutboundDialCandidate{
-                .endpoint = tcp::endpoint(dns_result.addresses.front(), config_.port),
-                .bind_local = std::nullopt
-            };
-        } else {
-            transport_target.candidates.reserve(dns_result.addresses.size());
-            for (const auto& addr : dns_result.addresses) {
-                transport_target.candidates.push_back(OutboundDialCandidate{
-                    .endpoint = tcp::endpoint(addr, config_.port),
-                    .bind_local = std::nullopt
-                });
-            }
-        }
-    }
-    transport_target.server_name = config_.stream_settings.tls.server_name.empty()
-        ? config_.address
-        : config_.stream_settings.tls.server_name;
-
-    if (transport_target.stream_settings->IsWs()) {
-        const auto ws_it = transport_target.stream_settings->ws.headers.find("Host");
-        if (ws_it != transport_target.stream_settings->ws.headers.end() && !ws_it->second.empty()) {
-            transport_target.server_name = ws_it->second;
-        }
+        co_return std::unexpected(transport_target.error());
     }
 
     LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
                    config_.address, config_.port,
-                   transport_target.stream_settings->security,
-                   transport_target.stream_settings->network);
+                   config_.stream_settings.security,
+                   config_.stream_settings.network);
 
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_FAIL_CTX(ctx, "[VMess] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
@@ -325,7 +300,10 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         vmess_config.stream_settings = cfg.stream_settings;
-        vmess_config.stream_settings.RecomputeModes();
+        vmess_config.send_through = cfg.send_through;
+        acpp::NormalizeOutboundStreamSettings(
+            vmess_config.stream_settings,
+            acpp::OutboundStreamDefaults{.fallback_server_name = vmess_config.address});
 
         if (vmess_config.address.empty() || vmess_config.uuid.empty()) {
             return std::nullopt;  // 配置不完整

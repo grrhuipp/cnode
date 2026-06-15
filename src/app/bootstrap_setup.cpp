@@ -108,6 +108,9 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(const Config& config) {
     runtime_config.routing = config.GetRouting();
     runtime_config.static_inbounds = BuildStaticInboundRuntimeEntries(config.GetStaticInbounds());
     runtime_config.outbounds = config.GetPreparedOutbounds();
+    runtime_config.default_outbound_tag = runtime_config.outbounds.empty()
+        ? std::string(constants::protocol::kDirect)
+        : runtime_config.outbounds.front().tag;
     runtime_config.workers = config.GetWorkers();
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
     runtime_config.pressure_idle_timeout = ComputePressureIdleTimeout(runtime_config);

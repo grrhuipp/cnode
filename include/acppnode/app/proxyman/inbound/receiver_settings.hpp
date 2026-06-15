@@ -4,6 +4,7 @@
 #include "acppnode/transport/internet/proxy_protocol_mode.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,11 +15,50 @@ class ConnectionLimiter;
 
 namespace acpp::proxyman::inbound {
 
+enum class RoutePolicyKind : uint8_t {
+    GlobalDefault,
+    FixedOutbound,
+    RouteWithFallback,
+};
+
+struct RoutePolicy {
+    RoutePolicyKind kind = RoutePolicyKind::GlobalDefault;
+    std::string outbound_tag;
+
+    [[nodiscard]] static RoutePolicy GlobalDefault() {
+        return {};
+    }
+
+    [[nodiscard]] static RoutePolicy Fixed(std::string tag) {
+        if (tag.empty()) {
+            return {};
+        }
+        RoutePolicy policy;
+        policy.kind = RoutePolicyKind::FixedOutbound;
+        policy.outbound_tag = std::move(tag);
+        return policy;
+    }
+
+    [[nodiscard]] static RoutePolicy RouteWithFallback(std::string tag) {
+        if (tag.empty()) {
+            return {};
+        }
+        RoutePolicy policy;
+        policy.kind = RoutePolicyKind::RouteWithFallback;
+        policy.outbound_tag = std::move(tag);
+        return policy;
+    }
+
+    [[nodiscard]] bool HasOutboundTag() const noexcept {
+        return !outbound_tag.empty();
+    }
+};
+
 // ============================================================================
 // ReceiverSettings - xray-style proxyman receiver settings
 //
 // 对齐 xray-core app/proxyman ReceiverConfig 的职责：监听、传输、嗅探、
-// 固定出站和 limiter 这些 receiver 语义。冷路径构建；inbound Handler
+// 路由策略和 limiter 这些 receiver 语义。冷路径构建；inbound Handler
 // 热路径只读。
 // ============================================================================
 struct ReceiverSettings {
@@ -29,12 +69,7 @@ struct ReceiverSettings {
     SniffConfig      sniff_config;
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto; // PROXY Protocol 处理模式
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
-    bool             has_fixed_outbound = false;       // fixed_outbound_tag 是否非空
-    // 非空时跳过路由；dispatcher 通过 outbound manager 按 tag 获取 handler。
-    std::string      fixed_outbound_tag;
-    bool             has_route_fallback_outbound = false;
-    // 非空时不跳过路由，只作为 routing.json 未命中时的默认 outbound。
-    std::string      route_fallback_outbound_tag;
+    RoutePolicy      route_policy;
     ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
@@ -49,9 +84,8 @@ struct ReceiverSettings {
     StreamSettings stream_settings,
     SniffConfig sniff_config,
     ConnectionLimiter* limiter,
-    std::string fixed_outbound = {},
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto,
-    std::string route_fallback_outbound = {}) {
+    RoutePolicy route_policy = {}) {
     ReceiverSettings settings;
     settings.inbound_tag     = std::move(inbound_tag);
     settings.inbound_tags    = std::move(inbound_tags);
@@ -64,10 +98,7 @@ struct ReceiverSettings {
         !settings.inbound_tags.empty() &&
         !(settings.inbound_tags.size() == 1 &&
           settings.inbound_tags.front() == settings.inbound_tag);
-    settings.has_fixed_outbound = !fixed_outbound.empty();
-    settings.fixed_outbound_tag = std::move(fixed_outbound);
-    settings.has_route_fallback_outbound = !route_fallback_outbound.empty();
-    settings.route_fallback_outbound_tag = std::move(route_fallback_outbound);
+    settings.route_policy    = std::move(route_policy);
     settings.limiter         = limiter;
     return settings;
 }

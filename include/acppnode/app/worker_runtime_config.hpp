@@ -17,6 +17,7 @@ struct WorkerRuntimeConfig {
     TimeoutsConfig timeouts;
     LimitsConfig limits;
     RoutingConfig routing;
+    std::string default_outbound_tag = std::string(constants::protocol::kDirect);
     std::vector<StaticInboundRuntimeEntry> static_inbounds;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
     uint32_t workers = 1;

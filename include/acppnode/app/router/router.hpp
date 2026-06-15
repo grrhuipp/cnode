@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 
@@ -15,6 +16,17 @@ struct Context;
 }  // namespace acpp
 
 namespace acpp::app::router {
+
+enum class RoutingDomainStrategy : uint8_t {
+    AsIs,
+    IPIfNonMatch,
+    IPOnDemand,
+};
+
+struct RouteDecision {
+    std::string_view outbound_tag;
+    bool matched = false;
+};
 
 class Router {
 public:
@@ -36,8 +48,13 @@ public:
     [[nodiscard]] std::string_view Route(
         const session::Context& ctx,
         std::string_view default_outbound_tag) const;
+    [[nodiscard]] RouteDecision RouteDetailed(const session::Context& ctx) const;
+    [[nodiscard]] RouteDecision RouteDetailed(
+        const session::Context& ctx,
+        std::string_view default_outbound_tag) const;
 
     [[nodiscard]] std::string_view DefaultOutbound() const;
+    [[nodiscard]] RoutingDomainStrategy DomainStrategy() const noexcept;
 
 private:
     struct Impl;
