@@ -12,7 +12,6 @@ on:
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
-      - 'tests/**/*.cmake'
   pull_request:
     paths:
       - '.github/workflows/ci.yml'
@@ -23,7 +22,6 @@ on:
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
-      - 'tests/**/*.cmake'
 
 env:
   BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
