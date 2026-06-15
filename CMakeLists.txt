@@ -14,6 +14,7 @@ option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
 option(CNODE_MIMALLOC_MUSL "Use mimalloc for global C++ new/delete in musl builds" ON)
+set(CNODE_ASIO_RECYCLING_CACHE_SIZE 8 CACHE STRING "Asio small-block recycling cache size")
 set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
 
 if(CNODE_IO_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -118,7 +119,10 @@ add_library(asio::asio ALIAS asio_standalone)
 target_include_directories(asio_standalone INTERFACE
     ${asio_SOURCE_DIR}/asio/include
 )
-target_compile_definitions(asio_standalone INTERFACE ASIO_STANDALONE)
+target_compile_definitions(asio_standalone INTERFACE
+    ASIO_STANDALONE
+    ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${CNODE_ASIO_RECYCLING_CACHE_SIZE}
+)
 
 if(CNODE_IO_URING)
     FetchContent_Declare(
