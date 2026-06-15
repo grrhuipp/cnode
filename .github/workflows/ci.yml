@@ -52,6 +52,7 @@ jobs:
           path: build-musl/_deps
           key: cmake-deps-musl-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cmake-deps-musl-${{ runner.os }}-
+          save-always: true
 
       - name: Configure
         run: |
@@ -107,9 +108,19 @@ jobs:
           path: build-heaptrack/_deps
           key: cmake-deps-glibc-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: cmake-deps-glibc-${{ runner.os }}-
+          save-always: true
 
       - name: Build glibc heaptrack variant
-        run: BUILD_ID=${{ env.BUILD_ID }} scripts/build-heaptrack.sh
+        run: |
+          cmake -S . -B build-heaptrack -G Ninja \
+            -DCMAKE_BUILD_TYPE=Profile \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCNODE_MEMORY_STATS=ON \
+            -DCNODE_HEAPTRACK_BUILD=ON \
+            -DUSE_MIMALLOC=OFF \
+            -DBUILD_ID=${{ env.BUILD_ID }}
+          cmake --build build-heaptrack --parallel $(nproc)
+          build-heaptrack/cnode -v
 
       - name: Package glibc binary
         run: |

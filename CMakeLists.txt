@@ -204,7 +204,29 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/madler/zlib.git
     GIT_TAG v1.3.1
 )
-FetchContent_MakeAvailable(zlib)
+FetchContent_GetProperties(zlib)
+if(NOT zlib_POPULATED)
+    FetchContent_Populate(zlib)
+endif()
+
+add_library(cnode_zlib STATIC
+    ${zlib_SOURCE_DIR}/adler32.c
+    ${zlib_SOURCE_DIR}/compress.c
+    ${zlib_SOURCE_DIR}/crc32.c
+    ${zlib_SOURCE_DIR}/deflate.c
+    ${zlib_SOURCE_DIR}/gzclose.c
+    ${zlib_SOURCE_DIR}/gzlib.c
+    ${zlib_SOURCE_DIR}/gzread.c
+    ${zlib_SOURCE_DIR}/gzwrite.c
+    ${zlib_SOURCE_DIR}/infback.c
+    ${zlib_SOURCE_DIR}/inffast.c
+    ${zlib_SOURCE_DIR}/inflate.c
+    ${zlib_SOURCE_DIR}/inftrees.c
+    ${zlib_SOURCE_DIR}/trees.c
+    ${zlib_SOURCE_DIR}/uncompr.c
+    ${zlib_SOURCE_DIR}/zutil.c
+)
+target_include_directories(cnode_zlib PUBLIC ${zlib_SOURCE_DIR})
 
 find_package(Threads REQUIRED)
 
@@ -379,7 +401,7 @@ target_link_libraries(cnode PRIVATE
     Threads::Threads
     ssl
     crypto
-    zlibstatic
+    cnode_zlib
 )
 
 # 构建版本号：优先使用外部传入的 BUILD_ID，否则生成随机 hex

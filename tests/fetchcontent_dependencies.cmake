@@ -1,6 +1,5 @@
 file(READ "${PROJECT_SOURCE_DIR}/CMakeLists.txt" cmake_source)
 file(READ "${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml" ci_workflow)
-file(READ "${PROJECT_SOURCE_DIR}/scripts/build-heaptrack.sh" heaptrack_script)
 file(READ "${PROJECT_SOURCE_DIR}/README.md" readme)
 file(READ "${PROJECT_SOURCE_DIR}/.gitignore" gitignore)
 
@@ -8,7 +7,11 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/vcpkg.json")
     message(FATAL_ERROR "vcpkg manifest must not reappear; dependencies are provided by CMake FetchContent")
 endif()
 
-foreach(content_name IN ITEMS cmake_source ci_workflow heaptrack_script readme gitignore)
+if(EXISTS "${PROJECT_SOURCE_DIR}/scripts/build-heaptrack.sh")
+    message(FATAL_ERROR "scripts directory must only contain cnode.sh; heaptrack build stays in CI")
+endif()
+
+foreach(content_name IN ITEMS cmake_source ci_workflow readme gitignore)
     if("${${content_name}}" MATCHES "[Vv][Cc][Pp][Kk][Gg]")
         message(FATAL_ERROR "Repository build surface must not reference vcpkg: ${content_name}")
     endif()
@@ -23,6 +26,7 @@ foreach(pattern IN ITEMS
         "GIT_TAG v1\\.73\\.0"
         "FetchContent_Declare\\([ \t\r\n]*zlib"
         "GIT_REPOSITORY https://github\\.com/madler/zlib\\.git"
+        "add_library\\(cnode_zlib STATIC"
         "FetchContent_Declare\\([ \t\r\n]*mimalloc"
         "GIT_REPOSITORY https://github\\.com/microsoft/mimalloc\\.git"
         "CNODE_AWSLC_NO_ASM"
@@ -48,7 +52,10 @@ foreach(pattern IN ITEMS
         "apk add --no-cache"
         "sudo apt-get install -y"
         "perl nasm"
-        "scripts/build-heaptrack.sh"
+        "save-always: true"
+        "path: build-musl/_deps"
+        "path: build-heaptrack/_deps"
+        "-DCNODE_HEAPTRACK_BUILD=ON"
         "name: cnode-musl-assets"
         "name: cnode-glibc-assets")
     if(NOT ci_workflow MATCHES "${pattern}")
@@ -59,7 +66,7 @@ endforeach()
 foreach(pattern IN ITEMS
         "CMAKE_TOOLCHAIN_FILE"
         "VCPKG_TARGET_TRIPLET")
-    if(ci_workflow MATCHES "${pattern}" OR heaptrack_script MATCHES "${pattern}")
-        message(FATAL_ERROR "CI/scripts must not pass vcpkg toolchain settings: ${pattern}")
+    if(ci_workflow MATCHES "${pattern}")
+        message(FATAL_ERROR "CI must not pass vcpkg toolchain settings: ${pattern}")
     endif()
 endforeach()

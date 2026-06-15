@@ -1,6 +1,9 @@
 file(READ "${PROJECT_SOURCE_DIR}/CMakeLists.txt" cmake_source)
-file(READ "${PROJECT_SOURCE_DIR}/scripts/build-heaptrack.sh" heaptrack_script)
 file(READ "${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml" ci_workflow)
+
+if(EXISTS "${PROJECT_SOURCE_DIR}/scripts/build-heaptrack.sh")
+    message(FATAL_ERROR "scripts directory must only contain cnode.sh; heaptrack build stays in CI")
+endif()
 
 foreach(pattern IN ITEMS
         "option\\(CNODE_HEAPTRACK_BUILD"
@@ -10,26 +13,6 @@ foreach(pattern IN ITEMS
         "set\\(BUILD_CHANNEL \"heaptrack\"\\)")
     if(NOT cmake_source MATCHES "${pattern}")
         message(FATAL_ERROR "CMake heaptrack variant guard is missing: ${pattern}")
-    endif()
-endforeach()
-
-foreach(pattern IN ITEMS
-        "-DCNODE_HEAPTRACK_BUILD=ON"
-        "-DUSE_MIMALLOC=OFF"
-        "heaptrack 变体必须使用 glibc 环境")
-    if(NOT heaptrack_script MATCHES "${pattern}")
-        message(FATAL_ERROR "heaptrack build script must keep glibc/system-allocator flags: ${pattern}")
-    endif()
-endforeach()
-
-foreach(pattern IN ITEMS
-        "-DCMAKE_EXE_LINKER_FLAGS=\"-static\""
-        "x64-linux-musl"
-        "mimalloc-static"
-        "CMAKE_TOOLCHAIN_FILE"
-        "VCPKG_TARGET_TRIPLET")
-    if(heaptrack_script MATCHES "${pattern}")
-        message(FATAL_ERROR "heaptrack build script must not use static musl/mimalloc settings: ${pattern}")
     endif()
 endforeach()
 
@@ -48,7 +31,8 @@ string(SUBSTRING "${ci_workflow}" ${glibc_pos} ${glibc_len} glibc_job)
 foreach(pattern IN ITEMS
         "runs-on: ubuntu-24.04"
         "perl nasm"
-        "scripts/build-heaptrack.sh"
+        "-DCNODE_HEAPTRACK_BUILD=ON"
+        "-DUSE_MIMALLOC=OFF"
         "name: cnode-glibc-assets"
         "cnode-linux-amd64-glibc")
     if(NOT glibc_job MATCHES "${pattern}")
@@ -58,9 +42,11 @@ endforeach()
 
 foreach(pattern IN ITEMS
         "container:"
-        "image: alpine")
+        "image: alpine"
+        "-DCMAKE_EXE_LINKER_FLAGS=\"-static\""
+        "scripts/build-heaptrack.sh")
     if(glibc_job MATCHES "${pattern}")
-        message(FATAL_ERROR "CI glibc heaptrack job must not run in the musl container: ${pattern}")
+        message(FATAL_ERROR "CI glibc heaptrack job must not use musl/static/script settings: ${pattern}")
     endif()
 endforeach()
 
