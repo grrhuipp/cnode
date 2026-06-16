@@ -1577,6 +1577,81 @@ net::awaitable<bool> WriteH2DataPayload(
     co_return true;
 }
 
+net::awaitable<bool> WriteH2DataPayloadBuffers(
+    AsyncStream& stream,
+    uint32_t stream_id,
+    std::span<const net::const_buffer> buffers,
+    bool end_stream = false) {
+    size_t total = 0;
+    for (const auto& buffer : buffers) {
+        total += buffer.size();
+    }
+    if (total == 0) {
+        if (!end_stream) {
+            co_return true;
+        }
+        co_return co_await WriteH2Frame(
+            stream,
+            H2FrameType::DATA,
+            0x1,
+            stream_id);
+    }
+
+    size_t buffer_index = 0;
+    size_t buffer_offset = 0;
+    size_t written = 0;
+    while (written < total) {
+        std::array<net::const_buffer, 7> payloads{};
+        size_t count = 0;
+        size_t frame_len = 0;
+
+        while (buffer_index < buffers.size() &&
+               frame_len < kHttp2MaxFramePayload &&
+               count < payloads.size()) {
+            const auto& source = buffers[buffer_index];
+            const size_t source_size = source.size();
+            if (buffer_offset >= source_size) {
+                ++buffer_index;
+                buffer_offset = 0;
+                continue;
+            }
+
+            const auto* data = static_cast<const uint8_t*>(source.data());
+            const size_t take = std::min(
+                source_size - buffer_offset,
+                kHttp2MaxFramePayload - frame_len);
+            if (take == 0) {
+                break;
+            }
+
+            payloads[count++] = net::buffer(data + buffer_offset, take);
+            frame_len += take;
+            written += take;
+            buffer_offset += take;
+            if (buffer_offset >= source_size) {
+                ++buffer_index;
+                buffer_offset = 0;
+            }
+        }
+
+        if (count == 0) {
+            co_return false;
+        }
+
+        const bool last = written >= total;
+        if (!co_await WriteH2FrameBuffers(
+                stream,
+                H2FrameType::DATA,
+                (end_stream && last) ? 0x1 : 0,
+                stream_id,
+                std::span<const net::const_buffer>(payloads.data(), count))) {
+            co_return false;
+        }
+    }
+
+    co_return true;
+}
+
 size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept;
 
 [[noreturn]] void ThrowGrpcStreamError(const char* what) {
@@ -2296,24 +2371,72 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            std::array<net::const_buffer, 16> stack_buffers{};
+            std::vector<net::const_buffer> spill_buffers;
+            size_t count = 0;
+            size_t total = 0;
+
+            for (const buf::Buffer* buffer : mb) {
+                if (!buffer || buffer->IsEmpty()) {
+                    continue;
+                }
+                const auto bytes = buffer->Bytes();
+                if (count < stack_buffers.size()) {
+                    stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
+                } else {
+                    if (spill_buffers.empty()) {
+                        spill_buffers.reserve(mb.size());
+                        spill_buffers.insert(
+                            spill_buffers.end(),
+                            stack_buffers.begin(),
+                            stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
+                    }
+                    spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
+                }
+                total += bytes.size();
+            }
+
+            try {
+                if (total > 0) {
+                    const auto payloads = spill_buffers.empty()
+                        ? std::span<const net::const_buffer>(stack_buffers.data(), count)
+                        : std::span<const net::const_buffer>(
+                              spill_buffers.data(), spill_buffers.size());
+                    if (!co_await WriteH2DataPayloadBuffers(
+                            *inner_,
+                            stream_id_,
+                            payloads)) {
+                        ThrowGrpcStreamError("HTTP/2 raw WriteMultiBuffer failed");
+                    }
+                }
+            } catch (...) {
+                for (buf::Buffer*& buffer : mb) {
+                    buf::Buffer::Free(buffer);
+                    buffer = nullptr;
+                }
+                mb.clear();
+                throw;
+            }
+
+            for (buf::Buffer*& buffer : mb) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
+            }
+            mb.clear();
+            co_return;
+        }
+
         for (buf::Buffer*& buffer : mb) {
             if (!buffer) {
                 continue;
             }
             if (!buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
-                if (payload_codec_ == H2PayloadCodec::RawData) {
-                    if (!co_await WriteH2DataPayload(*inner_, stream_id_, bytes)) {
-                        buf::Buffer::Free(buffer);
-                        buffer = nullptr;
-                        ThrowGrpcStreamError("HTTP/2 raw WriteMultiBuffer failed");
-                    }
-                } else {
-                    if (!co_await WriteGrpcMessage(bytes)) {
-                        buf::Buffer::Free(buffer);
-                        buffer = nullptr;
-                        ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
-                    }
+                if (!co_await WriteGrpcMessage(bytes)) {
+                    buf::Buffer::Free(buffer);
+                    buffer = nullptr;
+                    ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
                 }
             }
             buf::Buffer::Free(buffer);
@@ -2324,23 +2447,24 @@ public:
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            if (!co_await WriteH2DataPayloadBuffers(
+                    *inner_,
+                    stream_id_,
+                    buffers)) {
+                ThrowGrpcStreamError("HTTP/2 raw WriteBuffers failed");
+            }
+            co_return;
+        }
+
         for (const auto& buffer : buffers) {
             if (buffer.size() == 0) {
                 continue;
             }
             const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (payload_codec_ == H2PayloadCodec::RawData) {
-                if (!co_await WriteH2DataPayload(
-                        *inner_,
-                        stream_id_,
-                        std::span<const uint8_t>(data, buffer.size()))) {
-                    ThrowGrpcStreamError("HTTP/2 raw WriteBuffers failed");
-                }
-            } else {
-                if (!co_await WriteGrpcMessage(
-                        std::span<const uint8_t>(data, buffer.size()))) {
-                    ThrowGrpcStreamError("gRPC WriteBuffers failed");
-                }
+            if (!co_await WriteGrpcMessage(
+                    std::span<const uint8_t>(data, buffer.size()))) {
+                ThrowGrpcStreamError("gRPC WriteBuffers failed");
             }
         }
     }
@@ -2888,6 +3012,38 @@ public:
             *stream_,
             stream_id,
             data,
+            end_stream);
+    }
+
+    net::awaitable<bool> WriteRawDataBuffersSerialized(
+        uint32_t stream_id,
+        std::span<const net::const_buffer> buffers,
+        bool end_stream = false) {
+        while (write_busy_ && !cancelled_) {
+            auto [ec] = co_await write_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                co_return false;
+            }
+        }
+        if (cancelled_ || !stream_) {
+            co_return false;
+        }
+
+        write_busy_ = true;
+        auto guard = std::unique_ptr<void, void(*)(void*)>{
+            this,
+            [](void* ptr) {
+                auto* self = static_cast<GrpcServerSession*>(ptr);
+                self->write_busy_ = false;
+                self->WakeWriter();
+            }};
+        (void)guard;
+
+        co_return co_await WriteH2DataPayloadBuffers(
+            *stream_,
+            stream_id,
+            buffers,
             end_stream);
     }
 
@@ -3509,6 +3665,68 @@ net::awaitable<buf::MultiBuffer> GrpcServerSubStreamState::ReadMultiBuffer() {
 
 net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
     buf::MultiBuffer mb) {
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        std::array<net::const_buffer, 16> stack_buffers{};
+        std::vector<net::const_buffer> spill_buffers;
+        size_t count = 0;
+        size_t total = 0;
+
+        for (const buf::Buffer* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            if (count < stack_buffers.size()) {
+                stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
+            } else {
+                if (spill_buffers.empty()) {
+                    spill_buffers.reserve(mb.size());
+                    spill_buffers.insert(
+                        spill_buffers.end(),
+                        stack_buffers.begin(),
+                        stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
+                }
+                spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
+            }
+            total += bytes.size();
+        }
+
+        try {
+            if (total > 0) {
+                if (write_closed_ || cancelled_) {
+                    ThrowGrpcStreamError("gRPC write on closed server stream");
+                }
+                auto session = session_.lock();
+                if (!session) {
+                    ThrowGrpcStreamError("gRPC write without server session");
+                }
+                const auto payloads = spill_buffers.empty()
+                    ? std::span<const net::const_buffer>(stack_buffers.data(), count)
+                    : std::span<const net::const_buffer>(
+                          spill_buffers.data(), spill_buffers.size());
+                if (!co_await session->WriteRawDataBuffersSerialized(
+                        stream_id_,
+                        payloads)) {
+                    ThrowGrpcStreamError("HTTP/2 raw server stream WriteMultiBuffer failed");
+                }
+            }
+        } catch (...) {
+            for (buf::Buffer*& buffer : mb) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
+            }
+            mb.clear();
+            throw;
+        }
+
+        for (buf::Buffer*& buffer : mb) {
+            buf::Buffer::Free(buffer);
+            buffer = nullptr;
+        }
+        mb.clear();
+        co_return;
+    }
+
     for (buf::Buffer*& buffer : mb) {
         if (!buffer) {
             continue;
@@ -3535,6 +3753,32 @@ net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
 
 net::awaitable<void> GrpcServerSubStreamState::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        bool has_data = false;
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > 0) {
+                has_data = true;
+                break;
+            }
+        }
+        if (!has_data) {
+            co_return;
+        }
+        if (write_closed_ || cancelled_) {
+            ThrowGrpcStreamError("gRPC write on closed server stream");
+        }
+        auto session = session_.lock();
+        if (!session) {
+            ThrowGrpcStreamError("gRPC write without server session");
+        }
+        if (!co_await session->WriteRawDataBuffersSerialized(
+                stream_id_,
+                buffers)) {
+            ThrowGrpcStreamError("HTTP/2 raw server stream WriteBuffers failed");
+        }
+        co_return;
+    }
+
     for (const auto& buffer : buffers) {
         if (buffer.size() == 0) {
             continue;
