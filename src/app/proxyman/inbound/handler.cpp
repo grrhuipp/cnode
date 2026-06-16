@@ -305,6 +305,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         co_return;
     }
     auto stream = std::move(*build_result);
+    if (!stream) {
+        LOG_CONN_DEBUG(ctx, "[Session] Transport consumed connection ({}/{})",
+                       listener.stream_settings.security,
+                       listener.stream_settings.network);
+        co_return;
+    }
 
     if (!ws_real_ip.empty()) {
         IoErrorCode real_ip_ec;

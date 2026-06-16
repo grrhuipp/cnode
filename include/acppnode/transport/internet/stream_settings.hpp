@@ -123,6 +123,9 @@ struct XHttpConfig {
     static XHttpConfig FromJson(const json::object& j);
     [[nodiscard]] std::string NormalizedPath() const;
     [[nodiscard]] bool IsStreamOne() const noexcept;
+    [[nodiscard]] bool AcceptsStreamOne() const noexcept;
+    [[nodiscard]] bool AcceptsPacketUp() const noexcept;
+    [[nodiscard]] bool AcceptsStreamUp() const noexcept;
 };
 
 // ============================================================================

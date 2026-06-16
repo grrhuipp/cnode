@@ -396,6 +396,15 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     cfg.no_grpc_header = jbool(j, "no_grpc_header", cfg.no_grpc_header);
     cfg.no_sse_header = jbool(j, "noSSEHeader", false);
     cfg.no_sse_header = jbool(j, "no_sse_header", cfg.no_sse_header);
+    if (const auto* extra = j.if_contains("extra");
+        extra && extra->is_object()) {
+        const auto& extra_obj = extra->as_object();
+        parse_http_headers(extra_obj, cfg.headers);
+        cfg.no_grpc_header = jbool(extra_obj, "noGRPCHeader", cfg.no_grpc_header);
+        cfg.no_grpc_header = jbool(extra_obj, "no_grpc_header", cfg.no_grpc_header);
+        cfg.no_sse_header = jbool(extra_obj, "noSSEHeader", cfg.no_sse_header);
+        cfg.no_sse_header = jbool(extra_obj, "no_sse_header", cfg.no_sse_header);
+    }
     return cfg;
 }
 
@@ -418,6 +427,25 @@ std::string XHttpConfig::NormalizedPath() const {
 
 bool XHttpConfig::IsStreamOne() const noexcept {
     return mode == "stream-one";
+}
+
+bool XHttpConfig::AcceptsStreamOne() const noexcept {
+    return mode.empty() ||
+           mode == "auto" ||
+           mode == "stream-one" ||
+           mode == "stream-up";
+}
+
+bool XHttpConfig::AcceptsPacketUp() const noexcept {
+    return mode.empty() ||
+           mode == "auto" ||
+           mode == "packet-up";
+}
+
+bool XHttpConfig::AcceptsStreamUp() const noexcept {
+    return mode.empty() ||
+           mode == "auto" ||
+           mode == "stream-up";
 }
 
 std::string GrpcConfig::RequestPath() const {
@@ -587,7 +615,7 @@ void StreamSettings::RecomputeModes() noexcept {
         (network_mode == NetworkMode::Http &&
          (http.force_http2 || security_mode == SecurityMode::Tls)) ||
         (network_mode == NetworkMode::XHttp &&
-         (xhttp.IsStreamOne() || security_mode == SecurityMode::Tls))) {
+         (xhttp.AcceptsStreamOne() || security_mode == SecurityMode::Tls))) {
         auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
         if (!has_h2) {
             tls.alpn.insert(tls.alpn.begin(), "h2");
