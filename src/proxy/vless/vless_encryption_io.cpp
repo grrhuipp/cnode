@@ -79,7 +79,8 @@ std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
     AsyncStream& src,
     std::span<const uint8_t> read_context,
     std::span<const uint8_t> united_key,
-    VlessEncryptionAeadCipher cipher) noexcept {
+    VlessEncryptionAeadCipher cipher,
+    std::optional<VlessEncryptionHeaderXor> header_xor) noexcept {
     auto aead = VlessEncryptionAead::Create(read_context, united_key, cipher);
     if (!aead) {
         return std::nullopt;
@@ -87,16 +88,19 @@ std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
     return VlessEncryptionReader(
         src,
         std::move(*aead),
-        std::vector<uint8_t>(united_key.begin(), united_key.end()));
+        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        std::move(header_xor));
 }
 
 VlessEncryptionReader::VlessEncryptionReader(
     AsyncStream& src,
     VlessEncryptionAead aead,
-    std::vector<uint8_t> united_key) noexcept
+    std::vector<uint8_t> united_key,
+    std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
     : src_(src)
     , aead_(std::move(aead))
-    , united_key_(std::move(united_key)) {}
+    , united_key_(std::move(united_key))
+    , header_xor_(std::move(header_xor)) {}
 
 net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     std::array<uint8_t, kVlessEncryptionRecordHeaderSize> header{};
@@ -107,6 +111,9 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         true);
     if (!have_header) {
         co_return buf::MultiBuffer{};
+    }
+    if (header_xor_ && !header_xor_->XorInboundInPlace(header)) {
+        ThrowVlessEncryptionIoError("VLESS Encryption header xor failed");
     }
 
     const auto encrypted_len = DecodeVlessEncryptionRecordHeader(header);
@@ -120,6 +127,9 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         encrypted.data(),
         encrypted.size(),
         false);
+    if (header_xor_ && !header_xor_->XorInboundInPlace(encrypted)) {
+        ThrowVlessEncryptionIoError("VLESS Encryption body xor state failed");
+    }
 
     std::vector<uint8_t> plain(encrypted.size() - kVlessEncryptionTagSize);
     const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
@@ -162,7 +172,8 @@ std::optional<VlessEncryptionWriter> VlessEncryptionWriter::Create(
     AsyncStream& dst,
     std::span<const uint8_t> write_context,
     std::span<const uint8_t> united_key,
-    VlessEncryptionAeadCipher cipher) noexcept {
+    VlessEncryptionAeadCipher cipher,
+    std::optional<VlessEncryptionHeaderXor> header_xor) noexcept {
     auto aead = VlessEncryptionAead::Create(write_context, united_key, cipher);
     if (!aead) {
         return std::nullopt;
@@ -170,16 +181,19 @@ std::optional<VlessEncryptionWriter> VlessEncryptionWriter::Create(
     return VlessEncryptionWriter(
         dst,
         std::move(*aead),
-        std::vector<uint8_t>(united_key.begin(), united_key.end()));
+        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        std::move(header_xor));
 }
 
 VlessEncryptionWriter::VlessEncryptionWriter(
     AsyncStream& dst,
     VlessEncryptionAead aead,
-    std::vector<uint8_t> united_key) noexcept
+    std::vector<uint8_t> united_key,
+    std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
     : dst_(dst)
     , aead_(std::move(aead))
-    , united_key_(std::move(united_key)) {}
+    , united_key_(std::move(united_key))
+    , header_xor_(std::move(header_xor)) {}
 
 net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
     buf::MultiBuffer mb) {
@@ -210,6 +224,11 @@ net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
                              frame.data(),
                              *written))) {
                 ThrowVlessEncryptionIoError("VLESS Encryption write rekey failed");
+            }
+            auto frame_view = std::span<uint8_t>(frame.data(), *written);
+            if (header_xor_ &&
+                !header_xor_->XorOutboundInPlace(frame_view)) {
+                ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
             }
 
             co_await WriteFullToStream(dst_, frame.data(), *written);

@@ -5,6 +5,7 @@
 #include "acppnode/transport/link.hpp"
 
 #include "vless_encryption_record.hpp"
+#include "vless_encryption_xor.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -23,11 +24,15 @@ public:
         AsyncStream& src,
         std::span<const uint8_t> read_context,
         std::span<const uint8_t> united_key,
-        VlessEncryptionAeadCipher cipher) noexcept;
+        VlessEncryptionAeadCipher cipher,
+        std::optional<VlessEncryptionHeaderXor> header_xor =
+            std::nullopt) noexcept;
 
     VlessEncryptionReader(AsyncStream& src,
                           VlessEncryptionAead aead,
-                          std::vector<uint8_t> united_key) noexcept;
+                          std::vector<uint8_t> united_key,
+                          std::optional<VlessEncryptionHeaderXor>
+                              header_xor) noexcept;
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
@@ -37,6 +42,7 @@ private:
     AsyncStream& src_;
     VlessEncryptionAead aead_;
     std::vector<uint8_t> united_key_;
+    std::optional<VlessEncryptionHeaderXor> header_xor_;
 };
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
@@ -45,11 +51,15 @@ public:
         AsyncStream& dst,
         std::span<const uint8_t> write_context,
         std::span<const uint8_t> united_key,
-        VlessEncryptionAeadCipher cipher) noexcept;
+        VlessEncryptionAeadCipher cipher,
+        std::optional<VlessEncryptionHeaderXor> header_xor =
+            std::nullopt) noexcept;
 
     VlessEncryptionWriter(AsyncStream& dst,
                           VlessEncryptionAead aead,
-                          std::vector<uint8_t> united_key) noexcept;
+                          std::vector<uint8_t> united_key,
+                          std::optional<VlessEncryptionHeaderXor>
+                              header_xor) noexcept;
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> AsyncShutdownWrite() override;
@@ -60,6 +70,7 @@ private:
     AsyncStream& dst_;
     VlessEncryptionAead aead_;
     std::vector<uint8_t> united_key_;
+    std::optional<VlessEncryptionHeaderXor> header_xor_;
 };
 
 }  // namespace acpp::vless
