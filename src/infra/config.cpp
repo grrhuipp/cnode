@@ -55,6 +55,26 @@ inline std::vector<std::string> jstr_array(const json::value& v) {
     return result;
 }
 
+std::string lower_ascii_copy(std::string value) {
+    std::ranges::transform(value, value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+void parse_http_headers(const json::object& j,
+                        transport::internet::HttpHeaders& headers,
+                        std::string_view key = "headers") {
+    auto* p = j.if_contains(key);
+    if (p && p->is_object()) {
+        for (const auto& [k, v] : p->as_object()) {
+            if (v.is_string()) {
+                headers[std::string(k)] = std::string(v.as_string());
+            }
+        }
+    }
+}
+
 
 } // anonymous namespace
 
@@ -302,27 +322,68 @@ RoutingConfig RoutingConfig::FromJson(const json::object& j) {
 WsConfig WsConfig::FromJson(const json::object& j) {
     WsConfig cfg;
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
-    // headers 字段
-    auto parse_headers = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            for (const auto& [k, v] : p->as_object()) {
-                if (v.is_string()) {
-                    cfg.headers[std::string(k)] = std::string(v.as_string());
-                }
-            }
-        }
-    };
-    parse_headers("headers");
+    parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = jstr(j, "realIpHeader", "");
+    if (cfg.real_ip_header.empty()) {
+        cfg.real_ip_header = jstr(j, "real_ip_header", "");
+    }
     return cfg;
+}
+
+HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
+    HttpUpgradeConfig cfg;
+    cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
+    cfg.host = jstr(j, "host", "");
+    parse_http_headers(j, cfg.headers);
+    cfg.real_ip_header = jstr(j, "realIpHeader", "");
+    if (cfg.real_ip_header.empty()) {
+        cfg.real_ip_header = jstr(j, "real_ip_header", "");
+    }
+    cfg.accept_proxy_protocol = jbool(j, "acceptProxyProtocol", false);
+    return cfg;
+}
+
+GrpcConfig GrpcConfig::FromJson(const json::object& j) {
+    GrpcConfig cfg;
+    cfg.authority = jstr(j, "authority", "");
+    if (cfg.authority.empty()) {
+        cfg.authority = jstr(j, "host", "");
+    }
+    cfg.service_name = jstr(j, "serviceName", "");
+    if (cfg.service_name.empty()) {
+        cfg.service_name = jstr(j, "service_name", "");
+    }
+    cfg.user_agent = jstr(j, "user_agent", "");
+    if (cfg.user_agent.empty()) {
+        cfg.user_agent = jstr(j, "userAgent", "");
+    }
+    cfg.multi_mode = jbool(j, "multiMode", false);
+    cfg.multi_mode = jbool(j, "multi_mode", cfg.multi_mode);
+    cfg.initial_window_size = static_cast<int>(
+        jint(j, "initial_windows_size",
+             jint(j, "initialWindowSize", cfg.initial_window_size)));
+    return cfg;
+}
+
+std::string GrpcConfig::RequestPath() const {
+    if (!service_name.empty() && service_name.front() == '/') {
+        return service_name;
+    }
+    std::string path;
+    path.reserve(service_name.size() + 10);
+    path.push_back('/');
+    path.append(service_name);
+    path.append(multi_mode ? "/TunMulti" : "/Tun");
+    return path;
 }
 
 StreamSettings StreamSettings::FromJson(const json::object& j) {
     StreamSettings cfg;
 
-    cfg.network  = jstr(j, "network",  std::string(constants::protocol::kTcp));
-    cfg.security = jstr(j, "security", std::string(constants::protocol::kNone));
+    cfg.network  = lower_ascii_copy(
+        jstr(j, "network",  std::string(constants::protocol::kTcp)));
+    cfg.security = lower_ascii_copy(
+        jstr(j, "security", std::string(constants::protocol::kNone)));
 
     // TLS 配置
     auto parse_tls = [&](std::string_view key) {
@@ -359,6 +420,25 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
         }
     };
     parse_ws("wsSettings");
+    parse_ws("websocketSettings");
+
+    auto parse_http_upgrade = [&](std::string_view key) {
+        auto* p = j.if_contains(key);
+        if (p && p->is_object()) {
+            cfg.http_upgrade = HttpUpgradeConfig::FromJson(p->as_object());
+        }
+    };
+    parse_http_upgrade("httpupgradeSettings");
+    parse_http_upgrade("httpUpgradeSettings");
+
+    auto parse_grpc = [&](std::string_view key) {
+        auto* p = j.if_contains(key);
+        if (p && p->is_object()) {
+            cfg.grpc = GrpcConfig::FromJson(p->as_object());
+        }
+    };
+    parse_grpc("grpcSettings");
+    parse_grpc("grpc_settings");
 
     cfg.RecomputeModes();
     return cfg;
@@ -366,15 +446,64 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
 
 void StreamSettings::RecomputeModes() noexcept {
     // 仅初始化/配置更新时调用，热路径不再做字符串比较
-    network_mode  = (network == constants::protocol::kWs)  ? NetworkMode::Ws  : NetworkMode::Tcp;
-    security_mode = (security == constants::protocol::kTls) ? SecurityMode::Tls : SecurityMode::None;
+    network = lower_ascii_copy(std::move(network));
+    security = lower_ascii_copy(std::move(security));
+
+    if (network.empty() ||
+        network == constants::protocol::kTcp ||
+        network == constants::protocol::kRaw) {
+        network_mode = NetworkMode::Tcp;
+    } else if (network == constants::protocol::kWs ||
+               network == constants::protocol::kWebSocket) {
+        network_mode = NetworkMode::Ws;
+    } else if (network == constants::protocol::kHttpUpgrade ||
+               network == "httpupgrade") {
+        network_mode = NetworkMode::HttpUpgrade;
+        network = std::string(constants::protocol::kHttpUpgrade);
+    } else if (network == constants::protocol::kGrpc) {
+        network_mode = NetworkMode::Grpc;
+    } else if (network == constants::protocol::kXHttp) {
+        network_mode = NetworkMode::XHttp;
+    } else {
+        network_mode = NetworkMode::Unsupported;
+    }
+
+    if (security.empty() || security == constants::protocol::kNone) {
+        security_mode = SecurityMode::None;
+    } else if (security == constants::protocol::kTls) {
+        security_mode = SecurityMode::Tls;
+    } else if (security == constants::protocol::kReality) {
+        security_mode = SecurityMode::Reality;
+    } else {
+        security_mode = SecurityMode::Unsupported;
+    }
 
     flags = kFlagNone;
     if (network_mode == NetworkMode::Ws) {
         flags |= kFlagWs;
     }
+    if (network_mode == NetworkMode::HttpUpgrade) {
+        flags |= kFlagHttpUpgrade;
+    }
+    if (network_mode == NetworkMode::Grpc) {
+        flags |= kFlagGrpc;
+        network = std::string(constants::protocol::kGrpc);
+    }
+    if (network_mode == NetworkMode::XHttp) {
+        flags |= kFlagXHttp;
+    }
     if (security_mode == SecurityMode::Tls) {
         flags |= kFlagTls;
+    }
+    if (security_mode == SecurityMode::Reality) {
+        flags |= kFlagReality;
+    }
+
+    if (network_mode == NetworkMode::Grpc) {
+        auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
+        if (!has_h2) {
+            tls.alpn.insert(tls.alpn.begin(), "h2");
+        }
     }
 }
 

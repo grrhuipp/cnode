@@ -30,6 +30,9 @@ public:
 
     SSL_CTX* Native() { return ctx_; }
     const SSL_CTX* Native() const { return ctx_; }
+    const std::vector<unsigned char>& ServerAlpnWire() const noexcept {
+        return server_alpn_wire_;
+    }
 
     // 禁止拷贝
     SslContext(const SslContext&) = delete;
@@ -37,7 +40,10 @@ public:
 
 private:
     explicit SslContext(SSL_CTX* ctx) : ctx_(ctx) {}
+    void ConfigureServerAlpn(const std::vector<std::string>& protocols);
+
     SSL_CTX* ctx_ = nullptr;
+    std::vector<unsigned char> server_alpn_wire_;
 };
 
 // ============================================================================
@@ -78,6 +84,7 @@ public:
     net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;
     net::awaitable<void> AsyncShutdownWrite() override;

@@ -73,7 +73,7 @@ public:
                 if (!buffer || buffer->IsEmpty()) {
                     continue;
                 }
-                if (buffer->HasUDP() && !SameTargetAddress(buffer->udp, udp_target_)) {
+                if (buffer->HasUDP() && !SameTargetAddress(buffer->UDP(), udp_target_)) {
                     buf::Buffer::Free(buffer);
                     buffer = nullptr;
                     continue;

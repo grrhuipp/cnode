@@ -96,24 +96,6 @@ private:
     return dynamic_cast<const ShadowsocksUdpResponseContext*>(&context);
 }
 
-[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                           buf::MultiBuffer& out) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            return false;
-        }
-        const size_t n = std::min(data.size() - offset,
-                                  static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), data.data() + offset, n);
-        buffer->Produce(static_cast<uint32_t>(n));
-        out.push_back(buffer.release());
-        offset += n;
-    }
-    return true;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -364,7 +346,9 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
 
         buf::MultiBuffer payload;
         payload.reserve((encoded_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!AppendSpanToMultiBuffer(scratch, payload)) {
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(scratch.data(), scratch.size()),
+                payload)) {
             return {};
         }
         return payload;
@@ -425,7 +409,9 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
 
     buf::MultiBuffer payload;
     payload.reserve((encoded_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    if (!AppendSpanToMultiBuffer(scratch, payload)) {
+    if (!buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(scratch.data(), scratch.size()),
+            payload)) {
         return {};
     }
     return payload;

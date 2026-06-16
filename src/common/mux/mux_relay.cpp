@@ -35,25 +35,6 @@ constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
 constexpr size_t kMuxFrameBufKeepCap     = 0;
 constexpr size_t kMuxReplyOverhead       = 128;
 
-[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                           buf::MultiBuffer& out_mb) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            return false;
-        }
-        const size_t chunk = std::min(
-            data.size() - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        out_mb.push_back(out.release());
-        offset += chunk;
-    }
-    return true;
-}
-
 void AppendOwnedBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
     for (buf::Buffer*& buffer : src) {
         if (!buffer || buffer->IsEmpty()) {
@@ -143,12 +124,14 @@ struct MuxReply {
 
 struct ReplyQueueState {
     explicit ReplyQueueState(net::io_context& io_context)
-        : sub_done_signal(io_context, 1) {}
+        : reply_signal(io_context, 1)
+        , sub_done_signal(io_context, 1) {}
 
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
+    net::experimental::channel<void(IoErrorCode)> reply_signal;
     net::experimental::channel<void(IoErrorCode)> sub_done_signal;
     bool running = true;
     bool tcp_overflowed = false;
@@ -171,6 +154,7 @@ struct ReplyQueueState {
         if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
             shrink_queue_on_drain = true;
         }
+        WakeReplyWriter();
         return true;
     }
 
@@ -180,6 +164,7 @@ struct ReplyQueueState {
         if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
             shrink_queue_on_drain = true;
         }
+        WakeReplyWriter();
     }
 
     bool Pop(MuxReply& reply) {
@@ -208,6 +193,14 @@ struct ReplyQueueState {
         return tcp_queued_bytes <= kMuxQueueLowWaterBytes;
     }
 
+    [[nodiscard]] bool Empty() const noexcept {
+        return queue.empty();
+    }
+
+    void WakeReplyWriter() noexcept {
+        (void)reply_signal.try_send(IoErrorCode{});
+    }
+
     void AddSubLoop() noexcept {
         ++active_sub_loops;
     }
@@ -217,6 +210,7 @@ struct ReplyQueueState {
             --active_sub_loops;
         }
         (void)sub_done_signal.try_send(IoErrorCode{});
+        WakeReplyWriter();
     }
 };
 
@@ -247,7 +241,7 @@ public:
         }
         buf::MultiBuffer mb;
         mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!AppendSpanToMultiBuffer(payload, mb)) {
+        if (!buf::AppendSpanToMultiBuffer(payload, mb)) {
             return false;
         }
         PushClientPayload(std::move(mb));
@@ -420,7 +414,7 @@ public:
         }
         buf::MultiBuffer mb;
         mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!AppendSpanToMultiBuffer(payload, mb)) {
+        if (!buf::AppendSpanToMultiBuffer(payload, mb)) {
             return false;
         }
         for (buf::Buffer* buffer : mb) {
@@ -523,7 +517,7 @@ public:
             reply.session_id = session_id_;
             reply.is_end = false;
             reply.is_udp = true;
-            reply.udp_src = buffer->udp;
+            reply.udp_src = buffer->UDP();
             reply.payload.push_back(buffer);
             buffer = nullptr;
             reply_queue_.PushUdpPrepared(
@@ -723,6 +717,7 @@ net::awaitable<RelayResult> DoMuxRelay(
     ReadPollState read_poll;
 
     bool running = true;
+    bool client_input_done = false;
     auto release_write_frame = [&]() noexcept {
         write_frame.clear();
         ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
@@ -738,7 +733,7 @@ net::awaitable<RelayResult> DoMuxRelay(
 
                 buf::MultiBuffer frame_mb;
                 frame_mb.reserve((frame_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-                if (!AppendSpanToMultiBuffer(
+                if (!buf::AppendSpanToMultiBuffer(
                         std::span<const uint8_t>(frame.data(), frame.size()),
                         frame_mb)) {
                     result.error = ErrorCode::RESOURCE_EXHAUSTED;
@@ -812,6 +807,19 @@ net::awaitable<RelayResult> DoMuxRelay(
         }
         if (!running) break;
 
+        if (client_input_done) {
+            if (reply_queue.Empty() && reply_queue.active_sub_loops == 0) {
+                break;
+            }
+            auto [ec] = co_await reply_queue.reply_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                running = false;
+                break;
+            }
+            continue;
+        }
+
         if (reply_queue.tcp_overflowed) {
             reply_queue.tcp_overflowed = false;
             LOG_CONN_DEBUG(parent_ctx,
@@ -878,9 +886,11 @@ net::awaitable<RelayResult> DoMuxRelay(
             if (client_control && ConsumeReadSideTimeout(*client_control)) {
                 LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                 result.error = ErrorCode::RELAY_TIMEOUT;
+                running = false;
+                break;
             }
-            running = false;
-            break;
+            client_input_done = true;
+            continue;
         }
         parent_ctx.traffic.bytes_up += read_bytes;
         result.bytes_up += read_bytes;
@@ -888,9 +898,21 @@ net::awaitable<RelayResult> DoMuxRelay(
         AppendOwnedBuffers(frame_buf, read_mb);
 
         std::vector<uint8_t> frame_scratch;
-        CopyMultiBufferToScratch(frame_buf, frame_scratch);
-        const uint8_t* parse_data = frame_scratch.data();
-        const size_t parse_size = frame_scratch.size();
+        std::span<const uint8_t> parse_bytes;
+        if (frame_buf.size() == 1) {
+            const buf::Buffer* buffer = *frame_buf.begin();
+            if (buffer && !buffer->IsEmpty()) {
+                parse_bytes = buffer->Bytes();
+            }
+        }
+        if (parse_bytes.empty() && !frame_buf.empty()) {
+            CopyMultiBufferToScratch(frame_buf, frame_scratch);
+            parse_bytes = std::span<const uint8_t>(
+                frame_scratch.data(),
+                frame_scratch.size());
+        }
+        const uint8_t* parse_data = parse_bytes.data();
+        const size_t parse_size = parse_bytes.size();
         size_t parse_offset = 0;
 
         // --------------------------------------------------------------------

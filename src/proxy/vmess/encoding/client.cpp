@@ -81,24 +81,6 @@ uint8_t* PrepareScratch(memory::ByteVector& buffer, size_t size) {
     return buffer.data();
 }
 
-[[nodiscard]] bool AppendPlainToMultiBuffer(const uint8_t* data,
-                                            size_t len,
-                                            buf::MultiBuffer& out_mb) {
-    size_t offset = 0;
-    while (offset < len) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            return false;
-        }
-        const size_t copy = std::min(len - offset, static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), data + offset, copy);
-        out->Produce(static_cast<uint32_t>(copy));
-        out_mb.push_back(out.release());
-        offset += copy;
-    }
-    return true;
-}
-
 }  // namespace
 
 namespace vmess::encoding {
@@ -414,7 +396,9 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     out_mb.reserve((dec_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
     out_mb.push_back(out.release());
     if (first_copy < dec_size &&
-        !AppendPlainToMultiBuffer(plain + first_copy, dec_size - first_copy, out_mb)) {
+        !buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(plain + first_copy, dec_size - first_copy),
+            out_mb)) {
         ReleaseIdleBuffer(plain_buf, 0);
         co_return buf::MultiBuffer{};
     }

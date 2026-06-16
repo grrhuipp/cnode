@@ -23,6 +23,43 @@ namespace acpp {
 // SslContext 实现
 // ============================================================================
 
+namespace {
+
+int SelectServerAlpnCallback(
+    SSL* ssl,
+    const unsigned char** out,
+    unsigned char* outlen,
+    const unsigned char* in,
+    unsigned int inlen,
+    void* /*arg*/) {
+    auto* ctx = static_cast<SslContext*>(
+        SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)));
+    if (!ctx) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    const auto& configured = ctx->ServerAlpnWire();
+    if (configured.empty()) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    unsigned char* selected = nullptr;
+    const int rc = SSL_select_next_proto(
+        &selected,
+        outlen,
+        configured.data(),
+        static_cast<unsigned int>(configured.size()),
+        in,
+        inlen);
+    if (rc != OPENSSL_NPN_NEGOTIATED || !selected || *outlen == 0) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    *out = selected;
+    return SSL_TLSEXT_ERR_OK;
+}
+
+}  // namespace
+
 std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     const SSL_METHOD* method = TLS_server_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
@@ -57,7 +94,9 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
         return nullptr;
     }
 
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    out->ConfigureServerAlpn(config.alpn);
+    return out;
 }
 
 // ============================================================================
@@ -254,7 +293,9 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
 
     LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书，默认域名={}）",
              default_name);
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    out->ConfigureServerAlpn(config.alpn);
+    return out;
 }
 
 std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
@@ -278,6 +319,25 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     }
 
     return std::unique_ptr<SslContext>(new SslContext(ctx));
+}
+
+void SslContext::ConfigureServerAlpn(const std::vector<std::string>& protocols) {
+    server_alpn_wire_.clear();
+    for (const auto& proto : protocols) {
+        if (proto.empty() || proto.size() > 255) {
+            continue;
+        }
+        server_alpn_wire_.push_back(static_cast<unsigned char>(proto.size()));
+        server_alpn_wire_.insert(
+            server_alpn_wire_.end(),
+            proto.begin(),
+            proto.end());
+    }
+
+    if (!server_alpn_wire_.empty()) {
+        SSL_CTX_set_app_data(ctx_, this);
+        SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, nullptr);
+    }
 }
 
 SslContext::~SslContext() {
@@ -730,6 +790,68 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     }
 
     co_return total_written;
+}
+
+net::awaitable<void> TlsStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    if (!handshake_done_) {
+        if (!co_await Handshake()) {
+            ThrowTlsWriteError("TLS handshake failed during write");
+        }
+    }
+
+    if (buffers.empty()) {
+        co_return;
+    }
+
+    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
+
+    for (const auto& buffer : buffers) {
+        if (buffer.size() == 0) {
+            continue;
+        }
+
+        const uint8_t* data = static_cast<const uint8_t*>(buffer.data());
+        size_t remaining = buffer.size();
+
+        while (remaining > 0) {
+            const auto to_write = static_cast<int>(
+                std::min<std::size_t>(remaining, kTlsIoBufferSize));
+            int ret = SSL_write(ssl_, data, to_write);
+
+            if (ret > 0) {
+                data += ret;
+                remaining -= static_cast<size_t>(ret);
+                if (static_cast<size_t>(BIO_pending(write_bio_)) >= kTlsIoBufferSize * 8) {
+                    if (!co_await FlushWriteBio()) {
+                        ThrowTlsWriteError("TLS flush write BIO failed");
+                    }
+                }
+                continue;
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+            if (err == SSL_ERROR_WANT_WRITE) {
+                if (!co_await FlushWriteBio()) {
+                    ThrowTlsWriteError("TLS flush write BIO failed");
+                }
+            } else if (err == SSL_ERROR_WANT_READ) {
+                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
+                if (n > 0) {
+                    BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
+                } else {
+                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
+                }
+            } else {
+                ThrowTlsWriteError("TLS write failed");
+            }
+        }
+    }
+
+    if (!co_await FlushWriteBio()) {
+        ThrowTlsWriteError("TLS flush write BIO failed");
+    }
+    co_return;
 }
 
 net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {

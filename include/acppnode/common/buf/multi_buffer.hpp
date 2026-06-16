@@ -4,9 +4,12 @@
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/common/target_address.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -42,9 +45,8 @@ struct Buffer {
 
     // UDP 数据面：本 Buffer 数据对应的对端地址（Full Cone 逐包目标/来源），
     // 对齐 xray-core buf.Buffer.UDP 的 "buffer 携带 endpoint" 语义。上行=目标，
-    // 回包=来源。TCP relay 路径 has_udp 恒为 false，udp 默认构造、析构近乎 no-op。
-    bool has_udp = false;
-    TargetAddress udp;
+    // 回包=来源。TCP relay 路径通常不携带 endpoint，因此懒构造 TargetAddress。
+    std::optional<TargetAddress> udp_;
 
     // 有效数据视图 [start, end)
     std::span<uint8_t>       Bytes() noexcept       { return {data + start, end - start}; }
@@ -72,20 +74,20 @@ struct Buffer {
 
     // 设置/清除本 Buffer 的 UDP 对端地址。
     void SetUDP(const TargetAddress& dest) {
-        udp = dest;
-        has_udp = true;
+        udp_ = dest;
     }
-    void SetUDP(TargetAddress&& dest) noexcept {
-        udp = std::move(dest);
-        has_udp = true;
+    void SetUDP(TargetAddress&& dest) {
+        udp_ = std::move(dest);
     }
     void ClearUDP() noexcept {
-        if (has_udp) {
-            udp = TargetAddress{};
-            has_udp = false;
-        }
+        udp_.reset();
     }
-    [[nodiscard]] bool HasUDP() const noexcept { return has_udp; }
+    [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
+    [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
+    [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
+    [[nodiscard]] const TargetAddress* MaybeUDP() const noexcept {
+        return udp_ ? std::addressof(*udp_) : nullptr;
+    }
 
     // 从 Worker-local 回收缓存或 allocator 获取；仅初始化游标，payload 保持
     // 未初始化以避免热路径无谓 memset。命中回收缓存时省去 8KB 全局分配。
@@ -104,7 +106,7 @@ struct Buffer {
         return b;
     }
 
-    // 归还。Buffer 含非平凡成员（udp），先析构；裸内存优先回收到 Worker-local
+    // 归还。Buffer 含非平凡成员（udp_），先析构；裸内存优先回收到 Worker-local
     // 缓存，缓存满才真正还给 allocator。
     static void Free(Buffer* b) noexcept {
         if (!b) {
@@ -127,6 +129,13 @@ inline constexpr size_t kBufferRecycleCap = 16;
 struct BufferRecycleCache {
     void* slots[kBufferRecycleCap];
     size_t count = 0;
+#ifdef CNODE_MEMORY_STATS
+    uint64_t high_water = 0;
+    uint64_t pop_hits = 0;
+    uint64_t pop_misses = 0;
+    uint64_t push_hits = 0;
+    uint64_t push_drops = 0;
+#endif
 
     BufferRecycleCache() noexcept = default;
     BufferRecycleCache(const BufferRecycleCache&) = delete;
@@ -148,21 +157,55 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
 [[nodiscard]] inline void* BufferRecyclePop() noexcept {
     auto& cache = TlsBufferRecycle();
     if (cache.count == 0) {
+#ifdef CNODE_MEMORY_STATS
+        ++cache.pop_misses;
+#endif
         return nullptr;
     }
+#ifdef CNODE_MEMORY_STATS
+    ++cache.pop_hits;
+#endif
     return cache.slots[--cache.count];
 }
 
 [[nodiscard]] inline bool BufferRecyclePush(void* raw) noexcept {
     auto& cache = TlsBufferRecycle();
     if (cache.count >= kBufferRecycleCap) {
+#ifdef CNODE_MEMORY_STATS
+        ++cache.push_drops;
+#endif
         return false;
     }
     cache.slots[cache.count++] = raw;
+#ifdef CNODE_MEMORY_STATS
+    ++cache.push_hits;
+    cache.high_water = std::max<uint64_t>(
+        cache.high_water,
+        static_cast<uint64_t>(cache.count));
+#endif
     return true;
 }
 
+[[nodiscard]] inline memory::BufferRecycleStats SnapshotBufferRecycleStats() noexcept {
+    auto& cache = TlsBufferRecycle();
+    memory::BufferRecycleStats stats;
+    stats.cache_depth = cache.count;
+    stats.cache_capacity = kBufferRecycleCap;
+#ifdef CNODE_MEMORY_STATS
+    stats.cache_high_water = cache.high_water;
+    stats.pop_hits = cache.pop_hits;
+    stats.pop_misses = cache.pop_misses;
+    stats.push_hits = cache.push_hits;
+    stats.push_drops = cache.push_drops;
+#endif
+    return stats;
+}
+
 }  // namespace detail
+
+[[nodiscard]] inline memory::BufferRecycleStats SnapshotThreadBufferRecycleStats() noexcept {
+    return detail::SnapshotBufferRecycleStats();
+}
 
 // RAII 守卫：离开作用域时自动释放单个 Buffer
 struct BufferGuard {
@@ -247,6 +290,18 @@ public:
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
     [[nodiscard]] size_t size() const noexcept {
         return using_spill_ ? spill_.size() : size_;
+    }
+    [[nodiscard]] Buffer* back() noexcept {
+        if (empty()) {
+            return nullptr;
+        }
+        return using_spill_ ? spill_.back() : inline_buffers_[size_ - 1];
+    }
+    [[nodiscard]] const Buffer* back() const noexcept {
+        if (empty()) {
+            return nullptr;
+        }
+        return using_spill_ ? spill_.back() : inline_buffers_[size_ - 1];
     }
 
     void reserve(size_t n) {
@@ -424,6 +479,42 @@ inline size_t TotalLen(const MultiBuffer& mb) noexcept {
         }
     }
     return n;
+}
+
+[[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
+                                                  MultiBuffer& out_mb,
+                                                  bool coalesce_tail = true) {
+    size_t offset = 0;
+
+    if (coalesce_tail) {
+        Buffer* tail = out_mb.back();
+        // UDP endpoint marks packet boundaries; only coalesce plain stream buffers.
+        if (tail && !tail->HasUDP() && tail->Available() > 0) {
+            const size_t chunk = std::min(
+                data.size(),
+                static_cast<size_t>(tail->Available()));
+            if (chunk > 0) {
+                std::memcpy(tail->Tail().data(), data.data(), chunk);
+                tail->Produce(static_cast<uint32_t>(chunk));
+                offset += chunk;
+            }
+        }
+    }
+
+    while (offset < data.size()) {
+        BufferGuard out{Buffer::New()};
+        if (!out) {
+            return false;
+        }
+        const size_t chunk = std::min(
+            data.size() - offset,
+            static_cast<size_t>(out->Available()));
+        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
+        out->Produce(static_cast<uint32_t>(chunk));
+        out_mb.push_back(out.release());
+        offset += chunk;
+    }
+    return true;
 }
 
 }  // namespace acpp::buf

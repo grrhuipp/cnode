@@ -124,6 +124,53 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
     return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
 }
 
+[[nodiscard]] std::string BuildHttpUpgradeHostHeader(
+    const StreamSettings& settings,
+    std::string_view fallback_host,
+    uint16_t port) {
+    if (!settings.IsHttpUpgrade()) {
+        return {};
+    }
+    if (!settings.http_upgrade.host.empty()) {
+        return settings.http_upgrade.host;
+    }
+    if (const std::string_view explicit_host =
+            FindHttpHeaderCI(settings.http_upgrade.headers, "Host");
+        !explicit_host.empty()) {
+        return std::string(explicit_host);
+    }
+    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+}
+
+[[nodiscard]] std::string BuildGrpcAuthority(
+    const StreamSettings& settings,
+    std::string_view fallback_host,
+    uint16_t port) {
+    if (!settings.IsGrpc()) {
+        return {};
+    }
+    if (!settings.grpc.authority.empty()) {
+        return settings.grpc.authority;
+    }
+    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+}
+
+[[nodiscard]] std::string BuildHttpHostHeader(
+    const StreamSettings& settings,
+    std::string_view fallback_host,
+    uint16_t port) {
+    if (settings.IsWs()) {
+        return BuildWsHostHeader(settings, fallback_host, port);
+    }
+    if (settings.IsHttpUpgrade()) {
+        return BuildHttpUpgradeHostHeader(settings, fallback_host, port);
+    }
+    if (settings.IsGrpc()) {
+        return BuildGrpcAuthority(settings, fallback_host, port);
+    }
+    return {};
+}
+
 }  // namespace
 
 std::optional<net::ip::address> ParseLiteralAddress(std::string_view address) {
@@ -188,7 +235,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
     target.tls_server_name = options.tls_server_name;
-    target.ws_host = BuildWsHostHeader(
+    target.ws_host = BuildHttpHostHeader(
         *options.stream_settings,
         options.ws_host.empty() ? options.address : options.ws_host,
         options.port);

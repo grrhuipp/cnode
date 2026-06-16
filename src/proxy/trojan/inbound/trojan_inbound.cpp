@@ -183,7 +183,7 @@ private:
 // ============================================================================
 // Trojan UDP reader/writer helper
 //
-// 把 TCP 隧道上的 Trojan UDP 帧解析/封装为携带逐包目标(buffer.udp)的 MultiBuffer，
+// 把 TCP 隧道上的 Trojan UDP 帧解析/封装为携带逐包目标的 MultiBuffer，
 // 供 dispatcher.Dispatch -> outbound.Process -> DoUDPRelayLink 以协议无关方式中继。
 // 对齐 xray-core 把 UDP 封帧放在入站 reader/writer，而非 relay 内部。
 // ============================================================================
@@ -243,7 +243,7 @@ public:
                 break;
             }
             const size_t n = trojan::TrojanCodec::EncodeUdpPacketTo(
-                b->udp, b->Bytes().data(), b->Len(),
+                b->UDP(), b->Bytes().data(), b->Len(),
                 enc->Tail().data(), enc->Available());
             if (n == 0) {
                 buf::Buffer::Free(enc);
@@ -413,7 +413,7 @@ proxy::trojan::inbound::Handler::Process(
 
     if (net == Network::UDP) {
         // UDP：封帧下沉到入站 reader/writer helper，dispatcher 拿到的是携带逐包
-        // 目标(buffer.udp)的 Link；relay 协议无关。reader/writer 是本协程局部对象，
+        // 目标的 Link；relay 协议无关。reader/writer 是本协程局部对象，
         // 在 co_await Dispatch 期间有效；stream 被 Dispatch 接管但堆对象稳定，
         // 引用持续有效。首帧 leftover 在构造时喂入 reader 的 framer。
         TrojanUdpReader udp_reader(*stream, leftover);

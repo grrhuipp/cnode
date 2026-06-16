@@ -47,12 +47,22 @@ InboundBuild InboundBuilder(const std::string& panel_name,
         build.stream_settings.tls.server_name = node_config.TLSServerName;
     }
 
-    if (build.stream_settings.network == constants::protocol::kWs) {
+    build.stream_settings.RecomputeModes();
+
+    if (build.stream_settings.IsWs()) {
         build.stream_settings.ws.path = node_config.Path.empty()
             ? std::string(constants::binding::kRootPath)
             : node_config.Path;
         if (!node_config.Host.empty()) {
             build.stream_settings.ws.headers["Host"] = node_config.Host;
+        }
+    }
+    if (build.stream_settings.IsHttpUpgrade()) {
+        build.stream_settings.http_upgrade.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.http_upgrade.host = node_config.Host;
         }
     }
     build.stream_settings.RecomputeModes();

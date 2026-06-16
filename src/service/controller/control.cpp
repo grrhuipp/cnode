@@ -292,6 +292,7 @@ struct UserListDiff {
         && a.Obfs == b.Obfs
         && a.ObfsParam == b.ObfsParam
         && a.UUID == b.UUID
+        && a.Flow == b.Flow
         && a.AlterID == b.AlterID
         && a.Enabled == b.Enabled;
 }
@@ -322,6 +323,7 @@ struct UserInfoRefHash {
         HashCombine(seed, user.Obfs);
         HashCombine(seed, user.ObfsParam);
         HashCombine(seed, user.UUID);
+        HashCombine(seed, user.Flow);
         HashCombine(seed, user.AlterID);
         HashCombine(seed, user.Enabled);
         return seed;

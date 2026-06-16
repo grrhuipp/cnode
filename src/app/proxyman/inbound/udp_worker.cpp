@@ -189,7 +189,7 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
             continue;
         }
         impl_->reply_callback(UDPPacketView{
-            buffer->udp,
+            buffer->UDP(),
             buffer->Bytes(),
         });
     }

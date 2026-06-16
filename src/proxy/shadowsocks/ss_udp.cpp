@@ -133,24 +133,6 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
     return pos;
 }
 
-[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                           buf::MultiBuffer& out) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            return false;
-        }
-        const size_t n = std::min(data.size() - offset,
-                                  static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), data.data() + offset, n);
-        buffer->Produce(static_cast<uint32_t>(n));
-        out.push_back(buffer.release());
-        offset += n;
-    }
-    return true;
-}
-
 [[nodiscard]] bool RandomBytes(std::span<uint8_t> out) {
     return out.empty() ||
            RAND_bytes(out.data(), static_cast<int>(out.size())) == 1;
@@ -492,7 +474,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     result.reply_key = state->key;
     result.cipher_info = cipher_info;
     result.ss2022_session = std::move(state);
-    if (!AppendSpanToMultiBuffer(parsed.payload, result.payload)) {
+    if (!buf::AppendSpanToMultiBuffer(parsed.payload, result.payload)) {
         return std::nullopt;
     }
     return result;
@@ -903,7 +885,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
         const size_t payload_offset = std::min(addr->consumed, plaintext_len);
         const size_t payload_size = plaintext_len - payload_offset;
-        if (!AppendSpanToMultiBuffer(
+        if (!buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(
                     plaintext.data() + payload_offset,
                     payload_size),
@@ -992,7 +974,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     result.cipher_info = SsCipherInfo{cipher_type, key_size, salt_size};
 
     const size_t payload_offset = std::min(addr->consumed, plaintext_len);
-    if (!AppendSpanToMultiBuffer(
+    if (!buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(
                 plaintext.data() + payload_offset,
                 plaintext_len - payload_offset),
@@ -1133,7 +1115,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     result.target = std::move(parsed->target);
     result.cipher_info = state.cipher_info;
     result.reply_key = state.key;
-    if (!AppendSpanToMultiBuffer(parsed->payload, result.payload)) {
+    if (!buf::AppendSpanToMultiBuffer(parsed->payload, result.payload)) {
         return std::nullopt;
     }
     return result;

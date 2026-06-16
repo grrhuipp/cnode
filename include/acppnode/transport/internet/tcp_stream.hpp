@@ -42,6 +42,7 @@ public:
     // WriteMultiBuffer: scatter-write (WSASend / writev)，多 Buffer 合并为单次系统调用
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void>        WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void>        WriteBuffers(std::span<const net::const_buffer> buffers) override;
     void ShutdownRead() override;
     void ShutdownWrite() override;
     void Close() override;

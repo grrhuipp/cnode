@@ -273,6 +273,31 @@ void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
     out.push_back(0x00);
 }
 
+bool EncodeNewTo(std::vector<uint8_t>& out,
+                 uint16_t session_id,
+                 NetworkType network,
+                 const TargetAddress& target,
+                 const uint8_t* data,
+                 size_t len) {
+    size_t addr_reserve = 1 + 2 + 1 + 16;
+    if (target.IsDomain()) {
+        addr_reserve = 1 + 2 + 1 + 1 + target.host.size();
+    } else if (target.resolved_addr && target.resolved_addr->is_v4()) {
+        addr_reserve = 1 + 2 + 1 + 4;
+    }
+
+    InitFrameBase(out, session_id, SessionStatus::NEW,
+                  len > 0 ? kOptionData : 0x00,
+                  addr_reserve + len);
+    out.push_back(static_cast<uint8_t>(network));
+    if (!AppendAddress(out, target)) {
+        out.clear();
+        return false;
+    }
+    FinalizeFrame(out, data, len);
+    return true;
+}
+
 // ============================================================================
 // EncodeEnd
 // ============================================================================

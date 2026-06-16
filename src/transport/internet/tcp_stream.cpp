@@ -497,6 +497,54 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (!ec) TouchActivity();
 }
 
+net::awaitable<void> TcpStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown) || buffers.empty()) {
+        co_return;
+    }
+
+    constexpr size_t kStackBufs = 16;
+    std::array<net::const_buffer, kStackBufs> stack_bufs;
+    memory::ThreadLocalVector<net::const_buffer> spill_bufs;
+    size_t buf_count = 0;
+
+    if (buffers.size() <= kStackBufs) {
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > 0) {
+                stack_bufs[buf_count++] = buffer;
+            }
+        }
+    } else {
+        spill_bufs.reserve(buffers.size());
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > 0) {
+                spill_bufs.push_back(buffer);
+            }
+        }
+        buf_count = spill_bufs.size();
+    }
+
+    if (buf_count == 0) {
+        co_return;
+    }
+
+    auto bufs_span = (buffers.size() > kStackBufs)
+        ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
+        : std::span<const net::const_buffer>(stack_bufs.data(), buf_count);
+
+    ArmWriteDeadline();
+    auto [ec, n] = co_await net::async_write(
+        impl_->socket, bufs_span, net::as_tuple(net::use_awaitable));
+    DisarmWriteDeadline();
+    (void)n;
+
+    if (ec) {
+        throw IoSystemError(ec);
+    }
+    TouchActivity();
+}
+
 net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
         co_return 0;

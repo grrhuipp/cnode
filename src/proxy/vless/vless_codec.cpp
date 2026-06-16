@@ -124,6 +124,12 @@ std::optional<RequestHeader> Codec::ParseRequestHeader(
         return std::nullopt;
     }
 
+    if (req.command == Command::MUX) {
+        req.target = TargetAddress("v1.mux.cool", 9527);
+        consumed = reader.Position();
+        return req;
+    }
+
     auto target = ReadAddress(reader);
     if (!target) {
         return std::nullopt;
@@ -140,8 +146,20 @@ size_t Codec::EncodeRequestHeaderTo(
     const TargetAddress& target,
     uint8_t* output,
     size_t output_size) {
-    const size_t addr_size = VlessAddressSize(target);
+    const size_t addr_size = command == Command::MUX ? 0 : VlessAddressSize(target);
     if (addr_size == 0) {
+        if (command == Command::MUX) {
+            const size_t total = 1 + uuid.size() + 1 + 1;
+            if (total > output_size) {
+                return 0;
+            }
+            ByteWriter writer(output, output_size);
+            writer.WriteU8(kVersion);
+            writer.WriteBytes(uuid.data(), uuid.size());
+            writer.WriteU8(0);  // addons length; no-flow mode.
+            writer.WriteU8(static_cast<uint8_t>(command));
+            return writer.Ok() ? writer.Position() : 0;
+        }
         return 0;
     }
 

@@ -29,25 +29,6 @@ void FlushUdpRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
     acc.Reset();
 }
 
-[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                           buf::MultiBuffer& out_mb) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            return false;
-        }
-        const size_t chunk = std::min(
-            data.size() - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        out_mb.push_back(out.release());
-        offset += chunk;
-    }
-    return true;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -55,7 +36,7 @@ void FlushUdpRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
 //
 // 由 UDP-capable 出站的 Process 在 dispatcher.Dispatch -> outbound.Process
 // 链路内调用：client_reader/client_writer 是入站 transport::Link 端点，session
-// 是该 Worker 本地 Full Cone UDP socket。逐包目标由 buffer.udp 携带
+// 是该 Worker 本地 Full Cone UDP socket。逐包目标由 Buffer UDP endpoint 携带
 // （入站 reader/writer helper 填写）；relay 层不感知具体协议。上行与回包
 // 作为同一 Worker io_context 上的两个并发协程运行，client 侧空闲读取由入站
 // stream 的 idle timeout 终止，不再依赖单一 poll + AsyncStream::Cancel。
@@ -116,7 +97,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
         void push(UDPPacketView pkt) {
             UdpRelayReply owned;
             owned.target = pkt.target;
-            if (!AppendSpanToMultiBuffer(pkt.data, owned.payload)) {
+            if (!buf::AppendSpanToMultiBuffer(pkt.data, owned.payload)) {
                 return;
             }
             push(std::move(owned));
@@ -156,7 +137,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     ScheduledSleep download_rate_sleep(io_context);
     LocalStatsAccumulator stats_acc;
 
-    // 回包交给 client_writer：buffer 携带来源地址（buffer.udp），由入站
+    // 回包交给 client_writer：Buffer 携带来源地址，由入站
     // reader-writer helper 负责封帧/编码。relay 层不感知具体协议。
     auto send_reply = [&](SharedState::UdpRelayReply& packet) -> net::awaitable<bool> {
         try {
@@ -238,8 +219,8 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 }
             }
 
-            // 每个 buffer 携带自身目标（buffer.udp），由协议 reader-writer helper
-            // 在入站侧解析填好；relay 只按 buffer.udp 逐包发往 Full Cone session。
+            // 每个 buffer 携带自身目标，由协议 reader-writer helper
+            // 在入站侧解析填好；relay 只按 Buffer endpoint 逐包发往 Full Cone session。
             for (buf::Buffer* buffer : read_mb) {
                 if (!buffer || buffer->IsEmpty()) {
                     continue;
@@ -249,11 +230,12 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                                    buffer->Len());
                     continue;
                 }
+                const TargetAddress& target = buffer->UDP();
                 auto bytes = buffer->Bytes();
                 LOG_CONN_DEBUG(ctx, "UDP send: target={}, data_len={}",
-                               buffer->udp, bytes.size());
+                               target, bytes.size());
                 auto send_result = co_await session.SendTo(
-                    buffer->udp, bytes.data(), bytes.size(), callback_id);
+                    target, bytes.data(), bytes.size(), callback_id);
                 if (send_result != ErrorCode::OK) {
                     LOG_CONN_DEBUG(ctx, "UDP send failed: {}", ErrorCodeToString(send_result));
                 }

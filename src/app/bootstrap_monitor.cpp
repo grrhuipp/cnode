@@ -281,6 +281,27 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
                   runtime_mem.tcp_streams_peak,
                   runtime_mem.tls_streams_live,
                   runtime_mem.tls_streams_peak);
+
+        memory::BufferRecycleStats buffer_recycle;
+        for (const auto& worker_snapshot : worker_snapshots) {
+            const auto& stats = worker_snapshot.memory.buffer_recycle;
+            buffer_recycle.cache_depth += stats.cache_depth;
+            buffer_recycle.cache_capacity += stats.cache_capacity;
+            buffer_recycle.cache_high_water += stats.cache_high_water;
+            buffer_recycle.pop_hits += stats.pop_hits;
+            buffer_recycle.pop_misses += stats.pop_misses;
+            buffer_recycle.push_hits += stats.push_hits;
+            buffer_recycle.push_drops += stats.push_drops;
+        }
+        LOG_DEBUG(
+            "runtime.buffer_recycle depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={}",
+            buffer_recycle.cache_depth,
+            buffer_recycle.cache_capacity,
+            buffer_recycle.cache_high_water,
+            buffer_recycle.pop_hits,
+            buffer_recycle.pop_misses,
+            buffer_recycle.push_hits,
+            buffer_recycle.push_drops);
 #endif
 
         auto node_stats = ctx.controller.GetNodeStats();

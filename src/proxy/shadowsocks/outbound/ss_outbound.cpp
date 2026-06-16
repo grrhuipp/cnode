@@ -334,7 +334,7 @@ private:
     [[nodiscard]] size_t EncodedPacketSize(const buf::Buffer& buffer) {
         if (ss2022_state_) {
             return ss::Encode2022UdpRequestPacketTo(
-                buffer.udp,
+                buffer.UDP(),
                 buffer.Bytes().data(),
                 buffer.Len(),
                 *ss2022_state_,
@@ -343,7 +343,7 @@ private:
                 0);
         }
         return ss::EncodeUdpPacketTo(
-            buffer.udp,
+            buffer.UDP(),
             buffer.Bytes().data(),
             buffer.Len(),
             master_key_.span(),
@@ -359,7 +359,7 @@ private:
                                         size_t output_size) {
         if (ss2022_state_) {
             return ss::Encode2022UdpRequestPacketTo(
-                buffer.udp,
+                buffer.UDP(),
                 buffer.Bytes().data(),
                 buffer.Len(),
                 *ss2022_state_,
@@ -368,7 +368,7 @@ private:
                 output_size);
         }
         return ss::EncodeUdpPacketTo(
-            buffer.udp,
+            buffer.UDP(),
             buffer.Bytes().data(),
             buffer.Len(),
             master_key_.span(),

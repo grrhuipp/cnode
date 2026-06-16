@@ -24,11 +24,103 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace acpp {
 
 namespace {
+
+constexpr std::string_view kPacketAddrMagicAddress =
+    "sp.packet-addr.v2fly.arpa";
+
+bool IsPacketAddrMagic(const TargetAddress& target) {
+    return target.IsDomain() && target.host == kPacketAddrMagicAddress;
+}
+
+size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
+                                uint8_t* out,
+                                size_t cap) {
+    if (!target.resolved_addr) {
+        return 0;
+    }
+    if (target.resolved_addr->is_v4()) {
+        if (cap < 7) return 0;
+        out[0] = 0x01;
+        const auto bytes = target.resolved_addr->to_v4().to_bytes();
+        std::memcpy(out + 1, bytes.data(), bytes.size());
+        out[5] = static_cast<uint8_t>((target.port >> 8) & 0xff);
+        out[6] = static_cast<uint8_t>(target.port & 0xff);
+        return 7;
+    }
+    if (target.resolved_addr->is_v6()) {
+        if (cap < 19) return 0;
+        out[0] = 0x02;
+        const auto bytes = target.resolved_addr->to_v6().to_bytes();
+        std::memcpy(out + 1, bytes.data(), bytes.size());
+        out[17] = static_cast<uint8_t>((target.port >> 8) & 0xff);
+        out[18] = static_cast<uint8_t>(target.port & 0xff);
+        return 19;
+    }
+    return 0;
+}
+
+struct PacketAddrHeader {
+    TargetAddress target;
+    size_t consumed = 0;
+};
+
+std::optional<PacketAddrHeader> DecodePacketAddrHeader(std::span<const uint8_t> data) {
+    if (data.empty()) {
+        return std::nullopt;
+    }
+    if (data[0] == 0x01) {
+        if (data.size() < 7) return std::nullopt;
+        net::ip::address_v4::bytes_type bytes{};
+        std::memcpy(bytes.data(), data.data() + 1, bytes.size());
+        const uint16_t port =
+            (static_cast<uint16_t>(data[5]) << 8) |
+            static_cast<uint16_t>(data[6]);
+        return PacketAddrHeader{
+            TargetAddress(net::ip::make_address_v4(bytes), port),
+            7,
+        };
+    }
+    if (data[0] == 0x02) {
+        if (data.size() < 19) return std::nullopt;
+        net::ip::address_v6::bytes_type bytes{};
+        std::memcpy(bytes.data(), data.data() + 1, bytes.size());
+        const uint16_t port =
+            (static_cast<uint16_t>(data[17]) << 8) |
+            static_cast<uint16_t>(data[18]);
+        return PacketAddrHeader{
+            TargetAddress(net::ip::make_address_v6(bytes), port),
+            19,
+        };
+    }
+    return std::nullopt;
+}
+
+bool EncodePacketAddrUdpPacketTo(const TargetAddress& target,
+                                 std::span<const uint8_t> payload,
+                                 buf::Buffer& out) {
+    std::array<uint8_t, 19> addr{};
+    const size_t addr_len = EncodePacketAddrHeaderTo(target, addr.data(), addr.size());
+    if (addr_len == 0) {
+        return false;
+    }
+    const size_t packet_len = addr_len + payload.size();
+    if (packet_len == 0 || packet_len > 0xffff || out.Available() < packet_len + 2) {
+        return false;
+    }
+    auto tail = out.Tail();
+    tail[0] = static_cast<uint8_t>((packet_len >> 8) & 0xff);
+    tail[1] = static_cast<uint8_t>(packet_len & 0xff);
+    std::memcpy(tail.data() + 2, addr.data(), addr_len);
+    std::memcpy(tail.data() + 2 + addr_len, payload.data(), payload.size());
+    out.Produce(static_cast<uint32_t>(packet_len + 2));
+    return true;
+}
 
 class VlessOnlineSession {
 public:
@@ -81,6 +173,26 @@ net::awaitable<bool> WriteFull(AsyncStream& stream,
     }
     co_return true;
 }
+
+class VlessPendingReader final : public transport::MultiBufferReader {
+public:
+    VlessPendingReader(AsyncStream& src, std::span<const uint8_t> first_packet)
+        : src_(src) {
+        (void)buf::AppendSpanToMultiBuffer(first_packet, pending_);
+    }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (pending_.empty()) {
+            co_return co_await src_.ReadMultiBuffer();
+        }
+
+        co_return std::move(pending_);
+    }
+
+private:
+    AsyncStream& src_;
+    buf::MultiBuffer pending_;
+};
 
 class VlessUdpFramer {
 public:
@@ -188,9 +300,11 @@ class VlessUdpReader final : public transport::MultiBufferReader {
 public:
     VlessUdpReader(AsyncStream& src,
                    TargetAddress target,
-                   std::span<const uint8_t> first_packet)
+                   std::span<const uint8_t> first_packet,
+                   bool packet_addr = false)
         : src_(src)
-        , target_(std::move(target)) {
+        , target_(std::move(target))
+        , packet_addr_(packet_addr) {
         if (!first_packet.empty()) {
             framer_.Feed(first_packet.data(), first_packet.size());
         }
@@ -204,7 +318,16 @@ public:
                 if (!pkt || pkt->IsEmpty()) {
                     continue;
                 }
-                pkt->SetUDP(target_);
+                if (packet_addr_) {
+                    auto header = DecodePacketAddrHeader(pkt->Bytes());
+                    if (!header || header->consumed >= pkt->Len()) {
+                        continue;
+                    }
+                    pkt->Advance(static_cast<uint32_t>(header->consumed));
+                    pkt->SetUDP(std::move(header->target));
+                } else {
+                    pkt->SetUDP(target_);
+                }
                 out.push_back(pkt.release());
             }
             if (!out.empty()) {
@@ -227,12 +350,15 @@ public:
 private:
     AsyncStream& src_;
     TargetAddress target_;
+    bool packet_addr_ = false;
     VlessUdpFramer framer_;
 };
 
 class VlessUdpWriter final : public transport::MultiBufferWriter {
 public:
-    explicit VlessUdpWriter(AsyncStream& dst) : dst_(dst) {}
+    explicit VlessUdpWriter(AsyncStream& dst, bool packet_addr = false)
+        : dst_(dst)
+        , packet_addr_(packet_addr) {}
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         buf::MultiBuffer out;
@@ -244,15 +370,26 @@ public:
             if (!framed) {
                 break;
             }
-            const size_t written = vless::Codec::EncodeUdpPacketTo(
-                buffer->Bytes().data(),
-                buffer->Len(),
-                framed->Tail().data(),
-                framed->Available());
-            if (written == 0) {
+            bool ok = false;
+            if (packet_addr_) {
+                if (!buffer->HasUDP()) {
+                    continue;
+                }
+                ok = EncodePacketAddrUdpPacketTo(buffer->UDP(), buffer->Bytes(), *framed);
+            } else {
+                const size_t written = vless::Codec::EncodeUdpPacketTo(
+                    buffer->Bytes().data(),
+                    buffer->Len(),
+                    framed->Tail().data(),
+                    framed->Available());
+                if (written > 0) {
+                    framed->Produce(static_cast<uint32_t>(written));
+                    ok = true;
+                }
+            }
+            if (!ok) {
                 continue;
             }
-            framed->Produce(static_cast<uint32_t>(written));
             out.push_back(framed.release());
         }
         mb.clear();
@@ -268,6 +405,7 @@ public:
 
 private:
     AsyncStream& dst_;
+    bool packet_addr_ = false;
 };
 
 }  // namespace
@@ -359,11 +497,6 @@ proxy::vless::inbound::Handler::Process(
         LOG_CONN_FAIL("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
-    if (request->command == ::acpp::vless::Command::MUX) {
-        LOG_CONN_FAIL("[VLESS][{}] mux command is not supported yet", tag);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-
     auto user_info = validator_.FindUser(tag, request->uuid);
     if (!user_info) {
         LOG_CONN_FAIL("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
@@ -399,9 +532,15 @@ proxy::vless::inbound::Handler::Process(
     validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
     user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
 
-    const Network net = request->command == ::acpp::vless::Command::UDP
-        ? Network::UDP
-        : Network::TCP;
+    Network net = Network::TCP;
+    if (request->command == ::acpp::vless::Command::UDP) {
+        net = Network::UDP;
+    } else if (request->command == ::acpp::vless::Command::MUX) {
+        net = Network::MUX;
+    }
+    const bool packet_addr_udp =
+        request->command == ::acpp::vless::Command::UDP &&
+        IsPacketAddrMagic(request->target);
     ctx.outbound.original_target = request->target;
     ctx.outbound.target = std::move(request->target);
     ctx.content.network = net;
@@ -421,9 +560,25 @@ proxy::vless::inbound::Handler::Process(
             total_read - consumed);
     }
 
+    if (net == Network::MUX) {
+        auto* tcp_stream = stream.get();
+        VlessPendingReader mux_reader(*tcp_stream, leftover);
+        co_return co_await dispatcher.Dispatch(
+            io_context,
+            receiver,
+            std::move(stream),
+            transport::Link{&mux_reader, tcp_stream},
+            InitialPayload{},
+            ctx,
+            *stats_,
+            timeouts,
+            pressure_idle_timeout);
+    }
+
     if (net == Network::UDP) {
-        VlessUdpReader udp_reader(*stream, ctx.outbound.target, leftover);
-        VlessUdpWriter udp_writer(*stream);
+        VlessUdpReader udp_reader(
+            *stream, ctx.outbound.target, leftover, packet_addr_udp);
+        VlessUdpWriter udp_writer(*stream, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver,
@@ -514,6 +669,7 @@ const bool kVlessInboundRegistered = [] {
                 acpp::proxyman::inbound::PreparedVlessUser info;
                 info.uuid = uuid;
                 info.uuid_bytes = *uuid_bytes;
+                info.flow = acpp::vless::NormalizeFlow(runtime_user.flow);
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;

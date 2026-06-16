@@ -53,25 +53,6 @@ net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t l
     co_return true;
 }
 
-[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                           buf::MultiBuffer& out_mb) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            return false;
-        }
-        const size_t chunk = std::min(
-            data.size() - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        out_mb.push_back(out.release());
-        offset += chunk;
-    }
-    return true;
-}
-
 class TrojanUdpFramer {
 public:
     struct FramedUdpPacket {
@@ -223,7 +204,7 @@ public:
                 continue;
             }
             const TargetAddress& target =
-                buffer->HasUDP() ? buffer->udp : fallback_target_;
+                buffer->HasUDP() ? buffer->UDP() : fallback_target_;
             const size_t capacity = static_cast<size_t>(buffer->Len()) + 300;
             memory::ByteVector scratch(capacity);
             const size_t written = trojan::TrojanCodec::EncodeUdpPacketTo(
@@ -233,7 +214,7 @@ public:
                 scratch.data(),
                 scratch.size());
             if (written == 0 ||
-                !AppendSpanToMultiBuffer(
+                !buf::AppendSpanToMultiBuffer(
                     std::span<const uint8_t>(scratch.data(), written), out)) {
                 continue;
             }

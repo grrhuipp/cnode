@@ -144,12 +144,14 @@ bool PanelConfig::Validate() const {
         return false;
     }
     if (NodeType != constants::protocol::kVmess &&
+        NodeType != constants::protocol::kVless &&
         NodeType != constants::protocol::kTrojan &&
         NodeType != constants::protocol::kShadowsocks &&
         NodeType != constants::protocol::kAnyTLS) {
-        LOG_ERROR("Panel {} NodeType must be {}, {}, {} or {}",
+        LOG_ERROR("Panel {} NodeType must be {}, {}, {}, {} or {}",
                   Name,
                   constants::protocol::kVmess,
+                  constants::protocol::kVless,
                   constants::protocol::kTrojan,
                   constants::protocol::kShadowsocks,
                   constants::protocol::kAnyTLS);

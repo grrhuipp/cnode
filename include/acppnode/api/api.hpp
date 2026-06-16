@@ -41,6 +41,7 @@ struct UserInfo {
     std::string Obfs;
     std::string ObfsParam;
     std::string UUID;
+    std::string Flow;
     int AlterID = 0;
     bool Enabled = true;
 };

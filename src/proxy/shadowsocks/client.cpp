@@ -166,23 +166,6 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
     return pos;
 }
 
-bool WriteBytesToMultiBuffer(std::span<const uint8_t> data, buf::MultiBuffer& out) {
-    size_t offset = 0;
-    while (offset < data.size()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            return false;
-        }
-        const size_t n = std::min(data.size() - offset,
-                                  static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), data.data() + offset, n);
-        buffer->Produce(static_cast<uint32_t>(n));
-        out.push_back(buffer.release());
-        offset += n;
-    }
-    return true;
-}
-
 class RequestBodyWriter final : public transport::MultiBufferWriter {
 public:
     RequestBodyWriter(SsAeadCipher write_cipher,
@@ -400,7 +383,7 @@ private:
 net::awaitable<bool> WriteRawBytes(AsyncStream& stream, std::span<const uint8_t> data) {
     buf::MultiBuffer mb;
     mb.reserve((data.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    if (!WriteBytesToMultiBuffer(data, mb)) {
+    if (!buf::AppendSpanToMultiBuffer(data, mb)) {
         co_return false;
     }
     try {
@@ -701,7 +684,9 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                                          payload_cipher.size(), payload_plain.data())) {
                     co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
-                if (!WriteBytesToMultiBuffer(payload_plain, pending)) {
+                if (!buf::AppendSpanToMultiBuffer(
+                        std::span<const uint8_t>(payload_plain.data(), payload_plain.size()),
+                        pending)) {
                     co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
                 }
                 next_nonce = 2;

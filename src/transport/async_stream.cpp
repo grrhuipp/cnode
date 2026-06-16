@@ -84,6 +84,17 @@ net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     }
 }
 
+net::awaitable<void> AsyncStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+
+    for (const auto& buffer : buffers) {
+        if (buffer.size() == 0) {
+            continue;
+        }
+        co_await AsyncWrite(buffer);
+    }
+}
+
 void AsyncStream::SetIdleTimeout(std::chrono::seconds timeout) {
     if (auto* tcp = BaseTcpStream()) {
         tcp->SetIdleTimeout(timeout);

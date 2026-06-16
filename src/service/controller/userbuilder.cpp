@@ -38,6 +38,7 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
         user.email = BuildUserTag(tag, api_user);
         user.password = api_user.Passwd.empty() ? api_user.UUID : api_user.Passwd;
         user.uuid = api_user.UUID;
+        user.flow = api_user.Flow;
         user.speed_limit = api_user.SpeedLimit;
         user.device_limit = DeviceLimitOf(api_user);
         users.push_back(std::move(user));

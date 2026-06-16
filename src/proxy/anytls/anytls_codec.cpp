@@ -36,6 +36,17 @@ uint32_t ReadU32BE(const uint8_t* in) noexcept {
            static_cast<uint32_t>(in[3]);
 }
 
+std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
+    uint8_t cmd,
+    uint32_t sid,
+    size_t payload_size) noexcept {
+    std::array<uint8_t, kFrameHeaderSize> header{};
+    header[0] = cmd;
+    WriteU32BE(header.data() + 1, sid);
+    WriteU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
+    return header;
+}
+
 ErrorCode MapWriteException(const IoSystemError& e) noexcept {
     return MapAsioError(e.code());
 }
@@ -329,15 +340,20 @@ WriteAll(AsyncStream& stream, std::span<const uint8_t> data) {
 
 net::awaitable<std::expected<void, ErrorCode>>
 WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-    auto frame = BuildFrameBytes(cmd, sid, payload);
-    if (!frame) {
-        co_return std::unexpected(frame.error());
+    if (payload.size() > kMaxFramePayload) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    auto bytes = std::span<const uint8_t>(
-        reinterpret_cast<const uint8_t*>(frame->data()),
-        frame->size());
-    if (auto ok = co_await WriteAll(stream, bytes); !ok) {
-        co_return std::unexpected(ok.error());
+
+    auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
+    std::array<net::const_buffer, 2> buffers{
+        net::const_buffer(header.data(), header.size()),
+        net::const_buffer(payload.data(), payload.size())};
+    try {
+        co_await stream.WriteBuffers(buffers);
+    } catch (const IoSystemError& e) {
+        co_return std::unexpected(MapWriteException(e));
+    } catch (...) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
     co_return std::expected<void, ErrorCode>{};
 }

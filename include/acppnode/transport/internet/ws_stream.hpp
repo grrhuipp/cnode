@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
@@ -236,6 +237,108 @@ public:
                 frame_mask_offset_ = 0;
             }
             co_return chunk;
+        }
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (!CanWrite()) {
+            ThrowWsStreamError("WebSocket write on closed stream");
+        }
+
+        size_t total_len = 0;
+        for (const auto& buffer : buffers) {
+            total_len += buffer.size();
+        }
+        if (total_len == 0) {
+            co_return;
+        }
+
+        uint8_t mask_key[4]{};
+        if (is_client_ &&
+            RAND_bytes(mask_key, sizeof(mask_key)) != 1) [[unlikely]] {
+            ThrowWsStreamError("WebSocket client generate mask failed");
+        }
+
+        auto header = ws::EncodeFrameHeader(
+            total_len, ws::Opcode::BINARY, is_client_, mask_key);
+
+        if (!is_client_) {
+            constexpr size_t kStackBufs = 16;
+            std::array<net::const_buffer, kStackBufs> stack_bufs;
+            memory::ThreadLocalVector<net::const_buffer> spill_bufs;
+            const bool use_spill = buffers.size() + 1 > kStackBufs;
+            size_t count = 0;
+
+            auto add_buffer = [&](net::const_buffer buffer) {
+                if (buffer.size() == 0) {
+                    return;
+                }
+                if (use_spill) {
+                    spill_bufs.push_back(buffer);
+                } else {
+                    stack_bufs[count++] = buffer;
+                }
+            };
+
+            if (use_spill) {
+                spill_bufs.reserve(buffers.size() + 1);
+            }
+            add_buffer(net::const_buffer(header.bytes.data(), header.size));
+            for (const auto& buffer : buffers) {
+                add_buffer(buffer);
+            }
+
+            auto out = use_spill
+                ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
+                : std::span<const net::const_buffer>(stack_bufs.data(), count);
+            co_await inner_->WriteBuffers(out);
+            co_return;
+        }
+
+        if (total_len <= kSmallFrameThreshold) {
+            std::array<uint8_t, kSmallFrameThreshold + 14> frame{};
+            std::memcpy(frame.data(), header.bytes.data(), header.size);
+            size_t offset = header.size;
+            for (const auto& buffer : buffers) {
+                if (buffer.size() == 0) {
+                    continue;
+                }
+                std::memcpy(frame.data() + offset, buffer.data(), buffer.size());
+                offset += buffer.size();
+            }
+            ws::MaskData(frame.data() + header.size, total_len, mask_key);
+            std::array<net::const_buffer, 1> out{
+                net::const_buffer(frame.data(), header.size + total_len)};
+            co_await inner_->WriteBuffers(out);
+            co_return;
+        }
+
+        std::array<net::const_buffer, 1> header_buf{
+            net::const_buffer(header.bytes.data(), header.size)};
+        co_await inner_->WriteBuffers(header_buf);
+
+        buf::BufferGuard scratch{buf::Buffer::New()};
+        if (!scratch) {
+            throw std::bad_alloc();
+        }
+
+        uint8_t* masked_chunk = scratch->Tail().data();
+        const size_t masked_chunk_size = scratch->Available();
+        size_t payload_offset = 0;
+        for (const auto& buffer : buffers) {
+            const uint8_t* data = static_cast<const uint8_t*>(buffer.data());
+            size_t remaining = buffer.size();
+            while (remaining > 0) {
+                const size_t chunk = std::min(masked_chunk_size, remaining);
+                std::memcpy(masked_chunk, data, chunk);
+                ws::MaskData(masked_chunk, chunk, mask_key, payload_offset);
+                std::array<net::const_buffer, 1> out{
+                    net::const_buffer(masked_chunk, chunk)};
+                co_await inner_->WriteBuffers(out);
+                data += chunk;
+                remaining -= chunk;
+                payload_offset += chunk;
+            }
         }
     }
 
@@ -531,20 +634,32 @@ public:
             co_return;
         }
 
-        buf::BufferGuard header_buf{buf::Buffer::New()};
-        if (!header_buf) {
-            throw std::bad_alloc();
+        constexpr size_t kStackBufs = 16;
+        std::array<net::const_buffer, kStackBufs> stack_bufs;
+        memory::ThreadLocalVector<net::const_buffer> spill_bufs;
+        const bool use_spill = mb.size() > kStackBufs;
+        size_t count = 0;
+
+        if (use_spill) {
+            spill_bufs.reserve(mb.size());
         }
 
-        auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, false);
-        std::memcpy(header_buf->Tail().data(), header.bytes.data(), header.size);
-        header_buf->Produce(static_cast<uint32_t>(header.size));
+        for (const auto* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            if (use_spill) {
+                spill_bufs.emplace_back(bytes.data(), bytes.size());
+            } else {
+                stack_bufs[count++] = net::const_buffer(bytes.data(), bytes.size());
+            }
+        }
 
-        mb.reserve(mb.size() + 1);
-        mb.insert(mb.begin(), header_buf.get());
-        (void)header_buf.release();
-
-        co_await inner_->WriteMultiBuffer(std::move(mb));
+        auto payload = use_spill
+            ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
+            : std::span<const net::const_buffer>(stack_bufs.data(), count);
+        co_await WriteBuffers(payload);
         mb.clear();
     }
 
@@ -621,20 +736,41 @@ public:
             payload_offset += bytes.size();
         }
 
-        buf::BufferGuard header_buf{buf::Buffer::New()};
-        if (!header_buf) {
-            throw std::bad_alloc();
+        constexpr size_t kStackBufs = 16;
+        std::array<net::const_buffer, kStackBufs> stack_bufs;
+        memory::ThreadLocalVector<net::const_buffer> spill_bufs;
+        const bool use_spill = mb.size() + 1 > kStackBufs;
+        size_t count = 0;
+
+        auto add_buffer = [&](net::const_buffer buffer) {
+            if (buffer.size() == 0) {
+                return;
+            }
+            if (use_spill) {
+                spill_bufs.push_back(buffer);
+            } else {
+                stack_bufs[count++] = buffer;
+            }
+        };
+
+        if (use_spill) {
+            spill_bufs.reserve(mb.size() + 1);
         }
 
         auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, true, mask_key);
-        std::memcpy(header_buf->Tail().data(), header.bytes.data(), header.size);
-        header_buf->Produce(static_cast<uint32_t>(header.size));
+        add_buffer(net::const_buffer(header.bytes.data(), header.size));
+        for (const auto* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            add_buffer(net::const_buffer(bytes.data(), bytes.size()));
+        }
 
-        mb.reserve(mb.size() + 1);
-        mb.insert(mb.begin(), header_buf.get());
-        (void)header_buf.release();
-
-        co_await inner_->WriteMultiBuffer(std::move(mb));
+        auto out = use_spill
+            ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
+            : std::span<const net::const_buffer>(stack_bufs.data(), count);
+        co_await inner_->WriteBuffers(out);
         mb.clear();
     }
 

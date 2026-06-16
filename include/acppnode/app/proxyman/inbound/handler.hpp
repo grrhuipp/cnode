@@ -51,6 +51,15 @@ public:
         session::Context& ctx,
         uint32_t pressure_idle_timeout = 0);
 
+    net::awaitable<void> ProcessPreparedTransportStream(
+        net::io_context& io_context,
+        routing::Dispatcher& dispatcher,
+        StatsShard& stats,
+        const TimeoutsConfig& timeouts,
+        std::unique_ptr<AsyncStream> stream,
+        session::Context& ctx,
+        uint32_t pressure_idle_timeout = 0);
+
 private:
     inbound::ReceiverSettings receiver_;
     std::unique_ptr<Inbound> proxy_;

@@ -1030,6 +1030,7 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
     stats.dns_entries    = dns_stats.entries;
 
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
+    stats.buffer_recycle      = buf::SnapshotThreadBufferRecycleStats();
     return stats;
 }
 

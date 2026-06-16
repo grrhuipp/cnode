@@ -25,6 +25,8 @@ struct VlessOutboundConfig {
     std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
     std::string flow;
+    bool packet_xudp = false;
+    bool packet_addr = false;
 
     StreamSettings stream_settings;
     std::string send_through;

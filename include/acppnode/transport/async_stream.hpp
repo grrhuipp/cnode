@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -123,6 +124,15 @@ public:
      */
     virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb);
 
+    /**
+     * 批量写入非 owning buffer 序列。
+     *
+     * 调用方保证 buffers 指向的数据在 co_await 返回前有效。默认实现逐段
+     * AsyncWrite；TcpStream/TlsStream/WS 可 override 为 scatter 或协议内聚写，
+     * 用于小协议头 + 现有 payload 的零拷贝写出。
+     */
+    virtual net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers);
+
     // ========================================================================
     // 关闭操作（所有操作必须幂等）
     // ========================================================================
@@ -231,6 +241,12 @@ protected:
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
     friend class BaseWsStream;
+    static TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
+        return stream.BaseTcpStream();
+    }
+    static const TcpStream* BaseTcpStreamOf(const AsyncStream& stream) {
+        return stream.BaseTcpStream();
+    }
     virtual TcpStream* BaseTcpStream() { return nullptr; }
     virtual const TcpStream* BaseTcpStream() const { return nullptr; }
 

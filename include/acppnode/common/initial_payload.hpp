@@ -135,7 +135,7 @@ public:
             return std::move(overflow_);
         }
         buf::MultiBuffer mb;
-        AppendSpanToMultiBuffer(span(), mb);
+        (void)buf::AppendSpanToMultiBuffer(span(), mb);
         size_ = 0;
         return mb;
     }
@@ -184,31 +184,13 @@ public:
         }
 
         if (overflow_.empty() && old_size > 0) {
-            AppendSpanToMultiBuffer({inline_.data(), old_size}, overflow_);
+            (void)buf::AppendSpanToMultiBuffer({inline_.data(), old_size}, overflow_);
         }
-        AppendSpanToMultiBuffer({data, len}, overflow_);
+        (void)buf::AppendSpanToMultiBuffer({data, len}, overflow_);
         size_ = new_size;
     }
 
 private:
-    static bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                        buf::MultiBuffer& out) {
-        size_t offset = 0;
-        while (offset < data.size()) {
-            buf::BufferGuard buffer{buf::Buffer::New()};
-            if (!buffer) {
-                return false;
-            }
-            const size_t n = std::min(data.size() - offset,
-                                      static_cast<size_t>(buffer->Available()));
-            std::memcpy(buffer->Tail().data(), data.data() + offset, n);
-            buffer->Produce(static_cast<uint32_t>(n));
-            out.push_back(buffer.release());
-            offset += n;
-        }
-        return true;
-    }
-
     void AppendBuffers(const buf::MultiBuffer& buffers) {
         for (const auto* buffer : buffers) {
             if (!buffer || buffer->IsEmpty()) {

@@ -28,6 +28,7 @@ struct RuntimeUser {
     std::string email;
     std::string password;
     std::string uuid;
+    std::string flow;
     uint64_t speed_limit = 0;
     uint32_t device_limit = 0;
 };

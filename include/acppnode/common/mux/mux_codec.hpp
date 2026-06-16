@@ -89,6 +89,12 @@ struct FrameHeader {
 // ============================================================================
 
 void EncodeKeepAliveTo(std::vector<uint8_t>& out);
+[[nodiscard]] bool EncodeNewTo(std::vector<uint8_t>& out,
+                                uint16_t session_id,
+                                NetworkType network,
+                                const TargetAddress& target,
+                                const uint8_t* data,
+                                size_t len);
 void EncodeEndTo(std::vector<uint8_t>& out,
                  uint16_t session_id, bool error = false);
 void EncodeKeepDataTo(std::vector<uint8_t>& out,

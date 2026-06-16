@@ -973,6 +973,8 @@ APIClient::Impl::GetUserList() {
                 auto* uuid_p = u.if_contains("uuid");
                 user.UUID = (uuid_p && uuid_p->is_string()) ? std::string(uuid_p->as_string()) : "";
                 user.Passwd = user.UUID;
+                auto* flow_p = u.if_contains("flow");
+                user.Flow = (flow_p && flow_p->is_string()) ? std::string(flow_p->as_string()) : "";
 
                 // speed_limit 和 device_limit 可能是 null
                 auto* sl_p = u.if_contains("speed_limit");
