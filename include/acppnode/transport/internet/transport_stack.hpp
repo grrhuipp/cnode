@@ -4,6 +4,7 @@
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include <expected>
 #include <memory>
+#include <span>
 #include <string_view>
 
 namespace acpp {
@@ -31,6 +32,22 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     const StreamSettings& s,
     std::string_view tls_server_name = {},
     std::string_view ws_host = {},
+    uint64_t trace_conn_id = 0);
+
+enum class XHttpClientRequestKind {
+    Downlink,
+    StreamUp,
+    PacketUp,
+};
+
+net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
+    std::unique_ptr<AsyncStream> raw,
+    const StreamSettings& s,
+    std::string_view tls_server_name,
+    std::string_view host,
+    std::string_view path,
+    XHttpClientRequestKind kind,
+    std::span<const net::const_buffer> packet_payload = {},
     uint64_t trace_conn_id = 0);
 
 }  // namespace acpp

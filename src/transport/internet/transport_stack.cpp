@@ -11,6 +11,7 @@
 #include <asio/detached.hpp>
 #include <asio/experimental/channel.hpp>
 #include <array>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <deque>
@@ -4250,6 +4251,327 @@ net::awaitable<std::optional<std::vector<uint8_t>>> ReadXHttpPacketBody(
 }
 
 [[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
+[[nodiscard]] bool IsHttpOkStatus(std::string_view status_line);
+net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view authority,
+    bool tls,
+    uint64_t conn_id);
+
+[[nodiscard]] bool HasHeaderCI(const transport::internet::HttpHeaders& headers,
+                               std::string_view key) {
+    for (const auto& [name, _] : headers) {
+        if (EqualsAsciiCI(name, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
+                                            std::string_view path,
+                                            bool tls) {
+    std::string referer = tls ? "https://" : "http://";
+    referer.append(host.empty() ? "example.com" : host);
+    const std::string_view req_path = EffectivePath(path);
+    referer.append(req_path);
+    referer.push_back(req_path.find('?') == std::string_view::npos ? '?' : '&');
+    referer.append("x_padding=");
+    referer.append(100, 'X');
+    return referer;
+}
+
+[[nodiscard]] HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
+                                               std::string_view path,
+                                               std::string_view method,
+                                               bool tls,
+                                               XHttpClientRequestKind kind) {
+    HttpConfig http;
+    http.path.assign(path.data(), path.size());
+    http.host = cfg.host;
+    http.method.assign(method.data(), method.size());
+    http.headers = cfg.headers;
+    http.force_http2 = true;
+    if (kind == XHttpClientRequestKind::StreamUp &&
+        !cfg.no_grpc_header &&
+        !HasHeaderCI(http.headers, "Content-Type")) {
+        http.headers.emplace("content-type", "application/grpc");
+    }
+    if (!HasHeaderCI(http.headers, "Referer")) {
+        http.headers.emplace("referer", BuildXHttpReferer(http.host, http.path, tls));
+    }
+    return http;
+}
+
+[[nodiscard]] bool ShouldUseHttp2ForXHttp(const StreamSettings& s) {
+    if (!s.IsTls()) {
+        return false;
+    }
+    if (s.tls.alpn.size() == 1 &&
+        EqualsAsciiCI(s.tls.alpn.front(), "http/1.1")) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool IsHopByHopBodyHeader(std::string_view key) {
+    return IsHostHeader(key) ||
+           EqualsAsciiCI(key, "Content-Length") ||
+           EqualsAsciiCI(key, "Transfer-Encoding");
+}
+
+[[nodiscard]] std::string BuildXHttp1ClientRequest(
+    const HttpConfig& cfg,
+    std::string_view host,
+    std::string_view content_length = {},
+    bool chunked_upload = false) {
+    const std::string_view req_path = EffectivePath(cfg.path);
+    const std::string_view method = EffectiveHttpMethod(cfg.method);
+    size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
+                          content_length.size() + cfg.headers.size() * 32;
+
+    std::string request;
+    request.reserve(reserve_size);
+    request.append(method);
+    request.push_back(' ');
+    request.append(req_path);
+    request.append(" HTTP/1.1\r\n");
+    request.append("Host: ");
+    request.append(host);
+    request.append("\r\n");
+    if (chunked_upload) {
+        request.append("Transfer-Encoding: chunked\r\n");
+    } else if (!content_length.empty()) {
+        request.append("Content-Length: ");
+        request.append(content_length);
+        request.append("\r\n");
+    }
+    for (const auto& [key, value] : cfg.headers) {
+        if (key.empty() || IsHopByHopBodyHeader(key)) {
+            continue;
+        }
+        request.append(key);
+        request.append(": ");
+        request.append(value);
+        request.append("\r\n");
+    }
+    request.append("\r\n");
+    return request;
+}
+
+net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view host,
+    XHttpClientRequestKind kind,
+    std::span<const net::const_buffer> packet_payload,
+    uint64_t conn_id) {
+    size_t payload_len = 0;
+    for (const auto& buffer : packet_payload) {
+        payload_len += buffer.size();
+    }
+
+    std::array<char, 32> content_length_buf{};
+    std::string_view content_length;
+    if (kind == XHttpClientRequestKind::PacketUp) {
+        auto [ptr, ec] = std::to_chars(
+            content_length_buf.data(),
+            content_length_buf.data() + content_length_buf.size(),
+            payload_len);
+        if (ec != std::errc{}) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        content_length = std::string_view(
+            content_length_buf.data(),
+            static_cast<size_t>(ptr - content_length_buf.data()));
+    }
+
+    const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
+    const std::string request = BuildXHttp1ClientRequest(
+        cfg,
+        host,
+        content_length,
+        chunked_upload);
+    if (kind == XHttpClientRequestKind::StreamUp && payload_len > 0) {
+        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
+        auto [ptr, ec] = std::to_chars(
+            prefix.data(),
+            prefix.data() + prefix.size() - 2,
+            payload_len,
+            16);
+        if (ec != std::errc{}) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        *ptr++ = '\r';
+        *ptr++ = '\n';
+        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
+
+        std::array<net::const_buffer, 20> stack_buffers{};
+        std::vector<net::const_buffer> spill_buffers;
+        auto append_buffer = [&](net::const_buffer buffer) {
+            if (spill_buffers.empty() && buffer.size() > 0) {
+                size_t count = 0;
+                while (count < stack_buffers.size() && stack_buffers[count].size() > 0) {
+                    ++count;
+                }
+                if (count < stack_buffers.size()) {
+                    stack_buffers[count] = buffer;
+                    return;
+                }
+                spill_buffers.reserve(packet_payload.size() + 4);
+                spill_buffers.insert(
+                    spill_buffers.end(),
+                    stack_buffers.begin(),
+                    stack_buffers.end());
+            }
+            if (buffer.size() > 0) {
+                spill_buffers.push_back(buffer);
+            }
+        };
+
+        append_buffer(net::buffer(request.data(), request.size()));
+        append_buffer(net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
+        for (const auto& payload : packet_payload) {
+            append_buffer(payload);
+        }
+        append_buffer(net::buffer(kChunkTail.data(), kChunkTail.size()));
+
+        try {
+            if (spill_buffers.empty()) {
+                size_t count = 0;
+                while (count < stack_buffers.size() && stack_buffers[count].size() > 0) {
+                    ++count;
+                }
+                co_await stream->WriteBuffers(
+                    std::span<const net::const_buffer>(stack_buffers.data(), count));
+            } else {
+                co_await stream->WriteBuffers(spill_buffers);
+            }
+        } catch (...) {
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+
+        auto body = std::make_unique<Http1BodyStream>(
+            std::move(stream),
+            false,
+            true);
+        LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={} initial={}B",
+                         conn_id,
+                         EffectivePath(cfg.path),
+                         payload_len);
+        co_return std::unique_ptr<AsyncStream>(std::move(body));
+    }
+    if (!co_await WriteFullToStream(
+            *stream,
+            unsafe::ptr_cast<const uint8_t>(request.data()),
+            request.size())) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    if (kind == XHttpClientRequestKind::StreamUp) {
+        auto body = std::make_unique<Http1BodyStream>(
+            std::move(stream),
+            false,
+            true);
+        LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={}",
+                         conn_id,
+                         EffectivePath(cfg.path));
+        co_return std::unique_ptr<AsyncStream>(std::move(body));
+    }
+    if (kind == XHttpClientRequestKind::PacketUp && payload_len > 0) {
+        try {
+            co_await stream->WriteBuffers(packet_payload);
+        } catch (...) {
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+    }
+
+    buf::BufferGuard response_buf{buf::Buffer::New()};
+    if (!response_buf) {
+        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    char* response_data = unsafe::ptr_cast<char>(response_buf->Tail().data());
+    const size_t response_capacity = response_buf->Available();
+    size_t response_len = 0;
+    bool found_end = false;
+    size_t header_end = 0;
+
+    while (!found_end && response_len < response_capacity) {
+        size_t n = co_await stream->AsyncRead(
+            net::buffer(response_data + response_len,
+                        response_capacity - response_len));
+        if (n == 0) {
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+        response_len += n;
+        std::string_view response(response_data, response_len);
+        const size_t pos = response.find("\r\n\r\n");
+        if (pos != std::string_view::npos) {
+            found_end = true;
+            header_end = pos + 4;
+        }
+    }
+    if (!found_end) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    const std::string_view response(response_data, response_len);
+    if (!IsHttpOkStatus(ExtractStatusLine(response))) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    if (kind == XHttpClientRequestKind::PacketUp) {
+        stream->Close();
+        co_return std::unique_ptr<AsyncStream>{};
+    }
+
+    const bool read_chunked = kind == XHttpClientRequestKind::Downlink &&
+        HeaderContainsTokenCI(ExtractHeaderValueCI(response, "Transfer-Encoding"), "chunked");
+    auto body = std::make_unique<Http1BodyStream>(
+        std::move(stream),
+        read_chunked,
+        chunked_upload);
+    if (header_end < response_len) {
+        body->SetPendingData(
+            unsafe::ptr_cast<const uint8_t>(response_data + header_end),
+            response_len - header_end);
+    }
+    LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 {} ready path={}",
+                     conn_id,
+                     kind == XHttpClientRequestKind::Downlink ? "downlink" : "stream-up",
+                     EffectivePath(cfg.path));
+    co_return std::unique_ptr<AsyncStream>(std::move(body));
+}
+
+net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view host,
+    bool tls,
+    std::span<const net::const_buffer> packet_payload,
+    uint64_t conn_id) {
+    auto upload = co_await DoHttp2ClientHandshake(
+        std::move(stream),
+        cfg,
+        host,
+        tls,
+        conn_id);
+    if (!upload) {
+        co_return std::unexpected(upload.error());
+    }
+    auto body = std::move(*upload);
+    try {
+        co_await body->WriteBuffers(packet_payload);
+        co_await body->AsyncShutdownWrite();
+        std::array<uint8_t, 1> scratch{};
+        (void)co_await body->AsyncRead(net::buffer(scratch));
+    } catch (...) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    body->Close();
+    co_return std::unique_ptr<AsyncStream>{};
+}
+
+[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
 
 [[nodiscard]] bool IsHttpOkStatus(std::string_view status_line) {
     if (!status_line.starts_with("HTTP/")) {
@@ -5630,6 +5952,99 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
     }
 
     co_return stream;
+}
+
+net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
+    std::unique_ptr<AsyncStream> raw,
+    const StreamSettings& s,
+    std::string_view tls_server_name,
+    std::string_view host,
+    std::string_view path,
+    XHttpClientRequestKind kind,
+    std::span<const net::const_buffer> packet_payload,
+    uint64_t trace_conn_id) {
+    if (!raw || !s.IsXHttp() || s.IsUnsupported() || s.IsReality()) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+
+    std::unique_ptr<AsyncStream> stream = std::move(raw);
+    if (s.IsTls()) {
+        auto ctx = AcquireClientTlsContext(s.tls);
+        if (!ctx) {
+            co_return std::unexpected(ErrorCode::TLS_CERT_INVALID);
+        }
+        std::string sni = tls_server_name.empty()
+            ? s.tls.server_name
+            : std::string(tls_server_name);
+        auto tcp = TakeOwnedTcpStream(stream);
+        if (!tcp) {
+            co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        }
+        auto tls = co_await WrapTlsClient(std::move(tcp), *ctx, sni, s.tls.alpn);
+        if (!tls) {
+            co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+        }
+        stream = std::move(tls);
+    }
+
+    const HttpConfig http = XHttpClientHttpConfig(
+        s.xhttp,
+        path,
+        kind == XHttpClientRequestKind::Downlink ? "GET" : "POST",
+        s.IsTls(),
+        kind);
+
+    std::string authority(host);
+    if (authority.empty()) {
+        authority = tls_server_name.empty()
+            ? s.tls.server_name
+            : std::string(tls_server_name);
+    }
+    if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(http));
+        !configured_host.empty()) {
+        authority = std::string(configured_host);
+    }
+    if (authority.empty()) {
+        authority = "www.example.com";
+    }
+
+    const uint64_t conn_id = trace_conn_id;
+    if (ShouldUseHttp2ForXHttp(s)) {
+        if (kind == XHttpClientRequestKind::PacketUp) {
+            co_return co_await DoXHttp2PacketUpClientRequest(
+                std::move(stream),
+                http,
+                authority,
+                s.IsTls(),
+                packet_payload,
+                conn_id);
+        }
+        auto http2_result = co_await DoHttp2ClientHandshake(
+            std::move(stream),
+            http,
+            authority,
+            s.IsTls(),
+            conn_id);
+        if (!http2_result) {
+            co_return std::unexpected(http2_result.error());
+        }
+        if (kind == XHttpClientRequestKind::StreamUp && !packet_payload.empty()) {
+            try {
+                co_await (*http2_result)->WriteBuffers(packet_payload);
+            } catch (...) {
+                co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            }
+        }
+        co_return http2_result;
+    }
+
+    co_return co_await DoXHttp1ClientRequest(
+        std::move(stream),
+        http,
+        authority,
+        kind,
+        packet_payload,
+        conn_id);
 }
 
 }  // namespace acpp
