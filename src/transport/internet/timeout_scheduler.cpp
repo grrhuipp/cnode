@@ -40,6 +40,7 @@ struct TimeoutScheduler::Impl {
     uint64_t next_id = 1;
     uint64_t timer_generation = 0;
     bool timer_armed = false;
+    bool released = false;
     std::chrono::steady_clock::time_point armed_deadline{};
 
     void PushHeap(HeapEntry entry) {
@@ -91,6 +92,7 @@ struct TimeoutScheduler::Impl {
 
     void OnTimer(const IoErrorCode& ec) {
         timer_armed = false;
+        if (released) return;
         if (ec) return;  // cancelled / stopped
 
         auto& ready = ready_callbacks;
@@ -119,6 +121,17 @@ struct TimeoutScheduler::Impl {
 
         ArmTimer();
     }
+
+    void Release() noexcept {
+        released = true;
+        ++timer_generation;
+        IoErrorCode ec;
+        timer.cancel(ec);
+        timer_armed = false;
+        events.clear();
+        deadline_heap.clear();
+        ready_callbacks.clear();
+    }
 };
 
 namespace {
@@ -130,6 +143,13 @@ std::mutex& SchedulerMutex() {
 
 auto& SchedulerShards() {
     static std::unordered_map<net::io_context*, std::unique_ptr<TimeoutScheduler>> shards;
+    return shards;
+}
+
+auto& ReleasedSchedulerShards() {
+    // Shutdown may destroy pending coroutine frames after ReleaseForIoContext().
+    // Keep released shards alive so late token cancellation only resets tokens.
+    static std::unordered_map<net::io_context*, TimeoutScheduler*> shards;
     return shards;
 }
 
@@ -147,6 +167,14 @@ TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& io_context) {
     }
 
     std::lock_guard lk(SchedulerMutex());
+    auto& released_shards = ReleasedSchedulerShards();
+    if (auto released_it = released_shards.find(&io_context);
+            released_it != released_shards.end()) {
+        tl_cached_context = &io_context;
+        tl_cached_scheduler = released_it->second;
+        return *released_it->second;
+    }
+
     auto& shards = SchedulerShards();
     auto it = shards.find(&io_context);
     if (it != shards.end()) {
@@ -179,12 +207,18 @@ void TimeoutScheduler::ReleaseForIoContext(net::io_context& io_context) {
         }
         shard = std::move(it->second);
         shards.erase(it);
+        shard->impl_->Release();
+        ReleasedSchedulerShards()[&io_context] = shard.release();
     }
 }
 
 TimeoutToken TimeoutScheduler::ScheduleAfter(
     std::chrono::milliseconds delay,
     Callback cb) {
+    if (impl_->released) {
+        return {};
+    }
+
     if (delay < std::chrono::milliseconds::zero()) {
         delay = std::chrono::milliseconds::zero();
     }
@@ -203,7 +237,9 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
 void TimeoutScheduler::Cancel(TimeoutToken& token) {
     if (!token.Valid()) return;
 
-    impl_->events.erase(token.id);
+    if (!impl_->released) {
+        impl_->events.erase(token.id);
+    }
     token.Reset();
 }
 
