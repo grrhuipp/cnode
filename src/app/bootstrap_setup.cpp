@@ -141,9 +141,9 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
                             geo::GeoManager* geo_manager) {
     WorkerPool pool;
     const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
+    pool.workers.reserve(workers);
     pool.io_contexts.reserve(workers);
     pool.work_guards.reserve(workers);
-    pool.workers.reserve(workers);
 
     for (uint32_t i = 0; i < workers; ++i) {
         pool.io_contexts.push_back(std::make_unique<net::io_context>());
