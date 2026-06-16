@@ -728,4 +728,97 @@ BuildVlessEncryptionPadding(const VlessEncryptionConfig& config,
     };
 }
 
+std::optional<VlessEncryptionClientZeroRttRequest>
+BuildVlessEncryptionClientZeroRttRequest(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t> pfs_key,
+    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    if (pfs_key.size() != kVlessEncryptionPfsKeySize) {
+        return std::nullopt;
+    }
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+
+    VlessEncryptionClientZeroRttRequest request;
+    request.united_key = BuildUnitedKey(pfs_key, nfs_key);
+    const auto encoded_ticket_len =
+        EncodeVlessEncryptionLength(kVlessEncryptionEncryptedTicketSize);
+    auto sealed_len = nfs_aead->Seal(
+        encoded_ticket_len,
+        {},
+        request.encrypted_length);
+    if (!sealed_len || *sealed_len != request.encrypted_length.size()) {
+        return std::nullopt;
+    }
+
+    auto sealed_ticket = nfs_aead->Seal(
+        ticket,
+        {},
+        request.encrypted_ticket);
+    if (!sealed_ticket || *sealed_ticket != request.encrypted_ticket.size()) {
+        return std::nullopt;
+    }
+
+    request.bytes.reserve(
+        request.encrypted_length.size() + request.encrypted_ticket.size());
+    request.bytes.insert(request.bytes.end(),
+                         request.encrypted_length.begin(),
+                         request.encrypted_length.end());
+    request.bytes.insert(request.bytes.end(),
+                         request.encrypted_ticket.begin(),
+                         request.encrypted_ticket.end());
+    return request;
+}
+
+std::optional<VlessEncryptionServerZeroRttOpenResult>
+OpenVlessEncryptionClientZeroRttRequest(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t> pfs_key,
+    std::span<const uint8_t, kVlessEncryptionEncryptedLengthSize>
+        encrypted_length,
+    std::span<const uint8_t, kVlessEncryptionEncryptedTicketSize>
+        encrypted_ticket,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    if (pfs_key.size() != kVlessEncryptionPfsKeySize) {
+        return std::nullopt;
+    }
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, kVlessEncryptionLengthSize> length_plain{};
+    auto opened_len = nfs_aead->Open(encrypted_length, {}, length_plain);
+    if (!opened_len || *opened_len != length_plain.size()) {
+        return std::nullopt;
+    }
+    const auto declared_len = DecodeVlessEncryptionLength(length_plain);
+    if (!declared_len ||
+        *declared_len != kVlessEncryptionEncryptedTicketSize) {
+        return std::nullopt;
+    }
+
+    VlessEncryptionServerZeroRttOpenResult result;
+    auto opened_ticket = nfs_aead->Open(
+        encrypted_ticket,
+        {},
+        result.ticket);
+    if (!opened_ticket || *opened_ticket != result.ticket.size()) {
+        return std::nullopt;
+    }
+
+    std::copy(encrypted_ticket.begin(), encrypted_ticket.end(),
+              result.encrypted_ticket.begin());
+    if (!RandomBytes(result.server_random)) {
+        return std::nullopt;
+    }
+    result.united_key = BuildUnitedKey(pfs_key, nfs_key);
+    return result;
+}
+
 }  // namespace acpp::vless

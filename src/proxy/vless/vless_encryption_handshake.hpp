@@ -16,6 +16,7 @@ namespace acpp::vless {
 
 inline constexpr size_t kVlessEncryptionIvSize = kVlessEncryptionCtrIvSize;
 inline constexpr size_t kVlessEncryptionTicketSize = 16;
+inline constexpr size_t kVlessEncryptionServerRandomSize = 16;
 inline constexpr size_t kVlessEncryptionEncryptedLengthSize =
     kVlessEncryptionLengthSize + kVlessEncryptionTagSize;
 inline constexpr size_t kVlessEncryptionPfsKeySize =
@@ -89,6 +90,23 @@ struct VlessEncryptionEncryptedPadding {
     std::vector<uint8_t> bytes;
 };
 
+struct VlessEncryptionClientZeroRttRequest {
+    std::array<uint8_t, kVlessEncryptionEncryptedLengthSize>
+        encrypted_length{};
+    std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
+        encrypted_ticket{};
+    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> united_key;
+};
+
+struct VlessEncryptionServerZeroRttOpenResult {
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
+    std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
+        encrypted_ticket{};
+    std::array<uint8_t, kVlessEncryptionServerRandomSize> server_random{};
+    std::vector<uint8_t> united_key;
+};
+
 [[nodiscard]] std::optional<size_t> VlessEncryptionRelaysLength(
     const VlessEncryptionConfig& config) noexcept;
 
@@ -146,5 +164,24 @@ SealVlessEncryptionPadding(VlessEncryptionAead& aead,
 [[nodiscard]] std::optional<VlessEncryptionEncryptedPadding>
 BuildVlessEncryptionPadding(const VlessEncryptionConfig& config,
                             VlessEncryptionAead& aead) noexcept;
+
+[[nodiscard]] std::optional<VlessEncryptionClientZeroRttRequest>
+BuildVlessEncryptionClientZeroRttRequest(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t> pfs_key,
+    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
+    VlessEncryptionAeadCipher cipher) noexcept;
+
+[[nodiscard]] std::optional<VlessEncryptionServerZeroRttOpenResult>
+OpenVlessEncryptionClientZeroRttRequest(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t> pfs_key,
+    std::span<const uint8_t, kVlessEncryptionEncryptedLengthSize>
+        encrypted_length,
+    std::span<const uint8_t, kVlessEncryptionEncryptedTicketSize>
+        encrypted_ticket,
+    VlessEncryptionAeadCipher cipher) noexcept;
 
 }  // namespace acpp::vless
