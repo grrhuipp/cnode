@@ -109,6 +109,7 @@ struct EncodeRequestHeaderState final {
     MemoryAccount user;
     TargetAddress target;
     Security security = Security::AES_128_GCM;
+    Command command = Command::TCP;
     bool sent = false;
 
     std::array<uint8_t, 16> body_key{};
@@ -505,7 +506,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     if (!append_header_u8(0)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);  // Reserved
-    if (!append_header_u8(static_cast<uint8_t>(Command::TCP))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    if (!append_header_u8(static_cast<uint8_t>(state.command))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
 
     const uint8_t port_be[2] = {
         static_cast<uint8_t>(state.target.port >> 8),
@@ -767,10 +768,12 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
 ClientSession::ClientSession(const MemoryAccount& user,
                              const TargetAddress& target,
                              Security security,
+                             Command command,
                              uint8_t options)
     : user_(user)
     , target_(target)
-    , security_(security) {
+    , security_(security)
+    , command_(command) {
     std::array<uint8_t, 33> random_bytes{};
     if (RAND_bytes(random_bytes.data(), static_cast<int>(random_bytes.size())) != 1) {
         throw IoSystemError(io_error::operation_aborted, "VMess client session random init failed");
@@ -807,6 +810,7 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     state.user = user_;
     state.target = target_;
     state.security = security_;
+    state.command = command_;
     state.sent = sent_;
     state.body_key = request_body_key_;
     state.body_iv = request_body_iv_;

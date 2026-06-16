@@ -4,6 +4,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
@@ -12,7 +13,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <deque>
 #include <span>
+#include <utility>
 
 namespace acpp {
 
@@ -49,6 +52,252 @@ net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t l
     }
     co_return true;
 }
+
+[[nodiscard]] bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
+                                           buf::MultiBuffer& out_mb) {
+    size_t offset = 0;
+    while (offset < data.size()) {
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            return false;
+        }
+        const size_t chunk = std::min(
+            data.size() - offset,
+            static_cast<size_t>(out->Available()));
+        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
+        out->Produce(static_cast<uint32_t>(chunk));
+        out_mb.push_back(out.release());
+        offset += chunk;
+    }
+    return true;
+}
+
+class TrojanUdpFramer {
+public:
+    struct FramedUdpPacket {
+        TargetAddress target;
+        buf::BufferGuard payload;
+    };
+
+    void Feed(const uint8_t* data, size_t len) {
+        while (len > 0) {
+            if (!pending_) {
+                pending_ = buf::BufferGuard{buf::Buffer::New()};
+                if (!pending_) {
+                    return;
+                }
+            }
+
+            if (pending_->Available() == 0 && pending_->start > 0) {
+                Compact();
+            }
+            if (pending_->Available() == 0) {
+                ClearBuffer();
+                return;
+            }
+
+            const size_t n = std::min<size_t>(len, pending_->Available());
+            std::memcpy(pending_->Tail().data(), data, n);
+            pending_->Produce(static_cast<uint32_t>(n));
+            data += n;
+            len -= n;
+
+            Parse();
+        }
+    }
+
+    bool Next(FramedUdpPacket& out) {
+        if (queue_.empty()) {
+            return false;
+        }
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        return true;
+    }
+
+private:
+    buf::BufferGuard pending_;
+    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
+
+    void Compact() {
+        if (!pending_ || pending_->start == 0) {
+            return;
+        }
+        const uint32_t remaining = pending_->Len();
+        if (remaining == 0) {
+            ClearBuffer();
+            return;
+        }
+        std::memmove(pending_->data, pending_->Bytes().data(), remaining);
+        pending_->start = 0;
+        pending_->end = remaining;
+    }
+
+    const uint8_t* Data() const {
+        return pending_ ? pending_->Bytes().data() : nullptr;
+    }
+
+    size_t Size() const {
+        return pending_ ? pending_->Len() : 0;
+    }
+
+    void ClearBuffer() {
+        pending_ = buf::BufferGuard{};
+    }
+
+    void Parse() {
+        while (Size() > 0) {
+            auto parsed = trojan::TrojanCodec::ParseUdpPacket(Data(), Size());
+            if (parsed.result == trojan::TrojanCodec::UdpParseResult::SUCCESS) {
+                FramedUdpPacket pkt;
+                pkt.target = parsed.packet->target;
+                pkt.payload = buf::BufferGuard{buf::Buffer::New()};
+                if (pkt.payload) {
+                    const auto payload = parsed.packet->payload;
+                    const size_t n = std::min<size_t>(
+                        payload.size(),
+                        static_cast<size_t>(pkt.payload->Available()));
+                    std::memcpy(pkt.payload->Tail().data(), payload.data(), n);
+                    pkt.payload->Produce(static_cast<uint32_t>(n));
+                    queue_.push_back(std::move(pkt));
+                }
+                pending_->Advance(static_cast<uint32_t>(parsed.consumed));
+                continue;
+            }
+            if (parsed.result == trojan::TrojanCodec::UdpParseResult::INCOMPLETE) {
+                break;
+            }
+            pending_->Advance(1);
+            if (Size() < 8) {
+                ClearBuffer();
+                break;
+            }
+        }
+
+        if (pending_ && pending_->IsEmpty()) {
+            ClearBuffer();
+        }
+    }
+};
+
+class TrojanUdpOutboundEndpoint final
+    : public transport::MultiBufferReader
+    , public transport::MultiBufferWriter {
+public:
+    TrojanUdpOutboundEndpoint(AsyncStream& stream, TargetAddress fallback_target)
+        : stream_(stream)
+        , fallback_target_(std::move(fallback_target)) {}
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        while (true) {
+            buf::MultiBuffer out;
+            TrojanUdpFramer::FramedUdpPacket pkt;
+            while (framer_.Next(pkt)) {
+                if (!pkt.payload || pkt.payload->IsEmpty()) {
+                    continue;
+                }
+                pkt.payload->SetUDP(std::move(pkt.target));
+                out.push_back(pkt.payload.release());
+            }
+            if (!out.empty()) {
+                co_return out;
+            }
+
+            buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
+            if (raw.empty()) {
+                co_return buf::MultiBuffer{};
+            }
+            for (buf::Buffer* buffer : raw) {
+                if (buffer && !buffer->IsEmpty()) {
+                    framer_.Feed(buffer->Bytes().data(), buffer->Len());
+                }
+            }
+            raw.clear();
+        }
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        buf::MultiBuffer out;
+        for (buf::Buffer* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const TargetAddress& target =
+                buffer->HasUDP() ? buffer->udp : fallback_target_;
+            const size_t capacity = static_cast<size_t>(buffer->Len()) + 300;
+            memory::ByteVector scratch(capacity);
+            const size_t written = trojan::TrojanCodec::EncodeUdpPacketTo(
+                target,
+                buffer->Bytes().data(),
+                buffer->Len(),
+                scratch.data(),
+                scratch.size());
+            if (written == 0 ||
+                !AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(scratch.data(), written), out)) {
+                continue;
+            }
+        }
+        mb.clear();
+        if (!out.empty()) {
+            co_await stream_.WriteMultiBuffer(std::move(out));
+        }
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        stream_.ShutdownWrite();
+        co_return;
+    }
+
+    void SetIdleTimeout(std::chrono::seconds timeout) {
+        stream_.SetIdleTimeout(timeout);
+    }
+
+    void SetReadTimeout(std::chrono::seconds timeout) {
+        stream_.SetReadTimeout(timeout);
+    }
+
+    void SetWriteTimeout(std::chrono::seconds timeout) {
+        stream_.SetWriteTimeout(timeout);
+    }
+
+    bool ConsumeIdleTimeout() noexcept {
+        return stream_.ConsumeIdleTimeout();
+    }
+
+    bool ConsumeReadTimeout() noexcept {
+        return stream_.ConsumeReadTimeout();
+    }
+
+    bool ConsumeWriteTimeout() noexcept {
+        return stream_.ConsumeWriteTimeout();
+    }
+
+    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+        return stream_.StartPhaseDeadline(timeout);
+    }
+
+    void ClearPhaseDeadline() {
+        stream_.ClearPhaseDeadline();
+    }
+
+    bool ConsumePhaseDeadline() noexcept {
+        return stream_.ConsumePhaseDeadline();
+    }
+
+    void Cancel() noexcept {
+        stream_.Cancel();
+    }
+
+    void SetAbortiveClose(bool enable = true) noexcept {
+        stream_.SetAbortiveClose(enable);
+    }
+
+private:
+    AsyncStream& stream_;
+    TargetAddress fallback_target_;
+    TrojanUdpFramer framer_;
+};
 
 }  // namespace
 
@@ -134,9 +383,14 @@ proxy::trojan::outbound::Handler::Process(
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
+    const bool is_udp = ctx.content.network == Network::UDP;
+
     std::array<uint8_t, 512> header{};
     size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
-        config_.password, ::acpp::trojan::TrojanCommand::CONNECT, target,
+        config_.password,
+        is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
+               : ::acpp::trojan::TrojanCommand::CONNECT,
+        target,
         header.data(), header.size());
     if (header_len == 0) {
         LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: Handshake encode failed");
@@ -152,7 +406,7 @@ proxy::trojan::outbound::Handler::Process(
         }
 
         uint64_t prewritten_bytes = 0;
-        if (buf::TotalLen(first_payload) > 0) {
+        if (!is_udp && buf::TotalLen(first_payload) > 0) {
             const size_t first_payload_size = buf::TotalLen(first_payload);
             co_await stream->WriteMultiBuffer(std::move(first_payload));
             first_payload.clear();
@@ -161,7 +415,7 @@ proxy::trojan::outbound::Handler::Process(
             ctx.traffic.bytes_up = prewritten_bytes;
         }
 
-        if (!initial_payload.empty()) {
+        if (!is_udp && !initial_payload.empty()) {
             if (!co_await WriteFull(*stream, initial_payload.data(), initial_payload.size())) {
                 LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: initial payload write failed");
                 co_return fail_abortive(outbound_protocol_deadline.Expired()
@@ -178,6 +432,38 @@ proxy::trojan::outbound::Handler::Process(
         stream->SetReadTimeout(std::chrono::seconds(0));
         stream->SetWriteTimeout(relay_write_timeout);
         stream->ClearPhaseDeadline();
+
+        if (is_udp) {
+            TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
+            if (buf::TotalLen(first_payload) > 0) {
+                if (inbound.control) {
+                    co_return co_await DoRelayLinkWithFirstPacket(
+                        io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                        target_endpoint, ctx, stats, first_payload, relay_config);
+                }
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer, target_endpoint,
+                    ctx, stats, first_payload, relay_config);
+            }
+            if (!initial_payload.empty()) {
+                if (inbound.control) {
+                    co_return co_await DoRelayLinkWithFirstPacket(
+                        io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                        target_endpoint, ctx, stats, initial_payload, relay_config);
+                }
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer, target_endpoint,
+                    ctx, stats, initial_payload, relay_config);
+            }
+            if (inbound.control) {
+                co_return co_await DoRelayLink(
+                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                    target_endpoint, ctx, stats, relay_config);
+            }
+            co_return co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer,
+                target_endpoint, ctx, stats, relay_config);
+        }
 
         RelayResult result;
         if (inbound.control) {

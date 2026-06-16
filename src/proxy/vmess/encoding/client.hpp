@@ -34,6 +34,7 @@ public:
     ClientSession(const MemoryAccount& user,
                   const TargetAddress& target,
                   Security security,
+                  Command command = Command::TCP,
                   uint8_t options = 0);
 
     net::awaitable<VMessHandshakeResult> EncodeRequestHeader(AsyncStream& stream);
@@ -51,6 +52,7 @@ private:
     MemoryAccount user_;
     TargetAddress target_;
     Security security_ = Security::AES_128_GCM;
+    Command command_ = Command::TCP;
     std::array<uint8_t, 16> request_body_key_{};
     std::array<uint8_t, 16> request_body_iv_{};
     uint8_t response_header_ = 0;

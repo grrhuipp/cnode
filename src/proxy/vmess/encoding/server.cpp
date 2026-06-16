@@ -955,7 +955,9 @@ namespace {
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
     RequestBodyReader(VMessRequest& request, AsyncStream& stream)
-        : stream_(&stream) {
+        : stream_(&stream)
+        , is_udp_(request.command == Command::UDP)
+        , udp_target_(request.target) {
         InitRequestBodyState(request_body_state_, request);
     }
 
@@ -972,12 +974,22 @@ public:
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "VMess request reader has no stream");
         }
-        co_return co_await DecodeRequestBody(request_body_state_, *stream_);
+        auto mb = co_await DecodeRequestBody(request_body_state_, *stream_);
+        if (is_udp_) {
+            for (buf::Buffer* buffer : mb) {
+                if (buffer && !buffer->IsEmpty()) {
+                    buffer->SetUDP(udp_target_);
+                }
+            }
+        }
+        co_return mb;
     }
 
 private:
     DecodeRequestBodyState request_body_state_;
     AsyncStream* stream_ = nullptr;
+    bool is_udp_ = false;
+    TargetAddress udp_target_;
 };
 
 class ResponseBodyWriter final : public transport::MultiBufferWriter {

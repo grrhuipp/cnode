@@ -102,6 +102,12 @@ public:
         std::string error_reason;  // 用于调试和日志
     };
 
+    // 解析单个 UDP 包。SUCCESS 时 consumed 表示完整 frame 长度；
+    // INCOMPLETE 时保留输入等待更多字节；INVALID 时调用方可丢弃/同步。
+    static UdpParseOutput ParseUdpPacket(
+        const uint8_t* data,
+        size_t len);
+
     // 编码 UDP 包（in-place 版本，避免内存分配）
     // 返回实际写入字节数，0 表示失败（缓冲区太小）
     static size_t EncodeUdpPacketTo(

@@ -77,6 +77,7 @@ struct RouteRuleConfig {
     std::vector<std::string> domain_suffix;  // 域名后缀
     std::vector<std::string> domain_keyword; // 域名关键词
     std::vector<std::string> domain_full;    // 完整域名
+    std::vector<std::string> domain_regex;   // 正则域名
     std::vector<std::string> geosite;        // GeoSite tag (e.g., "cn", "category-ads")
     std::vector<std::string> ip;             // IP/CIDR
     std::vector<std::string> geoip;          // GeoIP tag (e.g., "cn", "private")

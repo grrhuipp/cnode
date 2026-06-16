@@ -255,4 +255,95 @@ size_t TrojanCodec::EncodeUdpPacketTo(
     return writer.Position();
 }
 
+TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
+    const uint8_t* data,
+    size_t len) {
+    UdpParseOutput output;
+    output.result = UdpParseResult::INCOMPLETE;
+    output.consumed = 0;
+
+    if (len < 8) {
+        output.error_reason = "buffer too short (< 8 bytes)";
+        return output;
+    }
+
+    ByteReader reader(data, len);
+    UdpPacket pkt;
+
+    const uint8_t atype = reader.ReadU8();
+    if (atype == 0x01) {
+        if (reader.Remaining() < 6) {
+            output.error_reason = "incomplete IPv4 address";
+            return output;
+        }
+        auto ipv4_bytes = reader.ReadBytes(4);
+        const uint16_t port = reader.ReadU16BE();
+        net::ip::address_v4::bytes_type bytes{};
+        std::memcpy(bytes.data(), ipv4_bytes.data(), bytes.size());
+        pkt.target = TargetAddress(net::ip::make_address_v4(bytes), port);
+    } else if (atype == 0x03) {
+        if (reader.Remaining() < 1) {
+            output.error_reason = "incomplete domain length";
+            return output;
+        }
+        const uint8_t domain_len = reader.ReadU8();
+        if (domain_len == 0 || domain_len > 253) {
+            output.result = UdpParseResult::INVALID;
+            output.error_reason = "invalid domain length";
+            return output;
+        }
+        if (reader.Remaining() < static_cast<size_t>(domain_len) + 2) {
+            output.error_reason = "incomplete domain address";
+            return output;
+        }
+        const std::string_view domain = reader.ReadStringView(domain_len);
+        const uint16_t port = reader.ReadU16BE();
+        pkt.target = TargetAddress(domain, port);
+    } else if (atype == 0x04) {
+        if (reader.Remaining() < 18) {
+            output.error_reason = "incomplete IPv6 address";
+            return output;
+        }
+        auto ipv6_bytes = reader.ReadBytes(16);
+        const uint16_t port = reader.ReadU16BE();
+        net::ip::address_v6::bytes_type bytes{};
+        std::memcpy(bytes.data(), ipv6_bytes.data(), bytes.size());
+        pkt.target = TargetAddress(net::ip::make_address_v6(bytes), port);
+    } else {
+        output.result = UdpParseResult::INVALID;
+        output.error_reason = "invalid address type";
+        return output;
+    }
+
+    const uint16_t payload_len = reader.ReadU16BE();
+    if (!reader.Ok()) {
+        output.error_reason = "incomplete payload length";
+        return output;
+    }
+
+    const uint8_t cr = reader.ReadU8();
+    const uint8_t lf = reader.ReadU8();
+    if (!reader.Ok()) {
+        output.error_reason = "incomplete CRLF";
+        return output;
+    }
+    if (cr != 0x0D || lf != 0x0A) {
+        output.result = UdpParseResult::INVALID;
+        output.error_reason = "CRLF mismatch";
+        return output;
+    }
+
+    auto payload = reader.ReadBytes(payload_len);
+    if (!reader.Ok()) {
+        output.error_reason = "incomplete payload";
+        return output;
+    }
+
+    pkt.payload = payload;
+    output.result = UdpParseResult::SUCCESS;
+    output.packet = pkt;
+    output.consumed = reader.Position();
+    return output;
+}
+
 }  // namespace acpp::trojan

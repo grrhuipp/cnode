@@ -147,7 +147,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
             } else if (val.substr(0, 8) == "keyword:") {
                 rule.domain_keyword.push_back(val.substr(8));
             } else if (val.substr(0, 7) == "regexp:") {
-                // 暂不支持正则，跳过
+                rule.domain_regex.push_back(val.substr(7));
             } else if (val.substr(0, 7) == "domain:") {
                 rule.domain_suffix.push_back(val.substr(7));
             } else {
@@ -169,6 +169,14 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     if (j.contains("domainFull")) {
         auto arr = jstr_array(j.at("domainFull"));
         rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
+    }
+    if (j.contains("domainRegex")) {
+        auto arr = jstr_array(j.at("domainRegex"));
+        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
+    }
+    if (j.contains("domainRegexp")) {
+        auto arr = jstr_array(j.at("domainRegexp"));
+        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
     }
     if (j.contains("geosite")) {
         auto arr = jstr_array(j.at("geosite"));

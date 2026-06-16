@@ -452,6 +452,7 @@ private:
     static constexpr uint8_t kNetworkUdp = 1u << 1;
     static constexpr uint8_t kProtocolTls = 1u << 0;
     static constexpr uint8_t kProtocolHttp = 1u << 1;
+    static constexpr uint8_t kProtocolBittorrent = 1u << 2;
 
     [[nodiscard]] bool MatchNetwork(const session::Context& ctx) const noexcept {
         const uint8_t bit = (ctx.content.network == Network::UDP) ? kNetworkUdp : kNetworkTcp;
@@ -522,6 +523,9 @@ private:
         }
         if (protocol == constants::protocol::kHttp) {
             return kProtocolHttp;
+        }
+        if (protocol == constants::protocol::kBitTorrent) {
+            return kProtocolBittorrent;
         }
         return 0;
     }
@@ -606,6 +610,14 @@ void DomainMatcher::AddKeyword(const std::string& keyword) {
     std::string lower = keyword;
     ToLowerInPlace(lower);
     keywords_.push_back(std::move(lower));
+}
+
+void DomainMatcher::AddRegex(const std::string& pattern) {
+    try {
+        regexes_.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
+    } catch (const std::regex_error& e) {
+        LOG_WARN("Router: invalid domain regexp '{}': {}", pattern, e.what());
+    }
 }
 
 bool DomainMatcher::Match(std::string_view domain) const {
@@ -943,6 +955,9 @@ void Router::Configure(
         }
         for (const auto& value : rc.domain_full) {
             domain_matcher.AddDomain(value);
+        }
+        for (const auto& value : rc.domain_regex) {
+            domain_matcher.AddRegex(value);
         }
         if (!domain_matcher.Empty()) {
             compound.conditions.push_back(DomainCondition{std::move(domain_matcher)});

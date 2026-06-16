@@ -19,14 +19,32 @@ namespace acpp {
 
 namespace {
 
+[[nodiscard]] bool SameTargetAddress(const TargetAddress& lhs,
+                                     const TargetAddress& rhs) {
+    if (lhs.port != rhs.port) {
+        return false;
+    }
+    if (lhs.IsDomain() || rhs.IsDomain()) {
+        return lhs.IsDomain() && rhs.IsDomain() && lhs.host == rhs.host;
+    }
+    if (lhs.resolved_addr && rhs.resolved_addr) {
+        return *lhs.resolved_addr == *rhs.resolved_addr;
+    }
+    return false;
+}
+
 class VMessOutboundEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
-                          AsyncStream& stream) noexcept
+                          AsyncStream& stream,
+                          bool is_udp,
+                          TargetAddress udp_target)
         : session_(session)
-        , stream_(stream) {}
+        , stream_(stream)
+        , is_udp_(is_udp)
+        , udp_target_(std::move(udp_target)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!response_header_read_) {
@@ -37,10 +55,36 @@ public:
             }
             response_header_read_ = true;
         }
-        co_return co_await session_.DecodeResponseBody(stream_);
+        auto mb = co_await session_.DecodeResponseBody(stream_);
+        if (is_udp_) {
+            for (buf::Buffer* buffer : mb) {
+                if (buffer && !buffer->IsEmpty()) {
+                    buffer->SetUDP(udp_target_);
+                }
+            }
+        }
+        co_return mb;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (is_udp_) {
+            buf::MultiBuffer filtered;
+            for (buf::Buffer*& buffer : mb) {
+                if (!buffer || buffer->IsEmpty()) {
+                    continue;
+                }
+                if (buffer->HasUDP() && !SameTargetAddress(buffer->udp, udp_target_)) {
+                    buf::Buffer::Free(buffer);
+                    buffer = nullptr;
+                    continue;
+                }
+                filtered.push_back(buffer);
+                buffer = nullptr;
+            }
+            mb.clear();
+            co_await session_.EncodeRequestBody(stream_, std::move(filtered));
+            co_return;
+        }
         co_await session_.EncodeRequestBody(stream_, std::move(mb));
     }
 
@@ -96,6 +140,8 @@ private:
     vmess::encoding::ClientSession& session_;
     AsyncStream& stream_;
     bool response_header_read_ = false;
+    bool is_udp_ = false;
+    TargetAddress udp_target_;
 };
 
 }  // namespace
@@ -191,8 +237,12 @@ proxy::vmess::outbound::Handler::Process(
     PhaseDeadlineHandle outbound_protocol_deadline =
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
+    const bool is_udp = ctx.content.network == Network::UDP;
     ::acpp::vmess::encoding::ClientSession vmess_session(
-        *user_, target, config_.security);
+        *user_,
+        target,
+        config_.security,
+        is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(*stream);
     if (!handshake_result) {
@@ -213,7 +263,7 @@ proxy::vmess::outbound::Handler::Process(
     stream->SetWriteTimeout(relay_write_timeout);
     stream->ClearPhaseDeadline();
 
-    VMessOutboundEndpoint target_endpoint(vmess_session, *stream);
+    VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
     if (buf::TotalLen(first_payload) > 0) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
