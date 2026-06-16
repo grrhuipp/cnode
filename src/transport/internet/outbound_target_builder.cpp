@@ -155,6 +155,24 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
     return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
 }
 
+[[nodiscard]] std::string BuildXHttpHostHeader(
+    const StreamSettings& settings,
+    std::string_view fallback_host,
+    uint16_t port) {
+    if (!settings.IsXHttp()) {
+        return {};
+    }
+    if (!settings.xhttp.host.empty()) {
+        return settings.xhttp.host;
+    }
+    if (const std::string_view explicit_host =
+            FindHttpHeaderCI(settings.xhttp.headers, "Host");
+        !explicit_host.empty()) {
+        return std::string(explicit_host);
+    }
+    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+}
+
 [[nodiscard]] std::string BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
@@ -167,6 +185,9 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
     }
     if (settings.IsGrpc()) {
         return BuildGrpcAuthority(settings, fallback_host, port);
+    }
+    if (settings.IsXHttp()) {
+        return BuildXHttpHostHeader(settings, fallback_host, port);
     }
     return {};
 }

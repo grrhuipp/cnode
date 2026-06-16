@@ -109,10 +109,27 @@ struct GrpcConfig {
 };
 
 // ============================================================================
+// XHTTP / SplitHTTP 传输配置
+// ============================================================================
+struct XHttpConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    std::string host;
+    std::string mode;
+    transport::internet::HttpHeaders headers;
+
+    bool no_grpc_header = false;
+    bool no_sse_header = false;
+
+    static XHttpConfig FromJson(const json::object& j);
+    [[nodiscard]] std::string NormalizedPath() const;
+    [[nodiscard]] bool IsStreamOne() const noexcept;
+};
+
+// ============================================================================
 // StreamSettings - 传输层 + 安全层组合配置
 //
 // 实现 Xray 式「传输层自由组合」：
-//   network (raw/tcp | ws/websocket | httpupgrade | grpc | xhttp)
+//   network (raw/tcp | ws/websocket | http/http2/h2 | httpupgrade | grpc | xhttp/splithttp)
 //     × security (none | tls | reality)
 //
 // 示例：
@@ -129,6 +146,7 @@ struct StreamSettings {
     HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
     HttpConfig http;            // 当 network == "http" / "h2" 时生效
     GrpcConfig grpc;           // 当 network == "grpc" 时生效
+    XHttpConfig xhttp;          // 当 network == "xhttp" / "splithttp" 时生效
 
     // 归一化后的缓存字段（热路径使用）
     NetworkMode  network_mode  = NetworkMode::Tcp;

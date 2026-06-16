@@ -386,6 +386,40 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
+XHttpConfig XHttpConfig::FromJson(const json::object& j) {
+    XHttpConfig cfg;
+    cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
+    cfg.host = jstr(j, "host", "");
+    cfg.mode = lower_ascii_copy(jstr(j, "mode", ""));
+    parse_http_headers(j, cfg.headers);
+    cfg.no_grpc_header = jbool(j, "noGRPCHeader", false);
+    cfg.no_grpc_header = jbool(j, "no_grpc_header", cfg.no_grpc_header);
+    cfg.no_sse_header = jbool(j, "noSSEHeader", false);
+    cfg.no_sse_header = jbool(j, "no_sse_header", cfg.no_sse_header);
+    return cfg;
+}
+
+std::string XHttpConfig::NormalizedPath() const {
+    std::string normalized = path.empty()
+        ? std::string(constants::binding::kRootPath)
+        : path;
+    const size_t query_pos = normalized.find('?');
+    if (query_pos != std::string::npos) {
+        normalized.erase(query_pos);
+    }
+    if (normalized.empty() || normalized.front() != '/') {
+        normalized.insert(normalized.begin(), '/');
+    }
+    if (normalized.back() != '/') {
+        normalized.push_back('/');
+    }
+    return normalized;
+}
+
+bool XHttpConfig::IsStreamOne() const noexcept {
+    return mode == "stream-one";
+}
+
 std::string GrpcConfig::RequestPath() const {
     if (!service_name.empty() && service_name.front() == '/') {
         return service_name;
@@ -471,6 +505,17 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
     parse_grpc("grpcSettings");
     parse_grpc("grpc_settings");
 
+    auto parse_xhttp = [&](std::string_view key) {
+        auto* p = j.if_contains(key);
+        if (p && p->is_object()) {
+            cfg.xhttp = XHttpConfig::FromJson(p->as_object());
+        }
+    };
+    parse_xhttp("xhttpSettings");
+    parse_xhttp("splithttpSettings");
+    parse_xhttp("xhttp_settings");
+    parse_xhttp("splithttp_settings");
+
     cfg.RecomputeModes();
     return cfg;
 }
@@ -496,7 +541,7 @@ void StreamSettings::RecomputeModes() noexcept {
     } else if (network == constants::protocol::kHttp || network == "h2") {
         http.force_http2 = http.force_http2 || (network == "h2");
         network_mode = NetworkMode::Http;
-    } else if (network == constants::protocol::kXHttp) {
+    } else if (network == constants::protocol::kXHttp || network == "splithttp") {
         network_mode = NetworkMode::XHttp;
     } else {
         network_mode = NetworkMode::Unsupported;
@@ -529,6 +574,7 @@ void StreamSettings::RecomputeModes() noexcept {
     }
     if (network_mode == NetworkMode::XHttp) {
         flags |= kFlagXHttp;
+        network = std::string(constants::protocol::kXHttp);
     }
     if (security_mode == SecurityMode::Tls) {
         flags |= kFlagTls;
@@ -539,7 +585,9 @@ void StreamSettings::RecomputeModes() noexcept {
 
     if (network_mode == NetworkMode::Grpc ||
         (network_mode == NetworkMode::Http &&
-         (http.force_http2 || security_mode == SecurityMode::Tls))) {
+         (http.force_http2 || security_mode == SecurityMode::Tls)) ||
+        (network_mode == NetworkMode::XHttp &&
+         (xhttp.IsStreamOne() || security_mode == SecurityMode::Tls))) {
         auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
         if (!has_h2) {
             tls.alpn.insert(tls.alpn.begin(), "h2");

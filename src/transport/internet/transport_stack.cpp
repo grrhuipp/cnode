@@ -2519,6 +2519,58 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     return FindConfiguredHost(cfg.headers);
 }
 
+[[nodiscard]] HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg,
+                                                  bool outbound) {
+    HttpConfig http;
+    http.path = cfg.NormalizedPath();
+    http.host = cfg.host;
+    http.method = outbound ? "POST" : "";
+    http.headers = cfg.headers;
+    http.force_http2 = true;
+    if (outbound && !cfg.no_grpc_header) {
+        bool has_content_type = false;
+        for (const auto& [key, _] : http.headers) {
+            if (EqualsAsciiCI(key, "Content-Type")) {
+                has_content_type = true;
+                break;
+            }
+        }
+        if (!has_content_type) {
+            http.headers.emplace("content-type", "application/grpc");
+        }
+    }
+    if (outbound) {
+        bool has_referer = false;
+        for (const auto& [key, _] : http.headers) {
+            if (EqualsAsciiCI(key, "Referer")) {
+                has_referer = true;
+                break;
+            }
+        }
+        if (!has_referer) {
+            std::string referer = "https://";
+            referer.append(http.host.empty() ? "example.com" : http.host);
+            referer.append(http.path.empty() ? "/" : http.path);
+            referer.append("?x_padding=");
+            referer.append(100, 'X');
+            http.headers.emplace("referer", std::move(referer));
+        }
+    }
+    if (!outbound && !cfg.no_sse_header) {
+        bool has_content_type = false;
+        for (const auto& [key, _] : http.headers) {
+            if (EqualsAsciiCI(key, "Content-Type")) {
+                has_content_type = true;
+                break;
+            }
+        }
+        if (!has_content_type) {
+            http.headers.emplace("content-type", "text/event-stream");
+        }
+    }
+    return http;
+}
+
 [[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
 
 [[nodiscard]] bool IsHttpOkStatus(std::string_view status_line) {
@@ -2761,7 +2813,8 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
-    std::string* out_real_ip) {
+    std::string* out_real_ip,
+    bool require_http2 = false) {
     std::array<uint8_t, 24> first{};
     size_t total = 0;
     while (total < first.size()) {
@@ -2788,6 +2841,10 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             io_context,
             std::move(stream_handler),
             conn_id);
+    }
+
+    if (require_http2) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     co_return co_await DoHttp1ServerHandshake(
@@ -3365,7 +3422,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
-    if (s.IsUnsupported() || s.IsReality() || s.IsXHttp()) {
+    if (s.IsUnsupported() || s.IsReality()) {
         LOG_ERROR("[Transport] BuildInbound: unsupported transport combination network={} security={}",
                   s.network,
                   s.security);
@@ -3437,7 +3494,36 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         stream = std::move(*http_result);
     }
 
-    // 4. WebSocket 层（服务端）
+    // 4. XHTTP stream-one 层（服务端，HTTP/2 raw body/response）
+    if (s.IsXHttp()) {
+        if (!s.xhttp.IsStreamOne()) {
+            LOG_ERROR("[Transport] BuildInbound: XHTTP mode '{}' is not supported yet",
+                      s.xhttp.mode.empty() ? "auto" : s.xhttp.mode);
+            co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        uint64_t conn_id = trace_conn_id;
+        if (conn_id == 0) {
+            thread_local uint64_t s_conn_counter_xhttp = 1;
+            conn_id = s_conn_counter_xhttp++;
+        }
+        const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, false);
+        auto xhttp_result = co_await DoHttpServerHandshake(
+            std::move(stream),
+            http,
+            io_context,
+            std::move(stream_handler),
+            conn_id,
+            out_real_ip,
+            true);
+        if (!xhttp_result) {
+            LOG_ACCESS_DEBUG("[Transport] BuildInbound: XHTTP server handshake failed ({})",
+                             ErrorCodeToString(xhttp_result.error()));
+            co_return std::unexpected(xhttp_result.error());
+        }
+        stream = std::move(*xhttp_result);
+    }
+
+    // 5. WebSocket 层（服务端）
     if (s.IsWs()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
@@ -3454,7 +3540,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         stream = std::move(*ws_result);
     }
 
-    // 5. HTTPUpgrade 层（服务端）
+    // 6. HTTPUpgrade 层（服务端）
     if (s.IsHttpUpgrade()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
@@ -3486,7 +3572,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
-    if (s.IsUnsupported() || s.IsReality() || s.IsXHttp()) {
+    if (s.IsUnsupported() || s.IsReality()) {
         LOG_ERROR("[Transport] BuildOutbound: unsupported transport combination network={} security={}",
                   s.network,
                   s.security);
@@ -3583,7 +3669,44 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         }
     }
 
-    // 4. WebSocket 层（客户端）
+    // 4. XHTTP stream-one 层（客户端，HTTP/2 raw body/response）
+    if (s.IsXHttp()) {
+        if (!s.xhttp.IsStreamOne()) {
+            LOG_ERROR("[Transport] BuildOutbound: XHTTP mode '{}' is not supported yet",
+                      s.xhttp.mode.empty() ? "auto" : s.xhttp.mode);
+            co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        uint64_t conn_id = trace_conn_id;
+        if (conn_id == 0) {
+            thread_local uint64_t s_conn_counter_xhttp_out = 1;
+            conn_id = s_conn_counter_xhttp_out++;
+        }
+        std::string host = ws_host.empty()
+            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
+            : std::string(ws_host);
+        const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, true);
+        if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(http));
+            !configured_host.empty()) {
+            host = std::string(configured_host);
+        }
+        if (host.empty()) {
+            host = "www.example.com";
+        }
+        auto xhttp_result = co_await DoHttp2ClientHandshake(
+            std::move(stream),
+            http,
+            host,
+            s.IsTls(),
+            conn_id);
+        if (!xhttp_result) {
+            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: XHTTP client handshake failed ({})",
+                             ErrorCodeToString(xhttp_result.error()));
+            co_return std::unexpected(xhttp_result.error());
+        }
+        stream = std::move(*xhttp_result);
+    }
+
+    // 5. WebSocket 层（客户端）
     if (s.IsWs()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
