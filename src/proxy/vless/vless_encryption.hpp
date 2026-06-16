@@ -61,6 +61,9 @@ struct VlessEncryptionParseResult {
 
 [[nodiscard]] bool IsNoVlessEncryption(std::string_view value) noexcept;
 
+[[nodiscard]] uint32_t VlessEncryptionXorModeValue(
+    VlessEncryptionMode mode) noexcept;
+
 [[nodiscard]] VlessEncryptionParseResult ParseVlessClientEncryption(
     std::string_view encryption);
 

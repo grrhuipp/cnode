@@ -268,6 +268,18 @@ bool IsNoVlessEncryption(std::string_view value) noexcept {
     return value.empty() || value == "none";
 }
 
+uint32_t VlessEncryptionXorModeValue(VlessEncryptionMode mode) noexcept {
+    switch (mode) {
+    case VlessEncryptionMode::Native:
+        return 0;
+    case VlessEncryptionMode::XorPub:
+        return 1;
+    case VlessEncryptionMode::Random:
+        return 2;
+    }
+    return 0;
+}
+
 VlessEncryptionParseResult ParseVlessClientEncryption(
     std::string_view encryption) {
     if (IsNoVlessEncryption(encryption)) {
