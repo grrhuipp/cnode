@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <utility>
 
 namespace acpp::vless {
@@ -17,6 +18,28 @@ constexpr size_t kMlKem768RelaySize = kVlessMlKem768CiphertextSize;
 [[nodiscard]] bool RandomBytes(std::span<uint8_t> out) noexcept {
     return out.empty() ||
            RAND_bytes(out.data(), static_cast<int>(out.size())) == 1;
+}
+
+[[nodiscard]] uint64_t RandomU64() noexcept {
+    uint64_t out = 0;
+    if (RAND_bytes(reinterpret_cast<uint8_t*>(&out), sizeof(out)) != 1) {
+        return 0;
+    }
+    return out;
+}
+
+[[nodiscard]] int64_t RandomBetween(int64_t from, int64_t to) noexcept {
+    if (from == to) {
+        return from;
+    }
+    if (from > to) {
+        std::swap(from, to);
+    }
+    const uint64_t width = static_cast<uint64_t>(to - from);
+    if (width == 0) {
+        return from;
+    }
+    return from + static_cast<int64_t>(RandomU64() % width);
 }
 
 [[nodiscard]] bool IsClientKey(std::span<const uint8_t> key) noexcept {
@@ -113,6 +136,49 @@ IvSpan(const std::array<uint8_t, kVlessEncryptionIvSize>& iv) noexcept {
     return std::span<const uint8_t, kVlessEncryptionIvSize>(
         iv.data(),
         iv.size());
+}
+
+[[nodiscard]] const VlessEncryptionNonce& MaxNonce() noexcept {
+    static constexpr VlessEncryptionNonce kMaxNonce = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    return kMaxNonce;
+}
+
+[[nodiscard]] uint16_t TicketSeconds(
+    const VlessEncryptionConfig& config) noexcept {
+    int64_t seconds = 0;
+    if (config.seconds_to == 0) {
+        seconds = config.seconds_from * RandomBetween(50, 100) / 100;
+    } else {
+        seconds = RandomBetween(config.seconds_from, config.seconds_to);
+    }
+    return static_cast<uint16_t>(seconds & 0xffff);
+}
+
+[[nodiscard]] bool AppendPfsKey(std::vector<uint8_t>& out,
+                                std::span<const uint8_t> mlkem_shared,
+                                std::span<const uint8_t> x25519_shared) {
+    if (mlkem_shared.size() != kVlessMlKem768SharedSecretSize ||
+        x25519_shared.size() != kVlessX25519KeySize) {
+        return false;
+    }
+    out.clear();
+    out.reserve(kVlessEncryptionPfsKeySize);
+    out.insert(out.end(), mlkem_shared.begin(), mlkem_shared.end());
+    out.insert(out.end(), x25519_shared.begin(), x25519_shared.end());
+    return true;
+}
+
+[[nodiscard]] std::vector<uint8_t> BuildUnitedKey(
+    std::span<const uint8_t> pfs_key,
+    std::span<const uint8_t> nfs_key) {
+    std::vector<uint8_t> out;
+    out.reserve(pfs_key.size() + nfs_key.size());
+    out.insert(out.end(), pfs_key.begin(), pfs_key.end());
+    out.insert(out.end(), nfs_key.begin(), nfs_key.end());
+    return out;
 }
 
 }  // namespace
@@ -296,6 +362,252 @@ OpenVlessEncryptionClientNfsHello(
     }
 
     result.nfs_key = std::move(nfs_key);
+    return result;
+}
+
+std::optional<VlessEncryptionClientPfsHello>
+BuildVlessEncryptionClientPfsHello(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+
+    VlessEncryptionClientPfsHello hello;
+    if (!RandomBytes(hello.mlkem_seed)) {
+        return std::nullopt;
+    }
+    auto mlkem_public = DeriveVlessMlKem768PublicKeyFromSeed(
+        hello.mlkem_seed);
+    if (!mlkem_public) {
+        return std::nullopt;
+    }
+
+    const auto x25519 = GenerateVlessX25519KeyPair();
+    hello.x25519_private_key = x25519.private_key;
+    std::copy(mlkem_public->begin(), mlkem_public->end(),
+              hello.public_key.begin());
+    std::copy(x25519.public_key.begin(), x25519.public_key.end(),
+              hello.public_key.begin() +
+                  static_cast<std::ptrdiff_t>(kVlessMlKem768PublicKeySize));
+
+    const auto encrypted_len = EncodeVlessEncryptionLength(
+        kVlessEncryptionEncryptedClientPfsPublicSize);
+    auto encrypted = std::span<uint8_t, kVlessEncryptionClientPfsHelloSize>(
+        hello.encrypted);
+    auto sealed_len = nfs_aead->Seal(
+        encrypted_len,
+        {},
+        encrypted.first(kVlessEncryptionEncryptedLengthSize));
+    if (!sealed_len || *sealed_len != kVlessEncryptionEncryptedLengthSize) {
+        return std::nullopt;
+    }
+
+    auto sealed_key = nfs_aead->Seal(
+        hello.public_key,
+        {},
+        encrypted.subspan(kVlessEncryptionEncryptedLengthSize));
+    if (!sealed_key ||
+        *sealed_key != kVlessEncryptionEncryptedClientPfsPublicSize) {
+        return std::nullopt;
+    }
+    return hello;
+}
+
+std::optional<std::array<uint8_t, kVlessEncryptionClientPfsPublicSize>>
+OpenVlessEncryptionClientPfsHello(
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t, kVlessEncryptionClientPfsHelloSize> encrypted,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, kVlessEncryptionLengthSize> length_plain{};
+    auto opened_len = nfs_aead->Open(
+        encrypted.first(kVlessEncryptionEncryptedLengthSize),
+        {},
+        length_plain);
+    if (!opened_len || *opened_len != length_plain.size()) {
+        return std::nullopt;
+    }
+
+    const auto declared_len = DecodeVlessEncryptionLength(length_plain);
+    if (!declared_len ||
+        *declared_len != kVlessEncryptionEncryptedClientPfsPublicSize) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, kVlessEncryptionClientPfsPublicSize> public_key{};
+    auto opened_key = nfs_aead->Open(
+        encrypted.subspan(kVlessEncryptionEncryptedLengthSize),
+        {},
+        public_key);
+    if (!opened_key || *opened_key != public_key.size()) {
+        return std::nullopt;
+    }
+    if (!ValidateVlessMlKem768PublicKey(
+            std::span<const uint8_t>(
+                public_key.data(),
+                kVlessMlKem768PublicKeySize))) {
+        return std::nullopt;
+    }
+    return public_key;
+}
+
+std::optional<VlessEncryptionServerPfsResponse>
+BuildVlessEncryptionServerPfsResponse(
+    const VlessEncryptionConfig& config,
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t, kVlessEncryptionClientPfsPublicSize>
+        client_public_key,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    if (config.role != VlessEncryptionRole::Server) {
+        return std::nullopt;
+    }
+
+    auto mlkem_enc = EncapsulateVlessMlKem768(
+        client_public_key.first(kVlessMlKem768PublicKeySize));
+    if (!mlkem_enc) {
+        return std::nullopt;
+    }
+
+    const auto x25519 = GenerateVlessX25519KeyPair();
+    auto x25519_shared = ComputeVlessX25519SharedKey(
+        x25519.private_key,
+        client_public_key.subspan(kVlessMlKem768PublicKeySize));
+    if (!x25519_shared) {
+        return std::nullopt;
+    }
+
+    VlessEncryptionServerPfsResponse response;
+    std::copy(mlkem_enc->ciphertext.begin(), mlkem_enc->ciphertext.end(),
+              response.public_key.begin());
+    std::copy(x25519.public_key.begin(), x25519.public_key.end(),
+              response.public_key.begin() +
+                  static_cast<std::ptrdiff_t>(
+                      kVlessMlKem768CiphertextSize));
+    if (!AppendPfsKey(response.pfs_key,
+                      mlkem_enc->shared_secret,
+                      *x25519_shared)) {
+        return std::nullopt;
+    }
+    response.united_key = BuildUnitedKey(response.pfs_key, nfs_key);
+
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+    auto sealed_public = nfs_aead->SealWithNonce(
+        MaxNonce(),
+        response.public_key,
+        {},
+        response.encrypted_public_key);
+    if (!sealed_public ||
+        *sealed_public != kVlessEncryptionEncryptedServerPfsPublicSize) {
+        return std::nullopt;
+    }
+
+    if (!RandomBytes(response.ticket)) {
+        return std::nullopt;
+    }
+    response.ticket_seconds = TicketSeconds(config);
+    const auto encoded_seconds =
+        EncodeVlessEncryptionLength(response.ticket_seconds);
+    std::copy(encoded_seconds.begin(), encoded_seconds.end(),
+              response.ticket.begin());
+
+    auto ticket_aead = VlessEncryptionAead::Create(
+        response.public_key,
+        response.united_key,
+        cipher);
+    if (!ticket_aead) {
+        return std::nullopt;
+    }
+    auto sealed_ticket = ticket_aead->Seal(
+        response.ticket,
+        {},
+        response.encrypted_ticket);
+    if (!sealed_ticket ||
+        *sealed_ticket != kVlessEncryptionEncryptedTicketSize) {
+        return std::nullopt;
+    }
+    return response;
+}
+
+std::optional<VlessEncryptionClientPfsOpenResult>
+OpenVlessEncryptionServerPfsResponse(
+    const VlessEncryptionClientPfsHello& client_hello,
+    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
+    std::span<const uint8_t> nfs_key,
+    std::span<const uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
+        encrypted_public_key,
+    std::span<const uint8_t, kVlessEncryptionEncryptedTicketSize>
+        encrypted_ticket,
+    VlessEncryptionAeadCipher cipher) noexcept {
+    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
+    if (!nfs_aead) {
+        return std::nullopt;
+    }
+
+    VlessEncryptionClientPfsOpenResult result;
+    auto opened_public = nfs_aead->OpenWithNonce(
+        MaxNonce(),
+        encrypted_public_key,
+        {},
+        result.server_public_key);
+    if (!opened_public ||
+        *opened_public != kVlessEncryptionServerPfsPublicSize) {
+        return std::nullopt;
+    }
+
+    auto mlkem_shared = DecapsulateVlessMlKem768FromSeed(
+        client_hello.mlkem_seed,
+        std::span<const uint8_t>(
+            result.server_public_key.data(),
+            kVlessMlKem768CiphertextSize));
+    if (!mlkem_shared) {
+        return std::nullopt;
+    }
+    auto x25519_shared = ComputeVlessX25519SharedKey(
+        client_hello.x25519_private_key,
+        std::span<const uint8_t>(
+            result.server_public_key.data() +
+                static_cast<std::ptrdiff_t>(kVlessMlKem768CiphertextSize),
+            kVlessX25519KeySize));
+    if (!x25519_shared ||
+        !AppendPfsKey(result.pfs_key, *mlkem_shared, *x25519_shared)) {
+        return std::nullopt;
+    }
+    result.united_key = BuildUnitedKey(result.pfs_key, nfs_key);
+
+    auto ticket_aead = VlessEncryptionAead::Create(
+        result.server_public_key,
+        result.united_key,
+        cipher);
+    if (!ticket_aead) {
+        return std::nullopt;
+    }
+    auto opened_ticket = ticket_aead->Open(
+        encrypted_ticket,
+        {},
+        result.ticket);
+    if (!opened_ticket || *opened_ticket != result.ticket.size()) {
+        return std::nullopt;
+    }
+    const auto seconds = DecodeVlessEncryptionLength(
+        std::span<const uint8_t, kVlessEncryptionLengthSize>(
+            result.ticket.data(),
+            kVlessEncryptionLengthSize));
+    if (!seconds) {
+        return std::nullopt;
+    }
+    result.ticket_seconds = *seconds;
     return result;
 }
 
