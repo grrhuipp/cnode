@@ -27,6 +27,10 @@ struct UserSet;
 // ============================================================================
 class UserStore final {
 public:
+    struct Array16Hash {
+        [[nodiscard]] size_t operator()(const std::array<uint8_t, 16>& value) const noexcept;
+    };
+
     struct Array32Hash {
         [[nodiscard]] size_t operator()(const std::array<uint8_t, 32>& value) const noexcept;
     };
@@ -44,6 +48,13 @@ public:
 
     struct TrojanCredential {
         std::string password_hash;
+        std::shared_ptr<const Profile> profile;
+    };
+
+    struct VlessCredential {
+        std::string uuid;
+        std::array<uint8_t, 16> uuid_bytes{};
+        std::string flow;
         std::shared_ptr<const Profile> profile;
     };
 
@@ -72,6 +83,10 @@ public:
                            TrojanCredential,
                            TransparentStringHash,
                            TransparentStringEq>;
+    using VlessUserMap =
+        std::unordered_map<std::array<uint8_t, 16>,
+                           VlessCredential,
+                           Array16Hash>;
     using ShadowsocksUserList = std::vector<ShadowsocksCredential>;
     using AnyTlsUserMap =
         std::unordered_map<std::array<uint8_t, 32>,
@@ -88,6 +103,19 @@ public:
             return users
                 ? std::shared_ptr<const VmessCredential>(users, &user)
                 : std::shared_ptr<const VmessCredential>{};
+        }
+    };
+
+    struct VlessUsersView {
+        std::shared_ptr<const VlessUserMap> users;
+
+        [[nodiscard]] bool empty() const noexcept { return !users || users->empty(); }
+        [[nodiscard]] size_t size() const noexcept { return users ? users->size() : 0; }
+        [[nodiscard]] std::shared_ptr<const VlessCredential>
+        Share(const VlessCredential& user) const noexcept {
+            return users
+                ? std::shared_ptr<const VlessCredential>(users, &user)
+                : std::shared_ptr<const VlessCredential>{};
         }
     };
 
@@ -109,12 +137,14 @@ public:
 
     struct Stats {
         size_t vmess_accounts = 0;
+        size_t vless_users = 0;
         size_t trojan_users = 0;
         size_t shadowsocks_users = 0;
         size_t anytls_users = 0;
 
         [[nodiscard]] size_t TotalUsers() const noexcept {
-            return vmess_accounts + trojan_users + shadowsocks_users + anytls_users;
+            return vmess_accounts + vless_users + trojan_users +
+                   shadowsocks_users + anytls_users;
         }
     };
 
@@ -133,6 +163,10 @@ public:
     static void ClearAll();
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);
+    [[nodiscard]] static VlessUsersView VlessUsers(std::string_view tag);
+    [[nodiscard]] static std::shared_ptr<const VlessCredential>
+    FindVlessUser(std::string_view tag,
+                  const std::array<uint8_t, 16>& uuid_bytes);
     [[nodiscard]] static std::shared_ptr<const TrojanCredential>
     FindTrojanUser(std::string_view tag, std::string_view password_hash);
     [[nodiscard]] static bool HasTrojanUser(std::string_view tag,

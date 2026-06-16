@@ -43,6 +43,9 @@ namespace acpp::naming {
     if (lowered.empty() || lowered == "v2ray" || lowered == "vmess") {
         return std::string(constants::protocol::kVmess);
     }
+    if (lowered == "vless") {
+        return std::string(constants::protocol::kVless);
+    }
     if (lowered == "trojan") {
         return std::string(constants::protocol::kTrojan);
     }
@@ -59,6 +62,9 @@ namespace acpp::naming {
     const auto lowered = LowerAscii(std::string(node_type));
     if (lowered.empty() || lowered == "vmess") {
         return "v2ray";
+    }
+    if (lowered == "vless") {
+        return "vless";
     }
     return lowered;
 }

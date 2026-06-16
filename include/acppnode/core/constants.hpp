@@ -55,6 +55,7 @@ inline constexpr std::string_view kForceIPv4v6 = "ForceIPv4v6";
 inline constexpr std::string_view kForceIPv4 = "ForceIPv4";
 
 inline constexpr std::string_view kVmess = "vmess";
+inline constexpr std::string_view kVless = "vless";
 inline constexpr std::string_view kDefaultNodeProtocol = kVmess;
 inline constexpr std::string_view kTrojan = "trojan";
 inline constexpr std::string_view kShadowsocks = "shadowsocks";

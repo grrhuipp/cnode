@@ -427,32 +427,49 @@ StaticUserConfig ParseStaticUserConfig(
         }
     }
 
-    const auto user_array_key = StaticUserArrayKeyForProtocol(protocol);
     bool saw_user_array = false;
-    if (const auto* users = settings.if_contains(user_array_key);
-            users && users->is_array()) {
-        saw_user_array = !users->as_array().empty();
-        for (const auto& client : users->as_array()) {
-            if (!client.is_object()) {
-                continue;
-            }
-            const auto& client_obj = client.as_object();
+    auto parse_user_array = [&](std::string_view key) {
+        if (const auto* users = settings.if_contains(key);
+                users && users->is_array()) {
+            saw_user_array = !users->as_array().empty();
+            for (const auto& client : users->as_array()) {
+                if (!client.is_object()) {
+                    continue;
+                }
+                const auto& client_obj = client.as_object();
 
-            StaticUser user;
-            if (const auto* id = client_obj.if_contains("id");
-                    id && id->is_string()) {
-                user.id = std::string(id->as_string());
+                StaticUser user;
+                if (const auto* id = client_obj.if_contains("id");
+                        id && id->is_string()) {
+                    user.id = std::string(id->as_string());
+                }
+                if (user.id.empty()) {
+                    if (const auto* uuid = client_obj.if_contains("uuid");
+                            uuid && uuid->is_string()) {
+                        user.id = std::string(uuid->as_string());
+                    }
+                }
+                if (const auto* password = client_obj.if_contains("password");
+                        password && password->is_string()) {
+                    user.password = std::string(password->as_string());
+                }
+                if (const auto* email = client_obj.if_contains("email");
+                        email && email->is_string()) {
+                    user.email = std::string(email->as_string());
+                }
+                if (const auto* flow = client_obj.if_contains("flow");
+                        flow && flow->is_string()) {
+                    user.flow = std::string(flow->as_string());
+                }
+                config.clients.push_back(std::move(user));
             }
-            if (const auto* password = client_obj.if_contains("password");
-                    password && password->is_string()) {
-                user.password = std::string(password->as_string());
-            }
-            if (const auto* email = client_obj.if_contains("email");
-                    email && email->is_string()) {
-                user.email = std::string(email->as_string());
-            }
-            config.clients.push_back(std::move(user));
         }
+    };
+
+    const auto user_array_key = StaticUserArrayKeyForProtocol(protocol);
+    parse_user_array(user_array_key);
+    if (protocol == constants::protocol::kVless && user_array_key != std::string_view("users")) {
+        parse_user_array("users");
     }
 
     if (protocol == constants::protocol::kShadowsocks &&

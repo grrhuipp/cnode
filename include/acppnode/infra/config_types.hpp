@@ -49,6 +49,7 @@ struct StaticUser {
     std::string id;
     std::string password;
     std::string email;
+    std::string flow;
 };
 
 struct StaticUserConfig {

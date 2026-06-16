@@ -12,6 +12,7 @@
 #include "acppnode/proxy/shadowsocks/validator.hpp"
 #include "acppnode/proxy/anytls/validator.hpp"
 #include "acppnode/proxy/trojan/validator.hpp"
+#include "acppnode/proxy/vless/validator.hpp"
 #include "acppnode/proxy/vmess/validator.hpp"
 
 namespace acpp::proxyman::inbound {
@@ -30,6 +31,8 @@ struct Manager::Impl {
         void* validator = nullptr;
         if (protocol == constants::protocol::kVmess) {
             validator = &vmess_validator;
+        } else if (protocol == constants::protocol::kVless) {
+            validator = &vless_validator;
         } else if (protocol == constants::protocol::kTrojan) {
             validator = &trojan_validator;
         } else if (protocol == constants::protocol::kShadowsocks) {
@@ -45,6 +48,7 @@ struct Manager::Impl {
 
     StatsShard& stats;
     ::acpp::vmess::TimedUserValidator vmess_validator;
+    ::acpp::vless::Validator vless_validator;
     ::acpp::trojan::Validator trojan_validator;
     ::acpp::ss::Validator ss_validator;
     ::acpp::anytls::Validator anytls_validator;
@@ -134,6 +138,9 @@ Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const
     if (protocol == constants::protocol::kVmess) {
         return impl_->vmess_validator.GetOnlineDevices(tag);
     }
+    if (protocol == constants::protocol::kVless) {
+        return impl_->vless_validator.GetOnlineDevices(tag);
+    }
     if (protocol == constants::protocol::kTrojan) {
         return impl_->trojan_validator.GetOnlineDevices(tag);
     }
@@ -150,6 +157,7 @@ Manager::UserMemoryStats Manager::GetUserMemoryStats() const noexcept {
     const auto stats = UserStore::GetStats();
     return UserMemoryStats{
         stats.vmess_accounts,
+        stats.vless_users,
         stats.trojan_users,
         stats.shadowsocks_users,
         stats.anytls_users,

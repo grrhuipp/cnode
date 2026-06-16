@@ -11,7 +11,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 
 ## 项目定位
 
-- 支持 VMess、Trojan、Shadowsocks、AnyTLS、Freedom、Blackhole。
+- 支持 VMess、VLESS、Trojan、Shadowsocks、AnyTLS、Freedom、Blackhole。
 - 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
@@ -39,10 +39,10 @@ main
   -> Worker(per-core)
   -> listener / accept
   -> TransportStack(TCP / TLS / WebSocket / PROXY protocol)
-  -> InboundHandler(VMess / Trojan / Shadowsocks / AnyTLS)
+  -> InboundHandler(VMess / VLESS / Trojan / Shadowsocks / AnyTLS)
   -> Dispatcher
   -> Router
-  -> OutboundHandler(Freedom / VMess / Trojan / Shadowsocks / AnyTLS / Blackhole)
+  -> OutboundHandler(Freedom / VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Blackhole)
   -> Relay(TCP / UDP / Mux)
 ```
 

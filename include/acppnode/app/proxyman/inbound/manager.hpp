@@ -65,6 +65,7 @@ public:
 
     struct UserMemoryStats {
         size_t vmess_accounts = 0;
+        size_t vless_users = 0;
         size_t trojan_users = 0;
         size_t shadowsocks_users = 0;
         size_t anytls_users = 0;

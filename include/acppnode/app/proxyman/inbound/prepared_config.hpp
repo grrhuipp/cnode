@@ -74,6 +74,13 @@ struct PreparedVmessUser {
     ::acpp::UserProfile profile;
 };
 
+struct PreparedVlessUser {
+    std::string uuid;
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::string flow;
+    ::acpp::UserProfile profile;
+};
+
 struct PreparedTrojanUser {
     std::string password_hash;
     ::acpp::UserProfile profile;
@@ -96,6 +103,7 @@ struct PreparedAnyTlsUser {
 
 struct UserSet {
     std::vector<PreparedVmessUser> vmess_accounts;
+    std::vector<PreparedVlessUser> vless_users;
     std::vector<PreparedTrojanUser> trojan_users;
     std::vector<PreparedShadowsocksUser> ss_users;
     std::vector<PreparedAnyTlsUser> anytls_users;

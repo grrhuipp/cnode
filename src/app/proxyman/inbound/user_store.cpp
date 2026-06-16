@@ -16,6 +16,11 @@ using VmessTagMap =
                        std::shared_ptr<const UserStore::VmessUserMap>,
                        TransparentStringHash,
                        TransparentStringEq>;
+using VlessTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::VlessUserMap>,
+                       TransparentStringHash,
+                       TransparentStringEq>;
 using TrojanTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::TrojanUserMap>,
@@ -34,6 +39,7 @@ using AnyTlsTagMap =
 
 struct Snapshot {
     VmessTagMap vmess;
+    VlessTagMap vless;
     TrojanTagMap trojan;
     ShadowsocksTagMap shadowsocks;
     AnyTlsTagMap anytls;
@@ -91,6 +97,26 @@ BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
     map->reserve(users.size());
     for (const auto& user : users) {
         (*map)[user.uuid] = BuildVmessCredential(user);
+    }
+    return map;
+}
+
+UserStore::VlessCredential
+BuildVlessCredential(const PreparedVlessUser& user) {
+    return UserStore::VlessCredential{
+        .uuid = user.uuid,
+        .uuid_bytes = user.uuid_bytes,
+        .flow = user.flow,
+        .profile = ShareProfile(user.profile),
+    };
+}
+
+std::shared_ptr<const UserStore::VlessUserMap>
+BuildVlessUsers(const std::vector<PreparedVlessUser>& users) {
+    auto map = std::make_shared<UserStore::VlessUserMap>();
+    map->reserve(users.size());
+    for (const auto& user : users) {
+        (*map)[user.uuid_bytes] = BuildVlessCredential(user);
     }
     return map;
 }
@@ -179,6 +205,15 @@ bool SameShadowsocksIdentity(const UserStore::ShadowsocksCredential& a,
 
 }  // namespace
 
+size_t UserStore::Array16Hash::operator()(const std::array<uint8_t, 16>& value) const noexcept {
+    size_t out = 1469598103934665603ull;
+    for (uint8_t byte : value) {
+        out ^= byte;
+        out *= 1099511628211ull;
+    }
+    return out;
+}
+
 size_t UserStore::Array32Hash::operator()(const std::array<uint8_t, 32>& value) const noexcept {
     size_t out = 1469598103934665603ull;
     for (uint8_t byte : value) {
@@ -194,6 +229,8 @@ void UserStore::ApplyUsers(std::string_view protocol,
     Publish([&](Snapshot& snapshot) {
         if (protocol == constants::protocol::kVmess) {
             SetOrErase(snapshot.vmess, tag, BuildVmessUsers(users.vmess_accounts));
+        } else if (protocol == constants::protocol::kVless) {
+            SetOrErase(snapshot.vless, tag, BuildVlessUsers(users.vless_users));
         } else if (protocol == constants::protocol::kTrojan) {
             SetOrErase(snapshot.trojan, tag, BuildTrojanUsers(users.trojan_users));
         } else if (protocol == constants::protocol::kShadowsocks) {
@@ -218,6 +255,16 @@ void UserStore::AddUsers(std::string_view protocol,
                 (*next)[user.uuid] = BuildVmessCredential(user);
             }
             SetOrErase(snapshot.vmess, tag, std::move(next));
+        } else if (protocol == constants::protocol::kVless) {
+            auto next = std::make_shared<VlessUserMap>();
+            if (auto it = snapshot.vless.find(tag); it != snapshot.vless.end() && it->second) {
+                *next = *it->second;
+            }
+            next->reserve(next->size() + users.vless_users.size());
+            for (const auto& user : users.vless_users) {
+                (*next)[user.uuid_bytes] = BuildVlessCredential(user);
+            }
+            SetOrErase(snapshot.vless, tag, std::move(next));
         } else if (protocol == constants::protocol::kTrojan) {
             auto next = std::make_shared<TrojanUserMap>();
             if (auto it = snapshot.trojan.find(tag); it != snapshot.trojan.end() && it->second) {
@@ -274,6 +321,14 @@ void UserStore::RemoveUsers(std::string_view protocol,
                 next->erase(user.uuid);
             }
             SetOrErase(snapshot.vmess, tag, std::move(next));
+        } else if (protocol == constants::protocol::kVless) {
+            auto it = snapshot.vless.find(tag);
+            if (it == snapshot.vless.end() || !it->second) return;
+            auto next = std::make_shared<VlessUserMap>(*it->second);
+            for (const auto& user : users.vless_users) {
+                next->erase(user.uuid_bytes);
+            }
+            SetOrErase(snapshot.vless, tag, std::move(next));
         } else if (protocol == constants::protocol::kTrojan) {
             auto it = snapshot.trojan.find(tag);
             if (it == snapshot.trojan.end() || !it->second) return;
@@ -312,6 +367,8 @@ void UserStore::ClearUsers(std::string_view protocol,
     Publish([&](Snapshot& snapshot) {
         if (protocol == constants::protocol::kVmess) {
             snapshot.vmess.erase(std::string(tag));
+        } else if (protocol == constants::protocol::kVless) {
+            snapshot.vless.erase(std::string(tag));
         } else if (protocol == constants::protocol::kTrojan) {
             snapshot.trojan.erase(std::string(tag));
         } else if (protocol == constants::protocol::kShadowsocks) {
@@ -326,6 +383,8 @@ void UserStore::ClearProtocol(std::string_view protocol) {
     Publish([&](Snapshot& snapshot) {
         if (protocol == constants::protocol::kVmess) {
             snapshot.vmess.clear();
+        } else if (protocol == constants::protocol::kVless) {
+            snapshot.vless.clear();
         } else if (protocol == constants::protocol::kTrojan) {
             snapshot.trojan.clear();
         } else if (protocol == constants::protocol::kShadowsocks) {
@@ -345,6 +404,26 @@ UserStore::VmessUsersView UserStore::VmessUsers(std::string_view tag) {
     auto snapshot = LoadSnapshot();
     auto it = snapshot->vmess.find(tag);
     return {it == snapshot->vmess.end() ? nullptr : it->second};
+}
+
+UserStore::VlessUsersView UserStore::VlessUsers(std::string_view tag) {
+    auto snapshot = LoadSnapshot();
+    auto it = snapshot->vless.find(tag);
+    return {it == snapshot->vless.end() ? nullptr : it->second};
+}
+
+std::shared_ptr<const UserStore::VlessCredential>
+UserStore::FindVlessUser(std::string_view tag,
+                         const std::array<uint8_t, 16>& uuid_bytes) {
+    auto view = VlessUsers(tag);
+    if (!view.users) {
+        return nullptr;
+    }
+    auto it = view.users->find(uuid_bytes);
+    if (it == view.users->end()) {
+        return nullptr;
+    }
+    return view.Share(it->second);
 }
 
 std::shared_ptr<const UserStore::TrojanCredential>
@@ -408,6 +487,10 @@ UserStore::Stats UserStore::GetStats() {
         (void)tag;
         if (users) stats.vmess_accounts += users->size();
     }
+    for (const auto& [tag, users] : snapshot->vless) {
+        (void)tag;
+        if (users) stats.vless_users += users->size();
+    }
     for (const auto& [tag, users] : snapshot->trojan) {
         (void)tag;
         if (users) stats.trojan_users += users->size();
@@ -428,6 +511,9 @@ size_t UserStore::SizeForProtocolTag(std::string_view protocol,
     auto snapshot = LoadSnapshot();
     if (protocol == constants::protocol::kVmess) {
         return TagSize(snapshot->vmess, tag);
+    }
+    if (protocol == constants::protocol::kVless) {
+        return TagSize(snapshot->vless, tag);
     }
     if (protocol == constants::protocol::kTrojan) {
         return TagSize(snapshot->trojan, tag);

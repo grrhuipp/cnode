@@ -349,6 +349,12 @@ set(CNODE_SOURCES
     src/proxy/vmess/inbound/vmess_inbound.cpp
     src/proxy/vmess/outbound/vmess_outbound.cpp
 
+    # Proxy - VLESS
+    src/proxy/vless/validator.cpp
+    src/proxy/vless/vless_codec.cpp
+    src/proxy/vless/inbound/vless_inbound.cpp
+    src/proxy/vless/outbound/vless_outbound.cpp
+
     # Proxy - Trojan
     src/proxy/trojan/validator.cpp
     src/proxy/trojan/trojan_codec.cpp
