@@ -964,6 +964,132 @@ private:
     bool closed_ = false;
 };
 
+[[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
+    if (!cfg.host.empty()) {
+        return cfg.host;
+    }
+    return FindConfiguredHost(cfg.headers);
+}
+
+struct XHttpRequestMeta {
+    enum class Kind {
+        Unknown,
+        StreamOne,
+        PacketDown,
+        PacketUp,
+        StreamUp,
+    };
+
+    Kind kind = Kind::Unknown;
+    std::string session_id;
+    uint64_t seq = 0;
+};
+
+[[nodiscard]] std::optional<uint64_t> ParseU64Decimal(std::string_view value) {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    uint64_t out = 0;
+    for (char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (out > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            return std::nullopt;
+        }
+        out = out * 10 + digit;
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<size_t> ParseContentLength(std::string_view value) {
+    value = TrimAscii(value);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    uint64_t out = 0;
+    for (char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (out > (std::numeric_limits<size_t>::max() - digit) / 10) {
+            return std::nullopt;
+        }
+        out = out * 10 + digit;
+    }
+    return static_cast<size_t>(out);
+}
+
+[[nodiscard]] XHttpRequestMeta ParseXHttpRequestMeta(std::string_view base_path,
+                                                     std::string_view request_path,
+                                                     std::string_view method) {
+    XHttpRequestMeta meta;
+    const std::string_view actual = PathWithoutQuery(request_path);
+    const std::string_view expected = EffectivePath(base_path);
+    if (actual == expected) {
+        if (EqualsAsciiCI(method, "POST")) {
+            meta.kind = XHttpRequestMeta::Kind::StreamOne;
+        }
+        return meta;
+    }
+    if (!actual.starts_with(expected)) {
+        return meta;
+    }
+
+    std::string_view rest = actual.substr(expected.size());
+    while (!rest.empty() && rest.front() == '/') {
+        rest.remove_prefix(1);
+    }
+    if (rest.empty()) {
+        return meta;
+    }
+
+    const size_t slash = rest.find('/');
+    if (slash == std::string_view::npos) {
+        meta.session_id.assign(rest.data(), rest.size());
+        meta.kind = EqualsAsciiCI(method, "GET")
+            ? XHttpRequestMeta::Kind::PacketDown
+            : XHttpRequestMeta::Kind::StreamUp;
+        return meta;
+    }
+
+    const std::string_view session = rest.substr(0, slash);
+    const std::string_view seq = rest.substr(slash + 1);
+    if (session.empty()) {
+        return meta;
+    }
+    auto parsed_seq = ParseU64Decimal(seq);
+    if (!parsed_seq) {
+        return meta;
+    }
+    meta.session_id.assign(session.data(), session.size());
+    meta.seq = *parsed_seq;
+    meta.kind = XHttpRequestMeta::Kind::PacketUp;
+    return meta;
+}
+
+[[nodiscard]] std::shared_ptr<XHttpPacketUpSession> GetXHttpPacketSession(
+    net::io_context& io_context,
+    std::string_view session_id,
+    bool create) {
+    thread_local std::unordered_map<std::string, std::weak_ptr<XHttpPacketUpSession>> sessions;
+    auto it = sessions.find(std::string(session_id));
+    if (it != sessions.end()) {
+        if (auto session = it->second.lock()) {
+            return session;
+        }
+        sessions.erase(it);
+    }
+    if (!create) {
+        return nullptr;
+    }
+    auto session = std::make_shared<XHttpPacketUpSession>(io_context);
+    sessions.emplace(std::string(session_id), session);
+    return session;
+}
+
 class XHttpPacketUpServerStream final : public AsyncStream {
 public:
     XHttpPacketUpServerStream(std::shared_ptr<XHttpPacketUpSession> session,
@@ -1660,6 +1786,415 @@ net::awaitable<void> SendWindowUpdate(AsyncStream& stream,
         end - start);
 }
 
+[[nodiscard]] std::optional<std::span<const uint8_t>> H2HeaderBlockPayload(
+    const H2Frame& frame) {
+    size_t start = 0;
+    size_t end = frame.payload.size();
+    if ((frame.flags & 0x8) != 0) {
+        if (frame.payload.empty()) {
+            return std::nullopt;
+        }
+        const size_t pad_len = frame.payload[0];
+        start = 1;
+        if (pad_len > end - start) {
+            return std::nullopt;
+        }
+        end -= pad_len;
+    }
+    if ((frame.flags & 0x20) != 0) {
+        if (end - start < 5) {
+            return std::nullopt;
+        }
+        start += 5;
+    }
+    return std::span<const uint8_t>(
+        frame.payload.data() + start,
+        end - start);
+}
+
+struct HpackHeaderField {
+    std::string name;
+    std::string value;
+};
+
+class HpackDecoder final {
+public:
+    std::optional<std::vector<HpackHeaderField>> Decode(
+        std::span<const uint8_t> block) {
+        std::vector<HpackHeaderField> fields;
+        size_t offset = 0;
+        while (offset < block.size()) {
+            const uint8_t first = block[offset];
+            if ((first & 0x80) != 0) {
+                auto index = ReadInteger(block, offset, 7);
+                if (!index || *index == 0) {
+                    return std::nullopt;
+                }
+                auto field = Indexed(*index);
+                if (!field) {
+                    return std::nullopt;
+                }
+                fields.push_back(std::move(*field));
+                continue;
+            }
+            if ((first & 0x40) != 0) {
+                auto field = ReadLiteral(block, offset, 6);
+                if (!field) {
+                    return std::nullopt;
+                }
+                AddDynamic(*field);
+                fields.push_back(std::move(*field));
+                continue;
+            }
+            if ((first & 0x20) != 0) {
+                auto size = ReadInteger(block, offset, 5);
+                if (!size) {
+                    return std::nullopt;
+                }
+                ResizeDynamic(*size);
+                continue;
+            }
+            auto field = ReadLiteral(block, offset, 4);
+            if (!field) {
+                return std::nullopt;
+            }
+            fields.push_back(std::move(*field));
+        }
+        return fields;
+    }
+
+private:
+    struct StaticField {
+        std::string_view name;
+        std::string_view value;
+    };
+
+    static constexpr std::array<StaticField, 61> kStaticTable{{
+        {":authority", ""},
+        {":method", "GET"},
+        {":method", "POST"},
+        {":path", "/"},
+        {":path", "/index.html"},
+        {":scheme", "http"},
+        {":scheme", "https"},
+        {":status", "200"},
+        {":status", "204"},
+        {":status", "206"},
+        {":status", "304"},
+        {":status", "400"},
+        {":status", "404"},
+        {":status", "500"},
+        {"accept-charset", ""},
+        {"accept-encoding", "gzip, deflate"},
+        {"accept-language", ""},
+        {"accept-ranges", ""},
+        {"accept", ""},
+        {"access-control-allow-origin", ""},
+        {"age", ""},
+        {"allow", ""},
+        {"authorization", ""},
+        {"cache-control", ""},
+        {"content-disposition", ""},
+        {"content-encoding", ""},
+        {"content-language", ""},
+        {"content-length", ""},
+        {"content-location", ""},
+        {"content-range", ""},
+        {"content-type", ""},
+        {"cookie", ""},
+        {"date", ""},
+        {"etag", ""},
+        {"expect", ""},
+        {"expires", ""},
+        {"from", ""},
+        {"host", ""},
+        {"if-match", ""},
+        {"if-modified-since", ""},
+        {"if-none-match", ""},
+        {"if-range", ""},
+        {"if-unmodified-since", ""},
+        {"last-modified", ""},
+        {"link", ""},
+        {"location", ""},
+        {"max-forwards", ""},
+        {"proxy-authenticate", ""},
+        {"proxy-authorization", ""},
+        {"range", ""},
+        {"referer", ""},
+        {"refresh", ""},
+        {"retry-after", ""},
+        {"server", ""},
+        {"set-cookie", ""},
+        {"strict-transport-security", ""},
+        {"transfer-encoding", ""},
+        {"user-agent", ""},
+        {"vary", ""},
+        {"via", ""},
+        {"www-authenticate", ""},
+    }};
+
+    static constexpr std::array<uint32_t, 256> kHpackHuffmanCodes{{
+        0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7,
+        0xfffffe8, 0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec,
+        0xfffffed, 0xfffffee, 0xfffffef, 0xffffff0, 0xffffff1, 0xffffff2, 0x3ffffffe, 0xffffff3,
+        0xffffff4, 0xffffff5, 0xffffff6, 0xffffff7, 0xffffff8, 0xffffff9, 0xffffffa, 0xffffffb,
+        0x14, 0x3f8, 0x3f9, 0xffa, 0x1ff9, 0x15, 0xf8, 0x7fa,
+        0x3fa, 0x3fb, 0xf9, 0x7fb, 0xfa, 0x16, 0x17, 0x18,
+        0x0, 0x1, 0x2, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x5c, 0xfb, 0x7ffc, 0x20, 0xffb, 0x3fc,
+        0x1ffa, 0x21, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62,
+        0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
+        0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
+        0xfc, 0x73, 0xfd, 0x1ffb, 0x7fff0, 0x1ffc, 0x3ffc, 0x22,
+        0x7ffd, 0x3, 0x23, 0x4, 0x24, 0x5, 0x25, 0x26,
+        0x27, 0x6, 0x74, 0x75, 0x28, 0x29, 0x2a, 0x7,
+        0x2b, 0x76, 0x2c, 0x8, 0x9, 0x2d, 0x77, 0x78,
+        0x79, 0x7a, 0x7b, 0x7ffe, 0x7fc, 0x3ffd, 0x1ffd, 0xffffffc,
+        0xfffe6, 0x3fffd2, 0xfffe7, 0xfffe8, 0x3fffd3, 0x3fffd4, 0x3fffd5, 0x7fffd9,
+        0x3fffd6, 0x7fffda, 0x7fffdb, 0x7fffdc, 0x7fffdd, 0x7fffde, 0xffffeb, 0x7fffdf,
+        0xffffec, 0xffffed, 0x3fffd7, 0x7fffe0, 0xffffee, 0x7fffe1, 0x7fffe2, 0x7fffe3,
+        0x7fffe4, 0x1fffdc, 0x3fffd8, 0x7fffe5, 0x3fffd9, 0x7fffe6, 0x7fffe7, 0xffffef,
+        0x3fffda, 0x1fffdd, 0xfffe9, 0x3fffdb, 0x3fffdc, 0x7fffe8, 0x7fffe9, 0x1fffde,
+        0x7fffea, 0x3fffdd, 0x3fffde, 0xfffff0, 0x1fffdf, 0x3fffdf, 0x7fffeb, 0x7fffec,
+        0x1fffe0, 0x1fffe1, 0x3fffe0, 0x1fffe2, 0x7fffed, 0x3fffe1, 0x7fffee, 0x7fffef,
+        0xfffea, 0x3fffe2, 0x3fffe3, 0x3fffe4, 0x7ffff0, 0x3fffe5, 0x3fffe6, 0x7ffff1,
+        0x3ffffe0, 0x3ffffe1, 0xfffeb, 0x7fff1, 0x3fffe7, 0x7ffff2, 0x3fffe8, 0x1ffffec,
+        0x3ffffe2, 0x3ffffe3, 0x3ffffe4, 0x7ffffde, 0x7ffffdf, 0x3ffffe5, 0xfffff1, 0x1ffffed,
+        0x7fff2, 0x1fffe3, 0x3ffffe6, 0x7ffffe0, 0x7ffffe1, 0x3ffffe7, 0x7ffffe2, 0xfffff2,
+        0x1fffe4, 0x1fffe5, 0x3ffffe8, 0x3ffffe9, 0xffffffd, 0x7ffffe3, 0x7ffffe4, 0x7ffffe5,
+        0xfffec, 0xfffff3, 0xfffed, 0x1fffe6, 0x3fffe9, 0x1fffe7, 0x1fffe8, 0x7ffff3,
+        0x3fffea, 0x3fffeb, 0x1ffffee, 0x1ffffef, 0xfffff4, 0xfffff5, 0x3ffffea, 0x7ffff4,
+        0x3ffffeb, 0x7ffffe6, 0x3ffffec, 0x3ffffed, 0x7ffffe7, 0x7ffffe8, 0x7ffffe9, 0x7ffffea,
+        0x7ffffeb, 0xffffffe, 0x7ffffec, 0x7ffffed, 0x7ffffee, 0x7ffffef, 0x7fffff0, 0x3ffffee,
+    }};
+
+    static constexpr std::array<uint8_t, 256> kHpackHuffmanCodeLen{{
+        13, 23, 28, 28, 28, 28, 28, 28,
+        28, 24, 30, 28, 28, 30, 28, 28,
+        28, 28, 28, 28, 28, 28, 30, 28,
+        28, 28, 28, 28, 28, 28, 28, 28,
+        6, 10, 10, 12, 13, 6, 8, 11,
+        10, 10, 8, 11, 8, 6, 6, 6,
+        5, 5, 5, 6, 6, 6, 6, 6,
+        6, 6, 7, 8, 15, 6, 12, 10,
+        13, 6, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7,
+        8, 7, 8, 13, 19, 13, 14, 6,
+        15, 5, 6, 5, 6, 5, 6, 6,
+        6, 5, 7, 7, 6, 6, 6, 5,
+        6, 7, 6, 5, 5, 6, 7, 7,
+        7, 7, 7, 15, 11, 14, 13, 28,
+        20, 22, 20, 20, 22, 22, 22, 23,
+        22, 23, 23, 23, 23, 23, 24, 23,
+        24, 24, 22, 23, 24, 23, 23, 23,
+        23, 21, 22, 23, 22, 23, 23, 24,
+        22, 21, 20, 22, 22, 23, 23, 21,
+        23, 22, 22, 24, 21, 22, 23, 23,
+        21, 21, 22, 21, 23, 22, 23, 23,
+        20, 22, 22, 22, 23, 22, 22, 23,
+        26, 26, 20, 19, 22, 23, 22, 25,
+        26, 26, 26, 27, 27, 26, 24, 25,
+        19, 21, 26, 27, 27, 26, 27, 24,
+        21, 21, 26, 26, 28, 27, 27, 27,
+        20, 24, 20, 21, 22, 21, 21, 23,
+        22, 22, 25, 25, 24, 24, 26, 23,
+        26, 27, 26, 26, 27, 27, 27, 27,
+        27, 28, 27, 27, 27, 27, 27, 26,
+    }};
+
+    static std::optional<uint32_t> ReadInteger(std::span<const uint8_t> block,
+                                               size_t& offset,
+                                               uint8_t prefix_bits) {
+        if (offset >= block.size() || prefix_bits == 0 || prefix_bits > 8) {
+            return std::nullopt;
+        }
+        const uint8_t mask = static_cast<uint8_t>((1u << prefix_bits) - 1u);
+        uint32_t value = block[offset++] & mask;
+        if (value < mask) {
+            return value;
+        }
+        uint32_t shift = 0;
+        while (offset < block.size() && shift <= 28) {
+            const uint8_t byte = block[offset++];
+            const uint32_t add = static_cast<uint32_t>(byte & 0x7f) << shift;
+            if (value > std::numeric_limits<uint32_t>::max() - add) {
+                return std::nullopt;
+            }
+            value += add;
+            if ((byte & 0x80) == 0) {
+                return value;
+            }
+            shift += 7;
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::string> DecodeHuffman(std::span<const uint8_t> data) {
+        std::string out;
+        out.reserve(data.size());
+        uint32_t code = 0;
+        uint8_t bits = 0;
+        for (uint8_t byte : data) {
+            for (int bit = 7; bit >= 0; --bit) {
+                code = (code << 1) | ((byte >> bit) & 0x1u);
+                ++bits;
+                bool matched = false;
+                for (size_t sym = 0; sym < kHpackHuffmanCodes.size(); ++sym) {
+                    if (kHpackHuffmanCodeLen[sym] == bits &&
+                        kHpackHuffmanCodes[sym] == code) {
+                        out.push_back(static_cast<char>(sym));
+                        code = 0;
+                        bits = 0;
+                        matched = true;
+                        break;
+                    }
+                }
+                (void)matched;
+            }
+        }
+        if (bits > 7) {
+            return std::nullopt;
+        }
+        if (bits > 0 && code != ((1u << bits) - 1u)) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    static std::optional<std::string> ReadString(std::span<const uint8_t> block,
+                                                 size_t& offset) {
+        if (offset >= block.size()) {
+            return std::nullopt;
+        }
+        const bool huffman = (block[offset] & 0x80) != 0;
+        auto len = ReadInteger(block, offset, 7);
+        if (!len || *len > block.size() - offset) {
+            return std::nullopt;
+        }
+        std::span<const uint8_t> encoded(block.data() + offset, *len);
+        offset += *len;
+        if (huffman) {
+            return DecodeHuffman(encoded);
+        }
+        std::string value(unsafe::ptr_cast<const char>(encoded.data()), encoded.size());
+        return value;
+    }
+
+    std::optional<HpackHeaderField> Indexed(uint32_t index) const {
+        if (index == 0) {
+            return std::nullopt;
+        }
+        if (index <= kStaticTable.size()) {
+            const auto& field = kStaticTable[index - 1];
+            return HpackHeaderField{
+                std::string(field.name),
+                std::string(field.value),
+            };
+        }
+        const uint32_t dynamic_index =
+            index - static_cast<uint32_t>(kStaticTable.size()) - 1;
+        if (dynamic_index >= dynamic_table_.size()) {
+            return std::nullopt;
+        }
+        return dynamic_table_[dynamic_index];
+    }
+
+    std::optional<std::string> IndexedName(uint32_t index) const {
+        auto field = Indexed(index);
+        if (!field) {
+            return std::nullopt;
+        }
+        return std::move(field->name);
+    }
+
+    std::optional<HpackHeaderField> ReadLiteral(std::span<const uint8_t> block,
+                                                size_t& offset,
+                                                uint8_t prefix_bits) const {
+        auto name_index = ReadInteger(block, offset, prefix_bits);
+        if (!name_index) {
+            return std::nullopt;
+        }
+        std::string name;
+        if (*name_index == 0) {
+            auto decoded = ReadString(block, offset);
+            if (!decoded) {
+                return std::nullopt;
+            }
+            name = std::move(*decoded);
+        } else {
+            auto decoded = IndexedName(*name_index);
+            if (!decoded) {
+                return std::nullopt;
+            }
+            name = std::move(*decoded);
+        }
+        auto value = ReadString(block, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        return HpackHeaderField{std::move(name), std::move(*value)};
+    }
+
+    void AddDynamic(const HpackHeaderField& field) {
+        const size_t entry_size = field.name.size() + field.value.size() + 32;
+        if (entry_size > dynamic_max_size_) {
+            dynamic_table_.clear();
+            dynamic_size_ = 0;
+            return;
+        }
+        dynamic_table_.insert(dynamic_table_.begin(), field);
+        dynamic_size_ += entry_size;
+        EvictDynamic();
+    }
+
+    void ResizeDynamic(uint32_t size) {
+        dynamic_max_size_ = size;
+        EvictDynamic();
+    }
+
+    void EvictDynamic() {
+        while (dynamic_size_ > dynamic_max_size_ && !dynamic_table_.empty()) {
+            const auto& field = dynamic_table_.back();
+            dynamic_size_ -= field.name.size() + field.value.size() + 32;
+            dynamic_table_.pop_back();
+        }
+    }
+
+    std::vector<HpackHeaderField> dynamic_table_;
+    size_t dynamic_size_ = 0;
+    size_t dynamic_max_size_ = 4096;
+};
+
+struct H2RequestHeaders {
+    std::string method;
+    std::string path;
+    std::string authority;
+};
+
+[[nodiscard]] std::optional<H2RequestHeaders> DecodeH2RequestHeaders(
+    HpackDecoder& decoder,
+    std::span<const uint8_t> block) {
+    auto fields = decoder.Decode(block);
+    if (!fields) {
+        return std::nullopt;
+    }
+    H2RequestHeaders request;
+    for (const auto& field : *fields) {
+        if (field.name == ":method") {
+            request.method = field.value;
+        } else if (field.name == ":path") {
+            request.path = field.value;
+        } else if (field.name == ":authority" || field.name == "host") {
+            request.authority = field.value;
+        }
+    }
+    if (request.method.empty() || request.path.empty()) {
+        return std::nullopt;
+    }
+    return request;
+}
+
 class GrpcStream final : public AsyncStream {
 public:
     enum class Role {
@@ -2189,14 +2724,18 @@ public:
                       std::unique_ptr<AsyncStream> stream,
                       std::shared_ptr<InboundTransportStreamHandler> stream_handler,
                       H2PayloadCodec payload_codec,
-                      const transport::internet::HttpHeaders* response_headers,
-                      uint64_t conn_id)
+                      transport::internet::HttpHeaders response_headers,
+                      uint64_t conn_id,
+                      std::optional<HttpConfig> http_config = std::nullopt,
+                      std::optional<XHttpConfig> xhttp_config = std::nullopt)
         : io_context_(io_context)
         , stream_(std::move(stream))
         , stream_handler_(std::move(stream_handler))
         , write_signal_(io_context, 1)
         , payload_codec_(payload_codec)
-        , response_headers_(response_headers)
+        , response_headers_(std::move(response_headers))
+        , http_config_(std::move(http_config))
+        , xhttp_config_(std::move(xhttp_config))
         , conn_id_(conn_id) {}
 
     ~GrpcServerSession() noexcept {
@@ -2365,6 +2904,17 @@ public:
         co_return co_await WriteRawDataSerialized(stream_id, {}, true);
     }
 
+    net::awaitable<bool> WriteHttpResponseHeadersSerialized(
+        uint32_t stream_id,
+        bool end_stream = false) {
+        auto response_headers = EncodeHttpResponseHeaders(response_headers_);
+        co_return co_await WriteFrameSerialized(
+            H2FrameType::HEADERS,
+            static_cast<uint8_t>(0x4 | (end_stream ? 0x1 : 0)),
+            stream_id,
+            response_headers);
+    }
+
     net::awaitable<bool> SendWindowUpdateSerialized(
         uint32_t stream_id,
         uint32_t increment) {
@@ -2378,6 +2928,10 @@ public:
             0,
             stream_id,
             payload);
+    }
+
+    net::awaitable<bool> HandleInitialHeadersFrame(H2Frame frame) {
+        co_return co_await HandleHeadersFrame(std::move(frame));
     }
 
     net::awaitable<void> RunReadLoop() {
@@ -2457,7 +3011,15 @@ private:
             co_return false;
         }
 
+        const uint8_t initial_flags = frame.flags;
         const uint32_t stream_id = frame.stream_id;
+        auto first_fragment = H2HeaderBlockPayload(frame);
+        if (!first_fragment) {
+            co_return false;
+        }
+        std::vector<uint8_t> header_block(
+            first_fragment->begin(),
+            first_fragment->end());
         while ((frame.flags & 0x4) == 0) {
             auto cont = co_await ReadH2Frame(*stream_);
             if (!cont ||
@@ -2465,23 +3027,40 @@ private:
                 cont->stream_id != stream_id) {
                 co_return false;
             }
+            header_block.insert(
+                header_block.end(),
+                cont->payload.begin(),
+                cont->payload.end());
             frame = std::move(*cont);
         }
 
-        auto sub = CreateStream(stream_id);
-        auto response_headers = payload_codec_ == H2PayloadCodec::RawData
-            ? EncodeHttpResponseHeaders(response_headers_ ? *response_headers_
-                                                          : transport::internet::HttpHeaders{})
-            : EncodeGrpcResponseHeaders();
-        if (!co_await WriteFrameSerialized(
-                H2FrameType::HEADERS,
-                0x4,
+        if (xhttp_config_ && http_config_ &&
+            payload_codec_ == H2PayloadCodec::RawData) {
+            co_return co_await HandleXHttpHeadersFrame(
                 stream_id,
-                response_headers)) {
-            co_return false;
+                initial_flags,
+                std::span<const uint8_t>(
+                    header_block.data(),
+                    header_block.size()));
         }
 
-        if ((frame.flags & 0x1) != 0 && sub) {
+        auto sub = CreateStream(stream_id);
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
+                co_return false;
+            }
+        } else {
+            auto response_headers = EncodeGrpcResponseHeaders();
+            if (!co_await WriteFrameSerialized(
+                    H2FrameType::HEADERS,
+                    0x4,
+                    stream_id,
+                    response_headers)) {
+                co_return false;
+            }
+        }
+
+        if ((initial_flags & 0x1) != 0 && sub) {
             sub->CloseInput();
         }
 
@@ -2499,6 +3078,192 @@ private:
             sub->CloseLocal();
         }
         co_return true;
+    }
+
+    net::awaitable<bool> HandleXHttpHeadersFrame(uint32_t stream_id,
+                                                 uint8_t initial_flags,
+                                                 std::span<const uint8_t> header_block) {
+        auto request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
+        if (!request) {
+            LOG_ACCESS_DEBUG("[XHTTP:{}] server: failed to decode H2 request headers stream_id={}",
+                             conn_id_,
+                             stream_id);
+            co_return false;
+        }
+        if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
+            !expected_host.empty() &&
+            !EqualsAsciiCI(TrimAscii(request->authority), expected_host)) {
+            LOG_ACCESS_DEBUG(
+                "[XHTTP:{}] server: H2 host mismatch expected='{}' actual='{}'",
+                conn_id_,
+                SanitizeForLog(expected_host),
+                SanitizeForLog(request->authority));
+            co_return false;
+        }
+
+        const auto meta = ParseXHttpRequestMeta(
+            http_config_->path,
+            request->path,
+            request->method);
+        if (meta.kind == XHttpRequestMeta::Kind::Unknown) {
+            LOG_ACCESS_DEBUG("[XHTTP:{}] server: unknown H2 request method='{}' path='{}'",
+                             conn_id_,
+                             SanitizeForLog(request->method),
+                             SanitizeForLog(request->path));
+            co_return false;
+        }
+
+        if (meta.kind == XHttpRequestMeta::Kind::StreamOne) {
+            if (!xhttp_config_->AcceptsStreamOne()) {
+                co_return false;
+            }
+            auto sub = CreateStream(stream_id);
+            if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
+                co_return false;
+            }
+            if ((initial_flags & 0x1) != 0 && sub) {
+                sub->CloseInput();
+            }
+            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 stream-one ready stream_id={}",
+                             conn_id_,
+                             stream_id);
+            auto handler = stream_handler_;
+            if (handler && sub) {
+                handler->OnInboundTransportStream(
+                    std::make_unique<GrpcServerSubStream>(std::move(sub)));
+            } else if (sub) {
+                sub->CloseLocal();
+            }
+            co_return true;
+        }
+
+        if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
+            if (!xhttp_config_->AcceptsPacketUp() &&
+                !xhttp_config_->AcceptsStreamUp()) {
+                co_return false;
+            }
+            auto xsession = GetXHttpPacketSession(
+                io_context_,
+                meta.session_id,
+                true);
+            if (!xsession) {
+                co_return false;
+            }
+            auto sub = CreateStream(stream_id);
+            if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
+                co_return false;
+            }
+            if ((initial_flags & 0x1) != 0 && sub) {
+                sub->CloseInput();
+            }
+            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 split downlink ready session={} stream_id={} mode={}",
+                             conn_id_,
+                             meta.session_id,
+                             stream_id,
+                             xhttp_config_->AcceptsStreamUp() ? "stream-up" : "packet-up");
+            auto handler = stream_handler_;
+            if (handler && sub) {
+                handler->OnInboundTransportStream(
+                    std::make_unique<XHttpPacketUpServerStream>(
+                        std::move(xsession),
+                        std::make_unique<GrpcServerSubStream>(std::move(sub))));
+            } else if (sub) {
+                sub->CloseLocal();
+            }
+            co_return true;
+        }
+
+        if (meta.kind == XHttpRequestMeta::Kind::StreamUp) {
+            if (!xhttp_config_->AcceptsStreamUp()) {
+                co_return false;
+            }
+            auto xsession = GetXHttpPacketSession(
+                io_context_,
+                meta.session_id,
+                true);
+            if (!xsession) {
+                co_return false;
+            }
+            auto sub = CreateStream(stream_id);
+            if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
+                co_return false;
+            }
+            if ((initial_flags & 0x1) != 0 && sub) {
+                sub->CloseInput();
+            }
+            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 stream-up upload ready session={} stream_id={}",
+                             conn_id_,
+                             meta.session_id,
+                             stream_id);
+            xsession->AttachStream(
+                std::make_unique<GrpcServerSubStream>(std::move(sub)));
+            co_return true;
+        }
+
+        if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
+            if (!xhttp_config_->AcceptsPacketUp()) {
+                co_return false;
+            }
+            auto xsession = GetXHttpPacketSession(
+                io_context_,
+                meta.session_id,
+                false);
+            if (!xsession) {
+                co_return false;
+            }
+            auto sub = CreateStream(stream_id);
+            if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
+                co_return false;
+            }
+            if ((initial_flags & 0x1) != 0 && sub) {
+                sub->CloseInput();
+            }
+            auto upload = std::make_unique<GrpcServerSubStream>(std::move(sub));
+            try {
+                net::co_spawn(
+                    io_context_.get_executor(),
+                    [stream = std::move(upload),
+                     xsession = std::move(xsession),
+                     seq = meta.seq,
+                     conn_id = conn_id_]() mutable -> net::awaitable<void> {
+                        std::vector<uint8_t> payload;
+                        std::array<uint8_t, 8192> scratch{};
+                        try {
+                            while (true) {
+                                const size_t n = co_await stream->AsyncRead(
+                                    net::buffer(scratch));
+                                if (n == 0) {
+                                    break;
+                                }
+                                payload.insert(
+                                    payload.end(),
+                                    scratch.data(),
+                                    scratch.data() + n);
+                            }
+                            xsession->Push(seq, std::move(payload));
+                        } catch (const std::exception& e) {
+                            LOG_ACCESS_DEBUG(
+                                "[XHTTP:{}] server: H2 packet-up read failed seq={} error={}",
+                                conn_id,
+                                seq,
+                                e.what());
+                        } catch (...) {
+                            LOG_ACCESS_DEBUG(
+                                "[XHTTP:{}] server: H2 packet-up read failed seq={} error=unknown",
+                                conn_id,
+                                seq);
+                        }
+                        stream->Close();
+                    },
+                    net::detached);
+            } catch (...) {
+                upload->CloseAbortive();
+                co_return false;
+            }
+            co_return true;
+        }
+
+        co_return false;
     }
 
     net::awaitable<void> HandleDataFrame(const H2Frame& frame) {
@@ -2541,7 +3306,10 @@ private:
     net::experimental::channel<void(IoErrorCode)> write_signal_;
     std::unordered_map<uint32_t, std::shared_ptr<GrpcServerSubStreamState>> streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
-    const transport::internet::HttpHeaders* response_headers_ = nullptr;
+    transport::internet::HttpHeaders response_headers_;
+    std::optional<HttpConfig> http_config_;
+    std::optional<XHttpConfig> xhttp_config_;
+    HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
     bool write_busy_ = false;
     bool cancelled_ = false;
@@ -3017,7 +3785,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
                 std::move(stream),
                 std::move(stream_handler),
                 H2PayloadCodec::GrpcHunk,
-                nullptr,
+                transport::internet::HttpHeaders{},
                 conn_id);
             auto sub = session->CreateStream(stream_id);
             auto response_headers = EncodeGrpcResponseHeaders();
@@ -3120,132 +3888,6 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         return actual.starts_with("/");
     }
     return actual.starts_with(expected);
-}
-
-[[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
-    if (!cfg.host.empty()) {
-        return cfg.host;
-    }
-    return FindConfiguredHost(cfg.headers);
-}
-
-struct XHttpRequestMeta {
-    enum class Kind {
-        Unknown,
-        StreamOne,
-        PacketDown,
-        PacketUp,
-        StreamUp,
-    };
-
-    Kind kind = Kind::Unknown;
-    std::string session_id;
-    uint64_t seq = 0;
-};
-
-[[nodiscard]] std::optional<uint64_t> ParseU64Decimal(std::string_view value) {
-    if (value.empty()) {
-        return std::nullopt;
-    }
-    uint64_t out = 0;
-    for (char ch : value) {
-        if (ch < '0' || ch > '9') {
-            return std::nullopt;
-        }
-        const uint64_t digit = static_cast<uint64_t>(ch - '0');
-        if (out > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
-            return std::nullopt;
-        }
-        out = out * 10 + digit;
-    }
-    return out;
-}
-
-[[nodiscard]] std::optional<size_t> ParseContentLength(std::string_view value) {
-    value = TrimAscii(value);
-    if (value.empty()) {
-        return std::nullopt;
-    }
-    uint64_t out = 0;
-    for (char ch : value) {
-        if (ch < '0' || ch > '9') {
-            return std::nullopt;
-        }
-        const uint64_t digit = static_cast<uint64_t>(ch - '0');
-        if (out > (std::numeric_limits<size_t>::max() - digit) / 10) {
-            return std::nullopt;
-        }
-        out = out * 10 + digit;
-    }
-    return static_cast<size_t>(out);
-}
-
-[[nodiscard]] XHttpRequestMeta ParseXHttpRequestMeta(std::string_view base_path,
-                                                     std::string_view request_path,
-                                                     std::string_view method) {
-    XHttpRequestMeta meta;
-    const std::string_view actual = PathWithoutQuery(request_path);
-    const std::string_view expected = EffectivePath(base_path);
-    if (actual == expected) {
-        if (EqualsAsciiCI(method, "POST")) {
-            meta.kind = XHttpRequestMeta::Kind::StreamOne;
-        }
-        return meta;
-    }
-    if (!actual.starts_with(expected)) {
-        return meta;
-    }
-
-    std::string_view rest = actual.substr(expected.size());
-    while (!rest.empty() && rest.front() == '/') {
-        rest.remove_prefix(1);
-    }
-    if (rest.empty()) {
-        return meta;
-    }
-
-    const size_t slash = rest.find('/');
-    if (slash == std::string_view::npos) {
-        meta.session_id.assign(rest.data(), rest.size());
-        meta.kind = EqualsAsciiCI(method, "GET")
-            ? XHttpRequestMeta::Kind::PacketDown
-            : XHttpRequestMeta::Kind::StreamUp;
-        return meta;
-    }
-
-    const std::string_view session = rest.substr(0, slash);
-    const std::string_view seq = rest.substr(slash + 1);
-    if (session.empty()) {
-        return meta;
-    }
-    auto parsed_seq = ParseU64Decimal(seq);
-    if (!parsed_seq) {
-        return meta;
-    }
-    meta.session_id.assign(session.data(), session.size());
-    meta.seq = *parsed_seq;
-    meta.kind = XHttpRequestMeta::Kind::PacketUp;
-    return meta;
-}
-
-[[nodiscard]] std::shared_ptr<XHttpPacketUpSession> GetXHttpPacketSession(
-    net::io_context& io_context,
-    std::string_view session_id,
-    bool create) {
-    thread_local std::unordered_map<std::string, std::weak_ptr<XHttpPacketUpSession>> sessions;
-    auto it = sessions.find(std::string(session_id));
-    if (it != sessions.end()) {
-        if (auto session = it->second.lock()) {
-            return session;
-        }
-        sessions.erase(it);
-    }
-    if (!create) {
-        return nullptr;
-    }
-    auto session = std::make_shared<XHttpPacketUpSession>(io_context);
-    sessions.emplace(std::string(session_id), session);
-    return session;
 }
 
 [[nodiscard]] std::string BuildXHttpResponseHeaders(const HttpConfig& cfg,
@@ -3388,7 +4030,8 @@ net::awaitable<TransportBuildResult> DoHttp2ServerHandshakeAfterPreface(
     const HttpConfig& cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id) {
+    uint64_t conn_id,
+    const XHttpConfig* xhttp_config = nullptr) {
     auto settings = EncodeSettingsPayload(HttpInitialWindow(cfg));
     if (!co_await WriteH2Frame(
             *stream,
@@ -3418,50 +4061,25 @@ net::awaitable<TransportBuildResult> DoHttp2ServerHandshakeAfterPreface(
             if (frame->stream_id == 0) {
                 co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
-            uint32_t stream_id = frame->stream_id;
-            while ((frame->flags & 0x4) == 0) {
-                auto cont = co_await ReadH2Frame(*stream);
-                if (!cont ||
-                    cont->type != H2FrameType::CONTINUATION ||
-                    cont->stream_id != stream_id) {
-                    co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                frame = std::move(cont);
-            }
-
             auto session = std::make_shared<GrpcServerSession>(
                 io_context,
                 std::move(stream),
                 std::move(stream_handler),
                 H2PayloadCodec::RawData,
-                &cfg.headers,
-                conn_id);
-            auto sub = session->CreateStream(stream_id);
-            auto response_headers = EncodeHttpResponseHeaders(cfg.headers);
-            if (!co_await session->WriteFrameSerialized(
-                    H2FrameType::HEADERS,
-                    0x4,
-                    stream_id,
-                    response_headers)) {
-                co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            if ((frame->flags & 0x1) != 0 && sub) {
-                sub->CloseInput();
-            }
-
-            LOG_ACCESS_DEBUG(
-                "[HTTP/2:{}] server: handshake ok stream_id={} path={}",
+                cfg.headers,
                 conn_id,
-                stream_id,
-                EffectivePath(cfg.path));
+                cfg,
+                xhttp_config ? std::optional<XHttpConfig>(*xhttp_config) : std::nullopt);
+            if (!co_await session->HandleInitialHeadersFrame(std::move(*frame))) {
+                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
             net::co_spawn(
                 io_context.get_executor(),
                 [session]() -> net::awaitable<void> {
                     co_await session->RunReadLoop();
                 },
                 net::detached);
-            co_return std::unique_ptr<AsyncStream>(
-                std::make_unique<GrpcServerSubStream>(std::move(sub)));
+            co_return std::unique_ptr<AsyncStream>{};
         }
         default:
             break;
@@ -3843,7 +4461,8 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             cfg,
             io_context,
             std::move(stream_handler),
-            conn_id);
+            conn_id,
+            xhttp_config);
     }
 
     if (require_http2) {
