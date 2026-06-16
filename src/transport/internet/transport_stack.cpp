@@ -4315,6 +4315,20 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     return true;
 }
 
+[[nodiscard]] bool ShouldUseHttp2ForHttp(const StreamSettings& s) {
+    if (s.http.force_http2) {
+        return true;
+    }
+    if (!s.IsTls()) {
+        return false;
+    }
+    if (s.tls.alpn.size() == 1 &&
+        EqualsAsciiCI(s.tls.alpn.front(), "http/1.1")) {
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] bool IsHopByHopBodyHeader(std::string_view key) {
     return IsHostHeader(key) ||
            EqualsAsciiCI(key, "Content-Length") ||
@@ -5843,7 +5857,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         if (host.empty()) {
             host = "www.example.com";
         }
-        if (s.http.force_http2 || s.IsTls()) {
+        if (ShouldUseHttp2ForHttp(s)) {
             auto http2_result = co_await DoHttp2ClientHandshake(
                 std::move(stream),
                 s.http,

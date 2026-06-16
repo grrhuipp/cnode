@@ -611,13 +611,16 @@ void StreamSettings::RecomputeModes() noexcept {
         flags |= kFlagReality;
     }
 
+    const bool http_should_default_h2 =
+        network_mode == NetworkMode::Http &&
+        (http.force_http2 ||
+         (security_mode == SecurityMode::Tls && tls.alpn.empty()));
     const bool xhttp_should_default_h2 =
         network_mode == NetworkMode::XHttp &&
         (xhttp.AcceptsStreamOne() || security_mode == SecurityMode::Tls) &&
         tls.alpn.empty();
     if (network_mode == NetworkMode::Grpc ||
-        (network_mode == NetworkMode::Http &&
-         (http.force_http2 || security_mode == SecurityMode::Tls)) ||
+        http_should_default_h2 ||
         xhttp_should_default_h2) {
         auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
         if (!has_h2) {

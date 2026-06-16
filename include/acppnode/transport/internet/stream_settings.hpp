@@ -86,7 +86,7 @@ struct HttpConfig {
     std::string real_ip_header;
 
     // network == "h2" 时强制使用 HTTP/2；network == "http" 时按生态习惯：
-    // TLS 使用 HTTP/2，明文使用 HTTP/1.1。
+    // TLS 默认 HTTP/2，显式 ALPN=http/1.1 时使用 HTTP/1.1，明文使用 HTTP/1.1。
     bool force_http2 = false;
 
     int initial_window_size = 0;
