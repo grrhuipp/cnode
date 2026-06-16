@@ -2,6 +2,8 @@
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
+#include "../vless_encryption_io.hpp"
+#include "../vless_encryption_runtime.hpp"
 #include "../vless_io_util.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -26,6 +28,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -808,27 +811,31 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
         config_.uuid_bytes = *uuid_bytes;
         const bool flow_ok =
             config_.flow.empty() || ::acpp::vless::IsVisionFlow(config_.flow);
-        config_valid_ =
-            flow_ok &&
-            ::acpp::vless::IsNoVlessEncryption(config_.encryption);
-    }
-    if (!config_valid_) {
+        bool encryption_ok = true;
         if (!::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
             auto parsed = ::acpp::vless::ParseVlessClientEncryption(
                 config_.encryption);
             if (parsed) {
-                LOG_ERROR("VLESS outbound '{}': encryption '{}' is valid VLESS Encryption syntax but runtime support is not implemented yet",
-                          config_.tag,
-                          config_.encryption);
+                encryption_ =
+                    std::make_shared<::acpp::vless::VlessEncryptionConfig>(
+                        std::move(*parsed.config));
             } else {
+                encryption_ok = false;
                 LOG_ERROR("VLESS outbound '{}': invalid encryption '{}': {}",
                           config_.tag,
                           config_.encryption,
                           ::acpp::vless::VlessEncryptionParseErrorMessage(
                               parsed.error));
             }
-        } else {
+        }
+        config_valid_ = flow_ok && encryption_ok;
+    }
+    if (!config_valid_) {
+        if (::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
             LOG_ERROR("VLESS outbound '{}': invalid UUID or unsupported flow '{}'",
+                      config_.tag, config_.flow);
+        } else {
+            LOG_ERROR("VLESS outbound '{}': invalid UUID, unsupported flow '{}', or invalid encryption",
                       config_.tag, config_.flow);
         }
     }
@@ -941,10 +948,47 @@ proxy::vless::outbound::Handler::Process(
 
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter* protocol_writer = stream.get();
+    VlessBufferedReader* active_reader = &protocol_reader;
+    transport::MultiBufferWriter* active_writer = protocol_writer;
+    std::optional<::acpp::vless::VlessEncryptionReader> encrypted_reader;
+    std::optional<::acpp::vless::VlessEncryptionWriter> encrypted_writer;
+    std::optional<VlessBufferedReader> encrypted_plain_reader;
+
+    if (encryption_) {
+        try {
+            auto runtime =
+                co_await ::acpp::vless::RunVlessEncryptionClient1RttHandshake(
+                    protocol_reader,
+                    *protocol_writer,
+                    *encryption_);
+            if (!runtime) {
+                co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            encrypted_reader.emplace(
+                protocol_reader,
+                std::move(runtime->read_aead),
+                runtime->united_key,
+                std::move(runtime->read_xor));
+            encrypted_writer.emplace(
+                *protocol_writer,
+                std::move(runtime->write_aead),
+                std::move(runtime->united_key),
+                std::move(runtime->write_xor));
+            encrypted_plain_reader.emplace(*encrypted_reader);
+            active_reader = std::addressof(*encrypted_plain_reader);
+            active_writer = std::addressof(*encrypted_writer);
+        } catch (const IoSystemError&) {
+            co_return fail_abortive(outbound_protocol_deadline.Expired()
+                ? ErrorCode::TIMEOUT
+                : ErrorCode::SOCKET_READ_FAILED);
+        } catch (...) {
+            co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+    }
 
     try {
         co_await WriteVlessBytes(
-            *protocol_writer,
+            *active_writer,
             std::span<const uint8_t>(header.data(), header_len));
     } catch (...) {
         co_return fail_abortive(outbound_protocol_deadline.Expired()
@@ -960,8 +1004,8 @@ proxy::vless::outbound::Handler::Process(
     if (use_xudp) {
         VlessMuxUdpEndpoint target_endpoint(
             *stream,
-            protocol_reader,
-            *protocol_writer,
+            *active_reader,
+            *active_writer,
             target);
         if (buf::TotalLen(first_payload) > 0) {
             if (inbound.control) {
@@ -995,8 +1039,8 @@ proxy::vless::outbound::Handler::Process(
 
     VlessOutboundEndpoint target_endpoint(
         *stream,
-        protocol_reader,
-        *protocol_writer,
+        *active_reader,
+        *active_writer,
         is_udp,
         target,
         use_packet_addr,
@@ -1139,10 +1183,6 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                              parsed.error));
                 return std::nullopt;
             }
-            LOG_WARN("VLESS outbound '{}': encryption '{}' is valid VLESS Encryption syntax but runtime support is not implemented yet",
-                     cfg.tag,
-                     vless_config.encryption);
-            return std::nullopt;
         }
 
         packet_encoding = lower_ascii(std::move(packet_encoding));

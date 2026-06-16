@@ -21,6 +21,7 @@ struct BuildRequest {
     std::string cipher_method;  // SS uses this; other protocols may ignore it.
     std::string ss_identity_password;
     std::string anytls_padding_scheme;
+    std::string vless_decryption;
 };
 
 struct RuntimeUser {

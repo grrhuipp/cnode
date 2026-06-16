@@ -67,6 +67,7 @@ struct VlessEncryptionServerPfsResponse {
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize> encrypted_ticket{};
     std::vector<uint8_t> pfs_key;
     std::vector<uint8_t> united_key;
+    VlessEncryptionAead write_aead;
     uint16_t ticket_seconds = 0;
 };
 
@@ -76,6 +77,7 @@ struct VlessEncryptionClientPfsOpenResult {
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::vector<uint8_t> pfs_key;
     std::vector<uint8_t> united_key;
+    VlessEncryptionAead read_aead;
     uint16_t ticket_seconds = 0;
 };
 
@@ -121,17 +123,14 @@ OpenVlessEncryptionClientNfsHello(
 
 [[nodiscard]] std::optional<VlessEncryptionClientPfsHello>
 BuildVlessEncryptionClientPfsHello(
-    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
-    std::span<const uint8_t> nfs_key,
-    VlessEncryptionAeadCipher cipher) noexcept;
+    VlessEncryptionAead& nfs_aead) noexcept;
 
 [[nodiscard]] std::optional<
     std::array<uint8_t, kVlessEncryptionClientPfsPublicSize>>
 OpenVlessEncryptionClientPfsHello(
-    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
-    std::span<const uint8_t> nfs_key,
-    std::span<const uint8_t, kVlessEncryptionClientPfsHelloSize> encrypted,
-    VlessEncryptionAeadCipher cipher) noexcept;
+    VlessEncryptionAead& nfs_aead,
+    std::span<const uint8_t, kVlessEncryptionClientPfsHelloSize>
+        encrypted) noexcept;
 
 [[nodiscard]] std::optional<VlessEncryptionServerPfsResponse>
 BuildVlessEncryptionServerPfsResponse(

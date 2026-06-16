@@ -1,7 +1,6 @@
 #include "vless_encryption_io.hpp"
 
 #include "acppnode/common/error.hpp"
-#include "acppnode/transport/async_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,39 +11,6 @@ namespace {
 
 [[noreturn]] void ThrowVlessEncryptionIoError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
-}
-
-net::awaitable<bool> ReadFullFromStream(AsyncStream& stream,
-                                        uint8_t* data,
-                                        size_t len,
-                                        bool eof_ok_at_start) {
-    size_t done = 0;
-    while (done < len) {
-        const size_t n = co_await stream.AsyncRead(
-            net::buffer(data + done, len - done));
-        if (n == 0) {
-            if (done == 0 && eof_ok_at_start) {
-                co_return false;
-            }
-            ThrowVlessEncryptionIoError("VLESS Encryption record truncated");
-        }
-        done += n;
-    }
-    co_return true;
-}
-
-net::awaitable<void> WriteFullToStream(AsyncStream& stream,
-                                       const uint8_t* data,
-                                       size_t len) {
-    size_t done = 0;
-    while (done < len) {
-        const size_t n = co_await stream.AsyncWrite(
-            net::buffer(data + done, len - done));
-        if (n == 0) {
-            ThrowVlessEncryptionIoError("VLESS Encryption record write stalled");
-        }
-        done += n;
-    }
 }
 
 void AppendBytesToMultiBuffer(buf::MultiBuffer& out,
@@ -76,7 +42,7 @@ void AppendBytesToMultiBuffer(buf::MultiBuffer& out,
 }  // namespace
 
 std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
-    AsyncStream& src,
+    transport::MultiBufferReader& src,
     std::span<const uint8_t> read_context,
     std::span<const uint8_t> united_key,
     VlessEncryptionAeadCipher cipher,
@@ -93,7 +59,7 @@ std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
 }
 
 VlessEncryptionReader::VlessEncryptionReader(
-    AsyncStream& src,
+    transport::MultiBufferReader& src,
     VlessEncryptionAead aead,
     std::vector<uint8_t> united_key,
     std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
@@ -104,8 +70,7 @@ VlessEncryptionReader::VlessEncryptionReader(
 
 net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     std::array<uint8_t, kVlessEncryptionRecordHeaderSize> header{};
-    const bool have_header = co_await ReadFullFromStream(
-        src_,
+    const bool have_header = co_await src_.ReadExact(
         header.data(),
         header.size(),
         true);
@@ -122,11 +87,9 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     }
 
     std::vector<uint8_t> encrypted(*encrypted_len);
-    co_await ReadFullFromStream(
-        src_,
-        encrypted.data(),
-        encrypted.size(),
-        false);
+    if (!co_await src_.ReadExact(encrypted.data(), encrypted.size())) {
+        ThrowVlessEncryptionIoError("VLESS Encryption record truncated");
+    }
     if (header_xor_ && !header_xor_->XorInboundInPlace(encrypted)) {
         ThrowVlessEncryptionIoError("VLESS Encryption body xor state failed");
     }
@@ -169,7 +132,7 @@ bool VlessEncryptionReader::Rekey(
 }
 
 std::optional<VlessEncryptionWriter> VlessEncryptionWriter::Create(
-    AsyncStream& dst,
+    transport::MultiBufferWriter& dst,
     std::span<const uint8_t> write_context,
     std::span<const uint8_t> united_key,
     VlessEncryptionAeadCipher cipher,
@@ -186,7 +149,7 @@ std::optional<VlessEncryptionWriter> VlessEncryptionWriter::Create(
 }
 
 VlessEncryptionWriter::VlessEncryptionWriter(
-    AsyncStream& dst,
+    transport::MultiBufferWriter& dst,
     VlessEncryptionAead aead,
     std::vector<uint8_t> united_key,
     std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
@@ -231,7 +194,9 @@ net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
                 ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
             }
 
-            co_await WriteFullToStream(dst_, frame.data(), *written);
+            co_await WriteVlessBytes(
+                dst_,
+                std::span<const uint8_t>(frame.data(), *written));
             data = data.subspan(n);
         }
     }

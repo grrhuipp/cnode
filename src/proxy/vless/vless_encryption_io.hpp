@@ -6,29 +6,26 @@
 
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
+#include "vless_io_util.hpp"
 
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
-namespace acpp {
-class AsyncStream;
-}  // namespace acpp
-
 namespace acpp::vless {
 
 class VlessEncryptionReader final : public transport::MultiBufferReader {
 public:
     [[nodiscard]] static std::optional<VlessEncryptionReader> Create(
-        AsyncStream& src,
+        transport::MultiBufferReader& src,
         std::span<const uint8_t> read_context,
         std::span<const uint8_t> united_key,
         VlessEncryptionAeadCipher cipher,
         std::optional<VlessEncryptionHeaderXor> header_xor =
             std::nullopt) noexcept;
 
-    VlessEncryptionReader(AsyncStream& src,
+    VlessEncryptionReader(transport::MultiBufferReader& src,
                           VlessEncryptionAead aead,
                           std::vector<uint8_t> united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -39,7 +36,7 @@ public:
 private:
     [[nodiscard]] bool Rekey(std::span<const uint8_t> context) noexcept;
 
-    AsyncStream& src_;
+    VlessBufferedReader src_;
     VlessEncryptionAead aead_;
     std::vector<uint8_t> united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
@@ -48,14 +45,14 @@ private:
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
 public:
     [[nodiscard]] static std::optional<VlessEncryptionWriter> Create(
-        AsyncStream& dst,
+        transport::MultiBufferWriter& dst,
         std::span<const uint8_t> write_context,
         std::span<const uint8_t> united_key,
         VlessEncryptionAeadCipher cipher,
         std::optional<VlessEncryptionHeaderXor> header_xor =
             std::nullopt) noexcept;
 
-    VlessEncryptionWriter(AsyncStream& dst,
+    VlessEncryptionWriter(transport::MultiBufferWriter& dst,
                           VlessEncryptionAead aead,
                           std::vector<uint8_t> united_key,
                           std::optional<VlessEncryptionHeaderXor>
@@ -67,7 +64,7 @@ public:
 private:
     [[nodiscard]] bool Rekey(std::span<const uint8_t> context) noexcept;
 
-    AsyncStream& dst_;
+    transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
     std::vector<uint8_t> united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;

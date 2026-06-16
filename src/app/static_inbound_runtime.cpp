@@ -36,6 +36,7 @@ std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
     entry.build_request.cipher_method = source.static_users.method;
     entry.build_request.ss_identity_password = source.static_users.identity_password;
     entry.build_request.anytls_padding_scheme = source.static_users.padding_scheme;
+    entry.build_request.vless_decryption = source.static_users.vless_decryption;
 
     auto users = proxyman::inbound::BuildStaticUsers(
         entry.protocol,

@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,6 +18,10 @@ namespace acpp {
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
+
+namespace vless {
+struct VlessEncryptionConfig;
+}  // namespace vless
 
 struct VlessOutboundConfig {
     std::string tag;
@@ -62,6 +67,7 @@ public:
 private:
     ::acpp::VlessOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
+    std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> encryption_;
     bool config_valid_ = false;
 };
 

@@ -391,14 +391,7 @@ OpenVlessEncryptionClientNfsHello(
 
 std::optional<VlessEncryptionClientPfsHello>
 BuildVlessEncryptionClientPfsHello(
-    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
-    std::span<const uint8_t> nfs_key,
-    VlessEncryptionAeadCipher cipher) noexcept {
-    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
-    if (!nfs_aead) {
-        return std::nullopt;
-    }
-
+    VlessEncryptionAead& nfs_aead) noexcept {
     VlessEncryptionClientPfsHello hello;
     if (!RandomBytes(hello.mlkem_seed)) {
         return std::nullopt;
@@ -421,7 +414,7 @@ BuildVlessEncryptionClientPfsHello(
         kVlessEncryptionEncryptedClientPfsPublicSize);
     auto encrypted = std::span<uint8_t, kVlessEncryptionClientPfsHelloSize>(
         hello.encrypted);
-    auto sealed_len = nfs_aead->Seal(
+    auto sealed_len = nfs_aead.Seal(
         encrypted_len,
         {},
         encrypted.first(kVlessEncryptionEncryptedLengthSize));
@@ -429,7 +422,7 @@ BuildVlessEncryptionClientPfsHello(
         return std::nullopt;
     }
 
-    auto sealed_key = nfs_aead->Seal(
+    auto sealed_key = nfs_aead.Seal(
         hello.public_key,
         {},
         encrypted.subspan(kVlessEncryptionEncryptedLengthSize));
@@ -442,17 +435,11 @@ BuildVlessEncryptionClientPfsHello(
 
 std::optional<std::array<uint8_t, kVlessEncryptionClientPfsPublicSize>>
 OpenVlessEncryptionClientPfsHello(
-    std::span<const uint8_t, kVlessEncryptionIvSize> iv,
-    std::span<const uint8_t> nfs_key,
-    std::span<const uint8_t, kVlessEncryptionClientPfsHelloSize> encrypted,
-    VlessEncryptionAeadCipher cipher) noexcept {
-    auto nfs_aead = VlessEncryptionAead::Create(iv, nfs_key, cipher);
-    if (!nfs_aead) {
-        return std::nullopt;
-    }
-
+    VlessEncryptionAead& nfs_aead,
+    std::span<const uint8_t, kVlessEncryptionClientPfsHelloSize>
+        encrypted) noexcept {
     std::array<uint8_t, kVlessEncryptionLengthSize> length_plain{};
-    auto opened_len = nfs_aead->Open(
+    auto opened_len = nfs_aead.Open(
         encrypted.first(kVlessEncryptionEncryptedLengthSize),
         {},
         length_plain);
@@ -467,7 +454,7 @@ OpenVlessEncryptionClientPfsHello(
     }
 
     std::array<uint8_t, kVlessEncryptionClientPfsPublicSize> public_key{};
-    auto opened_key = nfs_aead->Open(
+    auto opened_key = nfs_aead.Open(
         encrypted.subspan(kVlessEncryptionEncryptedLengthSize),
         {},
         public_key);
@@ -561,6 +548,7 @@ BuildVlessEncryptionServerPfsResponse(
         *sealed_ticket != kVlessEncryptionEncryptedTicketSize) {
         return std::nullopt;
     }
+    response.write_aead = std::move(*ticket_aead);
     return response;
 }
 
@@ -632,6 +620,7 @@ OpenVlessEncryptionServerPfsResponse(
         return std::nullopt;
     }
     result.ticket_seconds = *seconds;
+    result.read_aead = std::move(*ticket_aead);
     return result;
 }
 

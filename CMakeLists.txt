@@ -357,6 +357,7 @@ set(CNODE_SOURCES
     src/proxy/vless/vless_encryption_handshake.cpp
     src/proxy/vless/vless_encryption_io.cpp
     src/proxy/vless/vless_encryption_record.cpp
+    src/proxy/vless/vless_encryption_runtime.cpp
     src/proxy/vless/vless_encryption_xor.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
