@@ -972,11 +972,22 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 });
             return text;
         };
+        auto json_packet_encoding = [&](const acpp::json::object& obj) -> std::string {
+            std::string value = json_string(obj, "packet_encoding");
+            if (value.empty()) {
+                value = json_string(obj, "packetEncoding");
+            }
+            if (value.empty()) {
+                value = json_string(obj, "packet-encoding");
+            }
+            return value;
+        };
 
         acpp::VlessOutboundConfig vless_config;
         vless_config.tag = cfg.tag;
 
         const auto& s = cfg.settings;
+        std::string packet_encoding;
         if (const auto* vnext_p = s.if_contains("vnext");
                 vnext_p && vnext_p->is_array() && !vnext_p->as_array().empty() &&
                 vnext_p->as_array()[0].is_object()) {
@@ -994,6 +1005,10 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 }
                 vless_config.encryption = json_string(user, "encryption");
                 vless_config.flow = json_string(user, "flow");
+                const std::string user_packet_encoding = json_packet_encoding(user);
+                if (!user_packet_encoding.empty()) {
+                    packet_encoding = user_packet_encoding;
+                }
             }
             if (vless_config.encryption.empty()) {
                 vless_config.encryption = json_string(s, "encryption");
@@ -1010,6 +1025,10 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             vless_config.encryption = json_string(s, "encryption");
             vless_config.flow = json_string(s, "flow");
+            packet_encoding = json_packet_encoding(s);
+        }
+        if (packet_encoding.empty()) {
+            packet_encoding = json_packet_encoding(s);
         }
 
         vless_config.encryption = lower_ascii(std::move(vless_config.encryption));
@@ -1021,24 +1040,22 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        std::string packet_encoding = json_string(s, "packet_encoding");
-        if (packet_encoding.empty()) {
-            packet_encoding = json_string(s, "packetEncoding");
-        }
         packet_encoding = lower_ascii(std::move(packet_encoding));
-        if (!packet_encoding.empty() &&
-            packet_encoding != "none" &&
-            packet_encoding != "raw") {
-            if (packet_encoding == "xudp") {
-                vless_config.packet_xudp = true;
-            } else if (packet_encoding == "packetaddr" ||
-                       packet_encoding == "packet-addr") {
-                vless_config.packet_addr = true;
-            } else {
-                LOG_WARN("VLESS outbound '{}': packet encoding '{}' is not supported",
-                         cfg.tag, packet_encoding);
-                return std::nullopt;
-            }
+        if (packet_encoding.empty() || packet_encoding == "xudp") {
+            vless_config.packet_xudp = true;
+            vless_config.packet_addr = false;
+        } else if (packet_encoding == "none" || packet_encoding == "raw") {
+            vless_config.packet_xudp = false;
+            vless_config.packet_addr = false;
+        } else if (packet_encoding == "packetaddr" ||
+                   packet_encoding == "packet-addr" ||
+                   packet_encoding == "packet") {
+            vless_config.packet_xudp = false;
+            vless_config.packet_addr = true;
+        } else {
+            LOG_WARN("VLESS outbound '{}': packet encoding '{}' is not supported",
+                     cfg.tag, packet_encoding);
+            return std::nullopt;
         }
 
         vless_config.flow = acpp::vless::NormalizeFlow(vless_config.flow);

@@ -27,7 +27,7 @@ struct VlessOutboundConfig {
     std::array<uint8_t, 16> uuid_bytes{};
     std::string encryption = std::string(constants::protocol::kNone);
     std::string flow;
-    bool packet_xudp = false;
+    bool packet_xudp = true;
     bool packet_addr = false;
 
     StreamSettings stream_settings;
