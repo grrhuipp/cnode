@@ -17,6 +17,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace acpp::app::dispatcher {
@@ -224,21 +225,70 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     // 嗅探只需首部若干字节即可解析 TLS ClientHello SNI / HTTP Host；
     // 首包很大（例如客户端把大块 body pipeline 进首包）时无需整包拷贝。
     static constexpr size_t kSniffMaxBytes = 4096;
+    buf::MultiBuffer outbound_first_payload;
     std::span<const uint8_t> sniff_data;
     memory::ByteVector sniff_scratch;
-    if (receiver.sniff_config.enabled && !first_packet.empty()) {
-        if (first_packet.IsContiguous()) {
-            sniff_data = first_packet.span();
-            if (sniff_data.size() > kSniffMaxBytes) {
-                sniff_data = sniff_data.first(kSniffMaxBytes);
+
+    auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb) {
+        const size_t total = buf::TotalLen(mb);
+        if (total == 0) {
+            return;
+        }
+        const size_t want = std::min(total, kSniffMaxBytes);
+        sniff_scratch.resize(want);
+        size_t copied = 0;
+        for (const auto* buffer : mb) {
+            if (copied >= want) {
+                break;
             }
-        } else {
-            const size_t want = std::min(first_packet.size(), kSniffMaxBytes);
-            sniff_scratch.resize(want);
-            const size_t got = first_packet.CopyPrefixTo(
-                sniff_scratch.data(), sniff_scratch.size());
-            if (got > 0) {
-                sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            const size_t n = std::min(bytes.size(), want - copied);
+            std::memcpy(sniff_scratch.data() + copied, bytes.data(), n);
+            copied += n;
+        }
+        if (copied > 0) {
+            sniff_data = std::span<const uint8_t>(sniff_scratch.data(), copied);
+        }
+    };
+
+    if (receiver.sniff_config.enabled) {
+        if (!first_packet.empty()) {
+            if (first_packet.IsContiguous()) {
+                sniff_data = first_packet.span();
+                if (sniff_data.size() > kSniffMaxBytes) {
+                    sniff_data = sniff_data.first(kSniffMaxBytes);
+                }
+            } else {
+                const size_t want = std::min(first_packet.size(), kSniffMaxBytes);
+                sniff_scratch.resize(want);
+                const size_t got = first_packet.CopyPrefixTo(
+                    sniff_scratch.data(), sniff_scratch.size());
+                if (got > 0) {
+                    sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
+                }
+            }
+        } else if (ctx.content.network == Network::TCP && inbound_reader) {
+            try {
+                if (inbound_control) {
+                    inbound_control->SetReadTimeout(timeouts.ReadTimeout());
+                }
+                outbound_first_payload = co_await inbound_reader->ReadMultiBuffer();
+                if (buf::TotalLen(outbound_first_payload) > 0) {
+                    LOG_CONN_DEBUG(ctx, "[Session] Sniff prefetch payload={}B",
+                                   buf::TotalLen(outbound_first_payload));
+                    sniff_from_multibuffer(outbound_first_payload);
+                }
+            } catch (const IoSystemError& e) {
+                stats.OnError();
+                co_return MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
+                    ? ErrorCode::TIMEOUT
+                    : MapAsioError(e.code()));
+            } catch (...) {
+                stats.OnError();
+                co_return MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
             }
         }
     }
@@ -333,8 +383,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     relay_cfg.downlink_only = timeouts.DownlinkOnlyTimeout();
     relay_cfg.speed_limit   = ctx.content.speed_limit;
 
-    buf::MultiBuffer outbound_first_payload;
-    if (!first_packet.empty() && !first_packet.IsContiguous()) {
+    if (buf::TotalLen(outbound_first_payload) == 0 &&
+        !first_packet.empty() && !first_packet.IsContiguous()) {
         outbound_first_payload = first_packet.MoveToMultiBuffer();
     }
     const bool use_owned_first_payload =
