@@ -6,6 +6,7 @@
 #include "acppnode/transport/internet/tls_config.hpp"
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace acpp {
 
@@ -129,6 +130,40 @@ struct XHttpConfig {
 };
 
 // ============================================================================
+// REALITY 安全层配置
+// ============================================================================
+struct RealityConfig {
+    // 服务端字段
+    bool show = false;
+    std::string type;
+    std::string dest;
+    uint8_t xver = 0;
+    std::vector<std::string> server_names;
+    std::string private_key;
+    std::vector<std::string> short_ids;
+    std::string min_client_ver;
+    std::string max_client_ver;
+    uint64_t max_time_diff = 0;
+    std::string mldsa65_seed;
+
+    // 客户端字段
+    std::string fingerprint;
+    std::string server_name;
+    std::string public_key;
+    std::string short_id;
+    std::string spider_x;
+    std::string mldsa65_verify;
+
+    // 调试/兼容字段
+    std::string master_key_log;
+
+    [[nodiscard]] bool IsServer() const noexcept { return !private_key.empty(); }
+    [[nodiscard]] bool IsClient() const noexcept { return !public_key.empty(); }
+
+    static RealityConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
 // StreamSettings - 传输层 + 安全层组合配置
 //
 // 实现 Xray 式「传输层自由组合」：
@@ -145,6 +180,7 @@ struct StreamSettings {
     std::string security = std::string(constants::protocol::kNone);
 
     TlsConfig tls;             // 当 security == "tls" 时生效
+    RealityConfig reality;     // 当 security == "reality" 时生效
     WsConfig  ws;              // 当 network  == "ws" / "websocket" 时生效
     HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
     HttpConfig http;            // 当 network == "http" / "h2" 时生效
@@ -158,6 +194,7 @@ struct StreamSettings {
 
     bool IsTls() const noexcept { return (flags & kFlagTls) != 0; }
     bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
+    bool IsTlsLike() const noexcept { return IsTls() || IsReality(); }
     bool IsWs()  const noexcept { return (flags & kFlagWs)  != 0; }
     bool IsHttpUpgrade() const noexcept { return (flags & kFlagHttpUpgrade) != 0; }
     bool IsHttp() const noexcept { return (flags & kFlagHttp) != 0; }

@@ -4305,7 +4305,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
 }
 
 [[nodiscard]] bool ShouldUseHttp2ForXHttp(const StreamSettings& s) {
-    if (!s.IsTls()) {
+    if (!s.IsTlsLike()) {
         return false;
     }
     if (s.tls.alpn.size() == 1 &&
@@ -4319,7 +4319,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     if (s.http.force_http2) {
         return true;
     }
-    if (!s.IsTls()) {
+    if (!s.IsTlsLike()) {
         return false;
     }
     if (s.tls.alpn.size() == 1 &&

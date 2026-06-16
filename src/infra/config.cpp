@@ -42,6 +42,16 @@ inline int64_t jint(const json::object& obj, std::string_view key,
     return def;
 }
 
+inline std::string jstr_or_int(const json::object& obj, std::string_view key,
+                               std::string_view def = "") {
+    auto* p = obj.if_contains(key);
+    if (!p) return std::string(def);
+    if (p->is_string()) return std::string(p->as_string());
+    if (p->is_int64()) return std::to_string(p->as_int64());
+    if (p->is_uint64()) return std::to_string(p->as_uint64());
+    return std::string(def);
+}
+
 // 从 JSON array 中提取 string vector
 inline std::vector<std::string> jstr_array(const json::value& v) {
     std::vector<std::string> result;
@@ -408,6 +418,81 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
+RealityConfig RealityConfig::FromJson(const json::object& j) {
+    RealityConfig cfg;
+    cfg.show = jbool(j, "show", false);
+    cfg.type = lower_ascii_copy(jstr(j, "type", ""));
+    cfg.dest = jstr_or_int(j, "dest", "");
+    if (cfg.dest.empty()) {
+        cfg.dest = jstr_or_int(j, "target", "");
+    }
+    const int64_t xver = jint(j, "xver", 0);
+    cfg.xver = xver < 0 ? 0 : static_cast<uint8_t>(std::min<int64_t>(xver, 255));
+    if (auto* p = j.if_contains("serverNames"); p && p->is_array()) {
+        cfg.server_names = jstr_array(*p);
+    }
+    if (cfg.server_names.empty()) {
+        if (auto* p = j.if_contains("server_names"); p && p->is_array()) {
+            cfg.server_names = jstr_array(*p);
+        }
+    }
+    cfg.private_key = jstr(j, "privateKey", "");
+    if (cfg.private_key.empty()) {
+        cfg.private_key = jstr(j, "private_key", "");
+    }
+    if (auto* p = j.if_contains("shortIds"); p && p->is_array()) {
+        cfg.short_ids = jstr_array(*p);
+    }
+    if (cfg.short_ids.empty()) {
+        if (auto* p = j.if_contains("short_ids"); p && p->is_array()) {
+            cfg.short_ids = jstr_array(*p);
+        }
+    }
+    cfg.min_client_ver = jstr(j, "minClientVer", "");
+    if (cfg.min_client_ver.empty()) {
+        cfg.min_client_ver = jstr(j, "min_client_ver", "");
+    }
+    cfg.max_client_ver = jstr(j, "maxClientVer", "");
+    if (cfg.max_client_ver.empty()) {
+        cfg.max_client_ver = jstr(j, "max_client_ver", "");
+    }
+    cfg.max_time_diff = static_cast<uint64_t>(
+        std::max<int64_t>(0, jint(j, "maxTimeDiff", jint(j, "max_time_diff", 0))));
+    cfg.mldsa65_seed = jstr(j, "mldsa65Seed", "");
+    if (cfg.mldsa65_seed.empty()) {
+        cfg.mldsa65_seed = jstr(j, "mldsa65_seed", "");
+    }
+    cfg.fingerprint = lower_ascii_copy(jstr(j, "fingerprint", ""));
+    cfg.server_name = jstr(j, "serverName", "");
+    if (cfg.server_name.empty()) {
+        cfg.server_name = jstr(j, "server_name", "");
+    }
+    cfg.public_key = jstr(j, "publicKey", "");
+    if (cfg.public_key.empty()) {
+        cfg.public_key = jstr(j, "public_key", "");
+    }
+    if (cfg.public_key.empty()) {
+        cfg.public_key = jstr(j, "password", "");
+    }
+    cfg.short_id = jstr(j, "shortId", "");
+    if (cfg.short_id.empty()) {
+        cfg.short_id = jstr(j, "short_id", "");
+    }
+    cfg.spider_x = jstr(j, "spiderX", "");
+    if (cfg.spider_x.empty()) {
+        cfg.spider_x = jstr(j, "spider_x", "");
+    }
+    cfg.mldsa65_verify = jstr(j, "mldsa65Verify", "");
+    if (cfg.mldsa65_verify.empty()) {
+        cfg.mldsa65_verify = jstr(j, "mldsa65_verify", "");
+    }
+    cfg.master_key_log = jstr(j, "masterKeyLog", "");
+    if (cfg.master_key_log.empty()) {
+        cfg.master_key_log = jstr(j, "master_key_log", "");
+    }
+    return cfg;
+}
+
 std::string XHttpConfig::NormalizedPath() const {
     std::string normalized = path.empty()
         ? std::string(constants::binding::kRootPath)
@@ -494,6 +579,18 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
             cfg.tls.key_file  = jstr(t, "keyFile", "");
     };
     parse_tls("tlsSettings");
+
+    auto parse_reality = [&](std::string_view key) {
+        auto* p = j.if_contains(key);
+        if (p && p->is_object()) {
+            cfg.reality = RealityConfig::FromJson(p->as_object());
+        }
+    };
+    parse_reality("realitySettings");
+    parse_reality("reality_settings");
+    if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
+        cfg.tls.server_name = cfg.reality.server_name;
+    }
 
     // WS 配置
     auto parse_ws = [&](std::string_view key) {
@@ -614,10 +711,10 @@ void StreamSettings::RecomputeModes() noexcept {
     const bool http_should_default_h2 =
         network_mode == NetworkMode::Http &&
         (http.force_http2 ||
-         (security_mode == SecurityMode::Tls && tls.alpn.empty()));
+         (IsTlsLike() && tls.alpn.empty()));
     const bool xhttp_should_default_h2 =
         network_mode == NetworkMode::XHttp &&
-        (xhttp.AcceptsStreamOne() || security_mode == SecurityMode::Tls) &&
+        (xhttp.AcceptsStreamOne() || IsTlsLike()) &&
         tls.alpn.empty();
     if (network_mode == NetworkMode::Grpc ||
         http_should_default_h2 ||
