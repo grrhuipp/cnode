@@ -2,6 +2,7 @@
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
+#include "../vless_io_util.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -34,9 +35,13 @@ namespace acpp {
 
 namespace {
 
+using ::acpp::vless::VlessBufferedReader;
+using ::acpp::vless::WriteVlessBytes;
+
+constexpr size_t kUdpFrameQueueShrinkItems = 64;
+
 constexpr std::string_view kPacketAddrMagicAddress =
     "sp.packet-addr.v2fly.arpa";
-
 bool IsPacketAddrMagic(const TargetAddress& target) {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
 }
@@ -104,24 +109,34 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(std::span<const uint8_t> 
     return std::nullopt;
 }
 
-bool EncodePacketAddrUdpPacketTo(const TargetAddress& target,
-                                 std::span<const uint8_t> payload,
+bool EncodeVlessUdpLengthHeaderTo(size_t payload_len, buf::Buffer& out) {
+    if (payload_len == 0 || payload_len > 0xffff || out.Available() < 2) {
+        return false;
+    }
+    auto tail = out.Tail();
+    tail[0] = static_cast<uint8_t>((payload_len >> 8) & 0xff);
+    tail[1] = static_cast<uint8_t>(payload_len & 0xff);
+    out.Produce(2);
+    return true;
+}
+
+bool EncodePacketAddrUdpHeaderTo(const TargetAddress& target,
+                                 size_t payload_len,
                                  buf::Buffer& out) {
     std::array<uint8_t, 19> addr{};
     const size_t addr_len = EncodePacketAddrHeaderTo(target, addr.data(), addr.size());
     if (addr_len == 0) {
         return false;
     }
-    const size_t packet_len = addr_len + payload.size();
-    if (packet_len == 0 || packet_len > 0xffff || out.Available() < packet_len + 2) {
+    const size_t packet_len = addr_len + payload_len;
+    if (packet_len == 0 || packet_len > 0xffff || out.Available() < addr_len + 2) {
         return false;
     }
     auto tail = out.Tail();
     tail[0] = static_cast<uint8_t>((packet_len >> 8) & 0xff);
     tail[1] = static_cast<uint8_t>(packet_len & 0xff);
     std::memcpy(tail.data() + 2, addr.data(), addr_len);
-    std::memcpy(tail.data() + 2 + addr_len, payload.data(), payload.size());
-    out.Produce(static_cast<uint32_t>(packet_len + 2));
+    out.Produce(static_cast<uint32_t>(addr_len + 2));
     return true;
 }
 
@@ -179,7 +194,8 @@ net::awaitable<bool> WriteFull(AsyncStream& stream,
 
 class VlessPendingReader final : public transport::MultiBufferReader {
 public:
-    VlessPendingReader(AsyncStream& src, std::span<const uint8_t> first_packet)
+    VlessPendingReader(transport::MultiBufferReader& src,
+                       std::span<const uint8_t> first_packet)
         : src_(src) {
         (void)buf::AppendSpanToMultiBuffer(first_packet, pending_);
     }
@@ -193,7 +209,7 @@ public:
     }
 
 private:
-    AsyncStream& src_;
+    transport::MultiBufferReader& src_;
     buf::MultiBuffer pending_;
 };
 
@@ -230,8 +246,9 @@ public:
         }
         out = std::move(queue_.front());
         queue_.pop_front();
-        if (queue_.empty()) {
+        if (queue_.empty() && shrink_queue_on_drain_) {
             TryShrinkSequence(queue_);
+            shrink_queue_on_drain_ = false;
         }
         return true;
     }
@@ -239,6 +256,7 @@ public:
 private:
     buf::BufferGuard pending_;
     memory::ThreadLocalDeque<buf::BufferGuard> queue_;
+    bool shrink_queue_on_drain_ = false;
 
     void Compact() {
         if (!pending_ || pending_->start == 0) {
@@ -279,6 +297,9 @@ private:
                     std::memcpy(payload->Tail().data(), bytes.data(), n);
                     payload->Produce(static_cast<uint32_t>(n));
                     queue_.push_back(std::move(payload));
+                    if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+                        shrink_queue_on_drain_ = true;
+                    }
                 }
                 pending_->Advance(static_cast<uint32_t>(parsed.consumed));
                 continue;
@@ -301,7 +322,7 @@ private:
 
 class VlessUdpReader final : public transport::MultiBufferReader {
 public:
-    VlessUdpReader(AsyncStream& src,
+    VlessUdpReader(transport::MultiBufferReader& src,
                    TargetAddress target,
                    std::span<const uint8_t> first_packet,
                    bool packet_addr = false)
@@ -351,7 +372,7 @@ public:
     }
 
 private:
-    AsyncStream& src_;
+    transport::MultiBufferReader& src_;
     TargetAddress target_;
     bool packet_addr_ = false;
     VlessUdpFramer framer_;
@@ -359,18 +380,19 @@ private:
 
 class VlessUdpWriter final : public transport::MultiBufferWriter {
 public:
-    explicit VlessUdpWriter(AsyncStream& dst, bool packet_addr = false)
+    explicit VlessUdpWriter(transport::MultiBufferWriter& dst,
+                            bool packet_addr = false)
         : dst_(dst)
         , packet_addr_(packet_addr) {}
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         buf::MultiBuffer out;
-        for (buf::Buffer* buffer : mb) {
+        for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
-            buf::BufferGuard framed{buf::Buffer::New()};
-            if (!framed) {
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
                 break;
             }
             bool ok = false;
@@ -378,22 +400,19 @@ public:
                 if (!buffer->HasUDP()) {
                     continue;
                 }
-                ok = EncodePacketAddrUdpPacketTo(buffer->UDP(), buffer->Bytes(), *framed);
+                ok = EncodePacketAddrUdpHeaderTo(buffer->UDP(), buffer->Len(), *header);
             } else {
-                const size_t written = vless::Codec::EncodeUdpPacketTo(
-                    buffer->Bytes().data(),
-                    buffer->Len(),
-                    framed->Tail().data(),
-                    framed->Available());
-                if (written > 0) {
-                    framed->Produce(static_cast<uint32_t>(written));
-                    ok = true;
-                }
+                ok = EncodeVlessUdpLengthHeaderTo(buffer->Len(), *header);
             }
             if (!ok) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
                 continue;
             }
-            out.push_back(framed.release());
+            out.push_back(header.release());
+            buffer->ClearUDP();
+            out.push_back(buffer);
+            buffer = nullptr;
         }
         mb.clear();
         if (!out.empty()) {
@@ -407,7 +426,7 @@ public:
     }
 
 private:
-    AsyncStream& dst_;
+    transport::MultiBufferWriter& dst_;
     bool packet_addr_ = false;
 };
 
@@ -458,13 +477,15 @@ proxy::vless::inbound::Handler::Process(
     size_t total_read = 0;
     size_t consumed = 0;
     std::optional<::acpp::vless::RequestHeader> request;
+    VlessBufferedReader protocol_reader(*stream);
+    transport::MultiBufferWriter* protocol_writer = stream.get();
 
     while (!request && total_read < handshake.size()) {
-        size_t n = 0;
+        bool read_ok = false;
         try {
-            n = co_await stream->AsyncRead(
-                net::buffer(handshake.data() + total_read,
-                            handshake.size() - total_read));
+            read_ok = co_await protocol_reader.ReadExact(
+                handshake.data() + total_read,
+                1);
         } catch (const IoSystemError&) {
             if (stream->ConsumePhaseDeadline()) {
                 LOG_CONN_FAIL_CTX(ctx, "[VLESS][{}] handshake phase deadline from {}",
@@ -473,16 +494,16 @@ proxy::vless::inbound::Handler::Process(
             }
             co_return fail_abortive(ErrorCode::SOCKET_READ_FAILED);
         }
-        if (n == 0 && stream->ConsumePhaseDeadline()) {
+        if (!read_ok && stream->ConsumePhaseDeadline()) {
             co_return fail_abortive(ErrorCode::TIMEOUT);
         }
-        if (n == 0 && stream->ConsumeIdleTimeout()) {
+        if (!read_ok && stream->ConsumeIdleTimeout()) {
             co_return fail_abortive(ErrorCode::TIMEOUT);
         }
-        if (n == 0) {
+        if (!read_ok) {
             co_return fail_abortive(ErrorCode::SOCKET_EOF);
         }
-        total_read += n;
+        ++total_read;
         request = ::acpp::vless::Codec::ParseRequestHeader(
             handshake.data(),
             total_read,
@@ -575,8 +596,14 @@ proxy::vless::inbound::Handler::Process(
     uint8_t response_header[2]{};
     const size_t response_len =
         ::acpp::vless::Codec::EncodeResponseHeaderTo(response_header, sizeof(response_header));
-    if (response_len == 0 ||
-        !co_await WriteFull(*stream, response_header, response_len)) {
+    if (response_len == 0) {
+        co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    try {
+        co_await WriteVlessBytes(
+            *protocol_writer,
+            std::span<const uint8_t>(response_header, response_len));
+    } catch (...) {
         co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -588,13 +615,12 @@ proxy::vless::inbound::Handler::Process(
     }
 
     if (net == Network::MUX) {
-        auto* tcp_stream = stream.get();
-        VlessPendingReader mux_reader(*tcp_stream, leftover);
+        VlessPendingReader mux_reader(protocol_reader, leftover);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver,
             std::move(stream),
-            transport::Link{&mux_reader, tcp_stream},
+            transport::Link{&mux_reader, protocol_writer},
             InitialPayload{},
             ctx,
             *stats_,
@@ -604,8 +630,8 @@ proxy::vless::inbound::Handler::Process(
 
     if (net == Network::UDP) {
         VlessUdpReader udp_reader(
-            *stream, ctx.outbound.target, leftover, packet_addr_udp);
-        VlessUdpWriter udp_writer(*stream, packet_addr_udp);
+            protocol_reader, ctx.outbound.target, leftover, packet_addr_udp);
+        VlessUdpWriter udp_writer(*protocol_writer, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver,
@@ -623,10 +649,12 @@ proxy::vless::inbound::Handler::Process(
         first_packet.assign(leftover.begin(), leftover.end());
     }
 
-    auto* tcp_stream = stream.get();
     if (use_vision) {
-        ::acpp::vless::VisionReader vision_reader(*tcp_stream, request->uuid, leftover);
-        ::acpp::vless::VisionWriter vision_writer(*tcp_stream, request->uuid);
+        ::acpp::vless::VisionReader vision_reader(
+            protocol_reader,
+            request->uuid,
+            leftover);
+        ::acpp::vless::VisionWriter vision_writer(*protocol_writer, request->uuid);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver,
@@ -643,7 +671,7 @@ proxy::vless::inbound::Handler::Process(
         io_context,
         receiver,
         std::move(stream),
-        transport::Link{tcp_stream, tcp_stream},
+        transport::Link{&protocol_reader, protocol_writer},
         std::move(first_packet),
         ctx,
         *stats_,

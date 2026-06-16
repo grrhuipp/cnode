@@ -10,10 +10,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
-class AsyncStream;
-}  // namespace acpp
-
 namespace acpp::vless {
 
 inline constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
@@ -22,14 +18,14 @@ inline constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
 class VisionReader final : public transport::MultiBufferReader {
 public:
-    VisionReader(AsyncStream& src,
+    VisionReader(transport::MultiBufferReader& src,
                  std::array<uint8_t, 16> user_uuid,
                  std::span<const uint8_t> initial = {});
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
 private:
-    AsyncStream& src_;
+    transport::MultiBufferReader& src_;
     std::array<uint8_t, 16> user_uuid_{};
     std::vector<uint8_t> pending_;
     bool read_process_ = true;
@@ -41,13 +37,14 @@ private:
 
 class VisionWriter final : public transport::MultiBufferWriter {
 public:
-    VisionWriter(AsyncStream& dst, std::array<uint8_t, 16> user_uuid);
+    VisionWriter(transport::MultiBufferWriter& dst,
+                 std::array<uint8_t, 16> user_uuid);
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
-    AsyncStream& dst_;
+    transport::MultiBufferWriter& dst_;
     std::array<uint8_t, 16> user_uuid_{};
     bool write_process_ = true;
     bool send_uuid_ = true;

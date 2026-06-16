@@ -2,6 +2,7 @@
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
+#include "../vless_io_util.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
@@ -34,6 +35,11 @@
 namespace acpp {
 
 namespace {
+
+using ::acpp::vless::VlessBufferedReader;
+using ::acpp::vless::WriteVlessBytes;
+
+constexpr size_t kUdpFrameQueueShrinkItems = 64;
 
 [[nodiscard]] bool SameTargetAddress(const TargetAddress& lhs,
                                      const TargetAddress& rhs) {
@@ -123,24 +129,34 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(std::span<const uint8_t> 
     return std::nullopt;
 }
 
-bool EncodePacketAddrUdpPacketTo(const TargetAddress& target,
-                                 std::span<const uint8_t> payload,
+bool EncodeVlessUdpLengthHeaderTo(size_t payload_len, buf::Buffer& out) {
+    if (payload_len == 0 || payload_len > 0xffff || out.Available() < 2) {
+        return false;
+    }
+    auto tail = out.Tail();
+    tail[0] = static_cast<uint8_t>((payload_len >> 8) & 0xff);
+    tail[1] = static_cast<uint8_t>(payload_len & 0xff);
+    out.Produce(2);
+    return true;
+}
+
+bool EncodePacketAddrUdpHeaderTo(const TargetAddress& target,
+                                 size_t payload_len,
                                  buf::Buffer& out) {
     std::array<uint8_t, 19> addr{};
     const size_t addr_len = EncodePacketAddrHeaderTo(target, addr.data(), addr.size());
     if (addr_len == 0) {
         return false;
     }
-    const size_t packet_len = addr_len + payload.size();
-    if (packet_len == 0 || packet_len > 0xffff || out.Available() < packet_len + 2) {
+    const size_t packet_len = addr_len + payload_len;
+    if (packet_len == 0 || packet_len > 0xffff || out.Available() < addr_len + 2) {
         return false;
     }
     auto tail = out.Tail();
     tail[0] = static_cast<uint8_t>((packet_len >> 8) & 0xff);
     tail[1] = static_cast<uint8_t>(packet_len & 0xff);
     std::memcpy(tail.data() + 2, addr.data(), addr_len);
-    std::memcpy(tail.data() + 2 + addr_len, payload.data(), payload.size());
-    out.Produce(static_cast<uint32_t>(packet_len + 2));
+    out.Produce(static_cast<uint32_t>(addr_len + 2));
     return true;
 }
 
@@ -215,8 +231,9 @@ public:
         }
         out = std::move(queue_.front());
         queue_.pop_front();
-        if (queue_.empty()) {
+        if (queue_.empty() && shrink_queue_on_drain_) {
             TryShrinkSequence(queue_);
+            shrink_queue_on_drain_ = false;
         }
         return true;
     }
@@ -224,6 +241,7 @@ public:
 private:
     buf::BufferGuard pending_;
     memory::ThreadLocalDeque<buf::BufferGuard> queue_;
+    bool shrink_queue_on_drain_ = false;
 
     void Compact() {
         if (!pending_ || pending_->start == 0) {
@@ -264,6 +282,9 @@ private:
                     std::memcpy(payload->Tail().data(), bytes.data(), n);
                     payload->Produce(static_cast<uint32_t>(n));
                     queue_.push_back(std::move(payload));
+                    if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+                        shrink_queue_on_drain_ = true;
+                    }
                 }
                 pending_->Advance(static_cast<uint32_t>(parsed.consumed));
                 continue;
@@ -288,19 +309,23 @@ class VlessOutboundEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    VlessOutboundEndpoint(AsyncStream& stream,
+    VlessOutboundEndpoint(AsyncStream& control,
+                          VlessBufferedReader& reader,
+                          transport::MultiBufferWriter& writer,
                           bool is_udp,
                           TargetAddress udp_target,
                           bool packet_addr = false,
                           bool vision = false,
                           std::array<uint8_t, 16> user_uuid = {})
-        : stream_(stream)
+        : control_(control)
+        , reader_(reader)
+        , writer_(writer)
         , is_udp_(is_udp)
         , udp_target_(std::move(udp_target))
         , packet_addr_(packet_addr) {
         if (vision) {
-            vision_reader_.emplace(stream_, user_uuid);
-            vision_writer_.emplace(stream_, user_uuid);
+            vision_reader_.emplace(reader_, user_uuid);
+            vision_writer_.emplace(writer_, user_uuid);
         }
     }
 
@@ -318,7 +343,7 @@ public:
             if (vision_reader_) {
                 co_return co_await vision_reader_->ReadMultiBuffer();
             }
-            co_return co_await stream_.ReadMultiBuffer();
+            co_return co_await reader_.ReadMultiBuffer();
         }
 
         while (true) {
@@ -344,7 +369,7 @@ public:
                 co_return out;
             }
 
-            buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
+            buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (raw.empty()) {
                 co_return buf::MultiBuffer{};
             }
@@ -363,7 +388,7 @@ public:
                 co_await vision_writer_->WriteMultiBuffer(std::move(mb));
                 co_return;
             }
-            co_await stream_.WriteMultiBuffer(std::move(mb));
+            co_await writer_.WriteMultiBuffer(std::move(mb));
             co_return;
         }
 
@@ -379,8 +404,8 @@ public:
                     continue;
                 }
             }
-            buf::BufferGuard framed{buf::Buffer::New()};
-            if (!framed) {
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
                 break;
             }
             bool ok = false;
@@ -388,86 +413,78 @@ public:
                 const TargetAddress& target = buffer->HasUDP()
                     ? buffer->UDP()
                     : udp_target_;
-                ok = EncodePacketAddrUdpPacketTo(target, buffer->Bytes(), *framed);
+                ok = EncodePacketAddrUdpHeaderTo(target, buffer->Len(), *header);
             } else {
-                const size_t written = vless::Codec::EncodeUdpPacketTo(
-                    buffer->Bytes().data(),
-                    buffer->Len(),
-                    framed->Tail().data(),
-                    framed->Available());
-                if (written > 0) {
-                    framed->Produce(static_cast<uint32_t>(written));
-                    ok = true;
-                }
+                ok = EncodeVlessUdpLengthHeaderTo(buffer->Len(), *header);
             }
             if (!ok) {
                 buf::Buffer::Free(buffer);
                 buffer = nullptr;
                 continue;
             }
-            out.push_back(framed.release());
-            buf::Buffer::Free(buffer);
+            out.push_back(header.release());
+            buffer->ClearUDP();
+            out.push_back(buffer);
             buffer = nullptr;
         }
         mb.clear();
         if (!out.empty()) {
-            co_await stream_.WriteMultiBuffer(std::move(out));
+            co_await writer_.WriteMultiBuffer(std::move(out));
         }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        stream_.ShutdownWrite();
-        co_return;
+        co_await writer_.AsyncShutdownWrite();
     }
 
     void SetIdleTimeout(std::chrono::seconds timeout) {
-        stream_.SetIdleTimeout(timeout);
+        control_.SetIdleTimeout(timeout);
     }
 
     void SetReadTimeout(std::chrono::seconds timeout) {
-        stream_.SetReadTimeout(timeout);
+        control_.SetReadTimeout(timeout);
     }
 
     void SetWriteTimeout(std::chrono::seconds timeout) {
-        stream_.SetWriteTimeout(timeout);
+        control_.SetWriteTimeout(timeout);
     }
 
     bool ConsumeIdleTimeout() noexcept {
-        return stream_.ConsumeIdleTimeout();
+        return control_.ConsumeIdleTimeout();
     }
 
     bool ConsumeReadTimeout() noexcept {
-        return stream_.ConsumeReadTimeout();
+        return control_.ConsumeReadTimeout();
     }
 
     bool ConsumeWriteTimeout() noexcept {
-        return stream_.ConsumeWriteTimeout();
+        return control_.ConsumeWriteTimeout();
     }
 
     PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        return stream_.StartPhaseDeadline(timeout);
+        return control_.StartPhaseDeadline(timeout);
     }
 
     void ClearPhaseDeadline() {
-        stream_.ClearPhaseDeadline();
+        control_.ClearPhaseDeadline();
     }
 
     bool ConsumePhaseDeadline() noexcept {
-        return stream_.ConsumePhaseDeadline();
+        return control_.ConsumePhaseDeadline();
     }
 
     void Cancel() noexcept {
-        stream_.Cancel();
+        control_.Cancel();
     }
 
     void SetAbortiveClose(bool enable = true) noexcept {
-        stream_.SetAbortiveClose(enable);
+        control_.SetAbortiveClose(enable);
     }
 
 private:
     net::awaitable<bool> ReadResponseHeader() {
         uint8_t fixed[2]{};
-        if (!co_await ReadFull(stream_, fixed, sizeof(fixed))) {
+        if (!co_await reader_.ReadExact(fixed, sizeof(fixed))) {
             co_return false;
         }
         if (fixed[0] != vless::kVersion) {
@@ -476,14 +493,16 @@ private:
         const size_t addons_len = fixed[1];
         if (addons_len > 0) {
             std::array<uint8_t, 255> addons{};
-            if (!co_await ReadFull(stream_, addons.data(), addons_len)) {
+            if (!co_await reader_.ReadExact(addons.data(), addons_len)) {
                 co_return false;
             }
         }
         co_return true;
     }
 
-    AsyncStream& stream_;
+    AsyncStream& control_;
+    VlessBufferedReader& reader_;
+    transport::MultiBufferWriter& writer_;
     bool response_header_read_ = false;
     bool is_udp_ = false;
     TargetAddress udp_target_;
@@ -516,8 +535,9 @@ public:
         }
         out = std::move(queue_.front());
         queue_.pop_front();
-        if (queue_.empty()) {
+        if (queue_.empty() && shrink_queue_on_drain_) {
             TryShrinkSequence(queue_);
+            shrink_queue_on_drain_ = false;
         }
         return true;
     }
@@ -526,6 +546,7 @@ private:
     memory::ByteVector pending_;
     memory::ThreadLocalDeque<MuxFramePayload> queue_;
     size_t pending_offset_ = 0;
+    bool shrink_queue_on_drain_ = false;
 
     void Parse() {
         while (pending_offset_ < pending_.size()) {
@@ -556,6 +577,9 @@ private:
                 }
             }
             queue_.push_back(std::move(packet));
+            if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+                shrink_queue_on_drain_ = true;
+            }
             pending_offset_ += parsed->frame_size;
         }
         CompactConsumed();
@@ -587,8 +611,13 @@ class VlessMuxUdpEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    VlessMuxUdpEndpoint(AsyncStream& stream, TargetAddress udp_target)
-        : stream_(stream)
+    VlessMuxUdpEndpoint(AsyncStream& control,
+                        VlessBufferedReader& reader,
+                        transport::MultiBufferWriter& writer,
+                        TargetAddress udp_target)
+        : control_(control)
+        , reader_(reader)
+        , writer_(writer)
         , udp_target_(std::move(udp_target)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -621,7 +650,7 @@ public:
                 co_return std::move(frame.payload);
             }
 
-            buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
+            buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (raw.empty()) {
                 co_return buf::MultiBuffer{};
             }
@@ -671,7 +700,9 @@ public:
             if (!encoded || write_frame_.empty()) {
                 continue;
             }
-            if (!co_await WriteFull(stream_, write_frame_.data(), write_frame_.size())) {
+            try {
+                co_await WriteVlessBytes(writer_, write_frame_);
+            } catch (...) {
                 break;
             }
         }
@@ -681,61 +712,63 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override {
         if (session_started_ && !end_sent_) {
             mux::EncodeEndTo(write_frame_, session_id_);
-            (void)co_await WriteFull(stream_, write_frame_.data(), write_frame_.size());
+            try {
+                co_await WriteVlessBytes(writer_, write_frame_);
+            } catch (...) {
+            }
             end_sent_ = true;
         }
-        stream_.ShutdownWrite();
-        co_return;
+        co_await writer_.AsyncShutdownWrite();
     }
 
     void SetIdleTimeout(std::chrono::seconds timeout) {
-        stream_.SetIdleTimeout(timeout);
+        control_.SetIdleTimeout(timeout);
     }
 
     void SetReadTimeout(std::chrono::seconds timeout) {
-        stream_.SetReadTimeout(timeout);
+        control_.SetReadTimeout(timeout);
     }
 
     void SetWriteTimeout(std::chrono::seconds timeout) {
-        stream_.SetWriteTimeout(timeout);
+        control_.SetWriteTimeout(timeout);
     }
 
     bool ConsumeIdleTimeout() noexcept {
-        return stream_.ConsumeIdleTimeout();
+        return control_.ConsumeIdleTimeout();
     }
 
     bool ConsumeReadTimeout() noexcept {
-        return stream_.ConsumeReadTimeout();
+        return control_.ConsumeReadTimeout();
     }
 
     bool ConsumeWriteTimeout() noexcept {
-        return stream_.ConsumeWriteTimeout();
+        return control_.ConsumeWriteTimeout();
     }
 
     PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        return stream_.StartPhaseDeadline(timeout);
+        return control_.StartPhaseDeadline(timeout);
     }
 
     void ClearPhaseDeadline() {
-        stream_.ClearPhaseDeadline();
+        control_.ClearPhaseDeadline();
     }
 
     bool ConsumePhaseDeadline() noexcept {
-        return stream_.ConsumePhaseDeadline();
+        return control_.ConsumePhaseDeadline();
     }
 
     void Cancel() noexcept {
-        stream_.Cancel();
+        control_.Cancel();
     }
 
     void SetAbortiveClose(bool enable = true) noexcept {
-        stream_.SetAbortiveClose(enable);
+        control_.SetAbortiveClose(enable);
     }
 
 private:
     net::awaitable<bool> ReadResponseHeader() {
         uint8_t fixed[2]{};
-        if (!co_await ReadFull(stream_, fixed, sizeof(fixed))) {
+        if (!co_await reader_.ReadExact(fixed, sizeof(fixed))) {
             co_return false;
         }
         if (fixed[0] != vless::kVersion) {
@@ -744,14 +777,16 @@ private:
         const size_t addons_len = fixed[1];
         if (addons_len > 0) {
             std::array<uint8_t, 255> addons{};
-            if (!co_await ReadFull(stream_, addons.data(), addons_len)) {
+            if (!co_await reader_.ReadExact(addons.data(), addons_len)) {
                 co_return false;
             }
         }
         co_return true;
     }
 
-    AsyncStream& stream_;
+    AsyncStream& control_;
+    VlessBufferedReader& reader_;
+    transport::MultiBufferWriter& writer_;
     TargetAddress udp_target_;
     bool response_header_read_ = false;
     bool session_started_ = false;
@@ -904,7 +939,14 @@ proxy::vless::outbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    if (!co_await WriteFull(*stream, header.data(), header_len)) {
+    VlessBufferedReader protocol_reader(*stream);
+    transport::MultiBufferWriter* protocol_writer = stream.get();
+
+    try {
+        co_await WriteVlessBytes(
+            *protocol_writer,
+            std::span<const uint8_t>(header.data(), header_len));
+    } catch (...) {
         co_return fail_abortive(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : ErrorCode::SOCKET_WRITE_FAILED);
@@ -916,7 +958,11 @@ proxy::vless::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     if (use_xudp) {
-        VlessMuxUdpEndpoint target_endpoint(*stream, target);
+        VlessMuxUdpEndpoint target_endpoint(
+            *stream,
+            protocol_reader,
+            *protocol_writer,
+            target);
         if (buf::TotalLen(first_payload) > 0) {
             if (inbound.control) {
                 co_return co_await DoRelayLinkWithFirstPacket(
@@ -949,6 +995,8 @@ proxy::vless::outbound::Handler::Process(
 
     VlessOutboundEndpoint target_endpoint(
         *stream,
+        protocol_reader,
+        *protocol_writer,
         is_udp,
         target,
         use_packet_addr,

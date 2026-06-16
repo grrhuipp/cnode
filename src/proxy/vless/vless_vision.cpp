@@ -1,8 +1,6 @@
 #include "vless_vision.hpp"
 
 #include "acppnode/common/error.hpp"
-#include "acppnode/transport/async_stream.hpp"
-
 #include <algorithm>
 #include <cstring>
 #include <openssl/rand.h>
@@ -112,7 +110,7 @@ bool IsVisionFlow(std::string_view flow) noexcept {
     return flow == kVisionFlow;
 }
 
-VisionReader::VisionReader(AsyncStream& src,
+VisionReader::VisionReader(transport::MultiBufferReader& src,
                            std::array<uint8_t, 16> user_uuid,
                            std::span<const uint8_t> initial)
     : src_(src)
@@ -218,7 +216,8 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
     }
 }
 
-VisionWriter::VisionWriter(AsyncStream& dst, std::array<uint8_t, 16> user_uuid)
+VisionWriter::VisionWriter(transport::MultiBufferWriter& dst,
+                           std::array<uint8_t, 16> user_uuid)
     : dst_(dst)
     , user_uuid_(user_uuid) {}
 
