@@ -1,6 +1,7 @@
 #include "acppnode/proxy/vless/inbound/vless_inbound.hpp"
 
 #include "../vless_codec.hpp"
+#include "../vless_encryption.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -674,9 +675,18 @@ const bool kVlessInboundRegistered = [] {
     reg.build_static_users =
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            if (!config.vless_decryption.empty() &&
-                config.vless_decryption != acpp::constants::protocol::kNone) {
-                LOG_WARN("VLESS inbound '{}': decryption '{}' is not supported",
+            if (!acpp::vless::IsNoVlessEncryption(config.vless_decryption)) {
+                auto parsed = acpp::vless::ParseVlessServerDecryption(
+                    config.vless_decryption);
+                if (!parsed) {
+                    LOG_WARN("VLESS inbound '{}': invalid decryption '{}': {}",
+                             tag,
+                             config.vless_decryption,
+                             acpp::vless::VlessEncryptionParseErrorMessage(
+                                 parsed.error));
+                    return std::nullopt;
+                }
+                LOG_WARN("VLESS inbound '{}': decryption '{}' is valid VLESS Encryption syntax but runtime support is not implemented yet",
                          tag,
                          config.vless_decryption);
                 return std::nullopt;

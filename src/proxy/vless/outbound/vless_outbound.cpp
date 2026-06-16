@@ -1,6 +1,7 @@
 #include "acppnode/proxy/vless/outbound/vless_outbound.hpp"
 
 #include "../vless_codec.hpp"
+#include "../vless_encryption.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
@@ -767,9 +768,6 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
     : config_(config)
     , dns_service_(dns_service) {
     config_.literal_address = ParseLiteralAddress(config_.address);
-    std::ranges::transform(config_.encryption, config_.encryption.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
     config_.flow = ::acpp::vless::NormalizeFlow(config_.flow);
     if (auto uuid_bytes = ::acpp::vless::ParseUuidBytes(config_.uuid)) {
         config_.uuid_bytes = *uuid_bytes;
@@ -777,12 +775,27 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
             config_.flow.empty() || ::acpp::vless::IsVisionFlow(config_.flow);
         config_valid_ =
             flow_ok &&
-            (config_.encryption.empty() ||
-             config_.encryption == constants::protocol::kNone);
+            ::acpp::vless::IsNoVlessEncryption(config_.encryption);
     }
     if (!config_valid_) {
-        LOG_ERROR("VLESS outbound '{}': invalid UUID, unsupported flow '{}', or unsupported encryption '{}'",
-                  config_.tag, config_.flow, config_.encryption);
+        if (!::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
+            auto parsed = ::acpp::vless::ParseVlessClientEncryption(
+                config_.encryption);
+            if (parsed) {
+                LOG_ERROR("VLESS outbound '{}': encryption '{}' is valid VLESS Encryption syntax but runtime support is not implemented yet",
+                          config_.tag,
+                          config_.encryption);
+            } else {
+                LOG_ERROR("VLESS outbound '{}': invalid encryption '{}': {}",
+                          config_.tag,
+                          config_.encryption,
+                          ::acpp::vless::VlessEncryptionParseErrorMessage(
+                              parsed.error));
+            }
+        } else {
+            LOG_ERROR("VLESS outbound '{}': invalid UUID or unsupported flow '{}'",
+                      config_.tag, config_.flow);
+        }
     }
 
     NormalizeOutboundStreamSettings(
@@ -1067,10 +1080,18 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             packet_encoding = json_packet_encoding(s);
         }
 
-        vless_config.encryption = lower_ascii(std::move(vless_config.encryption));
-        if (!vless_config.encryption.empty() &&
-            vless_config.encryption != acpp::constants::protocol::kNone) {
-            LOG_WARN("VLESS outbound '{}': encryption '{}' is not supported",
+        if (!acpp::vless::IsNoVlessEncryption(vless_config.encryption)) {
+            auto parsed = acpp::vless::ParseVlessClientEncryption(
+                vless_config.encryption);
+            if (!parsed) {
+                LOG_WARN("VLESS outbound '{}': invalid encryption '{}': {}",
+                         cfg.tag,
+                         vless_config.encryption,
+                         acpp::vless::VlessEncryptionParseErrorMessage(
+                             parsed.error));
+                return std::nullopt;
+            }
+            LOG_WARN("VLESS outbound '{}': encryption '{}' is valid VLESS Encryption syntax but runtime support is not implemented yet",
                      cfg.tag,
                      vless_config.encryption);
             return std::nullopt;
