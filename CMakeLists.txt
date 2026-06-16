@@ -353,6 +353,7 @@ set(CNODE_SOURCES
     src/proxy/vless/validator.cpp
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption.cpp
+    src/proxy/vless/vless_encryption_crypto.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
     src/proxy/vless/outbound/vless_outbound.cpp

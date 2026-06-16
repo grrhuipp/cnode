@@ -27,6 +27,7 @@ enum class VlessEncryptionParseError : uint8_t {
     InvalidSeconds,
     InvalidBase64,
     InvalidKeyLength,
+    InvalidKeyMaterial,
     EmptyKeys,
     InvalidPadding,
     PaddingTooLarge,

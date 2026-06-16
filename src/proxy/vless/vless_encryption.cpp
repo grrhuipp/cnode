@@ -1,5 +1,7 @@
 #include "vless_encryption.hpp"
 
+#include "vless_encryption_crypto.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -10,9 +12,6 @@ namespace acpp::vless {
 namespace {
 
 constexpr std::string_view kEncryptionName = "mlkem768x25519plus";
-constexpr size_t kX25519KeySize = 32;
-constexpr size_t kMlKem768SeedSize = 64;
-constexpr size_t kMlKem768ClientKeySize = 1184;
 constexpr int kFirstPaddingMinProbability = 100;
 constexpr int kFirstPaddingMinLength = 18 + 17;
 constexpr int kMaxPaddingLength = 18 + 65535;
@@ -231,10 +230,22 @@ constexpr int kMaxPaddingLength = 18 + 65535;
         }
         const size_t len = key->size();
         const bool key_ok = role == VlessEncryptionRole::Client
-            ? (len == kX25519KeySize || len == kMlKem768ClientKeySize)
-            : (len == kX25519KeySize || len == kMlKem768SeedSize);
+            ? (len == kVlessX25519KeySize ||
+               len == kVlessMlKem768PublicKeySize)
+            : (len == kVlessX25519KeySize ||
+               len == kVlessMlKem768SeedSize);
         if (!key_ok) {
             return {.error = VlessEncryptionParseError::InvalidKeyLength};
+        }
+        if (role == VlessEncryptionRole::Client &&
+            len == kVlessMlKem768PublicKeySize &&
+            !ValidateVlessMlKem768PublicKey(*key)) {
+            return {.error = VlessEncryptionParseError::InvalidKeyMaterial};
+        }
+        if (role == VlessEncryptionRole::Server &&
+            len == kVlessMlKem768SeedSize &&
+            !DeriveVlessMlKem768PublicKeyFromSeed(*key)) {
+            return {.error = VlessEncryptionParseError::InvalidKeyMaterial};
         }
         config.keys.push_back(std::move(*key));
     }
@@ -292,6 +303,8 @@ std::string_view VlessEncryptionParseErrorMessage(
         return "invalid raw URL base64 key";
     case VlessEncryptionParseError::InvalidKeyLength:
         return "invalid key length";
+    case VlessEncryptionParseError::InvalidKeyMaterial:
+        return "invalid key material";
     case VlessEncryptionParseError::EmptyKeys:
         return "missing key material";
     case VlessEncryptionParseError::InvalidPadding:
