@@ -776,6 +776,9 @@ private:
         size_t copied = 0;
         while (copied < capacity) {
             if (chunk_remaining_ == 0) {
+                if (copied > 0) {
+                    co_return copied;
+                }
                 std::string line;
                 if (!co_await ReadLine(line)) {
                     read_closed_ = true;
@@ -808,6 +811,9 @@ private:
                 if (!co_await ReadExact(crlf.data(), crlf.size()) ||
                     crlf[0] != '\r' || crlf[1] != '\n') {
                     read_closed_ = true;
+                    co_return copied;
+                }
+                if (copied > 0) {
                     co_return copied;
                 }
             }
@@ -847,8 +853,16 @@ public:
     explicit XHttpPacketUpSession(net::io_context& io_context)
         : input_signal_(io_context) {}
 
+    void AttachStream(std::unique_ptr<AsyncStream> stream) {
+        if (closed_ || input_closed_ || !stream) {
+            return;
+        }
+        stream_input_ = std::move(stream);
+        Wake();
+    }
+
     void Push(uint64_t seq, std::vector<uint8_t> payload) {
-        if (closed_) {
+        if (closed_ || input_closed_) {
             return;
         }
         if (seq == next_seq_) {
@@ -869,13 +883,26 @@ public:
         Wake();
     }
 
+    void CloseInput() noexcept {
+        if (input_closed_) {
+            return;
+        }
+        input_closed_ = true;
+        Wake();
+    }
+
     void Close() noexcept {
         if (closed_) {
             return;
         }
         closed_ = true;
+        input_closed_ = true;
         ready_.clear();
         pending_.clear();
+        if (stream_input_) {
+            stream_input_->Close();
+            stream_input_.reset();
+        }
         Wake();
     }
 
@@ -902,7 +929,16 @@ public:
                 }
                 co_return n;
             }
-            if (closed_) {
+            if (stream_input_) {
+                const size_t n = co_await stream_input_->AsyncRead(buffer);
+                if (n > 0) {
+                    co_return n;
+                }
+                stream_input_.reset();
+                CloseInput();
+                co_return 0;
+            }
+            if (closed_ || input_closed_) {
                 co_return 0;
             }
             IoErrorCode ec;
@@ -921,8 +957,10 @@ private:
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     std::deque<std::vector<uint8_t>> ready_;
     std::map<uint64_t, std::vector<uint8_t>> pending_;
+    std::unique_ptr<AsyncStream> stream_input_;
     uint64_t next_seq_ = 0;
     size_t read_offset_ = 0;
+    bool input_closed_ = false;
     bool closed_ = false;
 };
 
@@ -3479,6 +3517,8 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
     const std::string_view transfer_encoding =
         ExtractHeaderValueCI(request, "Transfer-Encoding");
+    const std::string_view expect_header =
+        ExtractHeaderValueCI(request, "Expect");
     const bool request_chunked = HeaderContainsTokenCI(transfer_encoding, "chunked");
     const auto content_length =
         ParseContentLength(ExtractHeaderValueCI(request, "Content-Length"));
@@ -3523,7 +3563,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const size_t header_end = request.find("\r\n\r\n") + 4;
 
     if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
-        if (!xhttp_cfg.AcceptsPacketUp()) {
+        if (!xhttp_cfg.AcceptsPacketUp() && !xhttp_cfg.AcceptsStreamUp()) {
             co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         auto session = GetXHttpPacketSession(io_context, meta.session_id, true);
@@ -3545,9 +3585,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (header_end < total) {
             downlink->SetPendingData(data + header_end, total - header_end);
         }
-        LOG_ACCESS_DEBUG("[XHTTP:{}] server: packet-up downlink ready session={}",
+        LOG_ACCESS_DEBUG("[XHTTP:{}] server: split downlink ready session={} mode={}",
                          conn_id,
-                         meta.session_id);
+                         meta.session_id,
+                         xhttp_cfg.AcceptsStreamUp() ? "stream-up" : "packet-up");
         co_return std::unique_ptr<AsyncStream>(
             std::make_unique<XHttpPacketUpServerStream>(
                 std::move(session),
@@ -3593,7 +3634,46 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     }
 
     if (meta.kind == XHttpRequestMeta::Kind::StreamUp) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        if (!xhttp_cfg.AcceptsStreamUp()) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        auto session = GetXHttpPacketSession(io_context, meta.session_id, true);
+        if (!session) {
+            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        if (HeaderContainsTokenCI(expect_header, "100-continue")) {
+            constexpr std::string_view continue_response = "HTTP/1.1 100 Continue\r\n\r\n";
+            if (!co_await WriteFullToStream(
+                    *stream,
+                    unsafe::ptr_cast<const uint8_t>(continue_response.data()),
+                    continue_response.size())) {
+                co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            }
+        }
+        // Keep the upload response body open while the VLESS stream reads request chunks.
+        const std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "X-Accel-Buffering: no\r\n"
+            "Cache-Control: no-store\r\n"
+            "\r\n";
+        if (!co_await WriteFullToStream(
+                *stream,
+                unsafe::ptr_cast<const uint8_t>(response.data()),
+                response.size())) {
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+        auto body = std::make_unique<Http1BodyStream>(
+            std::move(stream),
+            request_chunked,
+            false);
+        if (header_end < total) {
+            body->SetPendingData(data + header_end, total - header_end);
+        }
+        LOG_ACCESS_DEBUG("[XHTTP:{}] server: stream-up upload ready session={}",
+                         conn_id,
+                         meta.session_id);
+        session->AttachStream(std::move(body));
+        co_return std::unique_ptr<AsyncStream>{};
     }
 
     co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
