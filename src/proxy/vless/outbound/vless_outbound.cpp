@@ -1,6 +1,7 @@
 #include "acppnode/proxy/vless/outbound/vless_outbound.hpp"
 
 #include "../vless_codec.hpp"
+#include "../vless_vision.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
@@ -289,11 +290,18 @@ public:
     VlessOutboundEndpoint(AsyncStream& stream,
                           bool is_udp,
                           TargetAddress udp_target,
-                          bool packet_addr = false)
+                          bool packet_addr = false,
+                          bool vision = false,
+                          std::array<uint8_t, 16> user_uuid = {})
         : stream_(stream)
         , is_udp_(is_udp)
         , udp_target_(std::move(udp_target))
-        , packet_addr_(packet_addr) {}
+        , packet_addr_(packet_addr) {
+        if (vision) {
+            vision_reader_.emplace(stream_, user_uuid);
+            vision_writer_.emplace(stream_, user_uuid);
+        }
+    }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!response_header_read_) {
@@ -306,6 +314,9 @@ public:
         }
 
         if (!is_udp_) {
+            if (vision_reader_) {
+                co_return co_await vision_reader_->ReadMultiBuffer();
+            }
             co_return co_await stream_.ReadMultiBuffer();
         }
 
@@ -347,6 +358,10 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!is_udp_) {
+            if (vision_writer_) {
+                co_await vision_writer_->WriteMultiBuffer(std::move(mb));
+                co_return;
+            }
             co_await stream_.WriteMultiBuffer(std::move(mb));
             co_return;
         }
@@ -472,6 +487,8 @@ private:
     bool is_udp_ = false;
     TargetAddress udp_target_;
     bool packet_addr_ = false;
+    std::optional<::acpp::vless::VisionReader> vision_reader_;
+    std::optional<::acpp::vless::VisionWriter> vision_writer_;
     VlessUdpFramer framer_;
 };
 
@@ -756,8 +773,10 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
     config_.flow = ::acpp::vless::NormalizeFlow(config_.flow);
     if (auto uuid_bytes = ::acpp::vless::ParseUuidBytes(config_.uuid)) {
         config_.uuid_bytes = *uuid_bytes;
+        const bool flow_ok =
+            config_.flow.empty() || ::acpp::vless::IsVisionFlow(config_.flow);
         config_valid_ =
-            config_.flow.empty() &&
+            flow_ok &&
             (config_.encryption.empty() ||
              config_.encryption == constants::protocol::kNone);
     }
@@ -843,6 +862,16 @@ proxy::vless::outbound::Handler::Process(
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     const bool is_udp = ctx.content.network == Network::UDP;
+    const bool use_vision =
+        !is_udp &&
+        ctx.content.network == Network::TCP &&
+        ::acpp::vless::IsVisionFlow(config_.flow);
+    if (!config_.flow.empty() && !use_vision) {
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (use_vision && !config_.stream_settings.IsTls()) {
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
     const bool use_xudp = is_udp && config_.packet_xudp;
     const bool use_packet_addr = is_udp && config_.packet_addr;
     TargetAddress request_target = use_packet_addr
@@ -856,7 +885,8 @@ proxy::vless::outbound::Handler::Process(
             : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
         request_target,
         header.data(),
-        header.size());
+        header.size(),
+        use_vision ? std::string_view(config_.flow) : std::string_view{});
     if (header_len == 0) {
         co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -904,7 +934,13 @@ proxy::vless::outbound::Handler::Process(
             target_endpoint, ctx, stats, relay_config);
     }
 
-    VlessOutboundEndpoint target_endpoint(*stream, is_udp, target, use_packet_addr);
+    VlessOutboundEndpoint target_endpoint(
+        *stream,
+        is_udp,
+        target,
+        use_packet_addr,
+        use_vision,
+        config_.uuid_bytes);
     if (buf::TotalLen(first_payload) > 0) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
@@ -1059,7 +1095,8 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         vless_config.flow = acpp::vless::NormalizeFlow(vless_config.flow);
-        if (!vless_config.flow.empty()) {
+        if (!vless_config.flow.empty() &&
+            !acpp::vless::IsVisionFlow(vless_config.flow)) {
             LOG_WARN("VLESS outbound '{}': flow '{}' is not supported",
                      cfg.tag, vless_config.flow);
             return std::nullopt;

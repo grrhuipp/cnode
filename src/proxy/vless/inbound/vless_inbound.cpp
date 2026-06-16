@@ -1,7 +1,9 @@
 #include "acppnode/proxy/vless/inbound/vless_inbound.hpp"
 
 #include "../vless_codec.hpp"
+#include "../vless_vision.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/udp_types.hpp"
@@ -33,7 +35,6 @@ namespace {
 
 constexpr std::string_view kPacketAddrMagicAddress =
     "sp.packet-addr.v2fly.arpa";
-constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
 bool IsPacketAddrMagic(const TargetAddress& target) {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
@@ -507,21 +508,32 @@ proxy::vless::inbound::Handler::Process(
         LOG_CONN_FAIL("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
+    const bool use_vision = ::acpp::vless::IsVisionFlow(request->flow);
     if (!request->flow.empty()) {
         if (request->flow != user_info->flow) {
             LOG_CONN_FAIL("[VLESS][{}] request flow '{}' not allowed for user",
                           tag, request->flow);
             co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
-        if (request->flow == kVisionFlow) {
-            LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, request->flow);
+        if (!use_vision) {
+            LOG_CONN_FAIL("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
             co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
-        LOG_CONN_FAIL("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
+    }
+    if (!user_info->flow.empty() && !::acpp::vless::IsVisionFlow(user_info->flow)) {
+        LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
-    if (!user_info->flow.empty()) {
-        LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
+    if (request->flow.empty() && ::acpp::vless::IsVisionFlow(user_info->flow)) {
+        LOG_CONN_FAIL("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (use_vision && request->command != ::acpp::vless::Command::TCP) {
+        LOG_CONN_FAIL("[VLESS][{}] flow '{}' only supports TCP", tag, request->flow);
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (use_vision && !receiver.stream_settings.IsTls()) {
+        LOG_CONN_FAIL("[VLESS][{}] flow '{}' requires TLS transport", tag, request->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
@@ -611,6 +623,21 @@ proxy::vless::inbound::Handler::Process(
     }
 
     auto* tcp_stream = stream.get();
+    if (use_vision) {
+        ::acpp::vless::VisionReader vision_reader(*tcp_stream, request->uuid, leftover);
+        ::acpp::vless::VisionWriter vision_writer(*tcp_stream, request->uuid);
+        co_return co_await dispatcher.Dispatch(
+            io_context,
+            receiver,
+            std::move(stream),
+            transport::Link{&vision_reader, &vision_writer},
+            InitialPayload{},
+            ctx,
+            *stats_,
+            timeouts,
+            pressure_idle_timeout);
+    }
+
     co_return co_await dispatcher.Dispatch(
         io_context,
         receiver,
