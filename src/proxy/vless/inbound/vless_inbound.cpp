@@ -645,8 +645,15 @@ const bool kVlessInboundRegistered = [] {
         };
 
     reg.build_static_users =
-        [](std::string_view /*tag*/, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
+            if (!config.vless_decryption.empty() &&
+                config.vless_decryption != acpp::constants::protocol::kNone) {
+                LOG_WARN("VLESS inbound '{}': decryption '{}' is not supported",
+                         tag,
+                         config.vless_decryption);
+                return std::nullopt;
+            }
             std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
             users.reserve(config.clients.size());
             for (const auto& client : config.clients) {

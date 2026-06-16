@@ -646,6 +646,10 @@ StaticUserConfig ParseStaticUserConfig(
             method && method->is_string()) {
         config.method = std::string(method->as_string());
     }
+    if (protocol == constants::protocol::kVless) {
+        config.vless_decryption = lower_ascii_copy(
+            jstr(settings, "decryption", std::string(constants::protocol::kNone)));
+    }
     if (const auto* padding = settings.if_contains("paddingScheme");
             padding && padding->is_array()) {
         bool first = true;

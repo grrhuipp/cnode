@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
@@ -24,6 +25,7 @@ struct VlessOutboundConfig {
     uint16_t port = 443;
     std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
+    std::string encryption = std::string(constants::protocol::kNone);
     std::string flow;
     bool packet_xudp = false;
     bool packet_addr = false;

@@ -56,6 +56,7 @@ struct StaticUserConfig {
     std::string method = std::string(constants::protocol::kAes256Gcm);
     std::string identity_password;
     std::string padding_scheme;
+    std::string vless_decryption = std::string(constants::protocol::kNone);
     std::vector<StaticUser> clients;
 };
 

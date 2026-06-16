@@ -746,18 +746,24 @@ private:
 }  // namespace
 
 proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
-                                         ::acpp::app::dns::DNS& dns_service)
+                                          ::acpp::app::dns::DNS& dns_service)
     : config_(config)
     , dns_service_(dns_service) {
     config_.literal_address = ParseLiteralAddress(config_.address);
+    std::ranges::transform(config_.encryption, config_.encryption.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     config_.flow = ::acpp::vless::NormalizeFlow(config_.flow);
     if (auto uuid_bytes = ::acpp::vless::ParseUuidBytes(config_.uuid)) {
         config_.uuid_bytes = *uuid_bytes;
-        config_valid_ = config_.flow.empty();
+        config_valid_ =
+            config_.flow.empty() &&
+            (config_.encryption.empty() ||
+             config_.encryption == constants::protocol::kNone);
     }
     if (!config_valid_) {
-        LOG_ERROR("VLESS outbound '{}': invalid UUID or unsupported flow '{}'",
-                  config_.tag, config_.flow);
+        LOG_ERROR("VLESS outbound '{}': invalid UUID, unsupported flow '{}', or unsupported encryption '{}'",
+                  config_.tag, config_.flow, config_.encryption);
     }
 
     NormalizeOutboundStreamSettings(
@@ -986,7 +992,11 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 if (vless_config.uuid.empty()) {
                     vless_config.uuid = json_string(user, "uuid");
                 }
+                vless_config.encryption = json_string(user, "encryption");
                 vless_config.flow = json_string(user, "flow");
+            }
+            if (vless_config.encryption.empty()) {
+                vless_config.encryption = json_string(s, "encryption");
             }
         } else {
             vless_config.address = json_string(s, "server");
@@ -998,7 +1008,17 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (vless_config.uuid.empty()) {
                 vless_config.uuid = json_string(s, "id");
             }
+            vless_config.encryption = json_string(s, "encryption");
             vless_config.flow = json_string(s, "flow");
+        }
+
+        vless_config.encryption = lower_ascii(std::move(vless_config.encryption));
+        if (!vless_config.encryption.empty() &&
+            vless_config.encryption != acpp::constants::protocol::kNone) {
+            LOG_WARN("VLESS outbound '{}': encryption '{}' is not supported",
+                     cfg.tag,
+                     vless_config.encryption);
+            return std::nullopt;
         }
 
         std::string packet_encoding = json_string(s, "packet_encoding");
