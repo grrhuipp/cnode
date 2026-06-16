@@ -12,6 +12,7 @@ struct StatsShard;
 
 namespace acpp::vless {
 struct VlessEncryptionConfig;
+class VlessEncryptionServerTicketStore;
 }  // namespace acpp::vless
 
 namespace acpp::proxy::vless::inbound {
@@ -22,6 +23,7 @@ public:
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
             std::string vless_decryption = {});
+    ~Handler() override;
 
     ::acpp::net::awaitable<::acpp::RelayResult> Process(
         std::unique_ptr<::acpp::AsyncStream> stream,
@@ -41,6 +43,8 @@ private:
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption_;
+    std::unique_ptr<::acpp::vless::VlessEncryptionServerTicketStore>
+        decryption_tickets_;
     bool ban_tracking_enabled_ = false;
 };
 

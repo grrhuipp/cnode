@@ -21,6 +21,7 @@ class DNS;
 
 namespace vless {
 struct VlessEncryptionConfig;
+struct VlessEncryptionClientTicketCache;
 }  // namespace vless
 
 struct VlessOutboundConfig {
@@ -68,6 +69,8 @@ private:
     ::acpp::VlessOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> encryption_;
+    std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
+        encryption_tickets_;
     bool config_valid_ = false;
 };
 

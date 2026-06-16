@@ -819,6 +819,8 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
                 encryption_ =
                     std::make_shared<::acpp::vless::VlessEncryptionConfig>(
                         std::move(*parsed.config));
+                encryption_tickets_ = std::make_unique<
+                    ::acpp::vless::VlessEncryptionClientTicketCache>();
             } else {
                 encryption_ok = false;
                 LOG_ERROR("VLESS outbound '{}': invalid encryption '{}': {}",
@@ -957,18 +959,29 @@ proxy::vless::outbound::Handler::Process(
     if (encryption_) {
         try {
             auto runtime =
-                co_await ::acpp::vless::RunVlessEncryptionClient1RttHandshake(
+                co_await ::acpp::vless::RunVlessEncryptionClientHandshake(
                     protocol_reader,
                     *protocol_writer,
-                    *encryption_);
+                    *encryption_,
+                    encryption_tickets_.get());
             if (!runtime) {
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
-            encrypted_reader.emplace(
-                protocol_reader,
-                std::move(runtime->read_aead),
-                runtime->united_key,
-                std::move(runtime->read_xor));
+            if (runtime->read_aead_ready) {
+                encrypted_reader.emplace(
+                    protocol_reader,
+                    std::move(runtime->read_aead),
+                    runtime->united_key,
+                    std::move(runtime->read_xor));
+            } else {
+                encrypted_reader.emplace(
+                    ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
+                        protocol_reader,
+                        runtime->lazy_read_context_size,
+                        runtime->united_key,
+                        runtime->cipher,
+                        runtime->lazy_read_xor_from_context));
+            }
             encrypted_writer.emplace(
                 *protocol_writer,
                 std::move(runtime->write_aead),

@@ -58,6 +58,20 @@ std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
         std::move(header_xor));
 }
 
+VlessEncryptionReader VlessEncryptionReader::CreateLazyReadContext(
+    transport::MultiBufferReader& src,
+    size_t read_context_size,
+    std::span<const uint8_t> united_key,
+    VlessEncryptionAeadCipher cipher,
+    bool header_xor_from_context) noexcept {
+    return VlessEncryptionReader(
+        src,
+        read_context_size,
+        cipher,
+        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        header_xor_from_context);
+}
+
 VlessEncryptionReader::VlessEncryptionReader(
     transport::MultiBufferReader& src,
     VlessEncryptionAead aead,
@@ -68,7 +82,49 @@ VlessEncryptionReader::VlessEncryptionReader(
     , united_key_(std::move(united_key))
     , header_xor_(std::move(header_xor)) {}
 
+VlessEncryptionReader::VlessEncryptionReader(
+    transport::MultiBufferReader& src,
+    size_t read_context_size,
+    VlessEncryptionAeadCipher cipher,
+    std::vector<uint8_t> united_key,
+    bool header_xor_from_context) noexcept
+    : src_(src)
+    , united_key_(std::move(united_key))
+    , aead_ready_(false)
+    , cipher_(cipher)
+    , pending_read_context_size_(read_context_size)
+    , header_xor_from_context_(header_xor_from_context) {}
+
 net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
+    if (!aead_ready_) {
+        std::vector<uint8_t> context(pending_read_context_size_);
+        if (!co_await src_.ReadExact(context.data(), context.size())) {
+            ThrowVlessEncryptionIoError("VLESS Encryption lazy context missing");
+        }
+        auto aead = VlessEncryptionAead::Create(context, united_key_, cipher_);
+        if (!aead) {
+            ThrowVlessEncryptionIoError("VLESS Encryption lazy context invalid");
+        }
+        aead_ = std::move(*aead);
+        if (header_xor_from_context_) {
+            if (context.size() != kVlessEncryptionCtrIvSize) {
+                ThrowVlessEncryptionIoError("VLESS Encryption lazy xor context invalid");
+            }
+            auto xor_ctx = VlessEncryptionHeaderXor::Create(
+                united_key_,
+                std::span<const uint8_t, kVlessEncryptionCtrIvSize>(
+                    context.data(),
+                    context.size()));
+            if (!xor_ctx) {
+                ThrowVlessEncryptionIoError("VLESS Encryption lazy xor failed");
+            }
+            header_xor_ = std::move(*xor_ctx);
+        }
+        aead_ready_ = true;
+        pending_read_context_size_ = 0;
+        header_xor_from_context_ = false;
+    }
+
     std::array<uint8_t, kVlessEncryptionRecordHeaderSize> header{};
     const bool have_header = co_await src_.ReadExact(
         header.data(),

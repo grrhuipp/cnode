@@ -450,6 +450,8 @@ proxy::vless::inbound::Handler::Handler(
             decryption_ =
                 std::make_shared<::acpp::vless::VlessEncryptionConfig>(
                     std::move(*parsed.config));
+            decryption_tickets_ = std::make_unique<
+                ::acpp::vless::VlessEncryptionServerTicketStore>();
         } else {
             LOG_WARN("VLESS inbound decryption ignored '{}': {}",
                      vless_decryption,
@@ -458,6 +460,8 @@ proxy::vless::inbound::Handler::Handler(
         }
     }
 }
+
+proxy::vless::inbound::Handler::~Handler() = default;
 
 net::awaitable<RelayResult>
 proxy::vless::inbound::Handler::Process(
@@ -507,20 +511,31 @@ proxy::vless::inbound::Handler::Process(
     if (decryption_) {
         try {
             auto runtime =
-                co_await ::acpp::vless::RunVlessEncryptionServer1RttHandshake(
+                co_await ::acpp::vless::RunVlessEncryptionServerHandshake(
                     protocol_reader,
                     *protocol_writer,
-                    *decryption_);
+                    *decryption_,
+                    decryption_tickets_.get());
             if (!runtime) {
                 LOG_CONN_FAIL("[VLESS][{}] encryption handshake failed from {}",
                               tag, client_ip);
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
-            encrypted_reader.emplace(
-                protocol_reader,
-                std::move(runtime->read_aead),
-                runtime->united_key,
-                std::move(runtime->read_xor));
+            if (runtime->read_aead_ready) {
+                encrypted_reader.emplace(
+                    protocol_reader,
+                    std::move(runtime->read_aead),
+                    runtime->united_key,
+                    std::move(runtime->read_xor));
+            } else {
+                encrypted_reader.emplace(
+                    ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
+                        protocol_reader,
+                        runtime->lazy_read_context_size,
+                        runtime->united_key,
+                        runtime->cipher,
+                        runtime->lazy_read_xor_from_context));
+            }
             encrypted_writer.emplace(
                 *protocol_writer,
                 std::move(runtime->write_aead),

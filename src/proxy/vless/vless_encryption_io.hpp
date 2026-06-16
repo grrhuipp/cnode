@@ -25,11 +25,24 @@ public:
         std::optional<VlessEncryptionHeaderXor> header_xor =
             std::nullopt) noexcept;
 
+    [[nodiscard]] static VlessEncryptionReader CreateLazyReadContext(
+        transport::MultiBufferReader& src,
+        size_t read_context_size,
+        std::span<const uint8_t> united_key,
+        VlessEncryptionAeadCipher cipher,
+        bool header_xor_from_context) noexcept;
+
     VlessEncryptionReader(transport::MultiBufferReader& src,
                           VlessEncryptionAead aead,
                           std::vector<uint8_t> united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
+
+    VlessEncryptionReader(transport::MultiBufferReader& src,
+                          size_t read_context_size,
+                          VlessEncryptionAeadCipher cipher,
+                          std::vector<uint8_t> united_key,
+                          bool header_xor_from_context) noexcept;
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
@@ -40,6 +53,10 @@ private:
     VlessEncryptionAead aead_;
     std::vector<uint8_t> united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
+    bool aead_ready_ = true;
+    VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
+    size_t pending_read_context_size_ = 0;
+    bool header_xor_from_context_ = false;
 };
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
