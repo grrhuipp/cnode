@@ -278,7 +278,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.network);
 
     std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler;
-    if (listener.stream_settings.IsGrpc()) {
+    if (listener.stream_settings.IsGrpc() || listener.stream_settings.IsHttp()) {
         logical_stream_handler = std::make_shared<LogicalTransportStreamSink>(
             *this,
             io_context,

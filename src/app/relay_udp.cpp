@@ -295,6 +295,10 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     LOG_CONN_DEBUG(ctx, "Unregistered Full Cone callback {}", callback_id);
     co_await net::post(io_context.get_executor(), net::use_awaitable);
     FlushUdpRelayStats(stats, stats_acc);
+    try {
+        co_await client_writer.AsyncShutdownWrite();
+    } catch (...) {
+    }
 
 #ifndef NDEBUG
     if (state.total_replies > 0) {

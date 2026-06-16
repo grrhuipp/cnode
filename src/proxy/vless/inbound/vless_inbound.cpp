@@ -399,7 +399,7 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        dst_.ShutdownWrite();
+        co_await dst_.AsyncShutdownWrite();
         co_return;
     }
 

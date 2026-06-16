@@ -17,7 +17,8 @@ enum class NetworkMode : uint8_t {
     Ws  = 1,
     HttpUpgrade = 2,
     Grpc = 3,
-    XHttp = 4,
+    Http = 4,
+    XHttp = 5,
     Unsupported = 255,
 };
 
@@ -34,8 +35,9 @@ enum StreamFlags : uint8_t {
     kFlagTls         = 1 << 1,
     kFlagHttpUpgrade = 1 << 2,
     kFlagGrpc        = 1 << 3,
-    kFlagXHttp       = 1 << 4,
-    kFlagReality     = 1 << 5,
+    kFlagHttp        = 1 << 4,
+    kFlagXHttp       = 1 << 5,
+    kFlagReality     = 1 << 6,
 };
 
 // ============================================================================
@@ -72,6 +74,27 @@ struct HttpUpgradeConfig {
 };
 
 // ============================================================================
+// V2Ray HTTP / h2 传输配置
+// ============================================================================
+struct HttpConfig {
+    std::string path = std::string(constants::binding::kRootPath);
+    std::string host;
+    std::string method;
+    transport::internet::HttpHeaders headers;
+
+    // 明确配置后才信任指定 header 覆盖 TCP 层源地址。
+    std::string real_ip_header;
+
+    // network == "h2" 时强制使用 HTTP/2；network == "http" 时按生态习惯：
+    // TLS 使用 HTTP/2，明文使用 HTTP/1.1。
+    bool force_http2 = false;
+
+    int initial_window_size = 0;
+
+    static HttpConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
 // gRPC 传输配置
 // ============================================================================
 struct GrpcConfig {
@@ -104,6 +127,7 @@ struct StreamSettings {
     TlsConfig tls;             // 当 security == "tls" 时生效
     WsConfig  ws;              // 当 network  == "ws" / "websocket" 时生效
     HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
+    HttpConfig http;            // 当 network == "http" / "h2" 时生效
     GrpcConfig grpc;           // 当 network == "grpc" 时生效
 
     // 归一化后的缓存字段（热路径使用）
@@ -115,6 +139,7 @@ struct StreamSettings {
     bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
     bool IsWs()  const noexcept { return (flags & kFlagWs)  != 0; }
     bool IsHttpUpgrade() const noexcept { return (flags & kFlagHttpUpgrade) != 0; }
+    bool IsHttp() const noexcept { return (flags & kFlagHttp) != 0; }
     bool IsGrpc() const noexcept { return (flags & kFlagGrpc) != 0; }
     bool IsXHttp() const noexcept { return (flags & kFlagXHttp) != 0; }
     bool IsUnsupported() const noexcept {
@@ -123,7 +148,8 @@ struct StreamSettings {
     }
     bool NeedsHttpRealIpExtraction() const noexcept {
         return (IsWs() && !ws.real_ip_header.empty()) ||
-               (IsHttpUpgrade() && !http_upgrade.real_ip_header.empty());
+               (IsHttpUpgrade() && !http_upgrade.real_ip_header.empty()) ||
+               (IsHttp() && !http.real_ip_header.empty());
     }
 
     // 供手动赋值场景调用（如面板动态配置构建）

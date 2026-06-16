@@ -188,6 +188,30 @@ SslContext* AcquireClientTlsContext(const TlsConfig& config) {
     return request.substr(0, end);
 }
 
+[[nodiscard]] std::string_view ExtractRequestMethod(std::string_view request_line) {
+    const size_t end = request_line.find(' ');
+    if (end == std::string_view::npos) {
+        return {};
+    }
+    return request_line.substr(0, end);
+}
+
+[[nodiscard]] std::string_view ExtractRequestPathAny(std::string_view request_line) {
+    const size_t first_space = request_line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return {};
+    }
+    size_t start = first_space + 1;
+    while (start < request_line.size() && request_line[start] == ' ') {
+        ++start;
+    }
+    const size_t end = request_line.find(' ', start);
+    if (end == std::string_view::npos || end <= start) {
+        return {};
+    }
+    return request_line.substr(start, end - start);
+}
+
 [[nodiscard]] std::string_view ExtractRequestPath(std::string_view request_line) {
     constexpr std::string_view kGet = "GET ";
     if (!request_line.starts_with(kGet)) {
@@ -722,6 +746,101 @@ void AppendHpackLiteralNewName(std::vector<uint8_t>& out,
     return h;
 }
 
+enum class H2PayloadCodec : uint8_t {
+    GrpcHunk,
+    RawData,
+};
+
+[[nodiscard]] std::string_view EffectiveHttpMethod(std::string_view method) {
+    return method.empty() ? std::string_view("PUT") : method;
+}
+
+[[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
+    std::string_view authority,
+    std::string_view path,
+    bool tls,
+    const HttpConfig& cfg) {
+    const std::string_view method = EffectiveHttpMethod(cfg.method);
+    const std::string_view req_path = EffectivePath(path);
+    std::vector<uint8_t> h;
+    h.reserve(128 + authority.size() + req_path.size() + method.size() +
+              cfg.headers.size() * 32);
+
+    if (method == "GET") {
+        AppendHpackIndexed(h, 2); // :method: GET
+    } else if (method == "POST") {
+        AppendHpackIndexed(h, 3); // :method: POST
+    } else {
+        AppendHpackLiteralIndexedName(h, 2, method); // :method
+    }
+    AppendHpackIndexed(h, tls ? 7 : 6); // :scheme
+    if (req_path == "/") {
+        AppendHpackIndexed(h, 4); // :path: /
+    } else {
+        AppendHpackLiteralIndexedName(h, 4, req_path); // :path
+    }
+    if (!authority.empty()) {
+        AppendHpackLiteralIndexedName(h, 1, authority); // :authority
+    }
+    for (const auto& [key, value] : cfg.headers) {
+        if (key.empty() || IsHostHeader(key)) {
+            continue;
+        }
+        AppendHpackLiteralNewName(h, key, value);
+    }
+    return h;
+}
+
+[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(
+    const transport::internet::HttpHeaders& headers) {
+    std::vector<uint8_t> h;
+    h.reserve(64 + headers.size() * 32);
+    AppendHpackIndexed(h, 8); // :status: 200
+    AppendHpackLiteralNewName(h, "cache-control", "no-store");
+    for (const auto& [key, value] : headers) {
+        if (key.empty()) {
+            continue;
+        }
+        AppendHpackLiteralNewName(h, key, value);
+    }
+    return h;
+}
+
+net::awaitable<bool> WriteH2DataPayload(
+    AsyncStream& stream,
+    uint32_t stream_id,
+    std::span<const uint8_t> data,
+    bool end_stream = false) {
+    if (data.empty()) {
+        co_return co_await WriteH2Frame(
+            stream,
+            H2FrameType::DATA,
+            end_stream ? 0x1 : 0,
+            stream_id);
+    }
+
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const size_t chunk = std::min(
+            data.size() - offset,
+            kHttp2MaxFramePayload);
+        std::array<net::const_buffer, 1> payload{
+            net::buffer(data.data() + offset, chunk)
+        };
+        const bool last = (offset + chunk) >= data.size();
+        if (!co_await WriteH2FrameBuffers(
+                stream,
+                H2FrameType::DATA,
+                (end_stream && last) ? 0x1 : 0,
+                stream_id,
+                payload)) {
+            co_return false;
+        }
+        offset += chunk;
+    }
+    co_return true;
+}
+
 size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept;
 
 [[noreturn]] void ThrowGrpcStreamError(const char* what) {
@@ -941,10 +1060,12 @@ public:
     GrpcStream(std::unique_ptr<AsyncStream> inner,
                uint32_t stream_id,
                Role role,
+               H2PayloadCodec payload_codec,
                uint64_t conn_id)
         : inner_(std::move(inner))
         , stream_id_(stream_id)
         , role_(role)
+        , payload_codec_(payload_codec)
         , conn_id_(conn_id) {}
 
     ~GrpcStream() noexcept override {
@@ -956,6 +1077,24 @@ public:
         const size_t capacity = buffer.size();
         if (capacity == 0) {
             co_return 0;
+        }
+
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            while (h2_data_offset_ >= h2_data_.size()) {
+                h2_data_.clear();
+                h2_data_offset_ = 0;
+                if (!co_await ReadNextDataFrame()) {
+                    co_return 0;
+                }
+            }
+            const size_t n = std::min(capacity, h2_data_.size() - h2_data_offset_);
+            std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
+            h2_data_offset_ += n;
+            if (h2_data_offset_ >= h2_data_.size()) {
+                h2_data_.clear();
+                h2_data_offset_ = 0;
+            }
+            co_return n;
         }
 
         while (read_offset_ >= read_payload_.size()) {
@@ -980,6 +1119,15 @@ public:
         }
         const auto* data = static_cast<const uint8_t*>(buffer.data());
         const size_t len = buffer.size();
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            if (!co_await WriteH2DataPayload(
+                    *inner_,
+                    stream_id_,
+                    std::span<const uint8_t>(data, len))) {
+                ThrowGrpcStreamError("HTTP/2 raw write failed");
+            }
+            co_return len;
+        }
         if (!co_await WriteGrpcMessage(std::span<const uint8_t>(data, len))) {
             ThrowGrpcStreamError("gRPC write failed");
         }
@@ -1009,10 +1157,18 @@ public:
             }
             if (!buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
-                if (!co_await WriteGrpcMessage(bytes)) {
-                    buf::Buffer::Free(buffer);
-                    buffer = nullptr;
-                    ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
+                if (payload_codec_ == H2PayloadCodec::RawData) {
+                    if (!co_await WriteH2DataPayload(*inner_, stream_id_, bytes)) {
+                        buf::Buffer::Free(buffer);
+                        buffer = nullptr;
+                        ThrowGrpcStreamError("HTTP/2 raw WriteMultiBuffer failed");
+                    }
+                } else {
+                    if (!co_await WriteGrpcMessage(bytes)) {
+                        buf::Buffer::Free(buffer);
+                        buffer = nullptr;
+                        ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
+                    }
                 }
             }
             buf::Buffer::Free(buffer);
@@ -1028,9 +1184,18 @@ public:
                 continue;
             }
             const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!co_await WriteGrpcMessage(
-                    std::span<const uint8_t>(data, buffer.size()))) {
-                ThrowGrpcStreamError("gRPC WriteBuffers failed");
+            if (payload_codec_ == H2PayloadCodec::RawData) {
+                if (!co_await WriteH2DataPayload(
+                        *inner_,
+                        stream_id_,
+                        std::span<const uint8_t>(data, buffer.size()))) {
+                    ThrowGrpcStreamError("HTTP/2 raw WriteBuffers failed");
+                }
+            } else {
+                if (!co_await WriteGrpcMessage(
+                        std::span<const uint8_t>(data, buffer.size()))) {
+                    ThrowGrpcStreamError("gRPC WriteBuffers failed");
+                }
             }
         }
     }
@@ -1055,7 +1220,9 @@ public:
             co_return;
         }
         write_closed_ = true;
-        if (role_ == Role::Server) {
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            (void)co_await WriteH2DataPayload(*inner_, stream_id_, {}, true);
+        } else if (role_ == Role::Server) {
             auto trailers = EncodeGrpcTrailers();
             (void)co_await WriteH2Frame(
                 *inner_,
@@ -1239,6 +1406,7 @@ private:
     std::unique_ptr<AsyncStream> inner_;
     uint32_t stream_id_ = 1;
     Role role_ = Role::Client;
+    H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     uint64_t conn_id_ = 0;
     std::vector<uint8_t> h2_data_;
     size_t h2_data_offset_ = 0;
@@ -1256,6 +1424,7 @@ public:
     GrpcServerSubStreamState(net::io_context& io_context,
                              std::shared_ptr<GrpcServerSession> session,
                              uint32_t stream_id,
+                             H2PayloadCodec payload_codec,
                              uint64_t conn_id);
 
     [[nodiscard]] uint32_t StreamId() const noexcept {
@@ -1288,11 +1457,13 @@ private:
 
     net::awaitable<bool> ReadNextGrpcMessage();
     net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len);
+    net::awaitable<size_t> AsyncReadRaw(net::mutable_buffer buffer);
 
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     std::weak_ptr<GrpcServerSession> session_;
     uint32_t stream_id_ = 0;
+    H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     uint64_t conn_id_ = 0;
     std::deque<std::vector<uint8_t>> h2_data_queue_;
     size_t h2_data_offset_ = 0;
@@ -1407,11 +1578,15 @@ public:
     GrpcServerSession(net::io_context& io_context,
                       std::unique_ptr<AsyncStream> stream,
                       std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+                      H2PayloadCodec payload_codec,
+                      const transport::internet::HttpHeaders* response_headers,
                       uint64_t conn_id)
         : io_context_(io_context)
         , stream_(std::move(stream))
         , stream_handler_(std::move(stream_handler))
         , write_signal_(io_context, 1)
+        , payload_codec_(payload_codec)
+        , response_headers_(response_headers)
         , conn_id_(conn_id) {}
 
     ~GrpcServerSession() noexcept {
@@ -1438,6 +1613,7 @@ public:
             io_context_,
             shared_from_this(),
             stream_id,
+            payload_codec_,
             conn_id_);
         streams_.emplace(stream_id, sub);
         return sub;
@@ -1534,6 +1710,38 @@ public:
         co_return co_await WriteGrpcHunkMessage(*stream_, stream_id, data);
     }
 
+    net::awaitable<bool> WriteRawDataSerialized(
+        uint32_t stream_id,
+        std::span<const uint8_t> data,
+        bool end_stream = false) {
+        while (write_busy_ && !cancelled_) {
+            auto [ec] = co_await write_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                co_return false;
+            }
+        }
+        if (cancelled_ || !stream_) {
+            co_return false;
+        }
+
+        write_busy_ = true;
+        auto guard = std::unique_ptr<void, void(*)(void*)>{
+            this,
+            [](void* ptr) {
+                auto* self = static_cast<GrpcServerSession*>(ptr);
+                self->write_busy_ = false;
+                self->WakeWriter();
+            }};
+        (void)guard;
+
+        co_return co_await WriteH2DataPayload(
+            *stream_,
+            stream_id,
+            data,
+            end_stream);
+    }
+
     net::awaitable<bool> WriteTrailersSerialized(uint32_t stream_id) {
         auto trailers = EncodeGrpcTrailers();
         co_return co_await WriteFrameSerialized(
@@ -1541,6 +1749,10 @@ public:
             0x4 | 0x1,
             stream_id,
             trailers);
+    }
+
+    net::awaitable<bool> WriteRawEndSerialized(uint32_t stream_id) {
+        co_return co_await WriteRawDataSerialized(stream_id, {}, true);
     }
 
     net::awaitable<bool> SendWindowUpdateSerialized(
@@ -1647,7 +1859,10 @@ private:
         }
 
         auto sub = CreateStream(stream_id);
-        auto response_headers = EncodeGrpcResponseHeaders();
+        auto response_headers = payload_codec_ == H2PayloadCodec::RawData
+            ? EncodeHttpResponseHeaders(response_headers_ ? *response_headers_
+                                                          : transport::internet::HttpHeaders{})
+            : EncodeGrpcResponseHeaders();
         if (!co_await WriteFrameSerialized(
                 H2FrameType::HEADERS,
                 0x4,
@@ -1661,7 +1876,8 @@ private:
         }
 
         LOG_ACCESS_DEBUG(
-            "[gRPC:{}] server: accepted logical stream_id={}",
+            "[{}:{}] server: accepted logical stream_id={}",
+            payload_codec_ == H2PayloadCodec::RawData ? "HTTP/2" : "gRPC",
             conn_id_,
             stream_id);
 
@@ -1714,6 +1930,8 @@ private:
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     net::experimental::channel<void(IoErrorCode)> write_signal_;
     std::unordered_map<uint32_t, std::shared_ptr<GrpcServerSubStreamState>> streams_;
+    H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
+    const transport::internet::HttpHeaders* response_headers_ = nullptr;
     uint64_t conn_id_ = 0;
     bool write_busy_ = false;
     bool cancelled_ = false;
@@ -1723,11 +1941,13 @@ GrpcServerSubStreamState::GrpcServerSubStreamState(
     net::io_context& io_context,
     std::shared_ptr<GrpcServerSession> session,
     uint32_t stream_id,
+    H2PayloadCodec payload_codec,
     uint64_t conn_id)
     : io_context_(io_context)
     , input_signal_(io_context, 1)
     , session_(std::move(session))
     , stream_id_(stream_id)
+    , payload_codec_(payload_codec)
     , conn_id_(conn_id) {}
 
 bool GrpcServerSubStreamState::PushH2Data(std::span<const uint8_t> data) {
@@ -1807,8 +2027,12 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
         try {
             net::co_spawn(
                 io_context_.get_executor(),
-                [session, stream_id]() -> net::awaitable<void> {
-                    (void)co_await session->WriteTrailersSerialized(stream_id);
+                [session, stream_id, codec = payload_codec_]() -> net::awaitable<void> {
+                    if (codec == H2PayloadCodec::RawData) {
+                        (void)co_await session->WriteRawEndSerialized(stream_id);
+                    } else {
+                        (void)co_await session->WriteTrailersSerialized(stream_id);
+                    }
                     session->RemoveStream(stream_id);
                 },
                 net::detached);
@@ -1842,6 +2066,10 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncRead(
         co_return 0;
     }
 
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        co_return co_await AsyncReadRaw(buffer);
+    }
+
     while (read_offset_ >= read_payload_.size()) {
         if (!co_await ReadNextGrpcMessage()) {
             co_return 0;
@@ -1869,6 +2097,14 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncWrite(
     }
     const auto* data = static_cast<const uint8_t*>(buffer.data());
     const size_t len = buffer.size();
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        if (!co_await session->WriteRawDataSerialized(
+                stream_id_,
+                std::span<const uint8_t>(data, len))) {
+            ThrowGrpcStreamError("HTTP/2 raw server stream write failed");
+        }
+        co_return len;
+    }
     if (!co_await session->WriteGrpcMessageSerialized(
             stream_id_,
             std::span<const uint8_t>(data, len))) {
@@ -1937,8 +2173,55 @@ net::awaitable<void> GrpcServerSubStreamState::AsyncShutdownWrite() {
     trailers_sent_ = true;
     auto session = session_.lock();
     if (session) {
-        (void)co_await session->WriteTrailersSerialized(stream_id_);
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            (void)co_await session->WriteRawEndSerialized(stream_id_);
+        } else {
+            (void)co_await session->WriteTrailersSerialized(stream_id_);
+        }
     }
+}
+
+net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
+    net::mutable_buffer buffer) {
+    auto* out = static_cast<uint8_t*>(buffer.data());
+    const size_t capacity = buffer.size();
+
+    while (!cancelled_) {
+        if (read_cancelled_) {
+            read_cancelled_ = false;
+            throw IoSystemError(io_error::operation_aborted, "HTTP/2 raw read cancelled");
+        }
+
+        while (!h2_data_queue_.empty() &&
+               h2_data_offset_ >= h2_data_queue_.front().size()) {
+            queued_bytes_ -= std::min(
+                queued_bytes_,
+                h2_data_queue_.front().size());
+            h2_data_queue_.pop_front();
+            h2_data_offset_ = 0;
+        }
+
+        if (!h2_data_queue_.empty()) {
+            const auto& front = h2_data_queue_.front();
+            const size_t n = std::min(
+                capacity,
+                front.size() - h2_data_offset_);
+            std::memcpy(out, front.data() + h2_data_offset_, n);
+            h2_data_offset_ += n;
+            co_return n;
+        }
+
+        if (input_done_ || read_closed_) {
+            co_return 0;
+        }
+
+        auto [ec] = co_await input_signal_.async_receive(
+            net::as_tuple(net::use_awaitable));
+        if (ec) {
+            co_return 0;
+        }
+    }
+    co_return 0;
 }
 
 net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
@@ -2123,6 +2406,8 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
                 io_context,
                 std::move(stream),
                 std::move(stream_handler),
+                H2PayloadCodec::GrpcHunk,
+                nullptr,
                 conn_id);
             auto sub = session->CreateStream(stream_id);
             auto response_headers = EncodeGrpcResponseHeaders();
@@ -2206,7 +2491,458 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
             std::move(stream),
             1,
             GrpcStream::Role::Client,
+        H2PayloadCodec::GrpcHunk,
             conn_id));
+}
+
+[[nodiscard]] uint32_t HttpInitialWindow(const HttpConfig& cfg) noexcept {
+    if (cfg.initial_window_size > 0) {
+        return static_cast<uint32_t>(cfg.initial_window_size);
+    }
+    return kGrpcInitialWindow;
+}
+
+[[nodiscard]] bool HttpPathMatches(std::string_view configured,
+                                   std::string_view actual) {
+    const std::string_view expected = EffectivePath(configured);
+    actual = PathWithoutQuery(actual);
+    if (expected == "/") {
+        return actual.starts_with("/");
+    }
+    return actual.starts_with(expected);
+}
+
+[[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
+    if (!cfg.host.empty()) {
+        return cfg.host;
+    }
+    return FindConfiguredHost(cfg.headers);
+}
+
+[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
+
+[[nodiscard]] bool IsHttpOkStatus(std::string_view status_line) {
+    if (!status_line.starts_with("HTTP/")) {
+        return false;
+    }
+    size_t pos = status_line.find(' ');
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    while (pos < status_line.size() && status_line[pos] == ' ') {
+        ++pos;
+    }
+    return pos + 3 <= status_line.size() &&
+           status_line[pos] == '2' &&
+           status_line[pos + 1] == '0' &&
+           status_line[pos + 2] == '0' &&
+           (pos + 3 == status_line.size() || status_line[pos + 3] == ' ');
+}
+
+net::awaitable<TransportBuildResult> DoHttp2ServerHandshakeAfterPreface(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    net::io_context& io_context,
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+    uint64_t conn_id) {
+    auto settings = EncodeSettingsPayload(HttpInitialWindow(cfg));
+    if (!co_await WriteH2Frame(
+            *stream,
+            H2FrameType::SETTINGS,
+            0,
+            0,
+            settings)) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    while (true) {
+        auto frame = co_await ReadH2Frame(*stream);
+        if (!frame) {
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+
+        switch (frame->type) {
+        case H2FrameType::SETTINGS:
+            if ((frame->flags & 0x1) == 0) {
+                co_await AcknowledgeH2Settings(*stream);
+            }
+            break;
+        case H2FrameType::PING:
+            co_await ReplyH2Ping(*stream, *frame);
+            break;
+        case H2FrameType::HEADERS: {
+            if (frame->stream_id == 0) {
+                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            uint32_t stream_id = frame->stream_id;
+            while ((frame->flags & 0x4) == 0) {
+                auto cont = co_await ReadH2Frame(*stream);
+                if (!cont ||
+                    cont->type != H2FrameType::CONTINUATION ||
+                    cont->stream_id != stream_id) {
+                    co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                frame = std::move(cont);
+            }
+
+            auto session = std::make_shared<GrpcServerSession>(
+                io_context,
+                std::move(stream),
+                std::move(stream_handler),
+                H2PayloadCodec::RawData,
+                &cfg.headers,
+                conn_id);
+            auto sub = session->CreateStream(stream_id);
+            auto response_headers = EncodeHttpResponseHeaders(cfg.headers);
+            if (!co_await session->WriteFrameSerialized(
+                    H2FrameType::HEADERS,
+                    0x4,
+                    stream_id,
+                    response_headers)) {
+                co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            }
+            if ((frame->flags & 0x1) != 0 && sub) {
+                sub->CloseInput();
+            }
+
+            LOG_ACCESS_DEBUG(
+                "[HTTP/2:{}] server: handshake ok stream_id={} path={}",
+                conn_id,
+                stream_id,
+                EffectivePath(cfg.path));
+            net::co_spawn(
+                io_context.get_executor(),
+                [session]() -> net::awaitable<void> {
+                    co_await session->RunReadLoop();
+                },
+                net::detached);
+            co_return std::unique_ptr<AsyncStream>(
+                std::make_unique<GrpcServerSubStream>(std::move(sub)));
+        }
+        default:
+            break;
+        }
+    }
+}
+
+net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    uint64_t conn_id,
+    std::string* out_real_ip,
+    std::span<const uint8_t> initial) {
+    buf::BufferGuard handshake_buf{buf::Buffer::New()};
+    if (!handshake_buf) {
+        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    uint8_t* data = handshake_buf->Tail().data();
+    const size_t capacity = handshake_buf->Available();
+    if (initial.size() > capacity) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    std::memcpy(data, initial.data(), initial.size());
+    size_t total = initial.size();
+
+    bool found = std::string_view(
+        unsafe::ptr_cast<char>(data),
+        total).find("\r\n\r\n") != std::string_view::npos;
+    while (!found && total < capacity) {
+        size_t n = co_await stream->AsyncRead(
+            net::buffer(data + total, capacity - total));
+        if (n == 0) {
+            LOG_ACCESS_DEBUG("[HTTP:{}] server: peer closed during request read", conn_id);
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+        total += n;
+        std::string_view sv(unsafe::ptr_cast<char>(data), total);
+        if (sv.find("\r\n\r\n") != std::string_view::npos) {
+            found = true;
+        }
+    }
+    if (!found) {
+        LOG_ACCESS_DEBUG("[HTTP:{}] server: request too large or incomplete", conn_id);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    const std::string_view request(unsafe::ptr_cast<char>(data), total);
+    const std::string_view request_line = ExtractRequestLine(request);
+    const std::string_view method = ExtractRequestMethod(request_line);
+    const std::string_view request_path = ExtractRequestPathAny(request_line);
+    const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
+    const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
+
+    LOG_ACCESS_TRACE(
+        "[HTTP:{}] server: request line='{}' method='{}' path='{}' host='{}' ua='{}' bytes={}",
+        conn_id,
+        SanitizeForLog(request_line),
+        SanitizeForLog(method),
+        SanitizeForLog(request_path),
+        SanitizeForLog(host),
+        SanitizeForLog(user_agent),
+        total);
+
+    if (method.empty() || !HttpPathMatches(cfg.path, request_path)) {
+        LOG_ACCESS_DEBUG(
+            "[HTTP:{}] server: path mismatch expected='{}' actual='{}'",
+            conn_id,
+            EffectivePath(cfg.path),
+            SanitizeForLog(request_path));
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    if (!cfg.method.empty() && !EqualsAsciiCI(method, cfg.method)) {
+        LOG_ACCESS_DEBUG(
+            "[HTTP:{}] server: method mismatch expected='{}' actual='{}'",
+            conn_id,
+            cfg.method,
+            SanitizeForLog(method));
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
+        !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
+        LOG_ACCESS_DEBUG(
+            "[HTTP:{}] server: host mismatch expected='{}' actual='{}'",
+            conn_id,
+            SanitizeForLog(expected_host),
+            SanitizeForLog(host));
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    if (out_real_ip && !cfg.real_ip_header.empty()) {
+        std::string_view val = ExtractHeaderValueCI(request, cfg.real_ip_header);
+        if (!val.empty()) {
+            const size_t comma = val.find(',');
+            if (comma != std::string_view::npos) {
+                val = val.substr(0, comma);
+            }
+            val = TrimAscii(val);
+            if (!val.empty()) {
+                *out_real_ip = std::string(val);
+            }
+        }
+    }
+
+    std::string response;
+    response.reserve(96 + cfg.headers.size() * 32);
+    response.append("HTTP/1.1 200 OK\r\n");
+    response.append("Cache-Control: no-store\r\n");
+    for (const auto& [key, value] : cfg.headers) {
+        if (key.empty()) {
+            continue;
+        }
+        response.append(key);
+        response.append(": ");
+        response.append(value);
+        response.append("\r\n");
+    }
+    response.append("\r\n");
+
+    if (!co_await WriteFullToStream(
+            *stream,
+            unsafe::ptr_cast<const uint8_t>(response.data()),
+            response.size())) {
+        LOG_ACCESS_DEBUG("[HTTP:{}] server: failed to send 200 response", conn_id);
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    auto http = std::make_unique<HttpUpgradeStream>(std::move(stream));
+    const size_t header_end = request.find("\r\n\r\n") + 4;
+    if (header_end < total) {
+        http->SetPendingData(data + header_end, total - header_end);
+    }
+    LOG_ACCESS_DEBUG("[HTTP:{}] server: handshake ok (path={})",
+                     conn_id,
+                     EffectivePath(cfg.path));
+    co_return std::unique_ptr<AsyncStream>(std::move(http));
+}
+
+net::awaitable<TransportBuildResult> DoHttpServerHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    net::io_context& io_context,
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+    uint64_t conn_id,
+    std::string* out_real_ip) {
+    std::array<uint8_t, 24> first{};
+    size_t total = 0;
+    while (total < first.size()) {
+        const size_t n = co_await stream->AsyncRead(
+            net::buffer(first.data() + total, first.size() - total));
+        if (n == 0) {
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+        total += n;
+        std::string_view prefix(
+            unsafe::ptr_cast<const char>(first.data()),
+            total);
+        if (!kHttp2ClientPreface.starts_with(prefix)) {
+            break;
+        }
+    }
+
+    if (total == first.size() &&
+        std::string_view(unsafe::ptr_cast<const char>(first.data()), first.size()) ==
+            kHttp2ClientPreface) {
+        co_return co_await DoHttp2ServerHandshakeAfterPreface(
+            std::move(stream),
+            cfg,
+            io_context,
+            std::move(stream_handler),
+            conn_id);
+    }
+
+    co_return co_await DoHttp1ServerHandshake(
+        std::move(stream),
+        cfg,
+        conn_id,
+        out_real_ip,
+        std::span<const uint8_t>(first.data(), total));
+}
+
+net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view authority,
+    bool tls,
+    uint64_t conn_id) {
+    if (!co_await WriteFullToStream(
+            *stream,
+            unsafe::ptr_cast<const uint8_t>(kHttp2ClientPreface.data()),
+            kHttp2ClientPreface.size())) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    auto settings = EncodeSettingsPayload(HttpInitialWindow(cfg));
+    if (!co_await WriteH2Frame(
+            *stream,
+            H2FrameType::SETTINGS,
+            0,
+            0,
+            settings)) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    auto headers = EncodeHttpRequestHeaders(
+        authority,
+        cfg.path,
+        tls,
+        cfg);
+    if (!co_await WriteH2Frame(
+            *stream,
+            H2FrameType::HEADERS,
+            0x4,
+            1,
+            headers)) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    LOG_ACCESS_DEBUG(
+        "[HTTP/2:{}] client: handshake sent authority={} path={}",
+        conn_id,
+        authority.empty() ? "-" : std::string(authority),
+        EffectivePath(cfg.path));
+    co_return std::unique_ptr<AsyncStream>(
+        std::make_unique<GrpcStream>(
+            std::move(stream),
+            1,
+            GrpcStream::Role::Client,
+            H2PayloadCodec::RawData,
+            conn_id));
+}
+
+net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view host,
+    uint64_t conn_id) {
+    const std::string_view req_path = EffectivePath(cfg.path);
+    const std::string_view method = EffectiveHttpMethod(cfg.method);
+    size_t reserve_size = 192 + method.size() + req_path.size() + host.size();
+    for (const auto& [key, value] : cfg.headers) {
+        if (!IsHostHeader(key)) {
+            reserve_size += key.size() + value.size() + 4;
+        }
+    }
+
+    std::string request;
+    request.reserve(reserve_size);
+    request.append(method);
+    request.push_back(' ');
+    request.append(req_path);
+    request.append(" HTTP/1.1\r\n");
+    request.append("Host: ");
+    request.append(host);
+    request.append("\r\n");
+    for (const auto& [key, value] : cfg.headers) {
+        if (IsHostHeader(key)) {
+            continue;
+        }
+        request.append(key);
+        request.append(": ");
+        request.append(value);
+        request.append("\r\n");
+    }
+    request.append("\r\n");
+
+    if (!co_await WriteFullToStream(
+            *stream,
+            unsafe::ptr_cast<const uint8_t>(request.data()),
+            request.size())) {
+        LOG_ACCESS_DEBUG("[HTTP:{}] client: failed to send request", conn_id);
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+
+    buf::BufferGuard response_buf{buf::Buffer::New()};
+    if (!response_buf) {
+        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    char* response_data = unsafe::ptr_cast<char>(response_buf->Tail().data());
+    const size_t response_capacity = response_buf->Available();
+    size_t response_len = 0;
+    bool found_end = false;
+    size_t header_end = 0;
+
+    while (!found_end && response_len < response_capacity) {
+        size_t n = co_await stream->AsyncRead(
+            net::buffer(response_data + response_len,
+                        response_capacity - response_len));
+        if (n == 0) {
+            LOG_ACCESS_DEBUG("[HTTP:{}] client: peer closed during response read", conn_id);
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+        response_len += n;
+        std::string_view response(response_data, response_len);
+        const size_t pos = response.find("\r\n\r\n");
+        if (pos != std::string_view::npos) {
+            found_end = true;
+            header_end = pos + 4;
+        }
+    }
+
+    if (!found_end) {
+        LOG_ACCESS_DEBUG("[HTTP:{}] client: incomplete response", conn_id);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    const std::string_view response(response_data, response_len);
+    const std::string_view status_line = ExtractStatusLine(response);
+    if (!IsHttpOkStatus(status_line)) {
+        LOG_ACCESS_DEBUG("[HTTP:{}] client: server rejected request: {}",
+                         conn_id,
+                         SanitizeForLog(status_line));
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    auto http = std::make_unique<HttpUpgradeStream>(std::move(stream));
+    if (header_end < response_len) {
+        http->SetPendingData(
+            unsafe::ptr_cast<const uint8_t>(response_data + header_end),
+            response_len - header_end);
+    }
+    LOG_ACCESS_DEBUG("[HTTP:{}] client: handshake ok (host={} path={})",
+                     conn_id,
+                     host,
+                     req_path);
+    co_return std::unique_ptr<AsyncStream>(std::move(http));
 }
 
 net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
@@ -2679,7 +3415,29 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         stream = std::move(*grpc_result);
     }
 
-    // 3. WebSocket 层（服务端）
+    // 3. HTTP / h2 层（服务端）
+    if (s.IsHttp()) {
+        uint64_t conn_id = trace_conn_id;
+        if (conn_id == 0) {
+            thread_local uint64_t s_conn_counter_http = 1;
+            conn_id = s_conn_counter_http++;
+        }
+        auto http_result = co_await DoHttpServerHandshake(
+            std::move(stream),
+            s.http,
+            io_context,
+            std::move(stream_handler),
+            conn_id,
+            out_real_ip);
+        if (!http_result) {
+            LOG_ACCESS_DEBUG("[Transport] BuildInbound: HTTP server handshake failed ({})",
+                             ErrorCodeToString(http_result.error()));
+            co_return std::unexpected(http_result.error());
+        }
+        stream = std::move(*http_result);
+    }
+
+    // 4. WebSocket 层（服务端）
     if (s.IsWs()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
@@ -2696,7 +3454,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         stream = std::move(*ws_result);
     }
 
-    // 4. HTTPUpgrade 层（服务端）
+    // 5. HTTPUpgrade 层（服务端）
     if (s.IsHttpUpgrade()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
@@ -2780,7 +3538,52 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         stream = std::move(*grpc_result);
     }
 
-    // 3. WebSocket 层（客户端）
+    // 3. HTTP / h2 层（客户端）
+    if (s.IsHttp()) {
+        uint64_t conn_id = trace_conn_id;
+        if (conn_id == 0) {
+            thread_local uint64_t s_conn_counter_http_out = 1;
+            conn_id = s_conn_counter_http_out++;
+        }
+        std::string host = ws_host.empty()
+            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
+            : std::string(ws_host);
+        if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(s.http));
+            !configured_host.empty()) {
+            host = std::string(configured_host);
+        }
+        if (host.empty()) {
+            host = "www.example.com";
+        }
+        if (s.http.force_http2 || s.IsTls()) {
+            auto http2_result = co_await DoHttp2ClientHandshake(
+                std::move(stream),
+                s.http,
+                host,
+                s.IsTls(),
+                conn_id);
+            if (!http2_result) {
+                LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTP/2 client handshake failed ({})",
+                                 ErrorCodeToString(http2_result.error()));
+                co_return std::unexpected(http2_result.error());
+            }
+            stream = std::move(*http2_result);
+        } else {
+            auto http1_result = co_await DoHttp1ClientHandshake(
+                std::move(stream),
+                s.http,
+                host,
+                conn_id);
+            if (!http1_result) {
+                LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTP client handshake failed ({})",
+                                 ErrorCodeToString(http1_result.error()));
+                co_return std::unexpected(http1_result.error());
+            }
+            stream = std::move(*http1_result);
+        }
+    }
+
+    // 4. WebSocket 层（客户端）
     if (s.IsWs()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {
@@ -2803,7 +3606,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         stream = std::move(ws);
     }
 
-    // 4. HTTPUpgrade 层（客户端）
+    // 5. HTTPUpgrade 层（客户端）
     if (s.IsHttpUpgrade()) {
         uint64_t conn_id = trace_conn_id;
         if (conn_id == 0) {

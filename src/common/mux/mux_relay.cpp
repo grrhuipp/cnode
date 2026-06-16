@@ -1121,10 +1121,12 @@ net::awaitable<RelayResult> DoMuxRelay(
             // ----------------------------------------------------------------
             case mux::SessionStatus::END: {
                 uint16_t sid = hdr.session_id;
+                bool known_session = false;
 
                 // 注销 UDP 子会话
                 auto udp_it = udp_subs.find(sid);
                 if (udp_it != udp_subs.end()) {
+                    known_session = true;
                     udp_it->second->CloseClientInput();
                     if (udp_it->second->DispatchDone()) {
                         udp_subs.erase(udp_it);
@@ -1134,16 +1136,20 @@ net::awaitable<RelayResult> DoMuxRelay(
                 // 取消 TCP 子会话
                 auto tcp_it = tcp_subs.find(sid);
                 if (tcp_it != tcp_subs.end()) {
+                    known_session = true;
                     tcp_it->second->CloseClientInput();
                     if (tcp_it->second->DispatchDone()) {
                         tcp_subs.erase(tcp_it);
                     }
                 }
 
-                // 回送 End 帧
-                mux::EncodeEndTo(write_frame, sid);
-                if (!co_await write_frame_to_client(write_frame)) {
-                    running = false;
+                // 已知子会话的 END 只表示客户端输入结束；真正回给客户端的
+                // END 由子会话 dispatch 完成时发送，避免先于最后一批回包到达。
+                if (!known_session) {
+                    mux::EncodeEndTo(write_frame, sid);
+                    if (!co_await write_frame_to_client(write_frame)) {
+                        running = false;
+                    }
                 }
                 break;
             }

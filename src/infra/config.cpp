@@ -343,6 +343,27 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
+HttpConfig HttpConfig::FromJson(const json::object& j) {
+    HttpConfig cfg;
+    cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
+    cfg.host = jstr(j, "host", "");
+    cfg.method = jstr(j, "method", "");
+    parse_http_headers(j, cfg.headers);
+    cfg.real_ip_header = jstr(j, "realIpHeader", "");
+    if (cfg.real_ip_header.empty()) {
+        cfg.real_ip_header = jstr(j, "real_ip_header", "");
+    }
+    cfg.force_http2 = jbool(j, "forceHttp2", false);
+    if (!cfg.force_http2) {
+        cfg.force_http2 = jbool(j, "force_http2", false);
+    }
+    cfg.initial_window_size = static_cast<int>(jint(j, "initialWindowSize", 0));
+    if (cfg.initial_window_size <= 0) {
+        cfg.initial_window_size = static_cast<int>(jint(j, "initial_window_size", 0));
+    }
+    return cfg;
+}
+
 GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     GrpcConfig cfg;
     cfg.authority = jstr(j, "authority", "");
@@ -431,6 +452,16 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
     parse_http_upgrade("httpupgradeSettings");
     parse_http_upgrade("httpUpgradeSettings");
 
+    auto parse_http = [&](std::string_view key) {
+        auto* p = j.if_contains(key);
+        if (p && p->is_object()) {
+            cfg.http = HttpConfig::FromJson(p->as_object());
+        }
+    };
+    parse_http("httpSettings");
+    parse_http("h2Settings");
+    parse_http("http_settings");
+
     auto parse_grpc = [&](std::string_view key) {
         auto* p = j.if_contains(key);
         if (p && p->is_object()) {
@@ -462,6 +493,9 @@ void StreamSettings::RecomputeModes() noexcept {
         network = std::string(constants::protocol::kHttpUpgrade);
     } else if (network == constants::protocol::kGrpc) {
         network_mode = NetworkMode::Grpc;
+    } else if (network == constants::protocol::kHttp || network == "h2") {
+        http.force_http2 = http.force_http2 || (network == "h2");
+        network_mode = NetworkMode::Http;
     } else if (network == constants::protocol::kXHttp) {
         network_mode = NetworkMode::XHttp;
     } else {
@@ -489,6 +523,10 @@ void StreamSettings::RecomputeModes() noexcept {
         flags |= kFlagGrpc;
         network = std::string(constants::protocol::kGrpc);
     }
+    if (network_mode == NetworkMode::Http) {
+        flags |= kFlagHttp;
+        network = http.force_http2 ? "h2" : std::string(constants::protocol::kHttp);
+    }
     if (network_mode == NetworkMode::XHttp) {
         flags |= kFlagXHttp;
     }
@@ -499,7 +537,9 @@ void StreamSettings::RecomputeModes() noexcept {
         flags |= kFlagReality;
     }
 
-    if (network_mode == NetworkMode::Grpc) {
+    if (network_mode == NetworkMode::Grpc ||
+        (network_mode == NetworkMode::Http &&
+         (http.force_http2 || security_mode == SecurityMode::Tls))) {
         auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
         if (!has_h2) {
             tls.alpn.insert(tls.alpn.begin(), "h2");
