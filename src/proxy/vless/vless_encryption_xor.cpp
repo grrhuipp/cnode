@@ -3,6 +3,7 @@
 #include <blake3.h>
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -110,6 +111,79 @@ bool XorVlessEncryptionInPlace(
     std::span<uint8_t> data) noexcept {
     auto ctr = VlessEncryptionCtr::Create(key, iv);
     return ctr && ctr->XorInPlace(data);
+}
+
+std::optional<VlessEncryptionHeaderXor> VlessEncryptionHeaderXor::Create(
+    std::span<const uint8_t> key,
+    std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv,
+    size_t initial_skip) noexcept {
+    auto ctr = VlessEncryptionCtr::Create(key, iv);
+    if (!ctr) {
+        return std::nullopt;
+    }
+    return VlessEncryptionHeaderXor(std::move(*ctr), initial_skip);
+}
+
+VlessEncryptionHeaderXor::VlessEncryptionHeaderXor(
+    VlessEncryptionCtr ctr,
+    size_t initial_skip) noexcept
+    : ctr_(std::move(ctr))
+    , skip_(initial_skip) {}
+
+bool VlessEncryptionHeaderXor::XorOutboundInPlace(
+    std::span<uint8_t> data) noexcept {
+    return Transform(data, false);
+}
+
+bool VlessEncryptionHeaderXor::XorInboundInPlace(
+    std::span<uint8_t> data) noexcept {
+    return Transform(data, true);
+}
+
+bool VlessEncryptionHeaderXor::Transform(std::span<uint8_t> data,
+                                         bool inbound) noexcept {
+    while (!data.empty()) {
+        if (skip_ > 0) {
+            const size_t n = std::min(skip_, data.size());
+            skip_ -= n;
+            data = data.subspan(n);
+            continue;
+        }
+
+        const size_t need = header_.size() - header_len_;
+        const size_t n = std::min(need, data.size());
+        auto header_part = data.first(n);
+        if (inbound && !ctr_.XorInPlace(header_part)) {
+            return false;
+        }
+        std::copy(
+            header_part.begin(),
+            header_part.end(),
+            header_.begin() + static_cast<std::ptrdiff_t>(header_len_));
+        if (!inbound && !ctr_.XorInPlace(header_part)) {
+            return false;
+        }
+
+        header_len_ += n;
+        data = data.subspan(n);
+        if (header_len_ < header_.size()) {
+            continue;
+        }
+        if (!FinishHeader()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VlessEncryptionHeaderXor::FinishHeader() noexcept {
+    auto length = DecodeVlessEncryptionRecordHeader(header_);
+    if (!length) {
+        return false;
+    }
+    skip_ = *length;
+    header_len_ = 0;
+    return true;
 }
 
 }  // namespace acpp::vless

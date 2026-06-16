@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vless_encryption_record.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -46,5 +48,39 @@ DeriveVlessEncryptionCtrKey(std::span<const uint8_t> key) noexcept;
     std::span<const uint8_t> key,
     std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv,
     std::span<uint8_t> data) noexcept;
+
+class VlessEncryptionHeaderXor {
+public:
+    VlessEncryptionHeaderXor() noexcept = default;
+
+    [[nodiscard]] static std::optional<VlessEncryptionHeaderXor> Create(
+        std::span<const uint8_t> key,
+        std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv,
+        size_t initial_skip = 0) noexcept;
+
+    [[nodiscard]] bool XorOutboundInPlace(std::span<uint8_t> data) noexcept;
+    [[nodiscard]] bool XorInboundInPlace(std::span<uint8_t> data) noexcept;
+
+    [[nodiscard]] size_t PendingHeaderSize() const noexcept {
+        return header_len_;
+    }
+
+    [[nodiscard]] size_t SkipBytes() const noexcept {
+        return skip_;
+    }
+
+private:
+    VlessEncryptionHeaderXor(VlessEncryptionCtr ctr,
+                             size_t initial_skip) noexcept;
+
+    [[nodiscard]] bool Transform(std::span<uint8_t> data,
+                                 bool inbound) noexcept;
+    [[nodiscard]] bool FinishHeader() noexcept;
+
+    VlessEncryptionCtr ctr_;
+    std::array<uint8_t, kVlessEncryptionRecordHeaderSize> header_{};
+    size_t header_len_ = 0;
+    size_t skip_ = 0;
+};
 
 }  // namespace acpp::vless
