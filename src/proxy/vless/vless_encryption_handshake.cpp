@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 namespace acpp::vless {
@@ -14,6 +15,13 @@ namespace {
 constexpr size_t kHashSize = 32;
 constexpr size_t kX25519RelaySize = kVlessX25519KeySize;
 constexpr size_t kMlKem768RelaySize = kVlessMlKem768CiphertextSize;
+constexpr VlessEncryptionPadding kDefaultPaddingLens[] = {
+    {100, 111, 1111},
+    {50, 0, 3333},
+};
+constexpr VlessEncryptionPadding kDefaultPaddingGaps[] = {
+    {75, 0, 111},
+};
 
 [[nodiscard]] bool RandomBytes(std::span<uint8_t> out) noexcept {
     return out.empty() ||
@@ -40,6 +48,22 @@ constexpr size_t kMlKem768RelaySize = kVlessMlKem768CiphertextSize;
         return from;
     }
     return from + static_cast<int64_t>(RandomU64() % width);
+}
+
+[[nodiscard]] std::optional<uint32_t> PickPaddingValue(
+    const VlessEncryptionPadding& padding) noexcept {
+    if (padding.probability < 0 || padding.from < 0 || padding.to < 0) {
+        return std::nullopt;
+    }
+    if (padding.probability < RandomBetween(0, 100)) {
+        return 0;
+    }
+    const int64_t value = RandomBetween(padding.from, padding.to);
+    if (value < 0 ||
+        value > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(value);
 }
 
 [[nodiscard]] bool IsClientKey(std::span<const uint8_t> key) noexcept {
@@ -609,6 +633,99 @@ OpenVlessEncryptionServerPfsResponse(
     }
     result.ticket_seconds = *seconds;
     return result;
+}
+
+std::optional<VlessEncryptionPaddingPlan>
+BuildVlessEncryptionPaddingPlan(
+    const VlessEncryptionConfig& config) noexcept {
+    VlessEncryptionPaddingPlan plan;
+    const bool use_default_padding = config.padding_lens.empty();
+    const auto lens = use_default_padding
+        ? std::span<const VlessEncryptionPadding>(kDefaultPaddingLens)
+        : std::span<const VlessEncryptionPadding>(config.padding_lens);
+    const auto gaps = use_default_padding
+        ? std::span<const VlessEncryptionPadding>(kDefaultPaddingGaps)
+        : std::span<const VlessEncryptionPadding>(config.padding_gaps);
+
+    plan.fragment_lengths.reserve(lens.size());
+    for (const auto& item : lens) {
+        auto length = PickPaddingValue(item);
+        if (!length) {
+            return std::nullopt;
+        }
+        plan.fragment_lengths.push_back(*length);
+        plan.total_length += *length;
+        if (plan.total_length > kVlessEncryptionMaxPaddingLength) {
+            return std::nullopt;
+        }
+    }
+
+    plan.gaps_ms.reserve(gaps.size());
+    for (const auto& item : gaps) {
+        auto gap = PickPaddingValue(item);
+        if (!gap) {
+            return std::nullopt;
+        }
+        plan.gaps_ms.push_back(*gap);
+    }
+
+    if (plan.total_length < kVlessEncryptionMinPaddingLength) {
+        return std::nullopt;
+    }
+    return plan;
+}
+
+std::optional<std::vector<uint8_t>>
+SealVlessEncryptionPadding(VlessEncryptionAead& aead,
+                           size_t padding_length) noexcept {
+    if (padding_length < kVlessEncryptionMinPaddingLength ||
+        padding_length > kVlessEncryptionMaxPaddingLength) {
+        return std::nullopt;
+    }
+
+    const size_t encrypted_body_length =
+        padding_length - kVlessEncryptionEncryptedLengthSize;
+    const size_t plaintext_body_length =
+        encrypted_body_length - kVlessEncryptionTagSize;
+    auto encoded_length = EncodeVlessEncryptionLength(encrypted_body_length);
+
+    std::vector<uint8_t> out(padding_length);
+    auto length_out = std::span<uint8_t>(
+        out.data(),
+        kVlessEncryptionEncryptedLengthSize);
+    auto sealed_length = aead.Seal(encoded_length, {}, length_out);
+    if (!sealed_length ||
+        *sealed_length != kVlessEncryptionEncryptedLengthSize) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> plain(plaintext_body_length);
+    auto body_out = std::span<uint8_t>(
+        out.data() + static_cast<std::ptrdiff_t>(
+            kVlessEncryptionEncryptedLengthSize),
+        encrypted_body_length);
+    auto sealed_body = aead.Seal(plain, {}, body_out);
+    if (!sealed_body || *sealed_body != encrypted_body_length) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+std::optional<VlessEncryptionEncryptedPadding>
+BuildVlessEncryptionPadding(const VlessEncryptionConfig& config,
+                            VlessEncryptionAead& aead) noexcept {
+    auto plan = BuildVlessEncryptionPaddingPlan(config);
+    if (!plan) {
+        return std::nullopt;
+    }
+    auto bytes = SealVlessEncryptionPadding(aead, plan->total_length);
+    if (!bytes) {
+        return std::nullopt;
+    }
+    return VlessEncryptionEncryptedPadding{
+        .plan = std::move(*plan),
+        .bytes = std::move(*bytes),
+    };
 }
 
 }  // namespace acpp::vless

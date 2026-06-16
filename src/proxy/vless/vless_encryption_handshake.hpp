@@ -33,6 +33,10 @@ inline constexpr size_t kVlessEncryptionEncryptedServerPfsPublicSize =
     kVlessEncryptionServerPfsPublicSize + kVlessEncryptionTagSize;
 inline constexpr size_t kVlessEncryptionEncryptedTicketSize =
     kVlessEncryptionTicketSize + kVlessEncryptionTagSize;
+inline constexpr size_t kVlessEncryptionMinPaddingLength =
+    kVlessEncryptionEncryptedLengthSize + kVlessEncryptionTagSize + 1;
+inline constexpr size_t kVlessEncryptionMaxPaddingLength =
+    kVlessEncryptionEncryptedLengthSize + 65535;
 
 struct VlessEncryptionClientNfsHello {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
@@ -72,6 +76,17 @@ struct VlessEncryptionClientPfsOpenResult {
     std::vector<uint8_t> pfs_key;
     std::vector<uint8_t> united_key;
     uint16_t ticket_seconds = 0;
+};
+
+struct VlessEncryptionPaddingPlan {
+    size_t total_length = 0;
+    std::vector<size_t> fragment_lengths;
+    std::vector<uint32_t> gaps_ms;
+};
+
+struct VlessEncryptionEncryptedPadding {
+    VlessEncryptionPaddingPlan plan;
+    std::vector<uint8_t> bytes;
 };
 
 [[nodiscard]] std::optional<size_t> VlessEncryptionRelaysLength(
@@ -119,5 +134,17 @@ OpenVlessEncryptionServerPfsResponse(
     std::span<const uint8_t, kVlessEncryptionEncryptedTicketSize>
         encrypted_ticket,
     VlessEncryptionAeadCipher cipher) noexcept;
+
+[[nodiscard]] std::optional<VlessEncryptionPaddingPlan>
+BuildVlessEncryptionPaddingPlan(
+    const VlessEncryptionConfig& config) noexcept;
+
+[[nodiscard]] std::optional<std::vector<uint8_t>>
+SealVlessEncryptionPadding(VlessEncryptionAead& aead,
+                           size_t padding_length) noexcept;
+
+[[nodiscard]] std::optional<VlessEncryptionEncryptedPadding>
+BuildVlessEncryptionPadding(const VlessEncryptionConfig& config,
+                            VlessEncryptionAead& aead) noexcept;
 
 }  // namespace acpp::vless
