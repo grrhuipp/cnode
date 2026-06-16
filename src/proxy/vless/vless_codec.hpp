@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace acpp::vless {
 
@@ -24,6 +25,7 @@ struct RequestHeader {
     uint8_t version = kVersion;
     std::array<uint8_t, 16> uuid{};
     uint8_t addons_len = 0;
+    std::string flow;
     Command command = Command::TCP;
     TargetAddress target;
 };
@@ -40,7 +42,8 @@ public:
         Command command,
         const TargetAddress& target,
         uint8_t* output,
-        size_t output_size);
+        size_t output_size,
+        std::string_view flow = {});
 
     static size_t EncodeResponseHeaderTo(uint8_t* output,
                                          size_t output_size) noexcept;

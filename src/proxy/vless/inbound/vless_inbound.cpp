@@ -33,6 +33,7 @@ namespace {
 
 constexpr std::string_view kPacketAddrMagicAddress =
     "sp.packet-addr.v2fly.arpa";
+constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
 bool IsPacketAddrMagic(const TargetAddress& target) {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
@@ -493,10 +494,6 @@ proxy::vless::inbound::Handler::Process(
         LOG_CONN_FAIL("[VLESS][{}] parse failed from {}", tag, client_ip);
         co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (request->addons_len != 0) {
-        LOG_CONN_FAIL("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
     auto user_info = validator_.FindUser(tag, request->uuid);
     if (!user_info) {
         LOG_CONN_FAIL("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
@@ -505,6 +502,23 @@ proxy::vless::inbound::Handler::Process(
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+    if (request->addons_len != 0 && request->flow.empty()) {
+        LOG_CONN_FAIL("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (!request->flow.empty()) {
+        if (request->flow != user_info->flow) {
+            LOG_CONN_FAIL("[VLESS][{}] request flow '{}' not allowed for user",
+                          tag, request->flow);
+            co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        if (request->flow == kVisionFlow) {
+            LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, request->flow);
+            co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        LOG_CONN_FAIL("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
+        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (!user_info->flow.empty()) {
         LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
