@@ -163,8 +163,14 @@ FetchContent_Declare(
     aws_lc
     GIT_REPOSITORY https://github.com/aws/aws-lc.git
     GIT_TAG v1.73.0
+    PATCH_COMMAND
+        ${CMAKE_COMMAND}
+            -DAWS_LC_SOURCE_DIR=<SOURCE_DIR>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_aws_lc_reality.cmake
 )
 FetchContent_MakeAvailable(aws_lc)
+include(cmake/patch_aws_lc_reality.cmake)
+cnode_patch_aws_lc_reality("${aws_lc_SOURCE_DIR}")
 message(STATUS "Using AWS-LC via FetchContent")
 
 FetchContent_Declare(

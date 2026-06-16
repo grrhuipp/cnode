@@ -71,6 +71,45 @@ std::string MakeTlsCacheKey(std::string_view role, const TlsConfig& config) {
     return key;
 }
 
+std::string MakeRealityCacheKey(const RealityConfig& reality,
+                                const TlsConfig& tls_config) {
+    std::string key = MakeTlsCacheKey("server-reality", tls_config);
+    key.push_back('|');
+    key.append(reality.private_key);
+    key.push_back('|');
+    key.append(reality.min_client_ver);
+    key.push_back('|');
+    key.append(reality.max_client_ver);
+    key.push_back('|');
+    key.append(std::to_string(reality.max_time_diff));
+    for (const auto& name : reality.server_names) {
+        key.push_back('|');
+        key.append(name);
+    }
+    key.push_back('|');
+    for (const auto& short_id : reality.short_ids) {
+        key.push_back(',');
+        key.append(short_id);
+    }
+    return key;
+}
+
+std::string MakeRealityClientCacheKey(const RealityConfig& reality,
+                                      const TlsConfig& tls_config) {
+    std::string key = MakeTlsCacheKey("client-reality", tls_config);
+    key.push_back('|');
+    key.append(reality.public_key);
+    key.push_back('|');
+    key.append(reality.fingerprint);
+    key.push_back('|');
+    key.append(reality.server_name);
+    key.push_back('|');
+    key.append(reality.short_id);
+    key.push_back('|');
+    key.append(reality.spider_x);
+    return key;
+}
+
 SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
     struct LastHit {
@@ -110,6 +149,37 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     return nullptr;
 }
 
+SslContext* AcquireServerRealityContext(const RealityConfig& reality,
+                                        const TlsConfig& tls_config) {
+    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    struct LastHit {
+        const RealityConfig* reality = nullptr;
+        const TlsConfig* tls = nullptr;
+        SslContext* ctx = nullptr;
+    };
+    thread_local LastHit last;
+
+    if (last.reality == &reality && last.tls == &tls_config && last.ctx) {
+        return last.ctx;
+    }
+
+    std::string key = MakeRealityCacheKey(reality, tls_config);
+    if (auto it = cache.find(key); it != cache.end()) {
+        last = LastHit{&reality, &tls_config, it->second.get()};
+        return it->second.get();
+    }
+
+    auto ctx = SslContext::CreateServerReality(reality, tls_config);
+    if (!ctx) {
+        return nullptr;
+    }
+
+    auto* raw = ctx.get();
+    cache.emplace(std::move(key), std::move(ctx));
+    last = LastHit{&reality, &tls_config, raw};
+    return raw;
+}
+
 SslContext* AcquireClientTlsContext(const TlsConfig& config) {
     thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
     thread_local const TlsConfig* last_config = nullptr;
@@ -136,6 +206,37 @@ SslContext* AcquireClientTlsContext(const TlsConfig& config) {
         return raw;
     }
     return nullptr;
+}
+
+SslContext* AcquireClientRealityContext(const RealityConfig& reality,
+                                        const TlsConfig& tls_config) {
+    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    struct LastHit {
+        const RealityConfig* reality = nullptr;
+        const TlsConfig* tls = nullptr;
+        SslContext* ctx = nullptr;
+    };
+    thread_local LastHit last;
+
+    if (last.reality == &reality && last.tls == &tls_config && last.ctx) {
+        return last.ctx;
+    }
+
+    std::string key = MakeRealityClientCacheKey(reality, tls_config);
+    if (auto it = cache.find(key); it != cache.end()) {
+        last = LastHit{&reality, &tls_config, it->second.get()};
+        return it->second.get();
+    }
+
+    auto ctx = SslContext::CreateClientReality(reality, tls_config);
+    if (!ctx) {
+        return nullptr;
+    }
+
+    auto* raw = ctx.get();
+    cache.emplace(std::move(key), std::move(ctx));
+    last = LastHit{&reality, &tls_config, raw};
+    return raw;
 }
 
 [[nodiscard]] char LowerAsciiChar(char ch) {
@@ -537,16 +638,27 @@ public:
         if (len == 0) {
             co_return 0;
         }
-        const std::string prefix = std::format("{:x}\r\n", len);
-        if (!co_await WriteFullToStream(
-                *inner_,
-                unsafe::ptr_cast<const uint8_t>(prefix.data()),
-                prefix.size()) ||
-            !co_await WriteFullToStream(*inner_, data, len) ||
-            !co_await WriteFullToStream(
-                *inner_,
-                unsafe::ptr_cast<const uint8_t>("\r\n"),
-                2)) {
+        std::array<char, sizeof(size_t) * 2 + 2> prefix{};
+        auto [ptr, ec] = std::to_chars(
+            prefix.data(),
+            prefix.data() + prefix.size() - 2,
+            len,
+            16);
+        if (ec != std::errc{}) {
+            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
+        }
+        *ptr++ = '\r';
+        *ptr++ = '\n';
+
+        constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
+        const std::array<net::const_buffer, 3> buffers{
+            net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())),
+            net::buffer(data, len),
+            net::buffer(kChunkTail.data(), kChunkTail.size())
+        };
+        try {
+            co_await inner_->WriteBuffers(buffers);
+        } catch (...) {
             throw IoSystemError(io_error::broken_pipe, "http1 chunk write failed");
         }
         co_return len;
@@ -2638,17 +2750,22 @@ private:
                     break;
                 }
                 const auto data = H2DataPayload(*frame);
-                if (!data.empty()) {
-                    h2_data_.assign(data.begin(), data.end());
+                const size_t data_len = data.size();
+                if (data_len > 0) {
+                    if ((frame->flags & 0x8) == 0) {
+                        h2_data_ = std::move(frame->payload);
+                    } else {
+                        h2_data_.assign(data.begin(), data.end());
+                    }
                     h2_data_offset_ = 0;
                     co_await SendWindowUpdate(
                         *inner_,
                         0,
-                        static_cast<uint32_t>(data.size()));
+                        static_cast<uint32_t>(data_len));
                     co_await SendWindowUpdate(
                         *inner_,
                         stream_id_,
-                        static_cast<uint32_t>(data.size()));
+                        static_cast<uint32_t>(data_len));
                     co_return true;
                 }
                 if ((frame->flags & 0x1) != 0) {
@@ -2706,6 +2823,7 @@ public:
     }
 
     bool PushH2Data(std::span<const uint8_t> data);
+    bool PushH2Data(std::vector<uint8_t> data);
     void CloseInput();
     void CancelFromSession() noexcept;
     void CancelPendingOperations() noexcept;
@@ -3127,7 +3245,7 @@ public:
                     }
                     break;
                 case H2FrameType::DATA:
-                    co_await HandleDataFrame(*frame);
+                    co_await HandleDataFrame(std::move(*frame));
                     break;
                 case H2FrameType::RST_STREAM:
                     if (frame->stream_id != 0) {
@@ -3423,23 +3541,27 @@ private:
         co_return false;
     }
 
-    net::awaitable<void> HandleDataFrame(const H2Frame& frame) {
+    net::awaitable<void> HandleDataFrame(H2Frame frame) {
         if (frame.stream_id == 0) {
             co_return;
         }
 
         const auto data = H2DataPayload(frame);
-        if (!data.empty()) {
+        const size_t data_len = data.size();
+        if (data_len > 0) {
             (void)co_await SendWindowUpdateSerialized(
                 0,
-                static_cast<uint32_t>(data.size()));
+                static_cast<uint32_t>(data_len));
             (void)co_await SendWindowUpdateSerialized(
                 frame.stream_id,
-                static_cast<uint32_t>(data.size()));
+                static_cast<uint32_t>(data_len));
 
             auto it = streams_.find(frame.stream_id);
             if (it != streams_.end() && it->second) {
-                if (!it->second->PushH2Data(data)) {
+                const bool queued = (frame.flags & 0x8) == 0
+                    ? it->second->PushH2Data(std::move(frame.payload))
+                    : it->second->PushH2Data(data);
+                if (!queued) {
                     RemoveStream(frame.stream_id);
                     (void)co_await WriteFrameSerialized(
                         H2FrameType::RST_STREAM,
@@ -3486,10 +3608,10 @@ GrpcServerSubStreamState::GrpcServerSubStreamState(
     , conn_id_(conn_id) {}
 
 bool GrpcServerSubStreamState::PushH2Data(std::span<const uint8_t> data) {
-    constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
     if (cancelled_ || input_done_ || data.empty()) {
         return !cancelled_;
     }
+    constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
     if (queued_bytes_ + data.size() > kMaxQueuedBytes) {
         CancelFromSession();
         return false;
@@ -3497,8 +3619,21 @@ bool GrpcServerSubStreamState::PushH2Data(std::span<const uint8_t> data) {
 
     std::vector<uint8_t> copy;
     copy.assign(data.begin(), data.end());
-    queued_bytes_ += copy.size();
-    h2_data_queue_.push_back(std::move(copy));
+    return PushH2Data(std::move(copy));
+}
+
+bool GrpcServerSubStreamState::PushH2Data(std::vector<uint8_t> data) {
+    if (cancelled_ || input_done_ || data.empty()) {
+        return !cancelled_;
+    }
+    constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
+    if (queued_bytes_ + data.size() > kMaxQueuedBytes) {
+        CancelFromSession();
+        return false;
+    }
+
+    queued_bytes_ += data.size();
+    h2_data_queue_.push_back(std::move(data));
     WakeInputReader();
     return true;
 }
@@ -4305,6 +4440,9 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
 }
 
 [[nodiscard]] bool ShouldUseHttp2ForXHttp(const StreamSettings& s) {
+    if (s.IsReality()) {
+        return std::ranges::find(s.tls.alpn, "h2") != s.tls.alpn.end();
+    }
     if (!s.IsTlsLike()) {
         return false;
     }
@@ -5096,10 +5234,12 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         cfg.path,
         tls,
         cfg);
+    const bool request_body_expected =
+        !EqualsAsciiCI(EffectiveHttpMethod(cfg.method), "GET");
     if (!co_await WriteH2Frame(
             *stream,
             H2FrameType::HEADERS,
-            0x4,
+            static_cast<uint8_t>(0x4 | (request_body_expected ? 0 : 0x1)),
             1,
             headers)) {
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
@@ -5635,32 +5775,42 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
-    if (s.IsUnsupported() || s.IsReality()) {
+    const bool reality_supported =
+        !s.IsReality() ||
+        s.network_mode == NetworkMode::Tcp ||
+        s.IsGrpc() ||
+        s.IsXHttp();
+    if (s.IsUnsupported() || !reality_supported) {
         LOG_ERROR("[Transport] BuildInbound: unsupported transport combination network={} security={}",
                   s.network,
                   s.security);
         co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
-    // 1. TLS 层（服务端）
-    if (s.IsTls()) {
-        auto ctx = AcquireServerTlsContext(s.tls);
+    // 1. TLS / REALITY 层（服务端）
+    if (s.IsTlsLike()) {
+        auto ctx = s.IsReality()
+            ? AcquireServerRealityContext(s.reality, s.tls)
+            : AcquireServerTlsContext(s.tls);
         if (!ctx) {
-            LOG_ERROR("[Transport] BuildInbound: failed to create TLS server context");
+            LOG_ERROR("[Transport] BuildInbound: failed to create {} server context",
+                      s.IsReality() ? "REALITY" : "TLS");
             co_return std::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
 
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
-            LOG_ERROR("[Transport] BuildInbound: TLS requested but base stream is not TcpStream");
+            LOG_ERROR("[Transport] BuildInbound: TLS-like security requested but base stream is not TcpStream");
             co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
         auto tls = co_await WrapTlsServer(std::move(tcp), *ctx);
         if (!tls) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: TLS server handshake failed");
+            LOG_ACCESS_DEBUG("[Transport] BuildInbound: {} server handshake failed",
+                             s.IsReality() ? "REALITY" : "TLS");
             co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
-        LOG_ACCESS_DEBUG("[Transport] BuildInbound: TLS handshake ok");
+        LOG_ACCESS_DEBUG("[Transport] BuildInbound: {} handshake ok",
+                         s.IsReality() ? "REALITY" : "TLS");
         stream = std::move(tls);
     }
 
@@ -5788,35 +5938,53 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
-    if (s.IsUnsupported() || s.IsReality()) {
+    const bool reality_supported =
+        !s.IsReality() ||
+        s.network_mode == NetworkMode::Tcp ||
+        s.IsGrpc() ||
+        s.IsXHttp();
+    if (s.IsUnsupported() || !reality_supported) {
         LOG_ERROR("[Transport] BuildOutbound: unsupported transport combination network={} security={}",
                   s.network,
                   s.security);
         co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
-    // 1. TLS 层（客户端）
-    if (s.IsTls()) {
-        auto ctx = AcquireClientTlsContext(s.tls);
+    // 1. TLS / REALITY 层（客户端）
+    if (s.IsTlsLike()) {
+        auto ctx = s.IsReality()
+            ? AcquireClientRealityContext(s.reality, s.tls)
+            : AcquireClientTlsContext(s.tls);
         if (!ctx) {
-            LOG_ERROR("[Transport] BuildOutbound: failed to create TLS client context");
+            LOG_ERROR("[Transport] BuildOutbound: failed to create {} client context",
+                      s.IsReality() ? "REALITY" : "TLS");
             co_return std::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
 
         std::string sni = tls_server_name.empty()
             ? s.tls.server_name
             : std::string(tls_server_name);
+        std::vector<std::string> alpn = s.tls.alpn;
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
-            LOG_ERROR("[Transport] BuildOutbound: TLS requested but base stream is not TcpStream");
+            LOG_ERROR("[Transport] BuildOutbound: TLS-like security requested but base stream is not TcpStream");
             co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
-        auto tls = co_await WrapTlsClient(std::move(tcp), *ctx, sni, s.tls.alpn);
+        auto tls = s.IsReality()
+            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, alpn)
+            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, alpn);
         if (!tls) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: TLS client handshake failed (sni={})", sni);
+            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: {} client handshake failed (sni={})",
+                             s.IsReality() ? "REALITY" : "TLS",
+                             sni);
             co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
-        LOG_ACCESS_DEBUG("[Transport] BuildOutbound: TLS handshake ok (sni={})", sni);
+        LOG_ACCESS_DEBUG("[Transport] BuildOutbound: {} handshake ok (sni={}, alpn={})",
+                         s.IsReality() ? "REALITY" : "TLS",
+                         sni,
+                         tls->NegotiatedAlpn().empty()
+                             ? "-"
+                             : tls->NegotiatedAlpn());
         stream = std::move(tls);
     }
 
@@ -5827,11 +5995,20 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_grpc_out = 1;
             conn_id = s_conn_counter_grpc_out++;
         }
-        std::string authority = ws_host.empty()
-            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
-            : std::string(ws_host);
+        std::string authority;
+        if (!s.grpc.authority.empty()) {
+            authority = s.grpc.authority;
+        } else if (s.IsReality()) {
+            authority.clear();
+        } else if (!ws_host.empty()) {
+            authority = std::string(ws_host);
+        } else {
+            authority = std::string(tls_server_name.empty()
+                ? s.tls.server_name
+                : tls_server_name);
+        }
         auto grpc_result = co_await DoGrpcClientHandshake(
-            std::move(stream), s.grpc, authority, s.IsTls(), conn_id);
+            std::move(stream), s.grpc, authority, s.IsTlsLike(), conn_id);
         if (!grpc_result) {
             LOG_ACCESS_DEBUG("[Transport] BuildOutbound: gRPC client handshake failed ({})",
                              ErrorCodeToString(grpc_result.error()));
@@ -5862,7 +6039,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
                 std::move(stream),
                 s.http,
                 host,
-                s.IsTls(),
+                s.IsTlsLike(),
                 conn_id);
             if (!http2_result) {
                 LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTP/2 client handshake failed ({})",
@@ -5912,7 +6089,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             std::move(stream),
             http,
             host,
-            s.IsTls(),
+            s.IsTlsLike(),
             conn_id);
         if (!xhttp_result) {
             LOG_ACCESS_DEBUG("[Transport] BuildOutbound: XHTTP client handshake failed ({})",
@@ -5977,24 +6154,29 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload,
     uint64_t trace_conn_id) {
-    if (!raw || !s.IsXHttp() || s.IsUnsupported() || s.IsReality()) {
+    if (!raw || !s.IsXHttp() || s.IsUnsupported()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     std::unique_ptr<AsyncStream> stream = std::move(raw);
-    if (s.IsTls()) {
-        auto ctx = AcquireClientTlsContext(s.tls);
+    if (s.IsTlsLike()) {
+        auto ctx = s.IsReality()
+            ? AcquireClientRealityContext(s.reality, s.tls)
+            : AcquireClientTlsContext(s.tls);
         if (!ctx) {
             co_return std::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
         std::string sni = tls_server_name.empty()
             ? s.tls.server_name
             : std::string(tls_server_name);
+        std::vector<std::string> alpn = s.tls.alpn;
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
             co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
-        auto tls = co_await WrapTlsClient(std::move(tcp), *ctx, sni, s.tls.alpn);
+        auto tls = s.IsReality()
+            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, alpn)
+            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, alpn);
         if (!tls) {
             co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
@@ -6005,14 +6187,18 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
         s.xhttp,
         path,
         kind == XHttpClientRequestKind::Downlink ? "GET" : "POST",
-        s.IsTls(),
+        s.IsTlsLike(),
         kind);
 
     std::string authority(host);
     if (authority.empty()) {
-        authority = tls_server_name.empty()
-            ? s.tls.server_name
-            : std::string(tls_server_name);
+        if (s.IsReality() && !s.reality.server_name.empty()) {
+            authority = s.reality.server_name;
+        } else {
+            authority = tls_server_name.empty()
+                ? s.tls.server_name
+                : std::string(tls_server_name);
+        }
     }
     if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(http));
         !configured_host.empty()) {
@@ -6029,7 +6215,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
                 std::move(stream),
                 http,
                 authority,
-                s.IsTls(),
+                s.IsTlsLike(),
                 packet_payload,
                 conn_id);
         }
@@ -6037,7 +6223,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
             std::move(stream),
             http,
             authority,
-            s.IsTls(),
+            s.IsTlsLike(),
             conn_id);
         if (!http2_result) {
             co_return std::unexpected(http2_result.error());

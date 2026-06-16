@@ -8,9 +8,12 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace acpp {
+
+struct RealityConfig;
 
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
@@ -22,6 +25,16 @@ public:
 
     // 创建服务端上下文（自签名，根据 SNI 动态生成证书）
     static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
+
+    // 创建 REALITY 服务端上下文
+    static std::unique_ptr<SslContext> CreateServerReality(
+        const RealityConfig& reality,
+        const TlsConfig& tls_config);
+
+    // 创建 REALITY 客户端上下文
+    static std::unique_ptr<SslContext> CreateClientReality(
+        const RealityConfig& reality,
+        const TlsConfig& tls_config);
 
     // 创建客户端上下文
     static std::unique_ptr<SslContext> CreateClient(const TlsConfig& config);
@@ -39,10 +52,13 @@ public:
     SslContext& operator=(const SslContext&) = delete;
 
 private:
-    explicit SslContext(SSL_CTX* ctx) : ctx_(ctx) {}
+    explicit SslContext(SSL_CTX* ctx, std::shared_ptr<void> app_state = {})
+        : ctx_(ctx)
+        , app_state_(std::move(app_state)) {}
     void ConfigureServerAlpn(const std::vector<std::string>& protocols);
 
     SSL_CTX* ctx_ = nullptr;
+    std::shared_ptr<void> app_state_;
     std::vector<unsigned char> server_alpn_wire_;
 };
 
@@ -69,6 +85,9 @@ public:
 
     // 设置 ALPN（客户端调用）
     void SetAlpn(const std::vector<std::string>& protocols);
+
+    // 设置 REALITY 客户端认证（客户端调用）
+    bool SetRealityClient(const RealityConfig& reality);
 
     // 执行 TLS 握手
     net::awaitable<bool> Handshake();
@@ -116,6 +135,7 @@ private:
     bool is_server_ = false;
     bool handshake_done_ = false;
     bool shutdown_initiated_ = false;  // 防止多次 SSL_shutdown
+    std::shared_ptr<void> app_state_;
 
     // TLS 底层 I/O pump 的临时缓冲大小。缓冲本体放在执行中的 awaitable 内，
     // 避免每个 TLS stream 对象常驻一块 scratch，并与 relay Buffer 对齐。
@@ -137,6 +157,15 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
 net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
+    const std::string& server_name = "",
+    const std::vector<std::string>& alpn = {});
+
+// 包装现有 TCP 流为 REALITY 客户端
+[[nodiscard]]
+net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
+    std::unique_ptr<TcpStream> inner,
+    SslContext& ctx,
+    const RealityConfig& reality,
     const std::string& server_name = "",
     const std::vector<std::string>& alpn = {});
 

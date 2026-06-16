@@ -168,7 +168,8 @@ struct RealityConfig {
 //
 // 实现 Xray 式「传输层自由组合」：
 //   network (raw/tcp | ws/websocket | http/http2/h2 | httpupgrade | grpc | xhttp/splithttp)
-//     × security (none | tls | reality)
+//     × security (none | tls)
+//   REALITY 按 Xray 生态约束只支持 raw/tcp、grpc、xhttp/splithttp。
 //
 // 示例：
 //   { "network": "ws", "security": "tls" }          → WS over TLS

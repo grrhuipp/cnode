@@ -708,15 +708,17 @@ void StreamSettings::RecomputeModes() noexcept {
         flags |= kFlagReality;
     }
 
+    const bool tls_like_for_alpn = IsTls();
     const bool http_should_default_h2 =
         network_mode == NetworkMode::Http &&
         (http.force_http2 ||
-         (IsTlsLike() && tls.alpn.empty()));
+         (tls_like_for_alpn && tls.alpn.empty()));
     const bool xhttp_should_default_h2 =
         network_mode == NetworkMode::XHttp &&
-        (xhttp.AcceptsStreamOne() || IsTlsLike()) &&
+        security_mode != SecurityMode::Reality &&
+        (xhttp.AcceptsStreamOne() || tls_like_for_alpn) &&
         tls.alpn.empty();
-    if (network_mode == NetworkMode::Grpc ||
+    if ((network_mode == NetworkMode::Grpc && tls_like_for_alpn) ||
         http_should_default_h2 ||
         xhttp_should_default_h2) {
         auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();

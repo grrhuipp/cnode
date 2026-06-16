@@ -152,6 +152,9 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
     if (!settings.grpc.authority.empty()) {
         return settings.grpc.authority;
     }
+    if (settings.IsReality()) {
+        return {};
+    }
     return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
 }
 
