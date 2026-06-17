@@ -80,22 +80,13 @@ jobs:
           key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-
 
-      - name: Restore FetchContent sources
-        id: fetchcontent-musl
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: |
-            ${{ env.BUILD_DIR }}/_deps/*-src
-            ${{ env.BUILD_DIR }}/_deps/*-subbuild
-          key: fetchcontent-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: fetchcontent-musl-${{ matrix.backend }}-${{ runner.os }}-
-
       - name: Configure
         run: |
           ccache --zero-stats || true
           cmake -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
+            -DCNODE_ENABLE_LTO=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -146,15 +137,6 @@ jobs:
           path: ${{ env.BUILD_DIR }}/.ccache
           key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Save FetchContent sources
-        if: always() && steps.fetchcontent-musl.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: |
-            ${{ env.BUILD_DIR }}/_deps/*-src
-            ${{ env.BUILD_DIR }}/_deps/*-subbuild
-          key: fetchcontent-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-
   build-glibc:
     name: Release (glibc ${{ matrix.backend }})
     runs-on: ubuntu-24.04
@@ -188,22 +170,13 @@ jobs:
           key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-
 
-      - name: Restore FetchContent sources
-        id: fetchcontent-glibc
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: |
-            ${{ env.BUILD_DIR }}/_deps/*-src
-            ${{ env.BUILD_DIR }}/_deps/*-subbuild
-          key: fetchcontent-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: fetchcontent-glibc-${{ matrix.backend }}-${{ runner.os }}-
-
       - name: Build glibc release variant
         run: |
           ccache --zero-stats || true
           cmake -S . -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
+            -DCNODE_ENABLE_LTO=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -244,15 +217,6 @@ jobs:
         with:
           path: ${{ env.BUILD_DIR }}/.ccache
           key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Save FetchContent sources
-        if: always() && steps.fetchcontent-glibc.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: |
-            ${{ env.BUILD_DIR }}/_deps/*-src
-            ${{ env.BUILD_DIR }}/_deps/*-subbuild
-          key: fetchcontent-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
   publish-release:
     name: Publish GitHub Release

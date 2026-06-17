@@ -11,6 +11,7 @@ include(FetchContent)
 option(CNODE_HEAPTRACK_BUILD "Build a heaptrack-friendly glibc/system-allocator variant" OFF)
 option(CNODE_AWSLC_NO_ASM "Disable AWS-LC assembly for local toolchains without nasm/perl" OFF)
 option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
+option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
 option(CNODE_MIMALLOC_MUSL "Use mimalloc for global C++ new/delete in musl builds" ON)
@@ -60,7 +61,7 @@ get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 # ============================================================================
 # LTO（链接时优化）— Release 模式启用
 # ============================================================================
-if(NOT CNODE_HEAPTRACK_BUILD)
+if(CNODE_ENABLE_LTO AND NOT CNODE_HEAPTRACK_BUILD)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 endif()
 
@@ -193,11 +194,9 @@ FetchContent_Declare(
     blake3
     GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
     GIT_TAG 1.8.5
+    SOURCE_SUBDIR cnode-no-upstream-cmake
 )
-FetchContent_GetProperties(blake3)
-if(NOT blake3_POPULATED)
-    FetchContent_Populate(blake3)
-endif()
+FetchContent_MakeAvailable(blake3)
 add_library(cnode_blake3 STATIC
     ${blake3_SOURCE_DIR}/c/blake3.c
     ${blake3_SOURCE_DIR}/c/blake3_dispatch.c
@@ -501,7 +500,7 @@ else()
     set(CNODE_BUILD_CHANNEL_SUMMARY "release")
 endif()
 
-if(CNODE_HEAPTRACK_BUILD)
+if(CNODE_HEAPTRACK_BUILD OR NOT CNODE_ENABLE_LTO)
     set(CNODE_LTO_SUMMARY "disabled")
 elseif(CNODE_IS_MULTI_CONFIG)
     set(CNODE_LTO_SUMMARY "Release config")
