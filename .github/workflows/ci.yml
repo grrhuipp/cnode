@@ -23,6 +23,10 @@ on:
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RELEASE_TAG: cnode-latest
 
@@ -86,7 +90,8 @@ jobs:
           cmake -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
-            -DCNODE_ENABLE_LTO=OFF \
+            -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
+            -DCNODE_RELEASE_FRAME_POINTERS=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -129,6 +134,7 @@ jobs:
           name: cnode-musl-${{ matrix.backend }}-assets
           path: release-assets/*
           if-no-files-found: error
+          compression-level: 0
 
       - name: Save compiler cache
         if: always()
@@ -156,7 +162,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential binutils ccache cmake ninja-build git curl \
             zip unzip tar pkg-config perl nasm file linux-libc-dev
 
@@ -176,7 +182,8 @@ jobs:
           cmake -S . -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
-            -DCNODE_ENABLE_LTO=OFF \
+            -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
+            -DCNODE_RELEASE_FRAME_POINTERS=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -210,6 +217,7 @@ jobs:
           name: cnode-glibc-${{ matrix.backend }}-assets
           path: glibc-assets/*
           if-no-files-found: error
+          compression-level: 0
 
       - name: Save compiler cache
         if: always()
