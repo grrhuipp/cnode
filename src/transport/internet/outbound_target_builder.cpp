@@ -6,8 +6,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <memory>
+#include <utility>
 
 namespace acpp {
+
+net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
+                                     bool allow_xhttp_download);
 
 namespace {
 
@@ -195,6 +201,57 @@ bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_add
     return {};
 }
 
+net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+AttachXHttpDownloadTarget(OutboundTransportTarget target,
+                          const OutboundTargetOptions& options,
+                          bool allow_xhttp_download) {
+    if (!allow_xhttp_download ||
+        !options.stream_settings ||
+        !options.stream_settings->IsXHttp() ||
+        !options.stream_settings->xhttp.download_settings) {
+        co_return target;
+    }
+
+    const auto& upload_xhttp = options.stream_settings->xhttp;
+    if (upload_xhttp.IsStreamOne()) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+
+    const auto& download = *upload_xhttp.download_settings;
+    if (download.address.empty() || download.port == 0) {
+        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+    if (!download.stream_settings.IsXHttp() ||
+        download.stream_settings.IsUnsupported() ||
+        download.stream_settings.xhttp.IsStreamOne()) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+
+    auto download_target = co_await BuildOutboundTransportTargetInternal(
+        OutboundTargetOptions{
+            .dns_service = options.dns_service,
+            .address = download.address,
+            .literal_address = std::nullopt,
+            .port = download.port,
+            .stream_settings = &download.stream_settings,
+            .timeout = options.timeout,
+            .send_through = download.send_through,
+            .inbound_local_addr = options.inbound_local_addr,
+            .tls_server_name = ResolveOutboundTlsServerName(
+                download.stream_settings,
+                download.address),
+            .ws_host = download.address,
+        },
+        false);
+    if (!download_target) {
+        co_return std::unexpected(download_target.error());
+    }
+
+    target.xhttp_download_target =
+        std::make_shared<OutboundTransportTarget>(std::move(*download_target));
+    co_return target;
+}
+
 }  // namespace
 
 std::optional<net::ip::address> ParseLiteralAddress(std::string_view address) {
@@ -244,7 +301,8 @@ std::string_view ResolveOutboundTlsServerName(
 }
 
 net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
-BuildOutboundTransportTarget(OutboundTargetOptions options) {
+BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
+                                     bool allow_xhttp_download) {
     if (!options.stream_settings || options.port == 0) {
         co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
@@ -274,11 +332,17 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
 
     if (options.literal_address) {
         append_single(*options.literal_address);
-        co_return target;
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            allow_xhttp_download);
     }
     if (auto literal = ParseLiteralAddress(options.address)) {
         append_single(*literal);
-        co_return target;
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            allow_xhttp_download);
     }
     if (!options.dns_service) {
         co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -297,7 +361,10 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
         for (const auto& addr : dns_result.addresses) {
             if (addr.is_v6()) {
                 append_single(addr);
-                co_return target;
+                co_return co_await AttachXHttpDownloadTarget(
+                    std::move(target),
+                    options,
+                    allow_xhttp_download);
             }
         }
         co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
@@ -317,7 +384,10 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
         }
         if (v4_count == 1) {
             append_single(*first_v4);
-            co_return target;
+            co_return co_await AttachXHttpDownloadTarget(
+                std::move(target),
+                options,
+                allow_xhttp_download);
         }
         target.candidates.reserve(v4_count);
         for (const auto& addr : dns_result.addresses) {
@@ -325,14 +395,27 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
                 AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
             }
         }
-        co_return target;
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target),
+            options,
+            allow_xhttp_download);
     }
 
     target.candidates.reserve(dns_result.addresses.size());
     for (const auto& addr : dns_result.addresses) {
         AppendCandidate(target, bind, options.inbound_local_addr, addr, options.port);
     }
-    co_return target;
+    co_return co_await AttachXHttpDownloadTarget(
+        std::move(target),
+        options,
+        allow_xhttp_download);
+}
+
+net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+BuildOutboundTransportTarget(OutboundTargetOptions options) {
+    co_return co_await BuildOutboundTransportTargetInternal(
+        std::move(options),
+        true);
 }
 
 }  // namespace acpp

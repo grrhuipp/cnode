@@ -7,6 +7,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -28,8 +29,27 @@ enum class XHttpOutboundMode {
     Unsupported,
 };
 
-[[nodiscard]] XHttpOutboundMode ResolveXHttpOutboundMode(const XHttpConfig& cfg) noexcept {
-    if (cfg.mode.empty() || cfg.mode == "auto" || cfg.mode == "packet-up") {
+[[nodiscard]] bool HasOnlyHttp11Alpn(const StreamSettings& settings) noexcept {
+    return settings.tls.alpn.size() == 1 &&
+           settings.tls.alpn.front() == "http/1.1";
+}
+
+[[nodiscard]] XHttpOutboundMode ResolveXHttpOutboundMode(
+    const StreamSettings& settings) noexcept {
+    const XHttpConfig& cfg = settings.xhttp;
+    if (cfg.mode.empty() || cfg.mode == "auto") {
+        if (cfg.download_settings) {
+            return XHttpOutboundMode::StreamUp;
+        }
+        if (settings.IsReality()) {
+            return XHttpOutboundMode::StreamOne;
+        }
+        if (settings.IsTls() && !HasOnlyHttp11Alpn(settings)) {
+            return XHttpOutboundMode::StreamUp;
+        }
+        return XHttpOutboundMode::PacketUp;
+    }
+    if (cfg.mode == "packet-up") {
         return XHttpOutboundMode::PacketUp;
     }
     if (cfg.mode == "stream-up") {
@@ -45,8 +65,19 @@ enum class XHttpOutboundMode {
     if (!target.stream_settings || !target.stream_settings->IsXHttp()) {
         return false;
     }
-    const auto mode = ResolveXHttpOutboundMode(target.stream_settings->xhttp);
+    const auto mode = ResolveXHttpOutboundMode(*target.stream_settings);
     return mode == XHttpOutboundMode::PacketUp || mode == XHttpOutboundMode::StreamUp;
+}
+
+[[nodiscard]] std::optional<OutboundDialCandidate> FirstDialCandidate(
+    const OutboundTransportTarget& target) {
+    if (target.single_candidate) {
+        return target.single_candidate;
+    }
+    if (!target.candidates.empty()) {
+        return target.candidates.front();
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] std::string AppendU64Hex(std::string out, uint64_t value) {
@@ -750,13 +781,25 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         co_return DialResult::Fail(ErrorCode::INVALID_ARGUMENT, "missing stream settings");
     }
 
-    const auto mode = ResolveXHttpOutboundMode(target.stream_settings->xhttp);
+    const auto mode = ResolveXHttpOutboundMode(*target.stream_settings);
     if (mode != XHttpOutboundMode::PacketUp && mode != XHttpOutboundMode::StreamUp) {
         co_return DialResult::Fail(ErrorCode::PROTOCOL_UNSUPPORTED, "unsupported xhttp mode");
     }
 
+    const OutboundTransportTarget& downlink_target =
+        target.xhttp_download_target ? *target.xhttp_download_target : target;
+    if (!downlink_target.stream_settings || !downlink_target.stream_settings->IsXHttp()) {
+        co_return DialResult::Fail(
+            ErrorCode::INVALID_ARGUMENT,
+            "invalid xhttp downlink target");
+    }
+
     const std::string session_id = MakeXHttpSessionId(ctx.conn_id);
     const std::string downlink_path = BuildXHttpSplitPath(
+        downlink_target.stream_settings->xhttp,
+        session_id,
+        std::nullopt);
+    const std::string upload_path = BuildXHttpSplitPath(
         target.stream_settings->xhttp,
         session_id,
         std::nullopt);
@@ -766,18 +809,19 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     std::optional<OutboundDialCandidate> selected;
     std::unique_ptr<AsyncStream> downlink;
 
-    for (const auto& candidate : candidates) {
+    auto try_downlink_candidate = [&](const OutboundDialCandidate& candidate)
+        -> net::awaitable<bool> {
         auto attempt = co_await DialAndBuildXHttpRequestCandidate(
             io_context,
             ctx,
-            target,
+            downlink_target,
             candidate,
             downlink_path,
             XHttpClientRequestKind::Downlink);
         if (attempt.Ok()) {
             selected = candidate;
             downlink = std::move(attempt.stream);
-            break;
+            co_return true;
         }
 
         LOG_CONN_DEBUG(ctx,
@@ -786,10 +830,29 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
                        candidate.endpoint.port(),
                        attempt.error_msg);
         last_result = std::move(attempt);
+        co_return false;
+    };
+
+    if (downlink_target.single_candidate) {
+        (void)co_await try_downlink_candidate(*downlink_target.single_candidate);
+    } else {
+        for (const auto& candidate : downlink_target.candidates) {
+            if (co_await try_downlink_candidate(candidate)) {
+                break;
+            }
+        }
     }
 
     if (!downlink || !selected) {
         co_return last_result;
+    }
+
+    std::optional<OutboundDialCandidate> upload_candidate =
+        target.xhttp_download_target ? FirstDialCandidate(target) : selected;
+    if (!upload_candidate) {
+        co_return DialResult::Fail(
+            ErrorCode::INVALID_ARGUMENT,
+            "missing xhttp upload candidate");
     }
 
     if (mode == XHttpOutboundMode::PacketUp) {
@@ -798,7 +861,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
                 io_context,
                 std::move(downlink),
                 target,
-                *selected,
+                *upload_candidate,
                 session_id,
                 ctx.conn_id));
     }
@@ -808,8 +871,8 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             io_context,
             std::move(downlink),
             target,
-            *selected,
-            downlink_path,
+            *upload_candidate,
+            upload_path,
             ctx.conn_id));
 }
 

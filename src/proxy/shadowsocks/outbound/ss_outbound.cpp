@@ -695,38 +695,55 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kShadowsocks,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
-        const auto* servers_p = cfg.settings.if_contains("servers");
-        if (!servers_p || !servers_p->is_array() || servers_p->as_array().empty()) {
-            return std::nullopt;
-        }
-        const auto& first_server = servers_p->as_array()[0];
-        if (!first_server.is_object()) {
-            return std::nullopt;
-        }
-        const auto& srv = first_server.as_object();
+        auto json_string = [](const acpp::json::object& obj,
+                              std::string_view key) -> std::string {
+            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
+                return std::string(v->as_string());
+            }
+            return {};
+        };
+        auto json_port = [](const acpp::json::object& obj,
+                            std::string_view key,
+                            uint16_t fallback = 0) -> uint16_t {
+            if (const auto* v = obj.if_contains(key); v) {
+                if (v->is_uint64()) {
+                    return static_cast<uint16_t>(v->as_uint64());
+                }
+                if (v->is_int64()) {
+                    return static_cast<uint16_t>(v->as_int64());
+                }
+            }
+            return fallback;
+        };
+        auto read_ss_server = [&](const acpp::json::object& obj,
+                                  acpp::SsOutboundConfig& config) {
+            config.address = json_string(obj, "address");
+            if (config.address.empty()) {
+                config.address = json_string(obj, "server");
+            }
+            config.port = json_port(
+                obj, "server_port", json_port(obj, "port", config.port));
+            config.password = json_string(obj, "password");
+            if (config.password.empty()) {
+                config.password = json_string(obj, "key");
+            }
+            if (const auto method = json_string(obj, "method"); !method.empty()) {
+                config.method = method;
+            }
+        };
 
         acpp::SsOutboundConfig ss_config;
-        ss_config.tag     = cfg.tag;
-        if (const auto* v = srv.if_contains("address"); v && v->is_string()) {
-            ss_config.address = std::string(v->as_string());
+        ss_config.tag = cfg.tag;
+
+        bool parsed_xray = false;
+        if (const auto* servers_p = cfg.settings.if_contains("servers");
+                servers_p && servers_p->is_array() && !servers_p->as_array().empty() &&
+                servers_p->as_array()[0].is_object()) {
+            read_ss_server(servers_p->as_array()[0].as_object(), ss_config);
+            parsed_xray = true;
         }
-        if (const auto* v = srv.if_contains("port"); v) {
-            if (v->is_uint64()) {
-                ss_config.port = static_cast<uint16_t>(v->as_uint64());
-            } else if (v->is_int64()) {
-                ss_config.port = static_cast<uint16_t>(v->as_int64());
-            }
-        }
-        if (const auto* v = srv.if_contains("password"); v && v->is_string()) {
-            ss_config.password = std::string(v->as_string());
-        }
-        if (ss_config.password.empty()) {
-            if (const auto* v = srv.if_contains("key"); v && v->is_string()) {
-                ss_config.password = std::string(v->as_string());
-            }
-        }
-        if (const auto* v = srv.if_contains("method"); v && v->is_string()) {
-            ss_config.method = std::string(v->as_string());
+        if (!parsed_xray) {
+            read_ss_server(cfg.settings, ss_config);
         }
         ss_config.stream_settings = cfg.stream_settings;
         ss_config.send_through = cfg.send_through;

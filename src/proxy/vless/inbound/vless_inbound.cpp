@@ -627,8 +627,11 @@ proxy::vless::inbound::Handler::Process(
         LOG_CONN_FAIL("[VLESS][{}] flow '{}' only supports TCP", tag, request->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
-    if (use_vision && !receiver.stream_settings.IsTls()) {
-        LOG_CONN_FAIL("[VLESS][{}] flow '{}' requires TLS transport", tag, request->flow);
+    if (use_vision &&
+        (!receiver.stream_settings.IsTlsLike() ||
+         receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
+        LOG_CONN_FAIL("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
+                      tag, request->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 

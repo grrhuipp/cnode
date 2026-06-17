@@ -16,6 +16,7 @@
 #include <deque>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace acpp {
 
@@ -489,37 +490,83 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
         const auto& s = cfg.settings;
 
-        acpp::TrojanOutboundConfig trojan_config;
-        trojan_config.tag     = cfg.tag;
-
-        // Xray 格式: servers[0] 包含 address/port/password 等
-        const auto* servers_p = s.if_contains("servers");
-        if (!servers_p || !servers_p->is_array() || servers_p->as_array().empty()) {
-            return std::nullopt;
-        }
-        const auto& first_server = servers_p->as_array()[0];
-        if (!first_server.is_object()) {
-            return std::nullopt;
-        }
-        const auto& srv = first_server.as_object();
-        if (const auto* v = srv.if_contains("address"); v && v->is_string()) {
-            trojan_config.address = std::string(v->as_string());
-        }
-        if (const auto* v = srv.if_contains("port"); v) {
-            if (v->is_uint64()) {
-                trojan_config.port = static_cast<uint16_t>(v->as_uint64());
-            } else if (v->is_int64()) {
-                trojan_config.port = static_cast<uint16_t>(v->as_int64());
+        auto json_string = [](const acpp::json::object& obj,
+                              std::string_view key) -> std::string {
+            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
+                return std::string(v->as_string());
             }
+            return {};
+        };
+        auto json_port = [](const acpp::json::object& obj,
+                            std::string_view key,
+                            uint16_t fallback = 0) -> uint16_t {
+            if (const auto* v = obj.if_contains(key); v) {
+                if (v->is_uint64()) {
+                    return static_cast<uint16_t>(v->as_uint64());
+                }
+                if (v->is_int64()) {
+                    return static_cast<uint16_t>(v->as_int64());
+                }
+            }
+            return fallback;
+        };
+        auto json_bool = [](const acpp::json::object& obj,
+                            std::string_view key,
+                            bool fallback = false) -> bool {
+            if (const auto* v = obj.if_contains(key); v && v->is_bool()) {
+                return v->as_bool();
+            }
+            return fallback;
+        };
+        auto json_string_array = [](const acpp::json::object& obj,
+                                    std::string_view key) {
+            std::vector<std::string> out;
+            const auto* v = obj.if_contains(key);
+            if (!v || !v->is_array()) {
+                return out;
+            }
+            for (const auto& item : v->as_array()) {
+                if (item.is_string()) {
+                    out.emplace_back(item.as_string());
+                }
+            }
+            return out;
+        };
+        auto read_trojan_server = [&](const acpp::json::object& obj,
+                                      acpp::TrojanOutboundConfig& config) {
+            config.address = json_string(obj, "address");
+            if (config.address.empty()) {
+                config.address = json_string(obj, "server");
+            }
+            config.port = json_port(
+                obj, "server_port", json_port(obj, "port", config.port));
+            config.password = json_string(obj, "password");
+            config.server_name = json_string(obj, "serverName");
+            if (config.server_name.empty()) {
+                config.server_name = json_string(obj, "server_name");
+            }
+            if (config.server_name.empty()) {
+                config.server_name = json_string(obj, "sni");
+            }
+            config.allow_insecure = json_bool(
+                obj,
+                "allowInsecure",
+                json_bool(obj, "allow_insecure", config.allow_insecure));
+            config.alpn = json_string_array(obj, "alpn");
+        };
+
+        acpp::TrojanOutboundConfig trojan_config;
+        trojan_config.tag = cfg.tag;
+
+        bool parsed_xray = false;
+        if (const auto* servers_p = s.if_contains("servers");
+                servers_p && servers_p->is_array() && !servers_p->as_array().empty() &&
+                servers_p->as_array()[0].is_object()) {
+            read_trojan_server(servers_p->as_array()[0].as_object(), trojan_config);
+            parsed_xray = true;
         }
-        if (const auto* v = srv.if_contains("password"); v && v->is_string()) {
-            trojan_config.password = std::string(v->as_string());
-        }
-        if (const auto* v = srv.if_contains("serverName"); v && v->is_string()) {
-            trojan_config.server_name = std::string(v->as_string());
-        }
-        if (const auto* v = srv.if_contains("allowInsecure"); v && v->is_bool()) {
-            trojan_config.allow_insecure = v->as_bool();
+        if (!parsed_xray) {
+            read_trojan_server(s, trojan_config);
         }
         trojan_config.stream_settings = cfg.stream_settings;
         trojan_config.send_through = cfg.send_through;

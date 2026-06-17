@@ -5,6 +5,7 @@
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,6 +40,9 @@ struct OutboundTransportTarget {
     std::string ws_host;                            // WS Host header（已按端口格式化，仅 WS 使用）
     const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
     std::chrono::seconds timeout{defaults::kDialTimeout};
+
+    // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。
+    std::shared_ptr<const OutboundTransportTarget> xhttp_download_target;
 };
 
 }  // namespace acpp

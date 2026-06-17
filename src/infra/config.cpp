@@ -192,12 +192,24 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         auto arr = jstr_array(j.at("domainSuffix"));
         rule.domain_suffix.insert(rule.domain_suffix.end(), arr.begin(), arr.end());
     }
+    if (j.contains("domain_suffix")) {
+        auto arr = jstr_array(j.at("domain_suffix"));
+        rule.domain_suffix.insert(rule.domain_suffix.end(), arr.begin(), arr.end());
+    }
     if (j.contains("domainKeyword")) {
         auto arr = jstr_array(j.at("domainKeyword"));
         rule.domain_keyword.insert(rule.domain_keyword.end(), arr.begin(), arr.end());
     }
+    if (j.contains("domain_keyword")) {
+        auto arr = jstr_array(j.at("domain_keyword"));
+        rule.domain_keyword.insert(rule.domain_keyword.end(), arr.begin(), arr.end());
+    }
     if (j.contains("domainFull")) {
         auto arr = jstr_array(j.at("domainFull"));
+        rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
+    }
+    if (j.contains("domain_full")) {
+        auto arr = jstr_array(j.at("domain_full"));
         rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
     }
     if (j.contains("domainRegex")) {
@@ -206,6 +218,14 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("domainRegexp")) {
         auto arr = jstr_array(j.at("domainRegexp"));
+        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
+    }
+    if (j.contains("domain_regex")) {
+        auto arr = jstr_array(j.at("domain_regex"));
+        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
+    }
+    if (j.contains("domain_regexp")) {
+        auto arr = jstr_array(j.at("domain_regexp"));
         rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
     }
     if (j.contains("geosite")) {
@@ -276,6 +296,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     {
         auto vals = parse_str_or_array("inboundTag");
         rule.inbound_tag.insert(rule.inbound_tag.end(), vals.begin(), vals.end());
+        vals = parse_str_or_array("inbound_tag");
+        rule.inbound_tag.insert(rule.inbound_tag.end(), vals.begin(), vals.end());
     }
 
     // 用户 email（Xray user 字段）
@@ -287,11 +309,16 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 来源 IP/CIDR（Xray source 字段）
     if (j.contains("source") && j.at("source").is_array()) {
         rule.source = jstr_array(j.at("source"));
+    } else {
+        auto vals = parse_str_or_array("source");
+        rule.source.insert(rule.source.end(), vals.begin(), vals.end());
     }
 
     // 来源端口（Xray sourcePort 字段）
     {
         auto vals = parse_str_or_array("sourcePort");
+        rule.source_port.insert(rule.source_port.end(), vals.begin(), vals.end());
+        vals = parse_str_or_array("source_port");
         rule.source_port.insert(rule.source_port.end(), vals.begin(), vals.end());
     }
 
@@ -304,6 +331,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 目标出站
     if (j.contains("outboundTag")) {
         rule.outbound_tag = std::string(j.at("outboundTag").as_string());
+    } else if (j.contains("outbound_tag")) {
+        rule.outbound_tag = std::string(j.at("outbound_tag").as_string());
     }
 
     return rule;
@@ -316,6 +345,8 @@ RoutingConfig RoutingConfig::FromJson(const json::object& j) {
     RoutingConfig cfg;
     if (j.contains("domainStrategy")) {
         cfg.domain_strategy = std::string(j.at("domainStrategy").as_string());
+    } else if (j.contains("domain_strategy")) {
+        cfg.domain_strategy = std::string(j.at("domain_strategy").as_string());
     }
     if (j.contains("rules")) {
         for (const auto& rule : j.at("rules").as_array()) {
@@ -396,6 +427,30 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
+std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
+    const json::object& j) {
+    auto settings = std::make_shared<XHttpDownloadSettings>();
+
+    settings->address = jstr(j, "address", "");
+    if (settings->address.empty()) {
+        settings->address = jstr(j, "server", "");
+    }
+
+    const int64_t port = jint(j, "port", jint(j, "server_port", 0));
+    if (port > 0 && port <= std::numeric_limits<uint16_t>::max()) {
+        settings->port = static_cast<uint16_t>(port);
+    }
+
+    settings->send_through = jstr(j, "sendThrough", "");
+    if (settings->send_through.empty()) {
+        settings->send_through = jstr(j, "send_through", "");
+    }
+
+    settings->stream_settings = StreamSettings::FromJson(j);
+    settings->stream_settings.xhttp.download_settings.reset();
+    return settings;
+}
+
 XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     XHttpConfig cfg;
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
@@ -406,6 +461,18 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     cfg.no_grpc_header = jbool(j, "no_grpc_header", cfg.no_grpc_header);
     cfg.no_sse_header = jbool(j, "noSSEHeader", false);
     cfg.no_sse_header = jbool(j, "no_sse_header", cfg.no_sse_header);
+    auto parse_download_settings = [&](const json::object& source) {
+        if (const auto* camel_download = source.if_contains("downloadSettings");
+            camel_download && camel_download->is_object()) {
+            cfg.download_settings =
+                ParseXHttpDownloadSettings(camel_download->as_object());
+        } else if (const auto* snake_download = source.if_contains("download_settings");
+                   snake_download && snake_download->is_object()) {
+            cfg.download_settings =
+                ParseXHttpDownloadSettings(snake_download->as_object());
+        }
+    };
+    parse_download_settings(j);
     if (const auto* extra = j.if_contains("extra");
         extra && extra->is_object()) {
         const auto& extra_obj = extra->as_object();
@@ -414,6 +481,7 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
         cfg.no_grpc_header = jbool(extra_obj, "no_grpc_header", cfg.no_grpc_header);
         cfg.no_sse_header = jbool(extra_obj, "noSSEHeader", cfg.no_sse_header);
         cfg.no_sse_header = jbool(extra_obj, "no_sse_header", cfg.no_sse_header);
+        parse_download_settings(extra_obj);
     }
     return cfg;
 }
@@ -754,28 +822,46 @@ StaticUserConfig ParseStaticUserConfig(
             "decryption",
             std::string(constants::protocol::kNone));
     }
-    if (const auto* padding = settings.if_contains("paddingScheme");
-            padding && padding->is_array()) {
-        bool first = true;
-        for (const auto& item : padding->as_array()) {
-            if (!item.is_string()) {
-                continue;
-            }
-            if (!first) {
-                config.padding_scheme.push_back('\n');
-            }
-            config.padding_scheme.append(std::string(item.as_string()));
-            first = false;
+    auto parse_padding_scheme = [&](std::string_view key) {
+        if (!config.padding_scheme.empty()) {
+            return;
         }
-    }
+        const auto* padding = settings.if_contains(key);
+        if (!padding) {
+            return;
+        }
+        if (padding->is_string()) {
+            config.padding_scheme = std::string(padding->as_string());
+            return;
+        }
+        if (padding->is_array()) {
+            bool first = true;
+            for (const auto& item : padding->as_array()) {
+                if (!item.is_string()) {
+                    continue;
+                }
+                if (!first) {
+                    config.padding_scheme.push_back('\n');
+                }
+                config.padding_scheme.append(std::string(item.as_string()));
+                first = false;
+            }
+        }
+    };
+    parse_padding_scheme("paddingScheme");
+    parse_padding_scheme("padding_scheme");
 
     const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
     StaticUser top_level_user;
-    if (protocol == constants::protocol::kShadowsocks) {
+    if (protocol == constants::protocol::kShadowsocks ||
+        protocol == constants::protocol::kTrojan ||
+        protocol == constants::protocol::kAnyTLS) {
         if (const auto* password = settings.if_contains("password");
                 password && password->is_string()) {
             top_level_user.password = std::string(password->as_string());
-            config.identity_password = top_level_user.password;
+            if (protocol == constants::protocol::kShadowsocks) {
+                config.identity_password = top_level_user.password;
+            }
         }
         if (const auto* email = settings.if_contains("email");
                 email && email->is_string()) {
@@ -827,10 +913,18 @@ StaticUserConfig ParseStaticUserConfig(
     if (protocol == constants::protocol::kVless && user_array_key != std::string_view("users")) {
         parse_user_array("users");
     }
+    if (protocol == constants::protocol::kAnyTLS && config.clients.empty()) {
+        parse_user_array("clients");
+    }
 
     if (protocol == constants::protocol::kShadowsocks &&
         !top_level_user.password.empty() &&
         (!ss2022_method || !saw_user_array)) {
+        config.clients.insert(config.clients.begin(), std::move(top_level_user));
+    } else if ((protocol == constants::protocol::kTrojan ||
+                protocol == constants::protocol::kAnyTLS) &&
+               !top_level_user.password.empty() &&
+               !saw_user_array) {
         config.clients.insert(config.clients.begin(), std::move(top_level_user));
     }
 
@@ -876,6 +970,8 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 
     if (j.contains("streamSettings") && j.at("streamSettings").is_object()) {
         cfg.stream_settings = StreamSettings::FromJson(j.at("streamSettings").as_object());
+    } else if (j.contains("stream_settings") && j.at("stream_settings").is_object()) {
+        cfg.stream_settings = StreamSettings::FromJson(j.at("stream_settings").as_object());
     }
 
     // Xray sniffing 配置
@@ -886,14 +982,19 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         cfg.sniffing.enabled = jbool(s, "enabled", true);
         if (s.contains("destOverride")) {
             cfg.sniffing.dest_override = jstr_array(s.at("destOverride"));
+        } else if (s.contains("dest_override")) {
+            cfg.sniffing.dest_override = jstr_array(s.at("dest_override"));
         }
         if (s.contains("domainsExcluded")) {
             cfg.sniffing.domains_excluded = jstr_array(s.at("domainsExcluded"));
+        } else if (s.contains("domains_excluded")) {
+            cfg.sniffing.domains_excluded = jstr_array(s.at("domains_excluded"));
         }
     };
     parse_sniffing("sniffing");
 
     cfg.routing_enabled = jbool(j, "routingEnabled", cfg.routing_enabled);
+    cfg.routing_enabled = jbool(j, "routing_enabled", cfg.routing_enabled);
 
     return cfg;
 }

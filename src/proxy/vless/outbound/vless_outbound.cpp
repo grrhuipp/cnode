@@ -926,7 +926,9 @@ proxy::vless::outbound::Handler::Process(
     if (!config_.flow.empty() && !use_vision) {
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
-    if (use_vision && !config_.stream_settings.IsTls()) {
+    if (use_vision &&
+        (!config_.stream_settings.IsTlsLike() ||
+         config_.stream_settings.network_mode != NetworkMode::Tcp)) {
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     const bool use_xudp = is_udp && config_.packet_xudp;

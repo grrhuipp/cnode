@@ -11,6 +11,8 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <openssl/rand.h>
 #include "acppnode/common/buffer_util.hpp"
@@ -306,54 +308,120 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
         const auto& s = cfg.settings;
 
-        // 解析 vnext[0]
-        const auto* vnext_p = s.if_contains("vnext");
-        if (!vnext_p || !vnext_p->is_array() || vnext_p->as_array().empty()) {
+        auto json_string = [](const acpp::json::object& obj,
+                              std::string_view key) -> std::string {
+            if (const auto* v = obj.if_contains(key); v && v->is_string()) {
+                return std::string(v->as_string());
+            }
+            return {};
+        };
+        auto json_port = [](const acpp::json::object& obj,
+                            std::string_view key,
+                            uint16_t fallback = 0) -> uint16_t {
+            if (const auto* v = obj.if_contains(key); v) {
+                if (v->is_uint64()) {
+                    return static_cast<uint16_t>(v->as_uint64());
+                }
+                if (v->is_int64()) {
+                    return static_cast<uint16_t>(v->as_int64());
+                }
+            }
+            return fallback;
+        };
+        auto json_int = [](const acpp::json::object& obj,
+                           std::string_view key,
+                           int fallback = 0) -> int {
+            if (const auto* v = obj.if_contains(key); v) {
+                if (v->is_uint64()) {
+                    return static_cast<int>(v->as_uint64());
+                }
+                if (v->is_int64()) {
+                    return static_cast<int>(v->as_int64());
+                }
+            }
+            return fallback;
+        };
+        auto lower_ascii = [](std::string text) {
+            std::transform(
+                text.begin(),
+                text.end(),
+                text.begin(),
+                [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            return text;
+        };
+        auto parse_security = [&](std::string security)
+            -> std::optional<acpp::vmess::Security> {
+            security = lower_ascii(std::move(security));
+            if (security.empty() ||
+                security == acpp::constants::protocol::kAes128Gcm ||
+                security == acpp::constants::binding::kAuto) {
+                return acpp::vmess::Security::AES_128_GCM;
+            }
+            if (security == acpp::constants::protocol::kChacha20IetfPoly1305 ||
+                security == "chacha20-poly1305") {
+                return acpp::vmess::Security::CHACHA20_POLY1305;
+            }
+            if (security == acpp::constants::protocol::kNone) {
+                return acpp::vmess::Security::NONE;
+            }
+            if (security == "zero") {
+                return acpp::vmess::Security::ZERO;
+            }
             return std::nullopt;
-        }
-        const auto& server = vnext_p->as_array()[0].as_object();
-
-        // 解析 users[0]
-        const auto* users_p = server.if_contains("users");
-        if (!users_p || !users_p->is_array() || users_p->as_array().empty()) {
-            return std::nullopt;
-        }
-        const auto& user = users_p->as_array()[0].as_object();
+        };
 
         acpp::VMessOutboundConfig vmess_config;
-        vmess_config.tag      = cfg.tag;
-        if (const auto* v = server.if_contains("address"); v && v->is_string()) {
-            vmess_config.address = std::string(v->as_string());
-        }
-        if (const auto* v = server.if_contains("port"); v) {
-            if (v->is_uint64()) {
-                vmess_config.port = static_cast<uint16_t>(v->as_uint64());
-            } else if (v->is_int64()) {
-                vmess_config.port = static_cast<uint16_t>(v->as_int64());
-            }
-        }
-        if (const auto* v = user.if_contains("id"); v && v->is_string()) {
-            vmess_config.uuid = std::string(v->as_string());
-        }
-        if (const auto* v = user.if_contains("alterId"); v) {
-            if (v->is_uint64()) {
-                vmess_config.alter_id = static_cast<int>(v->as_uint64());
-            } else if (v->is_int64()) {
-                vmess_config.alter_id = static_cast<int>(v->as_int64());
+        vmess_config.tag = cfg.tag;
+
+        bool parsed_xray = false;
+        if (const auto* vnext_p = s.if_contains("vnext");
+                vnext_p && vnext_p->is_array() && !vnext_p->as_array().empty() &&
+                vnext_p->as_array()[0].is_object()) {
+            const auto& server = vnext_p->as_array()[0].as_object();
+            if (const auto* users_p = server.if_contains("users");
+                    users_p && users_p->is_array() && !users_p->as_array().empty() &&
+                    users_p->as_array()[0].is_object()) {
+                const auto& user = users_p->as_array()[0].as_object();
+                vmess_config.address = json_string(server, "address");
+                if (vmess_config.address.empty()) {
+                    vmess_config.address = json_string(server, "server");
+                }
+                vmess_config.port = json_port(server, "port", vmess_config.port);
+                vmess_config.uuid = json_string(user, "id");
+                if (vmess_config.uuid.empty()) {
+                    vmess_config.uuid = json_string(user, "uuid");
+                }
+                vmess_config.alter_id = json_int(
+                    user, "alterId", json_int(user, "alter_id", vmess_config.alter_id));
+                auto parsed_security = parse_security(json_string(user, "security"));
+                if (!parsed_security) {
+                    return std::nullopt;
+                }
+                vmess_config.security = *parsed_security;
+                parsed_xray = true;
             }
         }
 
-        std::string security = std::string(acpp::constants::binding::kAuto);
-        if (const auto* v = user.if_contains("security"); v && v->is_string()) {
-            security = std::string(v->as_string());
-        }
-        if (security == acpp::constants::protocol::kAes128Gcm ||
-            security == acpp::constants::binding::kAuto) {
-            vmess_config.security = acpp::vmess::Security::AES_128_GCM;
-        } else if (security == acpp::constants::protocol::kChacha20IetfPoly1305) {
-            vmess_config.security = acpp::vmess::Security::CHACHA20_POLY1305;
-        } else if (security == acpp::constants::protocol::kNone) {
-            vmess_config.security = acpp::vmess::Security::NONE;
+        if (!parsed_xray) {
+            vmess_config.address = json_string(s, "server");
+            if (vmess_config.address.empty()) {
+                vmess_config.address = json_string(s, "address");
+            }
+            vmess_config.port = json_port(
+                s, "server_port", json_port(s, "port", vmess_config.port));
+            vmess_config.uuid = json_string(s, "uuid");
+            if (vmess_config.uuid.empty()) {
+                vmess_config.uuid = json_string(s, "id");
+            }
+            vmess_config.alter_id = json_int(
+                s, "alterId", json_int(s, "alter_id", vmess_config.alter_id));
+            auto parsed_security = parse_security(json_string(s, "security"));
+            if (!parsed_security) {
+                return std::nullopt;
+            }
+            vmess_config.security = *parsed_security;
         }
 
         vmess_config.stream_settings = cfg.stream_settings;

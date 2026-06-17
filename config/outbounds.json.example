@@ -71,6 +71,80 @@
     }
   },
   {
+    "tag": "proxy-vless-xhttp-reality",
+    "protocol": "vless",
+    "settings": {
+      "server": "vless.example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "encryption": "none",
+      "packetEncoding": "xudp"
+    },
+    "streamSettings": {
+      "network": "xhttp",
+      "security": "reality",
+      "xhttpSettings": {
+        "path": "/xhttp",
+        "host": "vless.example.com",
+        "mode": "packet-up"
+      },
+      "realitySettings": {
+        "serverName": "vless.example.com",
+        "publicKey": "your-reality-public-key",
+        "shortId": "0123456789abcdef",
+        "fingerprint": "chrome",
+        "spiderX": "/"
+      }
+    }
+  },
+  {
+    "tag": "proxy-vless-xhttp-split",
+    "protocol": "vless",
+    "settings": {
+      "server": "upload.example.com",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "encryption": "none",
+      "packetEncoding": "xudp"
+    },
+    "streamSettings": {
+      "network": "xhttp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "upload.example.com",
+        "alpn": [
+          "h2"
+        ],
+        "allowInsecure": false
+      },
+      "xhttpSettings": {
+        "path": "/xhttp-split",
+        "host": "upload.example.com",
+        "mode": "auto",
+        "extra": {
+          "downloadSettings": {
+            "address": "download.example.com",
+            "port": 443,
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+              "serverName": "download.example.com",
+              "alpn": [
+                "h2"
+              ],
+              "allowInsecure": false
+            },
+            "xhttpSettings": {
+              "path": "/xhttp-split",
+              "host": "download.example.com",
+              "mode": "auto"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
     "tag": "proxy-ss",
     "protocol": "shadowsocks",
     "settings": {

@@ -37,19 +37,36 @@ std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
     acpp::proxy::anytls::outbound::Settings result;
 
-    if (const auto* value = settings.if_contains("address"); value && value->is_string()) {
-        result.address = std::string(value->as_string());
-    }
-    if (const auto* value = settings.if_contains("port"); value) {
-        const auto raw = value->is_int64()
-            ? value->as_int64()
-            : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : 0);
-        if (raw > 0 && raw <= 65535) {
-            result.port = static_cast<uint16_t>(raw);
+    auto read_string = [&](std::string_view key) -> std::string {
+        if (const auto* value = settings.if_contains(key); value && value->is_string()) {
+            return std::string(value->as_string());
         }
+        return {};
+    };
+    auto read_port = [&](std::string_view key, uint16_t fallback) -> uint16_t {
+        if (const auto* value = settings.if_contains(key); value) {
+            const auto raw = value->is_int64()
+                ? value->as_int64()
+                : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : 0);
+            if (raw > 0 && raw <= 65535) {
+                return static_cast<uint16_t>(raw);
+            }
+        }
+        return fallback;
+    };
+
+    if (const auto value = read_string("address"); !value.empty()) {
+        result.address = value;
     }
-    if (const auto* value = settings.if_contains("password"); value && value->is_string()) {
-        result.password = std::string(value->as_string());
+    if (result.address.empty()) {
+        result.address = read_string("server");
+    }
+    result.port = read_port("server_port", read_port("port", result.port));
+    if (const auto value = read_string("password"); !value.empty()) {
+        result.password = value;
+    }
+    if (result.password.empty()) {
+        result.password = read_string("key");
     }
     auto read_seconds = [&](std::string_view key, std::chrono::seconds fallback) {
         if (const auto* value = settings.if_contains(key); value) {
@@ -64,9 +81,21 @@ std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     };
     result.idle_session_check_interval =
         read_seconds("idleSessionCheckInterval", result.idle_session_check_interval);
+    result.idle_session_check_interval =
+        read_seconds("idle_session_check_interval", result.idle_session_check_interval);
     result.idle_session_timeout =
         read_seconds("idleSessionTimeout", result.idle_session_timeout);
+    result.idle_session_timeout =
+        read_seconds("idle_session_timeout", result.idle_session_timeout);
     if (const auto* value = settings.if_contains("minIdleSession"); value) {
+        const auto raw = value->is_int64()
+            ? value->as_int64()
+            : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : -1);
+        if (raw >= 0) {
+            result.min_idle_sessions = static_cast<size_t>(raw);
+        }
+    }
+    if (const auto* value = settings.if_contains("min_idle_session"); value) {
         const auto raw = value->is_int64()
             ? value->as_int64()
             : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : -1);

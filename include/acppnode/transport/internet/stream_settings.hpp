@@ -5,10 +5,13 @@
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/tls_config.hpp"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace acpp {
+
+struct XHttpDownloadSettings;
 
 // ============================================================================
 // 传输模式缓存（初始化期归一化，运行时零字符串比较）
@@ -117,6 +120,7 @@ struct XHttpConfig {
     std::string host;
     std::string mode;
     transport::internet::HttpHeaders headers;
+    std::shared_ptr<const XHttpDownloadSettings> download_settings;
 
     bool no_grpc_header = false;
     bool no_sse_header = false;
@@ -215,6 +219,13 @@ struct StreamSettings {
     void RecomputeModes() noexcept;
 
     static StreamSettings FromJson(const json::object& j);
+};
+
+struct XHttpDownloadSettings {
+    std::string address;
+    uint16_t port = 0;
+    std::string send_through;
+    StreamSettings stream_settings;
 };
 
 }  // namespace acpp

@@ -492,12 +492,20 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         acpp::proxy::freedom::outbound::FreedomSettings settings;
 
         settings.send_through = std::string(acpp::constants::binding::kAuto);
-        if (const auto* v = s.if_contains("sendThrough"); v && v->is_string()) {
-            settings.send_through = std::string(v->as_string());
+        if (const auto* camel_send_through = s.if_contains("sendThrough");
+            camel_send_through && camel_send_through->is_string()) {
+            settings.send_through = std::string(camel_send_through->as_string());
+        } else if (const auto* snake_send_through = s.if_contains("send_through");
+                   snake_send_through && snake_send_through->is_string()) {
+            settings.send_through = std::string(snake_send_through->as_string());
         }
         settings.domain_strategy = std::string(acpp::constants::protocol::kAsIs);
-        if (const auto* v = s.if_contains("domainStrategy"); v && v->is_string()) {
-            settings.domain_strategy = std::string(v->as_string());
+        if (const auto* camel_domain_strategy = s.if_contains("domainStrategy");
+            camel_domain_strategy && camel_domain_strategy->is_string()) {
+            settings.domain_strategy = std::string(camel_domain_strategy->as_string());
+        } else if (const auto* snake_domain_strategy = s.if_contains("domain_strategy");
+                   snake_domain_strategy && snake_domain_strategy->is_string()) {
+            settings.domain_strategy = std::string(snake_domain_strategy->as_string());
         }
         if (const auto* v = s.if_contains("redirect"); v && v->is_string()) {
             settings.redirect = std::string(v->as_string());

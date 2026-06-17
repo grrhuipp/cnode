@@ -75,12 +75,12 @@ private:
 };
 
 void CopySessionContext(const session::Context& source, session::Context& target) {
-    target.conn_id = source.conn_id;
+    target.conn_id = session::NewID(source.worker_id);
     target.inbound = source.inbound;
     target.outbound = source.outbound;
     target.outbounds = source.outbounds;
     target.content = source.content;
-    target.traffic = source.traffic;
+    target.traffic = {};
     target.sockopt = source.sockopt;
     target.accept_time_us = source.accept_time_us;
     target.worker_id = source.worker_id;
@@ -368,6 +368,7 @@ public:
                     std::shared_ptr<AnyTLSDemuxSession> session,
                     uint32_t sid)
         : input_signal_(io_context, 1)
+        , input_space_signal_(io_context, 1)
         , session_(std::move(session))
         , sid_(sid) {}
 
@@ -382,24 +383,38 @@ public:
         return sid_;
     }
 
-    void PushInput(buf::MultiBuffer mb) {
+    net::awaitable<bool> PushInput(buf::MultiBuffer mb) {
         if (cancelled_ || input_done_) {
             mb.clear();
-            return;
+            co_return false;
         }
         const size_t bytes = buf::TotalLen(mb);
         if (bytes == 0) {
             mb.clear();
-            return;
+            co_return true;
         }
-        if (queued_bytes_ + bytes > kMaxSubStreamQueuedPayloadBytes) {
-            Cancel();
+        if (bytes > kMaxSubStreamQueuedPayloadBytes) {
             mb.clear();
-            return;
+            co_return false;
+        }
+        while (!cancelled_ &&
+               !input_done_ &&
+               queued_bytes_ + bytes > kMaxSubStreamQueuedPayloadBytes) {
+            auto [ec] = co_await input_space_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                mb.clear();
+                co_return false;
+            }
+        }
+        if (cancelled_ || input_done_) {
+            mb.clear();
+            co_return false;
         }
         input_queue_.push_back(std::move(mb));
         queued_bytes_ += bytes;
         WakeInputReader();
+        co_return true;
     }
 
     void CloseInput() {
@@ -419,6 +434,7 @@ public:
         input_queue_.clear();
         queued_bytes_ = 0;
         WakeInputReader();
+        WakeInputWriter();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -427,6 +443,7 @@ public:
                 buf::MultiBuffer mb = std::move(input_queue_.front());
                 queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
                 input_queue_.pop_front();
+                WakeInputWriter();
                 co_return mb;
             }
             if (input_done_) {
@@ -449,7 +466,12 @@ private:
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
+    void WakeInputWriter() noexcept {
+        (void)input_space_signal_.try_send(IoErrorCode{});
+    }
+
     net::experimental::channel<void(IoErrorCode)> input_signal_;
+    net::experimental::channel<void(IoErrorCode)> input_space_signal_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;
     std::deque<buf::MultiBuffer> input_queue_;
@@ -894,7 +916,11 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                 break;
             }
             case StreamState::Started:
-                sub->PushInput(std::move(*payload));
+                if (!co_await sub->PushInput(std::move(*payload))) {
+                    result.error = ErrorCode::CONNECTION_CLOSED;
+                    CancelAll();
+                    co_return result;
+                }
                 break;
         }
     }

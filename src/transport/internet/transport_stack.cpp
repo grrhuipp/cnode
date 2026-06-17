@@ -6064,7 +6064,11 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 4. XHTTP stream-one 层（客户端，HTTP/2 raw body/response）
     if (s.IsXHttp()) {
-        if (!s.xhttp.IsStreamOne()) {
+        const bool auto_reality_stream_one =
+            (s.xhttp.mode.empty() || s.xhttp.mode == "auto") &&
+            s.IsReality() &&
+            !s.xhttp.download_settings;
+        if (!s.xhttp.IsStreamOne() && !auto_reality_stream_one) {
             LOG_ERROR("[Transport] BuildOutbound: XHTTP mode '{}' is not supported yet",
                       s.xhttp.mode.empty() ? "auto" : s.xhttp.mode);
             co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
