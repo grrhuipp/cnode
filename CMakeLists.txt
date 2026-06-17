@@ -291,6 +291,7 @@ set(CNODE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_stream.cpp
+    src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp

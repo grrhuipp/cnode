@@ -14,10 +14,11 @@
 #include <asio/experimental/channel.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <deque>
 #include <exception>
-#include <format>
+#include <limits>
 #include <memory>
 #include <span>
 #include <utility>
@@ -499,8 +500,20 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         }
 
         const auto bind_addr = SelectUdpBindAddress(config_);
-        const auto session_id = std::format(
-            "ssudp-{}-{}", config_.tag, ctx.conn_id);
+        char conn_id_buf[std::numeric_limits<decltype(ctx.conn_id)>::digits10 + 1]{};
+        const auto [conn_id_end, conn_id_ec] =
+            std::to_chars(conn_id_buf, conn_id_buf + sizeof(conn_id_buf), ctx.conn_id);
+        if (conn_id_ec != std::errc{}) {
+            co_return std::unexpected(ErrorCode::INTERNAL);
+        }
+        std::string session_id;
+        session_id.reserve(
+            std::string_view("ssudp--").size() + config_.tag.size() +
+            static_cast<size_t>(conn_id_end - conn_id_buf));
+        session_id.append("ssudp-");
+        session_id.append(config_.tag);
+        session_id.push_back('-');
+        session_id.append(conn_id_buf, conn_id_end);
         auto* udp_session = udp_session_manager_->GetOrCreateSession(
             session_id, bind_addr);
         if (!udp_session) {
