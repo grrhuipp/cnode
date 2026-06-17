@@ -66,11 +66,19 @@ jobs:
       - name: Install Alpine build tools
         run: |
           apk add --no-cache \
-            build-base binutils cmake ninja git curl \
+            build-base binutils ccache cmake ninja git curl \
             zip unzip tar pkgconf linux-headers musl-dev \
             perl nasm
 
       - uses: actions/checkout@v6.0.3
+
+      - name: Restore compiler cache
+        id: ccache-musl
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: ${{ env.BUILD_DIR }}/.ccache
+          key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-
 
       - name: Restore CMake dependency builds
         id: cache-musl
@@ -82,15 +90,28 @@ jobs:
 
       - name: Configure
         run: |
+          ccache --zero-stats || true
           cmake -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_MEMORY_STATS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_EXE_LINKER_FLAGS="-static" \
             -DBUILD_ID=${{ env.BUILD_ID }}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
       - name: Build
         run: cmake --build "$BUILD_DIR" --parallel $(nproc)
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
+
+      - name: Show compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
       - name: Verify & package musl binary
         run: |
@@ -123,6 +144,13 @@ jobs:
           path: ${{ env.BUILD_DIR }}/_deps
           key: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: ${{ env.BUILD_DIR }}/.ccache
+          key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
   build-glibc:
     name: Release (glibc ${{ matrix.backend }})
     runs-on: ubuntu-24.04
@@ -143,10 +171,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential binutils cmake ninja-build git curl \
+            build-essential binutils ccache cmake ninja-build git curl \
             zip unzip tar pkg-config perl nasm file linux-libc-dev
 
       - uses: actions/checkout@v6.0.3
+
+      - name: Restore compiler cache
+        id: ccache-glibc
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: ${{ env.BUILD_DIR }}/.ccache
+          key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-
 
       - name: Restore CMake dependency builds
         id: cache-glibc
@@ -158,13 +194,24 @@ jobs:
 
       - name: Build glibc release variant
         run: |
+          ccache --zero-stats || true
           cmake -S . -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_MEMORY_STATS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_ID=${{ env.BUILD_ID }}
           cmake --build "$BUILD_DIR" --parallel $(nproc)
           "$BUILD_DIR/cnode" -v
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
+
+      - name: Show compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
       - name: Package glibc binary
         run: |
@@ -191,6 +238,13 @@ jobs:
         with:
           path: ${{ env.BUILD_DIR }}/_deps
           key: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: ${{ env.BUILD_DIR }}/.ccache
+          key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   publish-release:
     name: Publish GitHub Release
