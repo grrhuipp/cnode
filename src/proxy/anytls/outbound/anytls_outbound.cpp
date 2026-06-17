@@ -31,7 +31,7 @@
 
 namespace {
 
-constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::buf::Buffer::kSize * 4;
+constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::anytls::kMaxFramePayload;
 
 std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {

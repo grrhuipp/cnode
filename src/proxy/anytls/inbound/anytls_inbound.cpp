@@ -40,7 +40,7 @@ using namespace ::acpp::anytls;
 
 namespace {
 
-constexpr size_t kMaxSubStreamQueuedPayloadBytes = buf::Buffer::kSize * 4;
+constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
 
 class AnyTLSOnlineSession {
 public:
