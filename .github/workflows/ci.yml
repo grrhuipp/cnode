@@ -80,14 +80,6 @@ jobs:
           key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-
 
-      - name: Restore CMake dependency builds
-        id: cache-musl
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/_deps
-          key: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-
-
       - name: Configure
         run: |
           ccache --zero-stats || true
@@ -137,13 +129,6 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-      - name: Save CMake dependency builds
-        if: always() && steps.cache-musl.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/_deps
-          key: cmake-deps-musl-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v5.0.5
@@ -184,14 +169,6 @@ jobs:
           key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-
 
-      - name: Restore CMake dependency builds
-        id: cache-glibc
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/_deps
-          key: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-
-
       - name: Build glibc release variant
         run: |
           ccache --zero-stats || true
@@ -231,13 +208,6 @@ jobs:
           name: cnode-glibc-${{ matrix.backend }}-assets
           path: glibc-assets/*
           if-no-files-found: error
-
-      - name: Save CMake dependency builds
-        if: always() && steps.cache-glibc.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/_deps
-          key: cmake-deps-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
 
       - name: Save compiler cache
         if: always()
