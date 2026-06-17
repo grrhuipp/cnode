@@ -172,22 +172,29 @@ constexpr int kMaxPaddingLength = 18 + 65535;
     return VlessEncryptionParseError::None;
 }
 
+VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
+    return {
+        .config = std::nullopt,
+        .error = error,
+    };
+}
+
 [[nodiscard]] VlessEncryptionParseResult ParseVlessEncryption(
     std::string_view value,
     VlessEncryptionRole role) {
     auto parts = SplitDot(value);
     if (parts.size() < 4) {
-        return {.error = VlessEncryptionParseError::TooFewParts};
+        return ParseErrorResult(VlessEncryptionParseError::TooFewParts);
     }
     if (parts[0] != kEncryptionName) {
-        return {.error = VlessEncryptionParseError::UnsupportedName};
+        return ParseErrorResult(VlessEncryptionParseError::UnsupportedName);
     }
 
     VlessEncryptionConfig config;
     config.role = role;
     if (auto error = ParseMode(parts[1], config.mode);
         error != VlessEncryptionParseError::None) {
-        return {.error = error};
+        return ParseErrorResult(error);
     }
 
     if (role == VlessEncryptionRole::Client) {
@@ -196,7 +203,7 @@ constexpr int kMaxPaddingLength = 18 + 65535;
         } else if (parts[2] == "0rtt") {
             config.zero_rtt = true;
         } else {
-            return {.error = VlessEncryptionParseError::InvalidRtt};
+            return ParseErrorResult(VlessEncryptionParseError::InvalidRtt);
         }
     } else {
         std::string_view seconds = parts[2];
@@ -206,12 +213,12 @@ constexpr int kMaxPaddingLength = 18 + 65535;
         const size_t hyphen = seconds.find('-');
         if (hyphen == std::string_view::npos) {
             if (!ParseInt(seconds, config.seconds_from)) {
-                return {.error = VlessEncryptionParseError::InvalidSeconds};
+                return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
             }
         } else {
             if (!ParseInt(seconds.substr(0, hyphen), config.seconds_from) ||
                 !ParseInt(seconds.substr(hyphen + 1), config.seconds_to)) {
-                return {.error = VlessEncryptionParseError::InvalidSeconds};
+                return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
             }
         }
     }
@@ -226,7 +233,7 @@ constexpr int kMaxPaddingLength = 18 + 65535;
 
         auto key = DecodeRawUrlBase64(part);
         if (!key) {
-            return {.error = VlessEncryptionParseError::InvalidBase64};
+            return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
         const size_t len = key->size();
         const bool key_ok = role == VlessEncryptionRole::Client
@@ -235,31 +242,34 @@ constexpr int kMaxPaddingLength = 18 + 65535;
             : (len == kVlessX25519KeySize ||
                len == kVlessMlKem768SeedSize);
         if (!key_ok) {
-            return {.error = VlessEncryptionParseError::InvalidKeyLength};
+            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyLength);
         }
         if (role == VlessEncryptionRole::Client &&
             len == kVlessMlKem768PublicKeySize &&
             !ValidateVlessMlKem768PublicKey(*key)) {
-            return {.error = VlessEncryptionParseError::InvalidKeyMaterial};
+            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
         }
         if (role == VlessEncryptionRole::Server &&
             len == kVlessMlKem768SeedSize &&
             !DeriveVlessMlKem768PublicKeyFromSeed(*key)) {
-            return {.error = VlessEncryptionParseError::InvalidKeyMaterial};
+            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
         }
         config.keys.push_back(std::move(*key));
     }
 
     if (config.keys.empty()) {
-        return {.error = VlessEncryptionParseError::EmptyKeys};
+        return ParseErrorResult(VlessEncryptionParseError::EmptyKeys);
     }
 
     if (auto error = ParsePadding(padding_parts, config);
         error != VlessEncryptionParseError::None) {
-        return {.error = error};
+        return ParseErrorResult(error);
     }
 
-    return {.config = std::move(config)};
+    return {
+        .config = std::move(config),
+        .error = VlessEncryptionParseError::None,
+    };
 }
 
 }  // namespace

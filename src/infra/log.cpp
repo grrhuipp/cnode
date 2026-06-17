@@ -208,15 +208,28 @@ std::string LogExtension(const std::filesystem::path& configured_path) {
     return extension.empty() ? ".log" : extension;
 }
 
+std::filesystem::path ResolveConfiguredLogPath(
+    const std::filesystem::path& log_dir,
+    const std::filesystem::path& configured_path,
+    std::string_view fallback_prefix) {
+    std::filesystem::path path = configured_path.empty()
+        ? std::filesystem::path(std::format("{}.log", fallback_prefix))
+        : configured_path;
+    if (path.is_absolute()) {
+        return path;
+    }
+    return log_dir / path;
+}
+
 DailyLogSpec MakeDailySpec(const std::filesystem::path& log_dir,
                            const std::filesystem::path& configured_path,
                            std::string_view fallback_prefix) {
+    const auto resolved_path =
+        ResolveConfiguredLogPath(log_dir, configured_path, fallback_prefix);
     DailyLogSpec spec;
-    spec.directory = configured_path.empty()
-        ? log_dir
-        : configured_path.parent_path();
-    spec.stem = LogStem(configured_path, fallback_prefix);
-    spec.extension = LogExtension(configured_path);
+    spec.directory = resolved_path.parent_path();
+    spec.stem = LogStem(resolved_path, fallback_prefix);
+    spec.extension = LogExtension(resolved_path);
     return spec;
 }
 
@@ -233,10 +246,7 @@ std::filesystem::path ResolveFixedLogPath(
     const std::filesystem::path& log_dir,
     const std::filesystem::path& configured_path,
     std::string_view fallback_prefix) {
-    if (!configured_path.empty()) {
-        return configured_path;
-    }
-    return log_dir / std::format("{}.log", fallback_prefix);
+    return ResolveConfiguredLogPath(log_dir, configured_path, fallback_prefix);
 }
 
 std::filesystem::path ResolveLogPath(
@@ -358,8 +368,16 @@ public:
         current_date_ = TodayDateString();
         next_rotation_check_ = std::chrono::steady_clock::now() +
             kRotationCheckInterval;
-        error_target_ = LogTarget{"error", error_path};
-        access_target_ = LogTarget{"access", access_path};
+        error_target_ = LogTarget{
+            .fallback_prefix = "error",
+            .configured_path = error_path,
+            .active_path = {},
+        };
+        access_target_ = LogTarget{
+            .fallback_prefix = "access",
+            .configured_path = access_path,
+            .active_path = {},
+        };
 
         if (rotate_daily_) {
             CleanupManagedFiles(DailySpecs(), current_date_, max_days_, gzip_enabled_);
@@ -606,8 +624,16 @@ private:
     bool gzip_enabled_{true};
     std::string current_date_;
     std::chrono::steady_clock::time_point next_rotation_check_{};
-    LogTarget error_target_{"error"};
-    LogTarget access_target_{"access"};
+    LogTarget error_target_{
+        .fallback_prefix = "error",
+        .configured_path = {},
+        .active_path = {},
+    };
+    LogTarget access_target_{
+        .fallback_prefix = "access",
+        .configured_path = {},
+        .active_path = {},
+    };
     std::ofstream error_file_;
     std::ofstream access_file_;
 };

@@ -176,25 +176,6 @@ private:
     memory::ThreadLocalString client_ip_;
 };
 
-net::awaitable<bool> WriteFull(AsyncStream& stream,
-                               const uint8_t* data,
-                               size_t len) {
-    size_t offset = 0;
-    while (offset < len) {
-        size_t written = 0;
-        try {
-            written = co_await stream.AsyncWrite(net::buffer(data + offset, len - offset));
-        } catch (...) {
-            co_return false;
-        }
-        if (written == 0) {
-            co_return false;
-        }
-        offset += written;
-    }
-    co_return true;
-}
-
 class VlessPendingReader final : public transport::MultiBufferReader {
 public:
     VlessPendingReader(transport::MultiBufferReader& src,

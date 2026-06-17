@@ -163,44 +163,6 @@ bool EncodePacketAddrUdpHeaderTo(const TargetAddress& target,
     return true;
 }
 
-net::awaitable<bool> ReadFull(AsyncStream& stream,
-                              uint8_t* data,
-                              size_t len) {
-    size_t offset = 0;
-    while (offset < len) {
-        size_t n = 0;
-        try {
-            n = co_await stream.AsyncRead(net::buffer(data + offset, len - offset));
-        } catch (...) {
-            co_return false;
-        }
-        if (n == 0) {
-            co_return false;
-        }
-        offset += n;
-    }
-    co_return true;
-}
-
-net::awaitable<bool> WriteFull(AsyncStream& stream,
-                               const uint8_t* data,
-                               size_t len) {
-    size_t offset = 0;
-    while (offset < len) {
-        size_t n = 0;
-        try {
-            n = co_await stream.AsyncWrite(net::buffer(data + offset, len - offset));
-        } catch (...) {
-            co_return false;
-        }
-        if (n == 0) {
-            co_return false;
-        }
-        offset += n;
-    }
-    co_return true;
-}
-
 class VlessUdpFramer {
 public:
     void Feed(const uint8_t* data, size_t len) {

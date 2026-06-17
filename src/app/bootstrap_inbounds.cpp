@@ -112,6 +112,7 @@ void SetupTestMode(
         .id = std::string(constants::test::kTestVmessUuid),
         .password = {},
         .email = "test@example.com",
+        .flow = {},
     });
     auto test_users =
         proxyman::inbound::BuildStaticUsers(protocol, kTestTag, test_user_config);
