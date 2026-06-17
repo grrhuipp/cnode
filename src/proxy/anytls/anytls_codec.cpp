@@ -306,18 +306,32 @@ std::expected<std::string, ErrorCode> BuildFrameBytes(
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
+    std::string out;
+    out.reserve(kFrameHeaderSize + payload.size());
+    if (auto ok = AppendFrameBytesTo(out, cmd, sid, payload); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
+std::expected<void, ErrorCode> AppendFrameBytesTo(
+    std::string& out,
+    uint8_t cmd,
+    uint32_t sid,
+    std::span<const uint8_t> payload) {
     if (payload.size() > kMaxFramePayload) {
         return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    std::string out(kFrameHeaderSize + payload.size(), '\0');
-    auto* header = reinterpret_cast<uint8_t*>(out.data());
+    const size_t offset = out.size();
+    out.resize(offset + kFrameHeaderSize + payload.size());
+    auto* header = reinterpret_cast<uint8_t*>(out.data() + offset);
     header[0] = cmd;
     WriteU32BE(header + 1, sid);
     WriteU16BE(header + 5, static_cast<uint16_t>(payload.size()));
     if (!payload.empty()) {
-        std::memcpy(out.data() + kFrameHeaderSize, payload.data(), payload.size());
+        std::memcpy(out.data() + offset + kFrameHeaderSize, payload.data(), payload.size());
     }
-    return out;
+    return std::expected<void, ErrorCode>{};
 }
 
 net::awaitable<std::expected<void, ErrorCode>>
@@ -383,6 +397,7 @@ WritePacketWithPadding(AsyncStream& stream,
     }
 
     size_t offset = 0;
+    std::string record;
     for (int size : sizes) {
         if (size == -1) {
             if (offset >= packet.size()) {
@@ -395,7 +410,7 @@ WritePacketWithPadding(AsyncStream& stream,
             co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
 
-        std::string record;
+        record.clear();
         const size_t remaining = packet.size() - offset;
         if (remaining > static_cast<size_t>(size)) {
             record.assign(packet.data() + offset, static_cast<size_t>(size));
@@ -407,7 +422,8 @@ WritePacketWithPadding(AsyncStream& stream,
                 size - static_cast<int>(remaining) - static_cast<int>(kFrameHeaderSize);
             if (padding > 0) {
                 std::string zeros(static_cast<size_t>(padding), '\0');
-                auto waste = BuildFrameBytes(
+                auto waste = AppendFrameBytesTo(
+                    record,
                     kCmdWaste,
                     0,
                     std::span<const uint8_t>(
@@ -416,11 +432,11 @@ WritePacketWithPadding(AsyncStream& stream,
                 if (!waste) {
                     co_return std::unexpected(waste.error());
                 }
-                record.append(*waste);
             }
         } else {
             std::string zeros(static_cast<size_t>(size), '\0');
-            auto waste = BuildFrameBytes(
+            auto waste = AppendFrameBytesTo(
+                record,
                 kCmdWaste,
                 0,
                 std::span<const uint8_t>(
@@ -429,7 +445,6 @@ WritePacketWithPadding(AsyncStream& stream,
             if (!waste) {
                 co_return std::unexpected(waste.error());
             }
-            record = std::move(*waste);
         }
 
         if (!record.empty()) {
@@ -485,11 +500,10 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
         if (!buffer || buffer->IsEmpty()) {
             continue;
         }
-        auto frame = BuildFrameBytes(cmd, sid, buffer->Bytes());
-        if (!frame) {
-            co_return std::unexpected(frame.error());
+        auto ok = AppendFrameBytesTo(packet, cmd, sid, buffer->Bytes());
+        if (!ok) {
+            co_return std::unexpected(ok.error());
         }
-        packet.append(*frame);
     }
     mb.clear();
     co_return co_await WritePacketWithPadding(stream, scheme, packet_index, std::move(packet));

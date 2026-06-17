@@ -29,6 +29,8 @@ namespace acpp {
 
 namespace {
 
+constexpr size_t kUdpFrameQueueShrinkItems = 64;
+
 class TrojanOnlineSession {
 public:
     TrojanOnlineSession(::acpp::trojan::Validator& manager,
@@ -103,8 +105,9 @@ public:
         }
         out = std::move(queue_.front());
         queue_.pop_front();
-        if (queue_.empty()) {
+        if (queue_.empty() && shrink_queue_on_drain_) {
             TryShrinkSequence(queue_);
+            shrink_queue_on_drain_ = false;
         }
         return true;
     }
@@ -112,6 +115,7 @@ public:
 private:
     buf::BufferGuard pending_;
     memory::ThreadLocalDeque<FramedUdpPacket> queue_;
+    bool shrink_queue_on_drain_ = false;
 
     void Compact() {
         if (!pending_ || pending_->start == 0) {
@@ -160,6 +164,9 @@ private:
                     std::memcpy(pkt.payload->Tail().data(), payload.data(), n);
                     pkt.payload->Produce(static_cast<uint32_t>(n));
                     queue_.push_back(std::move(pkt));
+                    if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+                        shrink_queue_on_drain_ = true;
+                    }
                 }
                 pending_->Advance(static_cast<uint32_t>(result.consumed));
             } else if (result.result == trojan::TrojanCodec::UdpParseResult::INCOMPLETE) {
@@ -234,23 +241,27 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         buf::MultiBuffer out;
-        for (buf::Buffer* b : mb) {
+        for (buf::Buffer*& b : mb) {
             if (!b || b->IsEmpty() || !b->HasUDP()) {
                 continue;
             }
-            buf::Buffer* enc = buf::Buffer::New();
-            if (!enc) {
-                break;
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
+                throw std::bad_alloc();
             }
-            const size_t n = trojan::TrojanCodec::EncodeUdpPacketTo(
-                b->UDP(), b->Bytes().data(), b->Len(),
-                enc->Tail().data(), enc->Available());
+            const size_t n = trojan::TrojanCodec::EncodeUdpPacketHeaderTo(
+                b->UDP(), b->Len(),
+                header->Tail().data(), header->Available());
             if (n == 0) {
-                buf::Buffer::Free(enc);
+                buf::Buffer::Free(b);
+                b = nullptr;
                 continue;
             }
-            enc->Produce(static_cast<uint32_t>(n));
-            out.push_back(enc);
+            header->Produce(static_cast<uint32_t>(n));
+            out.push_back(header.release());
+            b->ClearUDP();
+            out.push_back(b);
+            b = nullptr;
         }
         mb.clear();
         if (!out.empty()) {

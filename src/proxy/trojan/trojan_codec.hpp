@@ -110,6 +110,12 @@ public:
 
     // 编码 UDP 包（in-place 版本，避免内存分配）
     // 返回实际写入字节数，0 表示失败（缓冲区太小）
+    static size_t EncodeUdpPacketHeaderTo(
+        const TargetAddress& target,
+        size_t payload_len,
+        uint8_t* output,
+        size_t output_size);
+
     static size_t EncodeUdpPacketTo(
         const TargetAddress& target,
         const uint8_t* payload,

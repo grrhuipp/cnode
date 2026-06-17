@@ -122,13 +122,16 @@ struct Buffer {
 
 namespace detail {
 
-// 每 Worker 最多缓存的 8KB 块数（16 块 = 128KB）。relay 收发 ping-pong 在
-// 最热路径反复 New/Free，小容量回收即可吸收，又不显著抬高空闲 RSS。
-inline constexpr size_t kBufferRecycleCap = 16;
+// 每 Worker 的 8KB 块回收缓存初始保留 16 块（128KB），遇到真实满载压力
+// 后最多增长到 32 块（256KB）。单 io_context 单线程时这是纯 Worker-local
+// 状态，不需要锁，也不会把空闲 RSS 一开始就抬高到最大值。
+inline constexpr size_t kBufferRecycleInitialCap = 16;
+inline constexpr size_t kBufferRecycleMaxCap = 32;
 
 struct BufferRecycleCache {
-    void* slots[kBufferRecycleCap];
+    void* slots[kBufferRecycleMaxCap];
     size_t count = 0;
+    size_t capacity = kBufferRecycleInitialCap;
 #ifdef CNODE_MEMORY_STATS
     uint64_t high_water = 0;
     uint64_t pop_hits = 0;
@@ -170,7 +173,10 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
 
 [[nodiscard]] inline bool BufferRecyclePush(void* raw) noexcept {
     auto& cache = TlsBufferRecycle();
-    if (cache.count >= kBufferRecycleCap) {
+    if (cache.count >= cache.capacity && cache.capacity < kBufferRecycleMaxCap) {
+        cache.capacity = std::min(cache.capacity * 2, kBufferRecycleMaxCap);
+    }
+    if (cache.count >= cache.capacity) {
 #ifdef CNODE_MEMORY_STATS
         ++cache.push_drops;
 #endif
@@ -190,7 +196,7 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
     auto& cache = TlsBufferRecycle();
     memory::BufferRecycleStats stats;
     stats.cache_depth = cache.count;
-    stats.cache_capacity = kBufferRecycleCap;
+    stats.cache_capacity = cache.capacity;
 #ifdef CNODE_MEMORY_STATS
     stats.cache_high_water = cache.high_water;
     stats.pop_hits = cache.pop_hits;

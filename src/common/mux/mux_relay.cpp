@@ -32,6 +32,7 @@ namespace {
 constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
+constexpr size_t kMuxQueueShrinkItems    = 128;
 constexpr size_t kMuxFrameBufKeepCap     = 0;
 constexpr size_t kMuxReplyOverhead       = 128;
 
@@ -42,6 +43,20 @@ void AppendOwnedBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
             buffer = nullptr;
             continue;
         }
+        dst.push_back(buffer);
+        buffer = nullptr;
+    }
+    src.clear();
+}
+
+void MoveOwnedPayloadBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
+    for (buf::Buffer*& buffer : src) {
+        if (!buffer || buffer->IsEmpty()) {
+            buf::Buffer::Free(buffer);
+            buffer = nullptr;
+            continue;
+        }
+        buffer->ClearUDP();
         dst.push_back(buffer);
         buffer = nullptr;
     }
@@ -91,34 +106,10 @@ struct MuxReply {
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
     TargetAddress udp_src;   // UDP 源地址（is_udp == true 时有效）
     buf::MultiBuffer payload;
+    size_t payload_size = 0;
 
     [[nodiscard]] size_t PayloadSize() const noexcept {
-        return buf::TotalLen(payload);
-    }
-
-    [[nodiscard]] std::span<const uint8_t> PayloadBytes(std::vector<uint8_t>& scratch) const {
-        if (payload.empty()) {
-            return {};
-        }
-
-        if (payload.size() == 1) {
-            const buf::Buffer* buffer = *payload.begin();
-            if (!buffer || buffer->IsEmpty()) {
-                return {};
-            }
-            return buffer->Bytes();
-        }
-
-        scratch.clear();
-        scratch.reserve(PayloadSize());
-        for (const auto* buffer : payload) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            scratch.insert(scratch.end(), bytes.begin(), bytes.end());
-        }
-        return std::span<const uint8_t>(scratch.data(), scratch.size());
+        return payload_size;
     }
 };
 
@@ -254,6 +245,9 @@ public:
             return;
         }
         input_queue_.push_back(std::move(mb));
+        if (input_queue_.size() >= kMuxQueueShrinkItems) {
+            shrink_input_queue_on_drain_ = true;
+        }
         WakeInputReader();
     }
 
@@ -280,8 +274,9 @@ public:
             if (!input_queue_.empty()) {
                 buf::MultiBuffer mb = std::move(input_queue_.front());
                 input_queue_.pop_front();
-                if (input_queue_.empty()) {
+                if (input_queue_.empty() && shrink_input_queue_on_drain_) {
                     TryShrinkSequence(input_queue_);
+                    shrink_input_queue_on_drain_ = false;
                 }
                 co_return mb;
             }
@@ -318,6 +313,7 @@ public:
             reply.session_id = session_id_;
             reply.is_end = false;
             reply.is_udp = false;
+            reply.payload_size = buffer->Len();
             reply.payload.push_back(buffer);
             buffer = nullptr;
             if (!reply_queue_.PushTcp(std::move(reply))) {
@@ -343,6 +339,7 @@ public:
         output_sleep_.Cancel();
         WakeInputReader();
         input_queue_.clear();
+        shrink_input_queue_on_drain_ = false;
     }
 
     void Close() {
@@ -376,6 +373,7 @@ private:
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
+    bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
     bool end_sent_ = false;
@@ -439,6 +437,10 @@ public:
         }
         queued_bytes_ += bytes;
         input_queue_.push_back(std::move(mb));
+        if (input_queue_.size() >= kMuxQueueShrinkItems ||
+            queued_bytes_ >= kMuxQueueHighWaterBytes) {
+            shrink_input_queue_on_drain_ = true;
+        }
         WakeInputReader();
     }
 
@@ -466,8 +468,9 @@ public:
                 buf::MultiBuffer mb = std::move(input_queue_.front());
                 queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
                 input_queue_.pop_front();
-                if (input_queue_.empty()) {
+                if (input_queue_.empty() && shrink_input_queue_on_drain_) {
                     TryShrinkSequence(input_queue_);
+                    shrink_input_queue_on_drain_ = false;
                 }
                 co_return mb;
             }
@@ -518,6 +521,7 @@ public:
             reply.is_end = false;
             reply.is_udp = true;
             reply.udp_src = buffer->UDP();
+            reply.payload_size = payload_bytes;
             reply.payload.push_back(buffer);
             buffer = nullptr;
             reply_queue_.PushUdpPrepared(
@@ -541,6 +545,7 @@ public:
         WakeInputReader();
         input_queue_.clear();
         queued_bytes_ = 0;
+        shrink_input_queue_on_drain_ = false;
     }
 
     void Close() {
@@ -575,6 +580,7 @@ private:
     uint64_t parent_conn_id_ = 0;
     memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
     size_t queued_bytes_ = 0;
+    bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
     bool end_sent_ = false;
@@ -722,41 +728,77 @@ net::awaitable<RelayResult> DoMuxRelay(
         write_frame.clear();
         ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
     };
-    auto write_frame_to_client =
-        [&](std::vector<uint8_t>& frame) -> net::awaitable<bool> {
+    auto write_multibuffer_to_client =
+        [&](buf::MultiBuffer frame_mb, size_t frame_size) -> net::awaitable<bool> {
             try {
-                const size_t frame_size = frame.size();
                 if (frame_size == 0) {
-                    release_write_frame();
+                    frame_mb.clear();
                     co_return true;
-                }
-
-                buf::MultiBuffer frame_mb;
-                frame_mb.reserve((frame_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-                if (!buf::AppendSpanToMultiBuffer(
-                        std::span<const uint8_t>(frame.data(), frame.size()),
-                        frame_mb)) {
-                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
-                    release_write_frame();
-                    co_return false;
                 }
 
                 co_await client_link.writer->WriteMultiBuffer(std::move(frame_mb));
                 frame_mb.clear();
                 parent_ctx.traffic.bytes_down += frame_size;
                 result.bytes_down += frame_size;
-                release_write_frame();
                 co_return true;
             } catch (const IoSystemError&) {
                 if (client_control && ConsumeWriteSideTimeout(*client_control)) {
                     result.error = ErrorCode::RELAY_TIMEOUT;
                 }
-                release_write_frame();
                 co_return false;
             } catch (...) {
+                co_return false;
+            }
+        };
+
+    auto write_frame_to_client =
+        [&](std::vector<uint8_t>& frame) -> net::awaitable<bool> {
+            const size_t frame_size = frame.size();
+            if (frame_size == 0) {
+                release_write_frame();
+                co_return true;
+            }
+
+            buf::MultiBuffer frame_mb;
+            frame_mb.reserve((frame_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(frame.data(), frame.size()),
+                    frame_mb)) {
+                result.error = ErrorCode::RESOURCE_EXHAUSTED;
                 release_write_frame();
                 co_return false;
             }
+
+            const bool ok = co_await write_multibuffer_to_client(
+                std::move(frame_mb), frame_size);
+            release_write_frame();
+            co_return ok;
+        };
+
+    auto write_payload_frame_to_client =
+        [&](std::vector<uint8_t>& frame, MuxReply& reply) -> net::awaitable<bool> {
+            const size_t payload_size = reply.PayloadSize();
+            const size_t frame_size = frame.size() + payload_size;
+            if (frame_size == 0) {
+                release_write_frame();
+                co_return true;
+            }
+
+            buf::MultiBuffer frame_mb;
+            frame_mb.reserve(1 + reply.payload.size());
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(frame.data(), frame.size()),
+                    frame_mb)) {
+                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                release_write_frame();
+                co_return false;
+            }
+            MoveOwnedPayloadBuffers(frame_mb, reply.payload);
+
+            const bool ok = co_await write_multibuffer_to_client(
+                std::move(frame_mb), frame_size);
+            release_write_frame();
+            co_return ok;
         };
 
     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
@@ -780,24 +822,28 @@ net::awaitable<RelayResult> DoMuxRelay(
                     tcp_subs.erase(tcp_it);
                 }
             } else if (reply.is_udp) {
-                std::vector<uint8_t> payload_scratch;
-                const auto payload = reply.PayloadBytes(payload_scratch);
-                if (!mux::EncodeKeepUDPTo(
+                const size_t payload_size = reply.PayloadSize();
+                if (!mux::EncodeKeepUDPHeaderTo(
                     write_frame,
                     reply.session_id, reply.udp_src,
-                    payload.data(), payload.size())) {
-                    ReleaseIdleBuffer(payload_scratch, 0);
+                    payload_size)) {
                     continue;
                 }
-                ReleaseIdleBuffer(payload_scratch, 0);
+                if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                    running = false;
+                    break;
+                }
+                continue;
             } else {
-                std::vector<uint8_t> payload_scratch;
-                const auto payload = reply.PayloadBytes(payload_scratch);
-                mux::EncodeKeepDataTo(
+                mux::EncodeKeepDataHeaderTo(
                     write_frame,
                     reply.session_id,
-                    payload.data(), payload.size());
-                ReleaseIdleBuffer(payload_scratch, 0);
+                    reply.PayloadSize());
+                if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                    running = false;
+                    break;
+                }
+                continue;
             }
 
             if (!co_await write_frame_to_client(write_frame)) {

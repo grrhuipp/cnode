@@ -73,6 +73,11 @@ struct UotRequest {
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload);
+[[nodiscard]] std::expected<void, ErrorCode> AppendFrameBytesTo(
+    std::string& out,
+    uint8_t cmd,
+    uint32_t sid,
+    std::span<const uint8_t> payload);
 
 net::awaitable<std::expected<void, ErrorCode>>
 WriteAll(AsyncStream& stream, std::span<const uint8_t> data);

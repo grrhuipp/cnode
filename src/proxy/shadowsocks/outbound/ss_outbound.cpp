@@ -198,6 +198,7 @@ public:
             mb.clear();
             throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
         }
+        memory::ByteVector scratch;
         for (buf::Buffer* buffer : mb) {
             if (!buffer || buffer->IsEmpty() || !buffer->HasUDP()) {
                 continue;
@@ -222,7 +223,7 @@ public:
                 send_result = co_await session_.SendTo(
                     server_, encoded->Bytes().data(), encoded->Len(), callback_id_);
             } else {
-                memory::ByteVector scratch(encoded_len);
+                scratch.resize(encoded_len);
                 const size_t written = EncodePacketTo(
                     *buffer, scratch.data(), scratch.size());
                 if (written != encoded_len) {

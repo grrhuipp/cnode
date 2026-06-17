@@ -355,7 +355,10 @@ struct Handler::ClientSession {
 
         if (!settings_sent) {
             const auto settings = DefaultClientSettings();
-            auto settings_frame = BuildFrameBytes(
+            std::string with_settings;
+            with_settings.reserve(packet.size() + kFrameHeaderSize + settings.size());
+            auto settings_frame = AppendFrameBytesTo(
+                with_settings,
                 kCmdSettings,
                 0,
                 std::span<const uint8_t>(
@@ -363,7 +366,8 @@ struct Handler::ClientSession {
             if (!settings_frame) {
                 co_return std::unexpected(settings_frame.error());
             }
-            packet.insert(0, *settings_frame);
+            with_settings.append(packet);
+            packet = std::move(with_settings);
         }
 
         const uint32_t this_packet = packet_index < padding_scheme.stop ? packet_index++ : 0;
@@ -832,8 +836,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     std::string open_packet;
-    auto syn_frame = BuildFrameBytes(kCmdSYN, sid, {});
-    auto target_frame = BuildFrameBytes(
+    open_packet.reserve(
+        (kFrameHeaderSize * 3) + target->size() + buf::TotalLen(first_payload) +
+        initial_payload.size() + 128);
+    auto syn_frame = AppendFrameBytesTo(open_packet, kCmdSYN, sid, {});
+    auto target_frame = AppendFrameBytesTo(
+        open_packet,
         kCmdPSH,
         sid,
         std::span<const uint8_t>(
@@ -843,8 +851,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         cleanup_logical_stream();
         co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    open_packet.append(*syn_frame);
-    open_packet.append(*target_frame);
     if (is_udp) {
         auto request = EncodeUotRequest(original_target, true);
         if (!request) {
@@ -852,7 +858,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             cleanup_logical_stream();
             co_return std::unexpected(request.error());
         }
-        auto request_frame = BuildFrameBytes(
+        auto request_frame = AppendFrameBytesTo(
+            open_packet,
             kCmdPSH,
             sid,
             std::span<const uint8_t>(
@@ -862,14 +869,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             cleanup_logical_stream();
             co_return std::unexpected(request_frame.error());
         }
-        open_packet.append(*request_frame);
     }
     if (buf::TotalLen(first_payload) > 0) {
         for (auto* buffer : first_payload) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
-            auto frame = BuildFrameBytes(
+            auto frame = AppendFrameBytesTo(
+                open_packet,
                 kCmdPSH,
                 sid,
                 buffer->Bytes());
@@ -878,18 +885,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 cleanup_logical_stream();
                 co_return std::unexpected(frame.error());
             }
-            open_packet.append(*frame);
         }
         first_payload.clear();
     }
     if (!initial_payload.empty()) {
-        auto frame = BuildFrameBytes(kCmdPSH, sid, initial_payload);
+        auto frame = AppendFrameBytesTo(open_packet, kCmdPSH, sid, initial_payload);
         if (!frame) {
             stream.Cancel();
             cleanup_logical_stream();
             co_return std::unexpected(frame.error());
         }
-        open_packet.append(*frame);
     }
     if (auto ok = co_await session->WriteOpenPacket(sid, std::move(open_packet)); !ok) {
         stream.Cancel();
@@ -955,17 +960,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             std::expected<void, ErrorCode> ok;
             if (is_udp) {
                 std::string packet;
+                packet.reserve(buf::TotalLen(mb) + (mb.size() * kFrameHeaderSize));
                 for (auto* buffer : mb) {
                     if (!buffer || buffer->IsEmpty()) {
                         continue;
                     }
-                    auto frame = BuildFrameBytes(kCmdPSH, sid, buffer->Bytes());
+                    auto frame = AppendFrameBytesTo(packet, kCmdPSH, sid, buffer->Bytes());
                     if (!frame) {
                         mb.clear();
                         logical->Close(frame.error());
                         throw IoSystemError(io_error::connection_reset, "AnyTLS UDP frame encode failed");
                     }
-                    packet.append(*frame);
                 }
                 mb.clear();
                 if (packet.empty()) {

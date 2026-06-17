@@ -100,10 +100,17 @@ void EncodeEndTo(std::vector<uint8_t>& out,
 void EncodeKeepDataTo(std::vector<uint8_t>& out,
                       uint16_t session_id,
                       const uint8_t* data, size_t len);
+void EncodeKeepDataHeaderTo(std::vector<uint8_t>& out,
+                            uint16_t session_id,
+                            size_t payload_len);
 [[nodiscard]] bool EncodeKeepUDPTo(std::vector<uint8_t>& out,
                      uint16_t session_id,
                      const TargetAddress& src,
                      const uint8_t* data, size_t len);
+[[nodiscard]] bool EncodeKeepUDPHeaderTo(std::vector<uint8_t>& out,
+                                         uint16_t session_id,
+                                         const TargetAddress& src,
+                                         size_t payload_len);
 
 // ============================================================================
 // 地址类型转换

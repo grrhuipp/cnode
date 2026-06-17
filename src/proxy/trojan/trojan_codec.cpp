@@ -219,12 +219,14 @@ size_t TrojanCodec::EncodeRequestTo(
     return writer.Position();
 }
 
-size_t TrojanCodec::EncodeUdpPacketTo(
+size_t TrojanCodec::EncodeUdpPacketHeaderTo(
     const TargetAddress& target,
-    const uint8_t* payload,
     size_t payload_len,
     uint8_t* output,
     size_t output_size) {
+    if (payload_len > 0xFFFF) {
+        return 0;
+    }
 
     size_t header_size = 0;
     header_size = SocksAddressSize(target);
@@ -233,7 +235,7 @@ size_t TrojanCodec::EncodeUdpPacketTo(
     }
     header_size += 2 + 2 + 2;  // port + payload_len + CRLF
 
-    if (header_size + payload_len > output_size) {
+    if (header_size > output_size) {
         return 0;
     }
 
@@ -248,11 +250,31 @@ size_t TrojanCodec::EncodeUdpPacketTo(
     writer.WriteU8(0x0D);
     writer.WriteU8(0x0A);
 
+    return writer.Position();
+}
+
+size_t TrojanCodec::EncodeUdpPacketTo(
+    const TargetAddress& target,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint8_t* output,
+    size_t output_size) {
+
+    const size_t header_len = EncodeUdpPacketHeaderTo(
+        target,
+        payload_len,
+        output,
+        output_size);
+    if (header_len == 0 || header_len + payload_len > output_size) {
+        return 0;
+    }
+
+    ByteWriter writer(output + header_len, output_size - header_len);
     if (payload && payload_len > 0) {
         writer.WriteBytes(payload, payload_len);
     }
 
-    return writer.Position();
+    return header_len + writer.Position();
 }
 
 TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(

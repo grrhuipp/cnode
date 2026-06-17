@@ -47,27 +47,11 @@ net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t l
         co_return true;
     }
 
-    buf::MultiBuffer mb;
-    mb.reserve((len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-
-    size_t offset = 0;
-    while (offset < len) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            co_return false;
-        }
-        const size_t chunk = std::min(
-            len - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), buf + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        mb.push_back(out.release());
-        offset += chunk;
-    }
-
     try {
-        co_await stream.WriteMultiBuffer(std::move(mb));
-        mb.clear();
+        const std::array<net::const_buffer, 1> buffers{
+            net::buffer(buf, len)
+        };
+        co_await stream.WriteBuffers(buffers);
     } catch (...) {
         co_return false;
     }
@@ -124,6 +108,43 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
     }
 
     const size_t max_output_size = 2 + len + state.cipher->Overhead() + padding_len;
+    if (max_output_size <= buf::Buffer::kSize) {
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            co_return false;
+        }
+
+        uint8_t* write_scratch = out->Tail().data();
+        ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + 2);
+        if (enc_len < 0) {
+            co_return false;
+        }
+
+        const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
+        uint16_t masked_len = total_len;
+        if (state.mask) {
+            const uint16_t size_mask = state.mask->NextMask();
+            masked_len ^= size_mask;
+        }
+
+        write_scratch[0] = (masked_len >> 8) & 0xFF;
+        write_scratch[1] = masked_len & 0xFF;
+
+        if (padding_len > 0) {
+            RAND_bytes(write_scratch + 2 + enc_len, static_cast<int>(padding_len));
+        }
+
+        const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
+        out->Produce(static_cast<uint32_t>(output_size));
+        buf::MultiBuffer mb{out.release()};
+        try {
+            co_await stream.WriteMultiBuffer(std::move(mb));
+        } catch (...) {
+            co_return false;
+        }
+        co_return true;
+    }
+
     memory::ByteVector write_output_buf;
     uint8_t* write_scratch = PrepareScratch(write_output_buf, max_output_size);
 
@@ -258,7 +279,11 @@ net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
         length_mask = state.mask->NextMask();
     }
 
-    alignas(16) uint8_t eof_buf[128];
+    buf::BufferGuard out{buf::Buffer::New()};
+    if (!out) {
+        co_return;
+    }
+    uint8_t* eof_buf = out->Tail().data();
     ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + 2);
     if (enc_len < 0) {
         co_return;
@@ -275,7 +300,13 @@ net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
     }
 
     const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
-    co_await WriteFull(stream, eof_buf, output_size);
+    out->Produce(static_cast<uint32_t>(output_size));
+    buf::MultiBuffer mb{out.release()};
+    try {
+        co_await stream.WriteMultiBuffer(std::move(mb));
+    } catch (...) {
+        co_return;
+    }
     state.eof_sent = true;
 }
 
@@ -423,11 +454,19 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
     EncodeRequestBodyState& state,
     AsyncStream& stream,
     std::span<const uint8_t> payload) {
+    const size_t overhead = state.cipher->Overhead();
+    if (buf::Buffer::kSize <= 2 + overhead + 63) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    const size_t max_chunk_size = std::min(
+        size_t(kVMessBodyMaxChunkSize - overhead),
+        size_t(buf::Buffer::kSize - 2 - overhead - 63));
+
     size_t offset = 0;
     while (offset < payload.size()) {
         const size_t chunk_size = std::min(
             payload.size() - offset,
-            size_t(kVMessBodyMaxChunkSize - state.cipher->Overhead()));
+            max_chunk_size);
         if (!co_await EncodeRequestBodyChunk(
                 state,
                 stream,

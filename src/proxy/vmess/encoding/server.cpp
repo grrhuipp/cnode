@@ -71,27 +71,11 @@ net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t l
         co_return true;
     }
 
-    buf::MultiBuffer mb;
-    mb.reserve((len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-
-    size_t offset = 0;
-    while (offset < len) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            co_return false;
-        }
-        const size_t chunk = std::min(
-            len - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), buf + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        mb.push_back(out.release());
-        offset += chunk;
-    }
-
     try {
-        co_await stream.WriteMultiBuffer(std::move(mb));
-        mb.clear();
+        const std::array<net::const_buffer, 1> buffers{
+            net::buffer(buf, len)
+        };
+        co_await stream.WriteBuffers(buffers);
     } catch (...) {
         co_return false;
     }
@@ -317,8 +301,12 @@ net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
         length_mask = state.mask->NextMask();
     }
 
-    uint8_t eof_enc[32];
-    ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_enc);
+    buf::BufferGuard out{buf::Buffer::New()};
+    if (!out) {
+        co_return false;
+    }
+    uint8_t* eof_buf = out->Tail().data();
+    ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + 2);
     if (enc_len < 0) {
         co_return false;
     }
@@ -327,20 +315,22 @@ net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
     const uint16_t masked_len = total_len ^ length_mask;
 
     const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
-    uint8_t eof_buf[128];
     eof_buf[0] = (masked_len >> 8) & 0xFF;
     eof_buf[1] = masked_len & 0xFF;
-    std::memcpy(eof_buf + 2, eof_enc, static_cast<size_t>(enc_len));
 
     if (padding_len > 0) {
         RAND_bytes(eof_buf + 2 + enc_len, static_cast<int>(padding_len));
     }
 
-    const bool ok = co_await WriteFull(stream, eof_buf, output_size);
-    if (ok) {
-        state.eof_sent = true;
+    out->Produce(static_cast<uint32_t>(output_size));
+    buf::MultiBuffer mb{out.release()};
+    try {
+        co_await stream.WriteMultiBuffer(std::move(mb));
+    } catch (...) {
+        co_return false;
     }
-    co_return ok;
+    state.eof_sent = true;
+    co_return true;
 }
 
 net::awaitable<bool> DecodeRequestBodyReadFull(DecodeRequestBodyState& state,

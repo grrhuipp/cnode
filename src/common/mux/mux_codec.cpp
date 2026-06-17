@@ -240,20 +240,29 @@ static void InitFrameBase(
     buf.push_back(option);
 }
 
-// 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
-static void FinalizeFrame(
-    std::vector<uint8_t>& buf,
-    const uint8_t* payload, size_t payload_len)
+// 回填 MetaLen（= buf.size() - 2）并按需追加 DataLen。
+static void FinalizeFrameHeader(std::vector<uint8_t>& buf, size_t payload_len)
 {
     // 回填 MetaLen
     uint16_t meta_len = static_cast<uint16_t>(buf.size() - 2);
     buf[0] = static_cast<uint8_t>(meta_len >> 8);
     buf[1] = static_cast<uint8_t>(meta_len & 0xFF);
 
-    if (payload && payload_len > 0) {
+    if (payload_len > 0) {
         // DataLen
         buf.push_back(static_cast<uint8_t>(payload_len >> 8));
         buf.push_back(static_cast<uint8_t>(payload_len & 0xFF));
+    }
+}
+
+// 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
+static void FinalizeFrame(
+    std::vector<uint8_t>& buf,
+    const uint8_t* payload, size_t payload_len)
+{
+    FinalizeFrameHeader(buf, payload && payload_len > 0 ? payload_len : 0);
+
+    if (payload && payload_len > 0) {
         // Payload
         buf.insert(buf.end(), payload, payload + payload_len);
     }
@@ -319,6 +328,15 @@ void EncodeKeepDataTo(
     FinalizeFrame(out, data, len);
 }
 
+void EncodeKeepDataHeaderTo(
+    std::vector<uint8_t>& out,
+    uint16_t session_id,
+    size_t payload_len)
+{
+    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, payload_len);
+    FinalizeFrameHeader(out, payload_len);
+}
+
 // ============================================================================
 // EncodeKeepUDP（UDP 回包，携带源地址）
 // ============================================================================
@@ -342,6 +360,29 @@ bool EncodeKeepUDPTo(
     }
 
     FinalizeFrame(out, data, len);
+    return true;
+}
+
+bool EncodeKeepUDPHeaderTo(
+    std::vector<uint8_t>& out,
+    uint16_t session_id,
+    const TargetAddress& src,
+    size_t payload_len)
+{
+    // 预估地址字节数
+    size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
+    InitFrameBase(out, session_id, SessionStatus::KEEP,
+                  kOptionData, addr_reserve + payload_len);
+
+    // NetworkType = UDP
+    out.push_back(static_cast<uint8_t>(NetworkType::UDP));
+    // PortThenAddress
+    if (!AppendAddress(out, src)) {
+        out.clear();
+        return false;
+    }
+
+    FinalizeFrameHeader(out, payload_len);
     return true;
 }
 

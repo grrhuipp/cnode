@@ -199,25 +199,31 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         buf::MultiBuffer out;
-        for (buf::Buffer* buffer : mb) {
+        for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
             const TargetAddress& target =
                 buffer->HasUDP() ? buffer->UDP() : fallback_target_;
-            const size_t capacity = static_cast<size_t>(buffer->Len()) + 300;
-            memory::ByteVector scratch(capacity);
-            const size_t written = trojan::TrojanCodec::EncodeUdpPacketTo(
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
+                throw std::bad_alloc();
+            }
+            const size_t written = trojan::TrojanCodec::EncodeUdpPacketHeaderTo(
                 target,
-                buffer->Bytes().data(),
                 buffer->Len(),
-                scratch.data(),
-                scratch.size());
-            if (written == 0 ||
-                !buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(scratch.data(), written), out)) {
+                header->Tail().data(),
+                header->Available());
+            if (written == 0) {
+                buf::Buffer::Free(buffer);
+                buffer = nullptr;
                 continue;
             }
+            header->Produce(static_cast<uint32_t>(written));
+            out.push_back(header.release());
+            buffer->ClearUDP();
+            out.push_back(buffer);
+            buffer = nullptr;
         }
         mb.clear();
         if (!out.empty()) {

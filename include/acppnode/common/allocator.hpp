@@ -59,11 +59,6 @@ inline void* AllocateRaw(size_t size,
     return ::operator new(size, std::nothrow);
 }
 
-inline void* AllocateSmallRaw(size_t size,
-                              size_t alignment = alignof(std::max_align_t)) noexcept {
-    return AllocateRaw(size, alignment);
-}
-
 inline void* AllocateArrayRaw(size_t count,
                               size_t elem_size,
                               size_t alignment = alignof(std::max_align_t)) noexcept {
@@ -90,6 +85,126 @@ inline void DeallocateRaw(void* p,
     ::operator delete(p);
 }
 
+namespace detail {
+
+inline constexpr size_t kSmallAllocMinClass = 16;
+inline constexpr size_t kSmallAllocMaxClass = 4096;
+inline constexpr size_t kSmallAllocClassCount = 9;
+inline constexpr size_t kSmallAllocBinCap = 64;
+
+struct SmallFreeBlock {
+    SmallFreeBlock* next = nullptr;
+};
+
+struct SmallAllocBin {
+    SmallFreeBlock* head = nullptr;
+    size_t count = 0;
+};
+
+[[nodiscard]] constexpr size_t SmallClassFor(size_t size) noexcept {
+    size_t klass = kSmallAllocMinClass;
+    while (klass < size && klass < kSmallAllocMaxClass) {
+        klass <<= 1;
+    }
+    return klass;
+}
+
+[[nodiscard]] constexpr size_t SmallClassIndex(size_t klass) noexcept {
+    size_t index = 0;
+    size_t cur = kSmallAllocMinClass;
+    while (cur < klass && index + 1 < kSmallAllocClassCount) {
+        cur <<= 1;
+        ++index;
+    }
+    return index;
+}
+
+[[nodiscard]] constexpr bool CanUseSmallCache(size_t size,
+                                              size_t alignment) noexcept {
+    return size > 0 &&
+           size <= kSmallAllocMaxClass &&
+           alignment <= alignof(std::max_align_t);
+}
+
+struct SmallAllocCache {
+    SmallAllocBin bins[kSmallAllocClassCount];
+
+    SmallAllocCache() noexcept = default;
+    SmallAllocCache(const SmallAllocCache&) = delete;
+    SmallAllocCache& operator=(const SmallAllocCache&) = delete;
+
+    ~SmallAllocCache() {
+        for (size_t i = 0; i < kSmallAllocClassCount; ++i) {
+            const size_t klass = kSmallAllocMinClass << i;
+            auto* block = bins[i].head;
+            while (block) {
+                auto* next = block->next;
+                DeallocateRaw(block, klass);
+                block = next;
+            }
+        }
+    }
+};
+
+inline SmallAllocCache& TlsSmallAllocCache() noexcept {
+    thread_local SmallAllocCache cache;
+    return cache;
+}
+
+[[nodiscard]] inline void* AllocateSmallCached(size_t size,
+                                               size_t alignment) noexcept {
+    if (!CanUseSmallCache(size, alignment)) {
+        return AllocateRaw(size, alignment);
+    }
+
+    const size_t klass = SmallClassFor(size);
+    auto& bin = TlsSmallAllocCache().bins[SmallClassIndex(klass)];
+    if (bin.head) {
+        SmallFreeBlock* block = bin.head;
+        bin.head = block->next;
+        --bin.count;
+        return block;
+    }
+    return AllocateRaw(klass);
+}
+
+inline void DeallocateSmallCached(void* p,
+                                  size_t size,
+                                  size_t alignment) noexcept {
+    if (!p) {
+        return;
+    }
+    if (!CanUseSmallCache(size, alignment)) {
+        DeallocateRaw(p, size, alignment);
+        return;
+    }
+
+    const size_t klass = SmallClassFor(size);
+    auto& bin = TlsSmallAllocCache().bins[SmallClassIndex(klass)];
+    if (bin.count >= kSmallAllocBinCap) {
+        DeallocateRaw(p, klass);
+        return;
+    }
+
+    auto* block = static_cast<SmallFreeBlock*>(p);
+    block->next = bin.head;
+    bin.head = block;
+    ++bin.count;
+}
+
+}  // namespace detail
+
+inline void* AllocateSmallRaw(size_t size,
+                              size_t alignment = alignof(std::max_align_t)) noexcept {
+    return detail::AllocateSmallCached(size, alignment);
+}
+
+inline void DeallocateSmallRaw(void* p,
+                               size_t size,
+                               size_t alignment = alignof(std::max_align_t)) noexcept {
+    detail::DeallocateSmallCached(p, size, alignment);
+}
+
 inline void CollectCurrentThread(bool /*force*/) noexcept {}
 
 inline void CollectSteady() noexcept {
@@ -114,7 +229,70 @@ public:
 };
 
 template <class T>
-using ThreadLocalAllocator = std::allocator<T>;
+class ThreadLocalAllocator {
+public:
+    using value_type = T;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using propagate_on_container_move_assignment = std::true_type;
+    using is_always_equal = std::true_type;
+
+    ThreadLocalAllocator() noexcept = default;
+
+    template <class U>
+    ThreadLocalAllocator(const ThreadLocalAllocator<U>&) noexcept {}
+
+    template <class U>
+    struct rebind {
+        using other = ThreadLocalAllocator<U>;
+    };
+
+    [[nodiscard]] T* allocate(size_type n) {
+        if (n > max_size()) {
+            throw std::bad_array_new_length();
+        }
+        size_t bytes = n * sizeof(T);
+        if (bytes == 0) {
+            bytes = 1;
+        }
+
+        void* raw = bytes <= detail::kSmallAllocMaxClass
+            ? AllocateSmallRaw(bytes, alignof(T))
+            : AllocateRaw(bytes, alignof(T));
+        if (!raw) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(raw);
+    }
+
+    void deallocate(T* p, size_type n) noexcept {
+        size_t bytes = n * sizeof(T);
+        if (bytes == 0) {
+            bytes = 1;
+        }
+        if (bytes <= detail::kSmallAllocMaxClass) {
+            DeallocateSmallRaw(p, bytes, alignof(T));
+            return;
+        }
+        DeallocateRaw(p, bytes, alignof(T));
+    }
+
+    [[nodiscard]] constexpr size_type max_size() const noexcept {
+        return std::numeric_limits<size_type>::max() / sizeof(T);
+    }
+};
+
+template <class T, class U>
+[[nodiscard]] constexpr bool operator==(const ThreadLocalAllocator<T>&,
+                                        const ThreadLocalAllocator<U>&) noexcept {
+    return true;
+}
+
+template <class T, class U>
+[[nodiscard]] constexpr bool operator!=(const ThreadLocalAllocator<T>&,
+                                        const ThreadLocalAllocator<U>&) noexcept {
+    return false;
+}
 
 template <class T>
 using ThreadLocalVector = std::vector<T, ThreadLocalAllocator<T>>;
