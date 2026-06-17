@@ -28,6 +28,34 @@ namespace acpp {
 
 namespace {
 
+constexpr size_t kTlsContextCacheMaxEntries = 16;
+constexpr size_t kXHttpPacketSessionPruneThreshold = 1024;
+
+template <typename Cache>
+void PruneTlsContextCache(Cache& cache,
+                          std::string_view keep_key,
+                          const SslContext* protected_ctx) {
+    if (cache.size() < kTlsContextCacheMaxEntries) {
+        return;
+    }
+
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (it->first != keep_key && it->second.get() != protected_ctx) {
+            cache.erase(it);
+            return;
+        }
+    }
+}
+
+template <typename Cache>
+void InsertTlsContext(Cache& cache,
+                      std::string key,
+                      std::unique_ptr<SslContext> ctx,
+                      const SslContext* protected_ctx) {
+    PruneTlsContextCache(cache, key, protected_ctx);
+    cache.emplace(std::move(key), std::move(ctx));
+}
+
 [[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key) {
     constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     std::string accept_src;
@@ -142,7 +170,7 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
 
     if (ctx) {
         auto* raw = ctx.get();
-        cache.emplace(std::move(key), std::move(ctx));
+        InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
         last = LastHit{&config, is_server, raw};
         return raw;
     }
@@ -175,7 +203,7 @@ SslContext* AcquireServerRealityContext(const RealityConfig& reality,
     }
 
     auto* raw = ctx.get();
-    cache.emplace(std::move(key), std::move(ctx));
+    InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
     last = LastHit{&reality, &tls_config, raw};
     return raw;
 }
@@ -200,7 +228,7 @@ SslContext* AcquireClientTlsContext(const TlsConfig& config) {
     std::unique_ptr<SslContext> ctx = SslContext::CreateClient(config);
     if (ctx) {
         auto* raw = ctx.get();
-        cache.emplace(std::move(key), std::move(ctx));
+        InsertTlsContext(cache, std::move(key), std::move(ctx), last_ctx);
         last_config = &config;
         last_ctx = raw;
         return raw;
@@ -234,7 +262,7 @@ SslContext* AcquireClientRealityContext(const RealityConfig& reality,
     }
 
     auto* raw = ctx.get();
-    cache.emplace(std::move(key), std::move(ctx));
+    InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
     last = LastHit{&reality, &tls_config, raw};
     return raw;
 }
@@ -1188,6 +1216,16 @@ struct XHttpRequestMeta {
     std::string_view session_id,
     bool create) {
     thread_local std::unordered_map<std::string, std::weak_ptr<XHttpPacketUpSession>> sessions;
+    if (sessions.size() >= kXHttpPacketSessionPruneThreshold) {
+        for (auto it = sessions.begin(); it != sessions.end();) {
+            if (it->second.expired()) {
+                it = sessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     auto it = sessions.find(std::string(session_id));
     if (it != sessions.end()) {
         if (auto session = it->second.lock()) {

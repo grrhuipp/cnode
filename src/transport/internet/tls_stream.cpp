@@ -12,6 +12,7 @@
 #include <openssl/tls1.h>
 #include <algorithm>
 #include <chrono>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -133,13 +134,21 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
 }
 
 struct AutoSignState {
+    static constexpr size_t kMaxCachedCerts = 256;
+
+    struct CachedCert {
+        X509* cert = nullptr;
+        std::list<std::string>::iterator lru_it;
+    };
+
     EVP_PKEY* pkey = nullptr;
     std::mutex mu;
-    std::unordered_map<std::string, X509*> cert_cache;
+    std::unordered_map<std::string, CachedCert> cert_cache;
+    std::list<std::string> cert_lru;
     long next_serial = 1;
 
     ~AutoSignState() {
-        for (auto& [_, cert] : cert_cache) X509_free(cert);
+        for (auto& [_, cached] : cert_cache) X509_free(cached.cert);
         if (pkey) EVP_PKEY_free(pkey);
     }
 
@@ -167,8 +176,10 @@ struct AutoSignState {
     // 为指定域名生成或获取缓存的证书
     X509* GetOrCreate(const std::string& cn) {
         std::lock_guard lock(mu);
-        if (auto it = cert_cache.find(cn); it != cert_cache.end())
-            return it->second;
+        if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
+            cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
+            return it->second.cert;
+        }
 
         X509* x509 = X509_new();
         if (!x509) return nullptr;
@@ -210,7 +221,18 @@ struct AutoSignState {
             return nullptr;
         }
 
-        cert_cache[cn] = x509;
+        while (cert_cache.size() >= kMaxCachedCerts && !cert_lru.empty()) {
+            auto victim = std::prev(cert_lru.end());
+            auto victim_it = cert_cache.find(*victim);
+            if (victim_it != cert_cache.end()) {
+                X509_free(victim_it->second.cert);
+                cert_cache.erase(victim_it);
+            }
+            cert_lru.erase(victim);
+        }
+
+        cert_lru.push_front(cn);
+        cert_cache.emplace(cn, CachedCert{x509, cert_lru.begin()});
         LOG_DEBUG("自签证书已生成: {}", cn);
         return x509;
     }
@@ -244,21 +266,7 @@ int AutoSignSniCallback(SSL* ssl, int* /*ad*/, void* /*arg*/) {
     std::string wildcard = sni ? ToWildcard(sni) : "localhost";
 
     auto& state = GetAutoSignState();
-    thread_local AutoSignState* last_state = nullptr;
-    thread_local std::string last_wildcard;
-    thread_local X509* last_cert = nullptr;
-
-    X509* cert = nullptr;
-    if (last_state == &state && last_cert && last_wildcard == wildcard) {
-        cert = last_cert;
-    } else {
-        cert = state.GetOrCreate(wildcard);
-        if (cert) {
-            last_state = &state;
-            last_wildcard = std::move(wildcard);
-            last_cert = cert;
-        }
-    }
+    X509* cert = state.GetOrCreate(wildcard);
     if (!cert) return SSL_TLSEXT_ERR_ALERT_FATAL;
 
     SSL_use_certificate(ssl, cert);
