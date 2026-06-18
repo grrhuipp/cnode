@@ -13,6 +13,7 @@ struct WorkerMemoryStats {
     size_t dns_entries = 0;
     size_t udp_sessions = 0;
     memory::BufferRecycleStats buffer_recycle;
+    memory::SmallAllocCacheStats small_alloc_cache;
 };
 
 struct WorkerRuntimeStatsSnapshot {

@@ -30,6 +30,17 @@ struct BufferRecycleStats {
     uint64_t trim_frees = 0;
 };
 
+struct SmallAllocCacheStats {
+    uint64_t cache_depth = 0;
+    uint64_t cache_capacity = 0;
+    uint64_t cache_high_water = 0;
+    uint64_t pop_hits = 0;
+    uint64_t pop_misses = 0;
+    uint64_t push_hits = 0;
+    uint64_t push_drops = 0;
+    uint64_t trim_frees = 0;
+};
+
 #ifdef CNODE_MEMORY_STATS
 
 namespace detail {

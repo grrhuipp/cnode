@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/common/memory_stats.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -130,6 +132,16 @@ struct SmallAllocBin {
 struct SmallAllocCache {
     SmallAllocBin bins[kSmallAllocClassCount];
 
+#ifdef CNODE_MEMORY_STATS
+    uint64_t current_depth = 0;
+    uint64_t high_water = 0;
+    uint64_t pop_hits = 0;
+    uint64_t pop_misses = 0;
+    uint64_t push_hits = 0;
+    uint64_t push_drops = 0;
+    uint64_t trim_frees = 0;
+#endif
+
     SmallAllocCache() noexcept = default;
     SmallAllocCache(const SmallAllocCache&) = delete;
     SmallAllocCache& operator=(const SmallAllocCache&) = delete;
@@ -152,6 +164,14 @@ inline SmallAllocCache& TlsSmallAllocCache() noexcept {
     return cache;
 }
 
+[[nodiscard]] inline uint64_t SmallCacheDepth(const SmallAllocCache& cache) noexcept {
+    uint64_t total = 0;
+    for (size_t i = 0; i < kSmallAllocClassCount; ++i) {
+        total += cache.bins[i].count;
+    }
+    return total;
+}
+
 [[nodiscard]] inline void* AllocateSmallCached(size_t size,
                                                size_t alignment) noexcept {
     if (!CanUseSmallCache(size, alignment)) {
@@ -159,13 +179,21 @@ inline SmallAllocCache& TlsSmallAllocCache() noexcept {
     }
 
     const size_t klass = SmallClassFor(size);
-    auto& bin = TlsSmallAllocCache().bins[SmallClassIndex(klass)];
+    auto& cache = TlsSmallAllocCache();
+    auto& bin = cache.bins[SmallClassIndex(klass)];
     if (bin.head) {
         SmallFreeBlock* block = bin.head;
         bin.head = block->next;
         --bin.count;
+#ifdef CNODE_MEMORY_STATS
+        --cache.current_depth;
+        ++cache.pop_hits;
+#endif
         return block;
     }
+#ifdef CNODE_MEMORY_STATS
+    ++cache.pop_misses;
+#endif
     return AllocateRaw(klass);
 }
 
@@ -181,8 +209,12 @@ inline void DeallocateSmallCached(void* p,
     }
 
     const size_t klass = SmallClassFor(size);
-    auto& bin = TlsSmallAllocCache().bins[SmallClassIndex(klass)];
+    auto& cache = TlsSmallAllocCache();
+    auto& bin = cache.bins[SmallClassIndex(klass)];
     if (bin.count >= kSmallAllocBinCap) {
+#ifdef CNODE_MEMORY_STATS
+        ++cache.push_drops;
+#endif
         DeallocateRaw(p, klass);
         return;
     }
@@ -191,6 +223,13 @@ inline void DeallocateSmallCached(void* p,
     block->next = bin.head;
     bin.head = block;
     ++bin.count;
+#ifdef CNODE_MEMORY_STATS
+    ++cache.current_depth;
+    ++cache.push_hits;
+    if (cache.current_depth > cache.high_water) {
+        cache.high_water = cache.current_depth;
+    }
+#endif
 }
 
 inline void TrimSmallAllocCache(bool force) noexcept {
@@ -203,9 +242,33 @@ inline void TrimSmallAllocCache(bool force) noexcept {
             auto* block = bin.head;
             bin.head = block->next;
             --bin.count;
+#ifdef CNODE_MEMORY_STATS
+            --cache.current_depth;
+            ++cache.trim_frees;
+#endif
             DeallocateRaw(block, klass);
         }
     }
+}
+
+[[nodiscard]] inline SmallAllocCacheStats SnapshotSmallAllocCacheStats() noexcept {
+    auto& cache = TlsSmallAllocCache();
+    SmallAllocCacheStats stats;
+#ifdef CNODE_MEMORY_STATS
+    stats.cache_depth = cache.current_depth;
+#else
+    stats.cache_depth = SmallCacheDepth(cache);
+#endif
+    stats.cache_capacity = kSmallAllocClassCount * kSmallAllocBinCap;
+#ifdef CNODE_MEMORY_STATS
+    stats.cache_high_water = cache.high_water;
+    stats.pop_hits = cache.pop_hits;
+    stats.pop_misses = cache.pop_misses;
+    stats.push_hits = cache.push_hits;
+    stats.push_drops = cache.push_drops;
+    stats.trim_frees = cache.trim_frees;
+#endif
+    return stats;
 }
 
 }  // namespace detail
@@ -223,6 +286,10 @@ inline void DeallocateSmallRaw(void* p,
 
 inline void CollectCurrentThread(bool force) noexcept {
     detail::TrimSmallAllocCache(force);
+}
+
+[[nodiscard]] inline SmallAllocCacheStats SnapshotThreadSmallAllocCacheStats() noexcept {
+    return detail::SnapshotSmallAllocCacheStats();
 }
 
 inline void CollectSteady() noexcept {

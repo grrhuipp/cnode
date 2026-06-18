@@ -305,6 +305,29 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
             buffer_recycle.push_hits,
             buffer_recycle.push_drops,
             buffer_recycle.trim_frees);
+
+        memory::SmallAllocCacheStats small_alloc_cache;
+        for (const auto& worker_snapshot : worker_snapshots) {
+            const auto& stats = worker_snapshot.memory.small_alloc_cache;
+            small_alloc_cache.cache_depth += stats.cache_depth;
+            small_alloc_cache.cache_capacity += stats.cache_capacity;
+            small_alloc_cache.cache_high_water += stats.cache_high_water;
+            small_alloc_cache.pop_hits += stats.pop_hits;
+            small_alloc_cache.pop_misses += stats.pop_misses;
+            small_alloc_cache.push_hits += stats.push_hits;
+            small_alloc_cache.push_drops += stats.push_drops;
+            small_alloc_cache.trim_frees += stats.trim_frees;
+        }
+        LOG_DEBUG(
+            "runtime.small_alloc_cache depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={} trim={}",
+            small_alloc_cache.cache_depth,
+            small_alloc_cache.cache_capacity,
+            small_alloc_cache.cache_high_water,
+            small_alloc_cache.pop_hits,
+            small_alloc_cache.pop_misses,
+            small_alloc_cache.push_hits,
+            small_alloc_cache.push_drops,
+            small_alloc_cache.trim_frees);
 #endif
 
         auto node_stats = ctx.controller.GetNodeStats();

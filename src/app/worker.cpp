@@ -1031,6 +1031,7 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
 
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
     stats.buffer_recycle      = buf::SnapshotThreadBufferRecycleStats();
+    stats.small_alloc_cache   = memory::SnapshotThreadSmallAllocCacheStats();
     return stats;
 }
 
