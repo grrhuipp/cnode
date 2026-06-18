@@ -65,6 +65,40 @@ uint8_t* PrepareScratch(memory::ByteVector& buffer, size_t size) {
     return buffer.data();
 }
 
+[[nodiscard]] bool EncodeChunkLength(vmess::VMessCipher* length_cipher,
+                                     vmess::ShakeMask* mask,
+                                     uint16_t total_len,
+                                     uint8_t* out,
+                                     size_t& out_len) {
+    if (length_cipher) {
+        const size_t length_overhead = length_cipher->Overhead();
+        if (total_len < length_overhead) {
+            return false;
+        }
+        const uint16_t plain_len =
+            static_cast<uint16_t>(total_len - static_cast<uint16_t>(length_overhead));
+        const uint8_t plain[2] = {
+            static_cast<uint8_t>((plain_len >> 8) & 0xFF),
+            static_cast<uint8_t>(plain_len & 0xFF),
+        };
+        const ssize_t enc_len = length_cipher->Encrypt(plain, sizeof(plain), out);
+        if (enc_len < 0) {
+            return false;
+        }
+        out_len = static_cast<size_t>(enc_len);
+        return true;
+    }
+
+    uint16_t masked_len = total_len;
+    if (mask) {
+        masked_len ^= mask->NextMask();
+    }
+    out[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
+    out[1] = static_cast<uint8_t>(masked_len & 0xFF);
+    out_len = 2;
+    return true;
+}
+
 }  // namespace
 
 namespace vmess::encoding {
@@ -107,7 +141,9 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
         padding_len = padding_mask % 64;
     }
 
-    const size_t max_output_size = 2 + len + state.cipher->Overhead() + padding_len;
+    const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
+    const size_t max_output_size =
+        length_header_size + len + state.cipher->Overhead() + padding_len;
     if (max_output_size <= buf::Buffer::kSize) {
         buf::BufferGuard out{buf::Buffer::New()};
         if (!out) {
@@ -115,26 +151,26 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
         }
 
         uint8_t* write_scratch = out->Tail().data();
-        ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + 2);
+        ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + length_header_size);
         if (enc_len < 0) {
             co_return false;
         }
 
         const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-        uint16_t masked_len = total_len;
-        if (state.mask) {
-            const uint16_t size_mask = state.mask->NextMask();
-            masked_len ^= size_mask;
+        size_t encoded_length_size = 0;
+        if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                               state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                               total_len,
+                               write_scratch,
+                               encoded_length_size)) {
+            co_return false;
         }
-
-        write_scratch[0] = (masked_len >> 8) & 0xFF;
-        write_scratch[1] = masked_len & 0xFF;
 
         if (padding_len > 0) {
-            RAND_bytes(write_scratch + 2 + enc_len, static_cast<int>(padding_len));
+            RAND_bytes(write_scratch + encoded_length_size + enc_len, static_cast<int>(padding_len));
         }
 
-        const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
+        const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
         out->Produce(static_cast<uint32_t>(output_size));
         buf::MultiBuffer mb{out.release()};
         try {
@@ -148,27 +184,28 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
     memory::ByteVector write_output_buf;
     uint8_t* write_scratch = PrepareScratch(write_output_buf, max_output_size);
 
-    ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + 2);
+    ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + length_header_size);
     if (enc_len < 0) {
         ReleaseIdleBuffer(write_output_buf, 0);
         co_return false;
     }
 
     const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-    uint16_t masked_len = total_len;
-    if (state.mask) {
-        const uint16_t size_mask = state.mask->NextMask();
-        masked_len ^= size_mask;
+    size_t encoded_length_size = 0;
+    if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                           state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                           total_len,
+                           write_scratch,
+                           encoded_length_size)) {
+        ReleaseIdleBuffer(write_output_buf, 0);
+        co_return false;
     }
-
-    write_scratch[0] = (masked_len >> 8) & 0xFF;
-    write_scratch[1] = masked_len & 0xFF;
 
     if (padding_len > 0) {
-        RAND_bytes(write_scratch + 2 + enc_len, static_cast<int>(padding_len));
+        RAND_bytes(write_scratch + encoded_length_size + enc_len, static_cast<int>(padding_len));
     }
 
-    const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
+    const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
     const bool ok = co_await WriteFull(stream, write_scratch, output_size);
     ReleaseIdleBuffer(write_output_buf, 0);
     co_return ok;
@@ -182,12 +219,13 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
         co_return;
     }
     const size_t overhead = state.cipher->Overhead();
-    if (buf::Buffer::kSize <= 2 + overhead + 63) {
+    const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
+    if (buf::Buffer::kSize <= length_header_size + overhead + 63) {
         ThrowVMessWriteError("VMess client buffer budget too small");
     }
     const size_t stream_chunk_size = std::min(
         size_t(kVMessBodyMaxChunkSize - overhead),
-        size_t(buf::Buffer::kSize - 2 - overhead - 63));
+        size_t(buf::Buffer::kSize - length_header_size - overhead - 63));
 
     buf::MultiBuffer out_mb;
     out_mb.reserve(kStreamFlushBufferCount);
@@ -227,26 +265,27 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
             }
 
             uint8_t* dst = out->Tail().data();
-            ssize_t enc_len = state.cipher->Encrypt(data + offset, chunk_size, dst + 2);
+            ssize_t enc_len = state.cipher->Encrypt(
+                data + offset, chunk_size, dst + length_header_size);
             if (enc_len < 0) {
                 ThrowVMessWriteError("VMess client stream encrypt failed");
             }
 
             const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-            uint16_t masked_len = total_len;
-            if (state.mask) {
-                const uint16_t size_mask = state.mask->NextMask();
-                masked_len ^= size_mask;
+            size_t encoded_length_size = 0;
+            if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                                   state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                                   total_len,
+                                   dst,
+                                   encoded_length_size)) {
+                ThrowVMessWriteError("VMess client length encrypt failed");
             }
-
-            const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
-            dst[0] = static_cast<uint8_t>((masked_len >> 8) & 0xFF);
-            dst[1] = static_cast<uint8_t>(masked_len & 0xFF);
 
             if (padding_len > 0) {
-                RAND_bytes(dst + 2 + enc_len, static_cast<int>(padding_len));
+                RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
             }
 
+            const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
             out->Produce(static_cast<uint32_t>(output_size));
             out_bytes += output_size;
             out_mb.push_back(out.release());
@@ -274,32 +313,32 @@ net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
         padding_len = padding_mask % 64;
     }
 
-    uint16_t length_mask = 0;
-    if (state.mask) {
-        length_mask = state.mask->NextMask();
-    }
-
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
         co_return;
     }
     uint8_t* eof_buf = out->Tail().data();
-    ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + 2);
+    const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
+    ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + length_header_size);
     if (enc_len < 0) {
         co_return;
     }
 
     const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-    const uint16_t masked_len = total_len ^ length_mask;
-
-    eof_buf[0] = (masked_len >> 8) & 0xFF;
-    eof_buf[1] = masked_len & 0xFF;
-
-    if (padding_len > 0) {
-        RAND_bytes(eof_buf + 2 + enc_len, static_cast<int>(padding_len));
+    size_t encoded_length_size = 0;
+    if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                           state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                           total_len,
+                           eof_buf,
+                           encoded_length_size)) {
+        co_return;
     }
 
-    const size_t output_size = 2 + static_cast<size_t>(enc_len) + padding_len;
+    if (padding_len > 0) {
+        RAND_bytes(eof_buf + encoded_length_size + enc_len, static_cast<int>(padding_len));
+    }
+
+    const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
     out->Produce(static_cast<uint32_t>(output_size));
     buf::MultiBuffer mb{out.release()};
     try {
@@ -316,15 +355,31 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
         co_return buf::MultiBuffer{};
     }
 
-    uint8_t len_buf[2];
-    if (!co_await ReadFull(stream, len_buf, 2)) {
+    uint8_t len_buf[18];
+    const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
+    if (!co_await ReadFull(stream, len_buf, length_header_size)) {
         LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody TCP-level close "
                          "(failed to read chunk header)");
         state.eof = true;
         throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
     }
 
-    const uint16_t raw_len = (static_cast<uint16_t>(len_buf[0]) << 8) | len_buf[1];
+    uint16_t raw_len = 0;
+    if (state.length_cipher) {
+        uint8_t len_plain[2];
+        const ssize_t dec_len = state.length_cipher->Decrypt(
+            len_buf, length_header_size, len_plain);
+        if (dec_len != 2) {
+            LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody authenticated length decrypt failed");
+            state.eof = true;
+            throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
+        }
+        raw_len = static_cast<uint16_t>(
+            (static_cast<uint16_t>(len_plain[0]) << 8) | len_plain[1]);
+        raw_len = static_cast<uint16_t>(raw_len + state.length_cipher->Overhead());
+    } else {
+        raw_len = (static_cast<uint16_t>(len_buf[0]) << 8) | len_buf[1];
+    }
 
     size_t padding_len = 0;
     if (state.global_padding && state.mask) {
@@ -333,7 +388,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     }
 
     uint16_t chunk_len = raw_len;
-    if (state.mask) {
+    if (!state.length_cipher && state.mask) {
         const uint16_t size_mask = state.mask->NextMask();
         chunk_len ^= size_mask;
     }
@@ -816,13 +871,29 @@ ClientSession::ClientSession(const MemoryAccount& user,
     }
 
     request_body_state_.cipher.emplace(security_, request_key_.data(), request_iv_.data());
-    request_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0;
+    if ((options_ & Option::AUTHENTICATED_LENGTH) != 0 &&
+        (security_ == Security::AES_128_GCM || security_ == Security::CHACHA20_POLY1305)) {
+        const std::array<std::string_view, 1> path{"auth_len"};
+        auto length_key = KDF16(request_body_key_.data(), request_body_key_.size(), path);
+        request_body_state_.length_cipher.emplace(
+            security_, length_key.data(), request_body_iv_.data());
+    }
+    request_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0 &&
+        !(security_ == Security::NONE && command_ != Command::UDP);
     if ((options_ & Option::CHUNK_MASKING) != 0) {
         request_body_state_.mask.emplace(request_body_iv_.data());
     }
 
     response_body_state_.cipher.emplace(security_, response_key_.data(), response_iv_.data());
-    response_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0;
+    if ((options_ & Option::AUTHENTICATED_LENGTH) != 0 &&
+        (security_ == Security::AES_128_GCM || security_ == Security::CHACHA20_POLY1305)) {
+        const std::array<std::string_view, 1> path{"auth_len"};
+        auto length_key = KDF16(request_body_key_.data(), request_body_key_.size(), path);
+        response_body_state_.length_cipher.emplace(
+            security_, length_key.data(), request_body_iv_.data());
+    }
+    response_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0 &&
+        !(security_ == Security::NONE && command_ != Command::UDP);
     if ((options_ & Option::CHUNK_MASKING) != 0) {
         response_body_state_.mask.emplace(response_iv_.data());
     }

@@ -11,6 +11,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <deque>
+#include <utility>
 
 namespace acpp {
 namespace vmess {
@@ -41,6 +43,80 @@ ToPreparedUsers(const std::vector<MemoryAccount>& users) {
 }  // namespace
 
 struct TimedUserValidator::Impl {
+    struct SessionKey {
+        std::array<uint8_t, 16> user{};
+        std::array<uint8_t, 16> key{};
+        std::array<uint8_t, 16> iv{};
+
+        [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
+            return user == other.user && key == other.key && iv == other.iv;
+        }
+    };
+
+    struct SessionKeyHash {
+        [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
+            size_t h = 1469598103934665603ull;
+            auto mix = [&h](uint8_t byte) noexcept {
+                h ^= static_cast<size_t>(byte);
+                h *= 1099511628211ull;
+            };
+            for (uint8_t byte : value.user) mix(byte);
+            for (uint8_t byte : value.key) mix(byte);
+            for (uint8_t byte : value.iv) mix(byte);
+            return h;
+        }
+    };
+
+    struct SessionHistory {
+        static constexpr int64_t kTtlSeconds = 180;
+        static constexpr int64_t kCleanupIntervalSeconds = 30;
+        static constexpr size_t kMaxEntries = 65536;
+
+        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash> entries;
+        memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
+        int64_t last_cleanup = 0;
+
+        void Cleanup(int64_t now) {
+            if (now - last_cleanup < kCleanupIntervalSeconds &&
+                entries.size() <= kMaxEntries) {
+                return;
+            }
+            last_cleanup = now;
+            while (!order.empty()) {
+                const auto& [key, expires_at] = order.front();
+                auto it = entries.find(key);
+                if (it == entries.end() || it->second != expires_at) {
+                    order.pop_front();
+                    continue;
+                }
+                if (expires_at > now && entries.size() <= kMaxEntries) {
+                    break;
+                }
+                entries.erase(it);
+                order.pop_front();
+            }
+        }
+
+        bool AddIfNew(SessionKey key, int64_t now) {
+            Cleanup(now);
+            auto it = entries.find(key);
+            if (it != entries.end() && it->second > now) {
+                return false;
+            }
+            const int64_t expires_at = now + kTtlSeconds;
+            entries[key] = expires_at;
+            order.emplace_back(std::move(key), expires_at);
+            Cleanup(now);
+            return true;
+        }
+
+        void Clear() {
+            entries.clear();
+            order.clear();
+            last_cleanup = 0;
+        }
+    };
+
     struct alignas(64) HotUserCache {
         static constexpr size_t kMaxEntries = 8192;
         static constexpr int64_t kWindowSeconds = 300;
@@ -107,6 +183,7 @@ struct TimedUserValidator::Impl {
     mutable HotUserCache hot_cache;
     mutable std::shared_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
     mutable int64_t last_hot_cache_cleanup = 0;
+    mutable SessionHistory session_history;
     UserOnlineTracker stats;
 };
 
@@ -122,6 +199,7 @@ void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<Memo
     set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
@@ -130,6 +208,7 @@ void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<Memory
     set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::AddUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
@@ -138,18 +217,21 @@ void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<Mem
     set.vmess_accounts = ToPreparedUsers(users);
     proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kVmess, tag, set);
     impl_->hot_cache.Clear();
+    impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
 void TimedUserValidator::ClearUsers(std::string_view tag) {
     proxyman::inbound::UserStore::ClearUsers(constants::protocol::kVmess, tag);
     impl_->hot_cache.Clear();
+    impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
 void TimedUserValidator::Clear() {
     proxyman::inbound::UserStore::ClearProtocol(constants::protocol::kVmess);
     impl_->hot_cache.Clear();
+    impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
@@ -243,6 +325,20 @@ TimedUserValidator::FindByAuthIDForTag(
     }
 
     return {};
+}
+
+bool TimedUserValidator::RegisterSessionIfNew(
+    const proxyman::inbound::UserStore::VmessCredential& user,
+    const std::array<uint8_t, 16>& body_key,
+    const std::array<uint8_t, 16>& body_iv) const {
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    Impl::SessionKey key;
+    key.user = user.uuid_bytes;
+    key.key = body_key;
+    key.iv = body_iv;
+    return impl_->session_history.AddIfNew(std::move(key), now);
 }
 
 void TimedUserValidator::OnUserConnected(std::string_view tag,

@@ -665,6 +665,7 @@ private:
     std::unordered_map<uint32_t, StreamState> stream_states_;
     bool write_busy_ = false;
     bool cancelled_ = false;
+    bool handshake_done_ = false;
 };
 
 net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
@@ -772,6 +773,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                     break;
                 }
             }
+            handshake_done_ = true;
             continue;
         }
         if (header->cmd == anytls::kCmdWaste ||
@@ -807,6 +809,21 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
 
         const uint32_t sid = header->sid;
         if (header->cmd == anytls::kCmdSYN) {
+            if (!handshake_done_) {
+                static constexpr std::string_view kAlert = "client did not send its settings";
+                (void)co_await WriteFrameSerialized(
+                    anytls::kCmdAlert,
+                    0,
+                    std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(kAlert.data()),
+                        kAlert.size()));
+                if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
+                    result.error = ok.error();
+                    break;
+                }
+                result.error = ErrorCode::PROTOCOL_INVALID_COMMAND;
+                break;
+            }
             auto sub = GetOrCreateStream(sid);
             stream_states_[sid] = StreamState::PendingTarget;
             if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {

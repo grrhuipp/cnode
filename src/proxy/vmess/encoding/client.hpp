@@ -17,6 +17,7 @@ using VMessHandshakeResult = std::expected<void, ErrorCode>;
 
 struct EncodeRequestBodyState final {
     std::optional<VMessCipher> cipher;
+    std::optional<VMessCipher> length_cipher;
     std::optional<ShakeMask> mask;
     bool global_padding = false;
     bool eof_sent = false;
@@ -24,6 +25,7 @@ struct EncodeRequestBodyState final {
 
 struct DecodeResponseBodyState final {
     std::optional<VMessCipher> cipher;
+    std::optional<VMessCipher> length_cipher;
     std::optional<ShakeMask> mask;
     bool global_padding = false;
     bool eof = false;

@@ -60,6 +60,13 @@ public:
                        const uint8_t* auth_id,
                        int64_t& out_timestamp) const;
 
+    // Records AEAD request body key/IV for replay protection.
+    // Returns false if the same user/key/IV tuple is still inside the replay window.
+    [[nodiscard]] bool RegisterSessionIfNew(
+        const proxyman::inbound::UserStore::VmessCredential& user,
+        const std::array<uint8_t, 16>& body_key,
+        const std::array<uint8_t, 16>& body_iv) const;
+
     // ── 在线追踪 ─────────────────────────────────────────────────────────────
 
     void OnUserConnected(std::string_view tag,
