@@ -31,6 +31,7 @@ class UDPSession;
 namespace relay_detail {
 
 inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
+inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 using SteadyClock = std::chrono::steady_clock;
 
 template <typename Endpoint>
@@ -83,6 +84,58 @@ void CancelRelayControls(FromControl& from, ToControl& to) noexcept {
         }
     } else {
         CancelIfSupported(to);
+    }
+}
+
+template <typename Endpoint>
+net::awaitable<void> ShutdownWriteForClose(Endpoint& endpoint) {
+    if constexpr (requires { endpoint.SetWriteTimeout(kRelayCloseGraceTimeout); }) {
+        endpoint.SetWriteTimeout(kRelayCloseGraceTimeout);
+    }
+
+    if constexpr (requires { endpoint.StartPhaseDeadline(kRelayCloseGraceTimeout); }) {
+        (void)endpoint.StartPhaseDeadline(kRelayCloseGraceTimeout);
+    }
+
+    try {
+        if constexpr (requires { endpoint.AsyncShutdownWrite(); }) {
+            co_await endpoint.AsyncShutdownWrite();
+        } else if constexpr (requires { endpoint.ShutdownWrite(); }) {
+            endpoint.ShutdownWrite();
+        }
+    } catch (...) {
+    }
+
+    if constexpr (requires { endpoint.ClearPhaseDeadline(); }) {
+        endpoint.ClearPhaseDeadline();
+    }
+}
+
+template <typename Writer, typename Control>
+net::awaitable<void> ShutdownWriteForClose(Writer& writer, Control& control) {
+    if constexpr (requires { control.SetWriteTimeout(kRelayCloseGraceTimeout); }) {
+        control.SetWriteTimeout(kRelayCloseGraceTimeout);
+    }
+
+    if constexpr (requires { control.StartPhaseDeadline(kRelayCloseGraceTimeout); }) {
+        (void)control.StartPhaseDeadline(kRelayCloseGraceTimeout);
+    }
+
+    try {
+        if constexpr (requires { writer.AsyncShutdownWrite(); }) {
+            co_await writer.AsyncShutdownWrite();
+        } else if constexpr (requires { ShutdownWrite(writer, control); }) {
+            co_await ShutdownWrite(writer, control);
+        } else if constexpr (requires { control.AsyncShutdownWrite(); }) {
+            co_await control.AsyncShutdownWrite();
+        } else if constexpr (requires { control.ShutdownWrite(); }) {
+            control.ShutdownWrite();
+        }
+    } catch (...) {
+    }
+
+    if constexpr (requires { control.ClearPhaseDeadline(); }) {
+        control.ClearPhaseDeadline();
     }
 }
 
@@ -613,10 +666,10 @@ net::awaitable<RelayResult> DoRelayLink(
     } else {
         // 并行发送双向优雅写关闭，减少 1 次 RTT
         auto shutdown_client = [&]() -> net::awaitable<void> {
-            try { co_await client.AsyncShutdownWrite(); } catch (...) {}
+            co_await relay_detail::ShutdownWriteForClose(client);
         };
         auto shutdown_target = [&]() -> net::awaitable<void> {
-            try { co_await target.AsyncShutdownWrite(); } catch (...) {}
+            co_await relay_detail::ShutdownWriteForClose(target);
         };
         co_await (shutdown_client() && shutdown_target());
         client.Cancel();
@@ -754,18 +807,10 @@ net::awaitable<RelayResult> DoRelayLink(
         relay_detail::CloseAbortiveIfSupported(target);
     } else {
         auto shutdown_client = [&]() -> net::awaitable<void> {
-            try {
-                if constexpr (requires { client_writer.AsyncShutdownWrite(); }) {
-                    co_await client_writer.AsyncShutdownWrite();
-                } else if constexpr (requires { ShutdownWrite(client_writer, client_control); }) {
-                    co_await ShutdownWrite(client_writer, client_control);
-                } else {
-                    co_await client_control.AsyncShutdownWrite();
-                }
-            } catch (...) {}
+            co_await relay_detail::ShutdownWriteForClose(client_writer, client_control);
         };
         auto shutdown_target = [&]() -> net::awaitable<void> {
-            try { co_await target.AsyncShutdownWrite(); } catch (...) {}
+            co_await relay_detail::ShutdownWriteForClose(target);
         };
         co_await (shutdown_client() && shutdown_target());
         client_control.Cancel();
@@ -911,8 +956,13 @@ net::awaitable<RelayResult> DoRelayLink(
         target.Cancel();
         relay_detail::CloseAbortiveIfSupported(target);
     } else {
-        try { co_await client_writer.AsyncShutdownWrite(); } catch (...) {}
-        try { co_await target.AsyncShutdownWrite(); } catch (...) {}
+        auto shutdown_client = [&]() -> net::awaitable<void> {
+            co_await relay_detail::ShutdownWriteForClose(client_writer);
+        };
+        auto shutdown_target = [&]() -> net::awaitable<void> {
+            co_await relay_detail::ShutdownWriteForClose(target);
+        };
+        co_await (shutdown_client() && shutdown_target());
         target.Cancel();
         relay_detail::CloseIfSupported(target);
     }
