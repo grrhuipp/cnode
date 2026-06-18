@@ -41,6 +41,29 @@ void MarkAbortiveCloseIfSupported(Endpoint& endpoint) {
 }
 
 template <typename Endpoint>
+void CloseIfSupported(Endpoint& endpoint) noexcept {
+    if constexpr (requires { endpoint.Close(); }) {
+        try {
+            endpoint.Close();
+        } catch (...) {
+        }
+    }
+}
+
+template <typename Endpoint>
+void CloseAbortiveIfSupported(Endpoint& endpoint) noexcept {
+    if constexpr (requires { endpoint.CloseAbortive(); }) {
+        try {
+            endpoint.CloseAbortive();
+        } catch (...) {
+        }
+    } else {
+        MarkAbortiveCloseIfSupported(endpoint);
+        CloseIfSupported(endpoint);
+    }
+}
+
+template <typename Endpoint>
 void CancelIfSupported(Endpoint& endpoint) noexcept {
     if constexpr (requires { endpoint.Cancel(); }) {
         try {
@@ -571,10 +594,10 @@ net::awaitable<RelayResult> DoRelayLink(
     // 直接 Cancel 所有挂起操作后由析构链关闭 socket。
     // 正常关闭（双方均 EOF）才执行协议级优雅关闭。
     if (error_up != ErrorCode::OK || error_down != ErrorCode::OK) {
-        relay_detail::MarkAbortiveCloseIfSupported(client);
-        relay_detail::MarkAbortiveCloseIfSupported(target);
         client.Cancel();
         target.Cancel();
+        relay_detail::CloseAbortiveIfSupported(client);
+        relay_detail::CloseAbortiveIfSupported(target);
     } else {
         // 并行发送双向优雅写关闭，减少 1 次 RTT
         auto shutdown_client = [&]() -> net::awaitable<void> {
@@ -586,6 +609,8 @@ net::awaitable<RelayResult> DoRelayLink(
         co_await (shutdown_client() && shutdown_target());
         client.Cancel();
         target.Cancel();
+        relay_detail::CloseIfSupported(client);
+        relay_detail::CloseIfSupported(target);
     }
 
     LOG_CONN_DEBUG(ctx, "Relay finished: up={} down={}", bytes_up, bytes_down);
@@ -711,10 +736,10 @@ net::awaitable<RelayResult> DoRelayLink(
                    result.client_closed_first ? "client" : "target");
 
     if (error_up != ErrorCode::OK || error_down != ErrorCode::OK) {
-        relay_detail::MarkAbortiveCloseIfSupported(client_control);
-        relay_detail::MarkAbortiveCloseIfSupported(target);
         client_control.Cancel();
         target.Cancel();
+        relay_detail::CloseAbortiveIfSupported(client_control);
+        relay_detail::CloseAbortiveIfSupported(target);
     } else {
         auto shutdown_client = [&]() -> net::awaitable<void> {
             try {
@@ -733,6 +758,8 @@ net::awaitable<RelayResult> DoRelayLink(
         co_await (shutdown_client() && shutdown_target());
         client_control.Cancel();
         target.Cancel();
+        relay_detail::CloseIfSupported(client_control);
+        relay_detail::CloseIfSupported(target);
     }
 
     LOG_CONN_DEBUG(ctx, "Relay finished: up={} down={}", bytes_up, bytes_down);
@@ -869,12 +896,13 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_down = result.bytes_down;
 
     if (result.error != ErrorCode::OK) {
-        relay_detail::MarkAbortiveCloseIfSupported(target);
         target.Cancel();
+        relay_detail::CloseAbortiveIfSupported(target);
     } else {
         try { co_await client_writer.AsyncShutdownWrite(); } catch (...) {}
         try { co_await target.AsyncShutdownWrite(); } catch (...) {}
         target.Cancel();
+        relay_detail::CloseIfSupported(target);
     }
 
     LOG_CONN_DEBUG(ctx, "Relay finished without client control: up={} down={}",
