@@ -1038,9 +1038,15 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             }
         }
 
+        void SetIdleTimeout(std::chrono::seconds) {}
+        void SetReadTimeout(std::chrono::seconds) {}
+        void SetWriteTimeout(std::chrono::seconds) {}
+        PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds) { return {}; }
+        void ClearPhaseDeadline() {}
         bool ConsumeIdleTimeout() noexcept { return false; }
         bool ConsumeReadTimeout() noexcept { return false; }
         bool ConsumeWriteTimeout() noexcept { return false; }
+        bool ConsumePhaseDeadline() noexcept { return false; }
     };
 
     LogicalEndpoint target_endpoint(
@@ -1051,38 +1057,79 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         original_target);
 
     RelayResult result;
+    auto* inbound_control = inbound.control;
     if (buf::TotalLen(first_payload) > 0) {
-        result = co_await DoRelayLinkWithFirstPacket(
-            io_context,
-            *inbound.reader,
-            *inbound.writer,
-            target_endpoint,
-            ctx,
-            stats,
-            first_payload,
-            relay_config);
+        if (inbound_control) {
+            result = co_await DoRelayLinkWithFirstPacket(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                *inbound_control,
+                target_endpoint,
+                ctx,
+                stats,
+                first_payload,
+                relay_config);
+        } else {
+            result = co_await DoRelayLinkWithFirstPacket(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                target_endpoint,
+                ctx,
+                stats,
+                first_payload,
+                relay_config);
+        }
     } else if (!initial_payload.empty()) {
-        result = co_await DoRelayLinkWithFirstPacket(
-            io_context,
-            *inbound.reader,
-            *inbound.writer,
-            target_endpoint,
-            ctx,
-            stats,
-            initial_payload,
-            relay_config);
+        if (inbound_control) {
+            result = co_await DoRelayLinkWithFirstPacket(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                *inbound_control,
+                target_endpoint,
+                ctx,
+                stats,
+                initial_payload,
+                relay_config);
+        } else {
+            result = co_await DoRelayLinkWithFirstPacket(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                target_endpoint,
+                ctx,
+                stats,
+                initial_payload,
+                relay_config);
+        }
     } else {
-        result = co_await DoRelayLink(
-            io_context,
-            *inbound.reader,
-            *inbound.writer,
-            target_endpoint,
-            ctx,
-            stats,
-            relay_config);
+        if (inbound_control) {
+            result = co_await DoRelayLink(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                *inbound_control,
+                target_endpoint,
+                ctx,
+                stats,
+                relay_config);
+        } else {
+            result = co_await DoRelayLink(
+                io_context,
+                *inbound.reader,
+                *inbound.writer,
+                target_endpoint,
+                ctx,
+                stats,
+                relay_config);
+        }
     }
 
-    try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
+    if (!inbound_control) {
+        try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
+    }
     session->UnregisterLogicalStream(sid);
     logical->Close(result.error);
     if (result.error != ErrorCode::OK) {
