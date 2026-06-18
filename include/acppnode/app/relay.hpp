@@ -500,6 +500,18 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             }
             CancelRelayControls(from_control, to_control);
             break;
+        } catch (const std::exception& e) {
+            error = ErrorCode::RELAY_WRITE_FAILED;
+            LOG_CONN_DEBUG(ctx, "[relay] {} exception: {}, transferred={}B",
+                           is_upload ? "up" : "down", e.what(), total_bytes);
+            CancelRelayControls(from_control, to_control);
+            break;
+        } catch (...) {
+            error = ErrorCode::RELAY_WRITE_FAILED;
+            LOG_CONN_DEBUG(ctx, "[relay] {} exception: unknown, transferred={}B",
+                           is_upload ? "up" : "down", total_bytes);
+            CancelRelayControls(from_control, to_control);
+            break;
         }
     }
 

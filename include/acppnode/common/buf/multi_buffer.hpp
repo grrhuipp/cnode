@@ -138,6 +138,7 @@ struct BufferRecycleCache {
     uint64_t pop_misses = 0;
     uint64_t push_hits = 0;
     uint64_t push_drops = 0;
+    uint64_t trim_frees = 0;
 #endif
 
     BufferRecycleCache() noexcept = default;
@@ -192,6 +193,21 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
     return true;
 }
 
+inline void TrimBufferRecycle(bool force) noexcept {
+    auto& cache = TlsBufferRecycle();
+    const size_t target = force ? 0 : kBufferRecycleInitialCap;
+    while (cache.count > target) {
+        memory::DeallocateRaw(cache.slots[--cache.count], sizeof(Buffer), alignof(Buffer));
+#ifdef CNODE_MEMORY_STATS
+        ++cache.trim_frees;
+#endif
+    }
+    if (cache.capacity > kBufferRecycleInitialCap &&
+        cache.count <= kBufferRecycleInitialCap) {
+        cache.capacity = kBufferRecycleInitialCap;
+    }
+}
+
 [[nodiscard]] inline memory::BufferRecycleStats SnapshotBufferRecycleStats() noexcept {
     auto& cache = TlsBufferRecycle();
     memory::BufferRecycleStats stats;
@@ -203,6 +219,7 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
     stats.pop_misses = cache.pop_misses;
     stats.push_hits = cache.push_hits;
     stats.push_drops = cache.push_drops;
+    stats.trim_frees = cache.trim_frees;
 #endif
     return stats;
 }
@@ -211,6 +228,10 @@ inline BufferRecycleCache& TlsBufferRecycle() noexcept {
 
 [[nodiscard]] inline memory::BufferRecycleStats SnapshotThreadBufferRecycleStats() noexcept {
     return detail::SnapshotBufferRecycleStats();
+}
+
+inline void TrimThreadBufferRecycle(bool force) noexcept {
+    detail::TrimBufferRecycle(force);
 }
 
 // RAII 守卫：离开作用域时自动释放单个 Buffer

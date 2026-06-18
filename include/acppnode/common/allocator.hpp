@@ -91,6 +91,7 @@ inline constexpr size_t kSmallAllocMinClass = 16;
 inline constexpr size_t kSmallAllocMaxClass = 4096;
 inline constexpr size_t kSmallAllocClassCount = 9;
 inline constexpr size_t kSmallAllocBinCap = 64;
+inline constexpr size_t kSmallAllocSteadyBinCap = 16;
 
 struct SmallFreeBlock {
     SmallFreeBlock* next = nullptr;
@@ -192,6 +193,21 @@ inline void DeallocateSmallCached(void* p,
     ++bin.count;
 }
 
+inline void TrimSmallAllocCache(bool force) noexcept {
+    auto& cache = TlsSmallAllocCache();
+    const size_t target = force ? 0 : kSmallAllocSteadyBinCap;
+    for (size_t i = 0; i < kSmallAllocClassCount; ++i) {
+        const size_t klass = kSmallAllocMinClass << i;
+        auto& bin = cache.bins[i];
+        while (bin.count > target && bin.head) {
+            auto* block = bin.head;
+            bin.head = block->next;
+            --bin.count;
+            DeallocateRaw(block, klass);
+        }
+    }
+}
+
 }  // namespace detail
 
 inline void* AllocateSmallRaw(size_t size,
@@ -205,7 +221,9 @@ inline void DeallocateSmallRaw(void* p,
     detail::DeallocateSmallCached(p, size, alignment);
 }
 
-inline void CollectCurrentThread(bool /*force*/) noexcept {}
+inline void CollectCurrentThread(bool force) noexcept {
+    detail::TrimSmallAllocCache(force);
+}
 
 inline void CollectSteady() noexcept {
 #if defined(__GLIBC__)

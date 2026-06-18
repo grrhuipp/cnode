@@ -98,6 +98,7 @@ net::awaitable<void> CollectWorkerHeaps(const RuntimeContext& ctx, bool force) {
                     worker->GetExecutor(),
                     [force]() -> net::awaitable<void> {
                         memory::CollectCurrentThread(force);
+                        buf::TrimThreadBufferRecycle(force);
                         co_return;
                     }(),
                     net::use_awaitable);
@@ -292,16 +293,18 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
             buffer_recycle.pop_misses += stats.pop_misses;
             buffer_recycle.push_hits += stats.push_hits;
             buffer_recycle.push_drops += stats.push_drops;
+            buffer_recycle.trim_frees += stats.trim_frees;
         }
         LOG_DEBUG(
-            "runtime.buffer_recycle depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={}",
+            "runtime.buffer_recycle depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={} trim={}",
             buffer_recycle.cache_depth,
             buffer_recycle.cache_capacity,
             buffer_recycle.cache_high_water,
             buffer_recycle.pop_hits,
             buffer_recycle.pop_misses,
             buffer_recycle.push_hits,
-            buffer_recycle.push_drops);
+            buffer_recycle.push_drops,
+            buffer_recycle.trim_frees);
 #endif
 
         auto node_stats = ctx.controller.GetNodeStats();
