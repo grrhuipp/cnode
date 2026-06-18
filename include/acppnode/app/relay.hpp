@@ -836,8 +836,6 @@ net::awaitable<RelayResult> DoRelayLink(
     StatsShard& stats,
     const RelayConfig& config = RelayConfig{}) {
 
-    (void)io_context;
-    (void)config;
     using namespace net::experimental::awaitable_operators;
 
     LOG_CONN_DEBUG(ctx, "Relay started without client control, speed_limit={}",
@@ -848,12 +846,32 @@ net::awaitable<RelayResult> DoRelayLink(
     std::pair<uint64_t, ErrorCode> down_result{0, ErrorCode::OK};
     ErrorCode first_error = ErrorCode::OK;
     bool first_error_from_client = false;
+    bool downlink_only_timeout_fired = false;
+    auto& timeout_scheduler = TimeoutScheduler::ForIoContext(io_context);
+    TimeoutToken downlink_only_token;
 
     auto remember_error = [&](ErrorCode error, bool from_client) {
         if (error != ErrorCode::OK && first_error == ErrorCode::OK) {
             first_error = error;
             first_error_from_client = from_client;
         }
+    };
+
+    auto arm_downlink_only_timeout = [&]() {
+        if (downlink_only_token.Valid()) {
+            return;
+        }
+        if (config.downlink_only.count() <= 0) {
+            downlink_only_timeout_fired = true;
+            target.Cancel();
+            return;
+        }
+        downlink_only_token = timeout_scheduler.ScheduleAfter(
+            std::chrono::duration_cast<std::chrono::milliseconds>(config.downlink_only),
+            [&target, &downlink_only_timeout_fired]() {
+                downlink_only_timeout_fired = true;
+                target.Cancel();
+            });
     };
 
     auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
@@ -864,6 +882,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 buf::MultiBuffer mb = co_await client_reader.ReadMultiBuffer();
                 if (mb.empty()) {
                     relay_detail::FlushRelayStats(&stats, stats_acc);
+                    arm_downlink_only_timeout();
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
                 const size_t n = buf::TotalLen(mb);
@@ -911,7 +930,10 @@ net::awaitable<RelayResult> DoRelayLink(
                 }
             } catch (const IoSystemError& e) {
                 relay_detail::FlushRelayStats(&stats, stats_acc);
-                const ErrorCode error = MapAsioError(e.code());
+                ErrorCode error = MapAsioError(e.code());
+                if (error == ErrorCode::CANCELLED && downlink_only_timeout_fired) {
+                    error = ErrorCode::RELAY_TIMEOUT;
+                }
                 down_result = std::make_pair(bytes, error);
                 remember_error(error, false);
                 relay_detail::CancelIfSupported(target);
@@ -935,6 +957,7 @@ net::awaitable<RelayResult> DoRelayLink(
             first_error = ErrorCode::INTERNAL;
         }
     }
+    timeout_scheduler.Cancel(downlink_only_token);
 
     RelayResult result;
     result.bytes_up = first_error == ErrorCode::OK ? up_result.first : ctx.traffic.bytes_up;
