@@ -367,7 +367,8 @@ public:
     AnyTLSSubStream(net::io_context& io_context,
                     std::shared_ptr<AnyTLSDemuxSession> session,
                     uint32_t sid)
-        : input_signal_(io_context, 1)
+        : io_context_(io_context)
+        , input_signal_(io_context, 1)
         , input_space_signal_(io_context, 1)
         , session_(std::move(session))
         , sid_(sid) {}
@@ -463,13 +464,20 @@ public:
 
 private:
     void WakeInputReader() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
     void WakeInputWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
+    net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     net::experimental::channel<void(IoErrorCode)> input_space_signal_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
@@ -642,6 +650,9 @@ private:
     }
 
     void WakeWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)write_signal_.try_send(IoErrorCode{});
     }
 

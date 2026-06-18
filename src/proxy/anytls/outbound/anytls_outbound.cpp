@@ -129,7 +129,8 @@ struct Handler::ClientSession {
     class LogicalStream final {
     public:
         LogicalStream(net::io_context& io_context, uint32_t stream_id)
-            : timeout_scheduler_(TimeoutScheduler::ForIoContext(io_context))
+            : io_context_(io_context)
+            , timeout_scheduler_(TimeoutScheduler::ForIoContext(io_context))
             , syn_signal_(io_context, 1)
             , payload_signal_(io_context, 1)
             , sid_(stream_id) {}
@@ -198,7 +199,7 @@ struct Handler::ClientSession {
                 [this]() {
                     syn_timeout_token_.Reset();
                     syn_timed_out_ = true;
-                    if (syn_waiting_) {
+                    if (syn_waiting_ && !io_context_.stopped()) {
                         (void)syn_signal_.try_send(IoErrorCode{});
                     }
                 });
@@ -268,15 +269,19 @@ struct Handler::ClientSession {
 
         void WakeSynWaiter() noexcept {
             timeout_scheduler_.Cancel(syn_timeout_token_);
-            if (syn_waiting_) {
+            if (syn_waiting_ && !io_context_.stopped()) {
                 (void)syn_signal_.try_send(IoErrorCode{});
             }
         }
 
         void WakePayloadReader() noexcept {
+            if (io_context_.stopped()) {
+                return;
+            }
             (void)payload_signal_.try_send(IoErrorCode{});
         }
 
+        net::io_context& io_context_;
         TimeoutScheduler& timeout_scheduler_;
         TimeoutToken syn_timeout_token_;
         net::experimental::channel<void(IoErrorCode)> syn_signal_;
@@ -293,9 +298,11 @@ struct Handler::ClientSession {
     };
 
     ClientSession(net::io_context& io_context, std::unique_ptr<AsyncStream> s)
-        : stream(std::move(s))
+        : io_context_(io_context)
+        , stream(std::move(s))
         , write_signal(io_context, 1) {}
 
+    net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
     PaddingScheme padding_scheme = DefaultPaddingScheme();
     uint32_t next_sid = 1;
@@ -369,6 +376,9 @@ struct Handler::ClientSession {
     }
 
     void WakeWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)write_signal.try_send(IoErrorCode{});
     }
 

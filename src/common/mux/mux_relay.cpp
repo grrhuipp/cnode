@@ -115,9 +115,11 @@ struct MuxReply {
 
 struct ReplyQueueState {
     explicit ReplyQueueState(net::io_context& io_context)
-        : reply_signal(io_context, 1)
+        : io_context_(io_context)
+        , reply_signal(io_context, 1)
         , sub_done_signal(io_context, 1) {}
 
+    net::io_context& io_context_;
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
@@ -189,6 +191,9 @@ struct ReplyQueueState {
     }
 
     void WakeReplyWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)reply_signal.try_send(IoErrorCode{});
     }
 
@@ -199,6 +204,9 @@ struct ReplyQueueState {
     void MarkSubLoopDone() noexcept {
         if (active_sub_loops > 0) {
             --active_sub_loops;
+        }
+        if (io_context_.stopped()) {
+            return;
         }
         (void)sub_done_signal.try_send(IoErrorCode{});
         WakeReplyWriter();
@@ -350,6 +358,9 @@ public:
 
 private:
     void WakeInputReader() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -556,6 +567,9 @@ public:
 
 private:
     void WakeInputReader() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 

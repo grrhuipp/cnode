@@ -325,7 +325,9 @@ public:
         IoErrorCode ignored;
         read_timer_.cancel(ignored);
         phase_timer_.cancel(ignored);
-        (void)signal_.try_send(io_error::operation_aborted);
+        if (!io_context_.stopped()) {
+            (void)signal_.try_send(io_error::operation_aborted);
+        }
     }
 
     void SetAbortiveClose(bool = true) noexcept {
@@ -412,6 +414,9 @@ private:
         }
         queued_bytes_ += payload_size;
         replies_.push_back(std::move(decoded->payload));
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)signal_.try_send(IoErrorCode{});
     }
 

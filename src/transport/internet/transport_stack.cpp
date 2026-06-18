@@ -992,7 +992,8 @@ private:
 class XHttpPacketUpSession final {
 public:
     explicit XHttpPacketUpSession(net::io_context& io_context)
-        : input_signal_(io_context) {}
+        : io_context_(io_context)
+        , input_signal_(io_context) {}
 
     void AttachStream(std::unique_ptr<AsyncStream> stream) {
         if (closed_ || input_closed_ || !stream) {
@@ -1092,9 +1093,13 @@ public:
 
 private:
     void Wake() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
+    net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     std::deque<std::vector<uint8_t>> ready_;
     std::map<uint64_t, std::vector<uint8_t>> pending_;
@@ -2878,6 +2883,9 @@ public:
 
 private:
     void WakeInputReader() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -3316,6 +3324,9 @@ public:
 
 private:
     void WakeWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
         (void)write_signal_.try_send(IoErrorCode{});
     }
 
