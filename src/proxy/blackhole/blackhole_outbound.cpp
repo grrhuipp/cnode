@@ -1,10 +1,27 @@
 #include "acppnode/proxy/blackhole/blackhole_outbound.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/source_config.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <cstring>
+
 namespace acpp::proxy::blackhole::outbound {
+
+namespace {
+constexpr std::string_view kHttp403Response =
+    "HTTP/1.1 403 Forbidden\r\n"
+    "Connection: close\r\n"
+    "Cache-Control: max-age=3600, public\r\n"
+    "Content-Length: 0\r\n"
+    "\r\n";
+
+[[nodiscard]] bool IsHttpResponse(std::string_view response) noexcept {
+    return response == constants::protocol::kHttp || response == "HTTP";
+}
+
+}  // namespace
 
 // ============================================================================
 // Handler 实现
@@ -21,14 +38,29 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const tcp::endpoint* /*inbound_local_addr*/,
     session::Context& ctx,
     const TimeoutsConfig& /*timeouts*/,
-    transport::Link /*inbound*/,
+    transport::Link inbound,
     StatsShard& /*stats*/,
     const RelayConfig& /*relay_config*/,
     std::span<const uint8_t> /*initial_payload*/,
-    buf::MultiBuffer& /*first_payload*/,
+    buf::MultiBuffer& first_payload,
     std::chrono::seconds /*relay_idle_timeout*/,
     std::chrono::seconds /*relay_write_timeout*/) {
-    LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay", tag_);
+    first_payload.clear();
+    if (IsHttpResponse(settings_.response) && inbound.writer) {
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (out && kHttp403Response.size() <= out->Available()) {
+            std::memcpy(out->Tail().data(), kHttp403Response.data(), kHttp403Response.size());
+            out->Produce(static_cast<uint32_t>(kHttp403Response.size()));
+            buf::MultiBuffer mb{out.release()};
+            try {
+                co_await inbound.writer->WriteMultiBuffer(std::move(mb));
+                co_await inbound.writer->AsyncShutdownWrite();
+            } catch (...) {
+                LOG_CONN_DEBUG(ctx, "[Blackhole][{}] failed to write http response", tag_);
+            }
+        }
+    }
+    LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}", tag_, settings_.response);
     co_return std::unexpected(ErrorCode::BLOCKED);
 }
 

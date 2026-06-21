@@ -17,14 +17,25 @@ namespace acpp::ss {
 
 namespace {
 
-constexpr size_t kStreamFlushBufferCount = 2;
-constexpr size_t kStreamFlushBytes = buf::Buffer::kSize * kStreamFlushBufferCount;
+constexpr size_t kStreamOutputReserveSlack = 10;
 constexpr size_t kStreamChunkPayloadSize =
-    buf::Buffer::kSize - 2 - SsAeadCipher::kTagSize;
+    buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
+constexpr size_t kStreamReadBatchChunks = 16;
 constexpr size_t kSs2022SmallVariableBufferSize = 512;
 
 [[noreturn]] void ThrowSsWriteError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
+}
+
+void AppendOwnedBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
+    for (buf::Buffer*& buffer : src) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        dst.push_back(buffer);
+        buffer = nullptr;
+    }
+    src.clear();
 }
 
 net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
@@ -246,80 +257,18 @@ public:
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "Shadowsocks request reader has no stream");
         }
-        auto& state = *this;
-        AsyncStream& stream = *stream_;
-
-        uint8_t enc_len_buf[2 + SsAeadCipher::kTagSize];
-        if (!co_await ReadFull(stream, enc_len_buf, sizeof(enc_len_buf))) {
-            co_return buf::MultiBuffer{};
-        }
-
-        uint8_t len_plain[2];
-        auto nonce = MakeNonce(state.read_nonce_);
-        if (!state.read_cipher_.Decrypt(nonce.data(), enc_len_buf, sizeof(enc_len_buf), len_plain)) {
-            co_return buf::MultiBuffer{};
-        }
-        ++state.read_nonce_;
-
-        const uint16_t payload_len =
-            static_cast<uint16_t>((len_plain[0] << 8) | len_plain[1]);
-        if (payload_len == 0 || payload_len > max_chunk_payload_) {
-            co_return buf::MultiBuffer{};
-        }
-
-        SsAeadStreamDecryptor decryptor(state.read_cipher_);
-        auto nonce2 = MakeNonce(state.read_nonce_);
-        if (!decryptor.Init(nonce2.data())) {
-            co_return buf::MultiBuffer{};
-        }
-
         buf::MultiBuffer out_mb;
-        out_mb.reserve((payload_len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-
-        buf::BufferGuard cipher{buf::Buffer::New()};
-        if (!cipher) {
-            co_return buf::MultiBuffer{};
-        }
-
-        size_t remaining = payload_len;
-        while (remaining > 0) {
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                co_return buf::MultiBuffer{};
+        out_mb.reserve(kStreamReadBatchChunks);
+        for (;;) {
+            if (DecodePending(out_mb)) {
+                co_return out_mb;
             }
-
-            const size_t to_process = std::min(remaining, static_cast<size_t>(out->Available()));
-            cipher->Reset();
-            if (!co_await ReadFull(stream, cipher->Tail().data(), to_process)) {
-                co_return buf::MultiBuffer{};
+            buf::MultiBuffer raw = co_await stream_->ReadMultiBuffer();
+            if (raw.empty()) {
+                co_return out_mb;
             }
-            cipher->Produce(static_cast<uint32_t>(to_process));
-
-            int produced = 0;
-            if (!decryptor.Update(cipher->Bytes().data(), to_process,
-                                  out->Tail().data(), &produced)) {
-                co_return buf::MultiBuffer{};
-            }
-            if (produced < 0 || static_cast<size_t>(produced) != to_process) {
-                co_return buf::MultiBuffer{};
-            }
-            out->Produce(static_cast<uint32_t>(produced));
-            out_mb.push_back(out.release());
-            remaining -= to_process;
+            AppendRaw(raw);
         }
-
-        std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};
-        if (!co_await ReadFull(stream, payload_tag.data(), payload_tag.size())) {
-            co_return buf::MultiBuffer{};
-        }
-        if (!decryptor.Final(payload_tag.data())) {
-            co_return buf::MultiBuffer{};
-        }
-        ++read_nonce_;
-
-        buf::MultiBuffer result = std::move(out_mb);
-        out_mb.clear();
-        co_return result;
     }
 
 private:
@@ -327,6 +276,128 @@ private:
     uint64_t read_nonce_ = 0;
     AsyncStream* stream_ = nullptr;
     size_t max_chunk_payload_ = kMaxChunkPayload;
+    std::vector<uint8_t> pending_;
+    size_t pending_offset_ = 0;
+
+    void AppendRaw(const buf::MultiBuffer& raw) {
+        CompactPending();
+        pending_.reserve(pending_.size() + buf::TotalLen(raw));
+        for (const auto* b : raw) {
+            if (!b || b->Len() == 0) {
+                continue;
+            }
+            const auto bytes = b->Bytes();
+            pending_.insert(pending_.end(), bytes.begin(), bytes.end());
+        }
+    }
+
+    bool DecodePending(buf::MultiBuffer& out_mb) {
+        size_t decoded = 0;
+        while (decoded < kStreamReadBatchChunks) {
+            const size_t available = pending_.size() - pending_offset_;
+            constexpr size_t kLenCipherSize = 2 + SsAeadCipher::kTagSize;
+            if (available < kLenCipherSize) {
+                break;
+            }
+
+            uint8_t len_plain[2]{};
+            auto nonce = MakeNonce(read_nonce_);
+            if (!read_cipher_.Decrypt(
+                    nonce.data(),
+                    pending_.data() + pending_offset_,
+                    kLenCipherSize,
+                    len_plain)) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+
+            const uint16_t payload_len =
+                static_cast<uint16_t>((len_plain[0] << 8) | len_plain[1]);
+            if (payload_len > max_chunk_payload_) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+
+            const size_t frame_size =
+                kLenCipherSize + payload_len + SsAeadCipher::kTagSize;
+            if (available < frame_size) {
+                break;
+            }
+
+            SsAeadStreamDecryptor decryptor(read_cipher_);
+            auto payload_nonce = MakeNonce(read_nonce_ + 1);
+            if (!decryptor.Init(payload_nonce.data())) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+
+            buf::BufferGuard out{buf::Buffer::New()};
+            if (!out) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+            int produced = 0;
+            if (payload_len > 0 &&
+                !decryptor.Update(
+                    pending_.data() + pending_offset_ + kLenCipherSize,
+                    payload_len,
+                    out->Tail().data(),
+                    &produced)) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+            if (produced < 0 || static_cast<size_t>(produced) != payload_len) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+            const uint8_t* tag =
+                pending_.data() + pending_offset_ + kLenCipherSize + payload_len;
+            if (!decryptor.Final(tag)) {
+                pending_.clear();
+                pending_offset_ = 0;
+                return true;
+            }
+
+            read_nonce_ += 2;
+            pending_offset_ += frame_size;
+            ++decoded;
+            if (payload_len == 0) {
+                CompactPending();
+                return true;
+            }
+            out->Produce(static_cast<uint32_t>(produced));
+            out_mb.push_back(out.release());
+        }
+        CompactPending();
+        return !out_mb.empty();
+    }
+
+    void CompactPending() {
+        if (pending_offset_ == 0) {
+            return;
+        }
+        if (pending_offset_ >= pending_.size()) {
+            pending_.clear();
+            pending_offset_ = 0;
+            if (pending_.capacity() > buf::Buffer::kSize * 8) {
+                std::vector<uint8_t>{}.swap(pending_);
+            }
+            return;
+        }
+        const size_t remaining = pending_.size() - pending_offset_;
+        if (pending_offset_ >= buf::Buffer::kSize && pending_offset_ >= remaining) {
+            pending_.erase(
+                pending_.begin(),
+                pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
+            pending_offset_ = 0;
+        }
+    }
 };
 
 class ResponseBodyWriter final : public transport::MultiBufferWriter {
@@ -382,17 +453,7 @@ public:
         }
 
         buf::MultiBuffer out_mb;
-        out_mb.reserve(kStreamFlushBufferCount);
-        size_t out_bytes = 0;
-
-        auto flush_out = [&stream, &out_mb, &out_bytes]() -> net::awaitable<void> {
-            if (out_mb.empty()) {
-                co_return;
-            }
-            co_await stream.WriteMultiBuffer(std::move(out_mb));
-            out_mb.clear();
-            out_bytes = 0;
-        };
+        out_mb.reserve(mb.size() + kStreamOutputReserveSlack);
 
         for (auto* buf : mb) {
             auto bytes = buf->Bytes();
@@ -442,19 +503,23 @@ public:
                     chunk_size +
                     SsAeadCipher::kTagSize;
                 out->Produce(static_cast<uint32_t>(output_size));
-                out_bytes += output_size;
                 out_mb.push_back(out.release());
 
                 data += chunk_size;
                 remaining -= chunk_size;
-
-                if (out_mb.size() >= kStreamFlushBufferCount || out_bytes >= kStreamFlushBytes) {
-                    co_await flush_out();
-                }
             }
         }
 
-        co_await flush_out();
+        if (!out_mb.empty()) {
+            if (!state.pending_prefix_.empty()) {
+                buf::MultiBuffer merged;
+                merged.reserve(state.pending_prefix_.size() + out_mb.size());
+                AppendOwnedBuffers(merged, state.pending_prefix_);
+                AppendOwnedBuffers(merged, out_mb);
+                out_mb = std::move(merged);
+            }
+            co_await stream.WriteMultiBuffer(std::move(out_mb));
+        }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -504,7 +569,9 @@ private:
         state.write_cipher_.emplace(state.cipher_type_, write_subkey.data(), state.key_size_);
         state.write_nonce_ = 0;
 
-        if (!co_await WriteFull(stream, server_salt.data(), state.salt_size_)) {
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(server_salt.data(), state.salt_size_),
+                state.pending_prefix_)) {
             co_return false;
         }
 
@@ -558,8 +625,12 @@ private:
         }
         state.write_nonce_ = 1;
 
-        if (!co_await WriteFull(stream, server_salt.data(), state.salt_size_) ||
-            !co_await WriteFull(stream, fixed_cipher.data(), fixed_cipher_size)) {
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(server_salt.data(), state.salt_size_),
+                state.pending_prefix_) ||
+            !buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),
+                state.pending_prefix_)) {
             co_return false;
         }
 
@@ -577,7 +648,9 @@ private:
                 co_return false;
             }
             state.write_nonce_ = 2;
-            if (!co_await WriteFull(stream, payload_cipher.data(), payload_cipher.size())) {
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(payload_cipher.data(), payload_cipher.size()),
+                    state.pending_prefix_)) {
                 co_return false;
             }
         }
@@ -591,6 +664,7 @@ private:
     std::array<uint8_t, 32> master_key_{};
     KeyBytes request_salt_;
     std::optional<SsAeadCipher> write_cipher_;
+    buf::MultiBuffer pending_prefix_;
     uint64_t write_nonce_ = 0;
     bool write_init_ = false;
     bool is_2022_ = false;

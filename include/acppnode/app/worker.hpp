@@ -68,6 +68,16 @@ public:
     // 添加监听：SO_REUSEPORT bind，为该 tag 启动一个独立 accept 协程
     void AddListenerAsync(const PortBinding& binding);
 
+#ifdef _WIN32
+    // Windows lacks Linux SO_REUSEPORT-style listener balancing. The accept
+    // owner transfers the native socket handle to the selected Worker, which
+    // adopts it on its own io_context before entering the normal hot path.
+    void AdoptAcceptedNativeTcpAsync(tcp::socket::native_handle_type native,
+                                     tcp::endpoint remote_ep,
+                                     tcp protocol,
+                                     std::string tag);
+#endif
+
     // 进程关闭冷路径：在 Worker 线程关闭一组监听，并在下一轮事件循环回调。
     void ShutdownListenersAsync(std::vector<std::string> tags, std::function<void()> on_done);
 

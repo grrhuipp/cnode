@@ -39,7 +39,6 @@ namespace acpp {
 namespace {
 
 using ::acpp::vless::VlessBufferedReader;
-using ::acpp::vless::WriteVlessBytes;
 
 constexpr size_t kUdpFrameQueueShrinkItems = 64;
 
@@ -414,6 +413,88 @@ private:
     bool packet_addr_ = false;
 };
 
+class VlessResponseHeaderWriter final : public transport::MultiBufferWriter {
+public:
+    VlessResponseHeaderWriter(transport::MultiBufferWriter& dst,
+                              std::span<const uint8_t> header)
+        : dst_(&dst) {
+        SetHeader(header);
+    }
+
+    VlessResponseHeaderWriter(AsyncStream& dst,
+                              std::span<const uint8_t> header)
+        : dst_(&dst)
+        , stream_(&dst) {
+        SetHeader(header);
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (header_len_ > 0) {
+            buf::MultiBuffer out;
+            out.reserve(mb.size() + 1);
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(header_.data(), header_len_),
+                    out)) {
+                throw IoSystemError(io_error::fault,
+                                    "VLESS response header allocation failed");
+            }
+            header_len_ = 0;
+            for (buf::Buffer*& buffer : mb) {
+                if (!buffer || buffer->IsEmpty()) {
+                    continue;
+                }
+                out.push_back(buffer);
+                buffer = nullptr;
+            }
+            mb.clear();
+            if (stream_) {
+                co_await stream_->WriteMultiBuffer(std::move(out));
+            } else {
+                co_await dst_->WriteMultiBuffer(std::move(out));
+            }
+            co_return;
+        }
+        if (stream_) {
+            co_await stream_->WriteMultiBuffer(std::move(mb));
+        } else {
+            co_await dst_->WriteMultiBuffer(std::move(mb));
+        }
+    }
+
+    net::awaitable<void> AsyncShutdownWrite() override {
+        if (header_len_ > 0) {
+            buf::MultiBuffer out;
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(header_.data(), header_len_),
+                    out)) {
+                throw IoSystemError(io_error::fault,
+                                    "VLESS response header allocation failed");
+            }
+            header_len_ = 0;
+            if (stream_) {
+                co_await stream_->WriteMultiBuffer(std::move(out));
+            } else {
+                co_await dst_->WriteMultiBuffer(std::move(out));
+            }
+        }
+        co_await dst_->AsyncShutdownWrite();
+    }
+
+private:
+    void SetHeader(std::span<const uint8_t> header) {
+        if (header.size() > header_.size()) {
+            throw std::bad_alloc();
+        }
+        std::copy(header.begin(), header.end(), header_.begin());
+        header_len_ = header.size();
+    }
+
+    transport::MultiBufferWriter* dst_ = nullptr;
+    AsyncStream* stream_ = nullptr;
+    std::array<uint8_t, 16> header_{};
+    size_t header_len_ = 0;
+};
+
 }  // namespace
 
 proxy::vless::inbound::Handler::Handler(
@@ -656,13 +737,17 @@ proxy::vless::inbound::Handler::Process(
     if (response_len == 0) {
         co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
     }
-    try {
-        co_await WriteVlessBytes(
+    std::optional<VlessResponseHeaderWriter> response_writer;
+    if (active_writer == protocol_writer) {
+        response_writer.emplace(
+            *stream,
+            std::span<const uint8_t>(response_header, response_len));
+    } else {
+        response_writer.emplace(
             *active_writer,
             std::span<const uint8_t>(response_header, response_len));
-    } catch (...) {
-        co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
     }
+    active_writer = &*response_writer;
 
     std::span<const uint8_t> leftover;
     if (consumed < total_read) {

@@ -51,6 +51,15 @@ public:
     bool IsOpen() const override;
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
+    tcp::socket::executor_type GetExecutor() noexcept;
+    tcp::socket& TlsLayerSocket() noexcept;
+    [[nodiscard]] bool TlsLayerCanRead() const noexcept;
+    [[nodiscard]] bool TlsLayerCanWrite() const noexcept;
+    [[nodiscard]] size_t ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcept;
+    void BeginTlsLayerRead();
+    void EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept;
+    void BeginTlsLayerWrite();
+    void EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept;
     tcp::endpoint LocalEndpoint() const;
     tcp::endpoint RemoteEndpoint() const;
     void SetIdleTimeout(std::chrono::seconds timeout);

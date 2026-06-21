@@ -882,7 +882,8 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
 }
 
 bool TlsStream::SetRealityClient(const RealityConfig& reality) {
-    if (is_server_ || !ssl_) {
+    SSL* ssl = NativeSsl();
+    if (is_server_ || !ssl) {
         return false;
     }
 
@@ -892,24 +893,24 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
     }
 
     if (SSL_set1_reality_peer_public_key(
-            ssl_,
+            ssl,
             state->server_public.data(),
             state->server_public.size()) != 1) {
         LOG_ERROR("REALITY client peer public key install failed");
         return false;
     }
 
-    if (SSL_set1_groups_list(ssl_, "X25519") != 1) {
+    if (SSL_set1_groups_list(ssl, "X25519") != 1) {
         LOG_ERROR("REALITY client failed to force X25519 key share");
         return false;
     }
-    if (SSL_set1_sigalgs_list(ssl_, "ed25519") != 1) {
+    if (SSL_set1_sigalgs_list(ssl, "ed25519") != 1) {
         LOG_ERROR("REALITY client failed to advertise Ed25519");
         return false;
     }
 
     SSL_set_reality_client_hello_cb(
-        ssl_,
+        ssl,
         RealityClientHelloCallback,
         state.get());
     app_state_ = std::static_pointer_cast<void>(state);

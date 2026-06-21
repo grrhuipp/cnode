@@ -26,9 +26,9 @@
 namespace acpp {
 
 namespace {
-constexpr uint32_t kMaxReadAllocBuffers = 2;
+constexpr uint32_t kMaxReadAllocBuffers = 8;
 constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
-constexpr uint8_t kReadGrowStreakRequired = 2;
+constexpr uint8_t kReadGrowStreakRequired = 1;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
 constexpr size_t kProxyProbeBytes = 256;
 using std::chrono::steady_clock;
@@ -296,7 +296,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 //
 // 自适应散读（仿 Xray ReadVReader allocStrategy）：
 //   - 低流量 / 启动：单 Buffer 快速路径，零额外堆分配
-//   - 连续大包后升到 2 个 Buffer，限制高并发时挂起读常驻 payload
+//   - 连续大包后按 1/2/4/8 个 Buffer 自适应增长，对齐 xray-core ReadVReader 上限
 //   - 未读满则收缩到实际使用数，避免浪费
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
@@ -309,33 +309,11 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return pending;
     }
 
-    // ── 快速路径：单 Buffer（低流量 / 启动阶段，零额外分配）─────────────
-    // 先等 fd 可读再申请 relay Buffer：大量空闲连接挂读时不常驻 8KB payload，
-    // Buffer 只覆盖真正的 read_some 生命周期。
+    // ── 快速路径：单 Buffer（低流量 / 启动阶段）───────────────────────
+    // 对齐 xray-core：直接挂起 read 到 8KB Buffer，避免 wait+read 的双
+    // IOCP 往返。Buffer 只在一次挂起读生命周期内持有，不进入长期池。
     if (impl_->read_alloc_count == 1) {
         ArmReadDeadline();
-        auto [wait_ec] = co_await impl_->socket.async_wait(
-            tcp::socket::wait_read,
-            net::as_tuple(net::use_awaitable));
-
-        if (wait_ec) {
-            CancelReadDeadline();
-            if (wait_ec == io_error::operation_aborted) {
-                co_return buf::MultiBuffer{};
-            }
-            if (wait_ec == io_error::connection_reset ||
-                wait_ec == io_error::broken_pipe) {
-                LOG_ACCESS_DEBUG("ReadMultiBuffer(wait): {} (fd={})", wait_ec.message(), NativeHandle());
-                co_return buf::MultiBuffer{};
-            }
-            throw IoSystemError(wait_ec);
-        }
-
-        if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
-            CancelReadDeadline();
-            co_return buf::MultiBuffer{};
-        }
-
         buf::BufferGuard buf{buf::Buffer::New()};
         if (!buf) {
             CancelReadDeadline();
@@ -782,6 +760,48 @@ void TcpStream::SetAbortiveClose(bool enable) noexcept {
     impl_->SetFlag(kAbortiveClose, enable);
 }
 
+tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
+    return impl_->socket.get_executor();
+}
+
+tcp::socket& TcpStream::TlsLayerSocket() noexcept {
+    return impl_->socket;
+}
+
+bool TcpStream::TlsLayerCanRead() const noexcept {
+    return impl_->socket.is_open() && !impl_->HasFlag(kReadShutdown);
+}
+
+bool TcpStream::TlsLayerCanWrite() const noexcept {
+    return impl_->socket.is_open() && !impl_->HasFlag(kWriteShutdown);
+}
+
+size_t TcpStream::ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcept {
+    return ConsumePendingData(target);
+}
+
+void TcpStream::BeginTlsLayerRead() {
+    ArmReadDeadline();
+}
+
+void TcpStream::EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept {
+    CancelReadDeadline();
+    if (!ec && n > 0) {
+        TouchActivity();
+    }
+}
+
+void TcpStream::BeginTlsLayerWrite() {
+    ArmWriteDeadline();
+}
+
+void TcpStream::EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept {
+    DisarmWriteDeadline();
+    if (!ec && n > 0) {
+        TouchActivity();
+    }
+}
+
 tcp::endpoint TcpStream::LocalEndpoint() const {
     if (!impl_->socket.is_open()) {
         return tcp::endpoint();
@@ -1211,11 +1231,9 @@ void SetupConnectedSocket(tcp::socket& sock) {
     IoErrorCode ec;
     auto fd = sock.native_handle();
 
-    // TCP_NODELAY - 禁用 Nagle 算法，降低延迟
-    sock.set_option(tcp::no_delay(true), ec);
-
     // 启用 TCP KeepAlive
     sock.set_option(net::socket_base::keep_alive(true), ec);
+    sock.set_option(tcp::no_delay(true), ec);
 
 #ifdef _WIN32
     // Windows: 使用 tcp_keepalive 结构设置 KeepAlive 参数

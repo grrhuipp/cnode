@@ -9,21 +9,20 @@
 #include <openssl/x509v3.h>
 #include <openssl/evp.h>
 #include <openssl/ec.h>
+#include <openssl/err.h>
 #include <openssl/tls1.h>
+#include <asio/ssl.hpp>
+#include <asio/write.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <list>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <sys/socket.h>
-#endif
 
 namespace acpp {
 
@@ -366,102 +365,217 @@ SslContext::~SslContext() {
 // TlsStream 实现
 // ============================================================================
 
-TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_server)
-    : inner_(std::move(*inner))
-    , is_server_(is_server) {
+namespace {
 
-    ssl_ = SSL_new(ctx);
-    if (!ssl_) {
+class TlsTcpLayer {
+public:
+    using executor_type = tcp::socket::executor_type;
+    using lowest_layer_type = TlsTcpLayer;
+
+    explicit TlsTcpLayer(std::unique_ptr<TcpStream> stream)
+        : stream_(std::move(stream)) {
+        if (!stream_) {
+            throw std::invalid_argument("TlsTcpLayer requires TcpStream");
+        }
+    }
+
+    TlsTcpLayer(TlsTcpLayer&&) noexcept = default;
+    TlsTcpLayer& operator=(TlsTcpLayer&&) noexcept = default;
+
+    executor_type get_executor() noexcept {
+        return stream_->GetExecutor();
+    }
+
+    lowest_layer_type& lowest_layer() noexcept {
+        return *this;
+    }
+
+    const lowest_layer_type& lowest_layer() const noexcept {
+        return *this;
+    }
+
+    TcpStream& Tcp() noexcept {
+        return *stream_;
+    }
+
+    const TcpStream& Tcp() const noexcept {
+        return *stream_;
+    }
+
+    template <typename MutableBufferSequence, typename CompletionToken>
+    auto async_read_some(const MutableBufferSequence& buffers,
+                         CompletionToken&& token) {
+        return net::async_initiate<CompletionToken, void(IoErrorCode, std::size_t)>(
+            [this](auto&& handler, MutableBufferSequence buffers) mutable {
+                auto ex = get_executor();
+                if (!stream_->TlsLayerCanRead()) {
+                    net::post(ex,
+                        [handler = std::forward<decltype(handler)>(handler)]() mutable {
+                            std::move(handler)(io_error::eof, 0);
+                        });
+                    return;
+                }
+
+                auto it = net::buffer_sequence_begin(buffers);
+                auto end = net::buffer_sequence_end(buffers);
+                for (; it != end; ++it) {
+                    net::mutable_buffer buffer = *it;
+                    if (buffer.size() == 0) {
+                        continue;
+                    }
+                    const std::size_t pending =
+                        stream_->ConsumeTlsLayerPendingData(buffer);
+                    if (pending > 0) {
+                        net::post(ex,
+                            [handler = std::forward<decltype(handler)>(handler),
+                             pending]() mutable {
+                                std::move(handler)(IoErrorCode{}, pending);
+                            });
+                        return;
+                    }
+                    break;
+                }
+
+                stream_->BeginTlsLayerRead();
+                stream_->TlsLayerSocket().async_read_some(
+                    buffers,
+                    [this,
+                     handler = std::forward<decltype(handler)>(handler)](
+                        IoErrorCode ec, std::size_t n) mutable {
+                        stream_->EndTlsLayerRead(ec, n);
+                        std::move(handler)(ec, n);
+                    });
+            },
+            token,
+            buffers);
+    }
+
+    template <typename ConstBufferSequence, typename CompletionToken>
+    auto async_write_some(const ConstBufferSequence& buffers,
+                          CompletionToken&& token) {
+        return net::async_initiate<CompletionToken, void(IoErrorCode, std::size_t)>(
+            [this](auto&& handler, ConstBufferSequence buffers) mutable {
+                auto ex = get_executor();
+                if (!stream_->TlsLayerCanWrite()) {
+                    net::post(ex,
+                        [handler = std::forward<decltype(handler)>(handler)](
+                            ) mutable {
+                            std::move(handler)(io_error::broken_pipe, 0);
+                        });
+                    return;
+                }
+
+                stream_->BeginTlsLayerWrite();
+                stream_->TlsLayerSocket().async_write_some(
+                    buffers,
+                    [this,
+                     handler = std::forward<decltype(handler)>(handler)](
+                        IoErrorCode ec, std::size_t n) mutable {
+                        stream_->EndTlsLayerWrite(ec, n);
+                        std::move(handler)(ec, n);
+                    });
+            },
+            token,
+            buffers);
+    }
+
+private:
+    std::unique_ptr<TcpStream> stream_;
+};
+
+SSL* NewSsl(SSL_CTX* ctx) {
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
         throw std::runtime_error("Failed to create SSL object");
     }
-    SSL_set_mode(ssl_, SSL_MODE_RELEASE_BUFFERS);
-
-    // 创建内存 BIO 对
-    read_bio_ = BIO_new(BIO_s_mem());
-    write_bio_ = BIO_new(BIO_s_mem());
-
-    if (!read_bio_ || !write_bio_) {
-        if (read_bio_) BIO_free(read_bio_);
-        if (write_bio_) BIO_free(write_bio_);
-        SSL_free(ssl_);
-        throw std::runtime_error("Failed to create BIO objects");
-    }
-
-    // 设置非阻塞模式
-    BIO_set_nbio(read_bio_, 1);
-    BIO_set_nbio(write_bio_, 1);
-
-    SSL_set_bio(ssl_, read_bio_, write_bio_);
-    memory::OnTlsStreamNew();
-
-    if (is_server_) {
-        SSL_set_accept_state(ssl_);
-    } else {
-        SSL_set_connect_state(ssl_);
-    }
+    SSL_set_mode(ssl, SSL_MODE_RELEASE_BUFFERS);
+    return ssl;
 }
 
-TlsStream::~TlsStream() {
-    if (ssl_) {
+}  // namespace
+
+struct TlsStream::Impl {
+    using SslStream = net::ssl::stream<TlsTcpLayer>;
+
+    Impl(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx)
+        : stream(TlsTcpLayer(std::move(inner)), NewSsl(ctx)) {
+        memory::OnTlsStreamNew();
+    }
+
+    ~Impl() {
         memory::OnTlsStreamFree();
-        SSL_free(ssl_);  // 这会自动释放关联的 BIO
     }
-}
+
+    SslStream stream;
+};
+
+TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_server)
+    : impl_(std::make_unique<Impl>(std::move(inner), ctx))
+    , is_server_(is_server) {}
+
+TlsStream::~TlsStream() = default;
 
 TlsStream::TlsStream(TlsStream&& other) noexcept
-    : inner_(std::move(other.inner_))
-    , ssl_(other.ssl_)
-    , read_bio_(other.read_bio_)
-    , write_bio_(other.write_bio_)
+    : impl_(std::move(other.impl_))
     , is_server_(other.is_server_)
     , handshake_done_(other.handshake_done_)
     , shutdown_initiated_(other.shutdown_initiated_)
     , app_state_(std::move(other.app_state_)) {
-    other.ssl_ = nullptr;
-    other.read_bio_ = nullptr;
-    other.write_bio_ = nullptr;
-    other.shutdown_initiated_ = true;  // 防止被移动的对象再调用 shutdown
+    other.shutdown_initiated_ = true;
 }
 
 TlsStream& TlsStream::operator=(TlsStream&& other) noexcept {
     if (this != &other) {
-        if (ssl_) {
-            memory::OnTlsStreamFree();
-            SSL_free(ssl_);
-        }
-        inner_ = std::move(other.inner_);
-        ssl_ = other.ssl_;
-        read_bio_ = other.read_bio_;
-        write_bio_ = other.write_bio_;
+        impl_ = std::move(other.impl_);
         is_server_ = other.is_server_;
         handshake_done_ = other.handshake_done_;
         shutdown_initiated_ = other.shutdown_initiated_;
         app_state_ = std::move(other.app_state_);
-        other.ssl_ = nullptr;
-        other.read_bio_ = nullptr;
-        other.write_bio_ = nullptr;
-        other.shutdown_initiated_ = true;  // 防止被移动的对象再调用 shutdown
+        other.shutdown_initiated_ = true;
     }
     return *this;
 }
 
+SSL* TlsStream::NativeSsl() noexcept {
+    return impl_ ? impl_->stream.native_handle() : nullptr;
+}
+
+const SSL* TlsStream::NativeSsl() const noexcept {
+    return impl_ ? impl_->stream.native_handle() : nullptr;
+}
+
+TcpStream* TlsStream::BaseTcpStream() {
+    return impl_ ? &impl_->stream.next_layer().Tcp() : nullptr;
+}
+
+const TcpStream* TlsStream::BaseTcpStream() const {
+    return impl_ ? &impl_->stream.next_layer().Tcp() : nullptr;
+}
+
 void TlsStream::SetServerName(const std::string& name) {
-    if (!is_server_ && ssl_) {
-        SSL_set_tlsext_host_name(ssl_, name.c_str());
+    SSL* ssl = NativeSsl();
+    if (!is_server_ && ssl) {
+        SSL_set_tlsext_host_name(ssl, name.c_str());
+        SSL_set1_host(ssl, name.c_str());
     }
 }
 
 void TlsStream::SetAlpn(const std::vector<std::string>& protocols) {
-    if (protocols.empty() || !ssl_) return;
+    SSL* ssl = NativeSsl();
+    if (protocols.empty() || !ssl) return;
 
-    // 构建 ALPN 格式：长度前缀 + 协议名
     std::vector<unsigned char> alpn;
     for (const auto& proto : protocols) {
+        if (proto.empty() || proto.size() > 255) {
+            continue;
+        }
         alpn.push_back(static_cast<unsigned char>(proto.size()));
         alpn.insert(alpn.end(), proto.begin(), proto.end());
     }
 
-    SSL_set_alpn_protos(ssl_, alpn.data(), static_cast<unsigned int>(alpn.size()));
+    if (!alpn.empty()) {
+        SSL_set_alpn_protos(ssl, alpn.data(), static_cast<unsigned int>(alpn.size()));
+    }
 }
 
 net::awaitable<bool> TlsStream::Handshake() {
@@ -469,561 +583,231 @@ net::awaitable<bool> TlsStream::Handshake() {
         co_return true;
     }
 
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
+    auto [ec] = co_await impl_->stream.async_handshake(
+        is_server_ ? net::ssl::stream_base::server
+                   : net::ssl::stream_base::client,
+        net::as_tuple(net::use_awaitable));
 
-    while (true) {
-        int ret = SSL_do_handshake(ssl_);
-
-        if (ret == 1) {
-            if (app_state_ && !VerifyRealityClientHandshake(ssl_, app_state_)) {
-                co_return false;
-            }
-            handshake_done_ = true;
-            co_return true;
-        }
-
-        int err = SSL_get_error(ssl_, ret);
-
-        if (err == SSL_ERROR_WANT_READ) {
-            // 先发送待发数据
-            if (!co_await FlushWriteBio()) {
-                co_return false;
-            }
-
-            // 从底层读取数据
-            auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-            if (n == 0) {
-                LOG_ACCESS_DEBUG("TLS handshake: connection closed during read");
-                co_return false;
-            }
-
-            // 写入 read_bio
-            BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
-        } else if (err == SSL_ERROR_WANT_WRITE) {
-            if (!co_await FlushWriteBio()) {
-                co_return false;
-            }
+    if (ec) {
+        const unsigned long err_code = ERR_get_error();
+        if (is_server_ && IsBenignServerHandshakeError(err_code)) {
+            LOG_ACCESS_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", ec.message());
         } else {
-            const unsigned long err_code = ERR_get_error();
-            char buf[256];
-            ERR_error_string_n(err_code, buf, sizeof(buf));
-            if (is_server_ && IsBenignServerHandshakeError(err_code)) {
-                LOG_ACCESS_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", buf);
-            } else {
-                LOG_CONN_FAIL("TLS handshake error: {}", buf);
-            }
-            co_return false;
+            LOG_CONN_FAIL("TLS handshake error: {}", ec.message());
         }
-    }
-}
-
-net::awaitable<bool> TlsStream::FlushWriteBio() {
-    try {
-        int pending = static_cast<int>(BIO_pending(write_bio_));
-        if (pending <= 0) {
-            co_return true;
-        }
-
-        if (static_cast<size_t>(pending) <= kTlsIoBufferSize) {
-            alignas(64) std::array<uint8_t, kTlsIoBufferSize> buf{};
-            while (pending > 0) {
-                const int to_read = static_cast<int>(
-                    std::min<size_t>(static_cast<size_t>(pending), buf.size()));
-                int read = BIO_read(write_bio_, buf.data(), to_read);
-                if (read > 0) {
-                    size_t written = co_await inner_.AsyncWrite(net::buffer(buf.data(), read));
-                    if (written != static_cast<size_t>(read)) {
-                        co_return false;
-                    }
-                    pending = static_cast<int>(BIO_pending(write_bio_));
-                    continue;
-                }
-                if (read < 0 && BIO_should_retry(write_bio_)) {
-                    co_return true;
-                }
-                co_return false;
-            }
-            co_return true;
-        }
-
-        buf::MultiBuffer mb;
-        mb.reserve((static_cast<size_t>(pending) + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        while (true) {
-            pending = static_cast<int>(BIO_pending(write_bio_));
-            if (pending <= 0) {
-                break;
-            }
-
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                co_return false;
-            }
-            const int to_read = static_cast<int>(std::min<size_t>(
-                static_cast<size_t>(pending),
-                static_cast<size_t>(out->Available())));
-            int read = BIO_read(write_bio_, out->Tail().data(), to_read);
-            if (read > 0) {
-                out->Produce(static_cast<uint32_t>(read));
-                mb.push_back(out.release());
-                continue;
-            }
-            if (read < 0 && BIO_should_retry(write_bio_)) {
-                break;
-            }
-            co_return false;
-        }
-
-        if (!mb.empty()) {
-            co_await inner_.WriteMultiBuffer(std::move(mb));
-        }
-        co_return true;
-    } catch (...) {
         co_return false;
     }
+
+    if (app_state_ && !VerifyRealityClientHandshake(NativeSsl(), app_state_)) {
+        co_return false;
+    }
+
+    handshake_done_ = true;
+    co_return true;
 }
 
 std::string TlsStream::NegotiatedAlpn() const {
-    if (!ssl_) return "";
+    const SSL* ssl = NativeSsl();
+    if (!ssl) return "";
 
     const unsigned char* data = nullptr;
     unsigned int len = 0;
-    SSL_get0_alpn_selected(ssl_, &data, &len);
+    SSL_get0_alpn_selected(ssl, &data, &len);
 
     if (data && len > 0) {
-        // ISSUE-02-02: 使用 unsafe::ptr_cast 替代 reinterpret_cast
         return std::string(unsafe::ptr_cast<const char>(data), len);
     }
     return "";
 }
 
 std::string TlsStream::ReceivedSni() const {
-    if (!ssl_ || !is_server_) return "";
+    const SSL* ssl = NativeSsl();
+    if (!ssl || !is_server_) return "";
 
-    const char* name = SSL_get_servername(ssl_, TLSEXT_NAMETYPE_host_name);
+    const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     return name ? name : "";
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
-    if (!handshake_done_) {
-        if (!co_await Handshake()) {
-            ThrowTlsReadError("TLS handshake failed during read");
-        }
+    if (!handshake_done_ && !co_await Handshake()) {
+        ThrowTlsReadError("TLS handshake failed during read");
     }
 
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
-
-    while (true) {
-        int ret = SSL_read(ssl_, buf.data(), static_cast<int>(buf.size()));
-
-        if (ret > 0) {
-            co_return static_cast<std::size_t>(ret);
+    auto [ec, n] = co_await impl_->stream.async_read_some(
+        buf, net::as_tuple(net::use_awaitable));
+    if (ec) {
+        if (ec == io_error::eof ||
+            ec == net::ssl::error::stream_truncated ||
+            ec == io_error::operation_aborted) {
+            co_return 0;
         }
-
-        int err = SSL_get_error(ssl_, ret);
-
-        if (err == SSL_ERROR_ZERO_RETURN) {
-            co_return 0;  // Clean shutdown
-        }
-
-        if (err == SSL_ERROR_WANT_READ) {
-            // 先刷新写缓冲
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsReadError("TLS flush write BIO failed");
-            }
-
-            // 从底层读取
-            auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-            if (n == 0) {
-                ThrowTlsReadError("TLS peer closed without close_notify");
-            }
-            BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
-        } else if (err == SSL_ERROR_WANT_WRITE) {
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsReadError("TLS flush write BIO failed");
-            }
-        } else {
-            ThrowTlsReadError("TLS read failed");
-        }
+        throw IoSystemError(ec);
     }
+    co_return n;
 }
 
 net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
-    if (!handshake_done_) {
-        if (!co_await Handshake()) {
-            ThrowTlsReadError("TLS handshake failed during read");
-        }
+    if (!handshake_done_ && !co_await Handshake()) {
+        ThrowTlsReadError("TLS handshake failed during read");
     }
 
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
-
-    while (true) {
-        if (SSL_pending(ssl_) <= 0 && BIO_pending(read_bio_) <= 0) {
-            bool need_encrypted_read = true;
-            std::array<uint8_t, 1> probe{};
-            const int peek = SSL_peek(ssl_, probe.data(), static_cast<int>(probe.size()));
-            if (peek > 0) {
-                // Application data is already decryptable; fall through and
-                // read it into a relay Buffer without consuming the probe byte.
-                need_encrypted_read = false;
-            } else {
-                const int peek_err = SSL_get_error(ssl_, peek);
-                if (peek_err == SSL_ERROR_ZERO_RETURN) {
-                    co_return buf::MultiBuffer{};
-                }
-                if (peek_err == SSL_ERROR_WANT_WRITE) {
-                    if (!co_await FlushWriteBio()) {
-                        ThrowTlsReadError("TLS flush write BIO failed");
-                    }
-                    continue;
-                }
-                if (peek_err != SSL_ERROR_WANT_READ) {
-                    ThrowTlsReadError("TLS read failed");
-                }
-            }
-
-            if (need_encrypted_read) {
-                if (!co_await FlushWriteBio()) {
-                    ThrowTlsReadError("TLS flush write BIO failed");
-                }
-
-                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-                if (n == 0) {
-                    ThrowTlsReadError("TLS peer closed without close_notify");
-                }
-
-                const int written = BIO_write(
-                    read_bio_,
-                    read_buffer.data(),
-                    static_cast<int>(std::min<std::size_t>(
-                        n,
-                        static_cast<std::size_t>(std::numeric_limits<int>::max()))));
-                if (written <= 0 || static_cast<std::size_t>(written) != n) {
-                    ThrowTlsReadError("TLS read BIO write failed");
-                }
-            }
-        }
-
-        bool want_read = false;
-        bool want_write = false;
-        {
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                co_return buf::MultiBuffer{};
-            }
-
-            int ret = SSL_read(ssl_, out->Tail().data(), static_cast<int>(out->Available()));
-            if (ret > 0) {
-                out->Produce(static_cast<uint32_t>(ret));
-                co_return buf::MultiBuffer{out.release()};
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_ZERO_RETURN) {
-                co_return buf::MultiBuffer{};
-            }
-
-            if (err == SSL_ERROR_WANT_READ) {
-                want_read = true;
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                want_write = true;
-            } else {
-                ThrowTlsReadError("TLS read failed");
-            }
-        }
-
-        if (want_write) {
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsReadError("TLS flush write BIO failed");
-            }
-            continue;
-        }
-
-        if (want_read) {
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsReadError("TLS flush write BIO failed");
-            }
-
-            auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-            if (n == 0) {
-                ThrowTlsReadError("TLS peer closed without close_notify");
-            }
-
-            const int written = BIO_write(
-                read_bio_,
-                read_buffer.data(),
-                static_cast<int>(std::min<std::size_t>(
-                    n,
-                    static_cast<std::size_t>(std::numeric_limits<int>::max()))));
-            if (written <= 0 || static_cast<std::size_t>(written) != n) {
-                ThrowTlsReadError("TLS read BIO write failed");
-            }
-            continue;
-        }
+    buf::BufferGuard out{buf::Buffer::New()};
+    if (!out) {
+        co_return buf::MultiBuffer{};
     }
+
+    auto [ec, n] = co_await impl_->stream.async_read_some(
+        net::mutable_buffer(out->Tail().data(), out->Available()),
+        net::as_tuple(net::use_awaitable));
+    if (ec || n == 0) {
+        if (!ec ||
+            ec == io_error::eof ||
+            ec == net::ssl::error::stream_truncated ||
+            ec == io_error::operation_aborted) {
+            co_return buf::MultiBuffer{};
+        }
+        throw IoSystemError(ec);
+    }
+
+    out->Produce(static_cast<uint32_t>(n));
+    co_return buf::MultiBuffer{out.release()};
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
-    if (!handshake_done_) {
-        if (!co_await Handshake()) {
-            ThrowTlsWriteError("TLS handshake failed during write");
-        }
+    if (!handshake_done_ && !co_await Handshake()) {
+        ThrowTlsWriteError("TLS handshake failed during write");
     }
 
-    size_t total_written = 0;
-    const uint8_t* data = static_cast<const uint8_t*>(buf.data());
-    size_t remaining = buf.size();
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
-
-    while (remaining > 0) {
-        const auto to_write = static_cast<int>(
-            std::min<std::size_t>(remaining, kTlsIoBufferSize));
-        int ret = SSL_write(ssl_, data + total_written, to_write);
-
-        if (ret > 0) {
-            total_written += ret;
-            remaining -= ret;
-
-            // 刷新写缓冲
-            if (!co_await FlushWriteBio()) {
-                ThrowTlsWriteError("TLS flush write BIO failed");
-            }
-        } else {
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_WRITE) {
-                if (!co_await FlushWriteBio()) {
-                    ThrowTlsWriteError("TLS flush write BIO failed");
-                }
-            } else if (err == SSL_ERROR_WANT_READ) {
-                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-                if (n > 0) {
-                    BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
-                } else {
-                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
-                }
-            } else {
-                ThrowTlsWriteError("TLS write failed");
-            }
-        }
+    auto [ec, n] = co_await net::async_write(
+        impl_->stream, buf, net::as_tuple(net::use_awaitable));
+    if (ec) {
+        throw IoSystemError(ec);
     }
-
-    if (total_written != buf.size()) {
-        ThrowTlsWriteError("TLS partial write");
-    }
-
-    co_return total_written;
+    co_return n;
 }
 
 net::awaitable<void> TlsStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    if (!handshake_done_) {
-        if (!co_await Handshake()) {
-            ThrowTlsWriteError("TLS handshake failed during write");
-        }
+    if (!handshake_done_ && !co_await Handshake()) {
+        ThrowTlsWriteError("TLS handshake failed during write");
     }
-
     if (buffers.empty()) {
         co_return;
     }
 
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
-
-    for (const auto& buffer : buffers) {
-        if (buffer.size() == 0) {
-            continue;
-        }
-
-        const uint8_t* data = static_cast<const uint8_t*>(buffer.data());
-        size_t remaining = buffer.size();
-
-        while (remaining > 0) {
-            const auto to_write = static_cast<int>(
-                std::min<std::size_t>(remaining, kTlsIoBufferSize));
-            int ret = SSL_write(ssl_, data, to_write);
-
-            if (ret > 0) {
-                data += ret;
-                remaining -= static_cast<size_t>(ret);
-                if (static_cast<size_t>(BIO_pending(write_bio_)) >= kTlsIoBufferSize * 8) {
-                    if (!co_await FlushWriteBio()) {
-                        ThrowTlsWriteError("TLS flush write BIO failed");
-                    }
-                }
-                continue;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_WRITE) {
-                if (!co_await FlushWriteBio()) {
-                    ThrowTlsWriteError("TLS flush write BIO failed");
-                }
-            } else if (err == SSL_ERROR_WANT_READ) {
-                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-                if (n > 0) {
-                    BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
-                } else {
-                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
-                }
-            } else {
-                ThrowTlsWriteError("TLS write failed");
-            }
-        }
+    auto [ec, n] = co_await net::async_write(
+        impl_->stream, buffers, net::as_tuple(net::use_awaitable));
+    (void)n;
+    if (ec) {
+        throw IoSystemError(ec);
     }
-
-    if (!co_await FlushWriteBio()) {
-        ThrowTlsWriteError("TLS flush write BIO failed");
-    }
-    co_return;
 }
 
 net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-    if (!handshake_done_) {
-        if (!co_await Handshake()) {
-            ThrowTlsWriteError("TLS handshake failed during write");
-        }
+    if (!handshake_done_ && !co_await Handshake()) {
+        ThrowTlsWriteError("TLS handshake failed during write");
     }
-
     if (mb.empty()) {
         co_return;
     }
 
-    std::array<uint8_t, kTlsIoBufferSize> read_buffer{};
+    constexpr size_t kStackBufs = 8;
+    std::array<net::const_buffer, kStackBufs> stack_bufs;
+    memory::ThreadLocalVector<net::const_buffer> spill_bufs;
+    size_t buf_count = 0;
 
-    for (const auto* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-
-        auto bytes = buffer->Bytes();
-        const uint8_t* data = bytes.data();
-        size_t remaining = bytes.size();
-
-        while (remaining > 0) {
-            const auto to_write = static_cast<int>(
-                std::min<std::size_t>(remaining, kTlsIoBufferSize));
-            int ret = SSL_write(ssl_, data, to_write);
-
-            if (ret > 0) {
-                data += ret;
-                remaining -= static_cast<size_t>(ret);
-                if (static_cast<size_t>(BIO_pending(write_bio_)) >= kTlsIoBufferSize * 8) {
-                    if (!co_await FlushWriteBio()) {
-                        ThrowTlsWriteError("TLS flush write BIO failed");
-                    }
-                }
-                continue;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_WRITE) {
-                if (!co_await FlushWriteBio()) {
-                    ThrowTlsWriteError("TLS flush write BIO failed");
-                }
-            } else if (err == SSL_ERROR_WANT_READ) {
-                auto n = co_await inner_.AsyncRead(net::buffer(read_buffer));
-                if (n > 0) {
-                    BIO_write(read_bio_, read_buffer.data(), static_cast<int>(n));
-                } else {
-                    ThrowTlsWriteError("TLS write peer closed while waiting for read");
-                }
-            } else {
-                ThrowTlsWriteError("TLS write failed");
+    if (mb.size() <= kStackBufs) {
+        for (const auto* buffer : mb) {
+            if (buffer && !buffer->IsEmpty()) {
+                const auto bytes = buffer->Bytes();
+                stack_bufs[buf_count++] =
+                    net::const_buffer(bytes.data(), bytes.size());
             }
         }
+    } else {
+        spill_bufs.reserve(mb.size());
+        for (const auto* buffer : mb) {
+            if (buffer && !buffer->IsEmpty()) {
+                const auto bytes = buffer->Bytes();
+                spill_bufs.emplace_back(bytes.data(), bytes.size());
+            }
+        }
+        buf_count = spill_bufs.size();
     }
 
-    if (!co_await FlushWriteBio()) {
-        ThrowTlsWriteError("TLS flush write BIO failed");
+    if (buf_count > 0) {
+        auto buffers = (mb.size() > kStackBufs)
+            ? std::span<const net::const_buffer>(spill_bufs)
+            : std::span<const net::const_buffer>(stack_bufs.data(), buf_count);
+        auto [ec, n] = co_await net::async_write(
+            impl_->stream, buffers, net::as_tuple(net::use_awaitable));
+        (void)n;
+        if (ec) {
+            throw IoSystemError(ec);
+        }
     }
-    co_return;
 }
 
 void TlsStream::ShutdownRead() {
-    inner_.ShutdownRead();
+    if (impl_) {
+        impl_->stream.next_layer().Tcp().ShutdownRead();
+    }
 }
 
 void TlsStream::ShutdownWrite() {
-    if (ssl_ && handshake_done_ && !shutdown_initiated_) {
+    if (handshake_done_ && !shutdown_initiated_) {
         shutdown_initiated_ = true;
-        SSL_shutdown(ssl_);
-
-        // 分块 flush close_notify，避免每连接为大 pending BIO 再做 heap 分配。
-        int fd = inner_.NativeHandle();
-        if (fd >= 0) {
-            alignas(64) std::array<uint8_t, kTlsIoBufferSize> buf{};
-            while (true) {
-                auto pending = static_cast<int>(BIO_pending(write_bio_));
-                if (pending <= 0) break;
-
-                int chunk = std::min<int>(pending, static_cast<int>(buf.size()));
-                int read = BIO_read(write_bio_, buf.data(), chunk);
-                if (read <= 0) break;
-
-                int sent_total = 0;
-                while (sent_total < read) {
-                    int sent = ::send(
-                        fd,
-                        unsafe::ptr_cast<const char>(buf.data()) + sent_total,
-                        read - sent_total,
-                        MSG_NOSIGNAL);
-                    if (sent <= 0) {
-                        break;
-                    }
-                    sent_total += sent;
-                }
-
-                if (sent_total < read) {
-                    break;
-                }
-            }
-        }
     }
-    inner_.ShutdownWrite();
+    if (impl_) {
+        impl_->stream.next_layer().Tcp().ShutdownWrite();
+    }
 }
 
 net::awaitable<void> TlsStream::AsyncShutdownWrite() {
-    // ISSUE-01-04: TLS 层 AsyncShutdownWrite 发送 close_notify
-    // 根据 RFC 5246/8446，优雅关闭需要发送 close_notify alert
-    if (ssl_ && handshake_done_ && !shutdown_initiated_) {
+    if (impl_ && handshake_done_ && !shutdown_initiated_) {
         shutdown_initiated_ = true;
         LOG_ACCESS_DEBUG("TLS: sending close_notify");
-        int ret = SSL_shutdown(ssl_);
-        if (ret == 0) {
-            // 第一次 SSL_shutdown 返回 0 表示 close_notify 已发送
-            // 但尚未收到对端的 close_notify
-            LOG_ACCESS_DEBUG("TLS: close_notify sent, waiting for peer");
-        } else if (ret == 1) {
-            LOG_ACCESS_DEBUG("TLS: bidirectional shutdown complete");
+        auto [ec] = co_await impl_->stream.async_shutdown(
+            net::as_tuple(net::use_awaitable));
+        if (ec && ec != net::ssl::error::stream_truncated &&
+            ec != io_error::eof && ec != io_error::operation_aborted) {
+            LOG_ACCESS_DEBUG("TLS: close_notify failed: {}", ec.message());
         }
-        co_await FlushWriteBio();
     }
-    co_await inner_.AsyncShutdownWrite();
+    if (impl_) {
+        co_await impl_->stream.next_layer().Tcp().AsyncShutdownWrite();
+    }
 }
 
 void TlsStream::Close() {
-    if (ssl_ && !shutdown_initiated_) {
-        shutdown_initiated_ = true;
-        SSL_shutdown(ssl_);
+    shutdown_initiated_ = true;
+    if (impl_) {
+        impl_->stream.next_layer().Tcp().Close();
     }
-    inner_.Close();
 }
 
 void TlsStream::CloseAbortive() {
     shutdown_initiated_ = true;
-    inner_.SetAbortiveClose(true);
-    inner_.Close();
+    if (impl_) {
+        impl_->stream.next_layer().Tcp().SetAbortiveClose(true);
+        impl_->stream.next_layer().Tcp().Close();
+    }
 }
 
 void TlsStream::Cancel() noexcept {
-    inner_.Cancel();
+    if (impl_) {
+        impl_->stream.next_layer().Tcp().Cancel();
+    }
 }
 
 int TlsStream::NativeHandle() const {
-    return inner_.NativeHandle();
+    return impl_ ? impl_->stream.next_layer().Tcp().NativeHandle() : -1;
 }
 
 bool TlsStream::IsOpen() const {
-    return inner_.IsOpen() && ssl_ != nullptr;
+    return impl_ && impl_->stream.next_layer().Tcp().IsOpen() && NativeSsl() != nullptr;
 }
+
 
 // ============================================================================
 // 工厂函数实现

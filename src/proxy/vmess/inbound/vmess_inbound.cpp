@@ -242,12 +242,8 @@ proxy::vmess::inbound::Handler::Process(
     ctx.outbound.target = std::move(target);
     ctx.content.network = net;
 
-    if (!co_await vmess_session.EncodeResponseHeader(*stream)) {
-        co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
     auto request_reader = vmess_session.DecodeRequestBody(*stream);
-    auto response_writer = vmess_session.EncodeResponseBody(*stream);
+    auto response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     if (!request_reader || !response_writer) {
         co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
     }

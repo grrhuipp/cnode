@@ -30,6 +30,9 @@ public:
     std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBody(
         AsyncStream& stream);
 
+    std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBodyWithHeader(
+        AsyncStream& stream);
+
 private:
     const TimedUserValidator* validator_ = nullptr;
     std::string tag_;

@@ -4,11 +4,8 @@
 #include "acppnode/transport/internet/tls_config.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <array>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace acpp {
@@ -114,32 +111,20 @@ public:
     bool IsOpen() const override;
 
 protected:
-    TcpStream* BaseTcpStream() override { return &inner_; }
-    const TcpStream* BaseTcpStream() const override { return &inner_; }
+    TcpStream* BaseTcpStream() override;
+    const TcpStream* BaseTcpStream() const override;
 
 private:
-    // BIO 回调（用于异步 I/O）
-    static int BioRead(BIO* bio, char* buf, int len);
-    static int BioWrite(BIO* bio, const char* buf, int len);
-    static long BioCtrl(BIO* bio, int cmd, long num, void* ptr);
-    static int BioCreate(BIO* bio);
-    static int BioDestroy(BIO* bio);
+    struct Impl;
 
-    // 刷新待发送数据
-    net::awaitable<bool> FlushWriteBio();
+    SSL* NativeSsl() noexcept;
+    const SSL* NativeSsl() const noexcept;
 
-    TcpStream inner_;
-    SSL* ssl_ = nullptr;
-    BIO* read_bio_ = nullptr;   // 用于接收数据
-    BIO* write_bio_ = nullptr;  // 用于发送数据
+    std::unique_ptr<Impl> impl_;
     bool is_server_ = false;
     bool handshake_done_ = false;
     bool shutdown_initiated_ = false;  // 防止多次 SSL_shutdown
     std::shared_ptr<void> app_state_;
-
-    // TLS 底层 I/O pump 的临时缓冲大小。缓冲本体放在执行中的 awaitable 内，
-    // 避免每个 TLS stream 对象常驻一块 scratch，并与 relay Buffer 对齐。
-    static constexpr size_t kTlsIoBufferSize = buf::Buffer::kSize;
 };
 
 // ============================================================================

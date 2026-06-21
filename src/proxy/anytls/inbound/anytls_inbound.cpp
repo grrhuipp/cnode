@@ -590,18 +590,31 @@ public:
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
-        for (auto* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            auto ok = co_await WriteFrameSerialized(cmd, sid, buffer->Bytes());
-            if (!ok) {
+        while (write_busy_ && !cancelled_) {
+            auto [ec] = co_await write_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
                 mb.clear();
-                co_return std::unexpected(ok.error());
+                co_return std::unexpected(ErrorCode::CANCELLED);
             }
         }
-        mb.clear();
-        co_return std::expected<void, ErrorCode>{};
+        if (cancelled_ || !stream_) {
+            mb.clear();
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+        }
+
+        write_busy_ = true;
+        auto guard = std::unique_ptr<void, void(*)(void*)>{
+            this,
+            [](void* p) {
+                auto* self = static_cast<AnyTLSDemuxSession*>(p);
+                self->write_busy_ = false;
+                self->WakeWriter();
+            }};
+        (void)guard;
+
+        co_return co_await anytls::WriteMultiBufferAsFrames(
+            *stream_, cmd, sid, std::move(mb));
     }
 
     void RemoveStream(uint32_t sid) {
@@ -945,9 +958,9 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
             }
             case StreamState::Started:
                 if (!co_await sub->PushInput(std::move(*payload))) {
-                    result.error = ErrorCode::CONNECTION_CLOSED;
-                    CancelAll();
-                    co_return result;
+                    stream_states_.erase(sid);
+                    RemoveStream(sid);
+                    break;
                 }
                 break;
         }
@@ -1022,6 +1035,11 @@ Handler::Process(
         result.error = ErrorCode::PROTOCOL_AUTH_FAILED;
         co_return result;
     }
+
+    stream->SetIdleTimeout(timeouts.StreamIdleTimeout());
+    stream->SetReadTimeout(std::chrono::seconds(0));
+    stream->SetWriteTimeout(std::min(timeouts.WriteTimeout(), timeouts.StreamIdleTimeout()));
+    stream->ClearPhaseDeadline();
 
     std::optional<AnyTLSOnlineSession> user_session;
     if (user->profile) {

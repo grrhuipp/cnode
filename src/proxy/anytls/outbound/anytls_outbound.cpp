@@ -961,6 +961,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         uint32_t sid = 0;
         bool is_udp = false;
         TargetAddress original_target;
+        bool write_shutdown_sent = false;
 
         LogicalEndpoint(std::shared_ptr<ClientSession> s,
                         std::shared_ptr<ClientSession::LogicalStream> l,
@@ -1027,9 +1028,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
 
         net::awaitable<void> AsyncShutdownWrite() override {
-            if (session) {
+            if (session && !write_shutdown_sent) {
+                write_shutdown_sent = true;
                 (void)co_await session->WriteFrameSerialized(kCmdFIN, sid, {});
             }
+        }
+
+        bool ForwardHalfCloseOnPeerEof() const noexcept {
+            return true;
         }
 
         void Cancel() noexcept {
@@ -1132,9 +1138,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
     session->UnregisterLogicalStream(sid);
     logical->Close(result.error);
-    if (result.error != ErrorCode::OK) {
-        session->CloseAll(result.error);
-    }
     {
         std::lock_guard lock(pool_mu_);
         if (session->active_streams > 0) {

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/transport/link.hpp"
@@ -22,12 +21,13 @@ public:
                                    bool eof_ok_at_start = false) {
         size_t done = 0;
         while (done < len) {
-            if (pending_offset_ < pending_.size()) {
+            buf::Buffer* head = PendingHead();
+            if (head) {
                 const size_t n = std::min(
                     len - done,
-                    pending_.size() - pending_offset_);
-                std::memcpy(data + done, pending_.data() + pending_offset_, n);
-                pending_offset_ += n;
+                    static_cast<size_t>(head->Len()));
+                std::memcpy(data + done, head->Bytes().data(), n);
+                head->Advance(static_cast<uint32_t>(n));
                 done += n;
                 CompactPending();
                 continue;
@@ -43,54 +43,46 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (pending_offset_ < pending_.size()) {
-            buf::MultiBuffer out;
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(
-                        pending_.data() + pending_offset_,
-                        pending_.size() - pending_offset_),
-                    out)) {
-                throw IoSystemError(io_error::fault,
-                                    "VLESS pending buffer allocation failed");
-            }
-            pending_.clear();
-            pending_offset_ = 0;
-            co_return out;
+        CompactPending();
+        if (!pending_.empty()) {
+            co_return std::move(pending_);
         }
         co_return co_await src_.ReadMultiBuffer();
     }
 
 private:
     transport::MultiBufferReader& src_;
-    memory::ByteVector pending_;
-    size_t pending_offset_ = 0;
+    buf::MultiBuffer pending_;
 
     void AppendToPending(buf::MultiBuffer mb) {
-        for (buf::Buffer* buffer : mb) {
+        for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
-            const auto bytes = buffer->Bytes();
-            pending_.insert(pending_.end(), bytes.begin(), bytes.end());
+            pending_.push_back(buffer);
+            buffer = nullptr;
         }
         mb.clear();
     }
 
+    buf::Buffer* PendingHead() noexcept {
+        CompactPending();
+        if (pending_.empty()) {
+            return nullptr;
+        }
+        return *pending_.begin();
+    }
+
     void CompactPending() {
-        if (pending_offset_ == 0) {
-            return;
+        size_t drained = 0;
+        for (buf::Buffer* buffer : pending_) {
+            if (buffer && !buffer->IsEmpty()) {
+                break;
+            }
+            ++drained;
         }
-        if (pending_offset_ >= pending_.size()) {
-            pending_.clear();
-            pending_offset_ = 0;
-            return;
-        }
-        if (pending_offset_ >= buf::Buffer::kSize &&
-            pending_offset_ >= pending_.size() - pending_offset_) {
-            pending_.erase(
-                pending_.begin(),
-                pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
-            pending_offset_ = 0;
+        if (drained > 0) {
+            pending_.drop_front(drained);
         }
     }
 };

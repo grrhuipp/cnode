@@ -557,7 +557,7 @@ private:
         if (pending_offset_ >= pending_.size()) {
             pending_.clear();
             pending_offset_ = 0;
-            if (pending_.capacity() > buf::Buffer::kSize * 8) {
+            if (pending_.capacity() > buf::Buffer::kSize * 2) {
                 TryShrinkSequence(pending_);
             }
             return;

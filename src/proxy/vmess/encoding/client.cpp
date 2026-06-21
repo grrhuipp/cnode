@@ -18,8 +18,8 @@ constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
 constexpr size_t kVMessBodyMaxChunkSize = 16 * 1024;
-constexpr size_t kStreamFlushBufferCount = 2;
-constexpr size_t kStreamFlushBytes = buf::Buffer::kSize * kStreamFlushBufferCount;
+constexpr size_t kStreamOutputReserveSlack = 10;
+constexpr size_t kStreamMaxPaddingLen = 64;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
@@ -220,25 +220,17 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
     }
     const size_t overhead = state.cipher->Overhead();
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
-    if (buf::Buffer::kSize <= length_header_size + overhead + 63) {
+    const size_t max_padding_len =
+        (state.global_padding && state.mask) ? kStreamMaxPaddingLen : 0;
+    if (buf::Buffer::kSize <= length_header_size + overhead + max_padding_len) {
         ThrowVMessWriteError("VMess client buffer budget too small");
     }
     const size_t stream_chunk_size = std::min(
         size_t(kVMessBodyMaxChunkSize - overhead),
-        size_t(buf::Buffer::kSize - length_header_size - overhead - 63));
+        size_t(buf::Buffer::kSize - length_header_size - overhead - max_padding_len));
 
     buf::MultiBuffer out_mb;
-    out_mb.reserve(kStreamFlushBufferCount);
-    size_t out_bytes = 0;
-
-    auto flush_out = [&stream, &out_mb, &out_bytes]() -> net::awaitable<void> {
-        if (out_mb.empty()) {
-            co_return;
-        }
-        co_await stream.WriteMultiBuffer(std::move(out_mb));
-        out_mb.clear();
-        out_bytes = 0;
-    };
+    out_mb.reserve(mb.size() + kStreamOutputReserveSlack);
 
     for (auto* buf : mb) {
         auto bytes = buf->Bytes();
@@ -287,18 +279,15 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
 
             const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
             out->Produce(static_cast<uint32_t>(output_size));
-            out_bytes += output_size;
             out_mb.push_back(out.release());
 
             offset += chunk_size;
-
-            if (out_mb.size() >= kStreamFlushBufferCount || out_bytes >= kStreamFlushBytes) {
-                co_await flush_out();
-            }
         }
     }
 
-    co_await flush_out();
+    if (!out_mb.empty()) {
+        co_await stream.WriteMultiBuffer(std::move(out_mb));
+    }
 }
 
 net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
@@ -444,22 +433,15 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     const size_t data_len = chunk_len - padding_len;
     const size_t expected_plain_len = data_len - overhead;
 
-    buf::BufferGuard out{buf::Buffer::New()};
-    if (!out) {
-        ReleaseIdleBuffer(crypto_buf, 0);
-        throw std::bad_alloc();
-    }
-
-    if (expected_plain_len <= out->Available()) {
-        ssize_t dec_len = state.cipher->Decrypt(crypto_scratch, data_len, out->Tail().data());
+    if (crypto_pool && expected_plain_len <= buf::Buffer::kSize) {
+        ssize_t dec_len = state.cipher->Decrypt(crypto_scratch, data_len, crypto_scratch);
         if (dec_len < 0) {
             ReleaseIdleBuffer(crypto_buf, 0);
             state.eof = true;
             throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
         }
-        ReleaseIdleBuffer(crypto_buf, 0);
-        out->Produce(static_cast<uint32_t>(dec_len));
-        co_return buf::MultiBuffer{out.release()};
+        crypto_pool->Produce(static_cast<uint32_t>(dec_len));
+        co_return buf::MultiBuffer{crypto_pool.release()};
     }
 
     memory::ByteVector plain_buf;
@@ -472,6 +454,12 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
         throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
     }
     ReleaseIdleBuffer(crypto_buf, 0);
+
+    buf::BufferGuard out{buf::Buffer::New()};
+    if (!out) {
+        ReleaseIdleBuffer(plain_buf, 0);
+        throw std::bad_alloc();
+    }
 
     const size_t dec_size = static_cast<size_t>(dec_len);
     const size_t first_copy = std::min<size_t>(dec_size, out->Available());
@@ -510,12 +498,14 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
     AsyncStream& stream,
     std::span<const uint8_t> payload) {
     const size_t overhead = state.cipher->Overhead();
-    if (buf::Buffer::kSize <= 2 + overhead + 63) {
+    const size_t max_padding_len =
+        (state.global_padding && state.mask) ? kStreamMaxPaddingLen : 0;
+    if (buf::Buffer::kSize <= 2 + overhead + max_padding_len) {
         co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const size_t max_chunk_size = std::min(
         size_t(kVMessBodyMaxChunkSize - overhead),
-        size_t(buf::Buffer::kSize - 2 - overhead - 63));
+        size_t(buf::Buffer::kSize - 2 - overhead - max_padding_len));
 
     size_t offset = 0;
     while (offset < payload.size()) {

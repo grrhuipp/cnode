@@ -477,6 +477,14 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
 
                 // 对齐 Xray：半关闭只切换 idle timer，不发送传输/协议级写关闭。
                 // 写关闭由 DoRelay 全关闭阶段统一发送。
+                // 例外：AnyTLS 这类协议虚拟流没有内核 TCP half-close 可继承，
+                // 必须在这里把 EOF 显式映射为逻辑 FIN，否则远端真实 TCP
+                // 目标不会收到 EOF（iperf3 等协议会一直等最终响应）。
+                if constexpr (requires { to_writer.ForwardHalfCloseOnPeerEof(); }) {
+                    if (to_writer.ForwardHalfCloseOnPeerEof()) {
+                        co_await ShutdownWriteForClose(to_writer, to_control);
+                    }
+                }
                 if (!peer_state.eof) {
                     if (half_close_timeout.count() > 0) {
                         const auto deadline = SteadyClock::now() + half_close_timeout;
@@ -882,6 +890,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 buf::MultiBuffer mb = co_await client_reader.ReadMultiBuffer();
                 if (mb.empty()) {
                     relay_detail::FlushRelayStats(&stats, stats_acc);
+                    co_await relay_detail::ShutdownWriteForClose(target);
                     arm_downlink_only_timeout();
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
@@ -918,6 +927,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 buf::MultiBuffer mb = co_await target.ReadMultiBuffer();
                 if (mb.empty()) {
                     relay_detail::FlushRelayStats(&stats, stats_acc);
+                    co_await relay_detail::ShutdownWriteForClose(client_writer);
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
                 const size_t n = buf::TotalLen(mb);
