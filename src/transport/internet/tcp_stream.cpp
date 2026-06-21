@@ -1233,7 +1233,6 @@ void SetupConnectedSocket(tcp::socket& sock) {
 
     // 启用 TCP KeepAlive
     sock.set_option(net::socket_base::keep_alive(true), ec);
-    sock.set_option(tcp::no_delay(true), ec);
 
 #ifdef _WIN32
     // Windows: 使用 tcp_keepalive 结构设置 KeepAlive 参数

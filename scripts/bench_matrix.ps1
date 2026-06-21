@@ -8,7 +8,7 @@ param(
     [int]$Rounds = 3,
     [int]$Seconds = 10,
     [int]$Parallel = 8,
-    [int]$CnodeWorkers = 4,
+    [int]$CnodeWorkers = 0,
     [int]$GraceSeconds = 10,
     [ValidateSet("error", "warning", "info", "debug")]
     [string]$XrayLogLevel = "error",

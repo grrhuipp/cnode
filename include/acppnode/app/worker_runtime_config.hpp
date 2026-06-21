@@ -20,7 +20,7 @@ struct WorkerRuntimeConfig {
     std::string default_outbound_tag = std::string(constants::protocol::kDirect);
     std::vector<StaticInboundRuntimeEntry> static_inbounds;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
-    uint32_t workers = 1;
+    uint32_t workers = 0;
     uint32_t pressure_threshold = 1;
     uint32_t pressure_idle_timeout = 0;
 };
