@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link.hpp"
@@ -11,7 +12,6 @@
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <vector>
 
 namespace acpp::vless {
 
@@ -34,14 +34,14 @@ public:
 
     VlessEncryptionReader(transport::MultiBufferReader& src,
                           VlessEncryptionAead aead,
-                          std::vector<uint8_t> united_key,
+                          memory::ByteVector united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
 
     VlessEncryptionReader(transport::MultiBufferReader& src,
                           size_t read_context_size,
                           VlessEncryptionAeadCipher cipher,
-                          std::vector<uint8_t> united_key,
+                          memory::ByteVector united_key,
                           bool header_xor_from_context) noexcept;
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
@@ -51,7 +51,7 @@ private:
 
     VlessBufferedReader src_;
     VlessEncryptionAead aead_;
-    std::vector<uint8_t> united_key_;
+    memory::ByteVector united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
     bool aead_ready_ = true;
     VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
@@ -71,19 +71,21 @@ public:
 
     VlessEncryptionWriter(transport::MultiBufferWriter& dst,
                           VlessEncryptionAead aead,
-                          std::vector<uint8_t> united_key,
+                          memory::ByteVector united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
+    net::awaitable<void> WritePlaintext(std::span<const uint8_t> data);
     [[nodiscard]] bool Rekey(std::span<const uint8_t> context) noexcept;
 
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
-    std::vector<uint8_t> united_key_;
+    memory::ByteVector united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
 };
 

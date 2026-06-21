@@ -28,7 +28,7 @@ std::optional<VlessEncryptionReader> VlessEncryptionReader::Create(
     return VlessEncryptionReader(
         src,
         std::move(*aead),
-        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        memory::ByteVector(united_key.begin(), united_key.end()),
         std::move(header_xor));
 }
 
@@ -42,14 +42,14 @@ VlessEncryptionReader VlessEncryptionReader::CreateLazyReadContext(
         src,
         read_context_size,
         cipher,
-        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        memory::ByteVector(united_key.begin(), united_key.end()),
         header_xor_from_context);
 }
 
 VlessEncryptionReader::VlessEncryptionReader(
     transport::MultiBufferReader& src,
     VlessEncryptionAead aead,
-    std::vector<uint8_t> united_key,
+    memory::ByteVector united_key,
     std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
     : src_(src)
     , aead_(std::move(aead))
@@ -60,7 +60,7 @@ VlessEncryptionReader::VlessEncryptionReader(
     transport::MultiBufferReader& src,
     size_t read_context_size,
     VlessEncryptionAeadCipher cipher,
-    std::vector<uint8_t> united_key,
+    memory::ByteVector united_key,
     bool header_xor_from_context) noexcept
     : src_(src)
     , united_key_(std::move(united_key))
@@ -217,14 +217,14 @@ std::optional<VlessEncryptionWriter> VlessEncryptionWriter::Create(
     return VlessEncryptionWriter(
         dst,
         std::move(*aead),
-        std::vector<uint8_t>(united_key.begin(), united_key.end()),
+        memory::ByteVector(united_key.begin(), united_key.end()),
         std::move(header_xor));
 }
 
 VlessEncryptionWriter::VlessEncryptionWriter(
     transport::MultiBufferWriter& dst,
     VlessEncryptionAead aead,
-    std::vector<uint8_t> united_key,
+    memory::ByteVector united_key,
     std::optional<VlessEncryptionHeaderXor> header_xor) noexcept
     : dst_(dst)
     , aead_(std::move(aead))
@@ -237,47 +237,63 @@ net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(
         if (!buffer || buffer->IsEmpty()) {
             continue;
         }
-        std::span<const uint8_t> data = buffer->Bytes();
-        while (!data.empty()) {
-            const size_t n = std::min<size_t>(
-                data.size(),
-                kVlessEncryptionMaxPlaintextSize);
-            std::array<
-                uint8_t,
-                kVlessEncryptionRecordHeaderSize +
-                    kVlessEncryptionMaxPlaintextSize +
-                    kVlessEncryptionTagSize> frame{};
-
-            const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
-            const auto written = SealVlessEncryptionRecord(
-                aead_,
-                data.first(n),
-                frame);
-            if (!written) {
-                ThrowVlessEncryptionIoError("VLESS Encryption record encrypt failed");
-            }
-            if (rekey && !Rekey(std::span<const uint8_t>(
-                             frame.data(),
-                             *written))) {
-                ThrowVlessEncryptionIoError("VLESS Encryption write rekey failed");
-            }
-            auto frame_view = std::span<uint8_t>(frame.data(), *written);
-            if (header_xor_ &&
-                !header_xor_->XorOutboundInPlace(frame_view)) {
-                ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
-            }
-
-            co_await WriteVlessBytes(
-                dst_,
-                std::span<const uint8_t>(frame.data(), *written));
-            data = data.subspan(n);
-        }
+        co_await WritePlaintext(buffer->Bytes());
     }
     mb.clear();
 }
 
+net::awaitable<void> VlessEncryptionWriter::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    for (const net::const_buffer& buffer : buffers) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        const size_t size = buffer.size();
+        if (!data || size == 0) {
+            continue;
+        }
+        co_await WritePlaintext(std::span<const uint8_t>{data, size});
+    }
+}
+
 net::awaitable<void> VlessEncryptionWriter::AsyncShutdownWrite() {
     co_await dst_.AsyncShutdownWrite();
+}
+
+net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
+    std::span<const uint8_t> data) {
+    while (!data.empty()) {
+        const size_t n = std::min<size_t>(
+            data.size(),
+            kVlessEncryptionMaxPlaintextSize);
+        std::array<
+            uint8_t,
+            kVlessEncryptionRecordHeaderSize +
+                kVlessEncryptionMaxPlaintextSize +
+                kVlessEncryptionTagSize> frame{};
+
+        const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
+        const auto written = SealVlessEncryptionRecord(
+            aead_,
+            data.first(n),
+            frame);
+        if (!written) {
+            ThrowVlessEncryptionIoError("VLESS Encryption record encrypt failed");
+        }
+        if (rekey && !Rekey(std::span<const uint8_t>(
+                         frame.data(),
+                         *written))) {
+            ThrowVlessEncryptionIoError("VLESS Encryption write rekey failed");
+        }
+        auto frame_view = std::span<uint8_t>(frame.data(), *written);
+        if (header_xor_ &&
+            !header_xor_->XorOutboundInPlace(frame_view)) {
+            ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
+        }
+
+        net::const_buffer buffer{frame.data(), *written};
+        co_await dst_.WriteBuffers(
+            std::span<const net::const_buffer>{&buffer, 1});
+        data = data.subspan(n);
+    }
 }
 
 bool VlessEncryptionWriter::Rekey(

@@ -1,5 +1,7 @@
 #include "vless_encryption_handshake.hpp"
 
+#include "acppnode/common/allocator.hpp"
+
 #include <blake3.h>
 #include <openssl/rand.h>
 
@@ -181,7 +183,7 @@ IvSpan(const std::array<uint8_t, kVlessEncryptionIvSize>& iv) noexcept {
     return static_cast<uint16_t>(seconds & 0xffff);
 }
 
-[[nodiscard]] bool AppendPfsKey(std::vector<uint8_t>& out,
+[[nodiscard]] bool AppendPfsKey(memory::ByteVector& out,
                                 std::span<const uint8_t> mlkem_shared,
                                 std::span<const uint8_t> x25519_shared) {
     if (mlkem_shared.size() != kVlessMlKem768SharedSecretSize ||
@@ -195,10 +197,10 @@ IvSpan(const std::array<uint8_t, kVlessEncryptionIvSize>& iv) noexcept {
     return true;
 }
 
-[[nodiscard]] std::vector<uint8_t> BuildUnitedKey(
+[[nodiscard]] memory::ByteVector BuildUnitedKey(
     std::span<const uint8_t> pfs_key,
     std::span<const uint8_t> nfs_key) {
-    std::vector<uint8_t> out;
+    memory::ByteVector out;
     out.reserve(pfs_key.size() + nfs_key.size());
     out.insert(out.end(), pfs_key.begin(), pfs_key.end());
     out.insert(out.end(), nfs_key.begin(), nfs_key.end());
@@ -232,7 +234,7 @@ BuildVlessEncryptionClientNfsHello(
 
     std::optional<VlessEncryptionCtr> last_ctr;
     std::span<uint8_t> relays(hello.relays);
-    std::vector<uint8_t> nfs_key;
+    memory::ByteVector nfs_key;
     for (size_t i = 0; i < config.keys.size(); ++i) {
         const auto& public_key = config.keys[i];
         const size_t relay_size = RelaySizeForClientKey(public_key);
@@ -327,7 +329,7 @@ OpenVlessEncryptionClientNfsHello(
 
     std::optional<VlessEncryptionCtr> last_ctr;
     std::span<uint8_t> relays(result.relays);
-    std::vector<uint8_t> nfs_key;
+    memory::ByteVector nfs_key;
     for (size_t i = 0; i < config.keys.size(); ++i) {
         const auto& secret_key = config.keys[i];
         const auto& public_key = (*public_keys)[i];
@@ -664,7 +666,7 @@ BuildVlessEncryptionPaddingPlan(
     return plan;
 }
 
-std::optional<std::vector<uint8_t>>
+std::optional<memory::ByteVector>
 SealVlessEncryptionPadding(VlessEncryptionAead& aead,
                            size_t padding_length) noexcept {
     if (padding_length < kVlessEncryptionMinPaddingLength ||
@@ -678,7 +680,7 @@ SealVlessEncryptionPadding(VlessEncryptionAead& aead,
         encrypted_body_length - kVlessEncryptionTagSize;
     auto encoded_length = EncodeVlessEncryptionLength(encrypted_body_length);
 
-    std::vector<uint8_t> out(padding_length);
+    memory::ByteVector out(padding_length);
     auto length_out = std::span<uint8_t>(
         out.data(),
         kVlessEncryptionEncryptedLengthSize);
@@ -688,7 +690,7 @@ SealVlessEncryptionPadding(VlessEncryptionAead& aead,
         return std::nullopt;
     }
 
-    std::vector<uint8_t> plain(plaintext_body_length);
+    memory::ByteVector plain(plaintext_body_length);
     auto body_out = std::span<uint8_t>(
         out.data() + static_cast<std::ptrdiff_t>(
             kVlessEncryptionEncryptedLengthSize),

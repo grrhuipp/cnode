@@ -33,71 +33,10 @@ constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
 constexpr size_t kMuxQueueShrinkItems    = 128;
-constexpr size_t kMuxFrameBufKeepCap     = 0;
+constexpr size_t kMuxFrameBufKeepCap     = 512;
 constexpr size_t kMuxReplyOverhead       = 128;
 
-void AppendOwnedBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
-    for (buf::Buffer*& buffer : src) {
-        if (!buffer || buffer->IsEmpty()) {
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-            continue;
-        }
-        dst.push_back(buffer);
-        buffer = nullptr;
-    }
-    src.clear();
-}
-
-void MoveOwnedPayloadBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
-    for (buf::Buffer*& buffer : src) {
-        if (!buffer || buffer->IsEmpty()) {
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-            continue;
-        }
-        buffer->ClearUDP();
-        dst.push_back(buffer);
-        buffer = nullptr;
-    }
-    src.clear();
-}
-
-void CopyMultiBufferToScratch(const buf::MultiBuffer& mb,
-                              std::vector<uint8_t>& scratch) {
-    scratch.clear();
-    scratch.reserve(buf::TotalLen(mb));
-    for (const auto* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        scratch.insert(scratch.end(), bytes.begin(), bytes.end());
-    }
-}
-
-void ConsumeMultiBuffer(buf::MultiBuffer& mb, size_t bytes) noexcept {
-    size_t remaining = bytes;
-    for (buf::Buffer*& buffer : mb) {
-        if (!buffer || remaining == 0) {
-            continue;
-        }
-        const size_t len = buffer->Len();
-        if (remaining >= len) {
-            remaining -= len;
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-            continue;
-        }
-        buffer->Advance(static_cast<uint32_t>(remaining));
-        remaining = 0;
-        break;
-    }
-
-    if (buf::TotalLen(mb) == 0) {
-        mb.clear();
-    }
-}
+using SignalChannel = net::experimental::channel<void(IoErrorCode)>;
 
 // 回包元素（出站 → 客户端）
 struct MuxReply {
@@ -114,18 +53,18 @@ struct MuxReply {
 };
 
 struct ReplyQueueState {
-    explicit ReplyQueueState(net::io_context& io_context)
+    explicit ReplyQueueState(net::io_context& io_context, SignalChannel& main_signal)
         : io_context_(io_context)
-        , reply_signal(io_context, 1)
-        , sub_done_signal(io_context, 1) {}
+        , sub_done_signal(io_context, 1)
+        , main_signal_(main_signal) {}
 
     net::io_context& io_context_;
     memory::ThreadLocalDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
-    net::experimental::channel<void(IoErrorCode)> reply_signal;
-    net::experimental::channel<void(IoErrorCode)> sub_done_signal;
+    SignalChannel sub_done_signal;
+    SignalChannel& main_signal_;
     bool running = true;
     bool tcp_overflowed = false;
     uint64_t udp_dropped = 0;
@@ -194,7 +133,7 @@ struct ReplyQueueState {
         if (io_context_.stopped()) {
             return;
         }
-        (void)reply_signal.try_send(IoErrorCode{});
+        (void)main_signal_.try_send(IoErrorCode{});
     }
 
     void AddSubLoop() noexcept {
@@ -210,6 +149,105 @@ struct ReplyQueueState {
         }
         (void)sub_done_signal.try_send(IoErrorCode{});
         WakeReplyWriter();
+    }
+};
+
+struct ClientReadQueueState {
+    explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
+        : io_context_(io_context)
+        , space_signal(io_context, 1)
+        , done_signal(io_context, 1)
+        , main_signal_(main_signal) {}
+
+    net::io_context& io_context_;
+    SignalChannel space_signal;
+    SignalChannel done_signal;
+    SignalChannel& main_signal_;
+    struct QueuedInput {
+        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
+            : payload(std::move(p))
+            , bytes(n) {}
+
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedInput> queue;
+    size_t queued_bytes = 0;
+    bool running = true;
+    bool done = false;
+    ErrorCode error = ErrorCode::OK;
+    bool shrink_queue_on_drain = false;
+
+    void WakeMain() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
+        (void)main_signal_.try_send(IoErrorCode{});
+    }
+
+    void WakeDone() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
+        (void)done_signal.try_send(IoErrorCode{});
+        WakeMain();
+    }
+
+    void WakeSpace() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
+        (void)space_signal.try_send(IoErrorCode{});
+    }
+
+    [[nodiscard]] bool Push(buf::MultiBuffer mb, size_t bytes) {
+        if (queued_bytes + bytes > kMuxQueueEmergencyBytes) {
+            mb.clear();
+            return false;
+        }
+        queued_bytes += bytes;
+        queue.emplace_back(std::move(mb), bytes);
+        if (queue.size() >= kMuxQueueShrinkItems ||
+            queued_bytes >= kMuxQueueHighWaterBytes) {
+            shrink_queue_on_drain = true;
+        }
+        WakeMain();
+        return true;
+    }
+
+    bool Pop(buf::MultiBuffer& mb) {
+        if (queue.empty()) {
+            return false;
+        }
+        auto& input = queue.front();
+        queued_bytes -= std::min(queued_bytes, input.bytes);
+        mb = std::move(input.payload);
+        queue.pop_front();
+        if (queue.empty() && shrink_queue_on_drain) {
+            TryShrinkSequence(queue);
+            shrink_queue_on_drain = false;
+        }
+        if (ReadWindowOpen()) {
+            WakeSpace();
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ShouldBackpressureReads() const noexcept {
+        return queued_bytes >= kMuxQueueHighWaterBytes;
+    }
+
+    [[nodiscard]] bool ReadWindowOpen() const noexcept {
+        return queued_bytes <= kMuxQueueLowWaterBytes;
+    }
+
+    void MarkDone(ErrorCode ec) noexcept {
+        if (done) {
+            return;
+        }
+        done = true;
+        error = ec;
+        WakeDone();
     }
 };
 
@@ -234,29 +272,20 @@ public:
     TcpSubState(const TcpSubState&) = delete;
     TcpSubState& operator=(const TcpSubState&) = delete;
 
-    [[nodiscard]] bool PushClientPayload(std::span<const uint8_t> payload) {
-        if (payload.empty()) {
+    [[nodiscard]] bool PushClientPayload(buf::MultiBuffer mb) {
+        const size_t bytes = buf::TotalLen(mb);
+        if (cancelled_ || input_done_ || bytes == 0) {
+            mb.clear();
             return true;
         }
-        buf::MultiBuffer mb;
-        mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!buf::AppendSpanToMultiBuffer(payload, mb)) {
-            return false;
-        }
-        PushClientPayload(std::move(mb));
-        return true;
-    }
-
-    void PushClientPayload(buf::MultiBuffer mb) {
-        if (cancelled_ || input_done_) {
-            mb.clear();
-            return;
-        }
-        input_queue_.push_back(std::move(mb));
-        if (input_queue_.size() >= kMuxQueueShrinkItems) {
+        queued_bytes_ += bytes;
+        input_queue_.emplace_back(std::move(mb), bytes);
+        if (input_queue_.size() >= kMuxQueueShrinkItems ||
+            queued_bytes_ >= kMuxQueueHighWaterBytes) {
             shrink_input_queue_on_drain_ = true;
         }
         WakeInputReader();
+        return true;
     }
 
     void CloseClientInput() {
@@ -280,13 +309,15 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
-                buf::MultiBuffer mb = std::move(input_queue_.front());
+                auto& input = input_queue_.front();
+                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
+                buf::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
                 if (input_queue_.empty() && shrink_input_queue_on_drain_) {
                     TryShrinkSequence(input_queue_);
                     shrink_input_queue_on_drain_ = false;
                 }
-                co_return mb;
+                co_return payload;
             }
             if (input_done_) {
                 co_return buf::MultiBuffer{};
@@ -297,6 +328,10 @@ public:
             (void)ec;
         }
         co_return buf::MultiBuffer{};
+    }
+
+    [[nodiscard]] bool ForwardHalfCloseToPeerOnEof() const noexcept {
+        return true;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -312,8 +347,7 @@ public:
 
         for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
 
@@ -322,8 +356,7 @@ public:
             reply.is_end = false;
             reply.is_udp = false;
             reply.payload_size = buffer->Len();
-            reply.payload.push_back(buffer);
-            buffer = nullptr;
+            reply.payload.push_back(mb.ReleaseSlot(buffer));
             if (!reply_queue_.PushTcp(std::move(reply))) {
                 reply_queue_.tcp_overflowed = true;
                 Cancel();
@@ -331,6 +364,43 @@ public:
             }
         }
         mb.clear();
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        while (!cancelled_ && reply_queue_.running &&
+               reply_queue_.ShouldBackpressureTcpReads()) {
+            co_await output_sleep_.WaitFor(std::chrono::milliseconds(10));
+        }
+
+        if (cancelled_ || !reply_queue_.running) {
+            co_return;
+        }
+
+        for (const net::const_buffer& buffer : buffers) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            if (!data || buffer.size() == 0) {
+                continue;
+            }
+
+            buf::MultiBuffer payload;
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(data, buffer.size()),
+                    payload)) {
+                throw std::bad_alloc();
+            }
+
+            MuxReply reply;
+            reply.session_id = session_id_;
+            reply.is_end = false;
+            reply.is_udp = false;
+            reply.payload_size = buffer.size();
+            reply.payload = std::move(payload);
+            if (!reply_queue_.PushTcp(std::move(reply))) {
+                reply_queue_.tcp_overflowed = true;
+                Cancel();
+                break;
+            }
+        }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -347,6 +417,7 @@ public:
         output_sleep_.Cancel();
         WakeInputReader();
         input_queue_.clear();
+        queued_bytes_ = 0;
         shrink_input_queue_on_drain_ = false;
     }
 
@@ -383,7 +454,16 @@ private:
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
-    memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
+    struct QueuedInput {
+        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
+            : payload(std::move(p))
+            , bytes(n) {}
+
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    size_t queued_bytes_ = 0;
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
@@ -401,12 +481,16 @@ public:
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue,
-        uint64_t parent_conn_id)
+        uint64_t parent_conn_id,
+        TargetAddress default_target,
+        bool xudp_packet_mode)
         : io_context_(io_context)
         , input_signal_(io_context, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue)
-        , parent_conn_id_(parent_conn_id) {}
+        , parent_conn_id_(parent_conn_id)
+        , default_target_(std::move(default_target))
+        , xudp_packet_mode_(xudp_packet_mode) {}
 
     ~UdpSubState() noexcept override {
         Cancel();
@@ -415,28 +499,12 @@ public:
     UdpSubState(const UdpSubState&) = delete;
     UdpSubState& operator=(const UdpSubState&) = delete;
 
-    [[nodiscard]] bool PushClientPayload(
-        const TargetAddress& target,
-        std::span<const uint8_t> payload) {
-        if (payload.empty()) {
-            return true;
-        }
-        buf::MultiBuffer mb;
-        mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        if (!buf::AppendSpanToMultiBuffer(payload, mb)) {
-            return false;
-        }
-        for (buf::Buffer* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                buffer->SetUDP(target);
-            }
-        }
-        PushClientPayload(std::move(mb));
-        return true;
-    }
-
     void PushClientPayload(buf::MultiBuffer mb) {
         const size_t bytes = buf::TotalLen(mb);
+        PushClientPayload(std::move(mb), bytes);
+    }
+
+    void PushClientPayload(buf::MultiBuffer mb, size_t bytes) {
         if (cancelled_ || input_done_ || bytes == 0) {
             mb.clear();
             return;
@@ -446,8 +514,13 @@ public:
             Cancel();
             return;
         }
+        if (xudp_packet_mode_) {
+            FeedXudpPackets(std::move(mb));
+            return;
+        }
+        StampDefaultTarget(mb);
         queued_bytes_ += bytes;
-        input_queue_.push_back(std::move(mb));
+        input_queue_.emplace_back(std::move(mb), bytes);
         if (input_queue_.size() >= kMuxQueueShrinkItems ||
             queued_bytes_ >= kMuxQueueHighWaterBytes) {
             shrink_input_queue_on_drain_ = true;
@@ -476,14 +549,15 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
-                buf::MultiBuffer mb = std::move(input_queue_.front());
-                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                auto& input = input_queue_.front();
+                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
+                buf::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
                 if (input_queue_.empty() && shrink_input_queue_on_drain_) {
                     TryShrinkSequence(input_queue_);
                     shrink_input_queue_on_drain_ = false;
                 }
-                co_return mb;
+                co_return payload;
             }
             if (input_done_) {
                 co_return buf::MultiBuffer{};
@@ -504,13 +578,11 @@ public:
 
         for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
             if (!buffer->HasUDP()) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
 
@@ -522,8 +594,7 @@ public:
                         "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
                         parent_conn_id_, dropped);
                 }
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
 
@@ -533,12 +604,15 @@ public:
             reply.is_udp = true;
             reply.udp_src = buffer->UDP();
             reply.payload_size = payload_bytes;
-            reply.payload.push_back(buffer);
-            buffer = nullptr;
+            reply.payload.push_back(mb.ReleaseSlot(buffer));
             reply_queue_.PushUdpPrepared(
                 std::move(reply), payload_bytes + kMuxReplyOverhead);
         }
         mb.clear();
+        co_return;
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
         co_return;
     }
 
@@ -592,13 +666,93 @@ private:
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     uint64_t parent_conn_id_ = 0;
-    memory::ThreadLocalDeque<buf::MultiBuffer> input_queue_;
+    TargetAddress default_target_;
+    bool xudp_packet_mode_ = false;
+    buf::MultiBuffer xudp_pending_;
+    size_t xudp_pending_bytes_ = 0;
+    struct QueuedInput {
+        QueuedInput(buf::MultiBuffer p, size_t n) noexcept
+            : payload(std::move(p))
+            , bytes(n) {}
+
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
     bool end_sent_ = false;
     bool dispatch_done_ = false;
+
+    void StampDefaultTarget(buf::MultiBuffer& mb) {
+        for (auto* buffer : mb) {
+            if (buffer && !buffer->IsEmpty() && !buffer->HasUDP()) {
+                buffer->SetUDP(default_target_);
+            }
+        }
+    }
+
+    void QueueDecodedPayload(buf::MultiBuffer payload, size_t bytes) {
+        if (bytes == 0) {
+            payload.clear();
+            return;
+        }
+        if (queued_bytes_ + bytes > kMuxQueueEmergencyBytes) {
+            payload.clear();
+            Cancel();
+            return;
+        }
+        StampDefaultTarget(payload);
+        queued_bytes_ += bytes;
+        input_queue_.emplace_back(std::move(payload), bytes);
+        if (input_queue_.size() >= kMuxQueueShrinkItems ||
+            queued_bytes_ >= kMuxQueueHighWaterBytes) {
+            shrink_input_queue_on_drain_ = true;
+        }
+        WakeInputReader();
+    }
+
+    void FeedXudpPackets(buf::MultiBuffer mb) {
+        const size_t bytes = buf::TotalLen(mb);
+        if (bytes == 0) {
+            return;
+        }
+        mb.MoveTo(xudp_pending_);
+        xudp_pending_bytes_ += bytes;
+
+        while (xudp_pending_bytes_ >= 2) {
+            std::array<uint8_t, 2> len_bytes{};
+            if (xudp_pending_.CopyPrefixTo(len_bytes) != len_bytes.size()) {
+                return;
+            }
+            const size_t packet_len =
+                (static_cast<size_t>(len_bytes[0]) << 8) |
+                static_cast<size_t>(len_bytes[1]);
+            if (packet_len > buf::Buffer::kSize) {
+                xudp_pending_.clear();
+                xudp_pending_bytes_ = 0;
+                Cancel();
+                return;
+            }
+            if (xudp_pending_bytes_ < 2 + packet_len) {
+                return;
+            }
+
+            xudp_pending_.DropPrefixBytes(2);
+            xudp_pending_bytes_ -= 2;
+            buf::MultiBuffer payload;
+            if (!xudp_pending_.MovePrefixTo(payload, packet_len)) {
+                xudp_pending_.clear();
+                xudp_pending_bytes_ = 0;
+                Cancel();
+                return;
+            }
+            xudp_pending_bytes_ -= packet_len;
+            QueueDecodedPayload(std::move(payload), packet_len);
+        }
+    }
 };
 
 using UdpSubInfo = std::unique_ptr<UdpSubState>;
@@ -691,6 +845,8 @@ net::awaitable<RelayResult> DoMuxRelay(
     uint32_t pressure_idle_timeout,
     const UDPRelayConfig& config)
 {
+    using namespace net::experimental::awaitable_operators;
+
     if (!client_link.Valid()) {
         RelayResult error;
         error.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -698,7 +854,9 @@ net::awaitable<RelayResult> DoMuxRelay(
     }
 
     // 回包队列：单线程，无锁；running 保护回调不在 DoMuxRelay 退出后继续推送。
-    ReplyQueueState reply_queue{io_context};
+    SignalChannel main_signal{io_context, 1};
+    ReplyQueueState reply_queue{io_context, main_signal};
+    ClientReadQueueState client_reads{io_context, main_signal};
 
     // 子会话集合
     memory::ThreadLocalUnorderedMap<uint16_t, UdpSubInfo> udp_subs;
@@ -706,91 +864,88 @@ net::awaitable<RelayResult> DoMuxRelay(
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
-    std::vector<uint8_t> write_frame;
+    size_t frame_buf_bytes = 0;
+    memory::ByteVector write_frame;
 
     RelayResult result;
     parent_ctx.traffic.bytes_up = 0;
     parent_ctx.traffic.bytes_down = 0;
 
-    auto& timeout_scheduler = TimeoutScheduler::ForIoContext(io_context);
-    TimeoutToken read_poll_token;
     const uint64_t parent_conn_id = parent_ctx.conn_id;
-
-    struct ReadPollState {
-        bool timed_out = false;
-        bool active = true;
-        void Reset() noexcept {
-            timed_out = false;
-            active = true;
-        }
-        bool TakeActive() noexcept {
-            if (!active) {
-                return false;
-            }
-            active = false;
-            return true;
-        }
-        void MarkInactive() noexcept {
-            active = false;
-        }
-    };
-    ReadPollState read_poll;
 
     bool running = true;
     bool client_input_done = false;
+
+    auto client_reader_loop = [&]() -> net::awaitable<void> {
+        while (client_reads.running) {
+            try {
+                buf::MultiBuffer read_mb = co_await client_link.reader->ReadMultiBuffer();
+                if (!buf::HasData(read_mb)) {
+                    client_reads.MarkDone(ErrorCode::OK);
+                    co_return;
+                }
+                const size_t read_bytes = buf::TotalLen(read_mb);
+                if (!client_reads.Push(std::move(read_mb), read_bytes)) {
+                    client_reads.MarkDone(ErrorCode::RESOURCE_EXHAUSTED);
+                    co_return;
+                }
+                while (client_reads.running &&
+                       client_reads.ShouldBackpressureReads()) {
+                    auto [ec] = co_await client_reads.space_signal.async_receive(
+                        net::as_tuple(net::use_awaitable));
+                    if (ec) {
+                        client_reads.MarkDone(ErrorCode::OK);
+                        co_return;
+                    }
+                }
+            } catch (const IoSystemError&) {
+                ErrorCode ec = ErrorCode::OK;
+                if (client_control && ConsumeReadSideTimeout(*client_control)) {
+                    ec = ErrorCode::RELAY_TIMEOUT;
+                }
+                client_reads.MarkDone(ec);
+                co_return;
+            } catch (...) {
+                client_reads.MarkDone(ErrorCode::INTERNAL);
+                co_return;
+            }
+        }
+        client_reads.MarkDone(ErrorCode::OK);
+    };
+
+    net::co_spawn(io_context.get_executor(), client_reader_loop(), net::detached);
     auto release_write_frame = [&]() noexcept {
         write_frame.clear();
         ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
     };
-    auto write_multibuffer_to_client =
-        [&](buf::MultiBuffer frame_mb, size_t frame_size) -> net::awaitable<bool> {
-            try {
-                if (frame_size == 0) {
-                    frame_mb.clear();
-                    co_return true;
-                }
-
-                co_await client_link.writer->WriteMultiBuffer(std::move(frame_mb));
-                frame_mb.clear();
-                parent_ctx.traffic.bytes_down += frame_size;
-                result.bytes_down += frame_size;
-                co_return true;
-            } catch (const IoSystemError&) {
-                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
-                    result.error = ErrorCode::RELAY_TIMEOUT;
-                }
-                co_return false;
-            } catch (...) {
-                co_return false;
-            }
-        };
-
     auto write_frame_to_client =
-        [&](std::vector<uint8_t>& frame) -> net::awaitable<bool> {
+        [&](memory::ByteVector& frame) -> net::awaitable<bool> {
             const size_t frame_size = frame.size();
             if (frame_size == 0) {
                 release_write_frame();
                 co_return true;
             }
 
-            buf::MultiBuffer frame_mb;
-            frame_mb.reserve((frame_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(frame.data(), frame.size()),
-                    frame_mb)) {
-                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+            std::array<net::const_buffer, 1> buffers{
+                net::const_buffer(frame.data(), frame.size())};
+            try {
+                co_await client_link.writer->WriteBuffers(buffers);
+                parent_ctx.traffic.bytes_down += frame_size;
+                result.bytes_down += frame_size;
                 release_write_frame();
-                co_return false;
+                co_return true;
+            } catch (const IoSystemError&) {
+                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
+                    result.error = ErrorCode::RELAY_TIMEOUT;
+                }
+            } catch (...) {
             }
-
-            const bool ok = co_await write_multibuffer_to_client(
-                std::move(frame_mb), frame_size);
             release_write_frame();
-            co_return ok;
+            co_return false;
         };
 
     auto write_payload_frame_to_client =
-        [&](std::vector<uint8_t>& frame, MuxReply& reply) -> net::awaitable<bool> {
+        [&](memory::ByteVector& frame, MuxReply& reply) -> net::awaitable<bool> {
             const size_t payload_size = reply.PayloadSize();
             const size_t frame_size = frame.size() + payload_size;
             if (frame_size == 0) {
@@ -798,21 +953,61 @@ net::awaitable<RelayResult> DoMuxRelay(
                 co_return true;
             }
 
-            buf::MultiBuffer frame_mb;
-            frame_mb.reserve(1 + reply.payload.size());
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(frame.data(), frame.size()),
-                    frame_mb)) {
-                result.error = ErrorCode::RESOURCE_EXHAUSTED;
-                release_write_frame();
-                co_return false;
-            }
-            MoveOwnedPayloadBuffers(frame_mb, reply.payload);
+            std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity>
+                inline_buffers{};
+            memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+            size_t buffer_count = 0;
+            auto append_buffer = [&](net::const_buffer send_buffer) {
+                if (buffer_count < inline_buffers.size()) {
+                    inline_buffers[buffer_count++] = send_buffer;
+                    return;
+                }
+                if (spill_buffers.empty()) {
+                    spill_buffers.reserve(1 + reply.payload.size());
+                    spill_buffers.insert(
+                        spill_buffers.end(),
+                        inline_buffers.begin(),
+                        inline_buffers.begin() + buffer_count);
+                }
+                spill_buffers.emplace_back(send_buffer);
+                ++buffer_count;
+            };
 
-            const bool ok = co_await write_multibuffer_to_client(
-                std::move(frame_mb), frame_size);
+            if (!frame.empty()) {
+                append_buffer(net::const_buffer(frame.data(), frame.size()));
+            }
+            for (const auto* buffer : reply.payload) {
+                if (!buffer || buffer->IsEmpty()) {
+                    continue;
+                }
+                const auto bytes = buffer->Bytes();
+                append_buffer(net::const_buffer(bytes.data(), bytes.size()));
+            }
+
+            const auto buffers = spill_buffers.empty()
+                ? std::span<const net::const_buffer>(
+                    inline_buffers.data(),
+                    buffer_count)
+                : std::span<const net::const_buffer>(
+                    spill_buffers.data(),
+                    spill_buffers.size());
+
+            try {
+                co_await client_link.writer->WriteBuffers(buffers);
+                reply.payload.clear();
+                parent_ctx.traffic.bytes_down += frame_size;
+                result.bytes_down += frame_size;
+                release_write_frame();
+                co_return true;
+            } catch (const IoSystemError&) {
+                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
+                    result.error = ErrorCode::RELAY_TIMEOUT;
+                }
+            } catch (...) {
+            }
+            reply.payload.clear();
             release_write_frame();
-            co_return ok;
+            co_return false;
         };
 
     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
@@ -841,6 +1036,9 @@ net::awaitable<RelayResult> DoMuxRelay(
                     write_frame,
                     reply.session_id, reply.udp_src,
                     payload_size)) {
+                    LOG_CONN_DEBUG(parent_ctx,
+                        "[MuxRelay] UDP reply header encode failed sid={} src={} payload={}B",
+                        reply.session_id, reply.udp_src, payload_size);
                     continue;
                 }
                 if (!co_await write_payload_frame_to_client(write_frame, reply)) {
@@ -867,19 +1065,6 @@ net::awaitable<RelayResult> DoMuxRelay(
         }
         if (!running) break;
 
-        if (client_input_done) {
-            if (reply_queue.Empty() && reply_queue.active_sub_loops == 0) {
-                break;
-            }
-            auto [ec] = co_await reply_queue.reply_signal.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                running = false;
-                break;
-            }
-            continue;
-        }
-
         if (reply_queue.tcp_overflowed) {
             reply_queue.tcp_overflowed = false;
             LOG_CONN_DEBUG(parent_ctx,
@@ -890,97 +1075,83 @@ net::awaitable<RelayResult> DoMuxRelay(
             break;
         }
 
-        // --------------------------------------------------------------------
-        // 2. 从客户端读取（100ms 轮询：超时则回到步骤 1 排空回包队列）
-        // --------------------------------------------------------------------
-        read_poll.Reset();
-        read_poll_token = timeout_scheduler.ScheduleAfter(
-            std::chrono::milliseconds(100),
-            [&read_poll, client_control]() {
-            if (client_control && read_poll.TakeActive()) {
-                read_poll.timed_out = true;
-                client_control->Cancel();
+        if (client_input_done) {
+            if (reply_queue.Empty() && reply_queue.active_sub_loops == 0) {
+                break;
             }
-        });
-
-        buf::MultiBuffer read_mb;
-        size_t read_bytes = 0;
-        try {
-            read_mb = co_await client_link.reader->ReadMultiBuffer();
-            read_bytes = buf::TotalLen(read_mb);
-            read_poll.MarkInactive();
-            timeout_scheduler.Cancel(read_poll_token);
-        } catch (const IoSystemError&) {
-            read_poll.MarkInactive();
-            timeout_scheduler.Cancel(read_poll_token);
-            if (read_poll.timed_out) {
-                if (client_control && ConsumeReadSideTimeout(*client_control)) {
-                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
-                    result.error = ErrorCode::RELAY_TIMEOUT;
-                    running = false;
-                    break;
-                }
-                // 100ms 超时：继续排空回包队列
-                continue;
-            }
-            if (client_control && ConsumeReadSideTimeout(*client_control)) {
-                LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
-                result.error = ErrorCode::RELAY_TIMEOUT;
-            }
-            // 真实 I/O 错误
-            running = false;
-            break;
-        }
-
-        if (read_poll.timed_out && read_bytes == 0) {
-            if (client_control && ConsumeReadSideTimeout(*client_control)) {
-                LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
-                result.error = ErrorCode::RELAY_TIMEOUT;
+            auto [ec] = co_await main_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
                 running = false;
                 break;
             }
             continue;
         }
 
+        // --------------------------------------------------------------------
+        // 2. 消费客户端读队列。读操作由独立协程持有，避免为了轮询回包而
+        //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
+        // --------------------------------------------------------------------
+        buf::MultiBuffer read_mb;
+        if (!client_reads.Pop(read_mb)) {
+            if (!reply_queue.Empty()) {
+                continue;
+            }
+            if (client_reads.done) {
+                if (client_reads.error != ErrorCode::OK) {
+                    if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
+                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                    }
+                    result.error = client_reads.error;
+                    running = false;
+                    break;
+                }
+                client_input_done = true;
+                continue;
+            }
+
+            auto [ec] = co_await main_signal.async_receive(
+                net::as_tuple(net::use_awaitable));
+            (void)ec;
+            continue;
+        }
+
+        const size_t read_bytes = buf::TotalLen(read_mb);
         if (read_bytes == 0) {
-            if (client_control && ConsumeReadSideTimeout(*client_control)) {
+            if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
                 LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
                 result.error = ErrorCode::RELAY_TIMEOUT;
                 running = false;
                 break;
             }
-            client_input_done = true;
+            if (client_reads.done && client_reads.error != ErrorCode::OK) {
+                result.error = client_reads.error;
+                running = false;
+                break;
+            }
             continue;
         }
         parent_ctx.traffic.bytes_up += read_bytes;
         result.bytes_up += read_bytes;
 
-        AppendOwnedBuffers(frame_buf, read_mb);
-
-        std::vector<uint8_t> frame_scratch;
-        std::span<const uint8_t> parse_bytes;
-        if (frame_buf.size() == 1) {
-            const buf::Buffer* buffer = *frame_buf.begin();
-            if (buffer && !buffer->IsEmpty()) {
-                parse_bytes = buffer->Bytes();
-            }
-        }
-        if (parse_bytes.empty() && !frame_buf.empty()) {
-            CopyMultiBufferToScratch(frame_buf, frame_scratch);
-            parse_bytes = std::span<const uint8_t>(
-                frame_scratch.data(),
-                frame_scratch.size());
-        }
-        const uint8_t* parse_data = parse_bytes.data();
-        const size_t parse_size = parse_bytes.size();
-        size_t parse_offset = 0;
+        read_mb.MoveTo(frame_buf);
+        frame_buf_bytes += read_bytes;
 
         // --------------------------------------------------------------------
         // 3. 循环解析并分发 Mux 帧
         // --------------------------------------------------------------------
-        while (running && parse_offset < parse_size) {
-            size_t remaining = parse_size - parse_offset;
-            auto opt_hdr = mux::DecodeFrame(parse_data + parse_offset, remaining);
+        while (running && frame_buf_bytes > 0) {
+            std::optional<mux::FrameHeader> opt_hdr;
+            const auto prefix = frame_buf.FrontSpan();
+            if (!prefix.empty()) {
+                opt_hdr = mux::DecodeFramePrefix(
+                    prefix.data(),
+                    prefix.size(),
+                    frame_buf_bytes);
+            }
+            if (!opt_hdr) {
+                opt_hdr = mux::DecodeFrame(frame_buf, 0, frame_buf_bytes);
+            }
             if (!opt_hdr) break;  // 数据不足，等待下次读取
 
             const mux::FrameHeader& hdr = *opt_hdr;
@@ -991,11 +1162,19 @@ net::awaitable<RelayResult> DoMuxRelay(
                 break;
             }
 
-            // Payload 指针（仅 has_data 时有效）
-            const uint8_t* payload = nullptr;
+            buf::MultiBuffer frame_payload;
             if (hdr.has_data && hdr.data_len > 0) {
-                payload = parse_data + parse_offset + (hdr.frame_size - hdr.data_len);
+                if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
+                    !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
+                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] payload extraction failed");
+                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                    running = false;
+                    break;
+                }
+            } else {
+                frame_buf.DropPrefixBytes(hdr.frame_size);
             }
+            frame_buf_bytes -= std::min(frame_buf_bytes, hdr.frame_size);
 
             switch (hdr.status) {
 
@@ -1012,7 +1191,9 @@ net::awaitable<RelayResult> DoMuxRelay(
             case mux::SessionStatus::NEW: {
                 if (hdr.network == mux::NetworkType::UDP) {
                     // ---- 新建 UDP 子会话 ----
-                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New UDP sid={}", hdr.session_id);
+                    LOG_CONN_DEBUG(parent_ctx,
+                        "[MuxRelay] New UDP sid={} target={} data={}B global_id={}",
+                        hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
 
                     uint16_t sid = hdr.session_id;
                     if (!hdr.has_target || udp_subs.find(sid) != udp_subs.end()) {
@@ -1022,7 +1203,12 @@ net::awaitable<RelayResult> DoMuxRelay(
                     }
 
                     auto sub_state = std::make_unique<UdpSubState>(
-                        io_context, sid, reply_queue, parent_conn_id);
+                        io_context,
+                        sid,
+                        reply_queue,
+                        parent_conn_id,
+                        hdr.target,
+                        hdr.has_global_id);
                     auto& sub_ctx = sub_state->ctx;
                     sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
                     sub_ctx.worker_id                = parent_ctx.worker_id;
@@ -1040,15 +1226,13 @@ net::awaitable<RelayResult> DoMuxRelay(
                     sub_ctx.outbound.original_target = hdr.target;
                     sub_ctx.outbound.target          = hdr.target;
 
-                    if (payload && hdr.data_len > 0 &&
-                        !sub_state->PushClientPayload(
-                            hdr.target,
-                            std::span<const uint8_t>(payload, hdr.data_len))) {
-                        LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] UDP payload buffer allocation failed sid={}", sid);
-                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                        (void)co_await write_frame_to_client(write_frame);
-                        break;
+                    if (buf::HasData(frame_payload)) {
+                        for (auto* buffer : frame_payload) {
+                            if (buffer && !buffer->IsEmpty()) {
+                                buffer->SetUDP(hdr.target);
+                            }
+                        }
+                        sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
                     }
 
                     auto [insert_it, inserted] = udp_subs.try_emplace(
@@ -1111,11 +1295,10 @@ net::awaitable<RelayResult> DoMuxRelay(
                         sub_ctx.outbound.target          = hdr.target;
                     }
 
-                    if (payload && hdr.data_len > 0 &&
-                        !sub_state->PushClientPayload(
-                            std::span<const uint8_t>(payload, hdr.data_len))) {
+                    if (buf::HasData(frame_payload) &&
+                        !sub_state->PushClientPayload(std::move(frame_payload))) {
                         LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] TCP payload buffer allocation failed sid={}", sid);
+                            "[MuxRelay] TCP input queue overflow sid={}", sid);
                         mux::EncodeEndTo(write_frame, hdr.session_id, true);
                         (void)co_await write_frame_to_client(write_frame);
                         break;
@@ -1147,28 +1330,31 @@ net::awaitable<RelayResult> DoMuxRelay(
 
             // ----------------------------------------------------------------
             case mux::SessionStatus::KEEP: {
-                if (hdr.has_target) {
-                    // UDP 数据包（携带目标/源地址）
-                    auto it = udp_subs.find(hdr.session_id);
-                    if (it != udp_subs.end() && payload && hdr.data_len > 0) {
-                        if (!it->second->PushClientPayload(
-                                hdr.target,
-                                std::span<const uint8_t>(payload, hdr.data_len))) {
-                            it->second->Cancel();
+                auto udp_it = udp_subs.find(hdr.session_id);
+                if (udp_it != udp_subs.end()) {
+                    if (hdr.has_target && buf::HasData(frame_payload)) {
+                        for (auto* buffer : frame_payload) {
+                            if (buffer && !buffer->IsEmpty()) {
+                                buffer->SetUDP(hdr.target);
+                            }
                         }
+                    }
+                    if (buf::HasData(frame_payload)) {
+                        udp_it->second->PushClientPayload(std::move(frame_payload), hdr.data_len);
                     }
                 } else {
                     // TCP 数据
                     auto it = tcp_subs.find(hdr.session_id);
                     bool tcp_write_failed = false;
-                    if (it != tcp_subs.end() && payload && hdr.data_len > 0) {
-                        if (!it->second->PushClientPayload(
-                                std::span<const uint8_t>(payload, hdr.data_len))) {
+                    if (it != tcp_subs.end() && buf::HasData(frame_payload)) {
+                        if (!it->second->PushClientPayload(std::move(frame_payload))) {
                             tcp_write_failed = true;
-                            it->second->Cancel();
                         }
                     }
                     if (tcp_write_failed) {
+                        if (it != tcp_subs.end()) {
+                            it->second->Cancel();
+                        }
                         mux::EncodeEndTo(write_frame, hdr.session_id);
                         if (!co_await write_frame_to_client(write_frame)) {
                             running = false;
@@ -1187,6 +1373,16 @@ net::awaitable<RelayResult> DoMuxRelay(
                 auto udp_it = udp_subs.find(sid);
                 if (udp_it != udp_subs.end()) {
                     known_session = true;
+                    if (hdr.has_target && buf::HasData(frame_payload)) {
+                        for (auto* buffer : frame_payload) {
+                            if (buffer && !buffer->IsEmpty()) {
+                                buffer->SetUDP(hdr.target);
+                            }
+                        }
+                    }
+                    if (buf::HasData(frame_payload)) {
+                        udp_it->second->PushClientPayload(std::move(frame_payload), hdr.data_len);
+                    }
                     udp_it->second->CloseClientInput();
                     if (udp_it->second->DispatchDone()) {
                         udp_subs.erase(udp_it);
@@ -1197,6 +1393,10 @@ net::awaitable<RelayResult> DoMuxRelay(
                 auto tcp_it = tcp_subs.find(sid);
                 if (tcp_it != tcp_subs.end()) {
                     known_session = true;
+                    if (buf::HasData(frame_payload) &&
+                        !tcp_it->second->PushClientPayload(std::move(frame_payload))) {
+                        tcp_it->second->Cancel();
+                    }
                     tcp_it->second->CloseClientInput();
                     if (tcp_it->second->DispatchDone()) {
                         tcp_subs.erase(tcp_it);
@@ -1215,15 +1415,7 @@ net::awaitable<RelayResult> DoMuxRelay(
             }
 
             }  // switch (hdr.status)
-
-            // 移动偏移游标（O(1)），代替逐帧 erase 的 O(n) memmove
-            parse_offset += hdr.frame_size;
         }
-
-        if (parse_offset > 0) {
-            ConsumeMultiBuffer(frame_buf, parse_offset);
-        }
-        ReleaseIdleBuffer(frame_scratch, 0);
     }
 
     release_write_frame();
@@ -1233,8 +1425,18 @@ net::awaitable<RelayResult> DoMuxRelay(
     // ------------------------------------------------------------------------
     // 先标记停止，阻止回调继续推送到 reply_queue
     reply_queue.running = false;
-    read_poll.MarkInactive();
-    timeout_scheduler.Cancel(read_poll_token);
+    client_reads.running = false;
+    client_reads.WakeSpace();
+    if (client_control) {
+        client_control->Cancel();
+    }
+    while (!client_reads.done) {
+        auto [ec] = co_await client_reads.done_signal.async_receive(
+            net::as_tuple(net::use_awaitable));
+        if (ec) {
+            break;
+        }
+    }
     co_await net::post(io_context.get_executor(), net::use_awaitable);
 
     LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: UDP={} TCP={}",

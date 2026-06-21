@@ -3,6 +3,8 @@
 #include "../anytls_codec.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
@@ -18,7 +20,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -41,6 +42,7 @@ using namespace ::acpp::anytls;
 namespace {
 
 constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
+constexpr size_t kSubStreamQueueShrinkItems = 64;
 
 class AnyTLSOnlineSession {
 public:
@@ -164,198 +166,162 @@ std::optional<TargetAddress> ParseSocksAddress(std::span<const uint8_t> data) {
     return std::nullopt;
 }
 
-std::string FlattenToString(const buf::MultiBuffer& mb) {
-    std::string out;
-    out.reserve(buf::TotalLen(mb));
-    for (const auto* buffer : mb) {
-        if (buffer && !buffer->IsEmpty()) {
-            auto bytes = buffer->Bytes();
-            out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        }
-    }
-    return out;
-}
-
-net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>>
-ReadNextPshPayload(AsyncStream& stream, uint32_t sid) {
-    while (true) {
-        auto header = co_await anytls::ReadFrameHeader(stream);
-        if (!header) {
-            co_return std::unexpected(header.error());
-        }
-        if (header->sid != 0 && header->sid != sid) {
-            if (auto ok = co_await anytls::DiscardFramePayload(stream, header->length); !ok) {
-                co_return std::unexpected(ok.error());
-            }
-            continue;
-        }
-        switch (header->cmd) {
-            case anytls::kCmdWaste:
-            case anytls::kCmdHeartRequest:
-            case anytls::kCmdHeartResponse:
-            case anytls::kCmdServerSettings:
-            case anytls::kCmdUpdatePaddingScheme:
-                if (auto ok = co_await anytls::DiscardFramePayload(stream, header->length); !ok) {
-                    co_return std::unexpected(ok.error());
-                }
-                break;
-            case anytls::kCmdPSH:
-                co_return co_await anytls::ReadFramePayload(stream, header->length);
-            case anytls::kCmdFIN:
-                (void)co_await anytls::DiscardFramePayload(stream, header->length);
-                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
-            default:
-                (void)co_await anytls::DiscardFramePayload(stream, header->length);
-                co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_COMMAND);
-        }
-    }
-}
-
-class AnyTLSStreamReader final : public transport::MultiBufferReader {
+class MultiBufferByteReader {
 public:
-    AnyTLSStreamReader(AsyncStream& stream, uint32_t sid) noexcept
-        : stream_(stream), sid_(sid) {}
+    MultiBufferByteReader(const buf::MultiBuffer& data, size_t size) noexcept
+        : data_(data), size_(size) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        while (true) {
-            auto header = co_await anytls::ReadFrameHeader(stream_);
-            if (!header) {
-                co_return buf::MultiBuffer{};
-            }
-            if (header->sid != 0 && header->sid != sid_) {
-                (void)co_await anytls::DiscardFramePayload(stream_, header->length);
-                continue;
-            }
-            switch (header->cmd) {
-                case anytls::kCmdWaste:
-                case anytls::kCmdHeartRequest:
-                case anytls::kCmdHeartResponse:
-                case anytls::kCmdServerSettings:
-                case anytls::kCmdUpdatePaddingScheme:
-                    (void)co_await anytls::DiscardFramePayload(stream_, header->length);
-                    break;
-                case anytls::kCmdPSH: {
-                    auto payload = co_await anytls::ReadFramePayload(stream_, header->length);
-                    if (!payload) {
-                        co_return buf::MultiBuffer{};
-                    }
-                    co_return std::move(*payload);
-                }
-                case anytls::kCmdFIN:
-                    (void)co_await anytls::DiscardFramePayload(stream_, header->length);
-                    co_return buf::MultiBuffer{};
-                default:
-                    (void)co_await anytls::DiscardFramePayload(stream_, header->length);
-                    co_return buf::MultiBuffer{};
-            }
+    [[nodiscard]] bool Ok() const noexcept { return !error_; }
+
+    [[nodiscard]] uint8_t ReadU8() noexcept {
+        uint8_t out = 0;
+        if (!ReadBytes(std::span<uint8_t>(&out, 1))) {
+            return 0;
         }
+        return out;
     }
 
-private:
-    AsyncStream& stream_;
-    uint32_t sid_;
-};
-
-class AnyTLSUotReader final : public transport::MultiBufferReader {
-public:
-    AnyTLSUotReader(AsyncStream& stream,
-                    uint32_t sid,
-                    TargetAddress source,
-                    std::string initial_pending)
-        : stream_(stream)
-        , sid_(sid)
-        , source_(std::move(source))
-        , initial_pending_(std::move(initial_pending)) {}
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        while (true) {
-            if (!initial_pending_.empty()) {
-                buf::MultiBuffer out;
-                buf::BufferGuard buffer{buf::Buffer::New()};
-                if (!buffer || initial_pending_.size() > buffer->Available()) {
-                    initial_pending_.clear();
-                    co_return buf::MultiBuffer{};
-                }
-                std::memcpy(buffer->Tail().data(), initial_pending_.data(), initial_pending_.size());
-                buffer->Produce(static_cast<uint32_t>(initial_pending_.size()));
-                buffer->SetUDP(source_);
-                out.push_back(buffer.release());
-                initial_pending_.clear();
-                co_return out;
-            }
-
-            auto payload = co_await ReadNextPshPayload(stream_, sid_);
-            if (!payload) {
-                co_return buf::MultiBuffer{};
-            }
-            for (auto* buffer : *payload) {
-                if (buffer && !buffer->IsEmpty()) {
-                    buffer->SetUDP(source_);
-                }
-            }
-            co_return std::move(*payload);
+    [[nodiscard]] uint16_t ReadU16BE() noexcept {
+        std::array<uint8_t, 2> bytes{};
+        if (!ReadBytes(bytes)) {
+            return 0;
         }
+        return static_cast<uint16_t>(
+            (static_cast<uint16_t>(bytes[0]) << 8) |
+            static_cast<uint16_t>(bytes[1]));
     }
 
-private:
-    AsyncStream& stream_;
-    uint32_t sid_;
-    TargetAddress source_;
-    std::string initial_pending_;
-};
-
-class AnyTLSStreamWriter final : public transport::MultiBufferWriter {
-public:
-    AnyTLSStreamWriter(AsyncStream& stream, uint32_t sid) noexcept
-        : stream_(stream), sid_(sid) {}
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        auto ok = co_await anytls::WriteMultiBufferAsFrames(
-            stream_, anytls::kCmdPSH, sid_, std::move(mb));
-        if (!ok) {
-            throw IoSystemError(make_error_code(std::errc::io_error));
+    [[nodiscard]] std::string ReadString(size_t len) {
+        std::string out(len, '\0');
+        if (len == 0) {
+            return out;
         }
+        if (!ReadBytes(std::span<uint8_t>(
+                reinterpret_cast<uint8_t*>(out.data()), out.size()))) {
+            return {};
+        }
+        return out;
     }
 
-    net::awaitable<void> AsyncShutdownWrite() override {
-        (void)co_await anytls::WriteFrame(stream_, anytls::kCmdFIN, sid_, {});
-    }
-
-private:
-    AsyncStream& stream_;
-    uint32_t sid_;
-};
-
-class AnyTLSUotWriter final : public transport::MultiBufferWriter {
-public:
-    AnyTLSUotWriter(AsyncStream& stream, uint32_t sid) noexcept
-        : stream_(stream), sid_(sid) {}
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        for (auto* buffer : mb) {
+    [[nodiscard]] bool ReadBytes(std::span<uint8_t> out) noexcept {
+        if (error_ || pos_ + out.size() > size_) {
+            error_ = true;
+            return false;
+        }
+        size_t skip = pos_;
+        size_t copied = 0;
+        for (const auto* buffer : data_) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
-            auto ok = co_await anytls::WriteFrame(
-                stream_,
-                anytls::kCmdPSH,
-                sid_,
-                buffer->Bytes());
-            if (!ok) {
-                throw IoSystemError(make_error_code(std::errc::io_error));
+            const auto bytes = buffer->Bytes();
+            if (skip >= bytes.size()) {
+                skip -= bytes.size();
+                continue;
             }
+            const size_t n = std::min(bytes.size() - skip, out.size() - copied);
+            std::memcpy(out.data() + copied, bytes.data() + skip, n);
+            copied += n;
+            if (copied == out.size()) {
+                pos_ += out.size();
+                return true;
+            }
+            skip = 0;
         }
-        mb.clear();
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        (void)co_await anytls::WriteFrame(stream_, anytls::kCmdFIN, sid_, {});
+        error_ = true;
+        return false;
     }
 
 private:
-    AsyncStream& stream_;
-    uint32_t sid_;
+    const buf::MultiBuffer& data_;
+    size_t size_ = 0;
+    size_t pos_ = 0;
+    bool error_ = false;
 };
+
+std::optional<TargetAddress> ParseSocksAddress(const buf::MultiBuffer& data, size_t size) {
+    MultiBufferByteReader reader(data, size);
+    const uint8_t atype = reader.ReadU8();
+    if (atype == 0x01) {
+        net::ip::address_v4::bytes_type bytes{};
+        const uint16_t port = [&]() {
+            (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
+            return reader.ReadU16BE();
+        }();
+        if (!reader.Ok()) {
+            return std::nullopt;
+        }
+        return TargetAddress(net::ip::make_address_v4(bytes), port);
+    }
+    if (atype == 0x04) {
+        net::ip::address_v6::bytes_type bytes{};
+        const uint16_t port = [&]() {
+            (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
+            return reader.ReadU16BE();
+        }();
+        if (!reader.Ok()) {
+            return std::nullopt;
+        }
+        return TargetAddress(net::ip::make_address_v6(bytes), port);
+    }
+    if (atype == 0x03) {
+        const uint8_t len = reader.ReadU8();
+        std::string host = reader.ReadString(len);
+        const uint16_t port = reader.ReadU16BE();
+        if (!reader.Ok() || len == 0) {
+            return std::nullopt;
+        }
+        return TargetAddress(std::string_view(host), port);
+    }
+    return std::nullopt;
+}
+
+std::expected<anytls::UotRequest, ErrorCode> DecodeUotRequest(
+    const buf::MultiBuffer& data,
+    size_t size) {
+    if (size < 1 + 1 + 2) {
+        return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    MultiBufferByteReader reader(data, size);
+    anytls::UotRequest request;
+    request.is_connect = reader.ReadU8() != 0;
+    const uint8_t atype = reader.ReadU8();
+    if (atype == 0x01) {
+        net::ip::address_v4::bytes_type bytes{};
+        (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
+        const uint16_t port = reader.ReadU16BE();
+        if (!reader.Ok()) {
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        request.destination = TargetAddress(net::ip::make_address_v4(bytes), port);
+        request.consumed = 1 + 1 + bytes.size() + 2;
+        return request;
+    }
+    if (atype == 0x04) {
+        net::ip::address_v6::bytes_type bytes{};
+        (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
+        const uint16_t port = reader.ReadU16BE();
+        if (!reader.Ok()) {
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        request.destination = TargetAddress(net::ip::make_address_v6(bytes), port);
+        request.consumed = 1 + 1 + bytes.size() + 2;
+        return request;
+    }
+    if (atype == 0x03) {
+        const uint8_t host_len = reader.ReadU8();
+        std::string host = reader.ReadString(host_len);
+        const uint16_t port = reader.ReadU16BE();
+        if (!reader.Ok() || host_len == 0) {
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        request.destination = TargetAddress(std::string_view(host), port);
+        request.consumed = 1 + 1 + 1 + host_len + 2;
+        return request;
+    }
+    return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+}
 
 class AnyTLSDemuxSession;
 
@@ -385,11 +351,15 @@ public:
     }
 
     net::awaitable<bool> PushInput(buf::MultiBuffer mb) {
+        const size_t bytes = buf::TotalLen(mb);
+        co_return co_await PushInput(std::move(mb), bytes);
+    }
+
+    net::awaitable<bool> PushInput(buf::MultiBuffer mb, size_t bytes) {
         if (cancelled_ || input_done_) {
             mb.clear();
             co_return false;
         }
-        const size_t bytes = buf::TotalLen(mb);
         if (bytes == 0) {
             mb.clear();
             co_return true;
@@ -412,8 +382,11 @@ public:
             mb.clear();
             co_return false;
         }
-        input_queue_.push_back(std::move(mb));
+        input_queue_.push_back(QueuedInput{std::move(mb), bytes});
         queued_bytes_ += bytes;
+        if (input_queue_.size() >= kSubStreamQueueShrinkItems) {
+            shrink_queue_on_drain_ = true;
+        }
         WakeInputReader();
         co_return true;
     }
@@ -434,6 +407,7 @@ public:
         input_done_ = true;
         input_queue_.clear();
         queued_bytes_ = 0;
+        shrink_queue_on_drain_ = false;
         WakeInputReader();
         WakeInputWriter();
     }
@@ -441,11 +415,12 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
-                buf::MultiBuffer mb = std::move(input_queue_.front());
-                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                QueuedInput input = std::move(input_queue_.front());
+                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
                 input_queue_.pop_front();
+                ShrinkQueueIfDrained();
                 WakeInputWriter();
-                co_return mb;
+                co_return std::move(input.payload);
             }
             if (input_done_) {
                 co_return buf::MultiBuffer{};
@@ -460,6 +435,7 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
@@ -477,13 +453,25 @@ private:
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
+    void ShrinkQueueIfDrained() noexcept {
+        if (input_queue_.empty() && shrink_queue_on_drain_) {
+            TryShrinkSequence(input_queue_);
+            shrink_queue_on_drain_ = false;
+        }
+    }
+
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     net::experimental::channel<void(IoErrorCode)> input_space_signal_;
     std::shared_ptr<AnyTLSDemuxSession> session_;
     uint32_t sid_ = 0;
-    std::deque<buf::MultiBuffer> input_queue_;
+    struct QueuedInput {
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
+    bool shrink_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
 };
@@ -492,23 +480,19 @@ class AnyTLSUotSubReader final : public transport::MultiBufferReader {
 public:
     AnyTLSUotSubReader(std::shared_ptr<AnyTLSSubStream> sub,
                        TargetAddress source,
-                       std::string initial_pending)
+                       buf::MultiBuffer initial_pending)
         : sub_(std::move(sub))
         , source_(std::move(source))
         , initial_pending_(std::move(initial_pending)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!initial_pending_.empty()) {
-            buf::MultiBuffer out;
-            buf::BufferGuard buffer{buf::Buffer::New()};
-            if (!buffer || initial_pending_.size() > buffer->Available()) {
-                initial_pending_.clear();
-                co_return buf::MultiBuffer{};
+            buf::MultiBuffer out = std::move(initial_pending_);
+            for (auto* buffer : out) {
+                if (buffer && !buffer->IsEmpty()) {
+                    buffer->SetUDP(source_);
+                }
             }
-            std::memcpy(buffer->Tail().data(), initial_pending_.data(), initial_pending_.size());
-            buffer->Produce(static_cast<uint32_t>(initial_pending_.size()));
-            buffer->SetUDP(source_);
-            out.push_back(buffer.release());
             initial_pending_.clear();
             co_return out;
         }
@@ -525,7 +509,7 @@ public:
 private:
     std::shared_ptr<AnyTLSSubStream> sub_;
     TargetAddress source_;
-    std::string initial_pending_;
+    buf::MultiBuffer initial_pending_;
 };
 
 class AnyTLSDemuxSession final : public std::enable_shared_from_this<AnyTLSDemuxSession> {
@@ -613,8 +597,49 @@ public:
             }};
         (void)guard;
 
-        co_return co_await anytls::WriteMultiBufferAsFrames(
+        co_return co_await anytls::WriteMultiBufferAsFrameBatch(
             *stream_, cmd, sid, std::move(mb));
+    }
+
+    net::awaitable<std::expected<void, ErrorCode>>
+    WriteBuffersSerialized(uint8_t cmd,
+                           uint32_t sid,
+                           std::span<const net::const_buffer> buffers) {
+        bool has_data = false;
+        for (const net::const_buffer& buffer : buffers) {
+            if (buffer.data() && buffer.size() > 0) {
+                has_data = true;
+                break;
+            }
+        }
+        if (!has_data) {
+            co_return std::expected<void, ErrorCode>{};
+        }
+
+        while (write_busy_ && !cancelled_) {
+            auto [ec] = co_await write_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                co_return std::unexpected(ErrorCode::CANCELLED);
+            }
+        }
+        if (cancelled_ || !stream_) {
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+        }
+
+        write_busy_ = true;
+        auto guard = std::unique_ptr<void, void(*)(void*)>{
+            this,
+            [](void* p) {
+                auto* self = static_cast<AnyTLSDemuxSession*>(p);
+                self->write_busy_ = false;
+                self->WakeWriter();
+            }};
+        (void)guard;
+
+        const PaddingScheme no_padding;
+        co_return co_await anytls::WriteBuffersAsFramesWithPadding(
+            *stream_, no_padding, 0, cmd, sid, buffers);
     }
 
     void RemoveStream(uint32_t sid) {
@@ -672,7 +697,7 @@ private:
     net::awaitable<void> StartDispatch(std::shared_ptr<AnyTLSSubStream> sub,
                                        Network network,
                                        TargetAddress target,
-                                       std::string initial_uot_payload);
+                                       buf::MultiBuffer initial_uot_payload);
 
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
@@ -685,8 +710,9 @@ private:
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
     net::experimental::channel<void(IoErrorCode)> write_signal_;
-    std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
-    std::unordered_map<uint32_t, StreamState> stream_states_;
+    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>
+        streams_;
+    memory::ThreadLocalUnorderedMap<uint32_t, StreamState> stream_states_;
     bool write_busy_ = false;
     bool cancelled_ = false;
     bool handshake_done_ = false;
@@ -704,6 +730,18 @@ net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     }
 }
 
+net::awaitable<void> AnyTLSSubStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+    auto session = session_;
+    if (!session) {
+        co_return;
+    }
+    auto ok = co_await session->WriteBuffersSerialized(anytls::kCmdPSH, sid_, buffers);
+    if (!ok) {
+        throw IoSystemError(make_error_code(std::errc::io_error));
+    }
+}
+
 net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
     auto session = session_;
     if (session) {
@@ -715,7 +753,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     std::shared_ptr<AnyTLSSubStream> sub,
     Network network,
     TargetAddress target,
-    std::string initial_uot_payload) {
+    buf::MultiBuffer initial_uot_payload) {
     if (!sub) {
         co_return;
     }
@@ -893,12 +931,8 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
 
         switch (state_it->second) {
             case StreamState::PendingTarget: {
-                std::string target_bytes = FlattenToString(*payload);
+                auto target = ParseSocksAddress(*payload, header->length);
                 payload->clear();
-                auto target = ParseSocksAddress(
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(target_bytes.data()),
-                        target_bytes.size()));
                 if (!target) {
                     result.error = ErrorCode::PROTOCOL_INVALID_ADDRESS;
                     CancelAll();
@@ -925,23 +959,14 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                 break;
             }
             case StreamState::PendingUotRequest: {
-                std::string request_bytes = FlattenToString(*payload);
-                payload->clear();
-                auto request = anytls::DecodeUotRequest(
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(request_bytes.data()),
-                        request_bytes.size()));
+                auto request = DecodeUotRequest(*payload, header->length);
                 if (!request || !request->destination.IsValid()) {
                     result.error = request ? ErrorCode::PROTOCOL_INVALID_ADDRESS : request.error();
+                    payload->clear();
                     CancelAll();
                     co_return result;
                 }
-                std::string initial_pending;
-                if (request->consumed < request_bytes.size()) {
-                    initial_pending.assign(
-                        request_bytes.data() + request->consumed,
-                        request_bytes.size() - request->consumed);
-                }
+                payload->DropPrefixBytes(request->consumed);
                 state_it->second = StreamState::Started;
                 auto self = shared_from_this();
                 net::co_spawn(
@@ -949,7 +974,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                     [self,
                      sub,
                      target = std::move(request->destination),
-                     initial = std::move(initial_pending)]() mutable -> net::awaitable<void> {
+                     initial = std::move(*payload)]() mutable -> net::awaitable<void> {
                         co_await self->StartDispatch(
                             std::move(sub), Network::UDP, std::move(target), std::move(initial));
                     },
@@ -957,7 +982,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                 break;
             }
             case StreamState::Started:
-                if (!co_await sub->PushInput(std::move(*payload))) {
+                if (!co_await sub->PushInput(std::move(*payload), header->length)) {
                     stream_states_.erase(sid);
                     RemoveStream(sid);
                     break;

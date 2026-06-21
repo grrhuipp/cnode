@@ -5,8 +5,6 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include <cstring>
-
 namespace acpp::proxy::blackhole::outbound {
 
 namespace {
@@ -47,17 +45,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     std::chrono::seconds /*relay_write_timeout*/) {
     first_payload.clear();
     if (IsHttpResponse(settings_.response) && inbound.writer) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (out && kHttp403Response.size() <= out->Available()) {
-            std::memcpy(out->Tail().data(), kHttp403Response.data(), kHttp403Response.size());
-            out->Produce(static_cast<uint32_t>(kHttp403Response.size()));
-            buf::MultiBuffer mb{out.release()};
-            try {
-                co_await inbound.writer->WriteMultiBuffer(std::move(mb));
-                co_await inbound.writer->AsyncShutdownWrite();
-            } catch (...) {
-                LOG_CONN_DEBUG(ctx, "[Blackhole][{}] failed to write http response", tag_);
-            }
+        net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
+        try {
+            co_await inbound.writer->WriteBuffers(
+                std::span<const net::const_buffer>{&response, 1});
+            co_await inbound.writer->AsyncShutdownWrite();
+        } catch (...) {
+            LOG_CONN_DEBUG(ctx, "[Blackhole][{}] failed to write http response", tag_);
         }
     }
     LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}", tag_, settings_.response);

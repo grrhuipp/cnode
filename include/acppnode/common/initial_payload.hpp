@@ -83,6 +83,25 @@ public:
     [[nodiscard]] bool IsContiguous() const noexcept {
         return overflow_.empty();
     }
+    [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const noexcept {
+        if (len == 0 || len > size_) {
+            return {};
+        }
+        if (overflow_.empty()) {
+            return std::span<const uint8_t>(inline_.data(), len);
+        }
+        for (const auto* buffer : overflow_) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            if (bytes.size() >= len) {
+                return bytes.first(len);
+            }
+            return {};
+        }
+        return {};
+    }
     [[nodiscard]] size_t CopyTo(uint8_t* out, size_t out_size) const {
         if (!out || out_size < size_) {
             return 0;

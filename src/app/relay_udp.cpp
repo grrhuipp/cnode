@@ -11,7 +11,6 @@
 #include <asio/experimental/channel.hpp>
 
 #include <cstring>
-#include <deque>
 #include <format>
 #include <memory>
 
@@ -62,10 +61,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
         struct UdpRelayReply {
             TargetAddress target;
             buf::MultiBuffer payload;
-
-            [[nodiscard]] size_t Size() const noexcept {
-                return buf::TotalLen(payload);
-            }
+            size_t payload_size = 0;
         };
 
         explicit SharedState(net::io_context& io_context)
@@ -85,7 +81,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
         }
 
         void push(UdpRelayReply&& pkt) {
-            const size_t pkt_bytes = pkt.Size();
+            const size_t pkt_bytes = pkt.payload_size;
             queued_bytes += pkt_bytes;
             reply_queue.push_back(std::move(pkt));
             if (reply_queue.size() >= 64 || queued_bytes >= 256 * 1024) {
@@ -100,12 +96,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             if (!buf::AppendSpanToMultiBuffer(pkt.data, owned.payload)) {
                 return;
             }
+            owned.payload_size = pkt.data.size();
             push(std::move(owned));
         }
 
         bool pop(UdpRelayReply& pkt) {
             if (reply_queue.empty()) return false;
-            queued_bytes -= reply_queue.front().Size();
+            queued_bytes -= std::min(queued_bytes, reply_queue.front().payload_size);
             pkt = std::move(reply_queue.front());
             reply_queue.pop_front();
             if (reply_queue.empty() && shrink_queue_on_drain) {
@@ -141,7 +138,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     // reader-writer helper 负责封帧/编码。relay 层不感知具体协议。
     auto send_reply = [&](SharedState::UdpRelayReply& packet) -> net::awaitable<bool> {
         try {
-            const size_t send_len = packet.Size();
+            const size_t send_len = packet.payload_size;
             if (send_len == 0) {
                 co_return false;
             }
@@ -180,10 +177,8 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     auto upload = [&]() -> net::awaitable<void> {
         while (state.running) {
             buf::MultiBuffer read_mb;
-            size_t read_bytes = 0;
             try {
                 read_mb = co_await client_reader.ReadMultiBuffer();
-                read_bytes = buf::TotalLen(read_mb);
             } catch (const IoSystemError& e) {
                 if (result.error == ErrorCode::OK) {
                     result.error = MapAsioError(e.code());
@@ -196,42 +191,34 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 break;
             }
 
-            if (read_bytes == 0) {
-                // 入站读到 EOF：client 关闭隧道，结束上行并触发回包收尾。
-                LOG_CONN_DEBUG(ctx, "UDP relay: client EOF, up={}B down={}B",
-                               result.bytes_up, result.bytes_down);
-                result.client_closed_first = true;
-                break;
-            }
-
-            ctx.traffic.bytes_up += read_bytes;
-            result.bytes_up += read_bytes;
-            stats_acc.AddBytesOut(read_bytes);
-            if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
-                FlushUdpRelayStats(stats, stats_acc);
-            }
-
-            // 上行限速
-            {
-                auto wait_time = upload_limiter.Consume(read_bytes);
-                if (wait_time.count() > 0) {
-                    co_await upload_rate_sleep.WaitFor(wait_time);
-                }
-            }
-
             // 每个 buffer 携带自身目标，由协议 reader-writer helper
             // 在入站侧解析填好；relay 只按 Buffer endpoint 逐包发往 Full Cone session。
+            bool has_payload = false;
             for (buf::Buffer* buffer : read_mb) {
                 if (!buffer || buffer->IsEmpty()) {
                     continue;
                 }
+                has_payload = true;
+                auto bytes = buffer->Bytes();
+                const size_t read_bytes = bytes.size();
+                ctx.traffic.bytes_up += read_bytes;
+                result.bytes_up += read_bytes;
+                stats_acc.AddBytesOut(read_bytes);
+                if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
+                    FlushUdpRelayStats(stats, stats_acc);
+                }
+
+                auto wait_time = upload_limiter.Consume(read_bytes);
+                if (wait_time.count() > 0) {
+                    co_await upload_rate_sleep.WaitFor(wait_time);
+                }
+
                 if (!buffer->HasUDP()) {
                     LOG_CONN_DEBUG(ctx, "UDP relay: buffer without target dropped {}B",
                                    buffer->Len());
                     continue;
                 }
                 const TargetAddress& target = buffer->UDP();
-                auto bytes = buffer->Bytes();
                 LOG_CONN_DEBUG(ctx, "UDP send: target={}, data_len={}",
                                target, bytes.size());
                 auto send_result = co_await session.SendTo(
@@ -239,6 +226,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 if (send_result != ErrorCode::OK) {
                     LOG_CONN_DEBUG(ctx, "UDP send failed: {}", ErrorCodeToString(send_result));
                 }
+            }
+            if (!has_payload) {
+                // 入站读到 EOF：client 关闭隧道，结束上行并触发回包收尾。
+                LOG_CONN_DEBUG(ctx, "UDP relay: client EOF, up={}B down={}B",
+                               result.bytes_up, result.bytes_down);
+                result.client_closed_first = true;
+                break;
             }
         }
 

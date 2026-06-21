@@ -11,7 +11,6 @@
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <deque>
 #include <utility>
 
 namespace acpp {

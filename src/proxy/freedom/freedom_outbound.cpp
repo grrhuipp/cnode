@@ -323,7 +323,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream->SetWriteTimeout(relay_write_timeout);
     AsyncStream* inbound_control = inbound.control;
 
-    if (buf::TotalLen(first_payload) > 0) {
+    if (buf::HasData(first_payload)) {
         if (inbound_control) {
             co_return co_await DoRelayLinkWithFirstPacket(
                 io_context, *inbound.reader, *inbound.writer, *inbound_control,

@@ -1,5 +1,7 @@
 #include "vless_encryption_runtime.hpp"
 
+#include "acppnode/common/allocator.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -98,13 +100,13 @@ net::awaitable<bool> ReadAndOpenPadding(VlessBufferedReader& reader,
         co_return false;
     }
 
-    std::vector<uint8_t> encrypted_padding(*encrypted_body_length);
+    memory::ByteVector encrypted_padding(*encrypted_body_length);
     if (!co_await reader.ReadExact(
             encrypted_padding.data(),
             encrypted_padding.size())) {
         co_return false;
     }
-    std::vector<uint8_t> plain(
+    memory::ByteVector plain(
         encrypted_padding.size() - kVlessEncryptionTagSize);
     const auto opened = aead.Open(encrypted_padding, {}, plain);
     co_return opened.has_value() && *opened == plain.size();
@@ -141,7 +143,9 @@ net::awaitable<bool> WriteBytes(transport::MultiBufferWriter& writer,
     }
 
     VlessEncryptionRuntime runtime;
-    runtime.united_key = server_open.united_key;
+    runtime.united_key.assign(
+        server_open.united_key.begin(),
+        server_open.united_key.end());
     runtime.read_aead = std::move(server_open.read_aead);
     runtime.write_aead = std::move(*write_aead);
     runtime.cipher = cipher;
@@ -176,7 +180,9 @@ net::awaitable<bool> WriteBytes(transport::MultiBufferWriter& writer,
     }
 
     VlessEncryptionRuntime runtime;
-    runtime.united_key = response.united_key;
+    runtime.united_key.assign(
+        response.united_key.begin(),
+        response.united_key.end());
     runtime.read_aead = std::move(*read_aead);
     runtime.write_aead = std::move(response.write_aead);
     runtime.cipher = cipher;
@@ -209,7 +215,9 @@ net::awaitable<bool> WriteBytes(transport::MultiBufferWriter& writer,
     }
 
     VlessEncryptionRuntime runtime;
-    runtime.united_key = request.united_key;
+    runtime.united_key.assign(
+        request.united_key.begin(),
+        request.united_key.end());
     runtime.write_aead = std::move(*write_aead);
     runtime.read_aead_ready = false;
     runtime.lazy_read_context_size = kVlessEncryptionServerRandomSize;
@@ -286,7 +294,7 @@ void VlessEncryptionClientTicketCache::Store(
         Clear();
         return;
     }
-    pfs_key = open.pfs_key;
+    pfs_key.assign(open.pfs_key.begin(), open.pfs_key.end());
     ticket = open.ticket;
     expires_at = now + std::chrono::seconds(open.ticket_seconds);
 }
@@ -304,7 +312,7 @@ void VlessEncryptionServerTicketStore::Prune(
     });
 }
 
-std::optional<std::vector<uint8_t>> VlessEncryptionServerTicketStore::Lookup(
+std::optional<memory::ByteVector> VlessEncryptionServerTicketStore::Lookup(
     std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
     std::span<const uint8_t> nfs_key,
     std::chrono::steady_clock::time_point now) {
@@ -451,7 +459,7 @@ RunVlessEncryptionServerHandshake(
         co_return std::nullopt;
     }
 
-    std::vector<uint8_t> iv_and_relays(kVlessEncryptionIvSize + *relays_len);
+    memory::ByteVector iv_and_relays(kVlessEncryptionIvSize + *relays_len);
     if (!co_await raw_reader.ReadExact(
             iv_and_relays.data(),
             iv_and_relays.size())) {

@@ -2,6 +2,7 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
@@ -174,19 +175,21 @@ struct AutoSignState {
 
     // 为指定域名生成或获取缓存的证书
     X509* GetOrCreate(const std::string& cn) {
-        std::lock_guard lock(mu);
-        if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
-            cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
-            return it->second.cert;
+        long serial = 0;
+        {
+            std::lock_guard lock(mu);
+            if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
+                cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
+                return it->second.cert;
+            }
+            serial = next_serial++;
         }
 
         X509* x509 = X509_new();
         if (!x509) return nullptr;
 
         X509_set_version(x509, 2);
-
-        // Cache-local serial; GetOrCreate is already serialized by mu.
-        ASN1_INTEGER_set(X509_get_serialNumber(x509), next_serial++);
+        ASN1_INTEGER_set(X509_get_serialNumber(x509), serial);
 
         X509_gmtime_adj(X509_get_notBefore(x509), 0);
         X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
@@ -218,6 +221,13 @@ struct AutoSignState {
         if (!X509_sign(x509, pkey, EVP_sha256())) {
             X509_free(x509);
             return nullptr;
+        }
+
+        std::lock_guard lock(mu);
+        if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
+            cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
+            X509_free(x509);
+            return it->second.cert;
         }
 
         while (cert_cache.size() >= kMaxCachedCerts && !cert_lru.empty()) {
@@ -707,40 +717,15 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (!handshake_done_ && !co_await Handshake()) {
         ThrowTlsWriteError("TLS handshake failed during write");
     }
-    if (mb.empty()) {
+    if (!buf::HasData(mb)) {
         co_return;
     }
 
-    constexpr size_t kStackBufs = 8;
-    std::array<net::const_buffer, kStackBufs> stack_bufs;
-    memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-    size_t buf_count = 0;
-
-    if (mb.size() <= kStackBufs) {
-        for (const auto* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                const auto bytes = buffer->Bytes();
-                stack_bufs[buf_count++] =
-                    net::const_buffer(bytes.data(), bytes.size());
-            }
-        }
-    } else {
-        spill_bufs.reserve(mb.size());
-        for (const auto* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                const auto bytes = buffer->Bytes();
-                spill_bufs.emplace_back(bytes.data(), bytes.size());
-            }
-        }
-        buf_count = spill_bufs.size();
-    }
-
-    if (buf_count > 0) {
-        auto buffers = (mb.size() > kStackBufs)
-            ? std::span<const net::const_buffer>(spill_bufs)
-            : std::span<const net::const_buffer>(stack_bufs.data(), buf_count);
+    ConstBufferSpanBuilder<8> out;
+    out.AppendMultiBuffer(mb);
+    if (!out.empty()) {
         auto [ec, n] = co_await net::async_write(
-            impl_->stream, buffers, net::as_tuple(net::use_awaitable));
+            impl_->stream, out.Span(), net::as_tuple(net::use_awaitable));
         (void)n;
         if (ec) {
             throw IoSystemError(ec);

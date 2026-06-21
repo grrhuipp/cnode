@@ -11,6 +11,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
 
@@ -263,35 +264,10 @@ public:
             total_len, ws::Opcode::BINARY, is_client_, mask_key);
 
         if (!is_client_) {
-            constexpr size_t kStackBufs = 16;
-            std::array<net::const_buffer, kStackBufs> stack_bufs;
-            memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-            const bool use_spill = buffers.size() + 1 > kStackBufs;
-            size_t count = 0;
-
-            auto add_buffer = [&](net::const_buffer buffer) {
-                if (buffer.size() == 0) {
-                    return;
-                }
-                if (use_spill) {
-                    spill_bufs.push_back(buffer);
-                } else {
-                    stack_bufs[count++] = buffer;
-                }
-            };
-
-            if (use_spill) {
-                spill_bufs.reserve(buffers.size() + 1);
-            }
-            add_buffer(net::const_buffer(header.bytes.data(), header.size));
-            for (const auto& buffer : buffers) {
-                add_buffer(buffer);
-            }
-
-            auto out = use_spill
-                ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
-                : std::span<const net::const_buffer>(stack_bufs.data(), count);
-            co_await inner_->WriteBuffers(out);
+            ConstBufferSpanBuilder<16> out;
+            out.Append(net::const_buffer(header.bytes.data(), header.size));
+            out.AppendBuffers(buffers);
+            co_await inner_->WriteBuffers(out.Span());
             co_return;
         }
 
@@ -445,31 +421,7 @@ protected:
     }
 
     size_t PopPendingData(uint8_t* dst, size_t max_len) {
-        size_t copied = 0;
-        // 统计已完全消费的头部前缀，最后一次性 drop_front，避免每个 Buffer
-        // 都做一次 O(size) 的 pop_front 搬移。
-        size_t drained = 0;
-        for (buf::Buffer* buffer : pending_data_) {
-            if (copied >= max_len) {
-                break;
-            }
-            if (!buffer || buffer->IsEmpty()) {
-                ++drained;
-                continue;
-            }
-            const size_t n = std::min(max_len - copied,
-                                      static_cast<size_t>(buffer->Len()));
-            std::memcpy(dst + copied, buffer->Bytes().data(), n);
-            buffer->Advance(static_cast<uint32_t>(n));
-            copied += n;
-            if (buffer->IsEmpty()) {
-                ++drained;
-            } else {
-                break;  // 部分消费，保留该 Buffer 及其后的剩余数据
-            }
-        }
-        pending_data_.drop_front(drained);
-        return copied;
+        return pending_data_.ConsumePrefixTo(std::span<uint8_t>(dst, max_len));
     }
 
     // 写入完整数据
@@ -482,26 +434,9 @@ protected:
         if (len == 0) {
             co_return;
         }
-
-        buf::MultiBuffer mb;
-        mb.reserve((len + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-        size_t offset = 0;
-        while (offset < len) {
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                throw std::bad_alloc();
-            }
-            const size_t chunk = std::min(
-                len - offset,
-                static_cast<size_t>(out->Available()));
-            std::memcpy(out->Tail().data(), buf + offset, chunk);
-            out->Produce(static_cast<uint32_t>(chunk));
-            mb.push_back(out.release());
-            offset += chunk;
-        }
-
-        co_await inner_->WriteMultiBuffer(std::move(mb));
-        mb.clear();
+        net::const_buffer buffer{buf, len};
+        co_await inner_->WriteBuffers(
+            std::span<const net::const_buffer>{&buffer, 1});
     }
 
     net::awaitable<bool> PrepareNextDataFrame() {
@@ -629,37 +564,23 @@ public:
             mb.clear();
             ThrowWsStreamError("WebSocket server write on closed stream");
         }
-        const size_t total_len = buf::TotalLen(mb);
-        if (total_len == 0) {
-            co_return;
-        }
 
-        constexpr size_t kStackBufs = 16;
-        std::array<net::const_buffer, kStackBufs> stack_bufs;
-        memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-        const bool use_spill = mb.size() > kStackBufs;
-        size_t count = 0;
+        ConstBufferSpanBuilder<16> payload;
+        size_t total_len = 0;
 
-        if (use_spill) {
-            spill_bufs.reserve(mb.size());
-        }
-
-        for (const auto* buffer : mb) {
+        for (auto* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
             const auto bytes = buffer->Bytes();
-            if (use_spill) {
-                spill_bufs.emplace_back(bytes.data(), bytes.size());
-            } else {
-                stack_bufs[count++] = net::const_buffer(bytes.data(), bytes.size());
-            }
+            total_len += bytes.size();
+            payload.Append(net::const_buffer(bytes.data(), bytes.size()));
+        }
+        if (total_len == 0) {
+            co_return;
         }
 
-        auto payload = use_spill
-            ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
-            : std::span<const net::const_buffer>(stack_bufs.data(), count);
-        co_await WriteBuffers(payload);
+        co_await WriteBuffers(payload.Span());
         mb.clear();
     }
 
@@ -684,13 +605,14 @@ public:
             co_return len;
         }
 
-        if (!co_await WriteFull(header.bytes.data(), header.size)) {
-            ThrowWsStreamError("WebSocket server write header failed");
-        }
-
-        // 发送 payload
-        if (!co_await WriteFull(data, len)) {
-            ThrowWsStreamError("WebSocket server write payload failed");
+        const std::array<net::const_buffer, 2> buffers{
+            net::const_buffer(header.bytes.data(), header.size),
+            net::const_buffer(data, len)
+        };
+        try {
+            co_await inner_->WriteBuffers(buffers);
+        } catch (...) {
+            ThrowWsStreamError("WebSocket server write frame failed");
         }
 
         co_return len;
@@ -716,61 +638,39 @@ public:
             mb.clear();
             ThrowWsStreamError("WebSocket client write on closed stream");
         }
-        const size_t total_len = buf::TotalLen(mb);
-        if (total_len == 0) {
-            co_return;
-        }
 
         uint8_t mask_key[4];
         if (RAND_bytes(mask_key, sizeof(mask_key)) != 1) [[unlikely]] {
             ThrowWsStreamError("WebSocket client generate mask failed");
         }
 
-        size_t payload_offset = 0;
-        for (auto* b : mb) {
-            auto bytes = b->Bytes();
-            if (bytes.empty()) {
-                continue;
-            }
-            ws::MaskData(bytes.data(), bytes.size(), mask_key, payload_offset);
-            payload_offset += bytes.size();
-        }
+        size_t total_len = 0;
 
-        constexpr size_t kStackBufs = 16;
-        std::array<net::const_buffer, kStackBufs> stack_bufs;
-        memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-        const bool use_spill = mb.size() + 1 > kStackBufs;
-        size_t count = 0;
-
-        auto add_buffer = [&](net::const_buffer buffer) {
-            if (buffer.size() == 0) {
-                return;
-            }
-            if (use_spill) {
-                spill_bufs.push_back(buffer);
-            } else {
-                stack_bufs[count++] = buffer;
-            }
-        };
-
-        if (use_spill) {
-            spill_bufs.reserve(mb.size() + 1);
-        }
-
-        auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, true, mask_key);
-        add_buffer(net::const_buffer(header.bytes.data(), header.size));
-        for (const auto* buffer : mb) {
+        for (auto* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
             const auto bytes = buffer->Bytes();
-            add_buffer(net::const_buffer(bytes.data(), bytes.size()));
+            total_len += bytes.size();
+        }
+        if (total_len == 0) {
+            co_return;
         }
 
-        auto out = use_spill
-            ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
-            : std::span<const net::const_buffer>(stack_bufs.data(), count);
-        co_await inner_->WriteBuffers(out);
+        auto header = ws::EncodeFrameHeader(total_len, ws::Opcode::BINARY, true, mask_key);
+        ConstBufferSpanBuilder<16> out;
+        out.Append(net::const_buffer(header.bytes.data(), header.size));
+        size_t payload_offset = 0;
+        for (auto* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            ws::MaskData(bytes.data(), bytes.size(), mask_key, payload_offset);
+            payload_offset += bytes.size();
+            out.Append(net::const_buffer(bytes.data(), bytes.size()));
+        }
+        co_await inner_->WriteBuffers(out.Span());
         mb.clear();
     }
 
@@ -802,10 +702,6 @@ public:
             co_return len;
         }
 
-        if (!co_await WriteFull(header.bytes.data(), header.size)) {
-            ThrowWsStreamError("WebSocket client write header failed");
-        }
-
         buf::BufferGuard scratch{buf::Buffer::New()};
         if (!scratch) {
             throw std::bad_alloc();
@@ -813,12 +709,26 @@ public:
         uint8_t* masked_chunk = scratch->Tail().data();
         const size_t masked_chunk_size = scratch->Available();
         size_t offset = 0;
+        bool header_sent = false;
         while (offset < len) {
             const size_t chunk = std::min(masked_chunk_size, len - offset);
             std::memcpy(masked_chunk, data + offset, chunk);
             ws::MaskData(masked_chunk, chunk, mask_key, offset);
-            if (!co_await WriteFull(masked_chunk, chunk)) {
-                ThrowWsStreamError("WebSocket client write payload failed");
+            if (!header_sent) {
+                const std::array<net::const_buffer, 2> buffers{
+                    net::const_buffer(header.bytes.data(), header.size),
+                    net::const_buffer(masked_chunk, chunk)
+                };
+                try {
+                    co_await inner_->WriteBuffers(buffers);
+                } catch (...) {
+                    ThrowWsStreamError("WebSocket client write frame failed");
+                }
+                header_sent = true;
+            } else {
+                if (!co_await WriteFull(masked_chunk, chunk)) {
+                    ThrowWsStreamError("WebSocket client write payload failed");
+                }
             }
             offset += chunk;
         }

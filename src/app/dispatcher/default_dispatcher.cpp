@@ -226,29 +226,22 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     // 首包很大（例如客户端把大块 body pipeline 进首包）时无需整包拷贝。
     static constexpr size_t kSniffMaxBytes = 4096;
     buf::MultiBuffer outbound_first_payload;
+    size_t outbound_first_payload_size = 0;
     std::span<const uint8_t> sniff_data;
     memory::ByteVector sniff_scratch;
 
-    auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb) {
-        const size_t total = buf::TotalLen(mb);
+    auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb, size_t total) {
         if (total == 0) {
             return;
         }
         const size_t want = std::min(total, kSniffMaxBytes);
-        sniff_scratch.resize(want);
-        size_t copied = 0;
-        for (const auto* buffer : mb) {
-            if (copied >= want) {
-                break;
-            }
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            const size_t n = std::min(bytes.size(), want - copied);
-            std::memcpy(sniff_scratch.data() + copied, bytes.data(), n);
-            copied += n;
+        if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
+            sniff_data = direct;
+            return;
         }
+        sniff_scratch.resize(want);
+        const size_t copied = mb.CopyPrefixTo(
+            std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
         if (copied > 0) {
             sniff_data = std::span<const uint8_t>(sniff_scratch.data(), copied);
         }
@@ -263,11 +256,15 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                 }
             } else {
                 const size_t want = std::min(first_packet.size(), kSniffMaxBytes);
-                sniff_scratch.resize(want);
-                const size_t got = first_packet.CopyPrefixTo(
-                    sniff_scratch.data(), sniff_scratch.size());
-                if (got > 0) {
-                    sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
+                if (auto direct = first_packet.PrefixSpan(want); !direct.empty()) {
+                    sniff_data = direct;
+                } else {
+                    sniff_scratch.resize(want);
+                    const size_t got = first_packet.CopyPrefixTo(
+                        sniff_scratch.data(), sniff_scratch.size());
+                    if (got > 0) {
+                        sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
+                    }
                 }
             }
         } else if (ctx.content.network == Network::TCP && inbound_reader) {
@@ -276,10 +273,13 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                     inbound_control->SetReadTimeout(timeouts.ReadTimeout());
                 }
                 outbound_first_payload = co_await inbound_reader->ReadMultiBuffer();
-                if (buf::TotalLen(outbound_first_payload) > 0) {
+                outbound_first_payload_size = buf::TotalLen(outbound_first_payload);
+                if (outbound_first_payload_size > 0) {
                     LOG_CONN_DEBUG(ctx, "[Session] Sniff prefetch payload={}B",
-                                   buf::TotalLen(outbound_first_payload));
-                    sniff_from_multibuffer(outbound_first_payload);
+                                   outbound_first_payload_size);
+                    sniff_from_multibuffer(
+                        outbound_first_payload,
+                        outbound_first_payload_size);
                 }
             } catch (const IoSystemError& e) {
                 stats.OnError();
@@ -383,14 +383,14 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     relay_cfg.downlink_only = timeouts.DownlinkOnlyTimeout();
     relay_cfg.speed_limit   = ctx.content.speed_limit;
 
-    if (buf::TotalLen(outbound_first_payload) == 0 &&
+    if (outbound_first_payload_size == 0 &&
         !first_packet.empty() && !first_packet.IsContiguous()) {
         outbound_first_payload = first_packet.MoveToMultiBuffer();
+        outbound_first_payload_size = buf::TotalLen(outbound_first_payload);
     }
-    const bool use_owned_first_payload =
-        buf::TotalLen(outbound_first_payload) > 0;
+    const bool use_owned_first_payload = outbound_first_payload_size > 0;
     const size_t relay_payload_size = use_owned_first_payload
-        ? buf::TotalLen(outbound_first_payload)
+        ? outbound_first_payload_size
         : first_packet.size();
 
     LOG_CONN_DEBUG(ctx, "[Session] Relay start: {} -> {} via {} payload={}B",

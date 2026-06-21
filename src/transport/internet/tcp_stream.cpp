@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -432,41 +433,15 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 // ============================================================================
 net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
 
-    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown) || mb.empty()) co_return;
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown) || !buf::HasData(mb)) co_return;
 
-    // 构造 scatter-write buffer 序列（栈分配，常规路径 <= 8 个 buffer）
-    constexpr size_t kStackBufs = 8;
-    std::array<net::const_buffer, kStackBufs> stack_bufs;
-    memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-    size_t buf_count = 0;
-
-    if (mb.size() <= kStackBufs) {
-        for (auto* b : mb) {
-            auto bytes = b->Bytes();
-            if (!bytes.empty()) {
-                stack_bufs[buf_count++] = net::const_buffer(bytes.data(), bytes.size());
-            }
-        }
-    } else {
-        spill_bufs.reserve(mb.size());
-        for (auto* b : mb) {
-            auto bytes = b->Bytes();
-            if (!bytes.empty()) {
-                spill_bufs.emplace_back(bytes.data(), bytes.size());
-            }
-        }
-        buf_count = spill_bufs.size();
-    }
-
-    if (buf_count == 0) co_return;
-
-    auto bufs_span = (mb.size() > kStackBufs)
-        ? std::span<net::const_buffer>(spill_bufs)
-        : std::span<net::const_buffer>(stack_bufs.data(), buf_count);
+    ConstBufferSpanBuilder<8> out;
+    out.AppendMultiBuffer(mb);
+    if (out.empty()) co_return;
 
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, bufs_span, net::as_tuple(net::use_awaitable));
+        impl_->socket, out.Span(), net::as_tuple(net::use_awaitable));
     DisarmWriteDeadline();
 
     if (ec) {
@@ -482,38 +457,15 @@ net::awaitable<void> TcpStream::WriteBuffers(
         co_return;
     }
 
-    constexpr size_t kStackBufs = 16;
-    std::array<net::const_buffer, kStackBufs> stack_bufs;
-    memory::ThreadLocalVector<net::const_buffer> spill_bufs;
-    size_t buf_count = 0;
-
-    if (buffers.size() <= kStackBufs) {
-        for (const auto& buffer : buffers) {
-            if (buffer.size() > 0) {
-                stack_bufs[buf_count++] = buffer;
-            }
-        }
-    } else {
-        spill_bufs.reserve(buffers.size());
-        for (const auto& buffer : buffers) {
-            if (buffer.size() > 0) {
-                spill_bufs.push_back(buffer);
-            }
-        }
-        buf_count = spill_bufs.size();
-    }
-
-    if (buf_count == 0) {
+    ConstBufferSpanBuilder<16> out;
+    out.AppendBuffers(buffers);
+    if (out.empty()) {
         co_return;
     }
 
-    auto bufs_span = (buffers.size() > kStackBufs)
-        ? std::span<const net::const_buffer>(spill_bufs.data(), spill_bufs.size())
-        : std::span<const net::const_buffer>(stack_bufs.data(), buf_count);
-
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, bufs_span, net::as_tuple(net::use_awaitable));
+        impl_->socket, out.Span(), net::as_tuple(net::use_awaitable));
     DisarmWriteDeadline();
     (void)n;
 
@@ -1023,37 +975,11 @@ bool TcpStream::ConsumePhaseDeadline() noexcept {
 }
 
 size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
-    auto* out = static_cast<uint8_t*>(target.data());
-    size_t remaining = target.size();
-    size_t copied = 0;
     auto& pending = impl_->pending_data;
-
-    // 顺序消费头部 Buffer，统计已完全消费的前缀，最后一次性 drop_front，
-    // 避免每个 Buffer 都做一次 O(size) 的 pop_front 搬移。
-    size_t drained = 0;
-    for (buf::Buffer* buffer : pending) {
-        if (remaining == 0) {
-            break;
-        }
-        if (!buffer || buffer->IsEmpty()) {
-            ++drained;
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        const size_t n = std::min(remaining, bytes.size());
-        std::memcpy(out + copied, bytes.data(), n);
-        buffer->Advance(static_cast<uint32_t>(n));
-        copied += n;
-        remaining -= n;
-        if (buffer->IsEmpty()) {
-            ++drained;
-        } else {
-            break;  // 部分消费，保留该 Buffer 及其后的剩余数据
-        }
-    }
-    pending.drop_front(drained);
-
-    return copied;
+    return pending.ConsumePrefixTo(
+        std::span<uint8_t>(
+            static_cast<uint8_t*>(target.data()),
+            target.size()));
 }
 
 void TcpStream::ReleasePendingData() noexcept {

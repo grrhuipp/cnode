@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/transport/link.hpp"
 
@@ -27,7 +28,7 @@ public:
 private:
     transport::MultiBufferReader& src_;
     std::array<uint8_t, 16> user_uuid_{};
-    std::vector<uint8_t> pending_;
+    memory::ByteVector pending_;
     bool read_process_ = true;
     bool expect_uuid_ = true;
 
@@ -41,6 +42,7 @@ public:
                  std::array<uint8_t, 16> user_uuid);
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
@@ -56,9 +58,11 @@ private:
 
     void FilterTLS(std::span<const uint8_t> data) noexcept;
     [[nodiscard]] bool ShouldEndVision(std::span<const uint8_t> data) const noexcept;
-    [[nodiscard]] bool AppendVisionFrame(buf::MultiBuffer& out,
-                                         std::span<const uint8_t> content,
-                                         uint8_t command);
+    [[nodiscard]] bool AppendVisionFrameBuffers(
+        buf::MultiBuffer& header_owner,
+        memory::ThreadLocalVector<net::const_buffer>& out,
+        std::span<const uint8_t> content,
+        uint8_t command);
 };
 
 }  // namespace acpp::vless

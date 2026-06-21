@@ -73,21 +73,24 @@ public:
             buf::MultiBuffer filtered;
             for (buf::Buffer*& buffer : mb) {
                 if (!buffer || buffer->IsEmpty()) {
+                    mb.FreeSlot(buffer);
                     continue;
                 }
                 if (buffer->HasUDP() && !SameTargetAddress(buffer->UDP(), udp_target_)) {
-                    buf::Buffer::Free(buffer);
-                    buffer = nullptr;
+                    mb.FreeSlot(buffer);
                     continue;
                 }
-                filtered.push_back(buffer);
-                buffer = nullptr;
+                filtered.push_back(mb.ReleaseSlot(buffer));
             }
             mb.clear();
             co_await session_.EncodeRequestBody(stream_, std::move(filtered));
             co_return;
         }
         co_await session_.EncodeRequestBody(stream_, std::move(mb));
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        co_await session_.EncodeRequestBody(stream_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -266,7 +269,7 @@ proxy::vmess::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
-    if (buf::TotalLen(first_payload) > 0) {
+    if (buf::HasData(first_payload)) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,

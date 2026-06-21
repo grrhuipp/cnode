@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
@@ -159,11 +160,8 @@ public:
         if (!downlink_) {
             co_return 0;
         }
-        if (!upload_ && !pending_initial_.empty()) {
-            std::array<net::const_buffer, 1> initial{
-                net::buffer(pending_initial_.data(), pending_initial_.size())
-            };
-            co_await OpenUploadWithInitial(initial);
+        if (!upload_ && buf::HasData(pending_initial_)) {
+            co_await OpenUploadWithPendingInitial();
         }
         co_return co_await downlink_->AsyncRead(buffer);
     }
@@ -174,10 +172,11 @@ public:
         }
         if (!upload_) {
             const auto* data = static_cast<const uint8_t*>(buffer.data());
-            pending_initial_.insert(
-                pending_initial_.end(),
-                data,
-                data + buffer.size());
+            if (!buf::AppendSpanToMultiBuffer(
+                    std::span<const uint8_t>(data, buffer.size()),
+                    pending_initial_)) {
+                throw std::bad_alloc();
+            }
             co_return buffer.size();
         }
         co_return co_await upload_->AsyncWrite(buffer);
@@ -187,57 +186,26 @@ public:
         if (!downlink_) {
             co_return buf::MultiBuffer{};
         }
-        if (!upload_ && !pending_initial_.empty()) {
-            std::array<net::const_buffer, 1> initial{
-                net::buffer(pending_initial_.data(), pending_initial_.size())
-            };
-            co_await OpenUploadWithInitial(initial);
+        if (!upload_ && buf::HasData(pending_initial_)) {
+            co_await OpenUploadWithPendingInitial();
         }
         co_return co_await downlink_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!upload_) {
-            std::array<net::const_buffer, 16> stack_buffers{};
-            std::vector<net::const_buffer> spill_buffers;
-            size_t count = 0;
-            size_t total = pending_initial_.size();
-            if (!pending_initial_.empty()) {
-                stack_buffers[count++] =
-                    net::buffer(pending_initial_.data(), pending_initial_.size());
-            }
-            for (const buf::Buffer* buffer : mb) {
-                if (!buffer || buffer->IsEmpty()) {
-                    continue;
-                }
-                const auto bytes = buffer->Bytes();
-                if (count < stack_buffers.size()) {
-                    stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-                } else {
-                    if (spill_buffers.empty()) {
-                        spill_buffers.reserve(mb.size());
-                        spill_buffers.insert(
-                            spill_buffers.end(),
-                            stack_buffers.begin(),
-                            stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
-                    }
-                    spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
-                }
-                total += bytes.size();
-            }
+            ConstBufferSpanBuilder<16> payloads;
+            AppendPendingInitialBuffers(payloads);
+            payloads.AppendMultiBuffer(mb);
             try {
-                if (total > 0) {
-                    const auto payloads = spill_buffers.empty()
-                        ? std::span<const net::const_buffer>(stack_buffers.data(), count)
-                        : std::span<const net::const_buffer>(
-                              spill_buffers.data(), spill_buffers.size());
-                    co_await OpenUploadWithInitial(payloads);
+                if (!payloads.empty()) {
+                    co_await OpenUploadWithInitial(payloads.Span());
                 }
             } catch (...) {
-                FreeMultiBuffer(mb);
+                mb.clear();
                 throw;
             }
-            FreeMultiBuffer(mb);
+            mb.clear();
             co_return;
         }
         co_await upload_->WriteMultiBuffer(std::move(mb));
@@ -245,43 +213,23 @@ public:
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (!upload_) {
-            size_t total = pending_initial_.size();
+            bool has_data = buf::HasData(pending_initial_);
             for (const auto& buffer : buffers) {
-                total += buffer.size();
+                if (buffer.size() > 0) {
+                    has_data = true;
+                    break;
+                }
             }
-            if (total == 0) {
+            if (!has_data) {
                 co_return;
             }
-            if (pending_initial_.empty()) {
+            if (!buf::HasData(pending_initial_)) {
                 co_await OpenUploadWithInitial(buffers);
             } else {
-                std::array<net::const_buffer, 16> stack_buffers{};
-                std::vector<net::const_buffer> spill_buffers;
-                size_t count = 0;
-                stack_buffers[count++] =
-                    net::buffer(pending_initial_.data(), pending_initial_.size());
-                for (const auto& buffer : buffers) {
-                    if (buffer.size() == 0) {
-                        continue;
-                    }
-                    if (count < stack_buffers.size()) {
-                        stack_buffers[count++] = buffer;
-                    } else {
-                        if (spill_buffers.empty()) {
-                            spill_buffers.reserve(buffers.size() + 1);
-                            spill_buffers.insert(
-                                spill_buffers.end(),
-                                stack_buffers.begin(),
-                                stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
-                        }
-                        spill_buffers.push_back(buffer);
-                    }
-                }
-                const auto payloads = spill_buffers.empty()
-                    ? std::span<const net::const_buffer>(stack_buffers.data(), count)
-                    : std::span<const net::const_buffer>(
-                          spill_buffers.data(), spill_buffers.size());
-                co_await OpenUploadWithInitial(payloads);
+                ConstBufferSpanBuilder<16> payloads;
+                AppendPendingInitialBuffers(payloads);
+                payloads.AppendBuffers(buffers);
+                co_await OpenUploadWithInitial(payloads.Span());
             }
             co_return;
         }
@@ -301,11 +249,8 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (!upload_ && !pending_initial_.empty()) {
-            std::array<net::const_buffer, 1> initial{
-                net::buffer(pending_initial_.data(), pending_initial_.size())
-            };
-            co_await OpenUploadWithInitial(initial);
+        if (!upload_ && buf::HasData(pending_initial_)) {
+            co_await OpenUploadWithPendingInitial();
         }
         if (upload_) {
             co_await upload_->AsyncShutdownWrite();
@@ -365,12 +310,14 @@ protected:
     }
 
 private:
-    static void FreeMultiBuffer(buf::MultiBuffer& mb) noexcept {
-        for (buf::Buffer*& buffer : mb) {
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-        }
-        mb.clear();
+    void AppendPendingInitialBuffers(ConstBufferSpanBuilder<16>& out) {
+        out.AppendMultiBuffer(pending_initial_);
+    }
+
+    net::awaitable<void> OpenUploadWithPendingInitial() {
+        ConstBufferSpanBuilder<16> payloads;
+        AppendPendingInitialBuffers(payloads);
+        co_await OpenUploadWithInitial(payloads.Span());
     }
 
     net::awaitable<void> OpenUploadWithInitial(
@@ -415,7 +362,7 @@ private:
     StreamSettings stream_settings_;
     OutboundDialCandidate candidate_;
     std::string upload_path_;
-    std::vector<uint8_t> pending_initial_;
+    buf::MultiBuffer pending_initial_;
     uint64_t conn_id_ = 0;
     bool closed_ = false;
 };
@@ -472,59 +419,36 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (write_closed_) {
-            FreeMultiBuffer(mb);
+            mb.clear();
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
 
-        std::array<net::const_buffer, 16> stack_buffers{};
-        std::vector<net::const_buffer> spill_buffers;
-        size_t count = 0;
-        size_t total = 0;
-
-        for (const buf::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            if (count < stack_buffers.size()) {
-                stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-            } else {
-                if (spill_buffers.empty()) {
-                    spill_buffers.reserve(mb.size());
-                    spill_buffers.insert(
-                        spill_buffers.end(),
-                        stack_buffers.begin(),
-                        stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
-                }
-                spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
-            }
-            total += bytes.size();
-        }
+        ConstBufferSpanBuilder<16> payloads;
+        payloads.AppendMultiBuffer(mb);
 
         try {
-            if (total > 0) {
-                const auto payloads = spill_buffers.empty()
-                    ? std::span<const net::const_buffer>(stack_buffers.data(), count)
-                    : std::span<const net::const_buffer>(
-                          spill_buffers.data(), spill_buffers.size());
-                co_await SendPacket(payloads);
+            if (!payloads.empty()) {
+                co_await SendPacket(payloads.Span());
             }
         } catch (...) {
-            FreeMultiBuffer(mb);
+            mb.clear();
             throw;
         }
-        FreeMultiBuffer(mb);
+        mb.clear();
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (write_closed_) {
             ThrowXHttpPacketError("xhttp packet-up write after shutdown");
         }
-        size_t total = 0;
+        bool has_data = false;
         for (const auto& buffer : buffers) {
-            total += buffer.size();
+            if (buffer.size() > 0) {
+                has_data = true;
+                break;
+            }
         }
-        if (total == 0) {
+        if (!has_data) {
             co_return;
         }
         co_await SendPacket(buffers);
@@ -591,14 +515,6 @@ protected:
     }
 
 private:
-    static void FreeMultiBuffer(buf::MultiBuffer& mb) noexcept {
-        for (buf::Buffer*& buffer : mb) {
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-        }
-        mb.clear();
-    }
-
     net::awaitable<void> SendPacket(std::span<const net::const_buffer> payloads) {
         if (!target_.stream_settings) {
             ThrowXHttpPacketError("xhttp packet-up missing stream settings");

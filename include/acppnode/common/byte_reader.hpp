@@ -26,7 +26,6 @@
 #include <string>
 #include <string_view>
 #include <optional>
-#include <vector>
 
 namespace acpp {
 
@@ -192,15 +191,6 @@ public:
         std::span<const uint8_t> result(data_ + pos_, len);
         pos_ += len;
         return result;
-    }
-
-    /**
-     * 读取指定长度的字节到 vector
-     */
-    [[nodiscard]] std::vector<uint8_t> ReadBytesVec(size_t len) {
-        auto span = ReadBytes(len);
-        if (error_) return {};
-        return std::vector<uint8_t>(span.begin(), span.end());
     }
 
     /**

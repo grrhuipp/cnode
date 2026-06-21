@@ -18,7 +18,6 @@ constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
 constexpr size_t kVMessBodyMaxChunkSize = 16 * 1024;
-constexpr size_t kStreamOutputReserveSlack = 10;
 constexpr size_t kStreamMaxPaddingLen = 64;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {
@@ -211,13 +210,13 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
     co_return ok;
 }
 
-net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
-                                                  AsyncStream& stream,
-                                                  buf::MultiBuffer mb) {
+struct RequestBodyEncodeBudget final {
+    size_t length_header_size = 0;
+    size_t stream_chunk_size = 0;
+};
 
-    if (mb.empty()) {
-        co_return;
-    }
+[[nodiscard]] RequestBodyEncodeBudget MakeRequestBodyEncodeBudget(
+    const EncodeRequestBodyState& state) {
     const size_t overhead = state.cipher->Overhead();
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     const size_t max_padding_len =
@@ -228,64 +227,122 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
     const size_t stream_chunk_size = std::min(
         size_t(kVMessBodyMaxChunkSize - overhead),
         size_t(buf::Buffer::kSize - length_header_size - overhead - max_padding_len));
+    return RequestBodyEncodeBudget{length_header_size, stream_chunk_size};
+}
 
-    buf::MultiBuffer out_mb;
-    out_mb.reserve(mb.size() + kStreamOutputReserveSlack);
-
-    for (auto* buf : mb) {
-        auto bytes = buf->Bytes();
-        if (bytes.empty()) {
-            continue;
-        }
-
-        const uint8_t* data = bytes.data();
-        const size_t len = bytes.size();
-        size_t offset = 0;
-
-        while (offset < len) {
-            const size_t chunk_size = std::min(len - offset, stream_chunk_size);
-
-            size_t padding_len = 0;
-            if (state.global_padding && state.mask) {
-                const uint16_t padding_mask = state.mask->NextMask();
-                padding_len = padding_mask % 64;
-            }
-
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                throw std::bad_alloc();
-            }
-
-            uint8_t* dst = out->Tail().data();
-            ssize_t enc_len = state.cipher->Encrypt(
-                data + offset, chunk_size, dst + length_header_size);
-            if (enc_len < 0) {
-                ThrowVMessWriteError("VMess client stream encrypt failed");
-            }
-
-            const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-            size_t encoded_length_size = 0;
-            if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
-                                   state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
-                                   total_len,
-                                   dst,
-                                   encoded_length_size)) {
-                ThrowVMessWriteError("VMess client length encrypt failed");
-            }
-
-            if (padding_len > 0) {
-                RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
-            }
-
-            const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
-            out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(out.release());
-
-            offset += chunk_size;
-        }
+void EncodeRequestBodyBytes(EncodeRequestBodyState& state,
+                            const RequestBodyEncodeBudget& budget,
+                            std::span<const uint8_t> bytes,
+                            buf::MultiBuffer& out_mb) {
+    if (bytes.empty()) {
+        return;
     }
 
-    if (!out_mb.empty()) {
+    const uint8_t* data = bytes.data();
+    const size_t len = bytes.size();
+    size_t offset = 0;
+
+    while (offset < len) {
+        const size_t chunk_size = std::min(len - offset, budget.stream_chunk_size);
+
+        size_t padding_len = 0;
+        if (state.global_padding && state.mask) {
+            const uint16_t padding_mask = state.mask->NextMask();
+            padding_len = padding_mask % 64;
+        }
+
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            throw std::bad_alloc();
+        }
+
+        uint8_t* dst = out->Tail().data();
+        ssize_t enc_len = state.cipher->Encrypt(
+            data + offset, chunk_size, dst + budget.length_header_size);
+        if (enc_len < 0) {
+            ThrowVMessWriteError("VMess client stream encrypt failed");
+        }
+
+        const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
+        size_t encoded_length_size = 0;
+        if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                               state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                               total_len,
+                               dst,
+                               encoded_length_size)) {
+            ThrowVMessWriteError("VMess client length encrypt failed");
+        }
+
+        if (padding_len > 0) {
+            RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
+        }
+
+        const size_t output_size =
+            encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
+        out->Produce(static_cast<uint32_t>(output_size));
+        out_mb.push_back(out.release());
+
+        offset += chunk_size;
+    }
+}
+
+net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
+                                                  AsyncStream& stream,
+                                                  buf::MultiBuffer mb) {
+
+    if (!buf::HasData(mb)) {
+        co_return;
+    }
+
+    const RequestBodyEncodeBudget budget = MakeRequestBodyEncodeBudget(state);
+    buf::MultiBuffer out_mb;
+    out_mb.reserve(mb.size());
+
+    for (auto* buffer : mb) {
+        if (!buffer) {
+            continue;
+        }
+        EncodeRequestBodyBytes(state, budget, buffer->Bytes(), out_mb);
+    }
+    mb.clear();
+
+    if (buf::HasData(out_mb)) {
+        co_await stream.WriteMultiBuffer(std::move(out_mb));
+    }
+}
+
+net::awaitable<void> EncodeRequestBodyBuffers(
+    EncodeRequestBodyState& state,
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers) {
+    bool has_data = false;
+    for (const net::const_buffer& buffer : buffers) {
+        if (buffer.data() && buffer.size() > 0) {
+            has_data = true;
+            break;
+        }
+    }
+    if (!has_data) {
+        co_return;
+    }
+
+    const RequestBodyEncodeBudget budget = MakeRequestBodyEncodeBudget(state);
+    buf::MultiBuffer out_mb;
+    out_mb.reserve(buffers.size());
+
+    for (const net::const_buffer& buffer : buffers) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) {
+            continue;
+        }
+        EncodeRequestBodyBytes(
+            state,
+            budget,
+            std::span<const uint8_t>(data, buffer.size()),
+            out_mb);
+    }
+
+    if (buf::HasData(out_mb)) {
         co_await stream.WriteMultiBuffer(std::move(out_mb));
     }
 }
@@ -529,6 +586,13 @@ net::awaitable<void> EncodeRequestBody(
     AsyncStream& stream,
     buf::MultiBuffer mb) {
     co_await EncodeRequestBodyMultiBuffer(state, stream, std::move(mb));
+}
+
+net::awaitable<void> EncodeRequestBody(
+    EncodeRequestBodyState& state,
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers) {
+    co_await EncodeRequestBodyBuffers(state, stream, buffers);
 }
 
 net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderState& state,
@@ -922,6 +986,13 @@ net::awaitable<void> ClientSession::EncodeRequestBody(
     buf::MultiBuffer mb) {
     co_await ::acpp::vmess::encoding::EncodeRequestBody(
         request_body_state_, stream, std::move(mb));
+}
+
+net::awaitable<void> ClientSession::EncodeRequestBody(
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers) {
+    co_await ::acpp::vmess::encoding::EncodeRequestBody(
+        request_body_state_, stream, buffers);
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {

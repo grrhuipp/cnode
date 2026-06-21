@@ -149,10 +149,31 @@ private:
         return trojan::TrojanCodec::ParseUdpPacket(data, len);
     }
 
+    [[nodiscard]] bool TryTakePacket(const TargetAddress& target,
+                                     std::span<const uint8_t> payload) {
+        buf::BufferGuard taken;
+        if (!buf::TakeBufferSuffix(pending_, payload, taken)) {
+            return false;
+        }
+
+        FramedUdpPacket pkt;
+        pkt.target = target;
+        pkt.payload = std::move(taken);
+        queue_.push_back(std::move(pkt));
+        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+            shrink_queue_on_drain_ = true;
+        }
+        return true;
+    }
+
     void Parse() {
         while (Size() > 0) {
             auto result = DecodePacket(Data(), Size());
             if (result.result == trojan::TrojanCodec::UdpParseResult::SUCCESS) {
+                if (result.packet &&
+                    TryTakePacket(result.packet->target, result.packet->payload)) {
+                    continue;
+                }
                 FramedUdpPacket pkt;
                 pkt.target = result.packet->target;
                 pkt.payload = buf::BufferGuard{buf::Buffer::New()};
@@ -214,11 +235,11 @@ public:
                 pkt.payload->SetUDP(std::move(pkt.target));
                 out.push_back(pkt.payload.release());
             }
-            if (!out.empty()) {
+            if (buf::HasData(out)) {
                 co_return out;
             }
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
-            if (raw.empty()) {
+            if (!buf::HasData(raw)) {
                 co_return buf::MultiBuffer{};
             }
             for (buf::Buffer* rb : raw) {
@@ -243,6 +264,7 @@ public:
         buf::MultiBuffer out;
         for (buf::Buffer*& b : mb) {
             if (!b || b->IsEmpty() || !b->HasUDP()) {
+                mb.FreeSlot(b);
                 continue;
             }
             buf::BufferGuard header{buf::Buffer::New()};
@@ -253,20 +275,22 @@ public:
                 b->UDP(), b->Len(),
                 header->Tail().data(), header->Available());
             if (n == 0) {
-                buf::Buffer::Free(b);
-                b = nullptr;
+                mb.FreeSlot(b);
                 continue;
             }
             header->Produce(static_cast<uint32_t>(n));
             out.push_back(header.release());
             b->ClearUDP();
-            out.push_back(b);
-            b = nullptr;
+            out.push_back(mb.ReleaseSlot(b));
         }
         mb.clear();
-        if (!out.empty()) {
+        if (buf::HasData(out)) {
             co_await dst_.WriteMultiBuffer(std::move(out));
         }
+        co_return;
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
         co_return;
     }
 

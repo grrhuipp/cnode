@@ -21,20 +21,17 @@ public:
                                    bool eof_ok_at_start = false) {
         size_t done = 0;
         while (done < len) {
-            buf::Buffer* head = PendingHead();
-            if (head) {
-                const size_t n = std::min(
-                    len - done,
-                    static_cast<size_t>(head->Len()));
-                std::memcpy(data + done, head->Bytes().data(), n);
-                head->Advance(static_cast<uint32_t>(n));
+            if (buf::HasData(pending_)) {
+                const size_t n = pending_.ConsumePrefixTo(
+                    std::span<uint8_t>(data + done, len - done));
                 done += n;
-                CompactPending();
-                continue;
+                if (n > 0) {
+                    continue;
+                }
             }
 
             buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
-            if (mb.empty()) {
+            if (!buf::HasData(mb)) {
                 co_return done == 0 && eof_ok_at_start ? false : done == len;
             }
             AppendToPending(std::move(mb));
@@ -43,8 +40,7 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        CompactPending();
-        if (!pending_.empty()) {
+        if (buf::HasData(pending_)) {
             co_return std::move(pending_);
         }
         co_return co_await src_.ReadMultiBuffer();
@@ -59,43 +55,17 @@ private:
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
-            pending_.push_back(buffer);
-            buffer = nullptr;
+            pending_.push_back(mb.ReleaseSlot(buffer));
         }
         mb.clear();
-    }
-
-    buf::Buffer* PendingHead() noexcept {
-        CompactPending();
-        if (pending_.empty()) {
-            return nullptr;
-        }
-        return *pending_.begin();
-    }
-
-    void CompactPending() {
-        size_t drained = 0;
-        for (buf::Buffer* buffer : pending_) {
-            if (buffer && !buffer->IsEmpty()) {
-                break;
-            }
-            ++drained;
-        }
-        if (drained > 0) {
-            pending_.drop_front(drained);
-        }
     }
 };
 
 inline net::awaitable<void> WriteVlessBytes(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> data) {
-    buf::MultiBuffer mb;
-    if (!buf::AppendSpanToMultiBuffer(data, mb)) {
-        throw IoSystemError(io_error::fault,
-                            "VLESS write buffer allocation failed");
-    }
-    co_await writer.WriteMultiBuffer(std::move(mb));
+    net::const_buffer buffer{data.data(), data.size()};
+    co_await writer.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
 }
 
 }  // namespace acpp::vless

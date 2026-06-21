@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
@@ -13,7 +14,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace acpp {
@@ -45,11 +45,17 @@ struct FrameHeader {
     uint16_t length = 0;
 };
 
+struct PaddingRecord {
+    bool copy_payload = false;
+    int min_size = 0;
+    int max_size_exclusive = 0;
+};
+
 struct PaddingScheme {
     std::string raw;
     std::string md5;
     uint32_t stop = 0;
-    std::unordered_map<std::string, std::string> records;
+    std::vector<std::vector<PaddingRecord>> records;
 };
 
 [[nodiscard]] PaddingScheme DefaultPaddingScheme();
@@ -69,12 +75,8 @@ struct UotRequest {
     const TargetAddress& target,
     bool is_connect);
 [[nodiscard]] std::expected<UotRequest, ErrorCode> DecodeUotRequest(std::span<const uint8_t> data);
-[[nodiscard]] std::expected<std::string, ErrorCode> BuildFrameBytes(
-    uint8_t cmd,
-    uint32_t sid,
-    std::span<const uint8_t> payload);
 [[nodiscard]] std::expected<void, ErrorCode> AppendFrameBytesTo(
-    std::string& out,
+    memory::ByteVector& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload);
@@ -92,10 +94,10 @@ net::awaitable<std::expected<void, ErrorCode>>
 WritePacketWithPadding(AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
-                       std::string packet);
+                       memory::ByteVector packet);
 
 net::awaitable<std::expected<void, ErrorCode>>
-WriteMultiBufferAsFrames(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
+WriteMultiBufferAsFrameBatch(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
 
 net::awaitable<std::expected<void, ErrorCode>>
 WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
@@ -104,6 +106,14 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
                                     uint8_t cmd,
                                     uint32_t sid,
                                     buf::MultiBuffer mb);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+                                const PaddingScheme& scheme,
+                                uint32_t packet_index,
+                                uint8_t cmd,
+                                uint32_t sid,
+                                std::span<const net::const_buffer> buffers);
 
 net::awaitable<std::expected<FrameHeader, ErrorCode>>
 ReadFrameHeader(AsyncStream& stream);

@@ -2,15 +2,21 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <algorithm>
+#include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
-#include <mutex>
-#include <unordered_map>
 
 namespace acpp {
 
 struct TimeoutScheduler::Impl {
     explicit Impl(net::io_context& io_context)
-        : timer(io_context) {}
+        : timer(io_context) {
+        events.reserve(kInitialEventReserve);
+        deadline_heap.reserve(kInitialEventReserve);
+        ready_callbacks.reserve(kInitialReadyReserve);
+    }
+
+    static constexpr size_t kInitialEventReserve = 1024;
+    static constexpr size_t kInitialReadyReserve = 64;
 
     struct Event {
         std::chrono::steady_clock::time_point deadline;
@@ -136,27 +142,36 @@ struct TimeoutScheduler::Impl {
 
 namespace {
 
-std::mutex& SchedulerMutex() {
-    static std::mutex mu;
-    return mu;
-}
-
-auto& SchedulerShards() {
-    static std::unordered_map<net::io_context*, std::unique_ptr<TimeoutScheduler>> shards;
-    return shards;
-}
-
-auto& ReleasedSchedulerShards() {
-    // Shutdown may destroy pending coroutine frames after ReleaseForIoContext().
-    // Keep released shards alive so late token cancellation only resets tokens.
-    static std::unordered_map<net::io_context*, TimeoutScheduler*> shards;
-    return shards;
-}
-
 thread_local net::io_context* tl_cached_context = nullptr;
 thread_local TimeoutScheduler* tl_cached_scheduler = nullptr;
 
 }  // namespace
+
+class TimeoutSchedulerService final : public asio::execution_context::service {
+public:
+    static asio::execution_context::id id;
+
+    explicit TimeoutSchedulerService(asio::execution_context& ctx)
+        : asio::execution_context::service(ctx)
+        , scheduler_(static_cast<net::io_context&>(ctx)) {}
+
+    [[nodiscard]] TimeoutScheduler& Scheduler() noexcept {
+        return scheduler_;
+    }
+
+    void ShutdownNow() noexcept {
+        scheduler_.Release();
+    }
+
+private:
+    void shutdown() override {
+        scheduler_.Release();
+    }
+
+    TimeoutScheduler scheduler_;
+};
+
+asio::execution_context::id TimeoutSchedulerService::id;
 
 TimeoutScheduler::TimeoutScheduler(net::io_context& io_context)
     : impl_(std::make_unique<Impl>(io_context)) {}
@@ -166,26 +181,8 @@ TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& io_context) {
         return *tl_cached_scheduler;
     }
 
-    std::lock_guard lk(SchedulerMutex());
-    auto& released_shards = ReleasedSchedulerShards();
-    if (auto released_it = released_shards.find(&io_context);
-            released_it != released_shards.end()) {
-        tl_cached_context = &io_context;
-        tl_cached_scheduler = released_it->second;
-        return *released_it->second;
-    }
-
-    auto& shards = SchedulerShards();
-    auto it = shards.find(&io_context);
-    if (it != shards.end()) {
-        tl_cached_context = &io_context;
-        tl_cached_scheduler = it->second.get();
-        return *it->second;
-    }
-
-    auto shard = std::unique_ptr<TimeoutScheduler>(new TimeoutScheduler(io_context));
-    auto* ptr = shard.get();
-    shards.emplace(&io_context, std::move(shard));
+    auto& service = asio::use_service<TimeoutSchedulerService>(io_context);
+    auto* ptr = &service.Scheduler();
     tl_cached_context = &io_context;
     tl_cached_scheduler = ptr;
     return *ptr;
@@ -197,19 +194,15 @@ void TimeoutScheduler::ReleaseForIoContext(net::io_context& io_context) {
         tl_cached_scheduler = nullptr;
     }
 
-    std::unique_ptr<TimeoutScheduler> shard;
-    {
-        std::lock_guard lk(SchedulerMutex());
-        auto& shards = SchedulerShards();
-        auto it = shards.find(&io_context);
-        if (it == shards.end()) {
-            return;
-        }
-        shard = std::move(it->second);
-        shards.erase(it);
-        shard->impl_->Release();
-        ReleasedSchedulerShards()[&io_context] = shard.release();
+    if (!asio::has_service<TimeoutSchedulerService>(io_context)) {
+        return;
     }
+    auto& service = asio::use_service<TimeoutSchedulerService>(io_context);
+    service.ShutdownNow();
+}
+
+void TimeoutScheduler::Release() noexcept {
+    impl_->Release();
 }
 
 TimeoutToken TimeoutScheduler::ScheduleAfter(

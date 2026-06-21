@@ -6,6 +6,7 @@
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/udp_session.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
@@ -16,7 +17,6 @@
 #include <algorithm>
 #include <charconv>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -64,6 +64,15 @@ public:
                 "Shadowsocks request writer is not initialized");
         }
         co_await request_writer_->WriteMultiBuffer(std::move(mb));
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (!request_writer_) {
+            throw IoSystemError(
+                io_error::not_connected,
+                "Shadowsocks request writer is not initialized");
+        }
+        co_await request_writer_->WriteBuffers(buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -179,10 +188,10 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
             if (!replies_.empty()) {
-                buf::MultiBuffer mb = std::move(replies_.front());
-                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                QueuedReply reply = std::move(replies_.front());
+                queued_bytes_ -= std::min(queued_bytes_, reply.bytes);
                 replies_.pop_front();
-                co_return mb;
+                co_return std::move(reply.payload);
             }
             if (closed_) {
                 co_return buf::MultiBuffer{};
@@ -239,6 +248,13 @@ public:
             }
         }
         mb.clear();
+        co_return;
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
+        if (closed_) {
+            throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
+        }
         co_return;
     }
 
@@ -397,7 +413,7 @@ private:
                 pkt.data.data(), pkt.data.size(), master_key_.span(),
                 cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
         }
-        if (!decoded || decoded->payload.empty()) {
+        if (!decoded || !buf::HasData(decoded->payload)) {
             return;
         }
 
@@ -413,7 +429,7 @@ private:
             }
         }
         queued_bytes_ += payload_size;
-        replies_.push_back(std::move(decoded->payload));
+        replies_.push_back(QueuedReply{std::move(decoded->payload), payload_size});
         if (io_context_.stopped()) {
             return;
         }
@@ -429,7 +445,11 @@ private:
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
     uint64_t callback_id_ = 0;
     net::experimental::channel<void(IoErrorCode)> signal_;
-    std::deque<buf::MultiBuffer> replies_;
+    struct QueuedReply {
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedReply> replies_;
     size_t queued_bytes_ = 0;
     bool closed_ = false;
     bool read_timeout_ = false;
@@ -614,7 +634,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         master_key_,
         request_session.request_salt,
         *stream);
-    if (buf::TotalLen(first_payload) > 0) {
+    if (buf::HasData(first_payload)) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,

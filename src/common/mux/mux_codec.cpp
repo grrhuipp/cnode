@@ -1,7 +1,10 @@
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/byte_reader.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <string>
 
 namespace acpp::mux {
 
@@ -69,6 +72,137 @@ static bool ParsePortThenAddress(ByteReader& r, TargetAddress& target) {
 
     (void)addr_type;  // 已通过 addr_raw 分支处理
     return true;
+}
+
+class MultiBufferFrameReader {
+public:
+    MultiBufferFrameReader(const buf::MultiBuffer& data, size_t offset, size_t size) noexcept
+        : data_(data), offset_(offset), size_(size) {}
+
+    [[nodiscard]] bool Ok() const noexcept { return !error_; }
+    [[nodiscard]] size_t Remaining() const noexcept {
+        return error_ || pos_ > size_ ? 0 : size_ - pos_;
+    }
+    [[nodiscard]] size_t Position() const noexcept { return pos_; }
+
+    [[nodiscard]] uint8_t ReadU8() noexcept {
+        uint8_t out = 0;
+        if (!ReadBytes(std::span<uint8_t>(&out, 1))) {
+            return 0;
+        }
+        return out;
+    }
+
+    [[nodiscard]] uint16_t ReadU16BE() noexcept {
+        std::array<uint8_t, 2> bytes{};
+        if (!ReadBytes(bytes)) {
+            return 0;
+        }
+        return static_cast<uint16_t>(
+            (static_cast<uint16_t>(bytes[0]) << 8) |
+            static_cast<uint16_t>(bytes[1]));
+    }
+
+    [[nodiscard]] std::optional<uint8_t> Peek() noexcept {
+        if (!CanRead(1)) {
+            return std::nullopt;
+        }
+        uint8_t out = 0;
+        if (!CopyAt(offset_ + pos_, std::span<uint8_t>(&out, 1))) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::string ReadString(size_t len) {
+        std::string out(len, '\0');
+        if (len == 0) {
+            return out;
+        }
+        if (!ReadBytes(std::span<uint8_t>(
+                reinterpret_cast<uint8_t*>(out.data()), out.size()))) {
+            return {};
+        }
+        return out;
+    }
+
+    [[nodiscard]] bool ReadBytes(std::span<uint8_t> out) noexcept {
+        if (!CanRead(out.size())) {
+            return false;
+        }
+        if (!CopyAt(offset_ + pos_, out)) {
+            error_ = true;
+            return false;
+        }
+        pos_ += out.size();
+        return true;
+    }
+
+private:
+    [[nodiscard]] bool CanRead(size_t n) noexcept {
+        if (error_ || pos_ + n > size_) {
+            error_ = true;
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool CopyAt(size_t absolute_offset, std::span<uint8_t> out) const noexcept {
+        size_t skip = absolute_offset;
+        size_t copied = 0;
+        for (const auto* buffer : data_) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            if (skip >= bytes.size()) {
+                skip -= bytes.size();
+                continue;
+            }
+            const size_t n = std::min(bytes.size() - skip, out.size() - copied);
+            std::memcpy(out.data() + copied, bytes.data() + skip, n);
+            copied += n;
+            if (copied == out.size()) {
+                return true;
+            }
+            skip = 0;
+        }
+        return copied == out.size();
+    }
+
+    const buf::MultiBuffer& data_;
+    size_t offset_ = 0;
+    size_t size_ = 0;
+    size_t pos_ = 0;
+    bool error_ = false;
+};
+
+static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& target) {
+    uint16_t port = r.ReadU16BE();
+    uint8_t addr_raw = r.ReadU8();
+    if (!r.Ok()) return false;
+
+    if (addr_raw == 1) {
+        net::ip::address_v4::bytes_type bytes{};
+        if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
+        target = TargetAddress(net::ip::make_address_v4(bytes), port);
+        return true;
+    }
+    if (addr_raw == 2) {
+        uint8_t domain_len = r.ReadU8();
+        if (!r.Ok()) return false;
+        std::string domain = r.ReadString(domain_len);
+        if (!r.Ok()) return false;
+        target = TargetAddress(std::string_view(domain), port);
+        return true;
+    }
+    if (addr_raw == 3) {
+        net::ip::address_v6::bytes_type bytes{};
+        if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
+        target = TargetAddress(net::ip::make_address_v6(bytes), port);
+        return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -147,7 +281,7 @@ std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
         // GlobalID：仅 New UDP 帧；元数据中地址之后恰好还剩 8 字节
         if (status == SessionStatus::NEW &&
             h.network == NetworkType::UDP &&
-            meta.Remaining() == 8)
+            meta.Remaining() >= 8)
         {
             auto gid_span = meta.ReadBytes(8);
             if (meta.Ok()) {
@@ -171,6 +305,194 @@ std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
 
         h.has_data = true;
         h.data_len = data_len;
+        h.data_offset = frame_size - data_len;
+    }
+
+    h.frame_size = frame_size;
+    return h;
+}
+
+std::optional<FrameHeader> DecodeFramePrefix(
+    const uint8_t* data,
+    size_t contiguous_len,
+    size_t total_len) {
+    if (!data || total_len < 2 || contiguous_len < 2) return std::nullopt;
+
+    uint16_t meta_len =
+        (static_cast<uint16_t>(data[0]) << 8) |
+         static_cast<uint16_t>(data[1]);
+
+    if (meta_len < 4) {
+        FrameHeader bad;
+        bad.frame_size = 0;
+        return bad;
+    }
+
+    if (total_len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+    if (contiguous_len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+
+    ByteReader meta(data + 2, meta_len);
+
+    uint16_t session_id = meta.ReadU16BE();
+    uint8_t  status_raw = meta.ReadU8();
+    uint8_t  option     = meta.ReadU8();
+    if (!meta.Ok()) {
+        FrameHeader bad; bad.frame_size = 0; return bad;
+    }
+
+    if (status_raw < 1 || status_raw > 4) {
+        FrameHeader bad; bad.frame_size = 0; return bad;
+    }
+    auto status = static_cast<SessionStatus>(status_raw);
+
+    FrameHeader h;
+    h.session_id = session_id;
+    h.status     = status;
+    h.option     = option;
+
+    bool read_address = false;
+    if (status == SessionStatus::NEW) {
+        read_address = true;
+    } else if (status == SessionStatus::KEEP) {
+        if (meta.Remaining() > 0) {
+            auto peek = meta.Peek();
+            if (peek && *peek == static_cast<uint8_t>(NetworkType::UDP)) {
+                read_address = true;
+            }
+        }
+    }
+
+    if (read_address && meta.Remaining() > 0) {
+        uint8_t net_raw = meta.ReadU8();
+        if (!meta.Ok()) { FrameHeader bad; bad.frame_size = 0; return bad; }
+
+        if (net_raw != 1 && net_raw != 2) {
+            FrameHeader bad; bad.frame_size = 0; return bad;
+        }
+
+        h.network    = static_cast<NetworkType>(net_raw);
+        h.has_target = true;
+
+        if (!ParsePortThenAddress(meta, h.target)) {
+            FrameHeader bad; bad.frame_size = 0; return bad;
+        }
+
+        if (status == SessionStatus::NEW &&
+            h.network == NetworkType::UDP &&
+            meta.Remaining() >= 8)
+        {
+            auto gid_span = meta.ReadBytes(8);
+            if (meta.Ok()) {
+                h.has_global_id = true;
+                std::memcpy(h.global_id.data(), gid_span.data(), 8);
+            }
+        }
+    }
+
+    size_t frame_size = 2 + meta_len;
+
+    if (option & kOptionData) {
+        if (total_len < frame_size + 2) return std::nullopt;
+        if (contiguous_len < frame_size + 2) return std::nullopt;
+        uint16_t data_len =
+            (static_cast<uint16_t>(data[frame_size]) << 8) |
+             static_cast<uint16_t>(data[frame_size + 1]);
+        frame_size += 2 + data_len;
+        if (total_len < frame_size) return std::nullopt;
+
+        h.has_data = true;
+        h.data_len = data_len;
+        h.data_offset = frame_size - data_len;
+    }
+
+    h.frame_size = frame_size;
+    return h;
+}
+
+std::optional<FrameHeader> DecodeFrame(
+    const buf::MultiBuffer& data,
+    size_t offset,
+    size_t len) {
+    if (len < 2) return std::nullopt;
+
+    MultiBufferFrameReader r(data, offset, len);
+    uint16_t meta_len = r.ReadU16BE();
+    if (!r.Ok()) return std::nullopt;
+
+    if (meta_len < 4) {
+        FrameHeader bad;
+        bad.frame_size = 0;
+        return bad;
+    }
+
+    if (len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+
+    MultiBufferFrameReader meta(data, offset + 2, meta_len);
+    uint16_t session_id = meta.ReadU16BE();
+    uint8_t status_raw = meta.ReadU8();
+    uint8_t option = meta.ReadU8();
+    if (!meta.Ok()) {
+        FrameHeader bad; bad.frame_size = 0; return bad;
+    }
+
+    if (status_raw < 1 || status_raw > 4) {
+        FrameHeader bad; bad.frame_size = 0; return bad;
+    }
+    auto status = static_cast<SessionStatus>(status_raw);
+
+    FrameHeader h;
+    h.session_id = session_id;
+    h.status = status;
+    h.option = option;
+
+    bool read_address = false;
+    if (status == SessionStatus::NEW) {
+        read_address = true;
+    } else if (status == SessionStatus::KEEP) {
+        if (meta.Remaining() > 0) {
+            auto peek = meta.Peek();
+            if (peek && *peek == static_cast<uint8_t>(NetworkType::UDP)) {
+                read_address = true;
+            }
+        }
+    }
+
+    if (read_address && meta.Remaining() > 0) {
+        uint8_t net_raw = meta.ReadU8();
+        if (!meta.Ok()) { FrameHeader bad; bad.frame_size = 0; return bad; }
+        if (net_raw != 1 && net_raw != 2) {
+            FrameHeader bad; bad.frame_size = 0; return bad;
+        }
+
+        h.network = static_cast<NetworkType>(net_raw);
+        h.has_target = true;
+
+        if (!ParsePortThenAddress(meta, h.target)) {
+            FrameHeader bad; bad.frame_size = 0; return bad;
+        }
+
+        if (status == SessionStatus::NEW &&
+            h.network == NetworkType::UDP &&
+            meta.Remaining() >= 8) {
+            if (meta.ReadBytes(std::span<uint8_t>(h.global_id.data(), h.global_id.size())) &&
+                meta.Ok()) {
+                h.has_global_id = true;
+            }
+        }
+    }
+
+    size_t frame_size = 2 + meta_len;
+    if (option & kOptionData) {
+        if (len < frame_size + 2) return std::nullopt;
+        MultiBufferFrameReader data_len_reader(data, offset + frame_size, 2);
+        const uint16_t data_len = data_len_reader.ReadU16BE();
+        if (!data_len_reader.Ok()) return std::nullopt;
+        frame_size += 2 + data_len;
+        if (len < frame_size) return std::nullopt;
+
+        h.has_data = true;
+        h.data_len = data_len;
+        h.data_offset = frame_size - data_len;
     }
 
     h.frame_size = frame_size;
@@ -178,9 +500,10 @@ std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
 }
 
 // ============================================================================
-// 内部：将 PortThenAddress 写入 buf（vector append）
+// 内部：将 PortThenAddress 写入 buf
 // ============================================================================
-static bool AppendAddress(std::vector<uint8_t>& buf, const TargetAddress& addr) {
+template <class ByteContainer>
+static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
     // Port (2 BE)
     buf.push_back(static_cast<uint8_t>(addr.port >> 8));
     buf.push_back(static_cast<uint8_t>(addr.port & 0xFF));
@@ -219,7 +542,7 @@ static bool AppendAddress(std::vector<uint8_t>& buf, const TargetAddress& addr) 
 }
 
 static void InitFrameBase(
-    std::vector<uint8_t>& buf,
+    auto& buf,
     uint16_t session_id,
     SessionStatus status,
     uint8_t option,
@@ -241,7 +564,7 @@ static void InitFrameBase(
 }
 
 // 回填 MetaLen（= buf.size() - 2）并按需追加 DataLen。
-static void FinalizeFrameHeader(std::vector<uint8_t>& buf, size_t payload_len)
+static void FinalizeFrameHeader(auto& buf, size_t payload_len)
 {
     // 回填 MetaLen
     uint16_t meta_len = static_cast<uint16_t>(buf.size() - 2);
@@ -257,7 +580,7 @@ static void FinalizeFrameHeader(std::vector<uint8_t>& buf, size_t payload_len)
 
 // 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
 static void FinalizeFrame(
-    std::vector<uint8_t>& buf,
+    auto& buf,
     const uint8_t* payload, size_t payload_len)
 {
     FinalizeFrameHeader(buf, payload && payload_len > 0 ? payload_len : 0);
@@ -271,7 +594,8 @@ static void FinalizeFrame(
 // ============================================================================
 // EncodeKeepAlive
 // ============================================================================
-void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
+template <class ByteContainer>
+static void EncodeKeepAliveToImpl(ByteContainer& out) {
     out.clear();
     out.reserve(6);
     out.push_back(0x00);
@@ -282,12 +606,17 @@ void EncodeKeepAliveTo(std::vector<uint8_t>& out) {
     out.push_back(0x00);
 }
 
-bool EncodeNewTo(std::vector<uint8_t>& out,
-                 uint16_t session_id,
-                 NetworkType network,
-                 const TargetAddress& target,
-                 const uint8_t* data,
-                 size_t len) {
+void EncodeKeepAliveTo(memory::ByteVector& out) {
+    EncodeKeepAliveToImpl(out);
+}
+
+template <class ByteContainer>
+static bool EncodeNewToImpl(ByteContainer& out,
+                            uint16_t session_id,
+                            NetworkType network,
+                            const TargetAddress& target,
+                            const uint8_t* data,
+                            size_t len) {
     size_t addr_reserve = 1 + 2 + 1 + 16;
     if (target.IsDomain()) {
         addr_reserve = 1 + 2 + 1 + 1 + target.host.size();
@@ -307,20 +636,35 @@ bool EncodeNewTo(std::vector<uint8_t>& out,
     return true;
 }
 
+bool EncodeNewTo(memory::ByteVector& out,
+                 uint16_t session_id,
+                 NetworkType network,
+                 const TargetAddress& target,
+                 const uint8_t* data,
+                 size_t len) {
+    return EncodeNewToImpl(out, session_id, network, target, data, len);
+}
+
 // ============================================================================
 // EncodeEnd
 // ============================================================================
-void EncodeEndTo(std::vector<uint8_t>& out, uint16_t session_id, bool error) {
+template <class ByteContainer>
+static void EncodeEndToImpl(ByteContainer& out, uint16_t session_id, bool error) {
     uint8_t option = error ? kOptionError : 0x00;
     InitFrameBase(out, session_id, SessionStatus::END, option);
     FinalizeFrame(out, nullptr, 0);
 }
 
+void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
+    EncodeEndToImpl(out, session_id, error);
+}
+
 // ============================================================================
 // EncodeKeepData（TCP 数据）
 // ============================================================================
-void EncodeKeepDataTo(
-    std::vector<uint8_t>& out,
+template <class ByteContainer>
+static void EncodeKeepDataToImpl(
+    ByteContainer& out,
     uint16_t session_id,
     const uint8_t* data, size_t len)
 {
@@ -328,8 +672,17 @@ void EncodeKeepDataTo(
     FinalizeFrame(out, data, len);
 }
 
-void EncodeKeepDataHeaderTo(
-    std::vector<uint8_t>& out,
+void EncodeKeepDataTo(
+    memory::ByteVector& out,
+    uint16_t session_id,
+    const uint8_t* data, size_t len)
+{
+    EncodeKeepDataToImpl(out, session_id, data, len);
+}
+
+template <class ByteContainer>
+static void EncodeKeepDataHeaderToImpl(
+    ByteContainer& out,
     uint16_t session_id,
     size_t payload_len)
 {
@@ -337,11 +690,20 @@ void EncodeKeepDataHeaderTo(
     FinalizeFrameHeader(out, payload_len);
 }
 
+void EncodeKeepDataHeaderTo(
+    memory::ByteVector& out,
+    uint16_t session_id,
+    size_t payload_len)
+{
+    EncodeKeepDataHeaderToImpl(out, session_id, payload_len);
+}
+
 // ============================================================================
 // EncodeKeepUDP（UDP 回包，携带源地址）
 // ============================================================================
-bool EncodeKeepUDPTo(
-    std::vector<uint8_t>& out,
+template <class ByteContainer>
+static bool EncodeKeepUDPToImpl(
+    ByteContainer& out,
     uint16_t session_id,
     const TargetAddress& src,
     const uint8_t* data, size_t len)
@@ -363,8 +725,18 @@ bool EncodeKeepUDPTo(
     return true;
 }
 
-bool EncodeKeepUDPHeaderTo(
-    std::vector<uint8_t>& out,
+bool EncodeKeepUDPTo(
+    memory::ByteVector& out,
+    uint16_t session_id,
+    const TargetAddress& src,
+    const uint8_t* data, size_t len)
+{
+    return EncodeKeepUDPToImpl(out, session_id, src, data, len);
+}
+
+template <class ByteContainer>
+static bool EncodeKeepUDPHeaderToImpl(
+    ByteContainer& out,
     uint16_t session_id,
     const TargetAddress& src,
     size_t payload_len)
@@ -384,6 +756,15 @@ bool EncodeKeepUDPHeaderTo(
 
     FinalizeFrameHeader(out, payload_len);
     return true;
+}
+
+bool EncodeKeepUDPHeaderTo(
+    memory::ByteVector& out,
+    uint16_t session_id,
+    const TargetAddress& src,
+    size_t payload_len)
+{
+    return EncodeKeepUDPHeaderToImpl(out, session_id, src, payload_len);
 }
 
 }  // namespace acpp::mux

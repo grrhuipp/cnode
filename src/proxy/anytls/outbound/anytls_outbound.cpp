@@ -4,6 +4,8 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
@@ -20,9 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -32,6 +32,7 @@
 namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::anytls::kMaxFramePayload;
+constexpr size_t kLogicalQueueShrinkItems = 64;
 
 std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     const acpp::json::object& settings) {
@@ -147,11 +148,15 @@ struct Handler::ClientSession {
         }
 
         void PushPayload(buf::MultiBuffer mb) {
+            const size_t bytes = buf::TotalLen(mb);
+            PushPayload(std::move(mb), bytes);
+        }
+
+        void PushPayload(buf::MultiBuffer mb, size_t bytes) {
             if (closed_) {
                 mb.clear();
                 return;
             }
-            const size_t bytes = buf::TotalLen(mb);
             if (bytes == 0) {
                 mb.clear();
                 return;
@@ -161,8 +166,11 @@ struct Handler::ClientSession {
                 mb.clear();
                 return;
             }
-            queue_.push_back(std::move(mb));
+            queue_.push_back(QueuedPayload{std::move(mb), bytes});
             queued_bytes_ += bytes;
+            if (queue_.size() >= kLogicalQueueShrinkItems) {
+                shrink_queue_on_drain_ = true;
+            }
             WakePayloadReader();
         }
 
@@ -230,6 +238,7 @@ struct Handler::ClientSession {
             error_ = ErrorCode::CANCELLED;
             queue_.clear();
             queued_bytes_ = 0;
+            shrink_queue_on_drain_ = false;
             WakeSynWaiter();
             WakePayloadReader();
         }
@@ -237,10 +246,11 @@ struct Handler::ClientSession {
         net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
             while (!closed_) {
                 if (!queue_.empty()) {
-                    buf::MultiBuffer mb = std::move(queue_.front());
-                    queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                    QueuedPayload payload = std::move(queue_.front());
+                    queued_bytes_ -= std::min(queued_bytes_, payload.bytes);
                     queue_.pop_front();
-                    co_return std::move(mb);
+                    ShrinkQueueIfDrained();
+                    co_return std::move(payload.data);
                 }
                 auto [ec] = co_await payload_signal_.async_receive(
                     net::as_tuple(net::use_awaitable));
@@ -249,10 +259,11 @@ struct Handler::ClientSession {
                 }
             }
             if (!queue_.empty()) {
-                buf::MultiBuffer mb = std::move(queue_.front());
-                queued_bytes_ -= std::min(queued_bytes_, buf::TotalLen(mb));
+                QueuedPayload payload = std::move(queue_.front());
+                queued_bytes_ -= std::min(queued_bytes_, payload.bytes);
                 queue_.pop_front();
-                co_return std::move(mb);
+                ShrinkQueueIfDrained();
+                co_return std::move(payload.data);
             }
             co_return std::unexpected(error_);
         }
@@ -263,6 +274,7 @@ struct Handler::ClientSession {
             error_ = error;
             queue_.clear();
             queued_bytes_ = 0;
+            shrink_queue_on_drain_ = false;
             WakeSynWaiter();
             WakePayloadReader();
         }
@@ -281,16 +293,28 @@ struct Handler::ClientSession {
             (void)payload_signal_.try_send(IoErrorCode{});
         }
 
+        void ShrinkQueueIfDrained() noexcept {
+            if (queue_.empty() && shrink_queue_on_drain_) {
+                TryShrinkSequence(queue_);
+                shrink_queue_on_drain_ = false;
+            }
+        }
+
         net::io_context& io_context_;
         TimeoutScheduler& timeout_scheduler_;
         TimeoutToken syn_timeout_token_;
         net::experimental::channel<void(IoErrorCode)> syn_signal_;
         net::experimental::channel<void(IoErrorCode)> payload_signal_;
         uint32_t sid_ = 0;
-        std::deque<buf::MultiBuffer> queue_;
+        struct QueuedPayload {
+            buf::MultiBuffer data;
+            size_t bytes = 0;
+        };
+        memory::ThreadLocalDeque<QueuedPayload> queue_;
         size_t queued_bytes_ = 0;
         ErrorCode error_ = ErrorCode::OK;
         ErrorCode syn_ack_error_ = ErrorCode::OK;
+        bool shrink_queue_on_drain_ = false;
         bool closed_ = false;
         bool syn_ack_done_ = false;
         bool syn_waiting_ = false;
@@ -304,15 +328,18 @@ struct Handler::ClientSession {
 
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
-    PaddingScheme padding_scheme = DefaultPaddingScheme();
+    std::shared_ptr<const PaddingScheme> padding_scheme =
+        std::make_shared<PaddingScheme>(DefaultPaddingScheme());
     uint32_t next_sid = 1;
     uint32_t packet_index = 1;
     bool settings_sent = false;
     uint8_t peer_version = 0;
     std::chrono::steady_clock::time_point idle_since{};
     net::experimental::channel<void(IoErrorCode)> write_signal;
-    std::mutex streams_mu;
-    std::unordered_map<uint32_t, std::weak_ptr<LogicalStream>> logical_streams;
+    acpp::memory::ThreadLocalUnorderedMap<
+        uint32_t,
+        std::weak_ptr<LogicalStream>>
+        logical_streams;
     size_t active_streams = 0;
     bool in_idle_pool = false;
     bool read_loop_started = false;
@@ -327,29 +354,24 @@ struct Handler::ClientSession {
         net::io_context& io_context,
         uint32_t sid) {
         auto logical = std::make_shared<LogicalStream>(io_context, sid);
-        std::lock_guard lock(streams_mu);
         logical_streams[sid] = logical;
         return logical;
     }
 
     void UnregisterLogicalStream(uint32_t sid) {
-        std::lock_guard lock(streams_mu);
         logical_streams.erase(sid);
     }
 
     void CloseAll(ErrorCode error) {
         closed.store(true);
         WakeWriter();
-        {
-            std::lock_guard lock(streams_mu);
-            for (auto& [sid, weak] : logical_streams) {
-                (void)sid;
-                if (auto logical = weak.lock()) {
-                    logical->Close(error);
-                }
+        for (auto& [sid, weak] : logical_streams) {
+            (void)sid;
+            if (auto logical = weak.lock()) {
+                logical->Close(error);
             }
-            logical_streams.clear();
         }
+        logical_streams.clear();
         if (stream) {
             stream->CloseAbortive();
         }
@@ -383,7 +405,7 @@ struct Handler::ClientSession {
     }
 
     net::awaitable<std::expected<void, ErrorCode>>
-    WriteOpenPacket(uint32_t sid, std::string packet) {
+    WriteOpenPacket(uint32_t sid, memory::ByteVector packet) {
         auto turn = co_await WaitWriteTurn();
         if (!turn) {
             co_return std::unexpected(turn.error());
@@ -394,7 +416,7 @@ struct Handler::ClientSession {
 
         if (!settings_sent) {
             const auto settings = DefaultClientSettings();
-            std::string with_settings;
+            memory::ByteVector with_settings;
             with_settings.reserve(packet.size() + kFrameHeaderSize + settings.size());
             auto settings_frame = AppendFrameBytesTo(
                 with_settings,
@@ -405,13 +427,15 @@ struct Handler::ClientSession {
             if (!settings_frame) {
                 co_return std::unexpected(settings_frame.error());
             }
-            with_settings.append(packet);
+            with_settings.insert(with_settings.end(), packet.begin(), packet.end());
             packet = std::move(with_settings);
         }
 
-        const uint32_t this_packet = packet_index < padding_scheme.stop ? packet_index++ : 0;
+        auto scheme_snapshot = padding_scheme;
+        const uint32_t this_packet =
+            packet_index < scheme_snapshot->stop ? packet_index++ : 0;
         auto ok = co_await WritePacketWithPadding(
-            *stream, padding_scheme, this_packet, std::move(packet));
+            *stream, *scheme_snapshot, this_packet, std::move(packet));
         if (!ok) {
             closed.store(true);
             co_return std::unexpected(ok.error());
@@ -431,10 +455,11 @@ struct Handler::ClientSession {
             this,
             [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
-        const PaddingScheme scheme_snapshot = padding_scheme;
-        const uint32_t this_packet = packet_index < scheme_snapshot.stop ? packet_index++ : 0;
+        auto scheme_snapshot = padding_scheme;
+        const uint32_t this_packet =
+            packet_index < scheme_snapshot->stop ? packet_index++ : 0;
         auto ok = co_await WriteMultiBufferAsFramesWithPadding(
-            *stream, scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+            *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
         if (!ok) {
             closed.store(true);
             co_return std::unexpected(ok.error());
@@ -443,7 +468,18 @@ struct Handler::ClientSession {
     }
 
     net::awaitable<std::expected<void, ErrorCode>>
-    WriteUdpPacket(uint32_t sid, std::string packet) {
+    WritePayloadBuffers(uint32_t sid, std::span<const net::const_buffer> buffers) {
+        bool has_data = false;
+        for (const net::const_buffer& buffer : buffers) {
+            if (buffer.data() && buffer.size() > 0) {
+                has_data = true;
+                break;
+            }
+        }
+        if (!has_data) {
+            co_return std::expected<void, ErrorCode>{};
+        }
+
         auto turn = co_await WaitWriteTurn();
         if (!turn) {
             co_return std::unexpected(turn.error());
@@ -452,10 +488,11 @@ struct Handler::ClientSession {
             this,
             [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
-        const PaddingScheme scheme_snapshot = padding_scheme;
-        const uint32_t this_packet = packet_index < scheme_snapshot.stop ? packet_index++ : 0;
-        auto ok = co_await WritePacketWithPadding(
-            *stream, scheme_snapshot, this_packet, std::move(packet));
+        auto scheme_snapshot = padding_scheme;
+        const uint32_t this_packet =
+            packet_index < scheme_snapshot->stop ? packet_index++ : 0;
+        auto ok = co_await WriteBuffersAsFramesWithPadding(
+            *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
         if (!ok) {
             closed.store(true);
             co_return std::unexpected(ok.error());
@@ -522,7 +559,8 @@ struct Handler::ClientSession {
                                 co_return;
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
-                                padding_scheme = std::move(*parsed);
+                                padding_scheme =
+                                    std::make_shared<PaddingScheme>(std::move(*parsed));
                             }
                         }
                         break;
@@ -560,15 +598,12 @@ struct Handler::ClientSession {
             }
 
             std::shared_ptr<LogicalStream> logical;
-            {
-                std::lock_guard lock(streams_mu);
-                auto stream_it = logical_streams.find(header->sid);
-                logical = stream_it == logical_streams.end()
-                    ? std::shared_ptr<LogicalStream>{}
-                    : stream_it->second.lock();
-                if (!logical && stream_it != logical_streams.end()) {
-                    logical_streams.erase(stream_it);
-                }
+            auto stream_it = logical_streams.find(header->sid);
+            logical = stream_it == logical_streams.end()
+                ? std::shared_ptr<LogicalStream>{}
+                : stream_it->second.lock();
+            if (!logical && stream_it != logical_streams.end()) {
+                logical_streams.erase(stream_it);
             }
             if (!logical) {
                 if (auto ok = co_await discard_current(); !ok) {
@@ -600,7 +635,7 @@ struct Handler::ClientSession {
                         logical->Close(payload.error());
                         break;
                     }
-                    logical->PushPayload(std::move(*payload));
+                    logical->PushPayload(std::move(*payload), header->length);
                     break;
                 }
                 case kCmdFIN:
@@ -634,12 +669,12 @@ void Handler::CloseSession(std::shared_ptr<ClientSession> session) noexcept {
     }
 }
 
-void Handler::PruneSessionsLocked() {
+void Handler::PruneSessions() {
     if (sessions_.empty() && idle_sessions_.empty()) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    std::vector<std::shared_ptr<ClientSession>> kept;
+    acpp::memory::ThreadLocalVector<std::shared_ptr<ClientSession>> kept;
     kept.reserve(sessions_.size());
     for (auto& session : sessions_) {
         if (!session || !session->stream) {
@@ -660,7 +695,7 @@ void Handler::PruneSessionsLocked() {
     }
     sessions_ = std::move(kept);
 
-    std::vector<std::shared_ptr<ClientSession>> idle;
+    acpp::memory::ThreadLocalVector<std::shared_ptr<ClientSession>> idle;
     idle.reserve(idle_sessions_.size());
     for (auto& session : idle_sessions_) {
         if (!session || session->closed.load() || !session->in_idle_pool || session->active_streams != 0) {
@@ -672,7 +707,7 @@ void Handler::PruneSessionsLocked() {
     const size_t keep_from = idle.size() > min_idle_sessions_
         ? idle.size() - min_idle_sessions_
         : 0;
-    std::vector<std::shared_ptr<ClientSession>> kept_idle;
+    acpp::memory::ThreadLocalVector<std::shared_ptr<ClientSession>> kept_idle;
     kept_idle.reserve(idle.size());
     for (size_t i = 0; i < idle.size(); ++i) {
         auto& session = idle[i];
@@ -715,15 +750,11 @@ Handler::Handler(std::string tag,
 }
 
 Handler::~Handler() noexcept {
-    std::vector<std::shared_ptr<ClientSession>> sessions;
-    {
-        std::lock_guard lock(pool_mu_);
-        sessions = std::move(sessions_);
-        idle_sessions_.clear();
-    }
-    for (auto& session : sessions) {
+    for (auto& session : sessions_) {
         CloseSession(session);
     }
+    sessions_.clear();
+    idle_sessions_.clear();
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
@@ -750,18 +781,15 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     std::shared_ptr<ClientSession> session;
-    {
-        std::lock_guard lock(pool_mu_);
-        PruneSessionsLocked();
-        while (!idle_sessions_.empty() && !session) {
-            auto candidate = idle_sessions_.back();
-            idle_sessions_.pop_back();
-            if (!candidate || !candidate->Available() || !candidate->in_idle_pool) {
-                continue;
-            }
-            candidate->in_idle_pool = false;
-            session = candidate;
+    PruneSessions();
+    while (!idle_sessions_.empty() && !session) {
+        auto candidate = idle_sessions_.back();
+        idle_sessions_.pop_back();
+        if (!candidate || !candidate->Available() || !candidate->in_idle_pool) {
+            continue;
         }
+        candidate->in_idle_pool = false;
+        session = candidate;
     }
 
     if (!session) {
@@ -803,7 +831,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         const auto default_scheme = DefaultPaddingScheme();
         const uint16_t auth_padding_size = AuthPaddingSize(default_scheme);
         auto auth_hash = PasswordHash(settings_.password);
-        std::vector<uint8_t> auth_packet(34 + auth_padding_size, 0);
+        std::array<uint8_t, 34 + kDefaultAuthPaddingSize> auth_packet{};
+        const size_t auth_packet_size = 34 + auth_padding_size;
+        if (auth_packet_size > auth_packet.size()) {
+            new_stream->Cancel();
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
         std::copy(auth_hash.begin(), auth_hash.end(), auth_packet.begin());
         auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
         auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
@@ -812,16 +845,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 *new_stream,
                 std::span<const uint8_t>(
                     auth_packet.data(),
-                    auth_packet.size())); !ok) {
+                    auth_packet_size)); !ok) {
             new_stream->Cancel();
             co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
         session = std::make_shared<ClientSession>(io_context, std::move(new_stream));
-        {
-            std::lock_guard lock(pool_mu_);
-            sessions_.push_back(session);
-            PruneSessionsLocked();
-        }
+        sessions_.push_back(session);
+        PruneSessions();
     } else if (session->stream) {
         LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] reuse idle session sid={}", session->next_sid);
     }
@@ -839,7 +869,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     auto cleanup_logical_stream = [&]() {
         session->UnregisterLogicalStream(sid);
         logical->Close(ErrorCode::CANCELLED);
-        std::lock_guard lock(pool_mu_);
         if (session->active_streams > 0) {
             --session->active_streams;
         }
@@ -847,11 +876,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             session->idle_since = std::chrono::steady_clock::now();
         }
     };
-    {
-        std::lock_guard lock(pool_mu_);
-        ++session->active_streams;
-        session->idle_since = {};
-    }
+    ++session->active_streams;
+    session->idle_since = {};
     if (!session->read_loop_started) {
         session->read_loop_started = true;
         auto read_session = session;
@@ -874,9 +900,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return std::unexpected(target.error());
     }
 
-    std::string open_packet;
+    const size_t first_payload_size = buf::TotalLen(first_payload);
+    memory::ByteVector open_packet;
     open_packet.reserve(
-        (kFrameHeaderSize * 3) + target->size() + buf::TotalLen(first_payload) +
+        (kFrameHeaderSize * 3) + target->size() + first_payload_size +
         initial_payload.size() + 128);
     auto syn_frame = AppendFrameBytesTo(open_packet, kCmdSYN, sid, {});
     auto target_frame = AppendFrameBytesTo(
@@ -909,7 +936,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             co_return std::unexpected(request_frame.error());
         }
     }
-    if (buf::TotalLen(first_payload) > 0) {
+    if (first_payload_size > 0) {
         for (auto* buffer : first_payload) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
@@ -993,34 +1020,19 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
 
         net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-            if (mb.empty()) {
+            if (!buf::HasData(mb)) {
                 co_return;
             }
 
-            std::expected<void, ErrorCode> ok;
-            if (is_udp) {
-                std::string packet;
-                packet.reserve(buf::TotalLen(mb) + (mb.size() * kFrameHeaderSize));
-                for (auto* buffer : mb) {
-                    if (!buffer || buffer->IsEmpty()) {
-                        continue;
-                    }
-                    auto frame = AppendFrameBytesTo(packet, kCmdPSH, sid, buffer->Bytes());
-                    if (!frame) {
-                        mb.clear();
-                        logical->Close(frame.error());
-                        throw IoSystemError(io_error::connection_reset, "AnyTLS UDP frame encode failed");
-                    }
-                }
-                mb.clear();
-                if (packet.empty()) {
-                    co_return;
-                }
-                ok = co_await session->WriteUdpPacket(sid, std::move(packet));
-            } else {
-                ok = co_await session->WritePayloadFrames(sid, std::move(mb));
+            auto ok = co_await session->WritePayloadFrames(sid, std::move(mb));
+            if (!ok) {
+                logical->Close(ok.error());
+                throw IoSystemError(io_error::connection_reset, "AnyTLS logical write failed");
             }
+        }
 
+        net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+            auto ok = co_await session->WritePayloadBuffers(sid, buffers);
             if (!ok) {
                 logical->Close(ok.error());
                 throw IoSystemError(io_error::connection_reset, "AnyTLS logical write failed");
@@ -1064,7 +1076,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     RelayResult result;
     auto* inbound_control = inbound.control;
-    if (buf::TotalLen(first_payload) > 0) {
+    if (buf::HasData(first_payload)) {
         if (inbound_control) {
             result = co_await DoRelayLinkWithFirstPacket(
                 io_context,
@@ -1138,20 +1150,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
     session->UnregisterLogicalStream(sid);
     logical->Close(result.error);
-    {
-        std::lock_guard lock(pool_mu_);
-        if (session->active_streams > 0) {
-            --session->active_streams;
-        }
-        if (result.error == ErrorCode::OK && session->active_streams == 0 && session->stream) {
-            session->idle_since = std::chrono::steady_clock::now();
-            if (!session->in_idle_pool && !session->closed.load()) {
-                session->in_idle_pool = true;
-                idle_sessions_.push_back(session);
-            }
-        }
-        PruneSessionsLocked();
+    if (session->active_streams > 0) {
+        --session->active_streams;
     }
+    if (result.error == ErrorCode::OK && session->active_streams == 0 && session->stream) {
+        session->idle_since = std::chrono::steady_clock::now();
+        if (!session->in_idle_pool && !session->closed.load()) {
+            session->in_idle_pool = true;
+            idle_sessions_.push_back(session);
+        }
+    }
+    PruneSessions();
     co_return result;
 }
 

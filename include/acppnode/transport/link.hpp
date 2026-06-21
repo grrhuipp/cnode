@@ -3,6 +3,8 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 
+#include <span>
+
 namespace acpp {
 class AsyncStream;
 }
@@ -21,6 +23,7 @@ public:
     virtual ~MultiBufferWriter() noexcept = default;
 
     virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) = 0;
+    virtual net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) = 0;
     virtual net::awaitable<void> AsyncShutdownWrite() { co_return; }
 };
 

@@ -666,7 +666,7 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
         return;
     }
 
-    const auto& send_buffers =
+    const auto send_buffers =
         proxyman::inbound::UdpWorker::ReplySendBuffers(*packet);
     const auto endpoint =
         proxyman::inbound::UdpWorker::ReplyEndpoint(*packet);

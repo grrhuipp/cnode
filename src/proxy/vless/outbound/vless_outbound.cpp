@@ -11,6 +11,7 @@
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/error.hpp"
@@ -43,6 +44,57 @@ using ::acpp::vless::VlessBufferedReader;
 using ::acpp::vless::WriteVlessBytes;
 
 constexpr size_t kUdpFrameQueueShrinkItems = 64;
+
+net::awaitable<bool> WriteVlessTcpInitial(
+    transport::MultiBufferWriter& writer,
+    std::span<const uint8_t> header,
+    buf::MultiBuffer& first_payload,
+    std::span<const uint8_t> initial_payload) {
+    std::array<net::const_buffer, 2 + buf::MultiBuffer::kInlineCapacity> stack_buffers{};
+    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+    const bool use_spill = first_payload.size() > buf::MultiBuffer::kInlineCapacity;
+    if (use_spill) {
+        spill_buffers.reserve(2 + first_payload.size());
+    }
+    size_t stack_count = 0;
+
+    auto append = [&](net::const_buffer buffer) {
+        if (buffer.size() == 0) {
+            return;
+        }
+        if (use_spill) {
+            spill_buffers.push_back(buffer);
+            return;
+        }
+        stack_buffers[stack_count++] = buffer;
+    };
+
+    append(net::const_buffer(header.data(), header.size()));
+    for (const buf::Buffer* buffer : first_payload) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        const auto bytes = buffer->Bytes();
+        append(net::const_buffer(bytes.data(), bytes.size()));
+    }
+    if (!initial_payload.empty()) {
+        append(net::const_buffer(initial_payload.data(), initial_payload.size()));
+    }
+
+    const auto buffers = use_spill
+        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
+        : std::span<const net::const_buffer>(stack_buffers.data(), stack_count);
+    if (buffers.empty()) {
+        co_return true;
+    }
+
+    try {
+        co_await writer.WriteBuffers(buffers);
+    } catch (...) {
+        co_return false;
+    }
+    co_return true;
+}
 
 [[nodiscard]] bool SameTargetAddress(const TargetAddress& lhs,
                                      const TargetAddress& rhs) {
@@ -234,10 +286,25 @@ private:
         pending_ = buf::BufferGuard{};
     }
 
+    [[nodiscard]] bool TryTakePayload(std::span<const uint8_t> payload) {
+        buf::BufferGuard taken;
+        if (!buf::TakeBufferSuffix(pending_, payload, taken)) {
+            return false;
+        }
+        queue_.push_back(std::move(taken));
+        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+            shrink_queue_on_drain_ = true;
+        }
+        return true;
+    }
+
     void Parse() {
         while (Size() > 0) {
             auto parsed = vless::Codec::ParseUdpPacket(Data(), Size());
             if (parsed.result == vless::Codec::UdpParseResult::SUCCESS) {
+                if (parsed.packet && TryTakePayload(parsed.packet->payload)) {
+                    continue;
+                }
                 buf::BufferGuard payload{buf::Buffer::New()};
                 if (payload && parsed.packet) {
                     const auto bytes = parsed.packet->payload;
@@ -330,12 +397,12 @@ public:
                 }
                 out.push_back(pkt.release());
             }
-            if (!out.empty()) {
+            if (buf::HasData(out)) {
                 co_return out;
             }
 
             buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
-            if (raw.empty()) {
+            if (!buf::HasData(raw)) {
                 co_return buf::MultiBuffer{};
             }
             for (buf::Buffer* buffer : raw) {
@@ -360,12 +427,12 @@ public:
         buf::MultiBuffer out;
         for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
+                mb.FreeSlot(buffer);
                 continue;
             }
             if (buffer->HasUDP() && !SameTargetAddress(buffer->UDP(), udp_target_)) {
                 if (!packet_addr_) {
-                    buf::Buffer::Free(buffer);
-                    buffer = nullptr;
+                    mb.FreeSlot(buffer);
                     continue;
                 }
             }
@@ -383,18 +450,57 @@ public:
                 ok = EncodeVlessUdpLengthHeaderTo(buffer->Len(), *header);
             }
             if (!ok) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
             out.push_back(header.release());
             buffer->ClearUDP();
-            out.push_back(buffer);
-            buffer = nullptr;
+            out.push_back(mb.ReleaseSlot(buffer));
         }
         mb.clear();
-        if (!out.empty()) {
+        if (buf::HasData(out)) {
             co_await writer_.WriteMultiBuffer(std::move(out));
+        }
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (!is_udp_) {
+            if (vision_writer_) {
+                co_await vision_writer_->WriteBuffers(buffers);
+                co_return;
+            }
+            co_await writer_.WriteBuffers(buffers);
+            co_return;
+        }
+
+        buf::MultiBuffer header_owner;
+        memory::ThreadLocalVector<net::const_buffer> out;
+        header_owner.reserve(buffers.size());
+        out.reserve(buffers.size() * 2);
+
+        for (const net::const_buffer& buffer : buffers) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            if (!data || buffer.size() == 0) {
+                continue;
+            }
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
+                throw std::bad_alloc();
+            }
+            const bool ok = packet_addr_
+                ? EncodePacketAddrUdpHeaderTo(udp_target_, buffer.size(), *header)
+                : EncodeVlessUdpLengthHeaderTo(buffer.size(), *header);
+            if (!ok) {
+                throw IoSystemError(io_error::fault, "VLESS UDP header allocation failed");
+            }
+            const auto header_bytes = header->Bytes();
+            out.emplace_back(header_bytes.data(), header_bytes.size());
+            header_owner.push_back(header.release());
+            out.emplace_back(data, buffer.size());
+        }
+
+        if (!out.empty()) {
+            co_await writer_.WriteBuffers(out);
         }
     }
 
@@ -489,7 +595,7 @@ public:
             return;
         }
         CompactConsumed();
-        pending_.reserve(pending_.size() + len);
+        EnsureAppendCapacity(pending_, len, buf::Buffer::kSize);
         pending_.insert(pending_.end(), data, data + len);
         Parse();
     }
@@ -601,7 +707,7 @@ public:
                 if (frame.header.status == mux::SessionStatus::END) {
                     co_return buf::MultiBuffer{};
                 }
-                if (!frame.header.has_data || frame.payload.empty()) {
+                if (!frame.header.has_data || !buf::HasData(frame.payload)) {
                     continue;
                 }
                 const TargetAddress& src = frame.header.has_target
@@ -616,7 +722,7 @@ public:
             }
 
             buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
-            if (raw.empty()) {
+            if (!buf::HasData(raw)) {
                 co_return buf::MultiBuffer{};
             }
             for (buf::Buffer* buffer : raw) {
@@ -631,8 +737,7 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
 
@@ -659,8 +764,7 @@ public:
                     bytes.size());
             }
 
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
+            mb.FreeSlot(buffer);
 
             if (!encoded || write_frame_.empty()) {
                 continue;
@@ -672,6 +776,43 @@ public:
             }
         }
         mb.clear();
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        for (const net::const_buffer& buffer : buffers) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            if (!data || buffer.size() == 0) {
+                continue;
+            }
+
+            bool encoded = false;
+            if (!session_started_) {
+                encoded = mux::EncodeNewTo(
+                    write_frame_,
+                    session_id_,
+                    mux::NetworkType::UDP,
+                    udp_target_,
+                    data,
+                    buffer.size());
+                session_started_ = encoded;
+            } else {
+                encoded = mux::EncodeKeepUDPTo(
+                    write_frame_,
+                    session_id_,
+                    udp_target_,
+                    data,
+                    buffer.size());
+            }
+
+            if (!encoded || write_frame_.empty()) {
+                continue;
+            }
+            try {
+                co_await WriteVlessBytes(writer_, write_frame_);
+            } catch (...) {
+                break;
+            }
+        }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -758,7 +899,7 @@ private:
     bool end_sent_ = false;
     uint16_t session_id_ = 1;
     MuxFrameFramer framer_;
-    std::vector<uint8_t> write_frame_;
+    memory::ByteVector write_frame_;
 };
 
 }  // namespace
@@ -963,14 +1104,42 @@ proxy::vless::outbound::Handler::Process(
         }
     }
 
-    try {
-        co_await WriteVlessBytes(
+    bool prewrote_tcp_payload = false;
+    const size_t first_payload_size = buf::TotalLen(first_payload);
+    const size_t initial_payload_size = initial_payload.size();
+    const bool can_batch_tcp_initial =
+        !is_udp &&
+        !use_vision &&
+        !encryption_ &&
+        (first_payload_size > 0 || initial_payload_size > 0);
+    if (can_batch_tcp_initial) {
+        const bool ok = co_await WriteVlessTcpInitial(
             *active_writer,
-            std::span<const uint8_t>(header.data(), header_len));
-    } catch (...) {
-        co_return fail_abortive(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : ErrorCode::SOCKET_WRITE_FAILED);
+            std::span<const uint8_t>(header.data(), header_len),
+            first_payload,
+            initial_payload);
+        if (!ok) {
+            co_return fail_abortive(outbound_protocol_deadline.Expired()
+                ? ErrorCode::TIMEOUT
+                : ErrorCode::SOCKET_WRITE_FAILED);
+        }
+        first_payload.clear();
+        prewrote_tcp_payload = true;
+        const uint64_t prewritten_bytes = first_payload_size + initial_payload_size;
+        if (prewritten_bytes > 0) {
+            stats.AddBytesOut(prewritten_bytes);
+            ctx.traffic.bytes_up = prewritten_bytes;
+        }
+    } else {
+        try {
+            co_await WriteVlessBytes(
+                *active_writer,
+                std::span<const uint8_t>(header.data(), header_len));
+        } catch (...) {
+            co_return fail_abortive(outbound_protocol_deadline.Expired()
+                ? ErrorCode::TIMEOUT
+                : ErrorCode::SOCKET_WRITE_FAILED);
+        }
     }
 
     stream->SetIdleTimeout(relay_idle_timeout);
@@ -984,7 +1153,7 @@ proxy::vless::outbound::Handler::Process(
             *active_reader,
             *active_writer,
             target);
-        if (buf::TotalLen(first_payload) > 0) {
+        if (first_payload_size > 0) {
             if (inbound.control) {
                 co_return co_await DoRelayLinkWithFirstPacket(
                     io_context, *inbound.reader, *inbound.writer, *inbound.control,
@@ -1023,7 +1192,7 @@ proxy::vless::outbound::Handler::Process(
         use_packet_addr,
         use_vision,
         config_.uuid_bytes);
-    if (buf::TotalLen(first_payload) > 0) {
+    if (buf::HasData(first_payload)) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,
@@ -1033,7 +1202,7 @@ proxy::vless::outbound::Handler::Process(
             io_context, *inbound.reader, *inbound.writer, target_endpoint,
             ctx, stats, first_payload, relay_config);
     }
-    if (!initial_payload.empty()) {
+    if (!prewrote_tcp_payload && !initial_payload.empty()) {
         if (inbound.control) {
             co_return co_await DoRelayLinkWithFirstPacket(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,

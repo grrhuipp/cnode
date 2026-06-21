@@ -46,6 +46,9 @@ public:
     net::awaitable<void> EncodeRequestBody(
         AsyncStream& stream,
         buf::MultiBuffer mb);
+    net::awaitable<void> EncodeRequestBody(
+        AsyncStream& stream,
+        std::span<const net::const_buffer> buffers);
     net::awaitable<void> EncodeRequestBodyEOF(AsyncStream& stream);
     net::awaitable<bool> DecodeResponseHeader(AsyncStream& stream);
     net::awaitable<buf::MultiBuffer> DecodeResponseBody(AsyncStream& stream);

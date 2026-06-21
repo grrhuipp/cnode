@@ -5,6 +5,8 @@
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
 
+#include "acppnode/common/allocator.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,15 +43,15 @@ inline constexpr size_t kVlessEncryptionMaxPaddingLength =
 
 struct VlessEncryptionClientNfsHello {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
-    std::vector<uint8_t> relays;
-    std::vector<uint8_t> nfs_key;
-    std::vector<uint8_t> bytes;
+    memory::ByteVector relays;
+    memory::ByteVector nfs_key;
+    memory::ByteVector bytes;
 };
 
 struct VlessEncryptionServerNfsOpenResult {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
-    std::vector<uint8_t> relays;
-    std::vector<uint8_t> nfs_key;
+    memory::ByteVector relays;
+    memory::ByteVector nfs_key;
 };
 
 struct VlessEncryptionClientPfsHello {
@@ -65,8 +67,8 @@ struct VlessEncryptionServerPfsResponse {
         encrypted_public_key{};
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize> encrypted_ticket{};
-    std::vector<uint8_t> pfs_key;
-    std::vector<uint8_t> united_key;
+    memory::ByteVector pfs_key;
+    memory::ByteVector united_key;
     VlessEncryptionAead write_aead;
     uint16_t ticket_seconds = 0;
 };
@@ -75,8 +77,8 @@ struct VlessEncryptionClientPfsOpenResult {
     std::array<uint8_t, kVlessEncryptionServerPfsPublicSize>
         server_public_key{};
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
-    std::vector<uint8_t> pfs_key;
-    std::vector<uint8_t> united_key;
+    memory::ByteVector pfs_key;
+    memory::ByteVector united_key;
     VlessEncryptionAead read_aead;
     uint16_t ticket_seconds = 0;
 };
@@ -89,7 +91,7 @@ struct VlessEncryptionPaddingPlan {
 
 struct VlessEncryptionEncryptedPadding {
     VlessEncryptionPaddingPlan plan;
-    std::vector<uint8_t> bytes;
+    memory::ByteVector bytes;
 };
 
 struct VlessEncryptionClientZeroRttRequest {
@@ -97,8 +99,8 @@ struct VlessEncryptionClientZeroRttRequest {
         encrypted_length{};
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
         encrypted_ticket{};
-    std::vector<uint8_t> bytes;
-    std::vector<uint8_t> united_key;
+    memory::ByteVector bytes;
+    memory::ByteVector united_key;
 };
 
 struct VlessEncryptionServerZeroRttOpenResult {
@@ -106,7 +108,7 @@ struct VlessEncryptionServerZeroRttOpenResult {
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
         encrypted_ticket{};
     std::array<uint8_t, kVlessEncryptionServerRandomSize> server_random{};
-    std::vector<uint8_t> united_key;
+    memory::ByteVector united_key;
 };
 
 [[nodiscard]] std::optional<size_t> VlessEncryptionRelaysLength(
@@ -156,7 +158,7 @@ OpenVlessEncryptionServerPfsResponse(
 BuildVlessEncryptionPaddingPlan(
     const VlessEncryptionConfig& config) noexcept;
 
-[[nodiscard]] std::optional<std::vector<uint8_t>>
+[[nodiscard]] std::optional<memory::ByteVector>
 SealVlessEncryptionPadding(VlessEncryptionAead& aead,
                            size_t padding_length) noexcept;
 

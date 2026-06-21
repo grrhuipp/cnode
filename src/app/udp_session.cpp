@@ -266,8 +266,7 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
         co_return ErrorCode::CONNECTION_CLOSED;
     }
 
-    const size_t payload_len = buf::TotalLen(payload);
-    if (payload_len == 0) {
+    if (!buf::HasData(payload)) {
         co_return ErrorCode::SUCCESS;
     }
 
@@ -300,18 +299,40 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
             impl_->AddTargetMapping(target_key, callback_id);
         }
 
-        memory::ThreadLocalVector<net::const_buffer> send_buffers;
-        send_buffers.reserve(payload.size());
+        std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_send_buffers{};
+        memory::ThreadLocalVector<net::const_buffer> spill_send_buffers;
+        size_t send_buffer_count = 0;
         for (const auto* buffer : payload) {
             if (buffer && !buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
-                send_buffers.emplace_back(bytes.data(), bytes.size());
+                net::const_buffer send_buffer{bytes.data(), bytes.size()};
+                if (send_buffer_count < inline_send_buffers.size()) {
+                    inline_send_buffers[send_buffer_count++] = send_buffer;
+                    continue;
+                }
+                if (spill_send_buffers.empty()) {
+                    spill_send_buffers.reserve(payload.size());
+                    spill_send_buffers.insert(
+                        spill_send_buffers.end(),
+                        inline_send_buffers.begin(),
+                        inline_send_buffers.begin() + send_buffer_count);
+                }
+                spill_send_buffers.emplace_back(send_buffer);
+                ++send_buffer_count;
             }
         }
 
-        if (send_buffers.empty()) {
+        if (send_buffer_count == 0) {
             co_return ErrorCode::SUCCESS;
         }
+
+        auto send_buffers = spill_send_buffers.empty()
+            ? std::span<const net::const_buffer>(
+                inline_send_buffers.data(),
+                send_buffer_count)
+            : std::span<const net::const_buffer>(
+                spill_send_buffers.data(),
+                spill_send_buffers.size());
 
         size_t sent = co_await impl_->socket.async_send_to(
             send_buffers,

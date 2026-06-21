@@ -86,7 +86,7 @@ if(CNODE_HEAPTRACK_BUILD)
     )
 endif()
 
-option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" ON)
+option(CNODE_MEMORY_STATS "Enable runtime live/peak memory object counters" OFF)
 
 # ============================================================================
 # 依赖（FetchContent）

@@ -112,7 +112,7 @@ public:
     /**
      * 批量读取数据到 buf::MultiBuffer
      *
-     * @return buf::MultiBuffer（空 = EOF）；调用方负责 FreeMultiBuffer
+     * @return buf::MultiBuffer（无有效数据 = EOF）；返回值按 RAII 自动归还 Buffer
      * @throws IoSystemError 网络错误
      */
     virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer();

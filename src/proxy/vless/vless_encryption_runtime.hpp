@@ -6,6 +6,7 @@
 #include "vless_encryption_xor.hpp"
 #include "vless_io_util.hpp"
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 
 #include <array>
@@ -16,7 +17,7 @@
 namespace acpp::vless {
 
 struct VlessEncryptionRuntime {
-    std::vector<uint8_t> united_key;
+    memory::ByteVector united_key;
     VlessEncryptionAead read_aead;
     VlessEncryptionAead write_aead;
     std::optional<VlessEncryptionHeaderXor> read_xor;
@@ -28,7 +29,7 @@ struct VlessEncryptionRuntime {
 };
 
 struct VlessEncryptionClientTicketCache {
-    std::vector<uint8_t> pfs_key;
+    memory::ByteVector pfs_key;
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::chrono::steady_clock::time_point expires_at{};
 
@@ -40,7 +41,7 @@ struct VlessEncryptionClientTicketCache {
 
 class VlessEncryptionServerTicketStore {
 public:
-    [[nodiscard]] std::optional<std::vector<uint8_t>> Lookup(
+    [[nodiscard]] std::optional<memory::ByteVector> Lookup(
         std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
         std::span<const uint8_t> nfs_key,
         std::chrono::steady_clock::time_point now);
@@ -53,7 +54,7 @@ public:
 private:
     struct Session {
         std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
-        std::vector<uint8_t> pfs_key;
+        memory::ByteVector pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
         std::vector<std::array<uint8_t, kVlessMlKem768SharedSecretSize>>
             seen_nfs_keys;

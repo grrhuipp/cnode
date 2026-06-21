@@ -2,7 +2,10 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/base64.hpp"
+#include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/container_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"
 
@@ -14,7 +17,6 @@
 #include <charconv>
 #include <cctype>
 #include <cstring>
-#include <deque>
 #include <format>
 #include <limits>
 #include <map>
@@ -30,6 +32,10 @@ namespace {
 
 constexpr size_t kTlsContextCacheMaxEntries = 16;
 constexpr size_t kXHttpPacketSessionPruneThreshold = 1024;
+constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
+
+using TlsContextCache =
+    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<SslContext>>;
 
 template <typename Cache>
 void PruneTlsContextCache(Cache& cache,
@@ -139,7 +145,7 @@ std::string MakeRealityClientCacheKey(const RealityConfig& reality,
 }
 
 SslContext* AcquireServerTlsContext(const TlsConfig& config) {
-    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    thread_local TlsContextCache cache;
     struct LastHit {
         const TlsConfig* config = nullptr;
         bool is_server = false;
@@ -179,7 +185,7 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
 
 SslContext* AcquireServerRealityContext(const RealityConfig& reality,
                                         const TlsConfig& tls_config) {
-    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    thread_local TlsContextCache cache;
     struct LastHit {
         const RealityConfig* reality = nullptr;
         const TlsConfig* tls = nullptr;
@@ -209,7 +215,7 @@ SslContext* AcquireServerRealityContext(const RealityConfig& reality,
 }
 
 SslContext* AcquireClientTlsContext(const TlsConfig& config) {
-    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    thread_local TlsContextCache cache;
     thread_local const TlsConfig* last_config = nullptr;
     thread_local SslContext* last_ctx = nullptr;
 
@@ -238,7 +244,7 @@ SslContext* AcquireClientTlsContext(const TlsConfig& config) {
 
 SslContext* AcquireClientRealityContext(const RealityConfig& reality,
                                         const TlsConfig& tls_config) {
-    thread_local std::unordered_map<std::string, std::unique_ptr<SslContext>> cache;
+    thread_local TlsContextCache cache;
     struct LastHit {
         const RealityConfig* reality = nullptr;
         const TlsConfig* tls = nullptr;
@@ -460,16 +466,43 @@ SslContext* AcquireClientRealityContext(const RealityConfig& reality,
 net::awaitable<bool> WriteFullToStream(AsyncStream& stream,
                                        const uint8_t* data,
                                        size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        size_t n = co_await stream.AsyncWrite(
-            net::buffer(data + sent, len - sent));
-        if (n == 0) {
-            co_return false;
-        }
-        sent += n;
+    if (len == 0) {
+        co_return true;
+    }
+    const net::const_buffer buffer{data, len};
+    try {
+        co_await stream.WriteBuffers(
+            std::span<const net::const_buffer>{&buffer, 1});
+    } catch (...) {
+        co_return false;
     }
     co_return true;
+}
+
+net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
+                                             buf::MultiBuffer& out,
+                                             size_t max_read) {
+    if (max_read == 0) {
+        co_return 0;
+    }
+    buf::BufferGuard buffer{buf::Buffer::New()};
+    if (!buffer) {
+        throw std::bad_alloc();
+    }
+    try {
+        const size_t capacity = std::min(
+            max_read,
+            static_cast<size_t>(buffer->Available()));
+        const size_t n = co_await stream.AsyncRead(
+            net::buffer(buffer->Tail().data(), capacity));
+        if (n > 0) {
+            buffer->Produce(static_cast<uint32_t>(n));
+            out.push_back(buffer.release());
+        }
+        co_return n;
+    } catch (...) {
+        throw;
+    }
 }
 
 }  // namespace
@@ -501,7 +534,7 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!pending_.empty()) {
+        if (buf::HasData(pending_)) {
             co_return PopPendingData(buffer);
         }
         co_return co_await inner_->AsyncRead(buffer);
@@ -512,7 +545,7 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!pending_.empty()) {
+        if (buf::HasData(pending_)) {
             co_return std::move(pending_);
         }
         co_return co_await inner_->ReadMultiBuffer();
@@ -590,33 +623,10 @@ protected:
 
 private:
     size_t PopPendingData(net::mutable_buffer target) noexcept {
-        auto* out = static_cast<uint8_t*>(target.data());
-        size_t remaining = target.size();
-        size_t copied = 0;
-        size_t drained = 0;
-
-        for (buf::Buffer* buffer : pending_) {
-            if (remaining == 0) {
-                break;
-            }
-            if (!buffer || buffer->IsEmpty()) {
-                ++drained;
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            const size_t n = std::min(remaining, bytes.size());
-            std::memcpy(out + copied, bytes.data(), n);
-            buffer->Advance(static_cast<uint32_t>(n));
-            copied += n;
-            remaining -= n;
-            if (buffer->IsEmpty()) {
-                ++drained;
-            } else {
-                break;
-            }
-        }
-        pending_.drop_front(drained);
-        return copied;
+        return pending_.ConsumePrefixTo(
+            std::span<uint8_t>(
+                static_cast<uint8_t*>(target.data()),
+                target.size()));
     }
 
     std::unique_ptr<AsyncStream> inner_;
@@ -642,9 +652,11 @@ public:
         if (len == 0) {
             return;
         }
-        const size_t old = pending_.size();
-        pending_.resize(old + len);
-        std::memcpy(pending_.data() + old, data, len);
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(data, len),
+                pending_)) {
+            throw std::bad_alloc();
+        }
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
@@ -693,6 +705,12 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (!read_chunked_) {
+            if (buf::HasData(pending_)) {
+                co_return std::move(pending_);
+            }
+            co_return co_await inner_->ReadMultiBuffer();
+        }
         buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) {
             throw std::bad_alloc();
@@ -709,19 +727,33 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        if (write_closed_) {
+            mb.clear();
+            throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
+        }
+        if (!write_chunked_) {
+            co_await inner_->WriteMultiBuffer(std::move(mb));
+            co_return;
+        }
         for (buf::Buffer*& buffer : mb) {
             if (buffer && !buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
                 (void)co_await AsyncWrite(net::buffer(bytes.data(), bytes.size()));
             }
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
+            mb.FreeSlot(buffer);
         }
         mb.clear();
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
+        if (write_closed_) {
+            throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
+        }
+        if (!write_chunked_) {
+            co_await inner_->WriteBuffers(buffers);
+            co_return;
+        }
         for (const auto& buffer : buffers) {
             if (buffer.size() == 0) {
                 continue;
@@ -733,7 +765,6 @@ public:
     void ShutdownRead() override {
         read_closed_ = true;
         pending_.clear();
-        pending_offset_ = 0;
         inner_->ShutdownRead();
     }
 
@@ -842,21 +873,17 @@ private:
         if (capacity == 0) {
             co_return 0;
         }
-        if (pending_offset_ < pending_.size()) {
-            const size_t n = std::min(capacity, pending_.size() - pending_offset_);
-            std::memcpy(out, pending_.data() + pending_offset_, n);
-            pending_offset_ += n;
-            CompactPending();
+        if (buf::HasData(pending_)) {
+            const size_t n = pending_.ConsumePrefixTo(
+                std::span<uint8_t>(out, capacity));
             co_return n;
         }
         co_return co_await inner_->AsyncRead(buffer);
     }
 
     net::awaitable<size_t> ReadRawByte(uint8_t& out) {
-        if (pending_offset_ < pending_.size()) {
-            out = pending_[pending_offset_++];
-            CompactPending();
-            co_return 1;
+        if (buf::HasData(pending_)) {
+            co_return pending_.ConsumePrefixTo(std::span<uint8_t>(&out, 1));
         }
         const size_t n = co_await inner_->AsyncRead(net::buffer(&out, 1));
         co_return n;
@@ -962,25 +989,8 @@ private:
         co_return copied;
     }
 
-    void CompactPending() {
-        if (pending_offset_ == 0) {
-            return;
-        }
-        if (pending_offset_ >= pending_.size()) {
-            pending_.clear();
-            pending_offset_ = 0;
-            return;
-        }
-        if (pending_offset_ > 4096) {
-            pending_.erase(pending_.begin(),
-                           pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
-            pending_offset_ = 0;
-        }
-    }
-
     std::unique_ptr<AsyncStream> inner_;
-    std::vector<uint8_t> pending_;
-    size_t pending_offset_ = 0;
+    buf::MultiBuffer pending_;
     size_t chunk_remaining_ = 0;
     bool read_chunked_ = false;
     bool write_chunked_ = false;
@@ -1003,8 +1013,9 @@ public:
         Wake();
     }
 
-    void Push(uint64_t seq, std::vector<uint8_t> payload) {
+    void Push(uint64_t seq, buf::MultiBuffer payload) {
         if (closed_ || input_closed_) {
+            payload.clear();
             return;
         }
         if (seq == next_seq_) {
@@ -1056,18 +1067,15 @@ public:
         }
 
         while (true) {
-            while (!ready_.empty() && ready_.front().empty()) {
+            while (!ready_.empty() && !buf::HasData(ready_.front())) {
                 ready_.pop_front();
-                read_offset_ = 0;
             }
             if (!ready_.empty()) {
-                const auto& front = ready_.front();
-                const size_t n = std::min(capacity, front.size() - read_offset_);
-                std::memcpy(out, front.data() + read_offset_, n);
-                read_offset_ += n;
-                if (read_offset_ >= front.size()) {
+                auto& front = ready_.front();
+                const size_t n = front.ConsumePrefixTo(
+                    std::span<uint8_t>(out, capacity));
+                if (!buf::HasData(front)) {
                     ready_.pop_front();
-                    read_offset_ = 0;
                 }
                 co_return n;
             }
@@ -1091,6 +1099,36 @@ public:
         }
     }
 
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
+        while (true) {
+            while (!ready_.empty() && !buf::HasData(ready_.front())) {
+                ready_.pop_front();
+            }
+            if (!ready_.empty()) {
+                buf::MultiBuffer mb = std::move(ready_.front());
+                ready_.pop_front();
+                co_return mb;
+            }
+            if (stream_input_) {
+                buf::MultiBuffer mb = co_await stream_input_->ReadMultiBuffer();
+                if (buf::HasData(mb)) {
+                    co_return mb;
+                }
+                stream_input_.reset();
+                CloseInput();
+                co_return buf::MultiBuffer{};
+            }
+            if (closed_ || input_closed_) {
+                co_return buf::MultiBuffer{};
+            }
+            IoErrorCode ec;
+            co_await input_signal_.async_receive(net::redirect_error(net::use_awaitable, ec));
+            if (ec && ec != io_error::operation_aborted) {
+                co_return buf::MultiBuffer{};
+            }
+        }
+    }
+
 private:
     void Wake() noexcept {
         if (io_context_.stopped()) {
@@ -1101,11 +1139,10 @@ private:
 
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
-    std::deque<std::vector<uint8_t>> ready_;
-    std::map<uint64_t, std::vector<uint8_t>> pending_;
+    memory::ThreadLocalDeque<buf::MultiBuffer> ready_;
+    memory::ThreadLocalMap<uint64_t, buf::MultiBuffer> pending_;
     std::unique_ptr<AsyncStream> stream_input_;
     uint64_t next_seq_ = 0;
-    size_t read_offset_ = 0;
     bool input_closed_ = false;
     bool closed_ = false;
 };
@@ -1220,7 +1257,12 @@ struct XHttpRequestMeta {
     net::io_context& io_context,
     std::string_view session_id,
     bool create) {
-    thread_local std::unordered_map<std::string, std::weak_ptr<XHttpPacketUpSession>> sessions;
+    using SessionMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        std::weak_ptr<XHttpPacketUpSession>>;
+    thread_local SessionMap sessions;
+    thread_local memory::ThreadLocalString lookup_key;
+
     if (sessions.size() >= kXHttpPacketSessionPruneThreshold) {
         for (auto it = sessions.begin(); it != sessions.end();) {
             if (it->second.expired()) {
@@ -1231,7 +1273,8 @@ struct XHttpRequestMeta {
         }
     }
 
-    auto it = sessions.find(std::string(session_id));
+    lookup_key.assign(session_id.data(), session_id.size());
+    auto it = sessions.find(lookup_key);
     if (it != sessions.end()) {
         if (auto session = it->second.lock()) {
             return session;
@@ -1242,7 +1285,7 @@ struct XHttpRequestMeta {
         return nullptr;
     }
     auto session = std::make_shared<XHttpPacketUpSession>(io_context);
-    sessions.emplace(std::string(session_id), session);
+    sessions.emplace(lookup_key, session);
     return session;
 }
 
@@ -1272,41 +1315,26 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            throw std::bad_alloc();
-        }
-        const size_t n = co_await AsyncRead(
-            net::buffer(buffer->Tail().data(), buffer->Available()));
-        if (n == 0) {
+        if (!session_) {
             co_return buf::MultiBuffer{};
         }
-        buffer->Produce(static_cast<uint32_t>(n));
-        buf::MultiBuffer mb;
-        mb.push_back(buffer.release());
-        co_return mb;
+        co_return co_await session_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        for (buf::Buffer*& buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                const auto bytes = buffer->Bytes();
-                (void)co_await AsyncWrite(net::buffer(bytes.data(), bytes.size()));
-            }
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
+        if (!downlink_) {
+            mb.clear();
+            throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
         }
-        mb.clear();
+        co_await downlink_->WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        for (const auto& buffer : buffers) {
-            if (buffer.size() == 0) {
-                continue;
-            }
-            (void)co_await AsyncWrite(buffer);
+        if (!downlink_) {
+            throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
         }
+        co_await downlink_->WriteBuffers(buffers);
     }
 
     void ShutdownRead() override {
@@ -1434,7 +1462,7 @@ struct H2Frame {
     H2FrameType type = H2FrameType::DATA;
     uint8_t flags = 0;
     uint32_t stream_id = 0;
-    std::vector<uint8_t> payload;
+    memory::ByteVector payload;
 };
 
 [[nodiscard]] uint32_t ReadU24(const uint8_t* p) noexcept {
@@ -1559,7 +1587,7 @@ net::awaitable<bool> WriteH2Frame(
             : std::span<const net::const_buffer>(buffers.data(), buffers.size()));
 }
 
-void AppendHpackInt(std::vector<uint8_t>& out,
+void AppendHpackInt(memory::ByteVector& out,
                     uint8_t prefix_bits,
                     uint8_t first_mask,
                     uint32_t value) {
@@ -1578,23 +1606,23 @@ void AppendHpackInt(std::vector<uint8_t>& out,
     out.push_back(static_cast<uint8_t>(value));
 }
 
-void AppendHpackString(std::vector<uint8_t>& out, std::string_view value) {
+void AppendHpackString(memory::ByteVector& out, std::string_view value) {
     AppendHpackInt(out, 7, 0, static_cast<uint32_t>(value.size()));
     out.insert(out.end(), value.begin(), value.end());
 }
 
-void AppendHpackIndexed(std::vector<uint8_t>& out, uint32_t index) {
+void AppendHpackIndexed(memory::ByteVector& out, uint32_t index) {
     AppendHpackInt(out, 7, 0x80, index);
 }
 
-void AppendHpackLiteralIndexedName(std::vector<uint8_t>& out,
+void AppendHpackLiteralIndexedName(memory::ByteVector& out,
                                    uint32_t name_index,
                                    std::string_view value) {
     AppendHpackInt(out, 4, 0, name_index);
     AppendHpackString(out, value);
 }
 
-void AppendHpackLiteralNewName(std::vector<uint8_t>& out,
+void AppendHpackLiteralNewName(memory::ByteVector& out,
                                std::string_view name,
                                std::string_view value) {
     out.push_back(0);
@@ -1602,12 +1630,12 @@ void AppendHpackLiteralNewName(std::vector<uint8_t>& out,
     AppendHpackString(out, value);
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeGrpcRequestHeaders(
+[[nodiscard]] memory::ByteVector EncodeGrpcRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     std::string_view user_agent) {
-    std::vector<uint8_t> h;
+    memory::ByteVector h;
     h.reserve(128 + authority.size() + path.size() + user_agent.size());
     AppendHpackIndexed(h, 3); // :method: POST
     AppendHpackIndexed(h, tls ? 7 : 6); // :scheme
@@ -1623,16 +1651,16 @@ void AppendHpackLiteralNewName(std::vector<uint8_t>& out,
     return h;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeGrpcResponseHeaders() {
-    std::vector<uint8_t> h;
+[[nodiscard]] memory::ByteVector EncodeGrpcResponseHeaders() {
+    memory::ByteVector h;
     h.reserve(32);
     AppendHpackIndexed(h, 8); // :status: 200
     AppendHpackLiteralIndexedName(h, 31, "application/grpc");
     return h;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeGrpcTrailers() {
-    std::vector<uint8_t> h;
+[[nodiscard]] memory::ByteVector EncodeGrpcTrailers() {
+    memory::ByteVector h;
     h.reserve(24);
     AppendHpackLiteralNewName(h, "grpc-status", "0");
     return h;
@@ -1647,14 +1675,14 @@ enum class H2PayloadCodec : uint8_t {
     return method.empty() ? std::string_view("PUT") : method;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
+[[nodiscard]] memory::ByteVector EncodeHttpRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     const HttpConfig& cfg) {
     const std::string_view method = EffectiveHttpMethod(cfg.method);
     const std::string_view req_path = EffectivePath(path);
-    std::vector<uint8_t> h;
+    memory::ByteVector h;
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
               cfg.headers.size() * 32);
 
@@ -1683,9 +1711,9 @@ enum class H2PayloadCodec : uint8_t {
     return h;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(
+[[nodiscard]] memory::ByteVector EncodeHttpResponseHeaders(
     const transport::internet::HttpHeaders& headers) {
-    std::vector<uint8_t> h;
+    memory::ByteVector h;
     h.reserve(64 + headers.size() * 32);
     AppendHpackIndexed(h, 8); // :status: 200
     AppendHpackLiteralNewName(h, "cache-control", "no-store");
@@ -1877,8 +1905,8 @@ net::awaitable<bool> WriteGrpcHunkMessage(
     co_return true;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeSettingsPayload(uint32_t initial_window) {
-    std::vector<uint8_t> payload;
+[[nodiscard]] memory::ByteVector EncodeSettingsPayload(uint32_t initial_window) {
+    memory::ByteVector payload;
     if (initial_window > 0) {
         payload.resize(6);
         payload[0] = 0;
@@ -1914,7 +1942,12 @@ bool ReadProtoVarint(std::span<const uint8_t> data,
     return false;
 }
 
-[[nodiscard]] std::optional<std::span<const uint8_t>> DecodeGrpcHunkData(
+struct GrpcHunkData {
+    size_t offset = 0;
+    size_t size = 0;
+};
+
+[[nodiscard]] std::optional<GrpcHunkData> DecodeGrpcHunkData(
     std::span<const uint8_t> message) {
     size_t offset = 0;
     while (offset < message.size()) {
@@ -1930,9 +1963,10 @@ bool ReadProtoVarint(std::span<const uint8_t> data,
                 len > message.size() - offset) {
                 return std::nullopt;
             }
-            return std::span<const uint8_t>(
-                message.data() + offset,
-                static_cast<size_t>(len));
+            return GrpcHunkData{
+                .offset = offset,
+                .size = static_cast<size_t>(len),
+            };
         }
 
         switch (wire) {
@@ -1964,7 +1998,7 @@ bool ReadProtoVarint(std::span<const uint8_t> data,
             return std::nullopt;
         }
     }
-    return std::span<const uint8_t>{};
+    return GrpcHunkData{};
 }
 
 net::awaitable<void> AcknowledgeH2Settings(AsyncStream& stream) {
@@ -2044,15 +2078,18 @@ net::awaitable<void> SendWindowUpdate(AsyncStream& stream,
 }
 
 struct HpackHeaderField {
-    std::string name;
-    std::string value;
+    memory::ThreadLocalString name;
+    memory::ThreadLocalString value;
 };
 
 class HpackDecoder final {
 public:
-    std::optional<std::vector<HpackHeaderField>> Decode(
+    using HeaderFields = memory::ThreadLocalVector<HpackHeaderField>;
+    using DynamicTable = memory::ThreadLocalDeque<HpackHeaderField>;
+
+    std::optional<HeaderFields> Decode(
         std::span<const uint8_t> block) {
-        std::vector<HpackHeaderField> fields;
+        HeaderFields fields;
         size_t offset = 0;
         while (offset < block.size()) {
             const uint8_t first = block[offset];
@@ -2261,8 +2298,9 @@ private:
         return std::nullopt;
     }
 
-    static std::optional<std::string> DecodeHuffman(std::span<const uint8_t> data) {
-        std::string out;
+    static std::optional<memory::ThreadLocalString> DecodeHuffman(
+        std::span<const uint8_t> data) {
+        memory::ThreadLocalString out;
         out.reserve(data.size());
         uint32_t code = 0;
         uint8_t bits = 0;
@@ -2293,8 +2331,9 @@ private:
         return out;
     }
 
-    static std::optional<std::string> ReadString(std::span<const uint8_t> block,
-                                                 size_t& offset) {
+    static std::optional<memory::ThreadLocalString> ReadString(
+        std::span<const uint8_t> block,
+        size_t& offset) {
         if (offset >= block.size()) {
             return std::nullopt;
         }
@@ -2308,7 +2347,9 @@ private:
         if (huffman) {
             return DecodeHuffman(encoded);
         }
-        std::string value(unsafe::ptr_cast<const char>(encoded.data()), encoded.size());
+        memory::ThreadLocalString value(
+            unsafe::ptr_cast<const char>(encoded.data()),
+            encoded.size());
         return value;
     }
 
@@ -2319,8 +2360,8 @@ private:
         if (index <= kStaticTable.size()) {
             const auto& field = kStaticTable[index - 1];
             return HpackHeaderField{
-                std::string(field.name),
-                std::string(field.value),
+                memory::ThreadLocalString(field.name.data(), field.name.size()),
+                memory::ThreadLocalString(field.value.data(), field.value.size()),
             };
         }
         const uint32_t dynamic_index =
@@ -2331,7 +2372,7 @@ private:
         return dynamic_table_[dynamic_index];
     }
 
-    std::optional<std::string> IndexedName(uint32_t index) const {
+    std::optional<memory::ThreadLocalString> IndexedName(uint32_t index) const {
         auto field = Indexed(index);
         if (!field) {
             return std::nullopt;
@@ -2346,7 +2387,7 @@ private:
         if (!name_index) {
             return std::nullopt;
         }
-        std::string name;
+        memory::ThreadLocalString name;
         if (*name_index == 0) {
             auto decoded = ReadString(block, offset);
             if (!decoded) {
@@ -2374,7 +2415,7 @@ private:
             dynamic_size_ = 0;
             return;
         }
-        dynamic_table_.insert(dynamic_table_.begin(), field);
+        dynamic_table_.push_front(field);
         dynamic_size_ += entry_size;
         EvictDynamic();
     }
@@ -2392,15 +2433,15 @@ private:
         }
     }
 
-    std::vector<HpackHeaderField> dynamic_table_;
+    DynamicTable dynamic_table_;
     size_t dynamic_size_ = 0;
     size_t dynamic_max_size_ = 4096;
 };
 
 struct H2RequestHeaders {
-    std::string method;
-    std::string path;
-    std::string authority;
+    memory::ThreadLocalString method;
+    memory::ThreadLocalString path;
+    memory::ThreadLocalString authority;
 };
 
 [[nodiscard]] std::optional<H2RequestHeaders> DecodeH2RequestHeaders(
@@ -2456,35 +2497,38 @@ public:
         }
 
         if (payload_codec_ == H2PayloadCodec::RawData) {
-            while (h2_data_offset_ >= h2_data_.size()) {
+            while (h2_data_offset_ >= h2_data_end_) {
                 h2_data_.clear();
                 h2_data_offset_ = 0;
+                h2_data_end_ = 0;
                 if (!co_await ReadNextDataFrame()) {
                     co_return 0;
                 }
             }
-            const size_t n = std::min(capacity, h2_data_.size() - h2_data_offset_);
+            const size_t n = std::min(capacity, h2_data_end_ - h2_data_offset_);
             std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
             h2_data_offset_ += n;
-            if (h2_data_offset_ >= h2_data_.size()) {
+            if (h2_data_offset_ >= h2_data_end_) {
                 h2_data_.clear();
                 h2_data_offset_ = 0;
+                h2_data_end_ = 0;
             }
             co_return n;
         }
 
-        while (read_offset_ >= read_payload_.size()) {
+        while (read_offset_ >= read_payload_end_) {
             if (!co_await ReadNextGrpcMessage()) {
                 co_return 0;
             }
         }
 
-        const size_t n = std::min(capacity, read_payload_.size() - read_offset_);
+        const size_t n = std::min(capacity, read_payload_end_ - read_offset_);
         std::memcpy(out, read_payload_.data() + read_offset_, n);
         read_offset_ += n;
-        if (read_offset_ >= read_payload_.size()) {
+        if (read_offset_ >= read_payload_end_) {
             read_payload_.clear();
             read_offset_ = 0;
+            read_payload_end_ = 0;
         }
         co_return n;
     }
@@ -2528,57 +2572,23 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (payload_codec_ == H2PayloadCodec::RawData) {
-            std::array<net::const_buffer, 16> stack_buffers{};
-            std::vector<net::const_buffer> spill_buffers;
-            size_t count = 0;
-            size_t total = 0;
-
-            for (const buf::Buffer* buffer : mb) {
-                if (!buffer || buffer->IsEmpty()) {
-                    continue;
-                }
-                const auto bytes = buffer->Bytes();
-                if (count < stack_buffers.size()) {
-                    stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-                } else {
-                    if (spill_buffers.empty()) {
-                        spill_buffers.reserve(mb.size());
-                        spill_buffers.insert(
-                            spill_buffers.end(),
-                            stack_buffers.begin(),
-                            stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
-                    }
-                    spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
-                }
-                total += bytes.size();
-            }
+            ConstBufferSpanBuilder<16> payloads;
+            payloads.AppendMultiBuffer(mb);
 
             try {
-                if (total > 0) {
-                    const auto payloads = spill_buffers.empty()
-                        ? std::span<const net::const_buffer>(stack_buffers.data(), count)
-                        : std::span<const net::const_buffer>(
-                              spill_buffers.data(), spill_buffers.size());
+                if (!payloads.empty()) {
                     if (!co_await WriteH2DataPayloadBuffers(
                             *inner_,
                             stream_id_,
-                            payloads)) {
+                            payloads.Span())) {
                         ThrowGrpcStreamError("HTTP/2 raw WriteMultiBuffer failed");
                     }
                 }
             } catch (...) {
-                for (buf::Buffer*& buffer : mb) {
-                    buf::Buffer::Free(buffer);
-                    buffer = nullptr;
-                }
                 mb.clear();
                 throw;
             }
 
-            for (buf::Buffer*& buffer : mb) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
-            }
             mb.clear();
             co_return;
         }
@@ -2590,13 +2600,11 @@ public:
             if (!buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
                 if (!co_await WriteGrpcMessage(bytes)) {
-                    buf::Buffer::Free(buffer);
-                    buffer = nullptr;
+                    mb.FreeSlot(buffer);
                     ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
                 }
             }
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
+            mb.FreeSlot(buffer);
         }
         mb.clear();
     }
@@ -2628,7 +2636,11 @@ public:
     void ShutdownRead() override {
         read_closed_ = true;
         read_payload_.clear();
+        read_offset_ = 0;
+        read_payload_end_ = 0;
         h2_data_.clear();
+        h2_data_offset_ = 0;
+        h2_data_end_ = 0;
         inner_->ShutdownRead();
     }
 
@@ -2675,7 +2687,11 @@ public:
         }
         closed_ = true;
         read_payload_.clear();
+        read_offset_ = 0;
+        read_payload_end_ = 0;
         h2_data_.clear();
+        h2_data_offset_ = 0;
+        h2_data_end_ = 0;
         inner_->Close();
     }
 
@@ -2723,7 +2739,7 @@ private:
             co_return false;
         }
         const uint32_t len = ReadU32(prefix.data() + 1);
-        std::vector<uint8_t> message(len);
+        memory::ByteVector message(len);
         read_offset_ = 0;
         if (len > 0 &&
             !co_await ReadGrpcBytes(message.data(), message.size())) {
@@ -2735,16 +2751,19 @@ private:
             LOG_ACCESS_DEBUG("[gRPC:{}] invalid Hunk protobuf message", conn_id_);
             co_return false;
         }
-        read_payload_.assign(hunk->begin(), hunk->end());
+        read_payload_ = std::move(message);
+        read_offset_ = hunk->offset;
+        read_payload_end_ = hunk->offset + hunk->size;
         co_return true;
     }
 
     net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len) {
         size_t copied = 0;
         while (copied < len) {
-            if (h2_data_offset_ >= h2_data_.size()) {
+            if (h2_data_offset_ >= h2_data_end_) {
                 h2_data_.clear();
                 h2_data_offset_ = 0;
+                h2_data_end_ = 0;
                 if (!co_await ReadNextDataFrame()) {
                     co_return false;
                 }
@@ -2753,7 +2772,7 @@ private:
 
             const size_t n = std::min(
                 len - copied,
-                h2_data_.size() - h2_data_offset_);
+                h2_data_end_ - h2_data_offset_);
             std::memcpy(out + copied, h2_data_.data() + h2_data_offset_, n);
             copied += n;
             h2_data_offset_ += n;
@@ -2795,12 +2814,10 @@ private:
                 const auto data = H2DataPayload(*frame);
                 const size_t data_len = data.size();
                 if (data_len > 0) {
-                    if ((frame->flags & 0x8) == 0) {
-                        h2_data_ = std::move(frame->payload);
-                    } else {
-                        h2_data_.assign(data.begin(), data.end());
-                    }
-                    h2_data_offset_ = 0;
+                    h2_data_offset_ = static_cast<size_t>(
+                        data.data() - frame->payload.data());
+                    h2_data_end_ = h2_data_offset_ + data_len;
+                    h2_data_ = std::move(frame->payload);
                     co_await SendWindowUpdate(
                         *inner_,
                         0,
@@ -2838,10 +2855,12 @@ private:
     Role role_ = Role::Client;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     uint64_t conn_id_ = 0;
-    std::vector<uint8_t> h2_data_;
+    memory::ByteVector h2_data_;
     size_t h2_data_offset_ = 0;
-    std::vector<uint8_t> read_payload_;
+    size_t h2_data_end_ = 0;
+    memory::ByteVector read_payload_;
     size_t read_offset_ = 0;
+    size_t read_payload_end_ = 0;
     bool read_closed_ = false;
     bool write_closed_ = false;
     bool closed_ = false;
@@ -2865,8 +2884,8 @@ public:
         return session_.lock();
     }
 
-    bool PushH2Data(std::span<const uint8_t> data);
-    bool PushH2Data(std::vector<uint8_t> data);
+    bool PushH2Data(memory::ByteVector data);
+    bool PushH2Data(memory::ByteVector data, size_t offset, size_t size);
     void CloseInput();
     void CancelFromSession() noexcept;
     void CancelPendingOperations() noexcept;
@@ -2892,6 +2911,9 @@ private:
     net::awaitable<bool> ReadNextGrpcMessage();
     net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len);
     net::awaitable<size_t> AsyncReadRaw(net::mutable_buffer buffer);
+    void MarkQueueForShrinkIfLarge() noexcept;
+    void ShrinkQueueIfDrained() noexcept;
+    void ClearH2Queue() noexcept;
 
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
@@ -2899,11 +2921,22 @@ private:
     uint32_t stream_id_ = 0;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     uint64_t conn_id_ = 0;
-    std::deque<std::vector<uint8_t>> h2_data_queue_;
+    struct QueuedH2Data {
+        memory::ByteVector data;
+        size_t offset = 0;
+        size_t end = 0;
+
+        [[nodiscard]] size_t Size() const noexcept {
+            return end > offset ? end - offset : 0;
+        }
+    };
+    memory::ThreadLocalDeque<QueuedH2Data> h2_data_queue_;
     size_t h2_data_offset_ = 0;
     size_t queued_bytes_ = 0;
-    std::vector<uint8_t> read_payload_;
+    bool shrink_h2_queue_on_drain_ = false;
+    memory::ByteVector read_payload_;
     size_t read_offset_ = 0;
+    size_t read_payload_end_ = 0;
     bool input_done_ = false;
     bool read_cancelled_ = false;
     bool read_closed_ = false;
@@ -3341,7 +3374,7 @@ private:
         if (!first_fragment) {
             co_return false;
         }
-        std::vector<uint8_t> header_block(
+        memory::ByteVector header_block(
             first_fragment->begin(),
             first_fragment->end());
         while ((frame.flags & 0x4) == 0) {
@@ -3550,19 +3583,16 @@ private:
                      xsession = std::move(xsession),
                      seq = meta.seq,
                      conn_id = conn_id_]() mutable -> net::awaitable<void> {
-                        std::vector<uint8_t> payload;
-                        std::array<uint8_t, 8192> scratch{};
+                        buf::MultiBuffer payload;
                         try {
                             while (true) {
-                                const size_t n = co_await stream->AsyncRead(
-                                    net::buffer(scratch));
+                                const size_t n = co_await ReadToMultiBufferTail(
+                                    *stream,
+                                    payload,
+                                    buf::Buffer::kSize);
                                 if (n == 0) {
                                     break;
                                 }
-                                payload.insert(
-                                    payload.end(),
-                                    scratch.data(),
-                                    scratch.data() + n);
                             }
                             xsession->Push(seq, std::move(payload));
                         } catch (const std::exception& e) {
@@ -3607,9 +3637,12 @@ private:
 
             auto it = streams_.find(frame.stream_id);
             if (it != streams_.end() && it->second) {
-                const bool queued = (frame.flags & 0x8) == 0
-                    ? it->second->PushH2Data(std::move(frame.payload))
-                    : it->second->PushH2Data(data);
+                const size_t data_offset = static_cast<size_t>(
+                    data.data() - frame.payload.data());
+                const bool queued = it->second->PushH2Data(
+                    std::move(frame.payload),
+                    data_offset,
+                    data_len);
                 if (!queued) {
                     RemoveStream(frame.stream_id);
                     (void)co_await WriteFrameSerialized(
@@ -3632,7 +3665,8 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     net::experimental::channel<void(IoErrorCode)> write_signal_;
-    std::unordered_map<uint32_t, std::shared_ptr<GrpcServerSubStreamState>> streams_;
+    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<GrpcServerSubStreamState>>
+        streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     transport::internet::HttpHeaders response_headers_;
     std::optional<HttpConfig> http_config_;
@@ -3656,33 +3690,35 @@ GrpcServerSubStreamState::GrpcServerSubStreamState(
     , payload_codec_(payload_codec)
     , conn_id_(conn_id) {}
 
-bool GrpcServerSubStreamState::PushH2Data(std::span<const uint8_t> data) {
-    if (cancelled_ || input_done_ || data.empty()) {
-        return !cancelled_;
-    }
-    constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
-    if (queued_bytes_ + data.size() > kMaxQueuedBytes) {
-        CancelFromSession();
-        return false;
-    }
-
-    std::vector<uint8_t> copy;
-    copy.assign(data.begin(), data.end());
-    return PushH2Data(std::move(copy));
+bool GrpcServerSubStreamState::PushH2Data(memory::ByteVector data) {
+    const size_t size = data.size();
+    return PushH2Data(std::move(data), 0, size);
 }
 
-bool GrpcServerSubStreamState::PushH2Data(std::vector<uint8_t> data) {
-    if (cancelled_ || input_done_ || data.empty()) {
+bool GrpcServerSubStreamState::PushH2Data(
+    memory::ByteVector data,
+    size_t offset,
+    size_t size) {
+    if (cancelled_ || input_done_ || size == 0) {
         return !cancelled_;
     }
+    if (offset > data.size() || size > data.size() - offset) {
+        CancelFromSession();
+        return false;
+    }
     constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
-    if (queued_bytes_ + data.size() > kMaxQueuedBytes) {
+    if (queued_bytes_ + size > kMaxQueuedBytes) {
         CancelFromSession();
         return false;
     }
 
-    queued_bytes_ += data.size();
-    h2_data_queue_.push_back(std::move(data));
+    queued_bytes_ += size;
+    h2_data_queue_.push_back(QueuedH2Data{
+        .data = std::move(data),
+        .offset = offset,
+        .end = offset + size,
+    });
+    MarkQueueForShrinkIfLarge();
     WakeInputReader();
     return true;
 }
@@ -3705,10 +3741,10 @@ void GrpcServerSubStreamState::CancelFromSession() noexcept {
     write_closed_ = true;
     trailers_sent_ = true;
     closing_local_ = true;
-    h2_data_queue_.clear();
-    queued_bytes_ = 0;
+    ClearH2Queue();
     read_payload_.clear();
     read_offset_ = 0;
+    read_payload_end_ = 0;
     WakeInputReader();
 }
 
@@ -3727,10 +3763,10 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
     closing_local_ = true;
     input_done_ = true;
     read_closed_ = true;
-    h2_data_queue_.clear();
-    queued_bytes_ = 0;
+    ClearH2Queue();
     read_payload_.clear();
     read_offset_ = 0;
+    read_payload_end_ = 0;
     WakeInputReader();
 
     auto session = session_.lock();
@@ -3766,10 +3802,10 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
 void GrpcServerSubStreamState::ShutdownRead() noexcept {
     read_closed_ = true;
     input_done_ = true;
-    h2_data_queue_.clear();
-    queued_bytes_ = 0;
+    ClearH2Queue();
     read_payload_.clear();
     read_offset_ = 0;
+    read_payload_end_ = 0;
     WakeInputReader();
 }
 
@@ -3789,18 +3825,19 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncRead(
         co_return co_await AsyncReadRaw(buffer);
     }
 
-    while (read_offset_ >= read_payload_.size()) {
+    while (read_offset_ >= read_payload_end_) {
         if (!co_await ReadNextGrpcMessage()) {
             co_return 0;
         }
     }
 
-    const size_t n = std::min(capacity, read_payload_.size() - read_offset_);
+    const size_t n = std::min(capacity, read_payload_end_ - read_offset_);
     std::memcpy(out, read_payload_.data() + read_offset_, n);
     read_offset_ += n;
-    if (read_offset_ >= read_payload_.size()) {
+    if (read_offset_ >= read_payload_end_) {
         read_payload_.clear();
         read_offset_ = 0;
+        read_payload_end_ = 0;
     }
     co_return n;
 }
@@ -3851,33 +3888,11 @@ net::awaitable<buf::MultiBuffer> GrpcServerSubStreamState::ReadMultiBuffer() {
 net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
     buf::MultiBuffer mb) {
     if (payload_codec_ == H2PayloadCodec::RawData) {
-        std::array<net::const_buffer, 16> stack_buffers{};
-        std::vector<net::const_buffer> spill_buffers;
-        size_t count = 0;
-        size_t total = 0;
-
-        for (const buf::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            if (count < stack_buffers.size()) {
-                stack_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-            } else {
-                if (spill_buffers.empty()) {
-                    spill_buffers.reserve(mb.size());
-                    spill_buffers.insert(
-                        spill_buffers.end(),
-                        stack_buffers.begin(),
-                        stack_buffers.begin() + static_cast<std::ptrdiff_t>(count));
-                }
-                spill_buffers.push_back(net::buffer(bytes.data(), bytes.size()));
-            }
-            total += bytes.size();
-        }
+        ConstBufferSpanBuilder<16> payloads;
+        payloads.AppendMultiBuffer(mb);
 
         try {
-            if (total > 0) {
+            if (!payloads.empty()) {
                 if (write_closed_ || cancelled_) {
                     ThrowGrpcStreamError("gRPC write on closed server stream");
                 }
@@ -3885,29 +3900,17 @@ net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
                 if (!session) {
                     ThrowGrpcStreamError("gRPC write without server session");
                 }
-                const auto payloads = spill_buffers.empty()
-                    ? std::span<const net::const_buffer>(stack_buffers.data(), count)
-                    : std::span<const net::const_buffer>(
-                          spill_buffers.data(), spill_buffers.size());
                 if (!co_await session->WriteRawDataBuffersSerialized(
                         stream_id_,
-                        payloads)) {
+                        payloads.Span())) {
                     ThrowGrpcStreamError("HTTP/2 raw server stream WriteMultiBuffer failed");
                 }
             }
         } catch (...) {
-            for (buf::Buffer*& buffer : mb) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
-            }
             mb.clear();
             throw;
         }
 
-        for (buf::Buffer*& buffer : mb) {
-            buf::Buffer::Free(buffer);
-            buffer = nullptr;
-        }
         mb.clear();
         co_return;
     }
@@ -3923,15 +3926,13 @@ net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
                 (void)co_await AsyncWrite(
                     net::buffer(bytes.data(), bytes.size()));
             } catch (...) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 mb.clear();
                 throw;
             }
             (void)len;
         }
-        buf::Buffer::Free(buffer);
-        buffer = nullptr;
+        mb.FreeSlot(buffer);
     }
     mb.clear();
 }
@@ -3988,6 +3989,29 @@ net::awaitable<void> GrpcServerSubStreamState::AsyncShutdownWrite() {
     }
 }
 
+void GrpcServerSubStreamState::MarkQueueForShrinkIfLarge() noexcept {
+    if (h2_data_queue_.size() >= kGrpcServerH2QueueShrinkItems) {
+        shrink_h2_queue_on_drain_ = true;
+    }
+}
+
+void GrpcServerSubStreamState::ShrinkQueueIfDrained() noexcept {
+    if (h2_data_queue_.empty() && shrink_h2_queue_on_drain_) {
+        TryShrinkSequence(h2_data_queue_);
+        shrink_h2_queue_on_drain_ = false;
+    }
+}
+
+void GrpcServerSubStreamState::ClearH2Queue() noexcept {
+    h2_data_queue_.clear();
+    queued_bytes_ = 0;
+    h2_data_offset_ = 0;
+    if (shrink_h2_queue_on_drain_) {
+        TryShrinkSequence(h2_data_queue_);
+        shrink_h2_queue_on_drain_ = false;
+    }
+}
+
 net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
     net::mutable_buffer buffer) {
     auto* out = static_cast<uint8_t*>(buffer.data());
@@ -3999,12 +4023,17 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
             throw IoSystemError(io_error::operation_aborted, "HTTP/2 raw read cancelled");
         }
 
-        while (!h2_data_queue_.empty() &&
-               h2_data_offset_ >= h2_data_queue_.front().size()) {
-            queued_bytes_ -= std::min(
-                queued_bytes_,
-                h2_data_queue_.front().size());
+        while (!h2_data_queue_.empty()) {
+            const auto& front = h2_data_queue_.front();
+            if (h2_data_offset_ < front.offset) {
+                h2_data_offset_ = front.offset;
+            }
+            if (h2_data_offset_ < front.end) {
+                break;
+            }
+            queued_bytes_ -= std::min(queued_bytes_, front.Size());
             h2_data_queue_.pop_front();
+            ShrinkQueueIfDrained();
             h2_data_offset_ = 0;
         }
 
@@ -4012,8 +4041,8 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
             const auto& front = h2_data_queue_.front();
             const size_t n = std::min(
                 capacity,
-                front.size() - h2_data_offset_);
-            std::memcpy(out, front.data() + h2_data_offset_, n);
+                front.end - h2_data_offset_);
+            std::memcpy(out, front.data.data() + h2_data_offset_, n);
             h2_data_offset_ += n;
             co_return n;
         }
@@ -4047,7 +4076,7 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
         co_return false;
     }
     const uint32_t len = ReadU32(prefix.data() + 1);
-    std::vector<uint8_t> message(len);
+    memory::ByteVector message(len);
     read_offset_ = 0;
     if (len > 0 &&
         !co_await ReadGrpcBytes(message.data(), message.size())) {
@@ -4061,7 +4090,9 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
             conn_id_);
         co_return false;
     }
-    read_payload_.assign(hunk->begin(), hunk->end());
+    read_payload_ = std::move(message);
+    read_offset_ = hunk->offset;
+    read_payload_end_ = hunk->offset + hunk->size;
     co_return true;
 }
 
@@ -4075,12 +4106,17 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadGrpcBytes(
             throw IoSystemError(io_error::operation_aborted, "gRPC read cancelled");
         }
 
-        while (!h2_data_queue_.empty() &&
-               h2_data_offset_ >= h2_data_queue_.front().size()) {
-            queued_bytes_ -= std::min(
-                queued_bytes_,
-                h2_data_queue_.front().size());
+        while (!h2_data_queue_.empty()) {
+            const auto& front = h2_data_queue_.front();
+            if (h2_data_offset_ < front.offset) {
+                h2_data_offset_ = front.offset;
+            }
+            if (h2_data_offset_ < front.end) {
+                break;
+            }
+            queued_bytes_ -= std::min(queued_bytes_, front.Size());
             h2_data_queue_.pop_front();
+            ShrinkQueueIfDrained();
             h2_data_offset_ = 0;
         }
 
@@ -4088,8 +4124,8 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadGrpcBytes(
             const auto& front = h2_data_queue_.front();
             const size_t n = std::min(
                 len - copied,
-                front.size() - h2_data_offset_);
-            std::memcpy(out + copied, front.data() + h2_data_offset_, n);
+                front.end - h2_data_offset_);
+            std::memcpy(out + copied, front.data.data() + h2_data_offset_, n);
             copied += n;
             h2_data_offset_ += n;
             continue;
@@ -4348,23 +4384,22 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     return response;
 }
 
-net::awaitable<std::optional<std::vector<uint8_t>>> ReadXHttpPacketBody(
+net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     Http1BodyStream& body,
     std::optional<size_t> content_length,
     bool chunked) {
-    std::vector<uint8_t> payload;
-    std::array<uint8_t, 8192> scratch{};
+    buf::MultiBuffer payload;
 
     if (content_length) {
-        payload.reserve(*content_length);
         size_t remaining = *content_length;
         while (remaining > 0) {
-            const size_t n = co_await body.AsyncRead(
-                net::buffer(scratch.data(), std::min(scratch.size(), remaining)));
+            const size_t n = co_await ReadToMultiBufferTail(
+                body,
+                payload,
+                std::min(static_cast<size_t>(buf::Buffer::kSize), remaining));
             if (n == 0) {
                 co_return std::nullopt;
             }
-            payload.insert(payload.end(), scratch.data(), scratch.data() + n);
             remaining -= n;
         }
         co_return payload;
@@ -4372,11 +4407,13 @@ net::awaitable<std::optional<std::vector<uint8_t>>> ReadXHttpPacketBody(
 
     if (chunked) {
         while (true) {
-            const size_t n = co_await body.AsyncRead(net::buffer(scratch));
+            const size_t n = co_await ReadToMultiBufferTail(
+                body,
+                payload,
+                buf::Buffer::kSize);
             if (n == 0) {
                 break;
             }
-            payload.insert(payload.end(), scratch.data(), scratch.data() + n);
         }
     }
     co_return payload;
@@ -4608,47 +4645,14 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         *ptr++ = '\n';
         constexpr std::array<char, 2> kChunkTail{'\r', '\n'};
 
-        std::array<net::const_buffer, 20> stack_buffers{};
-        std::vector<net::const_buffer> spill_buffers;
-        auto append_buffer = [&](net::const_buffer buffer) {
-            if (spill_buffers.empty() && buffer.size() > 0) {
-                size_t count = 0;
-                while (count < stack_buffers.size() && stack_buffers[count].size() > 0) {
-                    ++count;
-                }
-                if (count < stack_buffers.size()) {
-                    stack_buffers[count] = buffer;
-                    return;
-                }
-                spill_buffers.reserve(packet_payload.size() + 4);
-                spill_buffers.insert(
-                    spill_buffers.end(),
-                    stack_buffers.begin(),
-                    stack_buffers.end());
-            }
-            if (buffer.size() > 0) {
-                spill_buffers.push_back(buffer);
-            }
-        };
-
-        append_buffer(net::buffer(request.data(), request.size()));
-        append_buffer(net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
-        for (const auto& payload : packet_payload) {
-            append_buffer(payload);
-        }
-        append_buffer(net::buffer(kChunkTail.data(), kChunkTail.size()));
+        ConstBufferSpanBuilder<20> out;
+        out.Append(net::buffer(request.data(), request.size()));
+        out.Append(net::buffer(prefix.data(), static_cast<size_t>(ptr - prefix.data())));
+        out.AppendBuffers(packet_payload);
+        out.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
 
         try {
-            if (spill_buffers.empty()) {
-                size_t count = 0;
-                while (count < stack_buffers.size() && stack_buffers[count].size() > 0) {
-                    ++count;
-                }
-                co_await stream->WriteBuffers(
-                    std::span<const net::const_buffer>(stack_buffers.data(), count));
-            } else {
-                co_await stream->WriteBuffers(spill_buffers);
-            }
+            co_await stream->WriteBuffers(out.Span());
         } catch (...) {
             co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }

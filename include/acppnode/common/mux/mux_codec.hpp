@@ -1,12 +1,16 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <vector>
+
+namespace acpp::buf {
+class MultiBuffer;
+}
 
 namespace acpp::mux {
 
@@ -67,6 +71,7 @@ struct FrameHeader {
     // 载荷
     bool     has_data  = false;
     uint16_t data_len  = 0;
+    size_t   data_offset = 0;
 
     // 整帧字节数（= 2 + MetaLen + [2 + data_len]），用于推进 frame_buf
     // frame_size == 0 表示帧格式非法
@@ -84,30 +89,40 @@ struct FrameHeader {
 [[nodiscard]] std::optional<FrameHeader> DecodeFrame(
     const uint8_t* data, size_t len);
 
+[[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
+    const uint8_t* data,
+    size_t contiguous_len,
+    size_t total_len);
+
+[[nodiscard]] std::optional<FrameHeader> DecodeFrame(
+    const buf::MultiBuffer& data,
+    size_t offset,
+    size_t len);
+
 // ============================================================================
 // 序列化：服务器 → 客户端
 // ============================================================================
 
-void EncodeKeepAliveTo(std::vector<uint8_t>& out);
-[[nodiscard]] bool EncodeNewTo(std::vector<uint8_t>& out,
-                                uint16_t session_id,
-                                NetworkType network,
-                                const TargetAddress& target,
-                                const uint8_t* data,
-                                size_t len);
-void EncodeEndTo(std::vector<uint8_t>& out,
+void EncodeKeepAliveTo(memory::ByteVector& out);
+[[nodiscard]] bool EncodeNewTo(memory::ByteVector& out,
+                               uint16_t session_id,
+                               NetworkType network,
+                               const TargetAddress& target,
+                               const uint8_t* data,
+                               size_t len);
+void EncodeEndTo(memory::ByteVector& out,
                  uint16_t session_id, bool error = false);
-void EncodeKeepDataTo(std::vector<uint8_t>& out,
+void EncodeKeepDataTo(memory::ByteVector& out,
                       uint16_t session_id,
                       const uint8_t* data, size_t len);
-void EncodeKeepDataHeaderTo(std::vector<uint8_t>& out,
+void EncodeKeepDataHeaderTo(memory::ByteVector& out,
                             uint16_t session_id,
                             size_t payload_len);
-[[nodiscard]] bool EncodeKeepUDPTo(std::vector<uint8_t>& out,
+[[nodiscard]] bool EncodeKeepUDPTo(memory::ByteVector& out,
                      uint16_t session_id,
                      const TargetAddress& src,
                      const uint8_t* data, size_t len);
-[[nodiscard]] bool EncodeKeepUDPHeaderTo(std::vector<uint8_t>& out,
+[[nodiscard]] bool EncodeKeepUDPHeaderTo(memory::ByteVector& out,
                                          uint16_t session_id,
                                          const TargetAddress& src,
                                          size_t payload_len);

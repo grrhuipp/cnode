@@ -4,7 +4,8 @@ param(
         "cnode-vmess", "xray-vmess",
         "cnode-vless", "xray-vless",
         "cnode-trojan", "xray-trojan",
-        "cnode-shadowsocks", "xray-shadowsocks"
+        "cnode-shadowsocks", "xray-shadowsocks",
+        "cnode-out-shadowsocks", "cnode-out-trojan", "cnode-out-vless", "cnode-out-vmess"
     )]
     [string]$Scenario = "cnode-vmess",
     [int]$Seconds = 10,
@@ -19,7 +20,15 @@ param(
     [string]$VmessSecurity = "auto",
     [string]$ShadowsocksMethod = "aes-256-gcm",
     [ValidateSet("error", "warning", "info", "debug")]
-    [string]$XrayLogLevel = "error"
+    [string]$CnodeLogLevel = "error",
+    [ValidateSet("error", "warning", "info", "debug")]
+    [string]$XrayLogLevel = "error",
+    [switch]$Mux,
+    [int]$MuxConcurrency = 8,
+    [switch]$Udp,
+    [string]$UdpBandwidth = "1G",
+    [int]$UdpLength = 1200,
+    [int]$PostRunWaitMs = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +43,13 @@ $Iperf = Join-Path $Root "tmp\iperf3\iperf3.exe"
 $Xray = Join-Path $Root "tmp\xray\xray.exe"
 $Cnode = Join-Path $Root "build\Release\cnode.exe"
 $BenchUuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
-$BenchPassword = "bench-password"
+$BenchPassword = if ($ShadowsocksMethod -eq "2022-blake3-aes-128-gcm") {
+    "MDEyMzQ1Njc4OWFiY2RlZg=="
+} elseif ($ShadowsocksMethod.StartsWith("2022-")) {
+    "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+} else {
+    "bench-password"
+}
 $BenchEmail = "bench@example.com"
 
 if (!(Test-Path $Iperf)) { throw "iperf3 not found at $Iperf" }
@@ -50,7 +65,17 @@ function Write-Utf8NoBom($Path, $Content) {
 
 function Get-BenchProtocol($ScenarioName) {
     if ($ScenarioName -eq "direct") { return "direct" }
+    if ($ScenarioName.StartsWith("cnode-out-")) {
+        return $ScenarioName.Substring("cnode-out-".Length)
+    }
     return $ScenarioName.Substring($ScenarioName.IndexOf("-") + 1)
+}
+
+function Get-XrayClientProtocol($ScenarioName, $Protocol) {
+    if ($ScenarioName.StartsWith("cnode-out-")) {
+        return "vless"
+    }
+    return $Protocol
 }
 
 function Add-BenchProcess([ref]$Entries, [string]$Role, [System.Diagnostics.Process]$Process) {
@@ -101,7 +126,17 @@ function Emit-CpuDelta($Before, $After) {
     }
 }
 
-function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort) {
+function New-XrayMuxJson([bool]$EnableMux, [int]$Concurrency) {
+    if (!$EnableMux) { return "" }
+    if ($Concurrency -lt 1) { throw "MuxConcurrency must be >= 1" }
+    return @"
+,
+      "mux": { "enabled": true, "concurrency": $Concurrency }
+"@
+}
+
+function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort, [bool]$EnableMux, [int]$Concurrency) {
+    $MuxJson = New-XrayMuxJson $EnableMux $Concurrency
     switch ($Protocol) {
         "vmess" {
             return @"
@@ -117,7 +152,7 @@ function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort) {
           }
         ]
       },
-      "streamSettings": { "network": "tcp", "security": "none" }
+      "streamSettings": { "network": "tcp", "security": "none" }$MuxJson
     }
 "@
         }
@@ -135,7 +170,7 @@ function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort) {
           }
         ]
       },
-      "streamSettings": { "network": "tcp", "security": "none" }
+      "streamSettings": { "network": "tcp", "security": "none" }$MuxJson
     }
 "@
         }
@@ -147,7 +182,7 @@ function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort) {
       "settings": {
         "servers": [{ "address": "127.0.0.1", "port": $ServerPort, "password": "$BenchPassword" }]
       },
-      "streamSettings": { "network": "tcp", "security": "none" }
+      "streamSettings": { "network": "tcp", "security": "none" }$MuxJson
     }
 "@
         }
@@ -159,7 +194,7 @@ function New-XrayClientOutboundJson([string]$Protocol, [int]$ServerPort) {
       "settings": {
         "servers": [{ "address": "127.0.0.1", "port": $ServerPort, "method": "$ShadowsocksMethod", "password": "$BenchPassword" }]
       },
-      "streamSettings": { "network": "tcp", "security": "none" }
+      "streamSettings": { "network": "tcp", "security": "none" }$MuxJson
     }
 "@
         }
@@ -260,12 +295,105 @@ function New-CnodeInboundJson([string]$Protocol, [int]$ListenPort) {
 "@
 }
 
+function New-CnodeOutboundJson([string]$Protocol, [int]$ServerPort) {
+    switch ($Protocol) {
+        "trojan" {
+            return @"
+[
+  {
+    "tag": "to-server",
+    "protocol": "trojan",
+    "settings": {
+      "servers": [
+        {
+          "address": "127.0.0.1",
+          "port": $ServerPort,
+          "password": "$BenchPassword"
+        }
+      ]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" },
+    "sendThrough": "auto"
+  }
+]
+"@
+        }
+        "shadowsocks" {
+            return @"
+[
+  {
+    "tag": "to-server",
+    "protocol": "shadowsocks",
+    "settings": {
+      "servers": [
+        {
+          "address": "127.0.0.1",
+          "port": $ServerPort,
+          "method": "$ShadowsocksMethod",
+          "password": "$BenchPassword"
+        }
+      ]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" },
+    "sendThrough": "auto"
+  }
+]
+"@
+        }
+        "vless" {
+            return @"
+[
+  {
+    "tag": "to-server",
+    "protocol": "vless",
+    "settings": {
+      "vnext": [
+        {
+          "address": "127.0.0.1",
+          "port": $ServerPort,
+          "users": [{ "id": "$BenchUuid", "encryption": "none" }]
+        }
+      ]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" },
+    "sendThrough": "auto"
+  }
+]
+"@
+        }
+        "vmess" {
+            return @"
+[
+  {
+    "tag": "to-server",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "127.0.0.1",
+          "port": $ServerPort,
+          "users": [{ "id": "$BenchUuid", "alterId": 0, "security": "$VmessSecurity" }]
+        }
+      ]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" },
+    "sendThrough": "auto"
+  }
+]
+"@
+        }
+        default { throw "unsupported protocol for cnode outbound: $Protocol" }
+    }
+}
+
 $Protocol = Get-BenchProtocol $Scenario
+$XrayClientProtocol = Get-XrayClientProtocol $Scenario $Protocol
+$BenchNetwork = if ($Udp) { "tcp,udp" } else { "tcp" }
 $ProcessEntries = @()
 try {
     if ($Scenario -ne "direct") {
         $ServerPort = if ($Scenario.StartsWith("cnode-")) { $CnodePort } else { $XrayPort }
-        $ClientOutbound = New-XrayClientOutboundJson $Protocol $ServerPort
+        $ClientOutbound = New-XrayClientOutboundJson $XrayClientProtocol $ServerPort ([bool]$Mux) $MuxConcurrency
 
         Write-Utf8NoBom (Join-Path $XrayClientDir "config.json") @"
 {
@@ -276,7 +404,7 @@ try {
       "listen": "127.0.0.1",
       "port": $EntryPort,
       "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1", "port": $IperfPort, "network": "tcp" }
+      "settings": { "address": "127.0.0.1", "port": $IperfPort, "network": "$BenchNetwork" }
     }
   ],
   "outbounds": [
@@ -286,10 +414,45 @@ try {
 "@
     }
 
-    if ($Scenario.StartsWith("cnode-")) {
+    if ($Scenario.StartsWith("cnode-out-")) {
         Write-Utf8NoBom (Join-Path $CnodeDir "config.json") @"
 {
-  "log": { "loglevel": "error", "access": "$($LogDir.Replace('\','/'))/cnode-access.log", "error": "$($LogDir.Replace('\','/'))/cnode-error.log", "logDir": "$($LogDir.Replace('\','/'))" },
+  "log": { "loglevel": "$CnodeLogLevel", "access": "$($LogDir.Replace('\','/'))/cnode-access.log", "error": "$($LogDir.Replace('\','/'))/cnode-error.log", "logDir": "$($LogDir.Replace('\','/'))" },
+  "workers": $CnodeWorkers,
+  "dns": { "servers": ["8.8.8.8"], "timeout": 5, "cacheSize": 1024, "minTTL": 60, "maxTTL": 300 },
+  "timeouts": { "handshake": 10, "dial": 10, "read": 60, "write": 60, "idle": 300 },
+  "panels": []
+}
+"@
+        Write-Utf8NoBom (Join-Path $CnodeDir "inbounds.json") (New-CnodeInboundJson "vless" $CnodePort)
+        Write-Utf8NoBom (Join-Path $CnodeDir "outbounds.json") (New-CnodeOutboundJson $Protocol $XrayPort)
+        Write-Utf8NoBom (Join-Path $CnodeDir "routing.json") '{ "domainStrategy": "AsIs", "rules": [] }'
+
+        $ServerInbound = New-XrayServerInboundJson $Protocol $XrayPort
+        Write-Utf8NoBom (Join-Path $XrayServerDir "config.json") @"
+{
+  "log": { "loglevel": "$XrayLogLevel" },
+  "inbounds": [
+    $ServerInbound
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs",
+        "finalRules": [
+          { "action": "allow", "network": "$BenchNetwork", "port": $IperfPort }
+        ]
+      }
+    }
+  ]
+}
+"@
+    } elseif ($Scenario.StartsWith("cnode-")) {
+        Write-Utf8NoBom (Join-Path $CnodeDir "config.json") @"
+{
+  "log": { "loglevel": "$CnodeLogLevel", "access": "$($LogDir.Replace('\','/'))/cnode-access.log", "error": "$($LogDir.Replace('\','/'))/cnode-error.log", "logDir": "$($LogDir.Replace('\','/'))" },
   "workers": $CnodeWorkers,
   "dns": { "servers": ["8.8.8.8"], "timeout": 5, "cacheSize": 1024, "minTTL": 60, "maxTTL": 300 },
   "timeouts": { "handshake": 10, "dial": 10, "read": 60, "write": 60, "idle": 300 },
@@ -318,7 +481,7 @@ try {
       "settings": {
         "domainStrategy": "AsIs",
         "finalRules": [
-          { "action": "allow", "network": "tcp", "port": $IperfPort }
+          { "action": "allow", "network": "$BenchNetwork", "port": $IperfPort }
         ]
       }
     }
@@ -332,7 +495,18 @@ try {
     Start-Sleep -Milliseconds 400
 
     $ClientPort = $IperfPort
-    if ($Scenario.StartsWith("cnode-")) {
+    if ($Scenario.StartsWith("cnode-out-")) {
+        $XrayServer = Start-Process -FilePath $Xray -ArgumentList "run","-config",(Join-Path $XrayServerDir "config.json") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $LogDir "xray-server-stdout.log") -RedirectStandardError (Join-Path $LogDir "xray-server-stderr.log")
+        Add-BenchProcess ([ref]$ProcessEntries) "xray-server" $XrayServer
+        Start-Sleep -Milliseconds 900
+        $CnodeProcess = Start-Process -FilePath $Cnode -ArgumentList "--config-dir",$CnodeDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $LogDir "cnode-stdout.log") -RedirectStandardError (Join-Path $LogDir "cnode-stderr.log")
+        Add-BenchProcess ([ref]$ProcessEntries) "cnode-mid" $CnodeProcess
+        Start-Sleep -Milliseconds 900
+        $XrayClient = Start-Process -FilePath $Xray -ArgumentList "run","-config",(Join-Path $XrayClientDir "config.json") -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $LogDir "xray-client-stdout.log") -RedirectStandardError (Join-Path $LogDir "xray-client-stderr.log")
+        Add-BenchProcess ([ref]$ProcessEntries) "xray-client" $XrayClient
+        Start-Sleep -Milliseconds 900
+        $ClientPort = $EntryPort
+    } elseif ($Scenario.StartsWith("cnode-")) {
         $CnodeProcess = Start-Process -FilePath $Cnode -ArgumentList "--config-dir",$CnodeDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $LogDir "cnode-stdout.log") -RedirectStandardError (Join-Path $LogDir "cnode-stderr.log")
         Add-BenchProcess ([ref]$ProcessEntries) "cnode-server" $CnodeProcess
         Start-Sleep -Milliseconds 900
@@ -353,7 +527,14 @@ try {
     $Before = Snapshot-Cpu $ProcessEntries
     $IperfOut = Join-Path $LogDir "iperf-client-stdout.log"
     $IperfErr = Join-Path $LogDir "iperf-client-stderr.log"
-    $IperfClient = Start-Process -FilePath $Iperf -ArgumentList "-c","127.0.0.1","-p",$ClientPort,"-t",$Seconds,"-P",$Parallel -NoNewWindow -PassThru -RedirectStandardOutput $IperfOut -RedirectStandardError $IperfErr
+    $IperfArgs = @("-c","127.0.0.1","-p",$ClientPort,"-t",$Seconds,"-P",$Parallel)
+    if ($Udp) {
+        if ($UdpLength -lt 1 -or $UdpLength -gt 65507) {
+            throw "UdpLength must be between 1 and 65507"
+        }
+        $IperfArgs += @("-u","-b",$UdpBandwidth,"-l",$UdpLength)
+    }
+    $IperfClient = Start-Process -FilePath $Iperf -ArgumentList $IperfArgs -NoNewWindow -PassThru -RedirectStandardOutput $IperfOut -RedirectStandardError $IperfErr
     $Exited = $IperfClient.WaitForExit(($Seconds + $GraceSeconds) * 1000)
     if (!$Exited) {
         Stop-Process -Id $IperfClient.Id -Force -ErrorAction SilentlyContinue
@@ -363,6 +544,9 @@ try {
     Get-Content $IperfErr -ErrorAction SilentlyContinue
     if (!$Exited) {
         throw "iperf3 client timed out after $($Seconds + $GraceSeconds)s; see $LogDir"
+    }
+    if ($PostRunWaitMs -gt 0) {
+        Start-Sleep -Milliseconds $PostRunWaitMs
     }
     "CPU delta:"
     Emit-CpuDelta $Before $After | Format-Table -AutoSize

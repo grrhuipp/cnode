@@ -13,7 +13,6 @@
 
 #include <asio/experimental/channel.hpp>
 
-#include <deque>
 #include <unordered_map>
 
 namespace acpp::proxyman::inbound {
@@ -22,27 +21,55 @@ class UdpWorker::PendingUdpReply {
 public:
     udp::endpoint endpoint;
     buf::MultiBuffer payload;
-    std::vector<net::const_buffer> send_buffers;
+    size_t payload_size = 0;
+    std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_send_buffers{};
+    memory::ThreadLocalVector<net::const_buffer> spill_send_buffers;
+    size_t send_buffer_count = 0;
 
     [[nodiscard]] size_t PayloadSize() const noexcept {
-        return buf::TotalLen(payload);
+        return payload_size;
     }
 
     void PrepareSendBuffers() {
-        send_buffers.clear();
-        send_buffers.reserve(payload.size());
+        spill_send_buffers.clear();
+        send_buffer_count = 0;
         for (const auto* buffer : payload) {
             if (buffer && !buffer->IsEmpty()) {
-                send_buffers.emplace_back(buffer->Bytes().data(), buffer->Len());
+                const auto bytes = buffer->Bytes();
+                net::const_buffer send_buffer{bytes.data(), bytes.size()};
+                if (send_buffer_count < inline_send_buffers.size()) {
+                    inline_send_buffers[send_buffer_count++] = send_buffer;
+                    continue;
+                }
+                if (spill_send_buffers.empty()) {
+                    spill_send_buffers.reserve(payload.size());
+                    spill_send_buffers.insert(
+                        spill_send_buffers.end(),
+                        inline_send_buffers.begin(),
+                        inline_send_buffers.begin() + send_buffer_count);
+                }
+                spill_send_buffers.emplace_back(send_buffer);
+                ++send_buffer_count;
             }
         }
+    }
+
+    [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept {
+        if (!spill_send_buffers.empty()) {
+            return std::span<const net::const_buffer>(
+                spill_send_buffers.data(),
+                spill_send_buffers.size());
+        }
+        return std::span<const net::const_buffer>(
+            inline_send_buffers.data(),
+            send_buffer_count);
     }
 };
 
 namespace {
 
 struct UdpReplyQueueState {
-    std::deque<UdpWorker::PendingUdpReply> pending;
+    memory::ThreadLocalDeque<UdpWorker::PendingUdpReply> pending;
     size_t queued_bytes = 0;
     bool write_in_progress = false;
     bool shrink_pending_on_drain = false;
@@ -89,7 +116,11 @@ struct UdpWorker::ClientSession::Impl {
     net::io_context& io_context;
     net::experimental::channel<void(IoErrorCode)> reader_signal;
     ReplyCallback reply_callback;
-    std::deque<buf::MultiBuffer> input_queue;
+    struct QueuedInput {
+        buf::MultiBuffer payload;
+        size_t bytes = 0;
+    };
+    memory::ThreadLocalDeque<QueuedInput> input_queue;
     size_t queued_bytes = 0;
     bool shrink_queue_on_drain = false;
     bool closed = false;
@@ -135,7 +166,7 @@ void UdpWorker::ClientSession::Push(
     }
 
     impl_->queued_bytes += payload_size;
-    impl_->input_queue.push_back(std::move(payload));
+    impl_->input_queue.push_back(Impl::QueuedInput{std::move(payload), payload_size});
     if (impl_->input_queue.size() >= 64 || impl_->queued_bytes >= 256 * 1024) {
         impl_->shrink_queue_on_drain = true;
     }
@@ -156,15 +187,14 @@ net::awaitable<buf::MultiBuffer>
 UdpWorker::ClientSession::ReadMultiBuffer() {
     while (true) {
         if (!impl_->input_queue.empty()) {
-            buf::MultiBuffer mb = std::move(impl_->input_queue.front());
-            impl_->queued_bytes -= std::min(
-                impl_->queued_bytes, buf::TotalLen(mb));
+            auto input = std::move(impl_->input_queue.front());
+            impl_->queued_bytes -= std::min(impl_->queued_bytes, input.bytes);
             impl_->input_queue.pop_front();
             if (impl_->input_queue.empty() && impl_->shrink_queue_on_drain) {
                 TryShrinkSequence(impl_->input_queue);
                 impl_->shrink_queue_on_drain = false;
             }
-            co_return mb;
+            co_return std::move(input.payload);
         }
 
         if (impl_->closed) {
@@ -194,6 +224,11 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         });
     }
     mb.clear();
+    co_return;
+}
+
+net::awaitable<void>
+UdpWorker::ClientSession::WriteBuffers(std::span<const net::const_buffer>) {
     co_return;
 }
 
@@ -412,6 +447,7 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
 
     PendingUdpReply reply;
     reply.endpoint = std::move(endpoint);
+    reply.payload_size = payload_size;
     reply.payload = std::move(payload);
     queue.pending.push_back(std::move(reply));
     if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
@@ -434,6 +470,7 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
 
     PendingUdpReply reply;
     reply.endpoint = std::move(endpoint);
+    reply.payload_size = payload_size;
     reply.payload.push_back(payload.release());
     queue.pending.push_back(std::move(reply));
     if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
@@ -463,9 +500,9 @@ UdpWorker::BeginReplySend(const std::string& socket_key) {
     return packet;
 }
 
-const std::vector<net::const_buffer>&
+std::span<const net::const_buffer>
 UdpWorker::ReplySendBuffers(const PendingUdpReply& reply) noexcept {
-    return reply.send_buffers;
+    return reply.SendBuffers();
 }
 
 const udp::endpoint&

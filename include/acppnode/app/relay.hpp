@@ -11,6 +11,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/experimental/awaitable_operators.hpp>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -265,27 +266,35 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacket(
         co_return std::nullopt;
     }
 
-    buf::MultiBuffer mb;
-    mb.reserve((first_packet.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-
-    size_t offset = 0;
-    while (offset < first_packet.size()) {
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            throw std::bad_alloc();
-        }
-        const size_t chunk = std::min(
-            first_packet.size() - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), first_packet.data() + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        mb.push_back(out.release());
-        offset += chunk;
-    }
-
     try {
-        co_await target.WriteMultiBuffer(std::move(mb));
-        mb.clear();
+        if constexpr (requires(TargetStream& s, std::span<const net::const_buffer> buffers) {
+                          s.WriteBuffers(buffers);
+                      }) {
+            std::array<net::const_buffer, 1> buffers{
+                net::buffer(first_packet.data(), first_packet.size())};
+            co_await target.WriteBuffers(std::span<const net::const_buffer>{buffers});
+        } else {
+            buf::MultiBuffer mb;
+            mb.reserve((first_packet.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
+
+            size_t offset = 0;
+            while (offset < first_packet.size()) {
+                buf::BufferGuard out{buf::Buffer::New()};
+                if (!out) {
+                    throw std::bad_alloc();
+                }
+                const size_t chunk = std::min(
+                    first_packet.size() - offset,
+                    static_cast<size_t>(out->Available()));
+                std::memcpy(out->Tail().data(), first_packet.data() + offset, chunk);
+                out->Produce(static_cast<uint32_t>(chunk));
+                mb.push_back(out.release());
+                offset += chunk;
+            }
+
+            co_await target.WriteMultiBuffer(std::move(mb));
+            mb.clear();
+        }
         stats.AddBytesOut(first_packet.size());
         co_return std::nullopt;
 
@@ -322,9 +331,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketBuffer(
     }
 
     const size_t first_packet_size = first_packet->Len();
-    buf::MultiBuffer mb;
-    mb.reserve(1);
-    mb.push_back(first_packet);
+    buf::MultiBuffer mb(first_packet);
     first_packet = nullptr;
 
     try {
@@ -455,7 +462,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                 mb = co_await ReadMultiBuffer(from_reader, from_control);
             }
 
-            if (mb.empty()) {
+            if (!buf::HasData(mb)) {
                 if (ConsumeRelayTimeoutSignals(from_control, to_control)) {
                     error = ErrorCode::RELAY_TIMEOUT;
                     LOG_CONN_DEBUG(ctx, "[relay] {} relay timeout, transferred={}B",
@@ -475,15 +482,20 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                 LOG_CONN_DEBUG(ctx, "[relay] {} EOF after {}B", is_upload ? "up" : "down", total_bytes);
                 my_state.eof = true;
 
-                // 对齐 Xray：半关闭只切换 idle timer，不发送传输/协议级写关闭。
-                // 写关闭由 DoRelay 全关闭阶段统一发送。
-                // 例外：AnyTLS 这类协议虚拟流没有内核 TCP half-close 可继承，
-                // 必须在这里把 EOF 显式映射为逻辑 FIN，否则远端真实 TCP
-                // 目标不会收到 EOF（iperf3 等协议会一直等最终响应）。
+                // 对齐 Xray：普通 TCP 半关闭只切换 idle timer，不主动发送
+                // 传输/协议级写关闭。例外是 mux/AnyTLS 这类虚拟流：EOF 不会
+                // 经内核自动传播，必须显式映射为对端写半关闭，否则真实 TCP
+                // 目标可能一直等 FIN 才生成最终响应。
+                bool forward_half_close = false;
+                if constexpr (requires { from_reader.ForwardHalfCloseToPeerOnEof(); }) {
+                    forward_half_close = from_reader.ForwardHalfCloseToPeerOnEof();
+                }
                 if constexpr (requires { to_writer.ForwardHalfCloseOnPeerEof(); }) {
-                    if (to_writer.ForwardHalfCloseOnPeerEof()) {
-                        co_await ShutdownWriteForClose(to_writer, to_control);
-                    }
+                    forward_half_close =
+                        forward_half_close || to_writer.ForwardHalfCloseOnPeerEof();
+                }
+                if (forward_half_close) {
+                    co_await ShutdownWriteForClose(to_writer, to_control);
                 }
                 if (!peer_state.eof) {
                     if (half_close_timeout.count() > 0) {
@@ -888,7 +900,7 @@ net::awaitable<RelayResult> DoRelayLink(
         while (true) {
             try {
                 buf::MultiBuffer mb = co_await client_reader.ReadMultiBuffer();
-                if (mb.empty()) {
+                if (!buf::HasData(mb)) {
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                     co_await relay_detail::ShutdownWriteForClose(target);
                     arm_downlink_only_timeout();
@@ -925,7 +937,7 @@ net::awaitable<RelayResult> DoRelayLink(
         while (true) {
             try {
                 buf::MultiBuffer mb = co_await target.ReadMultiBuffer();
-                if (mb.empty()) {
+                if (!buf::HasData(mb)) {
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                     co_await relay_detail::ShutdownWriteForClose(client_writer);
                     co_return std::make_pair(bytes, ErrorCode::OK);

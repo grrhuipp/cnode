@@ -93,7 +93,7 @@ public:
                                     udp::endpoint endpoint,
                                     buf::BufferGuard payload);
     [[nodiscard]] PendingUdpReplyPtr BeginReplySend(const std::string& socket_key);
-    [[nodiscard]] static const std::vector<net::const_buffer>&
+    [[nodiscard]] static std::span<const net::const_buffer>
     ReplySendBuffers(const PendingUdpReply& reply) noexcept;
     [[nodiscard]] static const udp::endpoint&
     ReplyEndpoint(const PendingUdpReply& reply) noexcept;
@@ -156,6 +156,7 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
 
 private:
     struct Impl;

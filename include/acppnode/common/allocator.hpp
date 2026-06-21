@@ -7,6 +7,7 @@
 #include <deque>
 #include <limits>
 #include <list>
+#include <map>
 #include <memory>
 #include <new>
 #include <string>
@@ -387,6 +388,13 @@ using ThreadLocalDeque = std::deque<T, ThreadLocalAllocator<T>>;
 
 template <class T>
 using ThreadLocalList = std::list<T, ThreadLocalAllocator<T>>;
+
+template <class Key,
+          class Value,
+          class Compare = std::less<Key>>
+using ThreadLocalMap =
+    std::map<Key, Value, Compare,
+             ThreadLocalAllocator<std::pair<const Key, Value>>>;
 
 template <class Key, class Value,
           class Hash = std::hash<Key>,

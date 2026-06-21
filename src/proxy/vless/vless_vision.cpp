@@ -1,5 +1,6 @@
 #include "vless_vision.hpp"
 
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/error.hpp"
 #include <algorithm>
 #include <cstring>
@@ -21,6 +22,7 @@ constexpr std::array<uint8_t, 2> kTlsClientHandshakeStart{0x16, 0x03};
 constexpr std::array<uint8_t, 3> kTlsServerHandshakeStart{0x16, 0x03, 0x03};
 constexpr std::array<uint8_t, 3> kTlsApplicationDataStart{0x17, 0x03, 0x03};
 constexpr std::array<uint8_t, 6> kTls13SupportedVersions{0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
+constexpr std::array<uint8_t, 2048> kZeroPadding{};
 
 [[nodiscard]] uint16_t ReadU16(const uint8_t* p) noexcept {
     return static_cast<uint16_t>(
@@ -115,6 +117,7 @@ VisionReader::VisionReader(transport::MultiBufferReader& src,
                            std::span<const uint8_t> initial)
     : src_(src)
     , user_uuid_(user_uuid) {
+    EnsureAppendCapacity(pending_, initial.size(), buf::Buffer::kSize);
     pending_.insert(pending_.end(), initial.begin(), initial.end());
 }
 
@@ -122,6 +125,7 @@ void VisionReader::Feed(buf::MultiBuffer mb) {
     for (buf::Buffer* b : mb) {
         if (b && !b->IsEmpty()) {
             const auto bytes = b->Bytes();
+            EnsureAppendCapacity(pending_, bytes.size(), buf::Buffer::kSize);
             pending_.insert(pending_.end(), bytes.begin(), bytes.end());
         }
     }
@@ -134,7 +138,7 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
             AppendBytesToMultiBuffer(out, pending_);
             pending_.clear();
         }
-        return !out.empty();
+        return buf::HasData(out);
     }
 
     while (true) {
@@ -142,7 +146,7 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
             ? kVisionUuidHeaderLen
             : kVisionBaseHeaderLen;
         if (pending_.size() < header_len) {
-            return !out.empty();
+            return buf::HasData(out);
         }
 
         size_t pos = 0;
@@ -162,7 +166,7 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
 
         const size_t frame_len = header_len + content_len + padding_len;
         if (pending_.size() < frame_len) {
-            return !out.empty();
+            return buf::HasData(out);
         }
         if (command != kCommandPaddingContinue &&
             command != kCommandPaddingEnd &&
@@ -189,9 +193,9 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
                 AppendBytesToMultiBuffer(out, pending_);
                 pending_.clear();
             }
-            return !out.empty();
+            return buf::HasData(out);
         }
-        if (!out.empty()) {
+        if (buf::HasData(out)) {
             return true;
         }
     }
@@ -209,7 +213,7 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
         }
 
         buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
-        if (raw.empty()) {
+        if (!buf::HasData(raw)) {
             co_return buf::MultiBuffer{};
         }
         Feed(std::move(raw));
@@ -282,9 +286,11 @@ bool VisionWriter::ShouldEndVision(std::span<const uint8_t> data) const noexcept
     return !is_tls12_or_above_ && packets_to_filter_ <= 1;
 }
 
-bool VisionWriter::AppendVisionFrame(buf::MultiBuffer& out,
-                                     std::span<const uint8_t> content,
-                                     uint8_t command) {
+bool VisionWriter::AppendVisionFrameBuffers(
+    buf::MultiBuffer& header_owner,
+    memory::ThreadLocalVector<net::const_buffer>& out,
+    std::span<const uint8_t> content,
+    uint8_t command) {
     const uint16_t padding_len = PaddingLen(content.size(), is_tls_);
     const size_t header_len = send_uuid_
         ? kVisionUuidHeaderLen
@@ -308,25 +314,40 @@ bool VisionWriter::AppendVisionFrame(buf::MultiBuffer& out,
     WriteU16(tail + pos, padding_len);
     pos += 2;
     header->Produce(static_cast<uint32_t>(pos));
-    out.push_back(header.release());
+    out.emplace_back(header->Bytes().data(), header->Bytes().size());
+    header_owner.push_back(header.release());
 
-    AppendBytesToMultiBuffer(out, content);
-    if (padding_len > 0) {
-        AppendZerosToMultiBuffer(out, padding_len);
+    if (!content.empty()) {
+        out.emplace_back(content.data(), content.size());
+    }
+
+    size_t remaining_padding = padding_len;
+    while (remaining_padding > 0) {
+        const size_t n = std::min(remaining_padding, kZeroPadding.size());
+        out.emplace_back(kZeroPadding.data(), n);
+        remaining_padding -= n;
     }
     return true;
 }
 
 net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-    buf::MultiBuffer out;
-    for (buf::Buffer* b : mb) {
-        if (!b || b->IsEmpty()) {
+    if (!write_process_) {
+        co_await dst_.WriteMultiBuffer(std::move(mb));
+        co_return;
+    }
+
+    buf::MultiBuffer header_owner;
+    memory::ThreadLocalVector<net::const_buffer> out;
+    out.reserve(mb.size() * 3);
+    for (buf::Buffer*& buffer : mb) {
+        if (!buffer || buffer->IsEmpty()) {
+            mb.FreeSlot(buffer);
             continue;
         }
-        std::span<const uint8_t> bytes = b->Bytes();
+        std::span<const uint8_t> bytes = buffer->Bytes();
         while (!bytes.empty()) {
             if (!write_process_) {
-                AppendBytesToMultiBuffer(out, bytes);
+                out.emplace_back(bytes.data(), bytes.size());
                 break;
             }
 
@@ -337,7 +358,7 @@ net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
             const uint8_t command = end_vision
                 ? kCommandPaddingEnd
                 : kCommandPaddingContinue;
-            if (!AppendVisionFrame(out, chunk, command)) {
+            if (!AppendVisionFrameBuffers(header_owner, out, chunk, command)) {
                 mb.clear();
                 throw IoSystemError(io_error::fault,
                                     "VLESS Vision frame allocation failed");
@@ -348,9 +369,52 @@ net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
             bytes = bytes.subspan(n);
         }
     }
-    mb.clear();
     if (!out.empty()) {
-        co_await dst_.WriteMultiBuffer(std::move(out));
+        co_await dst_.WriteBuffers(out);
+    }
+    mb.clear();
+}
+
+net::awaitable<void> VisionWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
+    if (!write_process_) {
+        co_await dst_.WriteBuffers(buffers);
+        co_return;
+    }
+
+    buf::MultiBuffer header_owner;
+    memory::ThreadLocalVector<net::const_buffer> out;
+    out.reserve(buffers.size() * 3);
+    for (const net::const_buffer& buffer : buffers) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) {
+            continue;
+        }
+        std::span<const uint8_t> bytes(data, buffer.size());
+        while (!bytes.empty()) {
+            if (!write_process_) {
+                out.emplace_back(bytes.data(), bytes.size());
+                break;
+            }
+
+            const size_t n = std::min<size_t>(bytes.size(), kVisionFrameContentLimit);
+            const auto chunk = bytes.first(n);
+            FilterTLS(chunk);
+            const bool end_vision = ShouldEndVision(chunk);
+            const uint8_t command = end_vision
+                ? kCommandPaddingEnd
+                : kCommandPaddingContinue;
+            if (!AppendVisionFrameBuffers(header_owner, out, chunk, command)) {
+                throw IoSystemError(io_error::fault,
+                                    "VLESS Vision frame allocation failed");
+            }
+            if (end_vision) {
+                write_process_ = false;
+            }
+            bytes = bytes.subspan(n);
+        }
+    }
+    if (!out.empty()) {
+        co_await dst_.WriteBuffers(out);
     }
 }
 

@@ -11,6 +11,8 @@
 
 namespace acpp {
 
+class TimeoutSchedulerService;
+
 // ============================================================================
 // TimeoutToken - 共享定时调度器句柄
 // ============================================================================
@@ -32,7 +34,7 @@ struct TimeoutToken {
 // ============================================================================
 class TimeoutScheduler {
 public:
-    using Callback = std::function<void()>;
+    using Callback = std::move_only_function<void()>;
 
     // 获取 io_context 对应的分片（同一 io_context 复用同一调度器）。
     // Worker 线程命中 thread_local 缓存后不走全局锁。
@@ -49,7 +51,10 @@ public:
     void Cancel(TimeoutToken& token);
 
 private:
+    friend class TimeoutSchedulerService;
+
     explicit TimeoutScheduler(net::io_context& io_context);
+    void Release() noexcept;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -39,7 +39,6 @@ struct DecodeRequestBodyState final {
     std::optional<VMessCipher> length_cipher;
     std::optional<ShakeMask> mask;
     buf::MultiBuffer pending_read;
-    size_t pending_read_index = 0;
     bool global_padding = false;
     bool eof = false;
     uint32_t chunk_count = 0;
@@ -62,7 +61,6 @@ bool ParseDecryptedHeader(const uint8_t* data,
                           VMessRequest& request);
 
 namespace {
-constexpr size_t kStreamOutputReserveSlack = 10;
 constexpr size_t kStreamReadBatchChunks = 16;
 constexpr size_t kStreamMaxPaddingLen = 64;
 
@@ -125,78 +123,6 @@ uint8_t* PrepareScratch(memory::ByteVector& buffer, size_t size) {
     out[1] = static_cast<uint8_t>(masked_len & 0xFF);
     out_len = 2;
     return true;
-}
-
-[[nodiscard]] bool HasPendingRead(const buf::MultiBuffer& pending, size_t index) noexcept {
-    auto buffers = pending.begin();
-    for (size_t i = index; i < pending.size(); ++i) {
-        if (buffers[i] && !buffers[i]->IsEmpty()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-size_t CopyFromPendingRead(buf::MultiBuffer& pending,
-                           size_t& index,
-                           net::mutable_buffer out) noexcept {
-    size_t copied = 0;
-    auto* dst = static_cast<uint8_t*>(out.data());
-    auto buffers = pending.begin();
-    while (copied < out.size() && index < pending.size()) {
-        buf::Buffer* buffer = buffers[index];
-        if (!buffer || buffer->IsEmpty()) {
-            buf::Buffer::Free(buffer);
-            buffers[index] = nullptr;
-            ++index;
-            continue;
-        }
-        const size_t n = std::min(out.size() - copied, static_cast<size_t>(buffer->Len()));
-        std::memcpy(dst + copied, buffer->Bytes().data(), n);
-        buffer->Advance(static_cast<uint32_t>(n));
-        copied += n;
-        if (buffer->IsEmpty()) {
-            buf::Buffer::Free(buffer);
-            buffers[index] = nullptr;
-            ++index;
-        }
-    }
-    if (index >= pending.size()) {
-        pending.clear();
-        index = 0;
-    }
-    return copied;
-}
-
-buf::Buffer* TryTakeExactPendingReadBuffer(buf::MultiBuffer& pending,
-                                           size_t& index,
-                                           size_t len) noexcept {
-    if (len == 0 || index >= pending.size()) {
-        return nullptr;
-    }
-    auto buffers = pending.begin();
-    buf::Buffer* buffer = buffers[index];
-    if (!buffer || buffer->Len() != len) {
-        return nullptr;
-    }
-    buffers[index] = nullptr;
-    ++index;
-    if (index >= pending.size()) {
-        pending.clear();
-        index = 0;
-    }
-    return buffer;
-}
-
-void AppendOwnedBuffers(buf::MultiBuffer& dst, buf::MultiBuffer& src) {
-    for (buf::Buffer*& buffer : src) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        dst.push_back(buffer);
-        buffer = nullptr;
-    }
-    src.clear();
 }
 
 bool BuildResponseHeader(
@@ -273,14 +199,13 @@ net::awaitable<bool> EncodeResponseHeader(
     co_return true;
 }
 
-net::awaitable<void> EncodeResponseBodyMultiBuffer(EncodeResponseBodyState& state,
-                                                   AsyncStream& stream,
-                                                   buf::MultiBuffer mb) {
+struct ResponseBodyEncodeBudget final {
+    size_t length_header_size = 0;
+    size_t stream_chunk_size = 0;
+};
 
-    if (mb.empty()) {
-        co_return;
-    }
-
+[[nodiscard]] ResponseBodyEncodeBudget MakeResponseBodyEncodeBudget(
+    const EncodeResponseBodyState& state) {
     const size_t overhead = state.cipher->Overhead();
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     const size_t max_padding_len =
@@ -291,79 +216,141 @@ net::awaitable<void> EncodeResponseBodyMultiBuffer(EncodeResponseBodyState& stat
     const size_t stream_chunk_size = std::min(
         size_t(MAX_CHUNK_SIZE - overhead),
         size_t(buf::Buffer::kSize - length_header_size - overhead - max_padding_len));
+    return ResponseBodyEncodeBudget{length_header_size, stream_chunk_size};
+}
 
-    buf::MultiBuffer out_mb;
-    out_mb.reserve(mb.size() + kStreamOutputReserveSlack);
-
-    for (auto* buf : mb) {
-        auto bytes = buf->Bytes();
-        if (bytes.empty()) {
-            continue;
-        }
-
-        const uint8_t* data = bytes.data();
-        const size_t len = bytes.size();
-        size_t offset = 0;
-
-        while (offset < len) {
-            const size_t chunk_size = std::min(len - offset, stream_chunk_size);
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                throw std::bad_alloc();
-            }
-
-            uint8_t* dst = out->Tail().data();
-            ssize_t enc_len = state.cipher->Encrypt(
-                data + offset, chunk_size, dst + length_header_size);
-            if (enc_len < 0) {
-                ThrowVMessWriteError("VMess encoding stream encrypt failed");
-            }
-
-            size_t padding_len = 0;
-            if (state.global_padding && state.mask) {
-                const uint16_t padding_mask = state.mask->NextMask();
-                padding_len = padding_mask % 64;
-            }
-
-            const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-            ++state.chunk_count;
-
-            size_t encoded_length_size = 0;
-            if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
-                                   state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
-                                   total_len,
-                                   dst,
-                                   encoded_length_size)) {
-                ThrowVMessWriteError("VMess encoding length encrypt failed");
-            }
-
-            if (padding_len > 0) {
-                RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
-            }
-
-            const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
-            out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(out.release());
-
-            offset += chunk_size;
-        }
+void EncodeResponseBodyBytes(EncodeResponseBodyState& state,
+                             const ResponseBodyEncodeBudget& budget,
+                             std::span<const uint8_t> bytes,
+                             buf::MultiBuffer& out_mb) {
+    if (bytes.empty()) {
+        return;
     }
 
-    if (!state.pending_prefix.empty()) {
-        if (out_mb.empty()) {
+    const uint8_t* data = bytes.data();
+    const size_t len = bytes.size();
+    size_t offset = 0;
+
+    while (offset < len) {
+        const size_t chunk_size = std::min(len - offset, budget.stream_chunk_size);
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            throw std::bad_alloc();
+        }
+
+        uint8_t* dst = out->Tail().data();
+        ssize_t enc_len = state.cipher->Encrypt(
+            data + offset, chunk_size, dst + budget.length_header_size);
+        if (enc_len < 0) {
+            ThrowVMessWriteError("VMess encoding stream encrypt failed");
+        }
+
+        size_t padding_len = 0;
+        if (state.global_padding && state.mask) {
+            const uint16_t padding_mask = state.mask->NextMask();
+            padding_len = padding_mask % 64;
+        }
+
+        const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
+        ++state.chunk_count;
+
+        size_t encoded_length_size = 0;
+        if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                               state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                               total_len,
+                               dst,
+                               encoded_length_size)) {
+            ThrowVMessWriteError("VMess encoding length encrypt failed");
+        }
+
+        if (padding_len > 0) {
+            RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
+        }
+
+        const size_t output_size =
+            encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
+        out->Produce(static_cast<uint32_t>(output_size));
+        out_mb.push_back(out.release());
+
+        offset += chunk_size;
+    }
+}
+
+net::awaitable<void> FlushResponseBody(EncodeResponseBodyState& state,
+                                       AsyncStream& stream,
+                                       buf::MultiBuffer out_mb) {
+    if (buf::HasData(state.pending_prefix)) {
+        if (!buf::HasData(out_mb)) {
             out_mb = std::move(state.pending_prefix);
         } else {
             buf::MultiBuffer merged;
             merged.reserve(state.pending_prefix.size() + out_mb.size());
-            AppendOwnedBuffers(merged, state.pending_prefix);
-            AppendOwnedBuffers(merged, out_mb);
+            state.pending_prefix.MoveTo(merged);
+            out_mb.MoveTo(merged);
             out_mb = std::move(merged);
         }
     }
 
-    if (!out_mb.empty()) {
+    if (buf::HasData(out_mb)) {
         co_await stream.WriteMultiBuffer(std::move(out_mb));
     }
+}
+
+net::awaitable<void> EncodeResponseBodyMultiBuffer(EncodeResponseBodyState& state,
+                                                   AsyncStream& stream,
+                                                   buf::MultiBuffer mb) {
+
+    if (!buf::HasData(mb)) {
+        co_return;
+    }
+
+    const ResponseBodyEncodeBudget budget = MakeResponseBodyEncodeBudget(state);
+    buf::MultiBuffer out_mb;
+    out_mb.reserve(mb.size());
+
+    for (auto* buffer : mb) {
+        if (!buffer) {
+            continue;
+        }
+        EncodeResponseBodyBytes(state, budget, buffer->Bytes(), out_mb);
+    }
+    mb.clear();
+
+    co_await FlushResponseBody(state, stream, std::move(out_mb));
+}
+
+net::awaitable<void> EncodeResponseBodyBuffers(
+    EncodeResponseBodyState& state,
+    AsyncStream& stream,
+    std::span<const net::const_buffer> buffers) {
+    bool has_data = false;
+    for (const net::const_buffer& buffer : buffers) {
+        if (buffer.data() && buffer.size() > 0) {
+            has_data = true;
+            break;
+        }
+    }
+    if (!has_data) {
+        co_return;
+    }
+
+    const ResponseBodyEncodeBudget budget = MakeResponseBodyEncodeBudget(state);
+    buf::MultiBuffer out_mb;
+    out_mb.reserve(buffers.size());
+
+    for (const net::const_buffer& buffer : buffers) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) {
+            continue;
+        }
+        EncodeResponseBodyBytes(
+            state,
+            budget,
+            std::span<const uint8_t>(data, buffer.size()),
+            out_mb);
+    }
+
+    co_await FlushResponseBody(state, stream, std::move(out_mb));
 }
 
 net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
@@ -432,18 +419,15 @@ net::awaitable<bool> DecodeRequestBodyReadFull(DecodeRequestBodyState& state,
     }
 
     while (remaining > 0) {
-        if (!HasPendingRead(state.pending_read, state.pending_read_index)) {
+        if (!buf::HasData(state.pending_read)) {
             state.pending_read = co_await stream.ReadMultiBuffer();
-            state.pending_read_index = 0;
             if (state.pending_read.empty()) {
                 co_return false;
             }
         }
 
-        const size_t n = CopyFromPendingRead(
-            state.pending_read,
-            state.pending_read_index,
-            net::buffer(buf, remaining));
+        const size_t n = state.pending_read.ConsumePrefixTo(
+            std::span<uint8_t>(buf, remaining));
         if (n == 0) {
             co_return false;
         }
@@ -527,8 +511,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
         throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
     }
 
-    if (buf::Buffer* pending_body = TryTakeExactPendingReadBuffer(
-            state.pending_read, state.pending_read_index, chunk_len)) {
+    if (buf::Buffer* pending_body = state.pending_read.TakeFrontIfLen(chunk_len)) {
         const size_t data_len = chunk_len - padding_len;
         ssize_t dec_len = state.cipher->Decrypt(
             pending_body->Bytes().data(),
@@ -625,18 +608,18 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBodyMultiBuffer(DecodeRequestBodyS
                                                               AsyncStream& stream) {
     buf::MultiBuffer out;
     for (size_t i = 0; i < kStreamReadBatchChunks; ++i) {
-        if (i > 0 && !HasPendingRead(state.pending_read, state.pending_read_index)) {
+        if (i > 0 && !buf::HasData(state.pending_read)) {
             break;
         }
 
         buf::MultiBuffer chunk = co_await DecodeRequestBody(state, stream);
-        if (chunk.empty()) {
-            if (out.empty()) {
+        if (!buf::HasData(chunk)) {
+            if (!buf::HasData(out)) {
                 co_return buf::MultiBuffer{};
             }
             break;
         }
-        AppendOwnedBuffers(out, chunk);
+        chunk.MoveTo(out);
     }
     co_return out;
 }
@@ -1169,6 +1152,13 @@ public:
             throw IoSystemError(io_error::not_connected, "VMess response writer has no stream");
         }
         co_await EncodeResponseBodyMultiBuffer(response_body_state_, *stream_, std::move(mb));
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (!stream_) {
+            throw IoSystemError(io_error::not_connected, "VMess response writer has no stream");
+        }
+        co_await EncodeResponseBodyBuffers(response_body_state_, *stream_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {

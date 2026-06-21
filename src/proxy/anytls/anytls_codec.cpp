@@ -1,8 +1,10 @@
 #include "anytls_codec.hpp"
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstring>
 #include <openssl/evp.h>
@@ -11,6 +13,11 @@
 namespace acpp::anytls {
 
 namespace {
+
+const std::array<uint8_t, buf::Buffer::kSize>& ZeroPaddingBlock() {
+    static const std::array<uint8_t, buf::Buffer::kSize> zeros{};
+    return zeros;
+}
 
 void WriteU16BE(uint8_t* out, uint16_t value) noexcept {
     out[0] = static_cast<uint8_t>(value >> 8);
@@ -49,6 +56,138 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
 
 ErrorCode MapWriteException(const IoSystemError& e) noexcept {
     return MapAsioError(e.code());
+}
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteMultiBufferAsFrameBatchImpl(AsyncStream& stream,
+                                 uint8_t cmd,
+                                 uint32_t sid,
+                                 buf::MultiBuffer mb) {
+    static constexpr size_t kStackFrames = buf::MultiBuffer::kInlineCapacity;
+    std::array<std::array<uint8_t, kFrameHeaderSize>, kStackFrames> stack_headers{};
+    std::array<net::const_buffer, kStackFrames * 2> stack_buffers{};
+    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers;
+    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+
+    const bool use_spill = mb.size() > kStackFrames;
+    if (use_spill) {
+        spill_headers.reserve(mb.size());
+        spill_buffers.reserve(mb.size() * 2);
+    }
+
+    size_t stack_frame_count = 0;
+    size_t stack_buffer_count = 0;
+
+    for (auto* buffer : mb) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        const auto bytes = buffer->Bytes();
+        if (bytes.size() > kMaxFramePayload) {
+            mb.clear();
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        if (use_spill) {
+            auto& header =
+                spill_headers.emplace_back(BuildFrameHeaderBytes(cmd, sid, bytes.size()));
+            spill_buffers.emplace_back(header.data(), header.size());
+            spill_buffers.emplace_back(bytes.data(), bytes.size());
+            continue;
+        }
+
+        auto& header = stack_headers[stack_frame_count++];
+        header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
+        stack_buffers[stack_buffer_count++] =
+            net::const_buffer(header.data(), header.size());
+        stack_buffers[stack_buffer_count++] =
+            net::const_buffer(bytes.data(), bytes.size());
+    }
+
+    const auto buffers = use_spill
+        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
+        : std::span<const net::const_buffer>(stack_buffers.data(), stack_buffer_count);
+
+    if (!buffers.empty()) {
+        try {
+            co_await stream.WriteBuffers(buffers);
+        } catch (const IoSystemError& e) {
+            mb.clear();
+            co_return std::unexpected(MapWriteException(e));
+        } catch (...) {
+            mb.clear();
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+    }
+
+    mb.clear();
+    co_return std::expected<void, ErrorCode>{};
+}
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
+                             uint8_t cmd,
+                             uint32_t sid,
+                             std::span<const net::const_buffer> input) {
+    static constexpr size_t kStackFrames = buf::MultiBuffer::kInlineCapacity;
+    std::array<std::array<uint8_t, kFrameHeaderSize>, kStackFrames> stack_headers{};
+    std::array<net::const_buffer, kStackFrames * 2> stack_buffers{};
+    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers;
+    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+
+    size_t non_empty_count = 0;
+    for (const net::const_buffer& buffer : input) {
+        if (buffer.data() && buffer.size() > 0) {
+            ++non_empty_count;
+        }
+    }
+
+    const bool use_spill = non_empty_count > kStackFrames;
+    if (use_spill) {
+        spill_headers.reserve(non_empty_count);
+        spill_buffers.reserve(non_empty_count * 2);
+    }
+
+    size_t stack_frame_count = 0;
+    size_t stack_buffer_count = 0;
+    for (const net::const_buffer& buffer : input) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) {
+            continue;
+        }
+        if (buffer.size() > kMaxFramePayload) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        if (use_spill) {
+            auto& header =
+                spill_headers.emplace_back(BuildFrameHeaderBytes(cmd, sid, buffer.size()));
+            spill_buffers.emplace_back(header.data(), header.size());
+            spill_buffers.emplace_back(data, buffer.size());
+            continue;
+        }
+
+        auto& header = stack_headers[stack_frame_count++];
+        header = BuildFrameHeaderBytes(cmd, sid, buffer.size());
+        stack_buffers[stack_buffer_count++] =
+            net::const_buffer(header.data(), header.size());
+        stack_buffers[stack_buffer_count++] =
+            net::const_buffer(data, buffer.size());
+    }
+
+    const auto buffers = use_spill
+        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
+        : std::span<const net::const_buffer>(stack_buffers.data(), stack_buffer_count);
+
+    if (!buffers.empty()) {
+        try {
+            co_await stream.WriteBuffers(buffers);
+        } catch (const IoSystemError& e) {
+            co_return std::unexpected(MapWriteException(e));
+        } catch (...) {
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+    }
+
+    co_return std::expected<void, ErrorCode>{};
 }
 
 std::optional<int> ParseInt(std::string_view text) {
@@ -101,17 +240,11 @@ std::string Md5Hex(std::string_view text) {
     return HexDigest(digest, digest_len);
 }
 
-std::vector<int> GenerateRecordPayloadSizes(const PaddingScheme& scheme, uint32_t packet_index) {
-    auto it = scheme.records.find(std::to_string(packet_index));
-    if (it == scheme.records.end()) {
-        return {};
-    }
-
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    std::vector<int> out;
-    for (auto item : Split(it->second, ',')) {
+std::vector<PaddingRecord> ParsePaddingRecord(std::string_view text) {
+    std::vector<PaddingRecord> out;
+    for (auto item : Split(text, ',')) {
         if (item == "c") {
-            out.push_back(-1);
+            out.push_back(PaddingRecord{.copy_payload = true});
             continue;
         }
         const auto dash = item.find('-');
@@ -131,17 +264,53 @@ std::vector<int> GenerateRecordPayloadSizes(const PaddingScheme& scheme, uint32_
         if (lo <= 0 || hi <= 0) {
             continue;
         }
-        if (lo == hi) {
-            out.push_back(lo);
-        } else {
-            std::uniform_int_distribution<int> dist(lo, hi - 1);
-            out.push_back(dist(rng));
-        }
+        out.push_back(PaddingRecord{
+            .copy_payload = false,
+            .min_size = lo,
+            .max_size_exclusive = hi == lo ? lo : hi,
+        });
     }
     return out;
 }
 
+const std::vector<PaddingRecord>* FindPaddingRecord(
+    const PaddingScheme& scheme,
+    uint32_t packet_index) noexcept {
+    if (packet_index >= scheme.stop ||
+        packet_index >= scheme.records.size() ||
+        scheme.records[packet_index].empty()) {
+        return nullptr;
+    }
+    return &scheme.records[packet_index];
+}
+
+int GenerateRecordPayloadSize(const PaddingRecord& record) {
+    if (record.copy_payload) {
+        return -1;
+    }
+    if (record.min_size <= 0 || record.max_size_exclusive <= 0) {
+        return 0;
+    }
+    if (record.min_size == record.max_size_exclusive) {
+        return record.min_size;
+    }
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(
+        record.min_size,
+        record.max_size_exclusive - 1);
+    return dist(rng);
+}
+
 }  // namespace
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteMultiBufferAsFrameBatch(AsyncStream& stream,
+                             uint8_t cmd,
+                             uint32_t sid,
+                             buf::MultiBuffer mb) {
+    co_return co_await WriteMultiBufferAsFrameBatchImpl(
+        stream, cmd, sid, std::move(mb));
+}
 
 PaddingScheme DefaultPaddingScheme() {
     static constexpr std::string_view kRaw =
@@ -164,32 +333,54 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
     PaddingScheme scheme;
     scheme.raw.assign(raw);
     scheme.md5 = Md5Hex(raw);
+    size_t parsed_records = 0;
     for (auto line : Split(raw, '\n')) {
         const auto eq = line.find('=');
         if (eq == std::string_view::npos) {
             continue;
         }
-        std::string key(line.substr(0, eq));
-        std::string value(line.substr(eq + 1));
+        const auto key = line.substr(0, eq);
+        const auto value = line.substr(eq + 1);
         if (key == "stop") {
             auto stop = ParseInt(value);
             if (!stop || *stop <= 0) {
                 return std::nullopt;
             }
             scheme.stop = static_cast<uint32_t>(*stop);
+            continue;
         }
-        scheme.records.emplace(std::move(key), std::move(value));
+
+        auto index = ParseInt(key);
+        if (!index || *index < 0) {
+            continue;
+        }
+
+        auto record = ParsePaddingRecord(value);
+        if (record.empty()) {
+            continue;
+        }
+        const auto record_index = static_cast<size_t>(*index);
+        if (record_index >= scheme.records.size()) {
+            scheme.records.resize(record_index + 1);
+        }
+        if (scheme.records[record_index].empty()) {
+            ++parsed_records;
+        }
+        scheme.records[record_index] = std::move(record);
     }
-    if (scheme.stop == 0 || scheme.records.empty()) {
+    if (scheme.stop == 0 || parsed_records == 0) {
         return std::nullopt;
     }
     return scheme;
 }
 
 uint16_t AuthPaddingSize(const PaddingScheme& scheme) noexcept {
-    auto sizes = GenerateRecordPayloadSizes(scheme, 0);
-    if (!sizes.empty() && sizes.front() > 0 && sizes.front() <= 0xffff) {
-        return static_cast<uint16_t>(sizes.front());
+    const auto* record = FindPaddingRecord(scheme, 0);
+    if (record && !record->front().copy_payload) {
+        const int size = record->front().min_size;
+        if (size > 0 && size <= 0xffff) {
+            return static_cast<uint16_t>(size);
+        }
     }
     return kDefaultAuthPaddingSize;
 }
@@ -302,20 +493,8 @@ std::expected<UotRequest, ErrorCode> DecodeUotRequest(std::span<const uint8_t> d
     return request;
 }
 
-std::expected<std::string, ErrorCode> BuildFrameBytes(
-    uint8_t cmd,
-    uint32_t sid,
-    std::span<const uint8_t> payload) {
-    std::string out;
-    out.reserve(kFrameHeaderSize + payload.size());
-    if (auto ok = AppendFrameBytesTo(out, cmd, sid, payload); !ok) {
-        return std::unexpected(ok.error());
-    }
-    return out;
-}
-
 std::expected<void, ErrorCode> AppendFrameBytesTo(
-    std::string& out,
+    memory::ByteVector& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
@@ -324,7 +503,7 @@ std::expected<void, ErrorCode> AppendFrameBytesTo(
     }
     const size_t offset = out.size();
     out.resize(offset + kFrameHeaderSize + payload.size());
-    auto* header = reinterpret_cast<uint8_t*>(out.data() + offset);
+    auto* header = out.data() + offset;
     header[0] = cmd;
     WriteU32BE(header + 1, sid);
     WriteU16BE(header + 5, static_cast<uint16_t>(payload.size()));
@@ -382,23 +561,22 @@ net::awaitable<std::expected<void, ErrorCode>>
 WritePacketWithPadding(AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
-                       std::string packet) {
+                       memory::ByteVector packet) {
     if (packet.empty()) {
         co_return std::expected<void, ErrorCode>{};
     }
 
-    auto sizes = GenerateRecordPayloadSizes(scheme, packet_index);
-    if (packet_index >= scheme.stop || sizes.empty()) {
+    const auto* record_rules = FindPaddingRecord(scheme, packet_index);
+    if (!record_rules) {
         co_return co_await WriteAll(
             stream,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(packet.data()),
-                packet.size()));
+            std::span<const uint8_t>(packet.data(), packet.size()));
     }
 
     size_t offset = 0;
-    std::string record;
-    for (int size : sizes) {
+    memory::ByteVector record;
+    for (const PaddingRecord& rule : *record_rules) {
+        const int size = GenerateRecordPayloadSize(rule);
         if (size == -1) {
             if (offset >= packet.size()) {
                 break;
@@ -413,35 +591,33 @@ WritePacketWithPadding(AsyncStream& stream,
         record.clear();
         const size_t remaining = packet.size() - offset;
         if (remaining > static_cast<size_t>(size)) {
-            record.assign(packet.data() + offset, static_cast<size_t>(size));
+            const auto* data = packet.data() + offset;
+            record.assign(data, data + static_cast<size_t>(size));
             offset += static_cast<size_t>(size);
         } else if (remaining > 0) {
-            record.assign(packet.data() + offset, remaining);
+            const auto* data = packet.data() + offset;
+            record.assign(data, data + remaining);
             offset = packet.size();
             const int padding =
                 size - static_cast<int>(remaining) - static_cast<int>(kFrameHeaderSize);
             if (padding > 0) {
-                std::string zeros(static_cast<size_t>(padding), '\0');
+                const auto& zeros = ZeroPaddingBlock();
                 auto waste = AppendFrameBytesTo(
                     record,
                     kCmdWaste,
                     0,
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(zeros.data()),
-                        zeros.size()));
+                    std::span<const uint8_t>(zeros.data(), static_cast<size_t>(padding)));
                 if (!waste) {
                     co_return std::unexpected(waste.error());
                 }
             }
         } else {
-            std::string zeros(static_cast<size_t>(size), '\0');
+            const auto& zeros = ZeroPaddingBlock();
             auto waste = AppendFrameBytesTo(
                 record,
                 kCmdWaste,
                 0,
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(zeros.data()),
-                    zeros.size()));
+                std::span<const uint8_t>(zeros.data(), static_cast<size_t>(size)));
             if (!waste) {
                 co_return std::unexpected(waste.error());
             }
@@ -450,9 +626,7 @@ WritePacketWithPadding(AsyncStream& stream,
         if (!record.empty()) {
             auto ok = co_await WriteAll(
                 stream,
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(record.data()),
-                    record.size()));
+                std::span<const uint8_t>(record.data(), record.size()));
             if (!ok) {
                 co_return std::unexpected(ok.error());
             }
@@ -462,28 +636,8 @@ WritePacketWithPadding(AsyncStream& stream,
     if (offset < packet.size()) {
         co_return co_await WriteAll(
             stream,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(packet.data() + offset),
-                packet.size() - offset));
+            std::span<const uint8_t>(packet.data() + offset, packet.size() - offset));
     }
-    co_return std::expected<void, ErrorCode>{};
-}
-
-net::awaitable<std::expected<void, ErrorCode>>
-WriteMultiBufferAsFrames(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
-    for (auto* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        if (bytes.size() > kMaxFramePayload) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        if (auto ok = co_await WriteFrame(stream, cmd, sid, bytes); !ok) {
-            co_return std::unexpected(ok.error());
-        }
-    }
-    mb.clear();
     co_return std::expected<void, ErrorCode>{};
 }
 
@@ -494,7 +648,11 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
                                     uint8_t cmd,
                                     uint32_t sid,
                                     buf::MultiBuffer mb) {
-    std::string packet;
+    if (!FindPaddingRecord(scheme, packet_index)) {
+        co_return co_await WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
+    }
+
+    memory::ByteVector packet;
     packet.reserve(buf::TotalLen(mb) + (mb.size() * kFrameHeaderSize));
     for (auto* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
@@ -506,6 +664,48 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
         }
     }
     mb.clear();
+    co_return co_await WritePacketWithPadding(stream, scheme, packet_index, std::move(packet));
+}
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+                                const PaddingScheme& scheme,
+                                uint32_t packet_index,
+                                uint8_t cmd,
+                                uint32_t sid,
+                                std::span<const net::const_buffer> buffers) {
+    if (!FindPaddingRecord(scheme, packet_index)) {
+        co_return co_await WriteBuffersAsFrameBatchImpl(stream, cmd, sid, buffers);
+    }
+
+    size_t payload_bytes = 0;
+    size_t non_empty_count = 0;
+    for (const net::const_buffer& buffer : buffers) {
+        if (buffer.data() && buffer.size() > 0) {
+            if (buffer.size() > kMaxFramePayload) {
+                co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            }
+            payload_bytes += buffer.size();
+            ++non_empty_count;
+        }
+    }
+
+    memory::ByteVector packet;
+    packet.reserve(payload_bytes + (non_empty_count * kFrameHeaderSize));
+    for (const net::const_buffer& buffer : buffers) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) {
+            continue;
+        }
+        auto ok = AppendFrameBytesTo(
+            packet,
+            cmd,
+            sid,
+            std::span<const uint8_t>(data, buffer.size()));
+        if (!ok) {
+            co_return std::unexpected(ok.error());
+        }
+    }
     co_return co_await WritePacketWithPadding(stream, scheme, packet_index, std::move(packet));
 }
 

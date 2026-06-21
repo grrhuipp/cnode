@@ -1,12 +1,12 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -72,16 +72,15 @@ private:
     struct ClientSession;
 
     static void CloseSession(std::shared_ptr<ClientSession> session) noexcept;
-    void PruneSessionsLocked();
+    void PruneSessions();
 
     std::string tag_;
     Settings settings_;
     StreamSettings stream_settings_;
     std::chrono::seconds dial_timeout_;
     app::dns::DNS* dns_service_ = nullptr;
-    std::mutex pool_mu_;
-    std::vector<std::shared_ptr<ClientSession>> sessions_;
-    std::vector<std::shared_ptr<ClientSession>> idle_sessions_;
+    memory::ThreadLocalVector<std::shared_ptr<ClientSession>> sessions_;
+    memory::ThreadLocalVector<std::shared_ptr<ClientSession>> idle_sessions_;
     std::chrono::seconds idle_session_check_interval_{30};
     std::chrono::seconds idle_session_timeout_{60};
     size_t min_idle_sessions_ = 0;

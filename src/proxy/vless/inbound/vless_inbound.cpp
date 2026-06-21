@@ -184,7 +184,7 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (pending_.empty()) {
+        if (!buf::HasData(pending_)) {
             co_return co_await src_.ReadMultiBuffer();
         }
 
@@ -267,10 +267,25 @@ private:
         pending_ = buf::BufferGuard{};
     }
 
+    [[nodiscard]] bool TryTakePayload(std::span<const uint8_t> payload) {
+        buf::BufferGuard taken;
+        if (!buf::TakeBufferSuffix(pending_, payload, taken)) {
+            return false;
+        }
+        queue_.push_back(std::move(taken));
+        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
+            shrink_queue_on_drain_ = true;
+        }
+        return true;
+    }
+
     void Parse() {
         while (Size() > 0) {
             auto parsed = vless::Codec::ParseUdpPacket(Data(), Size());
             if (parsed.result == vless::Codec::UdpParseResult::SUCCESS) {
+                if (parsed.packet && TryTakePayload(parsed.packet->payload)) {
+                    continue;
+                }
                 buf::BufferGuard payload{buf::Buffer::New()};
                 if (payload && parsed.packet) {
                     const auto bytes = parsed.packet->payload;
@@ -337,12 +352,12 @@ public:
                 }
                 out.push_back(pkt.release());
             }
-            if (!out.empty()) {
+            if (buf::HasData(out)) {
                 co_return out;
             }
 
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
-            if (raw.empty()) {
+            if (!buf::HasData(raw)) {
                 co_return buf::MultiBuffer{};
             }
             for (buf::Buffer* rb : raw) {
@@ -372,6 +387,11 @@ public:
         buf::MultiBuffer out;
         for (buf::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
+                mb.FreeSlot(buffer);
+                continue;
+            }
+            if (packet_addr_ && !buffer->HasUDP()) {
+                mb.FreeSlot(buffer);
                 continue;
             }
             buf::BufferGuard header{buf::Buffer::New()};
@@ -380,26 +400,54 @@ public:
             }
             bool ok = false;
             if (packet_addr_) {
-                if (!buffer->HasUDP()) {
-                    continue;
-                }
                 ok = EncodePacketAddrUdpHeaderTo(buffer->UDP(), buffer->Len(), *header);
             } else {
                 ok = EncodeVlessUdpLengthHeaderTo(buffer->Len(), *header);
             }
             if (!ok) {
-                buf::Buffer::Free(buffer);
-                buffer = nullptr;
+                mb.FreeSlot(buffer);
                 continue;
             }
             out.push_back(header.release());
             buffer->ClearUDP();
-            out.push_back(buffer);
-            buffer = nullptr;
+            out.push_back(mb.ReleaseSlot(buffer));
         }
         mb.clear();
-        if (!out.empty()) {
+        if (buf::HasData(out)) {
             co_await dst_.WriteMultiBuffer(std::move(out));
+        }
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (packet_addr_) {
+            co_return;
+        }
+
+        buf::MultiBuffer header_owner;
+        memory::ThreadLocalVector<net::const_buffer> out;
+        header_owner.reserve(buffers.size());
+        out.reserve(buffers.size() * 2);
+
+        for (const net::const_buffer& buffer : buffers) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            if (!data || buffer.size() == 0) {
+                continue;
+            }
+            buf::BufferGuard header{buf::Buffer::New()};
+            if (!header) {
+                throw std::bad_alloc();
+            }
+            if (!EncodeVlessUdpLengthHeaderTo(buffer.size(), *header)) {
+                throw IoSystemError(io_error::fault, "VLESS UDP header allocation failed");
+            }
+            const auto header_bytes = header->Bytes();
+            out.emplace_back(header_bytes.data(), header_bytes.size());
+            header_owner.push_back(header.release());
+            out.emplace_back(data, buffer.size());
+        }
+
+        if (!out.empty()) {
+            co_await dst_.WriteBuffers(out);
         }
     }
 
@@ -423,59 +471,89 @@ public:
 
     VlessResponseHeaderWriter(AsyncStream& dst,
                               std::span<const uint8_t> header)
-        : dst_(&dst)
-        , stream_(&dst) {
+        : dst_(&dst) {
         SetHeader(header);
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (header_len_ > 0) {
-            buf::MultiBuffer out;
-            out.reserve(mb.size() + 1);
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(header_.data(), header_len_),
-                    out)) {
-                throw IoSystemError(io_error::fault,
-                                    "VLESS response header allocation failed");
-            }
+            const size_t header_len = header_len_;
+            std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity> stack_out{};
+            memory::ThreadLocalVector<net::const_buffer> spill_out;
+            const bool use_spill = mb.size() > buf::MultiBuffer::kInlineCapacity;
+            size_t stack_count = 0;
             header_len_ = 0;
-            for (buf::Buffer*& buffer : mb) {
+
+            auto append = [&](net::const_buffer buffer) {
+                if (buffer.size() == 0) {
+                    return;
+                }
+                if (use_spill) {
+                    spill_out.push_back(buffer);
+                    return;
+                }
+                stack_out[stack_count++] = buffer;
+            };
+
+            if (use_spill) {
+                spill_out.reserve(mb.size() + 1);
+            }
+            append(net::const_buffer(header_.data(), header_len));
+            for (const buf::Buffer* buffer : mb) {
                 if (!buffer || buffer->IsEmpty()) {
                     continue;
                 }
-                out.push_back(buffer);
-                buffer = nullptr;
+                const auto bytes = buffer->Bytes();
+                append(net::const_buffer(bytes.data(), bytes.size()));
             }
+            const auto out = use_spill
+                ? std::span<const net::const_buffer>(spill_out.data(), spill_out.size())
+                : std::span<const net::const_buffer>(stack_out.data(), stack_count);
+            co_await dst_->WriteBuffers(out);
             mb.clear();
-            if (stream_) {
-                co_await stream_->WriteMultiBuffer(std::move(out));
-            } else {
-                co_await dst_->WriteMultiBuffer(std::move(out));
-            }
             co_return;
         }
-        if (stream_) {
-            co_await stream_->WriteMultiBuffer(std::move(mb));
-        } else {
-            co_await dst_->WriteMultiBuffer(std::move(mb));
+        co_await dst_->WriteMultiBuffer(std::move(mb));
+    }
+
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (header_len_ > 0) {
+            std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity> stack_out{};
+            memory::ThreadLocalVector<net::const_buffer> spill_out;
+            const bool use_spill = buffers.size() > buf::MultiBuffer::kInlineCapacity;
+            size_t stack_count = 0;
+            if (use_spill) {
+                spill_out.reserve(buffers.size() + 1);
+                spill_out.emplace_back(header_.data(), header_len_);
+                for (const auto& buffer : buffers) {
+                    if (buffer.size() > 0) {
+                        spill_out.push_back(buffer);
+                    }
+                }
+            } else {
+                stack_out[stack_count++] = net::const_buffer(header_.data(), header_len_);
+                for (const auto& buffer : buffers) {
+                    if (buffer.size() > 0) {
+                        stack_out[stack_count++] = buffer;
+                    }
+                }
+            }
+            header_len_ = 0;
+            const auto out = use_spill
+                ? std::span<const net::const_buffer>(spill_out.data(), spill_out.size())
+                : std::span<const net::const_buffer>(stack_out.data(), stack_count);
+            co_await dst_->WriteBuffers(out);
+            co_return;
         }
+        co_await dst_->WriteBuffers(buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
         if (header_len_ > 0) {
-            buf::MultiBuffer out;
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(header_.data(), header_len_),
-                    out)) {
-                throw IoSystemError(io_error::fault,
-                                    "VLESS response header allocation failed");
-            }
+            std::array<net::const_buffer, 1> out{
+                net::const_buffer(header_.data(), header_len_)};
             header_len_ = 0;
-            if (stream_) {
-                co_await stream_->WriteMultiBuffer(std::move(out));
-            } else {
-                co_await dst_->WriteMultiBuffer(std::move(out));
-            }
+            co_await dst_->WriteBuffers(out);
         }
         co_await dst_->AsyncShutdownWrite();
     }
@@ -490,7 +568,6 @@ private:
     }
 
     transport::MultiBufferWriter* dst_ = nullptr;
-    AsyncStream* stream_ = nullptr;
     std::array<uint8_t, 16> header_{};
     size_t header_len_ = 0;
 };
