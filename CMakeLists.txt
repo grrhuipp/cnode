@@ -15,6 +15,7 @@ option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
 option(CNODE_MIMALLOC_MUSL "Use mimalloc for global C++ new/delete in musl builds" ON)
+option(CNODE_BUILD_TESTS "Build cnode unit tests" OFF)
 set(CNODE_ASIO_RECYCLING_CACHE_SIZE 8 CACHE STRING "Asio small-block recycling cache size")
 set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
 
@@ -290,6 +291,7 @@ set(CNODE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_stream.cpp
+    src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/transport_stack.cpp
@@ -530,6 +532,25 @@ elseif(CNODE_IO_URING)
     set(CNODE_IO_BACKEND_SUMMARY "io_uring")
 else()
     set(CNODE_IO_BACKEND_SUMMARY "epoll")
+endif()
+
+if(CNODE_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(cnode_autosign_cert_test
+        tests/autosign_cert_test.cpp
+        src/transport/internet/autosign_cert.cpp
+    )
+    target_include_directories(cnode_autosign_cert_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_link_libraries(cnode_autosign_cert_test PRIVATE crypto)
+    target_compile_options(cnode_autosign_cert_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
 endif()
 
 # ============================================================================

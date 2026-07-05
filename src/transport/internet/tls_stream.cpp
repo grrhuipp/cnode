@@ -6,10 +6,7 @@
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/evp.h>
-#include <openssl/ec.h>
+#include "autosign_cert.hpp"
 #include <openssl/err.h>
 #include <openssl/tls1.h>
 #include <asio/ssl.hpp>
@@ -19,11 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <list>
-#include <mutex>
-#include <optional>
 #include <span>
-#include <unordered_map>
 
 namespace acpp {
 
@@ -133,125 +126,6 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
     return false;
 }
 
-struct AutoSignState {
-    static constexpr size_t kMaxCachedCerts = 256;
-
-    struct CachedCert {
-        X509* cert = nullptr;
-        std::list<std::string>::iterator lru_it;
-    };
-
-    EVP_PKEY* pkey = nullptr;
-    std::mutex mu;
-    std::unordered_map<std::string, CachedCert> cert_cache;
-    std::list<std::string> cert_lru;
-    long next_serial = 1;
-
-    ~AutoSignState() {
-        for (auto& [_, cached] : cert_cache) X509_free(cached.cert);
-        if (pkey) EVP_PKEY_free(pkey);
-    }
-
-    bool EnsureKey() {
-        std::lock_guard lock(mu);
-        if (pkey) {
-            return true;
-        }
-
-        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
-        EVP_PKEY* generated = nullptr;
-        if (!pctx ||
-            EVP_PKEY_keygen_init(pctx) <= 0 ||
-            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0 ||
-            EVP_PKEY_keygen(pctx, &generated) <= 0) {
-            if (pctx) EVP_PKEY_CTX_free(pctx);
-            if (generated) EVP_PKEY_free(generated);
-            return false;
-        }
-        EVP_PKEY_CTX_free(pctx);
-        pkey = generated;
-        return true;
-    }
-
-    // 为指定域名生成或获取缓存的证书
-    X509* GetOrCreate(const std::string& cn) {
-        long serial = 0;
-        {
-            std::lock_guard lock(mu);
-            if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
-                cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
-                return it->second.cert;
-            }
-            serial = next_serial++;
-        }
-
-        X509* x509 = X509_new();
-        if (!x509) return nullptr;
-
-        X509_set_version(x509, 2);
-        ASN1_INTEGER_set(X509_get_serialNumber(x509), serial);
-
-        X509_gmtime_adj(X509_get_notBefore(x509), 0);
-        X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
-
-        X509_set_pubkey(x509, pkey);
-
-        X509_NAME* name = X509_get_subject_name(x509);
-        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-            reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
-        X509_set_issuer_name(x509, name);
-
-        // SAN 扩展：泛域名 + 裸域名（如 *.example.com, example.com）
-        X509V3_CTX v3ctx;
-        X509V3_set_ctx_nodb(&v3ctx);
-        X509V3_set_ctx(&v3ctx, x509, x509, nullptr, nullptr, 0);
-        std::string san_val = "DNS:" + cn;
-        // 泛域名时额外加裸域名
-        if (cn.size() > 2 && cn[0] == '*' && cn[1] == '.') {
-            san_val += ",DNS:" + cn.substr(2);
-        }
-        X509_EXTENSION* san_ext = X509V3_EXT_nconf_nid(
-            nullptr, &v3ctx, NID_subject_alt_name,
-            const_cast<char*>(san_val.c_str()));
-        if (san_ext) {
-            X509_add_ext(x509, san_ext, -1);
-            X509_EXTENSION_free(san_ext);
-        }
-
-        if (!X509_sign(x509, pkey, EVP_sha256())) {
-            X509_free(x509);
-            return nullptr;
-        }
-
-        std::lock_guard lock(mu);
-        if (auto it = cert_cache.find(cn); it != cert_cache.end()) {
-            cert_lru.splice(cert_lru.begin(), cert_lru, it->second.lru_it);
-            X509_free(x509);
-            return it->second.cert;
-        }
-
-        while (cert_cache.size() >= kMaxCachedCerts && !cert_lru.empty()) {
-            auto victim = std::prev(cert_lru.end());
-            auto victim_it = cert_cache.find(*victim);
-            if (victim_it != cert_cache.end()) {
-                X509_free(victim_it->second.cert);
-                cert_cache.erase(victim_it);
-            }
-            cert_lru.erase(victim);
-        }
-
-        cert_lru.push_front(cn);
-        cert_cache.emplace(cn, CachedCert{x509, cert_lru.begin()});
-        LOG_DEBUG("自签证书已生成: {}", cn);
-        return x509;
-    }
-};
-
-AutoSignState& GetAutoSignState() {
-    static AutoSignState state;
-    return state;
-}
-
 // 从 SNI 提取泛域名：www.example.com → *.example.com
 // 裸域名 example.com → *.example.com
 // 单标签 localhost → localhost（不做通配）
@@ -269,36 +143,31 @@ std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     return ToWildcard(config.server_name);
 }
 
-// SNI 回调：根据客户端请求的域名切换泛域名证书
-int AutoSignSniCallback(SSL* ssl, int* /*ad*/, void* /*arg*/) {
+int AutoSignCertCallback(SSL* ssl, void* arg) {
+    auto* default_name = static_cast<std::string*>(arg);
     const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    std::string wildcard = sni ? ToWildcard(sni) : "localhost";
+    std::string wildcard = sni ? ToWildcard(sni) : *default_name;
 
-    auto& state = GetAutoSignState();
-    X509* cert = state.GetOrCreate(wildcard);
-    if (!cert) return SSL_TLSEXT_ERR_ALERT_FATAL;
+    auto& state = transport::internet::GetAutoSignState();
+    auto material = state.GetOrCreate(wildcard);
+    if (!material.cert || !material.key) return 0;
 
-    SSL_use_certificate(ssl, cert);
-    SSL_use_PrivateKey(ssl, state.pkey);
-    return SSL_TLSEXT_ERR_OK;
+    if (SSL_use_certificate(ssl, material.cert) != 1 ||
+        SSL_use_PrivateKey(ssl, material.key) != 1) {
+        return 0;
+    }
+    return 1;
 }
 
 
 }  // namespace
 
 std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
-    auto& state = GetAutoSignState();
-
-    // 只在首次调用时生成 EC P-256 密钥
-    if (!state.EnsureKey()) {
-        LOG_ERROR("EC P-256 密钥生成失败");
-        return nullptr;
-    }
-
     // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
     const std::string default_name = ResolveAutoSignDefaultName(config);
-    X509* default_cert = state.GetOrCreate(default_name);
-    if (!default_cert) {
+    auto& state = transport::internet::GetAutoSignState();
+    auto default_material = state.GetOrCreate(default_name);
+    if (!default_material.cert || !default_material.key) {
         LOG_ERROR("默认自签证书生成失败");
         return nullptr;
     }
@@ -310,15 +179,16 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
-    SSL_CTX_use_certificate(ctx, default_cert);
-    SSL_CTX_use_PrivateKey(ctx, state.pkey);
+    SSL_CTX_use_certificate(ctx, default_material.cert);
+    SSL_CTX_use_PrivateKey(ctx, default_material.key);
 
-    // 注册 SNI 回调，按需切换证书
-    SSL_CTX_set_tlsext_servername_callback(ctx, AutoSignSniCallback);
+    auto default_name_state = std::make_shared<std::string>(default_name);
+    SSL_CTX_set_cert_cb(ctx, AutoSignCertCallback, default_name_state.get());
 
     LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书，默认域名={}）",
              default_name);
-    auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
+    auto out = std::unique_ptr<SslContext>(
+        new SslContext(ctx, std::move(default_name_state)));
     out->ConfigureServerAlpn(config.alpn);
     return out;
 }
