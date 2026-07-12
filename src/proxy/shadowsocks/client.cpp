@@ -1,4 +1,5 @@
 #include "shadowsocks_crypto.hpp"
+#include "stream_crypto.hpp"
 #include "client.hpp"
 
 #include "acppnode/common/allocator.hpp"
@@ -50,81 +51,6 @@ net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
     }
     return nonce;
 }
-
-class SsAeadStreamDecryptor {
-public:
-    explicit SsAeadStreamDecryptor(const SsAeadCipher& cipher)
-        : type_(cipher.Type())
-        , key_size_(cipher.Key().size()) {
-        if (key_size_ == 0 || key_size_ > key_.size()) {
-            return;
-        }
-        std::memcpy(key_.data(), cipher.Key().data(), key_size_);
-        ctx_ = EVP_CIPHER_CTX_new();
-    }
-
-    ~SsAeadStreamDecryptor() {
-        if (ctx_) {
-            EVP_CIPHER_CTX_free(ctx_);
-            ctx_ = nullptr;
-        }
-    }
-
-    SsAeadStreamDecryptor(const SsAeadStreamDecryptor&) = delete;
-    SsAeadStreamDecryptor& operator=(const SsAeadStreamDecryptor&) = delete;
-
-    bool Init(const uint8_t* nonce) noexcept {
-        if (!ctx_ || !nonce) return false;
-
-        const EVP_CIPHER* cipher = GetCipher(type_);
-        if (!cipher) return false;
-
-        if (EVP_CIPHER_CTX_reset(ctx_) != 1) return false;
-        if (EVP_DecryptInit_ex(ctx_, cipher, nullptr, nullptr, nullptr) != 1) return false;
-        if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) return false;
-        if (EVP_DecryptInit_ex(ctx_, nullptr, nullptr, key_.data(), nonce) != 1) return false;
-        return true;
-    }
-
-    bool Update(const uint8_t* ciphertext,
-                size_t ciphertext_len,
-                uint8_t* output,
-                int* out_len) noexcept {
-        if (!ctx_ || !ciphertext || !output || !out_len) return false;
-
-        return EVP_DecryptUpdate(
-            ctx_, output, out_len,
-            ciphertext, static_cast<int>(ciphertext_len)) == 1;
-    }
-
-    bool Final(const uint8_t* tag) noexcept {
-        if (!ctx_ || !tag) return false;
-
-        if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_TAG, 16,
-                                 const_cast<uint8_t*>(tag)) != 1) {
-            return false;
-        }
-
-        int final_len = 0;
-        uint8_t dummy[1]{};
-        return EVP_DecryptFinal_ex(ctx_, dummy, &final_len) == 1;
-    }
-
-private:
-    static const EVP_CIPHER* GetCipher(SsCipherType type) noexcept {
-        switch (BaseCipherType(type)) {
-            case SsCipherType::AES_128_GCM:      return EVP_aes_128_gcm();
-            case SsCipherType::AES_256_GCM:      return EVP_aes_256_gcm();
-            case SsCipherType::CHACHA20_POLY1305:return EVP_chacha20_poly1305();
-            default:                             return nullptr;
-        }
-    }
-
-    SsCipherType type_;
-    std::array<uint8_t, 32> key_{};
-    size_t key_size_ = 0;
-    EVP_CIPHER_CTX* ctx_ = nullptr;
-};
 
 size_t EncodeSocks5AddressTo(const TargetAddress& addr,
                             uint8_t* output,
@@ -387,7 +313,7 @@ private:
                 break;
             }
 
-            SsAeadStreamDecryptor decryptor(*read_cipher_);
+            detail::StreamAeadDecryptor decryptor(*read_cipher_);
             auto payload_nonce = MakeNonce(read_nonce_ + 1);
             if (!decryptor.Init(payload_nonce.data())) {
                 raw_pending_.clear();
@@ -395,31 +321,15 @@ private:
                 return true;
             }
 
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                raw_pending_.clear();
-                raw_pending_offset_ = 0;
-                return true;
-            }
-            int produced = 0;
-            if (payload_len > 0 &&
-                !decryptor.Update(
-                    raw_pending_.data() + raw_pending_offset_ + kLenCipherSize,
-                    payload_len,
-                    out->Tail().data(),
-                    &produced)) {
-                raw_pending_.clear();
-                raw_pending_offset_ = 0;
-                return true;
-            }
-            if (produced < 0 || static_cast<size_t>(produced) != payload_len) {
-                raw_pending_.clear();
-                raw_pending_offset_ = 0;
-                return true;
-            }
+            buf::MultiBuffer decoded_payload;
             const uint8_t* tag =
                 raw_pending_.data() + raw_pending_offset_ + kLenCipherSize + payload_len;
-            if (!decryptor.Final(tag)) {
+            if (!detail::DecryptStreamPayload(
+                    decryptor,
+                    raw_pending_.data() + raw_pending_offset_ + kLenCipherSize,
+                    payload_len,
+                    tag,
+                    decoded_payload)) {
                 raw_pending_.clear();
                 raw_pending_offset_ = 0;
                 return true;
@@ -432,8 +342,7 @@ private:
                 CompactPending();
                 return true;
             }
-            out->Produce(static_cast<uint32_t>(produced));
-            out_mb.push_back(out.release());
+            decoded_payload.MoveTo(out_mb);
         }
         CompactPending();
         return buf::HasData(out_mb);
