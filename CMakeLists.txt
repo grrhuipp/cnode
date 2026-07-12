@@ -604,18 +604,6 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_v2board_http_response_test
         COMMAND cnode_v2board_http_response_test)
 
-    add_executable(cnode_tcp_read_policy_test
-        tests/tcp_read_policy_test.cpp
-    )
-    target_include_directories(cnode_tcp_read_policy_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
-    )
-    target_link_libraries(cnode_tcp_read_policy_test PRIVATE Threads::Threads)
-    target_compile_options(cnode_tcp_read_policy_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(NAME cnode_tcp_read_policy_test COMMAND cnode_tcp_read_policy_test)
 endif()
 
 # ============================================================================

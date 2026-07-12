@@ -4,7 +4,6 @@
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "tcp_read_policy.hpp"
 
 #include <asio/read.hpp>
 #include <asio/write.hpp>
@@ -28,8 +27,7 @@
 namespace acpp {
 
 namespace {
-constexpr uint32_t kMaxReadAllocBuffers =
-    transport::internet::tcp_read_policy::kNormalReadBufferCap;
+constexpr uint32_t kMaxReadAllocBuffers = 4;
 constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
 constexpr uint8_t kReadGrowStreakRequired = 1;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
@@ -164,7 +162,6 @@ TcpStream::TcpStream(tcp::socket socket)
     : impl_(std::make_unique<Impl>(std::move(socket))) {
     if (impl_->socket.is_open()) {
         impl_->SetFlag(kCountedActive);
-        transport::internet::tcp_read_policy::RegisterActiveStream();
         memory::OnTcpStreamNew();
         SetupConnectedSocket(impl_->socket);
     }
@@ -301,7 +298,6 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 // 自适应散读（仿 Xray ReadVReader allocStrategy）：
 //   - 低流量 / 启动：单 Buffer 快速路径，零额外堆分配
 //   - 连续大包后按 1/2/4 个 Buffer 自适应增长
-//   - 当前 Worker 活跃 TCP stream 达到压力阈值时，把上限收紧到 2
 //   - 未读满则收缩到实际使用数，避免浪费
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
@@ -313,10 +309,6 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         TouchActivity();
         co_return pending;
     }
-
-    const uint32_t read_cap =
-        transport::internet::tcp_read_policy::MaxReadBufferCount();
-    impl_->read_alloc_count = std::min(impl_->read_alloc_count, read_cap);
 
     // ── 快速路径：单 Buffer（低流量 / 启动阶段）───────────────────────
     // 对齐 xray-core：直接挂起 read 到 8KB Buffer，避免 wait+read 的双
@@ -421,12 +413,9 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 
     TouchActivity();
 
-    // 自适应调整：全部读满时按当前 Worker 压力上限增长，否则收缩到
-    // 实际使用数。压力解除后，连接会在后续满读时从 readv2 恢复到 readv4。
+    // 自适应调整：全部读满时增长到固定 readv4 上限，否则收缩到实际使用数。
     if (used >= n_alloc) {
-        impl_->read_alloc_count = std::min(
-            n_alloc * 2u,
-            transport::internet::tcp_read_policy::MaxReadBufferCount());
+        impl_->read_alloc_count = std::min(n_alloc * 2u, kMaxReadAllocBuffers);
     } else {
         impl_->read_alloc_count = std::max(used, 1u);
     }
@@ -1151,7 +1140,6 @@ void TcpStream::CancelPhaseDeadline() noexcept {
 
 void TcpStream::ReleaseActiveCounter() noexcept {
     if (!impl_->HasFlag(kCountedActive)) return;
-    transport::internet::tcp_read_policy::UnregisterActiveStream();
     memory::OnTcpStreamFree();
     impl_->SetFlag(kCountedActive, false);
 }
