@@ -579,6 +579,30 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(NAME cnode_uot_ss2022_test COMMAND cnode_uot_ss2022_test)
+
+    add_executable(cnode_v2board_http_response_test
+        tests/v2board_http_response_test.cpp
+    )
+    target_include_directories(cnode_v2board_http_response_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
+    )
+    target_link_libraries(cnode_v2board_http_response_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_v2board_http_response_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_v2board_http_response_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_v2board_http_response_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_v2board_http_response_test
+        COMMAND cnode_v2board_http_response_test)
 endif()
 
 # ============================================================================
