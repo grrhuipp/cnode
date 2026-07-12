@@ -36,6 +36,7 @@ struct SsOutboundConfig {
     StreamSettings         stream_settings;
     std::string            send_through;
     std::chrono::seconds   timeout{10};
+    uint8_t                uot_version = 0;
 };
 
 // ============================================================================

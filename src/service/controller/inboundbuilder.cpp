@@ -75,6 +75,7 @@ InboundBuild InboundBuilder(const std::string& panel_name,
     build.handler_request.cipher_method = node_config.CypherMethod.empty()
         ? std::string(constants::protocol::kAes256Gcm)
         : node_config.CypherMethod;
+    build.handler_request.ss_identity_password = node_config.ShadowsocksServerKey;
 
     build.binding = MakePortBinding(
         node_config.Port,

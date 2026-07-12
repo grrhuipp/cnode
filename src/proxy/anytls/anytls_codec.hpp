@@ -37,7 +37,6 @@ inline constexpr uint8_t kCmdServerSettings = 10;
 inline constexpr size_t kFrameHeaderSize = 7;
 inline constexpr size_t kMaxFramePayload = 0xffff;
 inline constexpr uint16_t kDefaultAuthPaddingSize = 30;
-inline constexpr std::string_view kUotMagicAddress = "sp.v2.udp-over-tcp.arpa";
 
 struct FrameHeader {
     uint8_t cmd = 0;
@@ -63,18 +62,6 @@ struct PaddingScheme {
 [[nodiscard]] uint16_t AuthPaddingSize(const PaddingScheme& scheme) noexcept;
 [[nodiscard]] std::string DefaultClientSettings();
 [[nodiscard]] std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target);
-[[nodiscard]] bool IsUotMagicAddress(const TargetAddress& target) noexcept;
-
-struct UotRequest {
-    bool is_connect = false;
-    TargetAddress destination;
-    size_t consumed = 0;
-};
-
-[[nodiscard]] std::expected<std::string, ErrorCode> EncodeUotRequest(
-    const TargetAddress& target,
-    bool is_connect);
-[[nodiscard]] std::expected<UotRequest, ErrorCode> DecodeUotRequest(std::span<const uint8_t> data);
 [[nodiscard]] std::expected<void, ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
     uint8_t cmd,

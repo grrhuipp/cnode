@@ -1,6 +1,7 @@
 #include "acppnode/proxy/anytls/inbound/anytls_inbound.hpp"
 
 #include "../anytls_codec.hpp"
+#include "../../uot/uot.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -276,53 +277,6 @@ std::optional<TargetAddress> ParseSocksAddress(const buf::MultiBuffer& data, siz
     return std::nullopt;
 }
 
-std::expected<anytls::UotRequest, ErrorCode> DecodeUotRequest(
-    const buf::MultiBuffer& data,
-    size_t size) {
-    if (size < 1 + 1 + 2) {
-        return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    MultiBufferByteReader reader(data, size);
-    anytls::UotRequest request;
-    request.is_connect = reader.ReadU8() != 0;
-    const uint8_t atype = reader.ReadU8();
-    if (atype == 0x01) {
-        net::ip::address_v4::bytes_type bytes{};
-        (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        request.destination = TargetAddress(net::ip::make_address_v4(bytes), port);
-        request.consumed = 1 + 1 + bytes.size() + 2;
-        return request;
-    }
-    if (atype == 0x04) {
-        net::ip::address_v6::bytes_type bytes{};
-        (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        request.destination = TargetAddress(net::ip::make_address_v6(bytes), port);
-        request.consumed = 1 + 1 + bytes.size() + 2;
-        return request;
-    }
-    if (atype == 0x03) {
-        const uint8_t host_len = reader.ReadU8();
-        std::string host = reader.ReadString(host_len);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok() || host_len == 0) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        request.destination = TargetAddress(std::string_view(host), port);
-        request.consumed = 1 + 1 + 1 + host_len + 2;
-        return request;
-    }
-    return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-}
-
 class AnyTLSDemuxSession;
 
 class AnyTLSSubStream final
@@ -474,42 +428,6 @@ private:
     bool shrink_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
-};
-
-class AnyTLSUotSubReader final : public transport::MultiBufferReader {
-public:
-    AnyTLSUotSubReader(std::shared_ptr<AnyTLSSubStream> sub,
-                       TargetAddress source,
-                       buf::MultiBuffer initial_pending)
-        : sub_(std::move(sub))
-        , source_(std::move(source))
-        , initial_pending_(std::move(initial_pending)) {}
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!initial_pending_.empty()) {
-            buf::MultiBuffer out = std::move(initial_pending_);
-            for (auto* buffer : out) {
-                if (buffer && !buffer->IsEmpty()) {
-                    buffer->SetUDP(source_);
-                }
-            }
-            initial_pending_.clear();
-            co_return out;
-        }
-
-        auto mb = co_await sub_->ReadMultiBuffer();
-        for (auto* buffer : mb) {
-            if (buffer && !buffer->IsEmpty()) {
-                buffer->SetUDP(source_);
-            }
-        }
-        co_return mb;
-    }
-
-private:
-    std::shared_ptr<AnyTLSSubStream> sub_;
-    TargetAddress source_;
-    buf::MultiBuffer initial_pending_;
 };
 
 class AnyTLSDemuxSession final : public std::enable_shared_from_this<AnyTLSDemuxSession> {
@@ -694,10 +612,11 @@ private:
         (void)write_signal_.try_send(IoErrorCode{});
     }
 
-    net::awaitable<void> StartDispatch(std::shared_ptr<AnyTLSSubStream> sub,
-                                       Network network,
-                                       TargetAddress target,
-                                       buf::MultiBuffer initial_uot_payload);
+    net::awaitable<void> StartDispatch(
+        std::shared_ptr<AnyTLSSubStream> sub,
+        TargetAddress target,
+        buf::MultiBuffer initial_uot_payload,
+        std::optional<proxy::uot::Version> uot_version);
 
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
@@ -751,11 +670,54 @@ net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
 
 net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     std::shared_ptr<AnyTLSSubStream> sub,
-    Network network,
     TargetAddress target,
-    buf::MultiBuffer initial_uot_payload) {
+    buf::MultiBuffer initial_uot_payload,
+    std::optional<proxy::uot::Version> uot_version) {
     if (!sub) {
         co_return;
+    }
+
+    bool is_connect = false;
+    std::optional<proxy::uot::PacketReader> uot_reader;
+    std::optional<proxy::uot::PacketWriter> uot_writer;
+    if (uot_version) {
+        if (*uot_version == proxy::uot::Version::V2) {
+            auto request = co_await proxy::uot::ReadRequest(
+                *sub, initial_uot_payload);
+            if (!request || !request->destination.IsValid()) {
+                RemoveStream(sub->Sid());
+                co_return;
+            }
+            is_connect = request->is_connect;
+            target = std::move(request->destination);
+        }
+
+        uot_reader.emplace(
+            *sub, is_connect, target, std::move(initial_uot_payload));
+        if (*uot_version == proxy::uot::Version::V1) {
+            try {
+                auto first_packet = co_await uot_reader->ReadMultiBuffer();
+                if (!buf::HasData(first_packet)) {
+                    RemoveStream(sub->Sid());
+                    co_return;
+                }
+                for (const buf::Buffer* buffer : first_packet) {
+                    if (buffer && buffer->HasUDP()) {
+                        target = buffer->UDP();
+                        break;
+                    }
+                }
+                if (!target.IsValid()) {
+                    RemoveStream(sub->Sid());
+                    co_return;
+                }
+                uot_reader->SetInitialDecoded(std::move(first_packet));
+            } catch (...) {
+                RemoveStream(sub->Sid());
+                co_return;
+            }
+        }
+        uot_writer.emplace(*sub, is_connect, target);
     }
 
     session::Context ctx;
@@ -763,16 +725,15 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     ctx.outbound.original_target = target;
     ctx.outbound.target = target;
     ctx.outbound.route_target = target;
-    ctx.content.network = network;
+    ctx.content.network = uot_version ? Network::UDP : Network::TCP;
 
     RelayResult result;
-    if (ctx.content.network == Network::UDP) {
-        AnyTLSUotSubReader reader{sub, target, std::move(initial_uot_payload)};
+    if (uot_version) {
         result = co_await dispatcher_.Dispatch(
             io_context_,
             receiver_,
             nullptr,
-            transport::Link{&reader, sub.get()},
+            transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
             InitialPayload{},
             ctx,
             stats_,
@@ -943,8 +904,21 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                     CancelAll();
                     co_return result;
                 }
-                if (anytls::IsUotMagicAddress(*target)) {
-                    state_it->second = StreamState::PendingUotRequest;
+                if (const auto uot_version =
+                        proxy::uot::VersionFromMagicAddress(*target)) {
+                    if (*uot_version == proxy::uot::Version::V2) {
+                        state_it->second = StreamState::PendingUotRequest;
+                        break;
+                    }
+                    state_it->second = StreamState::Started;
+                    auto self = shared_from_this();
+                    net::co_spawn(
+                        io_context_.get_executor(),
+                        [self, sub]() mutable -> net::awaitable<void> {
+                            co_await self->StartDispatch(
+                                std::move(sub), {}, {}, proxy::uot::Version::V1);
+                        },
+                        net::detached);
                     break;
                 }
                 state_it->second = StreamState::Started;
@@ -953,30 +927,21 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                     io_context_.get_executor(),
                     [self, sub, target = std::move(*target)]() mutable -> net::awaitable<void> {
                         co_await self->StartDispatch(
-                            std::move(sub), Network::TCP, std::move(target), {});
+                            std::move(sub), std::move(target), {}, std::nullopt);
                     },
                     net::detached);
                 break;
             }
             case StreamState::PendingUotRequest: {
-                auto request = DecodeUotRequest(*payload, header->length);
-                if (!request || !request->destination.IsValid()) {
-                    result.error = request ? ErrorCode::PROTOCOL_INVALID_ADDRESS : request.error();
-                    payload->clear();
-                    CancelAll();
-                    co_return result;
-                }
-                payload->DropPrefixBytes(request->consumed);
                 state_it->second = StreamState::Started;
                 auto self = shared_from_this();
                 net::co_spawn(
                     io_context_.get_executor(),
                     [self,
                      sub,
-                     target = std::move(request->destination),
                      initial = std::move(*payload)]() mutable -> net::awaitable<void> {
                         co_await self->StartDispatch(
-                            std::move(sub), Network::UDP, std::move(target), std::move(initial));
+                            std::move(sub), {}, std::move(initial), proxy::uot::Version::V2);
                     },
                     net::detached);
                 break;

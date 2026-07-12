@@ -377,6 +377,9 @@ set(CNODE_SOURCES
     src/proxy/trojan/inbound/trojan_inbound.cpp
     src/proxy/trojan/outbound/trojan_outbound.cpp
 
+    # Proxy - UDP over TCP
+    src/proxy/uot/uot.cpp
+
     # Proxy - Shadowsocks
     src/proxy/shadowsocks/client.cpp
     src/proxy/shadowsocks/server.cpp
@@ -551,6 +554,31 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
+
+    add_executable(cnode_uot_ss2022_test
+        tests/uot_ss2022_test.cpp
+        src/proxy/uot/uot.cpp
+        src/proxy/shadowsocks/shadowsocks_protocol.cpp
+    )
+    target_include_directories(cnode_uot_ss2022_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/uot
+        ${blake3_SOURCE_DIR}/c
+    )
+    target_link_libraries(cnode_uot_ss2022_test PRIVATE
+        asio::asio
+        Threads::Threads
+        crypto
+        cnode_blake3
+    )
+    if(WIN32)
+        target_link_libraries(cnode_uot_ss2022_test PRIVATE ws2_32)
+    endif()
+    target_compile_options(cnode_uot_ss2022_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(NAME cnode_uot_ss2022_test COMMAND cnode_uot_ss2022_test)
 endif()
 
 # ============================================================================

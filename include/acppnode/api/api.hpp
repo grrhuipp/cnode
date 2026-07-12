@@ -60,6 +60,7 @@ struct NodeInfo {
     std::string TLSType;
     bool EnableVless = false;
     std::string CypherMethod = std::string(constants::protocol::kAes256Gcm);
+    std::string ShadowsocksServerKey;
     std::string ServiceName;
 
     // cnode local runtime extensions that are normalized from panel/config cold path.

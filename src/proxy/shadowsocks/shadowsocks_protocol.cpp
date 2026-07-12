@@ -5,7 +5,6 @@
 #include <blake3.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
-#include <openssl/sha.h>
 
 #include <algorithm>
 #include <cctype>
@@ -161,18 +160,31 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
         --plain_len;
         encoded.pop_back();
     }
-    if (plain_len < key_size) {
+    if (plain_len != key_size) {
+        return key;
+    }
+    key.assign(std::span<const uint8_t>(decoded.data(), plain_len));
+    return key;
+}
+
+KeyBytes Build2022UserKeyFromUuid(
+    std::string_view uuid,
+    const SsCipherInfo& info) {
+    KeyBytes key;
+    if (!Is2022Cipher(info) ||
+        info.key_size == 0 ||
+        info.key_size > KeyBytes::kMaxSize ||
+        uuid.size() < info.key_size) {
         return key;
     }
 
-    if (plain_len == key_size) {
-        key.assign(std::span<const uint8_t>(decoded.data(), plain_len));
-        return key;
-    }
-
-    std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
-    SHA256(decoded.data(), plain_len, digest.data());
-    key.assign(std::span<const uint8_t>(digest.data(), key_size));
+    // V2Board publishes the raw UUID to node backends, while subscriptions use
+    // base64(substr(uuid, 0, key_size)). The decoded SS2022 PSK is therefore
+    // exactly the first key_size UUID bytes; build it here in the protocol-owned
+    // credential cold path instead of leaking SS key construction into panel code.
+    key.assign(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(uuid.data()),
+        info.key_size));
     return key;
 }
 

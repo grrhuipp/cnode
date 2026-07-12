@@ -1,6 +1,7 @@
 #include "acppnode/proxy/shadowsocks/outbound/ss_outbound.hpp"
 #include "../client.hpp"
 #include "../ss_udp.hpp"
+#include "../../uot/uot.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
@@ -510,7 +511,10 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    if (ctx.content.network == Network::UDP) {
+    const bool use_uot =
+        ctx.content.network == Network::UDP && config_.uot_version != 0;
+
+    if (ctx.content.network == Network::UDP && !use_uot) {
         if (!udp_session_manager_) {
             LOG_CONN_FAIL_CTX(ctx, "[SsOutbound] UDP session manager not available");
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
@@ -578,7 +582,13 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         co_return result;
     }
 
-    const auto& target = ctx.outbound.target;
+    const TargetAddress protocol_target = use_uot
+        ? TargetAddress(
+            config_.uot_version == static_cast<uint8_t>(proxy::uot::Version::V1)
+                ? proxy::uot::kV1MagicAddress
+                : proxy::uot::kMagicAddress,
+            0)
+        : ctx.outbound.target;
 
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_service_,
@@ -613,7 +623,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     auto request_writer_result = co_await ss::WriteTCPRequest(
-        target, cipher_info_, master_key_, psk_chain_, *stream);
+        protocol_target, cipher_info_, master_key_, psk_chain_, *stream);
     if (!request_writer_result) {
         stream->Cancel();
         co_return std::unexpected(outbound_protocol_deadline.Expired()
@@ -634,34 +644,56 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         master_key_,
         request_session.request_salt,
         *stream);
-    if (buf::HasData(first_payload)) {
-        if (inbound.control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, first_payload, relay_config);
+
+    if (use_uot &&
+        config_.uot_version != static_cast<uint8_t>(proxy::uot::Version::V1)) {
+        auto request = proxy::uot::EncodeRequest(false, ctx.outbound.target);
+        if (!request) {
+            target_endpoint.Cancel();
+            co_return std::unexpected(request.error());
         }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, first_payload, relay_config);
+        const std::array<net::const_buffer, 1> request_buffers{
+            net::buffer(request->span())};
+        co_await target_endpoint.WriteBuffers(request_buffers);
     }
-    if (!initial_payload.empty()) {
-        if (inbound.control) {
+
+    auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
+        if (buf::HasData(first_payload)) {
+            if (inbound.control) {
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                    endpoint, ctx, stats, first_payload, relay_config);
+            }
             co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, initial_payload, relay_config);
+                io_context, *inbound.reader, *inbound.writer, endpoint,
+                ctx, stats, first_payload, relay_config);
         }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, initial_payload, relay_config);
-    }
-    if (inbound.control) {
+        if (!initial_payload.empty()) {
+            if (inbound.control) {
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                    endpoint, ctx, stats, initial_payload, relay_config);
+            }
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer, endpoint,
+                ctx, stats, initial_payload, relay_config);
+        }
+        if (inbound.control) {
+            co_return co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                endpoint, ctx, stats, relay_config);
+        }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *inbound.control,
-            target_endpoint, ctx, stats, relay_config);
+            io_context, *inbound.reader, *inbound.writer,
+            endpoint, ctx, stats, relay_config);
+    };
+
+    if (use_uot) {
+        proxy::uot::FramedEndpoint uot_endpoint(
+            target_endpoint, false, ctx.outbound.target);
+        co_return co_await relay_endpoint(uot_endpoint);
     }
-    co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
-        target_endpoint, ctx, stats, relay_config);
+    co_return co_await relay_endpoint(target_endpoint);
 }
 
 proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
@@ -740,6 +772,69 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return fallback;
         };
+        auto json_uot_version = [](const acpp::json::object& obj) -> uint8_t {
+            const acpp::json::value* value = obj.if_contains("udp_over_tcp");
+            if (!value) {
+                value = obj.if_contains("uot");
+            }
+            if (!value) {
+                return 0;
+            }
+            if (value->is_bool()) {
+                if (!value->as_bool()) {
+                    return 0;
+                }
+                const acpp::json::value* explicit_version =
+                    obj.if_contains("uotVersion");
+                if (!explicit_version) {
+                    explicit_version = obj.if_contains("uot_version");
+                }
+                if (explicit_version && explicit_version->is_int64()) {
+                    const auto parsed = explicit_version->as_int64();
+                    if (parsed == 1 || parsed == 2) {
+                        return static_cast<uint8_t>(parsed);
+                    }
+                }
+                if (explicit_version && explicit_version->is_uint64()) {
+                    const auto parsed = explicit_version->as_uint64();
+                    if (parsed == 1 || parsed == 2) {
+                        return static_cast<uint8_t>(parsed);
+                    }
+                }
+                return static_cast<uint8_t>(acpp::proxy::uot::Version::V2);
+            }
+            if (value->is_int64() || value->is_uint64()) {
+                const uint64_t version = value->is_uint64()
+                    ? value->as_uint64()
+                    : static_cast<uint64_t>(std::max<int64_t>(0, value->as_int64()));
+                return version == 1 || version == 2
+                    ? static_cast<uint8_t>(version)
+                    : 0;
+            }
+            if (!value->is_object()) {
+                return 0;
+            }
+            const auto& settings = value->as_object();
+            if (const auto* enabled = settings.if_contains("enabled");
+                enabled && enabled->is_bool() && !enabled->as_bool()) {
+                return 0;
+            }
+            if (const auto* version = settings.if_contains("version"); version) {
+                if (version->is_int64()) {
+                    const auto parsed = version->as_int64();
+                    if (parsed == 1 || parsed == 2) {
+                        return static_cast<uint8_t>(parsed);
+                    }
+                }
+                if (version->is_uint64()) {
+                    const auto parsed = version->as_uint64();
+                    if (parsed == 1 || parsed == 2) {
+                        return static_cast<uint8_t>(parsed);
+                    }
+                }
+            }
+            return static_cast<uint8_t>(acpp::proxy::uot::Version::V2);
+        };
         auto read_ss_server = [&](const acpp::json::object& obj,
                                   acpp::SsOutboundConfig& config) {
             config.address = json_string(obj, "address");
@@ -755,6 +850,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (const auto method = json_string(obj, "method"); !method.empty()) {
                 config.method = method;
             }
+            config.uot_version = json_uot_version(obj);
         };
 
         acpp::SsOutboundConfig ss_config;

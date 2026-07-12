@@ -1,6 +1,7 @@
 #include "acppnode/proxy/anytls/outbound/anytls_outbound.hpp"
 
 #include "../anytls_codec.hpp"
+#include "../../uot/uot.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
@@ -891,7 +892,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const bool is_udp = ctx.content.network == Network::UDP;
     const TargetAddress original_target = ctx.outbound.target;
     const TargetAddress stream_target = is_udp
-        ? TargetAddress(kUotMagicAddress, 0)
+        ? TargetAddress(proxy::uot::kMagicAddress, 0)
         : ctx.outbound.target;
     auto target = EncodeSocksAddress(stream_target);
     if (!target) {
@@ -918,7 +919,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     if (is_udp) {
-        auto request = EncodeUotRequest(original_target, true);
+        auto request = proxy::uot::EncodeRequest(true, original_target);
         if (!request) {
             stream.Cancel();
             cleanup_logical_stream();
@@ -928,15 +929,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             open_packet,
             kCmdPSH,
             sid,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(request->data()), request->size()));
+            request->span());
         if (!request_frame) {
             stream.Cancel();
             cleanup_logical_stream();
             co_return std::unexpected(request_frame.error());
         }
     }
-    if (first_payload_size > 0) {
+    if (!is_udp && first_payload_size > 0) {
         for (auto* buffer : first_payload) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
@@ -954,7 +954,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
         first_payload.clear();
     }
-    if (!initial_payload.empty()) {
+    if (!is_udp && !initial_payload.empty()) {
         auto frame = AppendFrameBytesTo(open_packet, kCmdPSH, sid, initial_payload);
         if (!frame) {
             stream.Cancel();
@@ -1076,73 +1076,45 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     RelayResult result;
     auto* inbound_control = inbound.control;
-    if (buf::HasData(first_payload)) {
-        if (inbound_control) {
-            result = co_await DoRelayLinkWithFirstPacket(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                *inbound_control,
-                target_endpoint,
-                ctx,
-                stats,
-                first_payload,
-                relay_config);
-        } else {
-            result = co_await DoRelayLinkWithFirstPacket(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                target_endpoint,
-                ctx,
-                stats,
-                first_payload,
-                relay_config);
+    auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
+        if (buf::HasData(first_payload)) {
+            if (inbound_control) {
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer,
+                    *inbound_control, endpoint, ctx, stats,
+                    first_payload, relay_config);
+            }
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer,
+                endpoint, ctx, stats, first_payload, relay_config);
         }
-    } else if (!initial_payload.empty()) {
-        if (inbound_control) {
-            result = co_await DoRelayLinkWithFirstPacket(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                *inbound_control,
-                target_endpoint,
-                ctx,
-                stats,
-                initial_payload,
-                relay_config);
-        } else {
-            result = co_await DoRelayLinkWithFirstPacket(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                target_endpoint,
-                ctx,
-                stats,
-                initial_payload,
-                relay_config);
+        if (!initial_payload.empty()) {
+            if (inbound_control) {
+                co_return co_await DoRelayLinkWithFirstPacket(
+                    io_context, *inbound.reader, *inbound.writer,
+                    *inbound_control, endpoint, ctx, stats,
+                    initial_payload, relay_config);
+            }
+            co_return co_await DoRelayLinkWithFirstPacket(
+                io_context, *inbound.reader, *inbound.writer,
+                endpoint, ctx, stats, initial_payload, relay_config);
         }
+        if (inbound_control) {
+            co_return co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer,
+                *inbound_control, endpoint, ctx, stats, relay_config);
+        }
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer,
+            endpoint, ctx, stats, relay_config);
+    };
+
+    if (is_udp) {
+        proxy::uot::FramedEndpoint uot_endpoint(
+            target_endpoint, true, original_target);
+        result = co_await relay_endpoint(uot_endpoint);
     } else {
-        if (inbound_control) {
-            result = co_await DoRelayLink(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                *inbound_control,
-                target_endpoint,
-                ctx,
-                stats,
-                relay_config);
-        } else {
-            result = co_await DoRelayLink(
-                io_context,
-                *inbound.reader,
-                *inbound.writer,
-                target_endpoint,
-                ctx,
-                stats,
-                relay_config);
-        }
+        result = co_await relay_endpoint(target_endpoint);
     }
 
     if (!inbound_control) {

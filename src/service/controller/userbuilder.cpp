@@ -29,6 +29,7 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
     req.cipher_method = node_config.CypherMethod.empty()
         ? std::string(constants::protocol::kAes256Gcm)
         : node_config.CypherMethod;
+    req.ss_identity_password = node_config.ShadowsocksServerKey;
 
     std::vector<proxyman::inbound::RuntimeUser> users;
     users.reserve(api_users.size());

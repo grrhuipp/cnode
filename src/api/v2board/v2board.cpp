@@ -897,6 +897,10 @@ APIClient::Impl::GetNodeInfo() {
         if (ciphp && ciphp->is_string()) {
             config.CypherMethod = std::string(ciphp->as_string());
         }
+        auto* ss_server_key = j.if_contains("server_key");
+        if (ss_server_key && ss_server_key->is_string()) {
+            config.ShadowsocksServerKey = std::string(ss_server_key->as_string());
+        }
 
         auto* bcp = j.if_contains("base_config");
         if (bcp && bcp->is_object()) {

@@ -2,6 +2,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "../server.hpp"
 #include "../ss_udp.hpp"
+#include "../../uot/uot.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
@@ -232,6 +233,68 @@ proxy::shadowsocks::inbound::Handler::Process(
         co_return fail(response_writer_result.error());
     }
     auto response_writer = std::move(response_writer_result.value());
+
+    if (const auto uot_version = proxy::uot::VersionFromMagicAddress(
+            ctx.outbound.target)) {
+        buf::MultiBuffer pending =
+            session_result->initial_payload.MoveToMultiBuffer();
+        bool is_connect = false;
+        TargetAddress udp_target;
+
+        if (*uot_version == proxy::uot::Version::V2) {
+            auto request = co_await proxy::uot::ReadRequest(
+                *request_reader, pending);
+            if (!request || !request->destination.IsValid()) {
+                co_return fail(request
+                    ? ErrorCode::PROTOCOL_INVALID_ADDRESS
+                    : request.error());
+            }
+            is_connect = request->is_connect;
+            udp_target = std::move(request->destination);
+        }
+
+        proxy::uot::PacketReader uot_reader(
+            *request_reader, is_connect, udp_target, std::move(pending));
+
+        if (*uot_version == proxy::uot::Version::V1) {
+            try {
+                auto first_packet = co_await uot_reader.ReadMultiBuffer();
+                if (!buf::HasData(first_packet)) {
+                    co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                for (const buf::Buffer* buffer : first_packet) {
+                    if (buffer && buffer->HasUDP()) {
+                        udp_target = buffer->UDP();
+                        break;
+                    }
+                }
+                if (!udp_target.IsValid()) {
+                    co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+                }
+                uot_reader.SetInitialDecoded(std::move(first_packet));
+            } catch (const IoSystemError& e) {
+                co_return fail(MapAsioError(e.code()));
+            }
+        }
+
+        proxy::uot::PacketWriter uot_writer(
+            *response_writer, is_connect, udp_target);
+        ctx.outbound.original_target = udp_target;
+        ctx.outbound.target = udp_target;
+        ctx.outbound.route_target = udp_target;
+        ctx.content.network = Network::UDP;
+
+        co_return co_await dispatcher.Dispatch(
+            io_context,
+            receiver,
+            std::move(stream),
+            transport::Link{&uot_reader, &uot_writer},
+            InitialPayload{},
+            ctx,
+            *stats_,
+            timeouts,
+            pressure_idle_timeout);
+    }
 
     co_return co_await dispatcher.Dispatch(
         io_context,
@@ -555,6 +618,18 @@ const bool kSsInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(runtime_users.size());
             acpp::proxyman::inbound::PreparedKeyBytes identity_key;
+            const bool has_uuid_backed_2022_users =
+                acpp::ss::Is2022AesCipher(cipher_info->type) &&
+                std::ranges::any_of(
+                    runtime_users,
+                    [](const auto& user) {
+                        return !user.uuid.empty() && user.password == user.uuid;
+                    });
+            if (has_uuid_backed_2022_users && req.ss_identity_password.empty()) {
+                LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key",
+                         req.tag);
+                return std::nullopt;
+            }
             if (acpp::ss::Is2022Cipher(*cipher_info) &&
                 !req.ss_identity_password.empty()) {
                 identity_key = ToPreparedKey(
@@ -578,8 +653,15 @@ const bool kSsInboundRegistered = [] {
                 info.cipher_type = ToPreparedCipher(cipher_info->type);
                 info.key_size = cipher_info->key_size;
                 info.salt_size = cipher_info->salt_size;
-                info.derived_key = ToPreparedKey(acpp::ss::BuildMasterKey(
-                    runtime_user.password, *cipher_info));
+                const bool uuid_backed_2022_key =
+                    acpp::ss::Is2022Cipher(*cipher_info) &&
+                    !runtime_user.uuid.empty() &&
+                    runtime_user.password == runtime_user.uuid;
+                info.derived_key = ToPreparedKey(uuid_backed_2022_key
+                    ? acpp::ss::Build2022UserKeyFromUuid(
+                        runtime_user.uuid, *cipher_info)
+                    : acpp::ss::BuildMasterKey(
+                        runtime_user.password, *cipher_info));
                 info.identity_key = identity_key;
                 if (info.derived_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",

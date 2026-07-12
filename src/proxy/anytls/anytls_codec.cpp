@@ -1,4 +1,5 @@
 #include "anytls_codec.hpp"
+#include "../uot/uot.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -390,7 +391,7 @@ std::string DefaultClientSettings() {
 }
 
 std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target) {
-    if (!target.IsValid() && !IsUotMagicAddress(target)) {
+    if (!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target)) {
         return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
@@ -421,76 +422,6 @@ std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& ta
     WriteU16BE(port, target.port);
     out.append(reinterpret_cast<const char*>(port), sizeof(port));
     return out;
-}
-
-bool IsUotMagicAddress(const TargetAddress& target) noexcept {
-    return target.IsDomain() && target.host.find(kUotMagicAddress) != std::string::npos;
-}
-
-std::expected<std::string, ErrorCode> EncodeUotRequest(
-    const TargetAddress& target,
-    bool is_connect) {
-    auto encoded_target = EncodeSocksAddress(target);
-    if (!encoded_target) {
-        return std::unexpected(encoded_target.error());
-    }
-    std::string out;
-    out.reserve(1 + encoded_target->size());
-    out.push_back(is_connect ? '\x01' : '\x00');
-    out.append(*encoded_target);
-    return out;
-}
-
-std::expected<UotRequest, ErrorCode> DecodeUotRequest(std::span<const uint8_t> data) {
-    if (data.size() < 1 + 1 + 2) {
-        return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    UotRequest request;
-    request.is_connect = data[0] != 0;
-    size_t offset = 1;
-    const uint8_t atype = data[offset++];
-    if (atype == 0x01) {
-        if (data.size() < offset + 4 + 2) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        net::ip::address_v4::bytes_type bytes{};
-        std::copy_n(data.data() + offset, bytes.size(), bytes.begin());
-        offset += bytes.size();
-        const uint16_t port = ReadU16BE(data.data() + offset);
-        offset += 2;
-        request.destination = TargetAddress(net::ip::make_address_v4(bytes), port);
-    } else if (atype == 0x04) {
-        if (data.size() < offset + 16 + 2) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        net::ip::address_v6::bytes_type bytes{};
-        std::copy_n(data.data() + offset, bytes.size(), bytes.begin());
-        offset += bytes.size();
-        const uint16_t port = ReadU16BE(data.data() + offset);
-        offset += 2;
-        request.destination = TargetAddress(net::ip::make_address_v6(bytes), port);
-    } else if (atype == 0x03) {
-        if (data.size() < offset + 1) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        const uint8_t host_len = data[offset++];
-        if (host_len == 0 || data.size() < offset + host_len + 2) {
-            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        std::string_view host(
-            reinterpret_cast<const char*>(data.data() + offset),
-            host_len);
-        offset += host_len;
-        const uint16_t port = ReadU16BE(data.data() + offset);
-        offset += 2;
-        request.destination = TargetAddress(host, port);
-    } else {
-        return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    }
-
-    request.consumed = offset;
-    return request;
 }
 
 std::expected<void, ErrorCode> AppendFrameBytesTo(

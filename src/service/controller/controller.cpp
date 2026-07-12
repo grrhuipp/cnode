@@ -297,7 +297,8 @@ bool Controller::Impl::ConfigChanged(const api::NodeInfo& a, const api::NodeInfo
         || a.TransportProtocol != b.TransportProtocol || a.Path != b.Path
         || a.Host != b.Host || a.EnableTLS != b.EnableTLS
         || a.TLSServerName != b.TLSServerName || a.TLSCert != b.TLSCert
-        || a.TLSKey != b.TLSKey || a.CypherMethod != b.CypherMethod;
+        || a.TLSKey != b.TLSKey || a.CypherMethod != b.CypherMethod
+        || a.ShadowsocksServerKey != b.ShadowsocksServerKey;
 }
 
 }  // namespace acpp
