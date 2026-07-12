@@ -42,10 +42,16 @@ $checks += Assert-Match `
     "max 8 buffers"
 
 $checks += Assert-Match `
-    "cnode readv cap" `
-    (Join-Path $Root "src\transport\internet\tcp_stream.cpp") `
-    "kMaxReadAllocBuffers\s*=\s*8" `
-    "max 8 buffers"
+    "cnode normal readv cap" `
+    (Join-Path $Root "src\transport\internet\tcp_read_policy.hpp") `
+    "kNormalReadBufferCap\s*=\s*4" `
+    "normal max 4 buffers"
+
+$checks += Assert-Match `
+    "cnode pressure readv cap" `
+    (Join-Path $Root "src\transport\internet\tcp_read_policy.hpp") `
+    "kPressureReadBufferCap\s*=\s*2" `
+    "pressure max 2 buffers"
 
 $checks += Assert-Match `
     "xray auth read batch" `
