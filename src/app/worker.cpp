@@ -14,6 +14,7 @@
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
+#include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
 #include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
@@ -32,8 +33,6 @@
 
 #ifndef _WIN32
 #include <sys/socket.h>
-#else
-#include <winsock2.h>
 #endif
 #include <algorithm>
 #include <chrono>
@@ -41,7 +40,6 @@
 #include <format>
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include <span>
 
 namespace acpp {
@@ -86,15 +84,6 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         tcp::socket socket,
         tcp::endpoint remote_ep,
         proxyman::inbound::Handler* inbound_handler);
-
-#ifdef _WIN32
-    void ProcessAdoptedNativeConnection(
-        Worker& worker,
-        tcp::socket::native_handle_type native,
-        tcp::endpoint remote_ep,
-        tcp protocol,
-        std::string tag);
-#endif
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
@@ -147,6 +136,7 @@ struct Worker::RuntimeState {
         , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
         , router(std::make_unique<app::router::Router>())
         , rule_manager(std::make_unique<rule::Manager>())
+        , mux_session_handler(std::make_unique<app::MuxSessionHandler>())
         , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
 
     [[nodiscard]] std::shared_ptr<const WorkerRuntimeConfig> Snapshot() const {
@@ -178,6 +168,7 @@ struct Worker::RuntimeState {
     std::unique_ptr<proxyman::outbound::Manager> outbound_manager;
     std::unique_ptr<app::router::Router> router;
     std::unique_ptr<rule::Manager> rule_manager;
+    std::unique_ptr<app::MuxSessionHandler> mux_session_handler;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
 };
 
@@ -185,73 +176,6 @@ namespace {
 
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
-
-#ifdef _WIN32
-using WindowsWorkerSnapshot = std::vector<Worker*>;
-
-std::mutex& WindowsWorkerRegistryMutex() {
-    static std::mutex mu;
-    return mu;
-}
-
-std::atomic<std::shared_ptr<const WindowsWorkerSnapshot>>& WindowsWorkerRegistrySnapshot() {
-    static std::atomic<std::shared_ptr<const WindowsWorkerSnapshot>> workers{
-        std::make_shared<const WindowsWorkerSnapshot>()};
-    return workers;
-}
-
-std::atomic<uint64_t>& WindowsAcceptRoundRobin() {
-    static std::atomic<uint64_t> next{0};
-    return next;
-}
-
-void RegisterWindowsWorker(Worker& worker) {
-    std::lock_guard lock(WindowsWorkerRegistryMutex());
-    auto current = WindowsWorkerRegistrySnapshot().load(std::memory_order_acquire);
-    WindowsWorkerSnapshot next = current ? *current : WindowsWorkerSnapshot{};
-    if (std::ranges::find(next, &worker) == next.end()) {
-        next.push_back(&worker);
-        WindowsWorkerRegistrySnapshot().store(
-            std::make_shared<const WindowsWorkerSnapshot>(std::move(next)),
-            std::memory_order_release);
-    }
-}
-
-Worker* PickWindowsAcceptedConnectionWorker(Worker& fallback) {
-    auto workers = WindowsWorkerRegistrySnapshot().load(std::memory_order_acquire);
-    if (!workers || workers->empty()) {
-        return &fallback;
-    }
-    const uint64_t index = WindowsAcceptRoundRobin().fetch_add(1, std::memory_order_relaxed);
-    return (*workers)[static_cast<size_t>(index % workers->size())];
-}
-
-void CloseNativeSocket(tcp::socket::native_handle_type native) noexcept {
-    ::closesocket(native);
-}
-
-bool TransferAcceptedSocketToWorker(
-    Worker& source,
-    Worker& target,
-    tcp::socket socket,
-    tcp::endpoint remote_ep,
-    std::string tag) {
-    if (&source == &target) {
-        return false;
-    }
-
-    IoErrorCode ec;
-    tcp::endpoint local_ep = socket.local_endpoint(ec);
-    tcp protocol = ec ? tcp::v4() : local_ep.protocol();
-    auto native = socket.release(ec);
-    if (ec) {
-        return false;
-    }
-
-    target.AdoptAcceptedNativeTcpAsync(native, remote_ep, protocol, std::move(tag));
-    return true;
-}
-#endif
 
 std::vector<std::string> BuildListenCandidates(std::string_view listen) {
     if (listen.empty() || listen == constants::network::kDualStackAuto) {
@@ -318,13 +242,10 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
                geo::GeoManager* geo_manager)
     : id_(id)
     , runtime_(std::make_unique<RuntimeState>(io_context, runtime_config, stats, geo_manager)) {
-#ifdef _WIN32
-    RegisterWindowsWorker(*this);
-#endif
-
     runtime_->dispatcher->BindRuleManager(*runtime_->rule_manager);
     runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
     runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
+    runtime_->dispatcher->BindMuxSessionHandler(*runtime_->mux_session_handler);
     runtime_->udp_session_manager->StartCleanup();
     const auto runtime_snapshot = runtime_->Snapshot();
     LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
@@ -395,6 +316,15 @@ void Worker::RuntimeState::InitRouter(
 // ============================================================================
 
 void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
+#ifdef _WIN32
+    // Windows has no SO_REUSEPORT-equivalent listener distribution.  Keep the
+    // accepted socket on its owning Worker instead of exporting Worker pointers
+    // and native handles across io_context boundaries.
+    if (worker.Id() != 0) {
+        return;
+    }
+#endif
+
     const bool replacing = std::ranges::any_of(
         tcp_listener_tags,
         [&](const auto& item) { return item.second == binding.tag; });
@@ -473,8 +403,7 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         candidate_acceptor->set_option(net::socket_base::reuse_address(true), ec);
 
 #ifndef _WIN32
-        // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡
-        // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
+        // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡。
         int optval = 1;
         if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
@@ -732,16 +661,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
         IoErrorCode ep_ec;
         remote_ep = socket.remote_endpoint(ep_ec);
 
-#ifdef _WIN32
-        if (Worker* target = PickWindowsAcceptedConnectionWorker(worker);
-            target && target != &worker) {
-            if (TransferAcceptedSocketToWorker(
-                    worker, *target, std::move(socket), remote_ep, tag)) {
-                continue;
-            }
-        }
-#endif
-
         auto* inbound_handler = slot ? slot->handler : nullptr;
         if (!inbound_handler) {
             LOG_ERROR("Worker[{}]: no inbound handler for tag={}", worker.id_, tag);
@@ -770,53 +689,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                       });
     }
 }
-
-#ifdef _WIN32
-void Worker::ListenerState::ProcessAdoptedNativeConnection(
-    Worker& worker,
-    tcp::socket::native_handle_type native,
-    tcp::endpoint remote_ep,
-    tcp protocol,
-    std::string tag) {
-    tcp::socket socket(worker.runtime_->io_context);
-    IoErrorCode ec;
-    socket.assign(protocol, native, ec);
-    if (ec) {
-        CloseNativeSocket(native);
-        LOG_WARN("Worker[{}]: adopted TCP assign failed tag={}: {}",
-                 worker.id_, tag, ec.message());
-        return;
-    }
-
-    auto slot_it = listener_slots.find(tag);
-    auto* inbound_handler =
-        slot_it == listener_slots.end() ? nullptr : slot_it->second.handler;
-    if (!inbound_handler) {
-        LOG_ERROR("Worker[{}]: no inbound handler for adopted tag={}", worker.id_, tag);
-        socket.close();
-        return;
-    }
-
-    ++worker.runtime_->active_connections;
-    net::co_spawn(worker.runtime_->io_context.get_executor(),
-                  ProcessReceivedConnection(worker, std::move(socket), remote_ep, inbound_handler),
-                  [&worker](std::exception_ptr ep) {
-                      if (ep) {
-                          try {
-                              std::rethrow_exception(ep);
-                          } catch (const std::exception& e) {
-                              LOG_ERROR("Worker[{}]: adopted TCP coroutine failed: {}",
-                                        worker.id_, e.what());
-                          } catch (...) {
-                              LOG_ERROR("Worker[{}]: adopted TCP coroutine failed: unknown",
-                                        worker.id_);
-                          }
-                      }
-                      --worker.runtime_->active_connections;
-                      worker.runtime_->listener_state->DrainRetiredHandlersIfIdle(worker);
-                  });
-}
-#endif
 
 // ============================================================================
 // ProcessReceivedConnection — per-connection 协程
@@ -925,23 +797,6 @@ void Worker::AddListenerAsync(const PortBinding& binding) {
             runtime_->listener_state->StartListening(*this, b);
         });
 }
-
-#ifdef _WIN32
-void Worker::AdoptAcceptedNativeTcpAsync(tcp::socket::native_handle_type native,
-                                         tcp::endpoint remote_ep,
-                                         tcp protocol,
-                                         std::string tag) {
-    net::post(runtime_->io_context,
-        [this,
-         native,
-         remote_ep,
-         protocol,
-         tag = std::move(tag)]() mutable {
-            runtime_->listener_state->ProcessAdoptedNativeConnection(
-                *this, native, remote_ep, protocol, std::move(tag));
-        });
-}
-#endif
 
 void Worker::ShutdownListenersAsync(std::vector<std::string> tags,
                                     std::function<void()> on_done) {
@@ -1235,6 +1090,14 @@ void Worker::ListenerState::StartUdpListening(
     Worker& worker,
     const PortBinding& binding,
     std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
+#ifdef _WIN32
+    // TCP follows the same ownership rule above.  A UDP socket and its client
+    // session table stay on the Worker that bound the socket.
+    if (worker.Id() != 0) {
+        return;
+    }
+#endif
+
     const bool replacing = std::ranges::any_of(
         udp_socket_tags,
         [&](const auto& item) { return item.second == binding.tag; });
@@ -1297,8 +1160,7 @@ void Worker::ListenerState::StartUdpListening(
         candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
 
 #ifndef _WIN32
-        // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡
-        // Windows 上 SO_REUSEADDR 已等效 Linux SO_REUSEPORT
+        // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡。
         int optval = 1;
         if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {

@@ -301,6 +301,7 @@ set(CNODE_SOURCES
 
     # App (Application layer)
     src/app/dispatcher/default_dispatcher.cpp
+    src/app/mux_session_handler.cpp
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/proxyman/inbound/manager.cpp

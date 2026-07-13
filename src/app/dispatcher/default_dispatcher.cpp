@@ -1,6 +1,7 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 
 #include "acppnode/app/session_tracking.hpp"
+#include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/ip_utils.hpp"
@@ -11,7 +12,6 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/app/router/router.hpp"
-#include "acppnode/common/mux/mux_relay.hpp"
 #include "acppnode/sniff/sniffer.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
@@ -122,6 +122,11 @@ void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
     dns_service_ = &dns_service;
 }
 
+void DefaultDispatcher::BindMuxSessionHandler(
+    app::MuxSessionHandler& mux_session_handler) noexcept {
+    mux_session_handler_ = &mux_session_handler;
+}
+
 features::outbound::Handler* DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
@@ -187,22 +192,14 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
 
     if (ctx.content.network == Network::MUX) {
+        if (!mux_session_handler_) {
+            stats.OnError();
+            co_return MakeRelayError(ErrorCode::INTERNAL);
+        }
         LOG_ACCESS(FormatAccessLog(ctx));
 
-        const auto relay_idle_timeout = ResolveRelayIdleTimeout(
-            timeouts, pressure_idle_timeout);
-        if (inbound_endpoint) {
-            inbound_endpoint->SetIdleTimeout(relay_idle_timeout);
-            inbound_endpoint->SetReadTimeout(std::chrono::seconds(0));
-            inbound_endpoint->SetWriteTimeout(
-                std::min(timeouts.WriteTimeout(), relay_idle_timeout));
-        }
-
-        UDPRelayConfig mux_cfg;
-        mux_cfg.speed_limit = ctx.content.speed_limit;
-
         ActiveSessionScope relay_scope{ctx, session_tracking_};
-        auto relay_result = co_await mux::DoMuxRelay(
+        auto relay_result = co_await mux_session_handler_->Process(
             io_context,
             transport::Link{inbound_reader, inbound_writer, inbound_control},
             inbound_control,
@@ -211,8 +208,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             ctx,
             stats,
             timeouts,
-            pressure_idle_timeout,
-            mux_cfg);
+            pressure_idle_timeout);
         if (relay_result.error != ErrorCode::OK) {
             LOG_CONN_DEBUG(ctx, "[Session] Mux relay end: {} up={}B down={}B target={}",
                            ErrorCodeToString(relay_result.error),
