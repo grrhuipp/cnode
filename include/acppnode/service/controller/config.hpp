@@ -29,9 +29,9 @@ struct PanelConfig {
     std::string DNSType;
     ProxyProtocolMode ProxyProtocol = ProxyProtocolMode::Auto; // off / auto / on
 
-    // TLS 配置
-    // false: 强制关闭 TLS（由外部 nginx/caddy 处理）
-    // true:  程序处理 TLS，并以本地配置决定是否加载证书/自签
+    // TLS 能力配置。
+    // true 表示本实例可以为面板中 tls=true 的节点终止 TLS；并不强制所有节点启用 TLS。
+    // 实际启用条件为 TLSEnable && 节点 tls=true。
     bool TLSEnable = false;
     std::string TLSCert;                    // 证书文件路径（空则自签名）
     std::string TLSKey;                     // 私钥文件路径（空则自签名）

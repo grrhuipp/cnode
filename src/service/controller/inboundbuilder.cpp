@@ -1,4 +1,5 @@
 #include "inboundbuilder.hpp"
+#include "tls_policy.hpp"
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
@@ -29,10 +30,11 @@ InboundBuild InboundBuilder(const std::string& panel_name,
 
     std::string cert_file = node_config.TLSCert;
     std::string key_file = node_config.TLSKey;
-    bool tls_enable = node_config.EnableTLS;
+    // TLSEnable only declares that this cnode instance can terminate TLS.
+    // The panel node still decides whether this particular inbound uses TLS.
+    const bool tls_enable = ShouldEnableInboundTls(panel_config, node_config);
 
     if (panel_config) {
-        tls_enable = panel_config->TLSEnable;
         if (tls_enable) {
             if (!panel_config->TLSCert.empty()) cert_file = panel_config->TLSCert;
             if (!panel_config->TLSKey.empty()) key_file = panel_config->TLSKey;
