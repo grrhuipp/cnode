@@ -81,18 +81,21 @@ UdpHandlerBuildResult Manager::NewUdpHandler(
         protocol, impl_->Deps(protocol), std::move(limiter), req);
 }
 
-Handler* Manager::AddHandler(std::unique_ptr<Handler> handler) {
+Handler* Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
     if (!handler) {
         return nullptr;
     }
 
     std::string tag(handler->Tag());
-    auto [it, inserted] = impl_->handlers.try_emplace(
-        std::move(tag), std::move(handler));
-    if (!inserted) {
-        return nullptr;
+    auto it = impl_->handlers.find(tag);
+    if (it == impl_->handlers.end()) {
+        auto [inserted_it, inserted] = impl_->handlers.try_emplace(
+            std::move(tag), std::move(handler));
+        return inserted ? inserted_it->second.get() : nullptr;
     }
 
+    impl_->retired_handlers.push_back(std::move(it->second));
+    it->second = std::move(handler);
     return it->second.get();
 }
 

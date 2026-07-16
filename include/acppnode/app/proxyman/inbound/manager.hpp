@@ -45,9 +45,9 @@ public:
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
-    // AddHandler 接管 handler 所有权。若 tag 已存在，返回 nullptr。
-    // mutation 会分配 tag/map/retired storage，分配失败必须向上传播。
-    [[nodiscard]] Handler* AddHandler(std::unique_ptr<Handler> handler);
+    // ReplaceHandler 原子替换同 tag handler；旧对象进入 retired 列表，
+    // 在分配失败时保持原 handler 不变。
+    [[nodiscard]] Handler* ReplaceHandler(std::unique_ptr<Handler> handler);
 
     // RemoveHandler 关闭 handler，并把它移入 retired 列表；retired handler
     // 的生命周期持续到 DrainRetiredHandlers，覆盖在途连接的 receiver 借用。

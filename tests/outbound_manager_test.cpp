@@ -71,7 +71,7 @@ static_assert(!noexcept(std::declval<OutboundManager&>().RemoveHandler(
     std::declval<std::string_view>())));
 
 using InboundManager = acpp::proxyman::inbound::Manager;
-static_assert(!noexcept(std::declval<InboundManager&>().AddHandler(
+static_assert(!noexcept(std::declval<InboundManager&>().ReplaceHandler(
     std::declval<std::unique_ptr<acpp::proxyman::inbound::Handler>>())));
 static_assert(!noexcept(std::declval<InboundManager&>().RemoveHandler(
     std::declval<std::string_view>())));

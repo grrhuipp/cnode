@@ -812,8 +812,6 @@ bool Worker::RegisterInboundOnWorkerThread(
         return false;
     }
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-    runtime_->listener_state->RetireInboundHandler(*this, receiver.inbound_tag);
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
     auto inbound_handler =
         std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(handler));
     auto& settings = inbound_handler->ReceiverSettings();
@@ -823,12 +821,27 @@ bool Worker::RegisterInboundOnWorkerThread(
                  id_, settings.inbound_tag, settings.route_policy.outbound_tag);
     }
     const std::string key(settings.inbound_tag);
-    auto* registered = runtime_->inbound_manager->AddHandler(std::move(inbound_handler));
+    auto [slot_it, slot_inserted] =
+        runtime_->listener_state->listener_slots.try_emplace(key);
+    proxyman::inbound::Handler* registered = nullptr;
+    try {
+        registered = runtime_->inbound_manager->ReplaceHandler(
+            std::move(inbound_handler));
+    } catch (...) {
+        if (slot_inserted) {
+            runtime_->listener_state->listener_slots.erase(slot_it);
+        }
+        throw;
+    }
     if (!registered) {
-        LOG_WARN("Worker[{}]: failed to add inbound handler tag={}", id_, key);
+        if (slot_inserted) {
+            runtime_->listener_state->listener_slots.erase(slot_it);
+        }
+        LOG_WARN("Worker[{}]: failed to install inbound handler tag={}", id_, key);
         return false;
     }
-    runtime_->listener_state->listener_slots[key].handler = registered;
+    slot_it->second.handler = registered;
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
     return true;
 }
 
