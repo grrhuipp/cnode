@@ -1063,6 +1063,25 @@ StreamSettings StreamSettings::FromJson(
         }
         cfg.tls.min_version = TlsVersion::V1_3;
         cfg.tls.max_version = TlsVersion::V1_3;
+        if (role == StreamEndpointRole::Outbound) {
+            if (!cfg.reality.public_key) {
+                throw std::invalid_argument(
+                    "outbound REALITY requires publicKey");
+            }
+        } else {
+            if (!cfg.reality.private_key) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires privateKey");
+            }
+            if (cfg.reality.server_names.empty()) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires at least one serverName");
+            }
+            if (cfg.reality.short_ids.empty()) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires at least one shortId");
+            }
+        }
     }
     if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
         cfg.tls.server_name = cfg.reality.server_name;

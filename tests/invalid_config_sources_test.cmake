@@ -473,6 +473,18 @@ expect_rejected(invalid_reality_public_key "{}" "outbounds.json"
 expect_rejected(invalid_reality_private_key "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-private-key","protocol":"vless","listen":"127.0.0.1","port":12103,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"not-base64url","shortIds":["0123456789abcdef"]}}}]]=]
     "REALITY privateKey is invalid")
+expect_rejected(missing_reality_outbound_public_key "{}" "outbounds.json"
+    [=[[{"tag":"missing-reality-public-key","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","shortId":"0123456789abcdef"}}}]]=]
+    "outbound REALITY requires publicKey")
+expect_rejected(missing_reality_inbound_private_key "{}" "inbounds.json"
+    [=[[{"tag":"missing-reality-private-key","protocol":"vless","listen":"127.0.0.1","port":12104,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"shortIds":["0123456789abcdef"]}}}]]=]
+    "inbound REALITY requires privateKey")
+expect_rejected(missing_reality_inbound_server_name "{}" "inbounds.json"
+    [=[[{"tag":"missing-reality-server-name","protocol":"vless","listen":"127.0.0.1","port":12105,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "inbound REALITY requires at least one serverName")
+expect_rejected(missing_reality_inbound_short_id "{}" "inbounds.json"
+    [=[[{"tag":"missing-reality-short-id","protocol":"vless","listen":"127.0.0.1","port":12106,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake"}}}]]=]
+    "inbound REALITY requires at least one shortId")
 expect_rejected(unsupported_reality_target_fallback "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "target fallback")
