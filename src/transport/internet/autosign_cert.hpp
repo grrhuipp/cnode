@@ -7,9 +7,12 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace acpp::transport::internet {
+
+[[nodiscard]] std::string NormalizeAutoSignCertificateName(std::string_view name);
 
 struct AutoSignMaterial {
     X509* cert = nullptr;

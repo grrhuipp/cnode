@@ -133,27 +133,19 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
     return false;
 }
 
-// 从 SNI 提取泛域名：www.example.com → *.example.com
-// 裸域名 example.com → *.example.com
-// 单标签 localhost → localhost（不做通配）
-std::string ToWildcard(std::string_view sni) {
-    auto dot = sni.find('.');
-    if (dot == std::string_view::npos) return std::string(sni);  // localhost 等
-    // *.example.com
-    return "*" + std::string(sni.substr(dot));
-}
-
 std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     if (config.server_name.empty()) {
         return "localhost";
     }
-    return ToWildcard(config.server_name);
+    return transport::internet::NormalizeAutoSignCertificateName(config.server_name);
 }
 
 int AutoSignCertCallback(SSL* ssl, void* arg) {
     auto* default_name = static_cast<std::string*>(arg);
     const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    std::string wildcard = sni ? ToWildcard(sni) : *default_name;
+    std::string wildcard = sni
+        ? transport::internet::NormalizeAutoSignCertificateName(sni)
+        : *default_name;
 
     auto& state = transport::internet::GetAutoSignState();
     auto material = state.GetOrCreate(wildcard);

@@ -2,6 +2,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <chrono>
 #include <cstdio>
@@ -41,9 +42,40 @@ bool Require(bool condition, const char* message) {
 
 int main() {
     using acpp::transport::internet::AutoSignState;
+    using acpp::transport::internet::NormalizeAutoSignCertificateName;
+
+    if (!Require(NormalizeAutoSignCertificateName("www.example.com") ==
+                     "*.example.com",
+                 "subdomain must normalize to its registrable wildcard")) return 1;
+    if (!Require(NormalizeAutoSignCertificateName("example.com") ==
+                     "*.example.com",
+                 "apex domain must not normalize to a public-suffix wildcard")) return 1;
+    if (!Require(NormalizeAutoSignCertificateName("localhost") == "localhost",
+                 "single-label host must remain exact")) return 1;
+    if (!Require(NormalizeAutoSignCertificateName("*.example.com") ==
+                     "*.example.com",
+                 "existing wildcard must remain unchanged")) return 1;
+    if (!Require(NormalizeAutoSignCertificateName("192.0.2.1") == "192.0.2.1",
+                 "IPv4 literal must remain exact")) return 1;
+    if (!Require(NormalizeAutoSignCertificateName("2001:db8::1") == "2001:db8::1",
+                 "IPv6 literal must remain exact")) return 1;
 
     AutoSignState state;
     const auto t0 = AutoSignState::Clock::time_point{};
+
+    auto apex = state.GetOrCreate(NormalizeAutoSignCertificateName("example.com"), t0);
+    if (!Require(apex.cert != nullptr, "apex certificate must be generated")) return 1;
+    if (!Require(X509_check_host(apex.cert, "example.com", 0,
+                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
+                 "apex certificate SAN must cover the apex domain")) return 1;
+    if (!Require(X509_check_host(apex.cert, "www.example.com", 0,
+                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 1,
+                 "apex certificate SAN must cover one-label subdomains")) return 1;
+
+    auto ip = state.GetOrCreate(NormalizeAutoSignCertificateName("192.0.2.1"), t0);
+    if (!Require(ip.cert != nullptr, "IP certificate must be generated")) return 1;
+    if (!Require(X509_check_ip_asc(ip.cert, "192.0.2.1", 0) == 1,
+                 "IP certificate SAN must contain the exact IP address")) return 1;
 
     auto first = state.GetOrCreate("*.example.com", t0);
     if (!Require(first.cert != nullptr, "first cert must be generated")) return 1;
