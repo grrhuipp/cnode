@@ -1209,6 +1209,7 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_inbound_listen_test
         tests/inbound_listen_test.cpp
+        src/app/proxyman/inbound/tcp_worker.cpp
         src/transport/internet/inbound_listen.cpp
     )
     target_include_directories(cnode_inbound_listen_test PRIVATE

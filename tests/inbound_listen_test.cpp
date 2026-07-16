@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/inbound_listen.hpp"
+#include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
 
 #include <array>
 #include <string_view>
@@ -35,6 +36,22 @@ int main() {
          std::array<std::string_view, 4>{"not-an-ip", "127.0.0.1junk", "AUTO", " auto"}) {
         if (acpp::InboundListen::Parse(value)) return 5;
     }
+
+    acpp::net::io_context io_context;
+    acpp::proxyman::inbound::TcpWorker worker("test-inbound");
+    auto* acceptor = worker.CreateAcceptor("stable-listener", io_context);
+    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor) return 6;
+
+    acpp::IoErrorCode ec;
+    acceptor->open(acpp::tcp::v4(), ec);
+    if (ec || !acceptor->is_open()) return 7;
+
+    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 8;
+    if (worker.FindAcceptor("stable-listener") != acceptor ||
+        !acceptor->is_open()) return 9;
+
+    worker.CloseAcceptor("stable-listener");
+    if (worker.FindAcceptor("stable-listener") != nullptr) return 10;
 
     return 0;
 }

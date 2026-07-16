@@ -32,14 +32,9 @@ void TcpWorker::Close() noexcept {
 
 tcp::acceptor* TcpWorker::CreateAcceptor(std::string listener_key,
                                          net::io_context& io_context) {
-    auto [it, inserted] =
-        impl_->acceptors.emplace(std::move(listener_key), tcp::acceptor(io_context));
-    if (!inserted) {
-        IoErrorCode ec;
-        it->second.close(ec);
-        it->second = tcp::acceptor(io_context);
-    }
-    return &it->second;
+    auto [it, inserted] = impl_->acceptors.try_emplace(
+        std::move(listener_key), io_context);
+    return inserted ? &it->second : nullptr;
 }
 
 tcp::acceptor* TcpWorker::FindAcceptor(const std::string& listener_key) noexcept {

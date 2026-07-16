@@ -31,6 +31,8 @@ public:
 
     void Close() noexcept;
 
+    // listener_key is unique for the lifetime of its AcceptLoop. Duplicate
+    // creation is rejected instead of replacing the object at a stable address.
     [[nodiscard]] tcp::acceptor* CreateAcceptor(std::string listener_key,
                                                 net::io_context& io_context);
     [[nodiscard]] tcp::acceptor* FindAcceptor(const std::string& listener_key) noexcept;
