@@ -815,8 +815,26 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     cfg.server_names = jstr_array(j, {"serverNames", "server_names"});
     cfg.private_key = jstr(j, {"privateKey", "private_key"}, "");
     cfg.short_ids = jstr_array(j, {"shortIds", "short_ids"});
-    cfg.min_client_ver = jstr(j, {"minClientVer", "min_client_ver"}, "");
-    cfg.max_client_ver = jstr(j, {"maxClientVer", "max_client_ver"}, "");
+    const auto min_client_version = transport::internet::ParseRealityClientVersion(
+        jstr(j, {"minClientVer", "min_client_ver"}, ""));
+    if (!min_client_version) {
+        throw std::invalid_argument("REALITY minClientVer is invalid");
+    }
+    cfg.min_client_version = *min_client_version;
+
+    const auto max_client_version = transport::internet::ParseRealityClientVersion(
+        jstr(j, {"maxClientVer", "max_client_ver"}, ""));
+    if (!max_client_version) {
+        throw std::invalid_argument("REALITY maxClientVer is invalid");
+    }
+    cfg.max_client_version = *max_client_version;
+    if (cfg.min_client_version && cfg.max_client_version &&
+        transport::internet::RealityClientVersionValue(*cfg.min_client_version) >
+            transport::internet::RealityClientVersionValue(
+                *cfg.max_client_version)) {
+        throw std::invalid_argument(
+            "REALITY minClientVer must not exceed maxClientVer");
+    }
     auto max_time_diff = ParseAliasedJsonUint64(
         j, {"maxTimeDiff", "max_time_diff"});
     if (!max_time_diff) {

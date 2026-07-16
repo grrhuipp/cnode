@@ -248,6 +248,12 @@ expect_started(equal_grpc_service_name_aliases
 expect_rejected(non_boolean_tls_allow_insecure "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-bool","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":"true"}}}]]=]
     "allowInsecure must be a boolean")
+expect_rejected(invalid_reality_min_client_version "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"1.8.0.1"}}}]]=]
+    "REALITY minClientVer is invalid")
+expect_rejected(reversed_reality_client_version_range "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-range","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"2.0.0","maxClientVer":"1.9.0"}}}]]=]
+    "REALITY minClientVer must not exceed maxClientVer")
 expect_rejected(negative_read_timeout
     [=[{"timeouts":{"read":-1}}]=] "" "")
 expect_rejected(conflicting_idle_timeout_aliases

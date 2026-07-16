@@ -21,6 +21,13 @@ public:
         for (const auto& value : values) AppendString(value);
     }
 
+    void AppendRealityVersion(
+        const std::optional<RealityClientVersion>& version) {
+        AppendByte(version ? 1 : 0);
+        if (!version) return;
+        for (const uint8_t component : *version) AppendByte(component);
+    }
+
     void AppendByte(uint8_t value) {
         key_.push_back(static_cast<char>(value));
     }
@@ -63,8 +70,8 @@ std::string MakeRealityServerContextCacheKey(
     CacheKeyBuilder key;
     key.AppendString(MakeTlsContextCacheKey("server-reality", tls_config));
     key.AppendString(reality.private_key);
-    key.AppendString(reality.min_client_ver);
-    key.AppendString(reality.max_client_ver);
+    key.AppendRealityVersion(reality.min_client_version);
+    key.AppendRealityVersion(reality.max_client_version);
     key.AppendUint64(reality.max_time_diff);
     key.AppendStrings(reality.server_names);
     key.AppendStrings(reality.short_ids);

@@ -1,4 +1,5 @@
 #include "reality_tls.hpp"
+#include "acppnode/transport/internet/reality_client_version.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
@@ -60,8 +61,8 @@ struct RealityServerState {
     std::array<uint8_t, kRealityX25519KeySize> private_key{};
     std::vector<std::string> server_names;
     std::vector<std::array<uint8_t, kRealityShortIdSize>> short_ids;
-    std::optional<std::array<uint8_t, 4>> min_client_ver;
-    std::optional<std::array<uint8_t, 4>> max_client_ver;
+    std::optional<transport::internet::RealityClientVersion> min_client_version;
+    std::optional<transport::internet::RealityClientVersion> max_client_version;
     uint64_t max_time_diff_ms = 0;
     UniqueEvpPkey ed25519_key;
     std::array<uint8_t, 32> ed25519_public{};
@@ -133,51 +134,6 @@ DecodeRealityShortId(std::string_view value) noexcept {
         out[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
     }
     return out;
-}
-
-[[nodiscard]] std::optional<std::array<uint8_t, 4>>
-ParseRealityClientVersion(std::string_view value) noexcept {
-    if (value.empty()) {
-        return std::nullopt;
-    }
-
-    std::array<uint8_t, 4> version{};
-    size_t part = 0;
-    size_t start = 0;
-    while (start <= value.size() && part < 3) {
-        const size_t dot = value.find('.', start);
-        const size_t end = dot == std::string_view::npos ? value.size() : dot;
-        if (end == start) {
-            return std::nullopt;
-        }
-        uint32_t parsed = 0;
-        for (char ch : value.substr(start, end - start)) {
-            if (ch < '0' || ch > '9') {
-                return std::nullopt;
-            }
-            parsed = parsed * 10u + static_cast<uint32_t>(ch - '0');
-            if (parsed > 255u) {
-                return std::nullopt;
-            }
-        }
-        version[part++] = static_cast<uint8_t>(parsed);
-        if (dot == std::string_view::npos) {
-            break;
-        }
-        start = dot + 1;
-    }
-    if (start < value.size() && part >= 3) {
-        return std::nullopt;
-    }
-    return version;
-}
-
-[[nodiscard]] uint32_t RealityVersionValue(
-    std::span<const uint8_t, 4> version) noexcept {
-    return (static_cast<uint32_t>(version[0]) << 24) |
-           (static_cast<uint32_t>(version[1]) << 16) |
-           (static_cast<uint32_t>(version[2]) << 8) |
-           static_cast<uint32_t>(version[3]);
 }
 
 [[nodiscard]] uint16_t ReadBigEndianU16(const uint8_t* data) noexcept {
@@ -620,13 +576,16 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     std::span<const uint8_t, kRealityPlainAuthSize> plain) noexcept {
     const std::array<uint8_t, 4> client_ver{
         plain[0], plain[1], plain[2], plain[3]};
-    const uint32_t client_ver_value = RealityVersionValue(client_ver);
-    if (state.min_client_ver &&
-        client_ver_value < RealityVersionValue(*state.min_client_ver)) {
+    const uint32_t client_ver_value =
+        transport::internet::RealityClientVersionValue(client_ver);
+    if (state.min_client_version &&
+        client_ver_value < transport::internet::RealityClientVersionValue(
+            *state.min_client_version)) {
         return false;
     }
-    if (state.max_client_ver &&
-        client_ver_value > RealityVersionValue(*state.max_client_ver)) {
+    if (state.max_client_version &&
+        client_ver_value > transport::internet::RealityClientVersionValue(
+            *state.max_client_version)) {
         return false;
     }
 
@@ -777,8 +736,8 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     std::copy_n(key->data(), state->private_key.size(), state->private_key.begin());
     state->server_names = config.server_names;
     state->max_time_diff_ms = config.max_time_diff;
-    state->min_client_ver = ParseRealityClientVersion(config.min_client_ver);
-    state->max_client_ver = ParseRealityClientVersion(config.max_client_ver);
+    state->min_client_version = config.min_client_version;
+    state->max_client_version = config.max_client_version;
 
     for (const auto& short_id_text : config.short_ids) {
         auto short_id = DecodeRealityShortId(short_id_text);

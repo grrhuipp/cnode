@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/transport/internet/reality_client_version.hpp"
+
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
@@ -150,8 +152,8 @@ struct RealityConfig {
     std::vector<std::string> server_names;
     std::string private_key;
     std::vector<std::string> short_ids;
-    std::string min_client_ver;
-    std::string max_client_ver;
+    std::optional<transport::internet::RealityClientVersion> min_client_version;
+    std::optional<transport::internet::RealityClientVersion> max_client_version;
     uint64_t max_time_diff = 0;
 
     // 客户端字段
