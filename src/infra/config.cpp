@@ -379,6 +379,37 @@ void AppendRoutingPortField(const json::object& object,
     AppendRoutingPortValue(out, *value, key);
 }
 
+void AppendAliasedRoutingPortField(
+    const json::object& object,
+    std::initializer_list<std::string_view> aliases,
+    std::vector<RoutingPortRange>& out) {
+    std::optional<std::vector<RoutingPortRange>> parsed;
+    std::string_view first_key;
+    for (const std::string_view key : aliases) {
+        if (!object.contains(key)) {
+            continue;
+        }
+        std::vector<RoutingPortRange> candidate;
+        AppendRoutingPortField(object, key, candidate);
+        const auto equal = [](const RoutingPortRange& lhs,
+                              const RoutingPortRange& rhs) {
+            return lhs.start == rhs.start && lhs.end == rhs.end;
+        };
+        if (parsed && (parsed->size() != candidate.size() ||
+                       !std::ranges::equal(*parsed, candidate, equal))) {
+            throw std::invalid_argument(std::format(
+                "{} and {} must match", first_key, key));
+        }
+        if (!parsed) {
+            parsed = std::move(candidate);
+            first_key = key;
+        }
+    }
+    if (parsed) {
+        out.insert(out.end(), parsed->begin(), parsed->end());
+    }
+}
+
 
 } // anonymous namespace
 
@@ -600,23 +631,37 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     };
 
     // 辅助：解析字符串/数组字段，支持逗号分隔字符串（Xray 格式）
-    auto parse_str_or_array = [&](std::string_view key) -> std::vector<std::string> {
-        auto* p = j.if_contains(key);
-        if (!p) return {};
-        std::vector<std::string> values;
-        if (p->is_array()) {
-            values = jstr_array(j, {key});
-        } else if (p->is_string()) {
-            values = split_comma(std::string(p->as_string()));
-        } else {
-            throw std::invalid_argument(std::format(
-                "routing {} must be a string or array of strings", key));
+    auto parse_str_or_array = [&](std::initializer_list<std::string_view> aliases) {
+        std::optional<std::vector<std::string>> parsed;
+        std::string_view first_key;
+        for (const std::string_view key : aliases) {
+            const auto* value = j.if_contains(key);
+            if (!value) {
+                continue;
+            }
+            std::vector<std::string> candidate;
+            if (value->is_array()) {
+                candidate = jstr_array(j, {key});
+            } else if (value->is_string()) {
+                candidate = split_comma(std::string(value->as_string()));
+            } else {
+                throw std::invalid_argument(std::format(
+                    "routing {} must be a string or array of strings", key));
+            }
+            if (candidate.empty()) {
+                throw std::invalid_argument(std::format(
+                    "routing {} must not be empty", key));
+            }
+            if (parsed && *parsed != candidate) {
+                throw std::invalid_argument(std::format(
+                    "{} and {} must match", first_key, key));
+            }
+            if (!parsed) {
+                parsed = std::move(candidate);
+                first_key = key;
+            }
         }
-        if (values.empty()) {
-            throw std::invalid_argument(std::format(
-                "routing {} must not be empty", key));
-        }
-        return values;
+        return std::move(parsed).value_or(std::vector<std::string>{});
     };
 
     // 端口（支持 Xray 格式: "53,443,1000-2000"）
@@ -624,7 +669,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 网络类型（支持 Xray 格式: "tcp,udp"）
     {
-        auto vals = parse_str_or_array("network");
+        auto vals = parse_str_or_array({"network"});
         for (auto& value : vals) {
             rule.network.push_back(RequireRoutingNetwork(std::move(value)));
         }
@@ -632,12 +677,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 入站标签
     {
-        auto vals = parse_str_or_array("inboundTag");
-        for (auto& value : vals) {
-            rule.inbound_tag.push_back(RequireRoutingSelector(
-                std::move(value), "inboundTag", false));
-        }
-        vals = parse_str_or_array("inbound_tag");
+        auto vals = parse_str_or_array({"inboundTag", "inbound_tag"});
         for (auto& value : vals) {
             rule.inbound_tag.push_back(RequireRoutingSelector(
                 std::move(value), "inboundTag", false));
@@ -646,7 +686,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 用户 email（Xray user 字段）
     {
-        auto vals = parse_str_or_array("user");
+        auto vals = parse_str_or_array({"user"});
         for (auto& value : vals) {
             rule.user.push_back(RequireRoutingSelector(
                 std::move(value), "user", false));
@@ -659,19 +699,19 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
             rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
         }
     } else {
-        auto vals = parse_str_or_array("source");
+        auto vals = parse_str_or_array({"source"});
         for (const auto& value : vals) {
             rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
         }
     }
 
     // 来源端口（Xray sourcePort 字段）
-    AppendRoutingPortField(j, "sourcePort", rule.source_port);
-    AppendRoutingPortField(j, "source_port", rule.source_port);
+    AppendAliasedRoutingPortField(
+        j, {"sourcePort", "source_port"}, rule.source_port);
 
     // 嗅探协议（Xray protocol 字段）
     {
-        auto vals = parse_str_or_array("protocol");
+        auto vals = parse_str_or_array({"protocol"});
         for (auto& value : vals) {
             rule.protocol.push_back(RequireRoutingSelector(
                 std::move(value), "protocol", true));
@@ -679,11 +719,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
 
     // 目标出站
-    if (j.contains("outboundTag")) {
-        rule.outbound_tag = std::string(j.at("outboundTag").as_string());
-    } else if (j.contains("outbound_tag")) {
-        rule.outbound_tag = std::string(j.at("outbound_tag").as_string());
-    }
+    rule.outbound_tag = jstr(j, {"outboundTag", "outbound_tag"});
 
     const bool has_condition =
         !rule.domain.empty() || !rule.domain_suffix.empty() ||
@@ -706,11 +742,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 // ============================================================================
 RoutingConfig RoutingConfig::FromJson(const json::object& j) {
     RoutingConfig cfg;
-    if (j.contains("domainStrategy")) {
-        cfg.domain_strategy = std::string(j.at("domainStrategy").as_string());
-    } else if (j.contains("domain_strategy")) {
-        cfg.domain_strategy = std::string(j.at("domain_strategy").as_string());
-    }
+    cfg.domain_strategy = jstr(
+        j, {"domainStrategy", "domain_strategy"}, cfg.domain_strategy);
     if (j.contains("rules")) {
         for (const auto& rule : j.at("rules").as_array()) {
             cfg.rules.push_back(RouteRuleConfig::FromJson(rule.as_object()));

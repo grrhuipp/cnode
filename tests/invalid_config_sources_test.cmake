@@ -374,6 +374,21 @@ expect_rejected(conflicting_route_domain_suffix_aliases "{}" "routing.json"
 expect_started(equal_route_domain_suffix_aliases
     [=[{"workers":1}]=] "routing.json"
     [=[{"rules":[{"domainSuffix":["same.example"],"domain_suffix":["same.example"],"outboundTag":"direct"}]}]=])
+expect_rejected(conflicting_route_inbound_tag_aliases "{}" "routing.json"
+    [=[{"rules":[{"inboundTag":"one","inbound_tag":"two","outboundTag":"direct"}]}]=]
+    "inboundTag and inbound_tag must match")
+expect_rejected(conflicting_route_source_port_aliases "{}" "routing.json"
+    [=[{"rules":[{"sourcePort":"80,443","source_port":[80,8443],"outboundTag":"direct"}]}]=]
+    "sourcePort and source_port must match")
+expect_rejected(conflicting_route_outbound_tag_aliases "{}" "routing.json"
+    [=[{"rules":[{"network":"tcp","outboundTag":"direct","outbound_tag":"blocked"}]}]=]
+    "outboundTag and outbound_tag must match")
+expect_rejected(conflicting_route_domain_strategy_aliases "{}" "routing.json"
+    [=[{"domainStrategy":"AsIs","domain_strategy":"IPIfNonMatch","rules":[{"network":"tcp","outboundTag":"direct"}]}]=]
+    "domainStrategy and domain_strategy must match")
+expect_started(equal_normalized_route_aliases
+    [=[{"workers":1}]=] "routing.json"
+    [=[{"domainStrategy":"AsIs","domain_strategy":"AsIs","rules":[{"inboundTag":"in-a,in-b","inbound_tag":["in-a","in-b"],"sourcePort":"80,443","source_port":[80,443],"outboundTag":"direct","outbound_tag":"direct"}]}]=])
 expect_rejected(empty_route_domain_keyword "{}" "routing.json"
     [=[{"rules":[{"domain":["keyword:"],"outboundTag":"direct"}]}]=]
     "routing domain keyword must not be empty")
