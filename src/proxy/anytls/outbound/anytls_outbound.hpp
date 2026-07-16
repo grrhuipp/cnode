@@ -71,6 +71,7 @@ public:
 
 private:
     struct ClientSession;
+    struct LogicalStreamLease;
 
     static void CloseSession(std::shared_ptr<ClientSession> session) noexcept;
     void PruneSessions();

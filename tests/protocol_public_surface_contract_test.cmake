@@ -44,3 +44,15 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES "active_dispatches_")
     message(FATAL_ERROR
         "AnyTLS demux must own explicit child dispatch lifetime state")
 endif()
+
+set(ANYTLS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp")
+file(READ "${ANYTLS_OUTBOUND}" ANYTLS_OUTBOUND_SOURCE)
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES "LogicalStreamLease")
+    message(FATAL_ERROR
+        "AnyTLS outbound logical streams must use exception-safe RAII ownership")
+endif()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES "cleanup_logical_stream")
+    message(FATAL_ERROR
+        "AnyTLS outbound must not restore manual logical stream cleanup")
+endif()

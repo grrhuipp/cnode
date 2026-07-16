@@ -583,6 +583,79 @@ struct Handler::ClientSession {
     }
 };
 
+struct Handler::LogicalStreamLease {
+    Handler& owner;
+    std::shared_ptr<ClientSession> session;
+    std::shared_ptr<ClientSession::LogicalStream> logical;
+    uint32_t sid = 0;
+    bool cleaned = false;
+    bool released = false;
+
+    LogicalStreamLease(
+        Handler& owner,
+        std::shared_ptr<ClientSession> session,
+        std::shared_ptr<ClientSession::LogicalStream> logical,
+        uint32_t sid) noexcept
+        : owner(owner)
+        , session(std::move(session))
+        , logical(std::move(logical))
+        , sid(sid) {
+        ++this->session->active_streams;
+        this->session->idle_since = {};
+    }
+
+    ~LogicalStreamLease() noexcept {
+        Cleanup(ErrorCode::CANCELLED);
+        if (!released) {
+            Handler::CloseSession(session);
+        }
+    }
+
+    LogicalStreamLease(const LogicalStreamLease&) = delete;
+    LogicalStreamLease& operator=(const LogicalStreamLease&) = delete;
+    LogicalStreamLease(LogicalStreamLease&&) = delete;
+    LogicalStreamLease& operator=(LogicalStreamLease&&) = delete;
+
+    void Finish(ErrorCode error) noexcept {
+        Cleanup(error);
+        if (error == ErrorCode::OK &&
+            session->active_streams == 0 &&
+            session->stream &&
+            !session->closed.load()) {
+            session->idle_since = std::chrono::steady_clock::now();
+            if (!session->in_idle_pool) {
+                try {
+                    owner.idle_sessions_.push_back(session);
+                    session->in_idle_pool = true;
+                } catch (...) {
+                    Handler::CloseSession(session);
+                }
+            }
+        } else if (error != ErrorCode::OK) {
+            Handler::CloseSession(session);
+        }
+        try {
+            owner.PruneSessions();
+        } catch (...) {
+            Handler::CloseSession(session);
+        }
+        released = true;
+    }
+
+private:
+    void Cleanup(ErrorCode error) noexcept {
+        if (cleaned) {
+            return;
+        }
+        cleaned = true;
+        session->UnregisterLogicalStream(sid);
+        logical->Close(error);
+        if (session->active_streams > 0) {
+            --session->active_streams;
+        }
+    }
+};
+
 void Handler::CloseSession(std::shared_ptr<ClientSession> session) noexcept {
     if (session && session->stream) {
         session->CloseAll(ErrorCode::CANCELLED);
@@ -786,18 +859,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     const uint32_t sid = session->next_sid++;
     auto logical = session->RegisterLogicalStream(io_context, sid);
-    auto cleanup_logical_stream = [&]() {
-        session->UnregisterLogicalStream(sid);
-        logical->Close(ErrorCode::CANCELLED);
-        if (session->active_streams > 0) {
-            --session->active_streams;
-        }
-        if (session->active_streams == 0 && session->stream && !session->closed.load()) {
-            session->idle_since = std::chrono::steady_clock::now();
-        }
-    };
-    ++session->active_streams;
-    session->idle_since = {};
+    LogicalStreamLease logical_lease(*this, session, logical, sid);
     if (!session->read_loop_started) {
         session->read_loop_started = true;
         auto read_session = session;
@@ -816,7 +878,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     auto target = EncodeSocksAddress(stream_target);
     if (!target) {
         stream.Cancel();
-        cleanup_logical_stream();
         co_return std::unexpected(target.error());
     }
 
@@ -834,14 +895,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             reinterpret_cast<const uint8_t*>(target->data()), target->size()));
     if (!syn_frame || !target_frame) {
         stream.Cancel();
-        cleanup_logical_stream();
         co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     if (is_udp) {
         auto request = proxy::uot::EncodeRequest(true, original_target);
         if (!request) {
             stream.Cancel();
-            cleanup_logical_stream();
             co_return std::unexpected(request.error());
         }
         auto request_frame = AppendFrameBytesTo(
@@ -851,7 +910,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             request->span());
         if (!request_frame) {
             stream.Cancel();
-            cleanup_logical_stream();
             co_return std::unexpected(request_frame.error());
         }
     }
@@ -867,7 +925,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 buffer->Bytes());
             if (!frame) {
                 stream.Cancel();
-                cleanup_logical_stream();
                 co_return std::unexpected(frame.error());
             }
         }
@@ -877,20 +934,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         auto frame = AppendFrameBytesTo(open_packet, kCmdPSH, sid, initial_payload);
         if (!frame) {
             stream.Cancel();
-            cleanup_logical_stream();
             co_return std::unexpected(frame.error());
         }
     }
     if (auto ok = co_await session->WriteOpenPacket(sid, std::move(open_packet)); !ok) {
         stream.Cancel();
         logical->Close(ok.error());
-        cleanup_logical_stream();
         co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
     }
     if (sid >= 2 && session->peer_version >= 2) {
         if (auto ok = co_await logical->WaitSynAck(std::chrono::seconds(3)); !ok) {
             session->CloseAll(ok.error());
-            cleanup_logical_stream();
             co_return std::unexpected(ok.error());
         }
     }
@@ -1039,19 +1093,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!inbound_control) {
         try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
     }
-    session->UnregisterLogicalStream(sid);
-    logical->Close(result.error);
-    if (session->active_streams > 0) {
-        --session->active_streams;
-    }
-    if (result.error == ErrorCode::OK && session->active_streams == 0 && session->stream) {
-        session->idle_since = std::chrono::steady_clock::now();
-        if (!session->in_idle_pool && !session->closed.load()) {
-            session->in_idle_pool = true;
-            idle_sessions_.push_back(session);
-        }
-    }
-    PruneSessions();
+    logical_lease.Finish(result.error);
     co_return result;
 }
 
