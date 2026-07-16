@@ -23,26 +23,6 @@ EVP_PKEY* GenerateEcP256Key() {
 
 }  // namespace
 
-std::string NormalizeAutoSignCertificateName(std::string_view name) {
-    std::string normalized(name);
-
-    ASN1_OCTET_STRING* ip_address = a2i_IPADDRESS(normalized.c_str());
-    if (ip_address) {
-        ASN1_OCTET_STRING_free(ip_address);
-        return normalized;
-    }
-
-    if (normalized.starts_with("*.") || normalized.find('.') == std::string::npos) {
-        return normalized;
-    }
-
-    const auto first_dot = normalized.find('.');
-    if (normalized.find('.', first_dot + 1) == std::string::npos) {
-        return "*." + normalized;
-    }
-    return "*" + normalized.substr(first_dot);
-}
-
 AutoSignState::~AutoSignState() {
     ClearCertCacheLocked();
     if (pkey_) EVP_PKEY_free(pkey_);

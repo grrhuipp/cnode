@@ -137,18 +137,16 @@ std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     if (config.server_name.empty()) {
         return "localhost";
     }
-    return transport::internet::NormalizeAutoSignCertificateName(config.server_name);
+    return config.server_name;
 }
 
 int AutoSignCertCallback(SSL* ssl, void* arg) {
     auto* default_name = static_cast<std::string*>(arg);
     const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    std::string wildcard = sni
-        ? transport::internet::NormalizeAutoSignCertificateName(sni)
-        : *default_name;
+    const std::string certificate_name = sni ? std::string(sni) : *default_name;
 
     auto& state = transport::internet::GetAutoSignState();
-    auto material = state.GetOrCreate(wildcard);
+    auto material = state.GetOrCreate(certificate_name);
     if (!material.cert || !material.key) return 0;
 
     if (SSL_use_certificate(ssl, material.cert) != 1 ||
