@@ -374,6 +374,18 @@ expect_rejected(conflicting_route_domain_suffix_aliases "{}" "routing.json"
 expect_started(equal_route_domain_suffix_aliases
     [=[{"workers":1}]=] "routing.json"
     [=[{"rules":[{"domainSuffix":["same.example"],"domain_suffix":["same.example"],"outboundTag":"direct"}]}]=])
+expect_rejected(empty_route_domain_keyword "{}" "routing.json"
+    [=[{"rules":[{"domain":["keyword:"],"outboundTag":"direct"}]}]=]
+    "routing domain keyword must not be empty")
+expect_rejected(empty_route_domain_regexp "{}" "routing.json"
+    [=[{"rules":[{"domain":["regexp:"],"outboundTag":"direct"}]}]=]
+    "routing domain regexp must not be empty")
+expect_rejected(invalid_route_domain_regexp "{}" "routing.json"
+    [=[{"rules":[{"domain":["regexp:["],"outboundTag":"direct"}]}]=]
+    "routing domain regexp")
+expect_rejected(invalid_route_domain_name "{}" "routing.json"
+    [=[{"rules":[{"domain":["domain:bad..example"],"outboundTag":"direct"}]}]=]
+    "routing domain suffix contains invalid DNS hostname")
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"

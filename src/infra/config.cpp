@@ -1,4 +1,5 @@
 #include "acppnode/infra/config.hpp"
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
@@ -13,6 +14,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -33,6 +35,56 @@ namespace {
             "routing field '{}' contains invalid IP network '{}'", field, value));
     }
     return std::move(*parsed);
+}
+
+[[nodiscard]] std::string RequireRoutingDomainName(
+    std::string value,
+    std::string_view kind) {
+    if (!domain::IsValidDnsHostname(
+            value, domain::TrailingDotPolicy::Allow)) {
+        throw std::invalid_argument(std::format(
+            "routing domain {} contains invalid DNS hostname '{}'",
+            kind, value));
+    }
+    domain::NormalizeDnsHostnameInPlace(value);
+    return value;
+}
+
+[[nodiscard]] std::string RequireRoutingDomainKeyword(std::string value) {
+    if (value.empty()) {
+        throw std::invalid_argument(
+            "routing domain keyword must not be empty");
+    }
+    for (char& ch : value) {
+        const unsigned char byte = static_cast<unsigned char>(ch);
+        if (byte < 0x20 || byte == 0x7f) {
+            throw std::invalid_argument(
+                "routing domain keyword contains control characters");
+        }
+        ch = domain::ToLowerAscii(byte);
+    }
+    return value;
+}
+
+[[nodiscard]] std::string RequireRoutingDomainRegexp(std::string value) {
+    if (value.empty()) {
+        throw std::invalid_argument(
+            "routing domain regexp must not be empty");
+    }
+    for (const unsigned char byte : value) {
+        if (byte < 0x20 || byte == 0x7f) {
+            throw std::invalid_argument(
+                "routing domain regexp contains control characters");
+        }
+    }
+    try {
+        (void)std::regex(
+            value, std::regex::ECMAScript | std::regex::icase);
+    } catch (const std::regex_error& error) {
+        throw std::invalid_argument(std::format(
+            "routing domain regexp '{}' is invalid: {}", value, error.what()));
+    }
+    return value;
 }
 
 // 从 object 中取 string，不存在则返回默认值
@@ -407,16 +459,21 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
             if (val.substr(0, 8) == "geosite:") {
                 rule.geosite.push_back(val.substr(8));
             } else if (val.substr(0, 5) == "full:") {
-                rule.domain_full.push_back(val.substr(5));
+                rule.domain_full.push_back(RequireRoutingDomainName(
+                    val.substr(5), "full"));
             } else if (val.substr(0, 8) == "keyword:") {
-                rule.domain_keyword.push_back(val.substr(8));
+                rule.domain_keyword.push_back(RequireRoutingDomainKeyword(
+                    val.substr(8)));
             } else if (val.substr(0, 7) == "regexp:") {
-                rule.domain_regex.push_back(val.substr(7));
+                rule.domain_regex.push_back(RequireRoutingDomainRegexp(
+                    val.substr(7)));
             } else if (val.substr(0, 7) == "domain:") {
-                rule.domain_suffix.push_back(val.substr(7));
+                rule.domain_suffix.push_back(RequireRoutingDomainName(
+                    val.substr(7), "suffix"));
             } else {
                 // 默认作为后缀匹配
-                rule.domain_suffix.push_back(val);
+                rule.domain_suffix.push_back(RequireRoutingDomainName(
+                    std::move(val), "suffix"));
             }
         }
     }
@@ -424,21 +481,33 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 独立的域名字段
     if (j.contains("domainSuffix") || j.contains("domain_suffix")) {
         auto arr = jstr_array(j, {"domainSuffix", "domain_suffix"});
-        rule.domain_suffix.insert(rule.domain_suffix.end(), arr.begin(), arr.end());
+        for (auto& value : arr) {
+            rule.domain_suffix.push_back(RequireRoutingDomainName(
+                std::move(value), "suffix"));
+        }
     }
     if (j.contains("domainKeyword") || j.contains("domain_keyword")) {
         auto arr = jstr_array(j, {"domainKeyword", "domain_keyword"});
-        rule.domain_keyword.insert(rule.domain_keyword.end(), arr.begin(), arr.end());
+        for (auto& value : arr) {
+            rule.domain_keyword.push_back(RequireRoutingDomainKeyword(
+                std::move(value)));
+        }
     }
     if (j.contains("domainFull") || j.contains("domain_full")) {
         auto arr = jstr_array(j, {"domainFull", "domain_full"});
-        rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
+        for (auto& value : arr) {
+            rule.domain_full.push_back(RequireRoutingDomainName(
+                std::move(value), "full"));
+        }
     }
     if (j.contains("domainRegex") || j.contains("domainRegexp") ||
         j.contains("domain_regex") || j.contains("domain_regexp")) {
         auto arr = jstr_array(j, {
             "domainRegex", "domainRegexp", "domain_regex", "domain_regexp"});
-        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
+        for (auto& value : arr) {
+            rule.domain_regex.push_back(RequireRoutingDomainRegexp(
+                std::move(value)));
+        }
     }
     if (j.contains("geosite")) {
         auto arr = jstr_array(j, {"geosite"});

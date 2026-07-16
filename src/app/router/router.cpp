@@ -525,11 +525,7 @@ void DomainMatcher::AddKeyword(const std::string& keyword) {
 }
 
 void DomainMatcher::AddRegex(const std::string& pattern) {
-    try {
-        regexes_.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
-    } catch (const std::regex_error& e) {
-        LOG_WARN("Router: invalid domain regexp '{}': {}", pattern, e.what());
-    }
+    regexes_.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
 }
 
 bool DomainMatcher::Match(std::string_view domain) const {
