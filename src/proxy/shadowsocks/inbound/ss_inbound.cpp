@@ -310,7 +310,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     std::string_view tag,
     std::string_view client_ip,
     const uint8_t* data,
-    size_t len) const {
+    size_t len) {
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(tag, client_ip)) {
         LOG_ACCESS_DEBUG("{} from {} rejected ip_banned [{}] (udp)",
@@ -325,7 +325,8 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
 
     auto decoded = ss::DecodeUdpPacket(
         data, len, users,
-        cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
+        cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
+        udp_replay_cache_);
     if (!decoded) {
         if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);

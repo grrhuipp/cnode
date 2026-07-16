@@ -4,6 +4,7 @@
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/app/udp_types.hpp"
+#include "../ss_udp.hpp"
 #include "../validator.hpp"
 
 #include <array>
@@ -39,7 +40,7 @@ public:
         std::string_view tag,
         std::string_view client_ip,
         const uint8_t* data,
-        size_t len) const override;
+        size_t len) override;
 
     [[nodiscard]] ::acpp::buf::MultiBuffer EncodeUdpResponse(
         ::acpp::UDPPacketView packet,
@@ -51,6 +52,7 @@ private:
     ::acpp::ConnectionLimiterPtr limiter_;
     std::string         cipher_method_;
     ::acpp::ss::SsCipherInfo cipher_info_;
+    ::acpp::ss::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）
     size_t last_matched_index_ = 0;
 };

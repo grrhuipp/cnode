@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -77,15 +78,18 @@ void CheckClassic(const TargetAddress& target,
 
 void Check2022(const TargetAddress& target,
                const std::vector<uint8_t>& source,
-               std::span<const uint8_t> payload) {
-    const ss::SsCipherInfo cipher{
-        ss::SsCipherType::AES_128_GCM_2022, 16, 16};
+               std::span<const uint8_t> payload,
+               ss::SsCipherType cipher_type,
+               size_t key_size,
+               proxyman::inbound::PreparedAeadCipher prepared_cipher) {
+    const ss::SsCipherInfo cipher{cipher_type, key_size, key_size};
     ss::KeyBytes key;
-    std::array<uint8_t, 16> key_bytes{};
-    for (size_t i = 0; i < key_bytes.size(); ++i) {
+    std::array<uint8_t, 32> key_bytes{};
+    for (size_t i = 0; i < key_size; ++i) {
         key_bytes[i] = static_cast<uint8_t>(i + 1);
     }
-    Check(key.assign(key_bytes), "failed to initialize Shadowsocks 2022 key");
+    Check(key.assign(std::span<const uint8_t>(key_bytes).first(key_size)),
+          "failed to initialize Shadowsocks 2022 key");
 
     ss::Ss2022UdpSessionState encoder;
     Check(ss::Init2022UdpSessionState(encoder, cipher, key),
@@ -109,18 +113,82 @@ void Check2022(const TargetAddress& target,
     proxyman::inbound::UserStore::ShadowsocksCredential user;
     Check(user.derived_key.assign(key.span()),
           "failed to initialize Shadowsocks 2022 decode user");
-    user.cipher_type =
-        proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022;
+    user.cipher_type = prepared_cipher;
     user.key_size = cipher.key_size;
     user.salt_size = cipher.salt_size;
     user_list->push_back(std::move(user));
     const proxyman::inbound::UserStore::ShadowsocksUsersView users{user_list};
+    std::vector<uint8_t> corrupted = encoded;
+    corrupted.back() ^= 0x01;
+    ss::Ss2022UdpReplayCache validation_cache;
+    Check(!ss::DecodeUdpPacket(
+              corrupted.data(), corrupted.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size,
+              validation_cache),
+          "invalid Shadowsocks 2022 request unexpectedly decoded");
+    Check(ss::DecodeUdpPacket(
+              encoded.data(), encoded.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size,
+              validation_cache).has_value(),
+          "invalid Shadowsocks 2022 request poisoned the replay window");
+
+    ss::Ss2022UdpReplayCache replay_cache;
     auto decoded = ss::DecodeUdpPacket(
         encoded.data(), encoded.size(), users,
-        cipher.type, cipher.key_size, cipher.salt_size);
+        cipher.type, cipher.key_size, cipher.salt_size, replay_cache);
     Check(decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source,
           "Shadowsocks 2022 split one MultiBuffer datagram");
+    Check(!ss::DecodeUdpPacket(
+              encoded.data(), encoded.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
+          "Shadowsocks 2022 accepted a replayed request packet");
+
+    ss::Ss2022UdpSessionState response_encoder = encoder;
+    response_encoder.next_packet_id = 0;
+    ss::Ss2022UdpSessionState response_decoder = response_encoder;
+    const size_t response_size = ss::Encode2022UdpResponsePacketTo(
+        target, payload.data(), payload.size(), response_encoder, nullptr, 0);
+    std::vector<uint8_t> response(response_size);
+    Check(ss::Encode2022UdpResponsePacketTo(
+              target, payload.data(), payload.size(), response_encoder,
+              response.data(), response.size()) == response.size(),
+          "Shadowsocks 2022 UDP response encoding failed");
+    auto response_decoded = ss::Decode2022UdpResponsePacket(
+        response.data(), response.size(), response_decoder);
+    Check(response_decoded &&
+          response_decoded->target.SameEndpoint(target) &&
+          Flatten(response_decoded->payload) == source,
+          "Shadowsocks 2022 UDP response decoding failed");
+    Check(!ss::Decode2022UdpResponsePacket(
+              response.data(), response.size(), response_decoder),
+          "Shadowsocks 2022 accepted a replayed response packet");
+}
+
+void Check2022ReplayWindow() {
+    ss::Ss2022UdpReplayWindow window;
+    Check(window.Accept(100) && window.Accept(98) && window.Accept(99),
+          "Shadowsocks 2022 replay window rejected valid reordering");
+    Check(!window.Accept(100) && !window.Accept(98),
+          "Shadowsocks 2022 replay window accepted duplicate packet IDs");
+    Check(window.Accept(100 + ss::Ss2022UdpReplayWindow::kWindowBits),
+          "Shadowsocks 2022 replay window rejected a new high packet ID");
+    Check(!window.Accept(100),
+          "Shadowsocks 2022 replay window accepted an out-of-window packet ID");
+
+    ss::Ss2022UdpReplayWindow cross_word_window;
+    Check(cross_word_window.Accept(0) && cross_word_window.Accept(65) &&
+          !cross_word_window.Accept(0) && cross_word_window.Accept(64) &&
+          !cross_word_window.Accept(64),
+          "Shadowsocks 2022 replay window lost bits across word boundaries");
+
+    ss::Ss2022UdpReplayCache cache;
+    const std::array<uint8_t, 8> session_id{1, 2, 3, 4, 5, 6, 7, 8};
+    const auto started = std::chrono::steady_clock::time_point{};
+    Check(cache.Accept(session_id, 7, started) &&
+          !cache.Accept(session_id, 7, started + std::chrono::seconds(64)) &&
+          cache.Accept(session_id, 7, started + std::chrono::seconds(66)),
+          "Shadowsocks 2022 replay cache retention is incorrect");
 }
 
 }  // namespace
@@ -135,6 +203,14 @@ int main() {
           "Shadowsocks UDP payload coalescing mismatch");
 
     CheckClassic(target, source, payload.Bytes());
-    Check2022(target, source, payload.Bytes());
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::AES_128_GCM_2022, 16,
+        proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022);
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::CHACHA20_POLY1305_2022, 32,
+        proxyman::inbound::PreparedAeadCipher::CHACHA20_POLY1305_2022);
+    Check2022ReplayWindow();
     return 0;
 }

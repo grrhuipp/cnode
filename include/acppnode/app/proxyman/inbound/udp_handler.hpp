@@ -32,11 +32,13 @@ class UdpHandler {
 public:
     virtual ~UdpHandler() noexcept = default;
 
+    // Called only by the owning Worker. Protocol decoders may update
+    // Worker-local session state such as replay windows after authentication.
     [[nodiscard]] virtual std::optional<UdpDecodeResult> DecodeUdp(
         std::string_view tag,
         std::string_view client_ip,
         const uint8_t* data,
-        size_t len) const = 0;
+        size_t len) = 0;
 
     [[nodiscard]] virtual buf::MultiBuffer EncodeUdpResponse(
         ::acpp::UDPPacketView packet,

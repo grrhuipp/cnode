@@ -484,7 +484,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     const uint8_t* datagram,
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
-    const SsCipherInfo& cipher_info) {
+    const SsCipherInfo& cipher_info,
+    Ss2022UdpReplayCache& replay_cache) {
 
     constexpr size_t kMinBodyPlain = 1 + 8 + 2 + 1 + 4 + 2;
     if (datagram_len < kSs2022UdpSeparateHeaderSize +
@@ -562,6 +563,11 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (!parsed) {
             continue;
         }
+        const uint64_t packet_id = GetU64BE(
+            separate.data() + kSs2022UdpSessionIdSize);
+        if (!replay_cache.Accept(client_session_id, packet_id)) {
+            return std::nullopt;
+        }
         return Make2022DecodeResult(
             user, i, cipher_info, client_session_id, std::move(*parsed));
     }
@@ -573,7 +579,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     const uint8_t* datagram,
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
-    const SsCipherInfo& cipher_info) {
+    const SsCipherInfo& cipher_info,
+    Ss2022UdpReplayCache& replay_cache) {
 
     constexpr size_t kMinPlain =
         kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + 1 + 4 + 2;
@@ -601,11 +608,16 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), plaintext.data(), client_session_id.size());
+        const uint64_t packet_id = GetU64BE(
+            plaintext.data() + kSs2022UdpSessionIdSize);
         const auto body = std::span<const uint8_t>(plaintext).subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
         auto parsed = Parse2022ClientBodyPlaintext(body, client_session_id);
         if (!parsed) {
             continue;
+        }
+        if (!replay_cache.Accept(client_session_id, packet_id)) {
+            return std::nullopt;
         }
         return Make2022DecodeResult(
             user, i, cipher_info, client_session_id, std::move(*parsed));
@@ -822,13 +834,110 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 
 }  // namespace
 
+bool Ss2022UdpReplayWindow::Accept(uint64_t packet_id) noexcept {
+    if (!initialized_) {
+        initialized_ = true;
+        highest_ = packet_id;
+        seen_[0] = 1;
+        return true;
+    }
+
+    if (packet_id > highest_) {
+        const uint64_t distance = packet_id - highest_;
+        Advance(distance >= kWindowBits
+                    ? kWindowBits
+                    : static_cast<size_t>(distance));
+        highest_ = packet_id;
+        seen_[0] |= 1;
+        return true;
+    }
+
+    const uint64_t distance = highest_ - packet_id;
+    if (distance >= kWindowBits) {
+        return false;
+    }
+    const size_t word = static_cast<size_t>(distance / kWordBits);
+    const uint64_t mask = uint64_t{1} << (distance % kWordBits);
+    if ((seen_[word] & mask) != 0) {
+        return false;
+    }
+    seen_[word] |= mask;
+    return true;
+}
+
+void Ss2022UdpReplayWindow::Advance(size_t distance) noexcept {
+    if (distance >= kWindowBits) {
+        seen_.fill(0);
+        return;
+    }
+
+    const size_t word_shift = distance / kWordBits;
+    const size_t bit_shift = distance % kWordBits;
+    for (size_t dst = kWordCount; dst-- > 0;) {
+        uint64_t value = 0;
+        if (dst >= word_shift) {
+            value = seen_[dst - word_shift] << bit_shift;
+            if (bit_shift != 0 && dst > word_shift) {
+                value |= seen_[dst - word_shift - 1] >>
+                    (kWordBits - bit_shift);
+            }
+        }
+        seen_[dst] = value;
+    }
+}
+
+bool Ss2022UdpReplayCache::Accept(
+    std::span<const uint8_t, 8> session_id,
+    uint64_t packet_id,
+    std::chrono::steady_clock::time_point now) {
+    const uint64_t key = GetU64BE(session_id.data());
+    auto it = sessions_.find(key);
+    if (it != sessions_.end()) {
+        if (now - it->second.last_seen < kRetention) {
+            if (!it->second.window.Accept(packet_id)) {
+                return false;
+            }
+            it->second.last_seen = now;
+            return true;
+        }
+        sessions_.erase(it);
+    }
+
+    if (sessions_.size() >= kMaxSessions) {
+        PruneExpired(now);
+        if (sessions_.size() >= kMaxSessions) {
+            return false;
+        }
+    }
+
+    Session session;
+    session.last_seen = now;
+    if (!session.window.Accept(packet_id)) {
+        return false;
+    }
+    sessions_.emplace(key, std::move(session));
+    return true;
+}
+
+void Ss2022UdpReplayCache::PruneExpired(
+    std::chrono::steady_clock::time_point now) {
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
+        if (now - it->second.last_seen >= kRetention) {
+            it = sessions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* datagram,
     size_t datagram_len,
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     SsCipherType cipher_type,
     size_t key_size,
-    size_t salt_size) {
+    size_t salt_size,
+    Ss2022UdpReplayCache& replay_cache) {
 
     if (users.empty()) {
         return std::nullopt;
@@ -836,10 +945,12 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
     const SsCipherInfo cipher_info{cipher_type, key_size, salt_size};
     if (Is2022AesCipher(cipher_type)) {
-        return Decode2022UdpAesRequest(datagram, datagram_len, users, cipher_info);
+        return Decode2022UdpAesRequest(
+            datagram, datagram_len, users, cipher_info, replay_cache);
     }
     if (cipher_type == SsCipherType::CHACHA20_POLY1305_2022) {
-        return Decode2022UdpChachaRequest(datagram, datagram_len, users, cipher_info);
+        return Decode2022UdpChachaRequest(
+            datagram, datagram_len, users, cipher_info, replay_cache);
     }
 
     if (key_size > 64 || salt_size > 64) {
@@ -1051,6 +1162,8 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     }
 
     memory::ByteVector plaintext;
+    std::array<uint8_t, kSs2022UdpSessionIdSize> server_session_id{};
+    uint64_t packet_id = 0;
     if (Is2022AesCipher(state.cipher_info.type)) {
         constexpr size_t kMinBodyPlain = 1 + 8 + 8 + 2 + 1 + 4 + 2;
         if (datagram_len < kSs2022UdpSeparateHeaderSize +
@@ -1063,6 +1176,9 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         if (!AesBlockCrypt(state.key.span(), encrypted_separate, separate, false)) {
             return std::nullopt;
         }
+        std::memcpy(
+            server_session_id.data(), separate.data(), server_session_id.size());
+        packet_id = GetU64BE(separate.data() + kSs2022UdpSessionIdSize);
         const size_t body_offset = kSs2022UdpSeparateHeaderSize;
         const size_t ciphertext_len = datagram_len - body_offset;
         plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
@@ -1099,6 +1215,10 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
                 decoded.data())) {
             return std::nullopt;
         }
+        std::memcpy(
+            server_session_id.data(), decoded.data(), server_session_id.size());
+        packet_id = GetU64BE(
+            decoded.data() + kSs2022UdpSessionIdSize);
         plaintext.assign(
             decoded.begin() + kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize,
             decoded.end());
@@ -1108,6 +1228,9 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
 
     auto parsed = Parse2022ServerBodyPlaintext(plaintext, state.client_session_id);
     if (!parsed) {
+        return std::nullopt;
+    }
+    if (!state.receive_replay_cache.Accept(server_session_id, packet_id)) {
         return std::nullopt;
     }
 

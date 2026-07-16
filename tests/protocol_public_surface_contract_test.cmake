@@ -273,6 +273,23 @@ if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "Shadowsocks UDP scatter writes must not be silently discarded")
 endif()
+set(SHADOWSOCKS_UDP_HEADER
+    "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.hpp")
+set(SHADOWSOCKS_UDP_SOURCE
+    "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.cpp")
+file(READ "${SHADOWSOCKS_UDP_HEADER}" SHADOWSOCKS_UDP_HEADER_SOURCE)
+file(READ "${SHADOWSOCKS_UDP_SOURCE}" SHADOWSOCKS_UDP_SOURCE)
+if(NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
+        "class Ss2022UdpReplayWindow" OR
+   NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
+        "Ss2022UdpReplayCache&" OR
+   NOT SHADOWSOCKS_UDP_SOURCE MATCHES
+        "replay_cache[.]Accept[(]client_session_id, packet_id[)]" OR
+   NOT SHADOWSOCKS_UDP_SOURCE MATCHES
+        "receive_replay_cache[.]Accept[(]server_session_id, packet_id[)]")
+    message(FATAL_ERROR
+        "Shadowsocks 2022 UDP request and response paths must reject replayed packet IDs")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES

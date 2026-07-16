@@ -7,12 +7,56 @@
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace acpp::ss {
+
+class Ss2022UdpReplayWindow {
+public:
+    static constexpr size_t kWindowBits = 2048;
+
+    [[nodiscard]] bool Accept(uint64_t packet_id) noexcept;
+
+private:
+    static constexpr size_t kWordBits = 64;
+    static constexpr size_t kWordCount = kWindowBits / kWordBits;
+
+    void Advance(size_t distance) noexcept;
+
+    std::array<uint64_t, kWordCount> seen_{};
+    uint64_t highest_ = 0;
+    bool initialized_ = false;
+};
+
+// Worker-local cache. It deliberately rejects new sessions when full instead of
+// evicting a still-protected session and reopening a replay window.
+class Ss2022UdpReplayCache {
+public:
+    static constexpr size_t kMaxSessions = 16384;
+    static constexpr auto kRetention = std::chrono::seconds(65);
+
+    [[nodiscard]] bool Accept(
+        std::span<const uint8_t, 8> session_id,
+        uint64_t packet_id,
+        std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now());
+
+    [[nodiscard]] size_t Size() const noexcept { return sessions_.size(); }
+
+private:
+    struct Session {
+        Ss2022UdpReplayWindow window;
+        std::chrono::steady_clock::time_point last_seen;
+    };
+
+    void PruneExpired(std::chrono::steady_clock::time_point now);
+
+    memory::ThreadLocalUnorderedMap<uint64_t, Session> sessions_;
+};
 
 // ============================================================================
 // SS AEAD UDP 数据报格式（Xray/shadowsocks-go 兼容）
@@ -35,6 +79,7 @@ struct Ss2022UdpSessionState {
     std::array<uint8_t, 8> client_session_id{};
     std::array<uint8_t, 8> server_session_id{};
     uint64_t next_packet_id = 0;
+    Ss2022UdpReplayCache receive_replay_cache;
 };
 
 // SS UDP 解码结果
@@ -67,7 +112,8 @@ struct SsUdpDecodeResult {
     const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
-    size_t                       salt_size);
+    size_t                       salt_size,
+    Ss2022UdpReplayCache&        replay_cache);
 
 // ============================================================================
 // EncodeUdpPacket — 编码 SS AEAD UDP 回包

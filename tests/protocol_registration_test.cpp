@@ -58,7 +58,7 @@ public:
         std::string_view,
         std::string_view,
         const uint8_t*,
-        size_t) const override {
+        size_t) override {
         return std::nullopt;
     }
 
