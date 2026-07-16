@@ -1,6 +1,7 @@
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
+#include "acppnode/transport/internet/reality_server_name.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
@@ -81,7 +82,13 @@ struct RealityServerState {
                                  static_cast<uint16_t>(data[1]));
 }
 
-[[nodiscard]] bool ParseRealitySni(
+enum class RealitySniParseResult {
+    Missing,
+    Present,
+    Invalid,
+};
+
+[[nodiscard]] RealitySniParseResult ParseRealitySni(
     const SSL_CLIENT_HELLO& hello,
     std::string_view& out) noexcept {
     const uint8_t* ext = nullptr;
@@ -90,15 +97,16 @@ struct RealityServerState {
             &hello,
             TLSEXT_TYPE_server_name,
             &ext,
-            &ext_len) != 1 ||
-        !ext ||
-        ext_len < 2) {
-        return false;
+            &ext_len) != 1) {
+        return RealitySniParseResult::Missing;
+    }
+    if (!ext || ext_len < 2) {
+        return RealitySniParseResult::Invalid;
     }
 
     const uint16_t list_len = ReadBigEndianU16(ext);
-    if (static_cast<size_t>(list_len) + 2 > ext_len) {
-        return false;
+    if (static_cast<size_t>(list_len) + 2 != ext_len) {
+        return RealitySniParseResult::Invalid;
     }
 
     size_t pos = 2;
@@ -108,17 +116,19 @@ struct RealityServerState {
         const uint16_t name_len = ReadBigEndianU16(ext + pos);
         pos += 2;
         if (pos + name_len > end) {
-            return false;
+            return RealitySniParseResult::Invalid;
         }
         if (name_type == 0) {
             out = std::string_view(
                 unsafe::ptr_cast<const char>(ext + pos),
                 name_len);
-            return !out.empty();
+            return out.empty()
+                ? RealitySniParseResult::Invalid
+                : RealitySniParseResult::Present;
         }
         pos += name_len;
     }
-    return false;
+    return RealitySniParseResult::Invalid;
 }
 
 [[nodiscard]] std::optional<std::array<uint8_t, kRealityX25519KeySize>>
@@ -597,10 +607,13 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     }
 
     std::string_view sni;
-    if (!ParseRealitySni(*hello, sni) ||
-        std::find(state->server_names.begin(),
-                  state->server_names.end(),
-                  sni) == state->server_names.end()) {
+    const RealitySniParseResult sni_result = ParseRealitySni(*hello, sni);
+    if (sni_result == RealitySniParseResult::Invalid ||
+        !transport::internet::IsRealityServerNameAllowed(
+            state->server_names,
+            sni_result == RealitySniParseResult::Missing
+                ? std::string_view{}
+                : sni)) {
         return fail("server name not allowed");
     }
 

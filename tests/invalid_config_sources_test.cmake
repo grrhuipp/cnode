@@ -485,6 +485,9 @@ expect_rejected(missing_reality_inbound_server_name "{}" "inbounds.json"
 expect_rejected(missing_reality_inbound_short_id "{}" "inbounds.json"
     [=[[{"tag":"missing-reality-short-id","protocol":"vless","listen":"127.0.0.1","port":12106,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake"}}}]]=]
     "inbound REALITY requires at least one shortId")
+expect_started(valid_reality_missing_sni_allowlist
+    [=[{"workers":1}]=] "inbounds.json"
+    [=[[{"tag":"reality-without-sni","protocol":"vless","listen":"127.0.0.1","port":12107,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":[""],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=])
 expect_rejected(unsupported_reality_target_fallback "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "target fallback")
