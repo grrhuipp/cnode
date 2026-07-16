@@ -905,15 +905,18 @@ GeoSiteCondition::GeoSiteCondition(
     std::vector<std::string> tags,
     const ::acpp::geo::GeoManager* geo) {
     if (!geo) {
-        return;
+        throw std::logic_error(
+            "geosite condition reached runtime without GeoManager");
     }
     handles_.reserve(tags.size());
     for (auto& tag : tags) {
         ToLowerInPlace(tag);
         auto handle = geo->ResolveGeoSiteTag(tag);
-        if (handle.Valid()) {
-            handles_.push_back(handle);
+        if (!handle.Valid()) {
+            throw std::logic_error(
+                "unresolved geosite tag reached routing runtime");
         }
+        handles_.push_back(handle);
     }
 }
 
@@ -932,15 +935,18 @@ GeoIPCondition::GeoIPCondition(
     std::vector<std::string> tags,
     const ::acpp::geo::GeoManager* geo) {
     if (!geo) {
-        return;
+        throw std::logic_error(
+            "geoip condition reached runtime without GeoManager");
     }
     handles_.reserve(tags.size());
     for (auto& tag : tags) {
         ToLowerInPlace(tag);
         auto handle = geo->ResolveGeoIPTag(tag);
-        if (handle.Valid()) {
-            handles_.push_back(handle);
+        if (!handle.Valid()) {
+            throw std::logic_error(
+                "unresolved geoip tag reached routing runtime");
         }
+        handles_.push_back(handle);
     }
 }
 

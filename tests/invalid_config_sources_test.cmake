@@ -407,6 +407,12 @@ expect_rejected(empty_route_user "{}" "routing.json"
 expect_rejected(empty_route_geosite "{}" "routing.json"
     [=[{"rules":[{"geosite":[""],"outboundTag":"direct"}]}]=]
     "routing geosite tag must not be empty")
+expect_rejected(missing_route_geosite_database "{}" "routing.json"
+    [=[{"rules":[{"geosite":["cn"],"outboundTag":"direct"}]}]=]
+    "routing geosite tags require")
+expect_rejected(missing_route_geoip_database "{}" "routing.json"
+    [=[{"rules":[{"geoip":["cn"],"outboundTag":"direct"}]}]=]
+    "routing geoip tags require")
 expect_rejected(conditionless_route_rule "{}" "routing.json"
     [=[{"rules":[{"outboundTag":"direct"}]}]=]
     "routing rule must contain at least one condition")

@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <format>
+#include <stdexcept>
 
 namespace acpp {
 
@@ -57,6 +59,17 @@ std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
     std::unique_ptr<geo::GeoManager> geo_manager;
     auto geoip_path   = config.GetConfigDir() / constants::paths::kGeoIpFile;
     auto geosite_path = config.GetConfigDir() / constants::paths::kGeoSiteFile;
+    const auto geoip_tags = config.GetUsedGeoIPTags();
+    const auto geosite_tags = config.GetUsedGeoSiteTags();
+
+    if (!geoip_tags.empty() && !std::filesystem::exists(geoip_path)) {
+        throw std::runtime_error(std::format(
+            "routing geoip tags require '{}'", geoip_path.string()));
+    }
+    if (!geosite_tags.empty() && !std::filesystem::exists(geosite_path)) {
+        throw std::runtime_error(std::format(
+            "routing geosite tags require '{}'", geosite_path.string()));
+    }
 
     if (!std::filesystem::exists(geoip_path) && !std::filesystem::exists(geosite_path)) {
         return geo_manager;
@@ -64,13 +77,26 @@ std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
 
     geo_manager = std::make_unique<geo::GeoManager>();
     if (geo_manager->Init(geoip_path, geosite_path)) {
-        geo_manager->PreloadTags(config.GetUsedGeoIPTags(), config.GetUsedGeoSiteTags());
+        geo_manager->PreloadTags(geoip_tags, geosite_tags);
+        for (const auto& tag : geoip_tags) {
+            if (!geo_manager->ResolveGeoIPTag(tag).Valid()) {
+                throw std::runtime_error(std::format(
+                    "routing geoip tag '{}' was not loaded from '{}'",
+                    tag, geoip_path.string()));
+            }
+        }
+        for (const auto& tag : geosite_tags) {
+            if (!geo_manager->ResolveGeoSiteTag(tag).Valid()) {
+                throw std::runtime_error(std::format(
+                    "routing geosite tag '{}' was not loaded from '{}'",
+                    tag, geosite_path.string()));
+            }
+        }
         auto gs = geo_manager->GetStats();
         LOG_CONSOLE("geodata ready geoip_tags={} geosite_tags={}",
                     gs.geoip_tags_loaded, gs.geosite_tags_loaded);
     } else {
-        LOG_WARN("geodata init_failed");
-        geo_manager.reset();
+        throw std::runtime_error("geodata initialization failed");
     }
     return geo_manager;
 }
