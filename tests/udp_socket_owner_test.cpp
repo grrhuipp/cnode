@@ -56,6 +56,9 @@ static_assert(noexcept(
 
 int main() {
     acpp::TargetAddress callback_source;
+    callback_source.type = acpp::AddressType::IPv4;
+    callback_source.resolved_addr = acpp::net::ip::address_v4::loopback();
+    callback_source.port = 5353;
     std::array<uint8_t, 1> callback_payload{0x5a};
     acpp::UDPPacketView callback_packet{callback_source, callback_payload};
 
@@ -102,6 +105,48 @@ int main() {
     io_context.run();
     if (!reply_failure_reported) {
         Fail("UDP client reply callback failure was silently ignored");
+    }
+    io_context.restart();
+
+    std::vector<uint8_t> callback_large_payload(
+        acpp::buf::Buffer::kSize + 257, 0x6d);
+    acpp::buf::MultiBuffer callback_large_buffers;
+    if (!acpp::buf::AppendSpanToMultiBuffer(
+            callback_large_payload, callback_large_buffers)) {
+        Fail("failed to allocate large UDP callback payload");
+    }
+    for (acpp::buf::Buffer* buffer : callback_large_buffers) {
+        if (buffer && !buffer->IsEmpty()) {
+            buffer->SetUDP(callback_source);
+        }
+    }
+
+    size_t large_callback_count = 0;
+    bool large_callback_matches = false;
+    acpp::proxyman::inbound::UdpWorker::ClientSession large_reply_session(
+        io_context,
+        acpp::PacketCallback{[&](acpp::UDPPacketView packet) {
+            ++large_callback_count;
+            large_callback_matches =
+                packet.data.size() == callback_large_payload.size() &&
+                std::equal(packet.data.begin(), packet.data.end(),
+                           callback_large_payload.begin());
+        }},
+        2);
+    bool large_reply_failed = false;
+    acpp::net::co_spawn(
+        io_context,
+        large_reply_session.WriteMultiBuffer(std::move(callback_large_buffers)),
+        [&](std::exception_ptr error) {
+            large_reply_failed = error != nullptr;
+        });
+    io_context.run();
+    if (large_reply_failed || large_callback_count != 1 ||
+        !large_callback_matches) {
+        std::cerr << "large_reply_failed=" << large_reply_failed
+                  << " callback_count=" << large_callback_count
+                  << " callback_matches=" << large_callback_matches << '\n';
+        Fail("multi-buffer UDP reply was split into multiple datagrams");
     }
     io_context.restart();
 

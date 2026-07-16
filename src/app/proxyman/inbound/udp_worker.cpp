@@ -17,6 +17,7 @@
 #include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <limits>
 #include <unordered_map>
 
 namespace acpp::proxyman::inbound {
@@ -206,18 +207,59 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         co_return;
     }
 
-    for (buf::Buffer* buffer : mb) {
-        if (!buffer || buffer->IsEmpty() || !buffer->HasUDP()) {
+    const TargetAddress* target = nullptr;
+    const buf::Buffer* single_buffer = nullptr;
+    size_t buffer_count = 0;
+    size_t payload_size = 0;
+    for (const buf::Buffer* buffer : mb) {
+        if (!buffer || buffer->IsEmpty()) {
             continue;
         }
-        if (!impl_->reply_callback(UDPPacketView{
-                buffer->UDP(),
-                buffer->Bytes(),
-            })) {
+        if (!buffer->HasUDP() ||
+            (target && !target->SameEndpoint(buffer->UDP()))) {
             mb.clear();
             throw IoSystemError(
-                io_error::fault, "UDP client reply callback failed");
+                io_error::invalid_argument,
+                "UDP client reply contains missing or mixed endpoints");
         }
+        if (buffer->Len() > std::numeric_limits<size_t>::max() - payload_size) {
+            mb.clear();
+            throw IoSystemError(
+                io_error::message_size, "UDP client reply is too large");
+        }
+        if (!target) {
+            target = std::addressof(buffer->UDP());
+        }
+        single_buffer = buffer;
+        ++buffer_count;
+        payload_size += buffer->Len();
+    }
+
+    if (!target || buffer_count == 0) {
+        mb.clear();
+        co_return;
+    }
+
+    std::span<const uint8_t> payload;
+    memory::ByteVector coalesced;
+    if (buffer_count == 1) {
+        payload = single_buffer->Bytes();
+    } else {
+        coalesced.reserve(payload_size);
+        for (const buf::Buffer* buffer : mb) {
+            if (!buffer || buffer->IsEmpty()) {
+                continue;
+            }
+            const auto bytes = buffer->Bytes();
+            coalesced.insert(coalesced.end(), bytes.begin(), bytes.end());
+        }
+        payload = coalesced;
+    }
+
+    if (!impl_->reply_callback(UDPPacketView{*target, payload})) {
+        mb.clear();
+        throw IoSystemError(
+            io_error::fault, "UDP client reply callback failed");
     }
     mb.clear();
     co_return;

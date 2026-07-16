@@ -162,6 +162,16 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSession must reject empty receive callbacks")
 endif()
+set(UDP_WORKER_SOURCE_PATH
+    "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
+file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
+if(NOT UDP_WORKER_SOURCE MATCHES
+    "buffer_count == 1" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+    "coalesced[.]reserve[(]payload_size[)]")
+    message(FATAL_ERROR
+        "UDP ClientSession must preserve one datagram across Buffer chunks")
+endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
 if(WORKER_SOURCE MATCHES
