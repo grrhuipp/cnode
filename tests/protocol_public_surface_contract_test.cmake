@@ -233,7 +233,7 @@ endif()
 if(NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
         "request_body_state_[.]packet_mode = command_ == Command::UDP" OR
    NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
-        "ContiguousUdpDatagram packet[(]mb[)]" OR
+        "ContiguousBufferView packet[(]mb[)]" OR
    NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
         "EncodeRequestBodyChunk")
     message(FATAL_ERROR
@@ -242,7 +242,7 @@ endif()
 if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
         "state[.]packet_mode = request[.]command == Command::UDP" OR
    NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
-        "ContiguousUdpDatagram packet[(]mb[)]" OR
+        "ContiguousBufferView packet[(]mb[)]" OR
    NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
         "EncodeResponseBodyChunk[(]state, packet[.]Bytes[(][)], out_mb[)]")
     message(FATAL_ERROR
@@ -252,6 +252,26 @@ if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
         "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
     message(FATAL_ERROR
         "VMess server response writer must validate each UDP datagram atomically")
+endif()
+set(SHADOWSOCKS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/ss_outbound.cpp")
+file(READ "${SHADOWSOCKS_OUTBOUND}" SHADOWSOCKS_OUTBOUND_SOURCE)
+if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "buf::InspectUdpDatagram[(]mb[)]" OR
+   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "buf::ContiguousBufferView payload[(]mb[)]")
+    message(FATAL_ERROR
+        "Shadowsocks outbound must encode one complete MultiBuffer datagram")
+endif()
+if(SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "for [(]buf::Buffer[*] buffer : mb[)][ \t\r\n]*[{][\t\r\n ]*if .*EncodePacket")
+    message(FATAL_ERROR
+        "Shadowsocks outbound must not encode one UDP packet per Buffer")
+endif()
+if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "Shadowsocks UDP scatter write requires a target")
+    message(FATAL_ERROR
+        "Shadowsocks UDP scatter writes must not be silently discarded")
 endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)

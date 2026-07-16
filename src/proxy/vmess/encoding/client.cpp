@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "../udp_datagram.hpp"
 
 namespace acpp {
@@ -299,7 +300,7 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
     }
 
     if (state.packet_mode) {
-        const ::acpp::vmess::ContiguousUdpDatagram packet(mb);
+        const buf::ContiguousBufferView packet(mb);
         const auto bytes = packet.Bytes();
         if (bytes.size() >
             ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
@@ -347,7 +348,7 @@ net::awaitable<void> EncodeRequestBodyBuffers(
     }
 
     if (state.packet_mode) {
-        const ::acpp::vmess::ContiguousUdpDatagram packet(buffers);
+        const buf::ContiguousBufferView packet(buffers);
         const auto bytes = packet.Bytes();
         if (bytes.size() >
             ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {

@@ -10,6 +10,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/link.hpp"
@@ -212,52 +213,72 @@ public:
             mb.clear();
             throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
         }
-        memory::ByteVector scratch;
-        for (buf::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty() || !buffer->HasUDP()) {
-                continue;
-            }
-            const size_t encoded_len = EncodedPacketSize(*buffer);
-            if (encoded_len == 0) {
-                continue;
-            }
+        const auto datagram = buf::InspectUdpDatagram(mb);
+        if (datagram.status == buf::UdpDatagramStatus::Empty) {
+            co_return;
+        }
+        if (!datagram.Valid() || !datagram.target ||
+            !datagram.target->IsValid()) {
+            throw IoSystemError(
+                io_error::invalid_argument,
+                "Shadowsocks UDP datagram contains missing or mixed endpoints");
+        }
 
-            ErrorCode send_result = ErrorCode::OK;
-            if (encoded_len <= buf::Buffer::kSize) {
-                buf::BufferGuard encoded{buf::Buffer::New()};
-                if (!encoded) {
-                    throw std::bad_alloc();
-                }
-                const size_t written = EncodePacketTo(
-                    *buffer, encoded->Tail().data(), encoded->Available());
-                if (written != encoded_len) {
-                    continue;
-                }
-                encoded->Produce(static_cast<uint32_t>(written));
-                send_result = co_await session_.SendTo(
-                    server_, encoded->Bytes().data(), encoded->Len(), callback_id_);
-            } else {
-                scratch.resize(encoded_len);
-                const size_t written = EncodePacketTo(
-                    *buffer, scratch.data(), scratch.size());
-                if (written != encoded_len) {
-                    continue;
-                }
-                send_result = co_await session_.SendTo(
-                    server_, scratch.data(), scratch.size(), callback_id_);
+        const TargetAddress target = *datagram.target;
+        const buf::ContiguousBufferView payload(mb);
+        const auto bytes = payload.Bytes();
+        const size_t encoded_len = EncodedPacketSize(target, bytes);
+        if (encoded_len == 0) {
+            throw IoSystemError(
+                io_error::message_size,
+                "invalid Shadowsocks UDP datagram size or target");
+        }
+
+        ErrorCode send_result = ErrorCode::OK;
+        if (encoded_len <= buf::Buffer::kSize) {
+            buf::BufferGuard encoded{buf::Buffer::New()};
+            if (!encoded) {
+                throw std::bad_alloc();
             }
-            if (send_result != ErrorCode::OK) {
-                mb.clear();
-                throw IoSystemError(io_error::fault, std::string(ErrorCodeToString(send_result)));
+            const size_t written = EncodePacketTo(
+                target, bytes, encoded->Tail().data(), encoded->Available());
+            if (written != encoded_len) {
+                throw IoSystemError(
+                    io_error::fault, "Shadowsocks UDP packet encoding failed");
             }
+            encoded->Produce(static_cast<uint32_t>(written));
+            send_result = co_await session_.SendTo(
+                server_, encoded->Bytes().data(), encoded->Len(), callback_id_);
+        } else {
+            memory::ByteVector scratch(encoded_len);
+            const size_t written = EncodePacketTo(
+                target, bytes, scratch.data(), scratch.size());
+            if (written != encoded_len) {
+                throw IoSystemError(
+                    io_error::fault, "Shadowsocks UDP packet encoding failed");
+            }
+            send_result = co_await session_.SendTo(
+                server_, scratch.data(), scratch.size(), callback_id_);
+        }
+        if (send_result != ErrorCode::OK) {
+            throw IoSystemError(
+                io_error::fault, std::string(ErrorCodeToString(send_result)));
         }
         mb.clear();
         co_return;
     }
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override {
         if (closed_) {
             throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
+        }
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > 0) {
+                throw IoSystemError(
+                    io_error::invalid_argument,
+                    "Shadowsocks UDP scatter write requires a target");
+            }
         }
         co_return;
     }
@@ -355,21 +376,23 @@ public:
     }
 
 private:
-    [[nodiscard]] size_t EncodedPacketSize(const buf::Buffer& buffer) {
+    [[nodiscard]] size_t EncodedPacketSize(
+        const TargetAddress& target,
+        std::span<const uint8_t> payload) {
         if (ss2022_state_) {
             return ss::Encode2022UdpRequestPacketTo(
-                buffer.UDP(),
-                buffer.Bytes().data(),
-                buffer.Len(),
+                target,
+                payload.data(),
+                payload.size(),
                 *ss2022_state_,
                 psk_chain_,
                 nullptr,
                 0);
         }
         return ss::EncodeUdpPacketTo(
-            buffer.UDP(),
-            buffer.Bytes().data(),
-            buffer.Len(),
+            target,
+            payload.data(),
+            payload.size(),
             master_key_.span(),
             cipher_info_.type,
             cipher_info_.key_size,
@@ -378,23 +401,24 @@ private:
             0);
     }
 
-    [[nodiscard]] size_t EncodePacketTo(const buf::Buffer& buffer,
+    [[nodiscard]] size_t EncodePacketTo(const TargetAddress& target,
+                                        std::span<const uint8_t> payload,
                                         uint8_t* output,
                                         size_t output_size) {
         if (ss2022_state_) {
             return ss::Encode2022UdpRequestPacketTo(
-                buffer.UDP(),
-                buffer.Bytes().data(),
-                buffer.Len(),
+                target,
+                payload.data(),
+                payload.size(),
                 *ss2022_state_,
                 psk_chain_,
                 output,
                 output_size);
         }
         return ss::EncodeUdpPacketTo(
-            buffer.UDP(),
-            buffer.Bytes().data(),
-            buffer.Len(),
+            target,
+            payload.data(),
+            payload.size(),
             master_key_.span(),
             cipher_info_.type,
             cipher_info_.key_size,

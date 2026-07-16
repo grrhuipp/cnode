@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/infra/log.hpp"
@@ -339,7 +340,7 @@ net::awaitable<void> EncodeResponseBodyMultiBuffer(EncodeResponseBodyState& stat
     }
 
     if (state.packet_mode) {
-        const ::acpp::vmess::ContiguousUdpDatagram packet(mb);
+        const buf::ContiguousBufferView packet(mb);
         buf::MultiBuffer out_mb;
         EncodeResponseBodyChunk(state, packet.Bytes(), out_mb);
         co_await FlushResponseBody(state, stream, std::move(out_mb));
@@ -377,7 +378,7 @@ net::awaitable<void> EncodeResponseBodyBuffers(
     }
 
     if (state.packet_mode) {
-        const ::acpp::vmess::ContiguousUdpDatagram packet(buffers);
+        const buf::ContiguousBufferView packet(buffers);
         buf::MultiBuffer out_mb;
         EncodeResponseBodyChunk(state, packet.Bytes(), out_mb);
         co_await FlushResponseBody(state, stream, std::move(out_mb));

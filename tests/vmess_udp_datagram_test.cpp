@@ -1,4 +1,5 @@
 #include "udp_datagram.hpp"
+#include "acppnode/common/buf/contiguous_buffer_view.hpp"
 
 #include <algorithm>
 #include <array>
@@ -56,7 +57,7 @@ int main() {
     valid.push_back(MakeBuffer(buf::Buffer::kSize, &target, 0x11));
     valid.push_back(MakeBuffer(257, &target, 0x22));
     vmess::ValidateFixedUdpDatagram(valid, target);
-    const vmess::ContiguousUdpDatagram contiguous(valid);
+    const buf::ContiguousBufferView contiguous(valid);
     Check(contiguous.Bytes().size() == buf::Buffer::kSize + 257 &&
           std::all_of(
               contiguous.Bytes().begin(),
@@ -74,7 +75,7 @@ int main() {
         net::buffer(first),
         net::buffer(second),
     };
-    const vmess::ContiguousUdpDatagram scatter_packet(scatter);
+    const buf::ContiguousBufferView scatter_packet(scatter);
     Check(scatter_packet.Bytes().size() == first.size() + second.size(),
           "VMess scatter UDP datagram was split into multiple payloads");
 
