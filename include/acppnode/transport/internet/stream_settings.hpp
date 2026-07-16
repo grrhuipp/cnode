@@ -13,6 +13,11 @@
 
 namespace acpp {
 
+enum class StreamEndpointRole {
+    Inbound,
+    Outbound,
+};
+
 struct XHttpDownloadSettings;
 
 // ============================================================================
@@ -214,7 +219,8 @@ struct StreamSettings {
     // 供手动赋值场景调用（如面板动态配置构建）
     void RecomputeModes() noexcept;
 
-    static StreamSettings FromJson(const json::object& j);
+    static StreamSettings FromJson(
+        const json::object& j, StreamEndpointRole role);
 };
 
 struct XHttpDownloadSettings {

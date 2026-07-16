@@ -34,7 +34,8 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(std::move(stream_settings.error()));
     }
     if (*stream_settings) {
-        cfg.stream_settings = StreamSettings::FromJson(**stream_settings);
+        cfg.stream_settings = StreamSettings::FromJson(
+            **stream_settings, StreamEndpointRole::Outbound);
     }
 
     const json::value* send_through = j.if_contains("sendThrough");

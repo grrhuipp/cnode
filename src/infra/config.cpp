@@ -708,7 +708,8 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     }
     settings->send_through = std::move(*parsed_bind);
 
-    settings->stream_settings = StreamSettings::FromJson(j);
+    settings->stream_settings = StreamSettings::FromJson(
+        j, StreamEndpointRole::Outbound);
     if (settings->stream_settings.xhttp.download_settings) {
         throw std::invalid_argument("nested xhttp downloadSettings is not supported");
     }
@@ -891,7 +892,8 @@ std::string GrpcConfig::RequestPath() const {
     return path;
 }
 
-StreamSettings StreamSettings::FromJson(const json::object& j) {
+StreamSettings StreamSettings::FromJson(
+    const json::object& j, StreamEndpointRole role) {
     StreamSettings cfg;
 
     cfg.network  = lower_ascii_copy(
@@ -903,6 +905,21 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
     if (const auto* tls = optional_object(j, {"tlsSettings"})) {
         cfg.tls.server_name = jstr(*tls, "serverName", "");
         cfg.tls.allow_insecure = jbool(*tls, {"allowInsecure"}, false);
+        cfg.tls.ca_file = jstr(*tls, {"caFile", "ca_file"}, "");
+        if (role == StreamEndpointRole::Inbound &&
+            cfg.tls.allow_insecure) {
+            throw std::invalid_argument(
+                "inbound tls allowInsecure is not supported");
+        }
+        if (role == StreamEndpointRole::Inbound &&
+            !cfg.tls.ca_file.empty()) {
+            throw std::invalid_argument(
+                "inbound tls caFile is not supported");
+        }
+        if (cfg.tls.allow_insecure && !cfg.tls.ca_file.empty()) {
+            throw std::invalid_argument(
+                "tls caFile cannot be used with allowInsecure");
+        }
         // ALPN
         cfg.tls.alpn = jstr_array(*tls, {"alpn"});
         std::optional<std::pair<std::string, std::string>> certificate_entry;
@@ -1265,7 +1282,8 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 
     if (const auto* stream_settings = optional_object(
             j, {"streamSettings", "stream_settings"})) {
-        cfg.stream_settings = StreamSettings::FromJson(*stream_settings);
+        cfg.stream_settings = StreamSettings::FromJson(
+            *stream_settings, StreamEndpointRole::Inbound);
     }
 
     // Xray sniffing 配置

@@ -74,11 +74,26 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
         }
     }
 
+    if (config.allow_insecure && !config.ca_file.empty()) {
+        LOG_ERROR("TLS client CA cannot be used when certificate verification is disabled");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
     if (config.allow_insecure) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     } else {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-        SSL_CTX_set_default_verify_paths(ctx);
+        const int trust_loaded = config.ca_file.empty()
+            ? SSL_CTX_set_default_verify_paths(ctx)
+            : SSL_CTX_load_verify_locations(
+                ctx, config.ca_file.c_str(), nullptr);
+        if (trust_loaded != 1) {
+            LOG_ERROR("Failed to load TLS client trust store: {}",
+                      config.ca_file.empty() ? "system defaults"
+                                             : config.ca_file);
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
     }
 
     return std::unique_ptr<SslContext>(new SslContext(ctx));

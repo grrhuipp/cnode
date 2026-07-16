@@ -172,6 +172,24 @@ expect_rejected(non_object_tls_settings "{}" "outbounds.json"
 expect_rejected(non_object_tls_certificate "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[42]}}}]]=]
     "tls certificates entries must be objects")
+expect_rejected(non_string_tls_ca "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":42}}}]]=]
+    "caFile must be a string")
+expect_rejected(conflicting_tls_ca_aliases "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-ca-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"one.pem","ca_file":"two.pem"}}}]]=]
+    "caFile and ca_file must match")
+expect_rejected(insecure_tls_ca "{}" "outbounds.json"
+    [=[[{"tag":"bad-insecure-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":true,"caFile":"ca.pem"}}}]]=]
+    "tls caFile cannot be used with allowInsecure")
+expect_rejected(inbound_tls_ca "{}" "inbounds.json"
+    [=[[{"tag":"bad-inbound-ca","protocol":"vless","listen":"127.0.0.1","port":43191,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"caFile":"ca.pem"}}}]]=]
+    "inbound tls caFile is not supported")
+expect_rejected(inbound_allow_insecure "{}" "inbounds.json"
+    [=[[{"tag":"bad-inbound-insecure","protocol":"vless","listen":"127.0.0.1","port":43192,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    "inbound tls allowInsecure is not supported")
+expect_started(equal_tls_ca_aliases
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"same.pem","ca_file":"same.pem"}}}]]=])
 expect_rejected(non_array_tls_certificates "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-certificates","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":{}}}}]]=]
     "tls certificates must be an array")
