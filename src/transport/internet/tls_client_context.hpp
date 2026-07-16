@@ -4,7 +4,10 @@
 
 #include "acppnode/transport/internet/tls_config.hpp"
 
+#include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace acpp {
 
@@ -15,5 +18,9 @@ namespace acpp {
     SSL_CTX* context,
     TlsVersion min_version,
     TlsVersion max_version) noexcept;
+
+[[nodiscard]] bool EncodeTlsAlpnProtocols(
+    std::span<const std::string> protocols,
+    std::vector<unsigned char>& wire);
 
 }  // namespace acpp

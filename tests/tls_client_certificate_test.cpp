@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -241,6 +242,31 @@ int main() {
     if (!Require(dns_verified,
                  "DNS SAN certificate must verify for its configured identity")) {
         return 19;
+    }
+
+    std::vector<unsigned char> alpn_wire;
+    const std::vector<std::string> valid_alpn = {"h2", "http/1.1"};
+    const std::vector<unsigned char> expected_alpn_wire = {
+        2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    if (!Require(acpp::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
+                     alpn_wire == expected_alpn_wire,
+                 "valid ALPN protocols must have canonical wire encoding")) {
+        return 20;
+    }
+    const std::vector<std::string> empty_alpn = {""};
+    if (!Require(!acpp::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
+                 "empty ALPN protocol must be rejected")) {
+        return 21;
+    }
+    const std::vector<std::string> overlong_alpn = {std::string(256, 'a')};
+    if (!Require(!acpp::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
+                 "overlong ALPN protocol must be rejected")) {
+        return 22;
+    }
+    const std::vector<std::string> duplicate_alpn = {"h2", "h2"};
+    if (!Require(!acpp::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
+                 "duplicate ALPN protocol must be rejected")) {
+        return 23;
     }
     return 0;
 }

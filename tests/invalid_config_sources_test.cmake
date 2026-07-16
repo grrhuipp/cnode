@@ -6,6 +6,7 @@ if(NOT DEFINED TEST_ROOT)
 endif()
 
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_FILE}" EXISTING_TEST_FILE)
+string(REPEAT "a" 256 ALPN_TOO_LONG)
 
 function(expect_rejected case_name main_content sidecar_name sidecar_content)
     set(case_dir "${TEST_ROOT}/${case_name}")
@@ -190,6 +191,15 @@ expect_rejected(incompatible_reality_tls_version "{}" "outbounds.json"
 expect_started(equal_tls_version_aliases
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-tls-version-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","min_version":"1.3","maxVersion":"1.3","max_version":"1.3"}}}]]=])
+expect_rejected(empty_tls_alpn "{}" "outbounds.json"
+    [=[[{"tag":"bad-empty-alpn","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":[""]}}}]]=]
+    "tls alpn entries must contain between 1 and 255 bytes")
+expect_rejected(overlong_tls_alpn "{}" "outbounds.json"
+    "[{\"tag\":\"bad-long-alpn\",\"protocol\":\"vless\",\"settings\":{\"server\":\"example.com\",\"server_port\":443,\"uuid\":\"b831381d-6324-4d53-ad4f-8cda48b30811\",\"encryption\":\"none\"},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"example.com\",\"alpn\":[\"${ALPN_TOO_LONG}\"]}}}]"
+    "tls alpn entries must contain between 1 and 255 bytes")
+expect_rejected(duplicate_tls_alpn "{}" "outbounds.json"
+    [=[[{"tag":"bad-duplicate-alpn","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h2","h2"]}}}]]=]
+    "tls alpn entries must contain between 1 and 255 bytes and must be unique")
 expect_rejected(non_string_tls_ca "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":42}}}]]=]
     "caFile must be a string")

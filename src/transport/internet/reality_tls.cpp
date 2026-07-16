@@ -849,7 +849,10 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
 
     auto out = std::unique_ptr<SslContext>(
         new SslContext(ctx, std::static_pointer_cast<void>(state)));
-    out->ConfigureServerAlpn(tls_config.alpn);
+    if (!out->ConfigureServerAlpn(tls_config.alpn)) {
+        LOG_ERROR("Invalid REALITY server ALPN policy");
+        return nullptr;
+    }
     LOG_INFO("REALITY server context enabled (serverNames={}, shortIds={})",
              reality.server_names.size(),
              reality.short_ids.size());

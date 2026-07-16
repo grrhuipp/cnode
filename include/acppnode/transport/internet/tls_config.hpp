@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -10,6 +12,19 @@ enum class TlsVersion : uint8_t {
     V1_2 = 2,
     V1_3 = 3,
 };
+
+[[nodiscard]] inline bool IsValidTlsAlpn(
+    std::span<const std::string> protocols) noexcept {
+    for (std::size_t i = 0; i < protocols.size(); ++i) {
+        if (protocols[i].empty() || protocols[i].size() > 255) {
+            return false;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (protocols[j] == protocols[i]) return false;
+        }
+    }
+    return true;
+}
 
 // ============================================================================
 // TLS 配置

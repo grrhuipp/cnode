@@ -53,7 +53,8 @@ private:
     explicit SslContext(SSL_CTX* ctx, std::shared_ptr<void> app_state = {})
         : ctx_(ctx)
         , app_state_(std::move(app_state)) {}
-    void ConfigureServerAlpn(const std::vector<std::string>& protocols);
+    [[nodiscard]] bool ConfigureServerAlpn(
+        const std::vector<std::string>& protocols);
 
     SSL_CTX* ctx_ = nullptr;
     std::shared_ptr<void> app_state_;
@@ -82,7 +83,7 @@ public:
     [[nodiscard]] bool SetServerIdentity(std::string_view identity);
 
     // 设置 ALPN（客户端调用）
-    void SetAlpn(const std::vector<std::string>& protocols);
+    [[nodiscard]] bool SetAlpn(const std::vector<std::string>& protocols);
 
     // 设置 REALITY 客户端认证（客户端调用）
     bool SetRealityClient(const RealityConfig& reality);

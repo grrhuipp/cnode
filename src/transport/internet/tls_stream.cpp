@@ -100,7 +100,10 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
     }
 
     auto out = std::unique_ptr<SslContext>(new SslContext(ctx));
-    out->ConfigureServerAlpn(config.alpn);
+    if (!out->ConfigureServerAlpn(config.alpn)) {
+        LOG_ERROR("Invalid TLS server ALPN policy");
+        return nullptr;
+    }
     return out;
 }
 
@@ -197,27 +200,22 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
              default_name);
     auto out = std::unique_ptr<SslContext>(
         new SslContext(ctx, std::move(default_name_state)));
-    out->ConfigureServerAlpn(config.alpn);
+    if (!out->ConfigureServerAlpn(config.alpn)) {
+        LOG_ERROR("Invalid auto-sign TLS ALPN policy");
+        return nullptr;
+    }
     return out;
 }
 
-void SslContext::ConfigureServerAlpn(const std::vector<std::string>& protocols) {
-    server_alpn_wire_.clear();
-    for (const auto& proto : protocols) {
-        if (proto.empty() || proto.size() > 255) {
-            continue;
-        }
-        server_alpn_wire_.push_back(static_cast<unsigned char>(proto.size()));
-        server_alpn_wire_.insert(
-            server_alpn_wire_.end(),
-            proto.begin(),
-            proto.end());
-    }
+bool SslContext::ConfigureServerAlpn(
+    const std::vector<std::string>& protocols) {
+    if (!EncodeTlsAlpnProtocols(protocols, server_alpn_wire_)) return false;
 
     if (!server_alpn_wire_.empty()) {
         SSL_CTX_set_app_data(ctx_, this);
         SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, nullptr);
     }
+    return true;
 }
 
 // ============================================================================
@@ -416,22 +414,13 @@ bool TlsStream::SetServerIdentity(std::string_view identity) {
     return !is_server_ && ConfigureTlsServerIdentity(ssl, identity);
 }
 
-void TlsStream::SetAlpn(const std::vector<std::string>& protocols) {
+bool TlsStream::SetAlpn(const std::vector<std::string>& protocols) {
     SSL* ssl = NativeSsl();
-    if (protocols.empty() || !ssl) return;
+    if (!ssl) return false;
 
     std::vector<unsigned char> alpn;
-    for (const auto& proto : protocols) {
-        if (proto.empty() || proto.size() > 255) {
-            continue;
-        }
-        alpn.push_back(static_cast<unsigned char>(proto.size()));
-        alpn.insert(alpn.end(), proto.begin(), proto.end());
-    }
-
-    if (!alpn.empty()) {
-        SSL_set_alpn_protos(ssl, alpn.data(), static_cast<unsigned int>(alpn.size()));
-    }
+    if (!EncodeTlsAlpnProtocols(protocols, alpn)) return false;
+    return SSL_set_alpn_protos(ssl, alpn.data(), alpn.size()) == 0;
 }
 
 net::awaitable<bool> TlsStream::Handshake() {
@@ -668,8 +657,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
         co_return nullptr;
     }
-    if (!alpn.empty()) {
-        stream->SetAlpn(alpn);
+    if (!alpn.empty() && !stream->SetAlpn(alpn)) {
+        co_return nullptr;
     }
 
     if (!co_await stream->Handshake()) {
@@ -691,8 +680,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
         co_return nullptr;
     }
-    if (!alpn.empty()) {
-        stream->SetAlpn(alpn);
+    if (!alpn.empty() && !stream->SetAlpn(alpn)) {
+        co_return nullptr;
     }
     if (!stream->SetRealityClient(reality)) {
         co_return nullptr;

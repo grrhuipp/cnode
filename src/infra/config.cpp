@@ -946,6 +946,11 @@ StreamSettings StreamSettings::FromJson(
         }
         // ALPN
         cfg.tls.alpn = jstr_array(*tls, {"alpn"});
+        if (!IsValidTlsAlpn(cfg.tls.alpn)) {
+            throw std::invalid_argument(
+                "tls alpn entries must contain between 1 and 255 bytes "
+                "and must be unique");
+        }
         std::optional<std::pair<std::string, std::string>> certificate_entry;
         if (const auto* certificates = tls->if_contains("certificates")) {
             if (!certificates->is_array()) {

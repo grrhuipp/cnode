@@ -37,6 +37,24 @@ bool ConfigureTlsProtocolVersions(
         SSL_CTX_set_max_proto_version(context, maximum) == 1;
 }
 
+bool EncodeTlsAlpnProtocols(
+    std::span<const std::string> protocols,
+    std::vector<unsigned char>& wire) {
+    wire.clear();
+    if (!IsValidTlsAlpn(protocols)) return false;
+
+    std::size_t wire_size = 0;
+    for (const auto& protocol : protocols) {
+        wire_size += 1 + protocol.size();
+    }
+    wire.reserve(wire_size);
+    for (const auto& protocol : protocols) {
+        wire.push_back(static_cast<unsigned char>(protocol.size()));
+        wire.insert(wire.end(), protocol.begin(), protocol.end());
+    }
+    return true;
+}
+
 bool ConfigureTlsServerIdentity(
     SSL* ssl, std::string_view identity) noexcept {
     if (!ssl || identity.empty() || identity.find('\0') != std::string_view::npos) {
