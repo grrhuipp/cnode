@@ -98,6 +98,25 @@ struct TimeoutScheduler::Impl {
         });
     }
 
+    void ReconcileTimerAfterCancellation() {
+        PruneHeapTop();
+        if (!timer_armed) {
+            return;
+        }
+        if (!deadline_heap.empty() &&
+            deadline_heap.front().deadline == armed_deadline) {
+            return;
+        }
+
+        ++timer_generation;
+        IoErrorCode ec;
+        timer.cancel(ec);
+        timer_armed = false;
+        if (!deadline_heap.empty()) {
+            ArmTimer();
+        }
+    }
+
     void OnTimer(const IoErrorCode& ec) {
         timer_armed = false;
         if (released) return;
@@ -254,7 +273,10 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) {
     if (!token.Valid()) return;
 
     if (!impl_->released) {
-        impl_->events.erase(token.id);
+        const bool removed = impl_->events.erase(token.id) != 0;
+        if (removed) {
+            impl_->ReconcileTimerAfterCancellation();
+        }
     }
     token.Reset();
 }

@@ -1,6 +1,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <chrono>
+#include <future>
 #include <stdexcept>
 #include <thread>
 
@@ -60,6 +61,25 @@ int main() {
 
     scheduler.Cancel(throwing);
     scheduler.Cancel(after_throw);
+
+    auto long_lived = scheduler.ScheduleAfter(1h, []() {});
+    scheduler.Cancel(long_lived);
+
+    io_context.restart();
+    std::promise<void> run_finished;
+    auto run_finished_future = run_finished.get_future();
+    std::thread runner([&]() {
+        io_context.run();
+        run_finished.set_value();
+    });
+    if (run_finished_future.wait_for(1s) != std::future_status::ready) {
+        io_context.stop();
+        runner.join();
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 6;
+    }
+    runner.join();
+
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;
 }
