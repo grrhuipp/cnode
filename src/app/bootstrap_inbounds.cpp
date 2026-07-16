@@ -77,6 +77,8 @@ net::awaitable<bool> SetupWorkerInbounds(
     Worker& worker,
     std::vector<StaticInboundRuntimeEntry> inbounds,
     ConnectionLimiterPtr connection_limiter) {
+    co_await worker.StartRuntimeTask();
+
     std::vector<std::string> installed;
     installed.reserve(inbounds.size());
 
@@ -150,10 +152,6 @@ InboundStartup QueueInboundStartup(
     startup.tags.reserve(startup.entries.size());
     for (const auto& inbound : startup.entries) {
         startup.tags.push_back(inbound.tag);
-    }
-
-    if (startup.entries.empty()) {
-        return startup;
     }
 
     startup.worker_results.reserve(workers.size());

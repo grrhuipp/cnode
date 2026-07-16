@@ -187,6 +187,7 @@ struct Worker::RuntimeState {
     std::unique_ptr<rule::Manager> rule_manager;
     std::unique_ptr<app::MuxSessionHandler> mux_session_handler;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
+    bool started = false;
 };
 
 namespace {
@@ -248,7 +249,20 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
                const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
                geo::GeoManager* geo_manager)
     : id_(id)
-    , runtime_(std::make_unique<RuntimeState>(io_context, runtime_config, stats, geo_manager)) {
+    , runtime_(std::make_unique<RuntimeState>(
+          io_context, runtime_config, stats, geo_manager)) {}
+
+Worker::~Worker() = default;
+
+net::io_context::executor_type Worker::GetExecutor() {
+    return runtime_->io_context.get_executor();
+}
+
+net::awaitable<void> Worker::StartRuntimeTask() {
+    if (runtime_->started) {
+        co_return;
+    }
+
     runtime_->dispatcher->BindRuleManager(*runtime_->rule_manager);
     runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
     runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
@@ -260,20 +274,16 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     const std::string_view default_outbound_tag = runtime_snapshot->default_outbound_tag.empty()
         ? std::string_view(constants::protocol::kDirect)
         : std::string_view(runtime_snapshot->default_outbound_tag);
-    runtime_->InitRouter(*this, runtime_snapshot->routing, default_outbound_tag, geo_manager);
-}
-
-Worker::~Worker() = default;
-
-net::io_context::executor_type Worker::GetExecutor() {
-    return runtime_->io_context.get_executor();
-}
-
-void Worker::StartWorkerLocalServices() {
+    runtime_->InitRouter(
+        *this,
+        runtime_snapshot->routing,
+        default_outbound_tag,
+        runtime_->geo_manager);
     runtime_->udp_session_manager->StartCleanup();
-    const auto runtime_snapshot = runtime_->Snapshot();
+    runtime_->started = true;
     LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
               id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
+    co_return;
 }
 
 // ============================================================================
