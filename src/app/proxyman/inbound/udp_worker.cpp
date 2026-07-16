@@ -17,7 +17,6 @@
 #include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
 
-#include <limits>
 #include <unordered_map>
 
 namespace acpp::proxyman::inbound {
@@ -207,45 +206,24 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         co_return;
     }
 
-    const TargetAddress* target = nullptr;
-    const buf::Buffer* single_buffer = nullptr;
-    size_t buffer_count = 0;
-    size_t payload_size = 0;
-    for (const buf::Buffer* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        if (!buffer->HasUDP() ||
-            (target && !target->SameEndpoint(buffer->UDP()))) {
-            mb.clear();
-            throw IoSystemError(
-                io_error::invalid_argument,
-                "UDP client reply contains missing or mixed endpoints");
-        }
-        if (buffer->Len() > std::numeric_limits<size_t>::max() - payload_size) {
-            mb.clear();
-            throw IoSystemError(
-                io_error::message_size, "UDP client reply is too large");
-        }
-        if (!target) {
-            target = std::addressof(buffer->UDP());
-        }
-        single_buffer = buffer;
-        ++buffer_count;
-        payload_size += buffer->Len();
-    }
-
-    if (!target || buffer_count == 0) {
+    const auto datagram = buf::InspectUdpDatagram(mb);
+    if (datagram.status == buf::UdpDatagramStatus::Empty) {
         mb.clear();
         co_return;
+    }
+    if (!datagram.Valid()) {
+        mb.clear();
+        throw IoSystemError(
+            io_error::invalid_argument,
+            "UDP client reply contains missing or mixed endpoints");
     }
 
     std::span<const uint8_t> payload;
     memory::ByteVector coalesced;
-    if (buffer_count == 1) {
-        payload = single_buffer->Bytes();
+    if (datagram.buffer_count == 1) {
+        payload = datagram.single_buffer->Bytes();
     } else {
-        coalesced.reserve(payload_size);
+        coalesced.reserve(datagram.payload_size);
         for (const buf::Buffer* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
@@ -256,7 +234,7 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         payload = coalesced;
     }
 
-    if (!impl_->reply_callback(UDPPacketView{*target, payload})) {
+    if (!impl_->reply_callback(UDPPacketView{*datagram.target, payload})) {
         mb.clear();
         throw IoSystemError(
             io_error::fault, "UDP client reply callback failed");

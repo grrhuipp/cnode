@@ -657,39 +657,37 @@ public:
             co_return;
         }
 
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            if (!buffer->HasUDP()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-
-            const size_t payload_bytes = buffer->Len();
-            if (!reply_queue_.CanPushUdp(payload_bytes)) {
-                const uint64_t dropped = ++reply_queue_.udp_dropped;
-                if (dropped % 100 == 1) {
-                    LOG_ACCESS_DEBUG(
-                        "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
-                        parent_conn_id_, dropped);
-                }
-                mb.FreeSlot(buffer);
-                continue;
-            }
-
-            MuxReply reply;
-            reply.session_id = session_id_;
-            reply.is_end = false;
-            reply.is_udp = true;
-            reply.udp_src = buffer->UDP();
-            reply.payload_size = payload_bytes;
-            reply.payload.push_back(mb.ReleaseSlot(buffer));
-            reply_queue_.PushUdpPrepared(
-                std::move(reply), payload_bytes + kMuxReplyOverhead);
+        const auto datagram = buf::InspectUdpDatagram(mb);
+        if (datagram.status == buf::UdpDatagramStatus::Empty) {
+            mb.clear();
+            co_return;
         }
-        mb.clear();
+        if (!datagram.Valid()) {
+            mb.clear();
+            throw IoSystemError(
+                io_error::invalid_argument,
+                "Mux UDP reply contains missing or mixed endpoints");
+        }
+        if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
+            const uint64_t dropped = ++reply_queue_.udp_dropped;
+            if (dropped % 100 == 1) {
+                LOG_ACCESS_DEBUG(
+                    "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
+                    parent_conn_id_, dropped);
+            }
+            mb.clear();
+            co_return;
+        }
+
+        MuxReply reply;
+        reply.session_id = session_id_;
+        reply.is_end = false;
+        reply.is_udp = true;
+        reply.udp_src = *datagram.target;
+        reply.payload_size = datagram.payload_size;
+        mb.MoveTo(reply.payload, true);
+        reply_queue_.PushUdpPrepared(
+            std::move(reply), datagram.payload_size + kMuxReplyOverhead);
         co_return;
     }
 

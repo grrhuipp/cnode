@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -825,6 +826,60 @@ private:
 // 计算 MultiBuffer 中所有 Buffer 的有效字节总数
 inline size_t TotalLen(const MultiBuffer& mb) noexcept {
     return mb.byte_size();
+}
+
+enum class UdpDatagramStatus : uint8_t {
+    Empty,
+    Valid,
+    MissingTarget,
+    MixedTarget,
+    SizeOverflow,
+};
+
+// UDP 链路的一次 Read/WriteMultiBuffer 必须表示一份 datagram；多个 Buffer
+// 只是同一报文的存储分块。返回的指针仅在 MultiBuffer 未修改期间有效。
+struct UdpDatagramInfo {
+    UdpDatagramStatus status = UdpDatagramStatus::Empty;
+    const TargetAddress* target = nullptr;
+    const Buffer* single_buffer = nullptr;
+    size_t buffer_count = 0;
+    size_t payload_size = 0;
+
+    [[nodiscard]] bool Valid() const noexcept {
+        return status == UdpDatagramStatus::Valid;
+    }
+};
+
+[[nodiscard]] inline UdpDatagramInfo InspectUdpDatagram(
+    const MultiBuffer& mb) noexcept {
+    UdpDatagramInfo info;
+    for (const Buffer* buffer : mb) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        if (!buffer->HasUDP()) {
+            info.status = UdpDatagramStatus::MissingTarget;
+            return info;
+        }
+        if (info.target && !info.target->SameEndpoint(buffer->UDP())) {
+            info.status = UdpDatagramStatus::MixedTarget;
+            return info;
+        }
+        if (buffer->Len() > std::numeric_limits<size_t>::max() - info.payload_size) {
+            info.status = UdpDatagramStatus::SizeOverflow;
+            return info;
+        }
+        if (!info.target) {
+            info.target = std::addressof(buffer->UDP());
+        }
+        info.single_buffer = buffer;
+        ++info.buffer_count;
+        info.payload_size += buffer->Len();
+    }
+    if (info.buffer_count != 0) {
+        info.status = UdpDatagramStatus::Valid;
+    }
+    return info;
 }
 
 [[nodiscard]] inline bool HasData(const MultiBuffer& mb) noexcept {

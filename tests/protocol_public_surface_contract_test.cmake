@@ -95,6 +95,13 @@ if(MUX_RELAY_SOURCE MATCHES "packet_len > buf::Buffer::kSize")
     message(FATAL_ERROR
         "XUDP wire packet length must not be limited by one internal Buffer")
 endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "const auto datagram = buf::InspectUdpDatagram[(]mb[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+        "mb[.]MoveTo[(]reply[.]payload, true[)]")
+    message(FATAL_ERROR
+        "Mux UDP replies must preserve one datagram across Buffer chunks")
+endif()
 set(VLESS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
 file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
@@ -114,7 +121,7 @@ endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES
-        "if [(]buffer_count == 1[)]")
+        "buf::InspectUdpDatagram[(]read_mb[)]")
     message(FATAL_ERROR
         "UDP relay must preserve one ReadMultiBuffer as one datagram")
 endif()
@@ -166,9 +173,9 @@ set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
 file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
 if(NOT UDP_WORKER_SOURCE MATCHES
-    "buffer_count == 1" OR
+    "datagram[.]buffer_count == 1" OR
    NOT UDP_WORKER_SOURCE MATCHES
-    "coalesced[.]reserve[(]payload_size[)]")
+    "coalesced[.]reserve[(]datagram[.]payload_size[)]")
     message(FATAL_ERROR
         "UDP ClientSession must preserve one datagram across Buffer chunks")
 endif()
