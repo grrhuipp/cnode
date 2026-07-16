@@ -691,10 +691,6 @@ public:
         co_return;
     }
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
-        co_return;
-    }
-
     net::awaitable<void> AsyncShutdownWrite() override {
         PushEnd();
         co_return;

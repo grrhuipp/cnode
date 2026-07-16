@@ -113,10 +113,6 @@ public:
         co_await trojan::WriteUdpDatagram(dst_, std::move(mb));
     }
 
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
-        co_return;
-    }
-
 private:
     AsyncStream& dst_;
 };

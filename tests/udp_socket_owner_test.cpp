@@ -143,6 +143,30 @@ int main() {
     }
     io_context.restart();
 
+    size_t raw_reply_callbacks = 0;
+    acpp::proxyman::inbound::UdpWorker::ClientSession raw_reply_session(
+        io_context,
+        acpp::RoutedPacketCallback{
+            [&](acpp::UDPPacketView, const acpp::udp::endpoint&) {
+                ++raw_reply_callbacks;
+            }},
+        reply_endpoint_a,
+        default_owner);
+    std::array<acpp::net::const_buffer, 1> raw_reply_buffers{
+        acpp::net::buffer(callback_payload)};
+    bool raw_reply_rejected = false;
+    acpp::net::co_spawn(
+        io_context,
+        raw_reply_session.WriteBuffers(raw_reply_buffers),
+        [&](std::exception_ptr error) {
+            raw_reply_rejected = error != nullptr;
+        });
+    io_context.run();
+    if (!raw_reply_rejected || raw_reply_callbacks != 0) {
+        Fail("UDP raw scatter write was silently reported as delivered");
+    }
+    io_context.restart();
+
     std::vector<uint8_t> callback_large_payload(
         acpp::buf::Buffer::kSize + 257, 0x6d);
     acpp::buf::MultiBuffer callback_large_buffers;

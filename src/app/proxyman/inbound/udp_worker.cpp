@@ -271,11 +271,6 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
     co_return;
 }
 
-net::awaitable<void>
-UdpWorker::ClientSession::WriteBuffers(std::span<const net::const_buffer>) {
-    co_return;
-}
-
 struct UdpWorker::Impl {
     using UdpSocketMap =
         memory::ThreadLocalUnorderedMap<std::string, UdpWorker::SocketPtr>;

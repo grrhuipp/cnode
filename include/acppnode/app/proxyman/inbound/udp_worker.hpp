@@ -171,7 +171,6 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
 
 private:
     struct Impl;

@@ -370,6 +370,13 @@ set(UDP_HANDLER_HEADER_PATH
 file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
 file(READ "${UDP_WORKER_HEADER_PATH}" UDP_WORKER_HEADER_SOURCE)
 file(READ "${UDP_HANDLER_HEADER_PATH}" UDP_HANDLER_HEADER_SOURCE)
+set(LINK_HEADER_PATH "${SOURCE_DIR}/include/acppnode/transport/link.hpp")
+file(READ "${LINK_HEADER_PATH}" LINK_HEADER_SOURCE)
+set(MUX_RELAY_SOURCE_PATH "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+file(READ "${MUX_RELAY_SOURCE_PATH}" MUX_RELAY_SOURCE)
+set(TROJAN_INBOUND_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp")
+file(READ "${TROJAN_INBOUND_SOURCE_PATH}" TROJAN_INBOUND_SOURCE)
 if(NOT UDP_WORKER_SOURCE MATCHES
         "datagram[.]buffer_count == 1" OR
    NOT UDP_WORKER_SOURCE MATCHES
@@ -387,6 +394,17 @@ if(NOT UDP_WORKER_SOURCE MATCHES
         "bool[\r\n ]+Push[(]")
     message(FATAL_ERROR
         "UDP input and reply queues must expose bounded backpressure")
+endif()
+if(NOT LINK_HEADER_SOURCE MATCHES
+        "co_await WriteMultiBuffer[(]std::move[(]payload[)][)]" OR
+   UDP_WORKER_SOURCE MATCHES
+        "ClientSession::WriteBuffers" OR
+   MUX_RELAY_SOURCE MATCHES
+        "WriteBuffers[(]std::span<const net::const_buffer>[)][\r\n ]*override[\r\n ]*[{][\r\n ]*co_return" OR
+   TROJAN_INBOUND_SOURCE MATCHES
+        "WriteBuffers[(]std::span<const net::const_buffer>[)][\r\n ]*override[\r\n ]*[{][\r\n ]*co_return")
+    message(FATAL_ERROR
+        "packet writers must not silently discard raw scatter writes")
 endif()
 if(NOT UDP_WORKER_SOURCE MATCHES
         "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR
