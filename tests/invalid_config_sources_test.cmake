@@ -148,6 +148,22 @@ expect_rejected(string_trojan_outbound_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"trojan","settings":{"server":"example.com","server_port":"443","password":"secret"}}]]=])
 expect_rejected(overflow_ss_outbound_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":65536,"method":"aes-256-gcm","password":"secret"}}]]=])
+expect_rejected(invalid_ss_uot_boolean_version "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":3}}]]=])
+expect_rejected(non_boolean_ss_uot "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":"true"}}]]=])
+expect_rejected(invalid_ss_uot_object_version "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","udp_over_tcp":{"enabled":true,"version":3}}}]]=])
+expect_rejected(non_boolean_ss_uot_enabled "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","udp_over_tcp":{"enabled":1,"version":2}}}]]=])
+expect_rejected(conflicting_ss_uot_aliases "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":false,"udp_over_tcp":true}}]]=])
+expect_rejected(conflicting_ss_uot_version_aliases "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":1,"uot_version":2}}]]=])
+expect_rejected(orphan_ss_uot_version "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uotVersion":2}}]]=])
+expect_rejected(nested_invalid_ss_uot_version "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":3}]}}]]=])
 expect_rejected(invalid_anytls_preferred_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":"bad","port":443,"password":"secret"}}]]=])
 expect_rejected(non_integer_anytls_idle_check_interval "{}" "outbounds.json"

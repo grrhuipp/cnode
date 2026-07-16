@@ -1,4 +1,5 @@
 #include "acppnode/proxy/shadowsocks/outbound/ss_outbound.hpp"
+#include "ss_outbound_uot.hpp"
 #include "../client.hpp"
 #include "../ss_udp.hpp"
 #include "../../uot/uot.hpp"
@@ -513,7 +514,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     }
 
     const bool use_uot =
-        ctx.content.network == Network::UDP && config_.uot_version != 0;
+        ctx.content.network == Network::UDP && config_.uot_version.has_value();
 
     if (ctx.content.network == Network::UDP && !use_uot) {
         if (!udp_session_manager_) {
@@ -585,7 +586,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     const TargetAddress protocol_target = use_uot
         ? TargetAddress(
-            config_.uot_version == static_cast<uint8_t>(proxy::uot::Version::V1)
+            *config_.uot_version == SsUotVersion::V1
                 ? proxy::uot::kV1MagicAddress
                 : proxy::uot::kMagicAddress,
             0)
@@ -647,7 +648,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         *stream);
 
     if (use_uot &&
-        config_.uot_version != static_cast<uint8_t>(proxy::uot::Version::V1)) {
+        *config_.uot_version != SsUotVersion::V1) {
         auto request = proxy::uot::EncodeRequest(false, ctx.outbound.target);
         if (!request) {
             target_endpoint.Cancel();
@@ -760,69 +761,6 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return {};
         };
-        auto json_uot_version = [](const acpp::json::object& obj) -> uint8_t {
-            const acpp::json::value* value = obj.if_contains("udp_over_tcp");
-            if (!value) {
-                value = obj.if_contains("uot");
-            }
-            if (!value) {
-                return 0;
-            }
-            if (value->is_bool()) {
-                if (!value->as_bool()) {
-                    return 0;
-                }
-                const acpp::json::value* explicit_version =
-                    obj.if_contains("uotVersion");
-                if (!explicit_version) {
-                    explicit_version = obj.if_contains("uot_version");
-                }
-                if (explicit_version && explicit_version->is_int64()) {
-                    const auto parsed = explicit_version->as_int64();
-                    if (parsed == 1 || parsed == 2) {
-                        return static_cast<uint8_t>(parsed);
-                    }
-                }
-                if (explicit_version && explicit_version->is_uint64()) {
-                    const auto parsed = explicit_version->as_uint64();
-                    if (parsed == 1 || parsed == 2) {
-                        return static_cast<uint8_t>(parsed);
-                    }
-                }
-                return static_cast<uint8_t>(acpp::proxy::uot::Version::V2);
-            }
-            if (value->is_int64() || value->is_uint64()) {
-                const uint64_t version = value->is_uint64()
-                    ? value->as_uint64()
-                    : static_cast<uint64_t>(std::max<int64_t>(0, value->as_int64()));
-                return version == 1 || version == 2
-                    ? static_cast<uint8_t>(version)
-                    : 0;
-            }
-            if (!value->is_object()) {
-                return 0;
-            }
-            const auto& settings = value->as_object();
-            if (const auto* enabled = settings.if_contains("enabled");
-                enabled && enabled->is_bool() && !enabled->as_bool()) {
-                return 0;
-            }
-            if (const auto* version = settings.if_contains("version"); version) {
-                if (version->is_int64()) {
-                    const auto parsed = version->as_int64();
-                    if (parsed == 1 || parsed == 2) {
-                        return static_cast<uint8_t>(parsed);
-                    }
-                }
-                if (version->is_uint64()) {
-                    const auto parsed = version->as_uint64();
-                    if (parsed == 1 || parsed == 2) {
-                        return static_cast<uint8_t>(parsed);
-                    }
-                }
-            }
-            return static_cast<uint8_t>(acpp::proxy::uot::Version::V2);
-        };
         auto read_ss_server = [&](const acpp::json::object& obj,
                                   acpp::SsOutboundConfig& config) {
             config.address = json_string(obj, "address");
@@ -844,7 +782,14 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (const auto method = json_string(obj, "method"); !method.empty()) {
                 config.method = method;
             }
-            config.uot_version = json_uot_version(obj);
+            auto uot_version =
+                acpp::proxy::shadowsocks::outbound::ParseUotVersion(obj);
+            if (!uot_version) {
+                LOG_ERROR("Shadowsocks outbound '{}': invalid UoT settings: {}",
+                          cfg.tag, uot_version.error());
+                return false;
+            }
+            config.uot_version = *uot_version;
             return true;
         };
 

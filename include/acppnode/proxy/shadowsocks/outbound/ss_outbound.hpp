@@ -27,6 +27,11 @@ class DNS;
 // ============================================================================
 // SS Outbound 配置
 // ============================================================================
+enum class SsUotVersion : uint8_t {
+    V1 = 1,
+    V2 = 2,
+};
+
 struct SsOutboundConfig {
     std::string            tag;
     std::string            address;
@@ -37,7 +42,7 @@ struct SsOutboundConfig {
     StreamSettings         stream_settings;
     OutboundBind           send_through;
     std::chrono::seconds   timeout{10};
-    uint8_t                uot_version = 0;
+    std::optional<SsUotVersion> uot_version;
 };
 
 // ============================================================================

@@ -394,6 +394,7 @@ set(CNODE_SOURCES
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
     src/proxy/shadowsocks/inbound/ss_inbound.cpp
+    src/proxy/shadowsocks/outbound/ss_outbound_uot.cpp
     src/proxy/shadowsocks/outbound/ss_outbound.cpp
 
     # Proxy - AnyTLS
@@ -719,6 +720,32 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_anytls_outbound_settings_test
         COMMAND cnode_anytls_outbound_settings_test)
+
+    add_executable(cnode_ss_outbound_uot_test
+        tests/ss_outbound_uot_test.cpp
+        src/proxy/shadowsocks/outbound/ss_outbound_uot.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_ss_outbound_uot_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks/outbound
+    )
+    target_link_libraries(cnode_ss_outbound_uot_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_ss_outbound_uot_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_ss_outbound_uot_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_ss_outbound_uot_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_ss_outbound_uot_test
+        COMMAND cnode_ss_outbound_uot_test)
 
     add_executable(cnode_inbound_tls_policy_test
         tests/inbound_tls_policy_test.cpp
