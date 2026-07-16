@@ -73,7 +73,7 @@ std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
         protocol, impl_->Deps(protocol), std::move(limiter), req);
 }
 
-std::unique_ptr<UdpHandler> Manager::NewUdpHandler(
+UdpHandlerBuildResult Manager::NewUdpHandler(
     std::string_view protocol,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {

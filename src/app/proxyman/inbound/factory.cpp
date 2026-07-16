@@ -84,17 +84,24 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
     return it->second.create_tcp_handler(deps, limiter, req);
 }
 
-std::unique_ptr<UdpHandler> NewUdpHandler(
+UdpHandlerBuildResult NewUdpHandler(
     std::string_view protocol,
     const ProtocolDeps& deps,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
-    if (it == registrations.end() || !it->second.create_udp_handler) {
-        return nullptr;
+    if (it == registrations.end()) {
+        return {UdpHandlerBuildStatus::Failed, nullptr};
     }
-    return it->second.create_udp_handler(deps, limiter, req);
+    if (!it->second.create_udp_handler) {
+        return {UdpHandlerBuildStatus::Unsupported, nullptr};
+    }
+    auto handler = it->second.create_udp_handler(deps, limiter, req);
+    if (!handler) {
+        return {UdpHandlerBuildStatus::Failed, nullptr};
+    }
+    return {UdpHandlerBuildStatus::Ready, std::move(handler)};
 }
 
 std::optional<UserSet> BuildStaticUsers(

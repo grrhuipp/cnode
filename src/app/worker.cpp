@@ -16,6 +16,7 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
+#include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
 #include "acppnode/app/proxyman/outbound/manager.hpp"
@@ -1028,12 +1029,20 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
     std::string protocol,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req) {
-    auto handler = runtime_->inbound_manager->NewUdpHandler(protocol, limiter, req);
-    if (!handler) {
-        co_return true;
+    auto result = runtime_->inbound_manager->NewUdpHandler(protocol, limiter, req);
+    switch (result.status) {
+        case proxyman::inbound::UdpHandlerBuildStatus::Unsupported:
+            co_return true;
+        case proxyman::inbound::UdpHandlerBuildStatus::Failed:
+            co_return false;
+        case proxyman::inbound::UdpHandlerBuildStatus::Ready:
+            if (!result.handler) {
+                co_return false;
+            }
+            break;
     }
     co_return runtime_->listener_state->StartUdpListening(
-        *this, binding, std::move(handler));
+        *this, binding, std::move(result.handler));
 }
 
 bool Worker::ListenerState::StartUdpListening(

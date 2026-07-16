@@ -23,6 +23,17 @@ namespace acpp::proxyman::inbound {
 
 class UdpHandler;
 
+enum class UdpHandlerBuildStatus : uint8_t {
+    Unsupported,
+    Failed,
+    Ready,
+};
+
+struct UdpHandlerBuildResult {
+    UdpHandlerBuildStatus status = UdpHandlerBuildStatus::Unsupported;
+    std::unique_ptr<UdpHandler> handler;
+};
+
 // ============================================================================
 // ProtocolRuntime - 每个 Worker 的协议私有可变状态
 // ============================================================================
@@ -117,7 +128,7 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req);
 
-[[nodiscard]] std::unique_ptr<UdpHandler> NewUdpHandler(
+[[nodiscard]] UdpHandlerBuildResult NewUdpHandler(
     std::string_view protocol,
     const ProtocolDeps& deps,
     ::acpp::ConnectionLimiterPtr limiter,
