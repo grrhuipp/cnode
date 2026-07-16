@@ -28,9 +28,10 @@ public:
     [[nodiscard]] Outbound* GetHandler(std::string_view tag) noexcept override;
     [[nodiscard]] Outbound* GetDefaultHandler() noexcept override;
 
-    [[nodiscard]] Outbound* AddHandler(std::unique_ptr<Outbound> handler) noexcept;
-    [[nodiscard]] Outbound* ReplaceHandler(std::unique_ptr<Outbound> handler) noexcept;
-    void RemoveHandler(std::string_view tag) noexcept;
+    // Mutations allocate tag/map/retirement storage and propagate failures.
+    [[nodiscard]] Outbound* AddHandler(std::unique_ptr<Outbound> handler);
+    [[nodiscard]] Outbound* ReplaceHandler(std::unique_ptr<Outbound> handler);
+    void RemoveHandler(std::string_view tag);
     void Clear() noexcept;
     void DrainRetiredHandlers() noexcept;
 

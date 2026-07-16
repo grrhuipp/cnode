@@ -1,7 +1,10 @@
 #include "acppnode/app/proxyman/outbound/manager.hpp"
+#include "acppnode/app/proxyman/inbound/manager.hpp"
 #include "acppnode/proxy/outbound.hpp"
 
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -36,6 +39,43 @@ private:
     int generation_;
 };
 
+class OversizedTagOutbound final : public acpp::Outbound {
+public:
+    std::string_view Tag() const noexcept override {
+        static constexpr char marker = 'x';
+        return {&marker, std::numeric_limits<size_t>::max()};
+    }
+
+    acpp::net::awaitable<acpp::OutboundProcessResult> Process(
+        acpp::net::io_context&,
+        const acpp::tcp::endpoint*,
+        acpp::session::Context&,
+        const acpp::TimeoutsConfig&,
+        acpp::transport::Link,
+        acpp::StatsShard&,
+        const acpp::RelayConfig&,
+        std::span<const uint8_t>,
+        acpp::buf::MultiBuffer&,
+        std::chrono::seconds,
+        std::chrono::seconds) override {
+        co_return acpp::RelayResult{};
+    }
+};
+
+using OutboundManager = acpp::proxyman::outbound::Manager;
+static_assert(!noexcept(std::declval<OutboundManager&>().AddHandler(
+    std::declval<std::unique_ptr<acpp::Outbound>>())));
+static_assert(!noexcept(std::declval<OutboundManager&>().ReplaceHandler(
+    std::declval<std::unique_ptr<acpp::Outbound>>())));
+static_assert(!noexcept(std::declval<OutboundManager&>().RemoveHandler(
+    std::declval<std::string_view>())));
+
+using InboundManager = acpp::proxyman::inbound::Manager;
+static_assert(!noexcept(std::declval<InboundManager&>().AddHandler(
+    std::declval<std::unique_ptr<acpp::proxyman::inbound::Handler>>())));
+static_assert(!noexcept(std::declval<InboundManager&>().RemoveHandler(
+    std::declval<std::string_view>())));
+
 }  // namespace
 
 int main() {
@@ -59,6 +99,22 @@ int main() {
 
     manager.DrainRetiredHandlers();
     if (manager.GetHandler("direct") != second_raw) return 10;
+
+    try {
+        (void)manager.AddHandler(std::make_unique<OversizedTagOutbound>());
+        return 11;
+    } catch (const std::length_error&) {
+    }
+    if (manager.GetHandler("direct") != second_raw ||
+        manager.GetDefaultHandler() != second_raw) return 12;
+
+    try {
+        (void)manager.ReplaceHandler(std::make_unique<OversizedTagOutbound>());
+        return 13;
+    } catch (const std::length_error&) {
+    }
+    if (manager.GetHandler("direct") != second_raw ||
+        manager.GetDefaultHandler() != second_raw) return 14;
 
     return 0;
 }
