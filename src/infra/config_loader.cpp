@@ -80,15 +80,15 @@ RoutingConfig ParseRoutingConfigValue(const json::value& value) {
     return RoutingConfig::FromJson(obj);
 }
 
-std::optional<proxyman::outbound::PreparedOutboundConfig> PrepareOutboundForLoad(
+proxyman::outbound::PreparedOutboundConfig PrepareOutboundForLoad(
     proxyman::outbound::OutboundSourceConfig raw_config) {
     auto prepared = proxyman::outbound::PrepareOutboundConfig(raw_config);
     if (!prepared) {
-        LOG_WARN("config.outbound_skipped tag={} protocol={} reason=unsupported",
-                 raw_config.tag, raw_config.protocol);
-        return std::nullopt;
+        throw std::invalid_argument(
+            "outbound '" + raw_config.tag + "' protocol '" +
+            raw_config.protocol + "' is unsupported or invalid");
     }
-    return prepared;
+    return std::move(*prepared);
 }
 
 void LoadInboundItems(
@@ -110,11 +110,8 @@ void LoadOutboundItems(
     std::string_view source_name) {
     size_t count_before = outbounds.size();
     LoadConfigItems(value, [&](const json::object& item) {
-        auto prepared = PrepareOutboundForLoad(
-            proxyman::outbound::OutboundSourceConfig::FromJson(item));
-        if (prepared) {
-            outbounds.push_back(std::move(*prepared));
-        }
+        outbounds.push_back(PrepareOutboundForLoad(
+            proxyman::outbound::OutboundSourceConfig::FromJson(item)));
     });
     LOG_CONSOLE("config.sidecar loaded file={} outbounds={}",
                 source_name,
@@ -256,9 +253,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
         auto prepared = proxyman::outbound::PrepareOutboundConfig(direct);
-        if (prepared) {
-            cfg.prepared_outbounds_.insert(cfg.prepared_outbounds_.begin(), std::move(*prepared));
+        if (!prepared) {
+            LOG_ERROR("config.outbound builtin_prepare_failed tag={} protocol={}",
+                      direct.tag, direct.protocol);
+            return std::nullopt;
         }
+        cfg.prepared_outbounds_.insert(cfg.prepared_outbounds_.begin(), std::move(*prepared));
         LOG_CONSOLE("config.outbound builtin tag={} sendThrough={}",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
@@ -267,10 +267,13 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         proxyman::outbound::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
-        auto prepared = PrepareOutboundForLoad(std::move(blackhole));
-        if (prepared) {
-            cfg.prepared_outbounds_.push_back(std::move(*prepared));
+        auto prepared = proxyman::outbound::PrepareOutboundConfig(blackhole);
+        if (!prepared) {
+            LOG_ERROR("config.outbound builtin_prepare_failed tag={} protocol={}",
+                      blackhole.tag, blackhole.protocol);
+            return std::nullopt;
         }
+        cfg.prepared_outbounds_.push_back(std::move(*prepared));
         LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
     }
 

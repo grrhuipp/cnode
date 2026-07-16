@@ -40,19 +40,6 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     return it->second(config);
 }
 
-std::vector<PreparedOutboundConfig> PrepareOutboundConfigs(
-    const std::vector<OutboundSourceConfig>& configs) {
-    std::vector<PreparedOutboundConfig> prepared;
-    prepared.reserve(configs.size());
-    for (const auto& config : configs) {
-        auto entry = PrepareOutboundConfig(config);
-        if (entry) {
-            prepared.push_back(std::move(*entry));
-        }
-    }
-    return prepared;
-}
-
 std::unique_ptr<::acpp::Outbound> NewHandler(
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,

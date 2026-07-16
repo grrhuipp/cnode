@@ -41,5 +41,9 @@ expect_rejected(wrong_shape_routing "{}" "routing.json" [=[{"routing":[]}]=])
 expect_rejected(scalar_inbounds "{}" "inbounds.json" "42")
 expect_rejected(scalar_outbounds "{}" "outbounds.json" "42")
 expect_rejected(scalar_routing "{}" "routing.json" "42")
+expect_rejected(unsupported_outbound "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
+expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 
 file(REMOVE_RECURSE "${TEST_ROOT}")

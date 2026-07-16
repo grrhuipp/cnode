@@ -31,7 +31,4 @@ bool RegisterProxy(
 [[nodiscard]] std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     const OutboundSourceConfig& config);
 
-[[nodiscard]] std::vector<PreparedOutboundConfig> PrepareOutboundConfigs(
-    const std::vector<OutboundSourceConfig>& configs);
-
 }  // namespace acpp::proxyman::outbound
