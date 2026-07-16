@@ -40,7 +40,9 @@ struct Controller::Impl {
     net::awaitable<std::vector<api::UserTraffic>> getTraffic(const std::string& tag);
     net::awaitable<std::vector<api::OnlineUser>> GetOnlineDevice(const std::string& tag,
                                                                  const std::string& protocol);
-    void UpdateRule(const std::string& tag, const std::vector<api::DetectRule>& new_rule_list);
+    net::awaitable<void> UpdateRule(
+        const std::string& tag,
+        const std::vector<api::DetectRule>& new_rule_list);
     net::awaitable<std::vector<api::DetectResult>> GetDetectResult(const std::string& tag);
 
     net::awaitable<void> removeInbound(const std::string& tag);

@@ -247,11 +247,25 @@ Controller::Impl::GetOnlineDevice(const std::string& tag,
     co_return users;
 }
 
-void Controller::Impl::UpdateRule(const std::string& tag,
-                            const std::vector<api::DetectRule>& new_rule_list) {
+net::awaitable<void> Controller::Impl::UpdateRule(
+    const std::string& tag,
+    const std::vector<api::DetectRule>& new_rule_list) {
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers_.size());
     for (const auto& worker : workers_) {
-        worker->UpdateRuleAsync(tag, new_rule_list);
+        tasks.push_back(
+            [](Worker* current,
+               std::string current_tag,
+               std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
+                co_await net::co_spawn(
+                    current->GetExecutor(),
+                    current->UpdateRuleTask(
+                        std::move(current_tag), std::move(rules)),
+                    net::use_awaitable);
+            }(worker.get(), tag, new_rule_list));
     }
+    co_await controller::RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
 }
 
 net::awaitable<std::vector<api::DetectResult>>

@@ -965,11 +965,11 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     co_return;
 }
 
-void Worker::UpdateRuleAsync(std::string tag, std::vector<rule::DetectRule> rules) {
-    net::post(runtime_->io_context,
-        [this, t = std::move(tag), r = std::move(rules)] {
-            runtime_->rule_manager->UpdateRule(t, r);
-        });
+net::awaitable<void> Worker::UpdateRuleTask(
+    std::string tag,
+    std::vector<rule::DetectRule> rules) {
+    runtime_->rule_manager->UpdateRule(tag, rules);
+    co_return;
 }
 
 // ============================================================================

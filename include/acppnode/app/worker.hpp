@@ -94,7 +94,9 @@ public:
     // 动态控制面使用：必须在 Worker executor 上执行，完成后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);
 
-    void UpdateRuleAsync(std::string tag, std::vector<rule::DetectRule> rules);
+    net::awaitable<void> UpdateRuleTask(
+        std::string tag,
+        std::vector<rule::DetectRule> rules);
 
     // ── Per-Worker 流量统计（无锁，仅 Worker 线程写）────────────────────────
 

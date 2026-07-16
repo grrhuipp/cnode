@@ -872,6 +872,21 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_awaitable_batch_test
         COMMAND cnode_awaitable_batch_test)
 
+    add_executable(cnode_rule_lifecycle_test
+        tests/rule_lifecycle_test.cpp
+        src/common/rule.cpp
+    )
+    target_include_directories(cnode_rule_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(cnode_rule_lifecycle_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_rule_lifecycle_test
+        COMMAND cnode_rule_lifecycle_test)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}

@@ -184,6 +184,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     co_await removeInbound(old_tag);
                     co_await removeOutbound(old_tag);
                     clearUsers(old_tag, old_protocol);
+                    co_await UpdateRule(old_tag, {});
                     node_configs_.erase(cfg_it);
                     user_lists_.erase(panel);
                     inbound_started_.erase(panel);
@@ -275,7 +276,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 }
                 node_configs_[panel] = fetched_config;
                 if (rules_result.Ok() && !rules_result.not_modified) {
-                    UpdateRule(tag, rules_result.rules);
+                    co_await UpdateRule(tag, rules_result.rules);
                 }
             } else {
                 if (!next_users) {
@@ -372,7 +373,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 node_stats_[stats_key].user_count = next_users->size();
 
                 if (rules_result.Ok() && !rules_result.not_modified) {
-                    UpdateRule(tag, rules_result.rules);
+                    co_await UpdateRule(tag, rules_result.rules);
                 }
 
                 if (old_config && old_tag != tag) {
@@ -381,7 +382,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     }
                     co_await removeOutbound(old_tag);
                     clearUsers(old_tag, old_protocol);
-                    UpdateRule(old_tag, {});
+                    co_await UpdateRule(old_tag, {});
                 }
 
                 LOG_CONSOLE(

@@ -78,6 +78,7 @@ void Manager::UpdateRule(std::string_view tag,
     if (new_rule_list.empty()) {
         next_snapshot->erase(std::string(tag));
         impl_->rules_snapshot = std::move(next_snapshot);
+        impl_->inbound_detect_result.erase(std::string(tag));
         return;
     }
 
