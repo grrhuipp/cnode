@@ -129,6 +129,20 @@ if(NOT UDP_SESSION_SOURCE MATCHES "socket[.]available")
     message(FATAL_ERROR
         "UDPSession must size large datagrams before receiving them")
 endif()
+string(REGEX MATCHALL "ResolveEndpoint[(]target[)]"
+    UDP_RESOLVE_CALLS "${UDP_SESSION_SOURCE}")
+list(LENGTH UDP_RESOLVE_CALLS UDP_RESOLVE_CALL_COUNT)
+if(NOT UDP_RESOLVE_CALL_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "both UDPSession SendTo paths must share endpoint resolution")
+endif()
+string(REGEX MATCHALL "SendResolved[\r\n (]"
+    UDP_SEND_CALLS "${UDP_SESSION_SOURCE}")
+list(LENGTH UDP_SEND_CALLS UDP_SEND_CALL_COUNT)
+if(UDP_SEND_CALL_COUNT LESS 3)
+    message(FATAL_ERROR
+        "UDPSession must centralize socket send, accounting and payload limits")
+endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
 if(WORKER_SOURCE MATCHES

@@ -12,8 +12,10 @@
 #include "udp_receive_buffer.hpp"
 
 #include <algorithm>
+#include <new>
 #include <optional>
 #include <span>
+#include <utility>
 
 namespace acpp {
 
@@ -100,6 +102,9 @@ static std::optional<net::ip::address> SelectAddressForSocket(
 }  // namespace
 
 struct UDPSession::Impl {
+    static constexpr size_t kMaxIpv4UdpPayload = 65507;
+    static constexpr size_t kMaxIpv6UdpPayload = 65527;
+
     Impl(net::io_context& io_context,
          const std::string& session_id,
          ::acpp::app::dns::DNS& dns_service)
@@ -112,11 +117,51 @@ struct UDPSession::Impl {
 
     void Touch() { last_active = std::chrono::steady_clock::now(); }
     net::awaitable<void> DoReceive();
+    net::awaitable<std::pair<ErrorCode, udp::endpoint>> ResolveEndpoint(
+        const TargetAddress& target);
     void AddTargetMapping(const UdpEndpointKey& target_key, uint64_t callback_id);
     void MaybePruneTargetMappings(steady_clock::time_point now);
     void RefreshTargetMapping(const UdpEndpointKey& target_key,
                               uint64_t callback_id,
                               steady_clock::time_point now);
+
+    template <typename ConstBufferSequence>
+    net::awaitable<ErrorCode> SendResolved(
+        udp::endpoint remote_ep,
+        ConstBufferSequence buffers,
+        size_t payload_size,
+        uint64_t callback_id) {
+        const size_t max_payload = remote_ep.address().is_v4()
+            ? kMaxIpv4UdpPayload
+            : kMaxIpv6UdpPayload;
+        if (payload_size == 0) {
+            co_return ErrorCode::SUCCESS;
+        }
+        if (payload_size > max_payload) {
+            co_return ErrorCode::INVALID_ARGUMENT;
+        }
+
+        try {
+            if (callback_id > 0) {
+                const UdpEndpointKey target_key = MakeEndpointKey(
+                    remote_ep.address(), remote_ep.port());
+                AddTargetMapping(target_key, callback_id);
+            }
+
+            const size_t sent = co_await socket.async_send_to(
+                buffers, remote_ep, net::use_awaitable);
+            if (sent != payload_size) {
+                co_return ErrorCode::NETWORK_IO_ERROR;
+            }
+            ++packets_sent;
+            bytes_sent += sent;
+            Touch();
+            co_return ErrorCode::SUCCESS;
+        } catch (const IoSystemError& e) {
+            LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
+            co_return ErrorCode::NETWORK_IO_ERROR;
+        }
+    }
 
     net::io_context& io_context;
     std::string session_id;
@@ -197,6 +242,46 @@ ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
 // UDP 发送接口实现
 // ============================================================================
 
+net::awaitable<std::pair<ErrorCode, udp::endpoint>>
+UDPSession::Impl::ResolveEndpoint(const TargetAddress& target) {
+    if (!target.IsValid()) {
+        co_return std::make_pair(
+            ErrorCode::PROTOCOL_INVALID_ADDRESS, udp::endpoint{});
+    }
+    if (target.resolved_addr) {
+        co_return std::make_pair(
+            ErrorCode::SUCCESS,
+            udp::endpoint(*target.resolved_addr, target.port));
+    }
+    if (!target.IsDomain()) {
+        co_return std::make_pair(
+            ErrorCode::PROTOCOL_INVALID_ADDRESS, udp::endpoint{});
+    }
+
+    try {
+        auto dns_result = co_await dns_service.Resolve(target.host);
+        if (!dns_result.Ok()) {
+            LOG_ACCESS_DEBUG(
+                "UDP session {} DNS resolve failed for {}", session_id, target.host);
+            co_return std::make_pair(
+                ErrorCode::DNS_RESOLVE_FAILED, udp::endpoint{});
+        }
+
+        auto selected_addr = SelectAddressForSocket(dns_result.addresses, socket);
+        if (!selected_addr || selected_addr->is_unspecified()) {
+            co_return std::make_pair(
+                ErrorCode::DNS_RESOLVE_FAILED, udp::endpoint{});
+        }
+        co_return std::make_pair(
+            ErrorCode::SUCCESS, udp::endpoint(*selected_addr, target.port));
+    } catch (const IoSystemError& e) {
+        LOG_ACCESS_DEBUG(
+            "UDP session {} endpoint resolve error: {}", session_id, e.what());
+        co_return std::make_pair(
+            ErrorCode::NETWORK_IO_ERROR, udp::endpoint{});
+    }
+}
+
 net::awaitable<ErrorCode> UDPSession::SendTo(
     const TargetAddress& target,
     const uint8_t* data,
@@ -206,52 +291,19 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
     if (!impl_->running) {
         co_return ErrorCode::CONNECTION_CLOSED;
     }
-
-    try {
-        udp::endpoint remote_ep;
-
-        if (target.resolved_addr) {
-            remote_ep = udp::endpoint(*target.resolved_addr, target.port);
-        } else if (target.type == AddressType::Domain) {
-            auto dns_result = co_await impl_->dns_service.Resolve(target.host);
-
-            if (!dns_result.Ok()) {
-                LOG_ACCESS_DEBUG("UDP session {} DNS resolve failed for {}", impl_->session_id, target.host);
-                co_return ErrorCode::DNS_RESOLVE_FAILED;
-            }
-
-            auto selected_addr = SelectAddressForSocket(dns_result.addresses, impl_->socket);
-            if (!selected_addr || selected_addr->is_unspecified()) {
-                co_return ErrorCode::DNS_RESOLVE_FAILED;
-            }
-
-            remote_ep = udp::endpoint(*selected_addr, target.port);
-        } else {
-            co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
-        }
-
-        // 记录目标映射（用于 Full Cone 回包路由）
-        if (callback_id > 0) {
-            const UdpEndpointKey target_key = MakeEndpointKey(
-                remote_ep.address(), remote_ep.port());
-            impl_->AddTargetMapping(target_key, callback_id);
-        }
-
-        size_t sent = co_await impl_->socket.async_send_to(
-            net::buffer(data, len),
-            remote_ep,
-            net::use_awaitable);
-
-        impl_->packets_sent++;
-        impl_->bytes_sent += sent;
-        Touch();
-
+    if (len == 0) {
         co_return ErrorCode::SUCCESS;
-
-    } catch (const IoSystemError& e) {
-        LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", impl_->session_id, e.what());
-        co_return ErrorCode::NETWORK_IO_ERROR;
     }
+    if (!data) {
+        co_return ErrorCode::INVALID_ARGUMENT;
+    }
+
+    auto [resolve_error, remote_ep] = co_await impl_->ResolveEndpoint(target);
+    if (resolve_error != ErrorCode::SUCCESS) {
+        co_return resolve_error;
+    }
+    co_return co_await impl_->SendResolved(
+        remote_ep, net::buffer(data, len), len, callback_id);
 }
 
 net::awaitable<ErrorCode> UDPSession::SendTo(
@@ -268,40 +320,17 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
     }
 
     try {
-        udp::endpoint remote_ep;
-
-        if (target.resolved_addr) {
-            remote_ep = udp::endpoint(*target.resolved_addr, target.port);
-        } else if (target.type == AddressType::Domain) {
-            auto dns_result = co_await impl_->dns_service.Resolve(target.host);
-
-            if (!dns_result.Ok()) {
-                LOG_ACCESS_DEBUG("UDP session {} DNS resolve failed for {}", impl_->session_id, target.host);
-                co_return ErrorCode::DNS_RESOLVE_FAILED;
-            }
-
-            auto selected_addr = SelectAddressForSocket(dns_result.addresses, impl_->socket);
-            if (!selected_addr || selected_addr->is_unspecified()) {
-                co_return ErrorCode::DNS_RESOLVE_FAILED;
-            }
-
-            remote_ep = udp::endpoint(*selected_addr, target.port);
-        } else {
-            co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
-        }
-
-        if (callback_id > 0) {
-            const UdpEndpointKey target_key = MakeEndpointKey(
-                remote_ep.address(), remote_ep.port());
-            impl_->AddTargetMapping(target_key, callback_id);
-        }
-
         std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_send_buffers{};
         memory::ThreadLocalVector<net::const_buffer> spill_send_buffers;
         size_t send_buffer_count = 0;
+        size_t payload_size = 0;
         for (const auto* buffer : payload) {
             if (buffer && !buffer->IsEmpty()) {
                 const auto bytes = buffer->Bytes();
+                if (bytes.size() > Impl::kMaxIpv6UdpPayload - payload_size) {
+                    co_return ErrorCode::INVALID_ARGUMENT;
+                }
+                payload_size += bytes.size();
                 net::const_buffer send_buffer{bytes.data(), bytes.size()};
                 if (send_buffer_count < inline_send_buffers.size()) {
                     inline_send_buffers[send_buffer_count++] = send_buffer;
@@ -323,6 +352,11 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
             co_return ErrorCode::SUCCESS;
         }
 
+        auto [resolve_error, remote_ep] = co_await impl_->ResolveEndpoint(target);
+        if (resolve_error != ErrorCode::SUCCESS) {
+            co_return resolve_error;
+        }
+
         auto send_buffers = spill_send_buffers.empty()
             ? std::span<const net::const_buffer>(
                 inline_send_buffers.data(),
@@ -331,20 +365,11 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
                 spill_send_buffers.data(),
                 spill_send_buffers.size());
 
-        size_t sent = co_await impl_->socket.async_send_to(
-            send_buffers,
-            remote_ep,
-            net::use_awaitable);
+        co_return co_await impl_->SendResolved(
+            remote_ep, send_buffers, payload_size, callback_id);
 
-        impl_->packets_sent++;
-        impl_->bytes_sent += sent;
-        Touch();
-
-        co_return ErrorCode::SUCCESS;
-
-    } catch (const IoSystemError& e) {
-        LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", impl_->session_id, e.what());
-        co_return ErrorCode::NETWORK_IO_ERROR;
+    } catch (const std::bad_alloc&) {
+        co_return ErrorCode::RESOURCE_EXHAUSTED;
     }
 }
 
