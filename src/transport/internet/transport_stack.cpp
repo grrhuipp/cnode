@@ -3617,12 +3617,22 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
             net::co_spawn(
                 io_context_.get_executor(),
                 [session, stream_id, codec = payload_codec_]() -> net::awaitable<void> {
+                    struct StreamRemovalGuard final {
+                        std::shared_ptr<GrpcServerSession> session;
+                        uint32_t stream_id;
+
+                        ~StreamRemovalGuard() noexcept {
+                            session->RemoveStream(stream_id);
+                        }
+                    };
+                    StreamRemovalGuard removal_guard{session, stream_id};
+                    (void)removal_guard;
+
                     if (codec == H2PayloadCodec::RawData) {
                         (void)co_await session->WriteRawEndSerialized(stream_id);
                     } else {
                         (void)co_await session->WriteTrailersSerialized(stream_id);
                     }
-                    session->RemoveStream(stream_id);
                 },
                 net::detached);
         } catch (...) {

@@ -56,3 +56,17 @@ if(ANYTLS_OUTBOUND_SOURCE MATCHES "cleanup_logical_stream")
     message(FATAL_ERROR
         "AnyTLS outbound must not restore manual logical stream cleanup")
 endif()
+
+set(TRANSPORT_STACK
+    "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
+file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
+if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
+    message(FATAL_ERROR
+        "detached HTTP/2 server stream close must own exception-safe removal")
+endif()
+string(FIND "${TRANSPORT_STACK_SOURCE}"
+    "~StreamRemovalGuard() noexcept" STREAM_REMOVAL_GUARD_DESTRUCTOR)
+if(STREAM_REMOVAL_GUARD_DESTRUCTOR EQUAL -1)
+    message(FATAL_ERROR
+        "HTTP/2 server stream removal must run while unwinding failed writes")
+endif()
