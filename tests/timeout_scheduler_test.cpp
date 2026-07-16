@@ -1,9 +1,12 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
+#include <asio/post.hpp>
+
 #include <chrono>
 #include <future>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 int main() {
     using namespace std::chrono_literals;
@@ -119,6 +122,44 @@ int main() {
     right_scheduler.Cancel(right_token);
     acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
     acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
+
+    acpp::net::io_context fairness_io_context;
+    auto& fairness_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(fairness_io_context);
+    constexpr size_t kTimeoutStormSize = 256;
+    constexpr size_t kExpectedMaxReadyBatch = 64;
+    size_t timeout_callbacks = 0;
+    size_t callbacks_seen_by_post = 0;
+    std::vector<acpp::TimeoutToken> storm_tokens;
+    storm_tokens.reserve(kTimeoutStormSize);
+    for (size_t i = 0; i < kTimeoutStormSize; ++i) {
+        storm_tokens.push_back(fairness_scheduler.ScheduleAfter(1ms, [&]() {
+            ++timeout_callbacks;
+            if (timeout_callbacks == 1) {
+                acpp::net::post(fairness_io_context, [&]() {
+                    callbacks_seen_by_post = timeout_callbacks;
+                });
+            }
+        }));
+    }
+
+    std::this_thread::sleep_for(10ms);
+    fairness_io_context.run();
+    if (timeout_callbacks != kTimeoutStormSize) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 9;
+    }
+    if (callbacks_seen_by_post == 0 ||
+        callbacks_seen_by_post > kExpectedMaxReadyBatch) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 10;
+    }
+    for (auto& token : storm_tokens) {
+        fairness_scheduler.Cancel(token);
+    }
+    acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
 
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;

@@ -14,11 +14,11 @@ struct TimeoutScheduler::Impl {
         : timer(io_context) {
         events.reserve(kInitialEventReserve);
         deadline_heap.reserve(kInitialEventReserve);
-        ready_event_ids.reserve(kInitialReadyReserve);
+        ready_event_ids.reserve(kMaxReadyBatch);
     }
 
     static constexpr size_t kInitialEventReserve = 1024;
-    static constexpr size_t kInitialReadyReserve = 64;
+    static constexpr size_t kMaxReadyBatch = 64;
 
     struct Event {
         std::chrono::steady_clock::time_point deadline;
@@ -126,7 +126,7 @@ struct TimeoutScheduler::Impl {
         ready.clear();
 
         const auto now = std::chrono::steady_clock::now();
-        while (true) {
+        while (ready.size() < kMaxReadyBatch) {
             PruneHeapTop();
             if (deadline_heap.empty() || deadline_heap.front().deadline > now) {
                 break;
