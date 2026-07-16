@@ -1,4 +1,4 @@
-#include "acppnode/proxy/vmess/inbound/vmess_inbound.hpp"
+#include "vmess_inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"

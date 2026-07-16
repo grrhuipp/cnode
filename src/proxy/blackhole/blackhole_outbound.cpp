@@ -1,4 +1,4 @@
-#include "acppnode/proxy/blackhole/blackhole_outbound.hpp"
+#include "blackhole_outbound.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"

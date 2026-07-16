@@ -1,4 +1,4 @@
-#include "acppnode/proxy/shadowsocks/inbound/ss_inbound.hpp"
+#include "ss_inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "../server.hpp"
 #include "../ss_udp.hpp"

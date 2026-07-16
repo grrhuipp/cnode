@@ -1,4 +1,4 @@
-#include "acppnode/proxy/shadowsocks/outbound/ss_outbound.hpp"
+#include "ss_outbound.hpp"
 #include "ss_outbound_uot.hpp"
 #include "../client.hpp"
 #include "../ss_udp.hpp"

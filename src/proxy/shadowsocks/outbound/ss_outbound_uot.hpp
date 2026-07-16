@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/infra/json.hpp"
-#include "acppnode/proxy/shadowsocks/outbound/ss_outbound.hpp"
+#include "ss_outbound.hpp"
 
 #include <expected>
 #include <optional>

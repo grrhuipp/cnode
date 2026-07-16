@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/infra/json.hpp"
-#include "acppnode/proxy/anytls/outbound/anytls_outbound.hpp"
+#include "anytls_outbound.hpp"
 
 #include <expected>
 #include <string>

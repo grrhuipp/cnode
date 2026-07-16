@@ -1,4 +1,4 @@
-#include "acppnode/proxy/trojan/inbound/trojan_inbound.hpp"
+#include "trojan_inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
 #include "acppnode/app/rate_limiter.hpp"

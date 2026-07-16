@@ -1,4 +1,4 @@
-#include "acppnode/proxy/vless/outbound/vless_outbound.hpp"
+#include "vless_outbound.hpp"
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"

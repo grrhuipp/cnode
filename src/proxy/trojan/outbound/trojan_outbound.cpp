@@ -1,4 +1,4 @@
-#include "acppnode/proxy/trojan/outbound/trojan_outbound.hpp"
+#include "trojan_outbound.hpp"
 #include "../trojan_codec.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"

@@ -1428,6 +1428,12 @@ if(CNODE_BUILD_TESTS)
     set_tests_properties(cnode_graceful_shutdown_test PROPERTIES TIMEOUT 15)
 
     add_test(
+        NAME cnode_protocol_handler_header_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_handler_header_contract_test.cmake)
+
+    add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}
             "-DCNODE_EXE=$<TARGET_FILE:cnode>"

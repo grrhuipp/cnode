@@ -1,4 +1,4 @@
-#include "acppnode/proxy/vmess/outbound/vmess_outbound.hpp"
+#include "vmess_outbound.hpp"
 #include "../encoding/client.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"

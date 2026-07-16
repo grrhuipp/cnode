@@ -1,4 +1,4 @@
-#include "acppnode/proxy/freedom/freedom_outbound.hpp"
+#include "freedom_outbound.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/ip_utils.hpp"
