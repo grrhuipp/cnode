@@ -100,35 +100,16 @@ enum class RealitySniParseResult {
             &ext_len) != 1) {
         return RealitySniParseResult::Missing;
     }
-    if (!ext || ext_len < 2) {
+    if (!ext) {
         return RealitySniParseResult::Invalid;
     }
-
-    const uint16_t list_len = ReadBigEndianU16(ext);
-    if (static_cast<size_t>(list_len) + 2 != ext_len) {
+    auto parsed = transport::internet::ParseRealityServerNameExtension(
+        std::span<const uint8_t>(ext, ext_len));
+    if (!parsed) {
         return RealitySniParseResult::Invalid;
     }
-
-    size_t pos = 2;
-    const size_t end = 2 + static_cast<size_t>(list_len);
-    while (pos + 3 <= end) {
-        const uint8_t name_type = ext[pos++];
-        const uint16_t name_len = ReadBigEndianU16(ext + pos);
-        pos += 2;
-        if (pos + name_len > end) {
-            return RealitySniParseResult::Invalid;
-        }
-        if (name_type == 0) {
-            out = std::string_view(
-                unsafe::ptr_cast<const char>(ext + pos),
-                name_len);
-            return out.empty()
-                ? RealitySniParseResult::Invalid
-                : RealitySniParseResult::Present;
-        }
-        pos += name_len;
-    }
-    return RealitySniParseResult::Invalid;
+    out = *parsed;
+    return RealitySniParseResult::Present;
 }
 
 [[nodiscard]] std::optional<std::array<uint8_t, kRealityX25519KeySize>>
