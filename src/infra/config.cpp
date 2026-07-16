@@ -4,6 +4,7 @@
 #include "acppnode/infra/log.hpp"
 #include "http2_initial_window.hpp"
 #include "json_bool.hpp"
+#include "acppnode/infra/json_object.hpp"
 #include "json_string.hpp"
 #include "json_unsigned.hpp"
 #include <algorithm>
@@ -80,15 +81,13 @@ uint32_t juint32(
 }
 
 const json::object* optional_object(
-    const json::object& obj, std::string_view key) {
-    const auto* value = obj.if_contains(key);
-    if (!value) {
-        return nullptr;
+    const json::object& obj,
+    std::initializer_list<std::string_view> aliases) {
+    auto parsed = ParseAliasedJsonObject(obj, aliases);
+    if (!parsed) {
+        throw std::invalid_argument(std::move(parsed.error()));
     }
-    if (!value->is_object()) {
-        throw std::invalid_argument(std::format("{} must be an object", key));
-    }
-    return &value->as_object();
+    return *parsed;
 }
 
 uint16_t required_port(const json::object& obj, std::string_view key) {
@@ -694,15 +693,13 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
             ParseXHttpDownloadSettings(declaration->as_object());
     };
     parse_download_settings(j);
-    if (const auto* extra = j.if_contains("extra");
-        extra && extra->is_object()) {
-        const auto& extra_obj = extra->as_object();
-        parse_http_headers(extra_obj, cfg.headers);
+    if (const auto* extra = optional_object(j, {"extra"})) {
+        parse_http_headers(*extra, cfg.headers);
         cfg.no_grpc_header = jbool(
-            extra_obj, {"noGRPCHeader", "no_grpc_header"}, cfg.no_grpc_header);
+            *extra, {"noGRPCHeader", "no_grpc_header"}, cfg.no_grpc_header);
         cfg.no_sse_header = jbool(
-            extra_obj, {"noSSEHeader", "no_sse_header"}, cfg.no_sse_header);
-        parse_download_settings(extra_obj);
+            *extra, {"noSSEHeader", "no_sse_header"}, cfg.no_sse_header);
+        parse_download_settings(*extra);
     }
     if (cfg.download_settings) {
         if (cfg.IsStreamOne()) {
@@ -832,16 +829,13 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
         jstr(j, "security", std::string(constants::protocol::kNone)));
 
     // TLS 配置
-    auto parse_tls = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (!p || !p->is_object()) return;
-        const auto& t = p->as_object();
-        cfg.tls.server_name    = jstr(t, "serverName", "");
-        cfg.tls.allow_insecure = jbool(t, {"allowInsecure"}, false);
+    if (const auto* tls = optional_object(j, {"tlsSettings"})) {
+        cfg.tls.server_name = jstr(*tls, "serverName", "");
+        cfg.tls.allow_insecure = jbool(*tls, {"allowInsecure"}, false);
         // ALPN
-        cfg.tls.alpn = jstr_array(t, {"alpn"});
+        cfg.tls.alpn = jstr_array(*tls, {"alpn"});
         // 证书（服务端）
-        auto* certs = t.if_contains("certificates");
+        auto* certs = tls->if_contains("certificates");
         if (certs && certs->is_array() && !certs->as_array().empty()) {
             const auto& c = certs->as_array()[0];
             if (c.is_object()) {
@@ -850,72 +844,45 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
             }
         }
         if (cfg.tls.cert_file.empty())
-            cfg.tls.cert_file = jstr(t, "certFile", "");
+            cfg.tls.cert_file = jstr(*tls, "certFile", "");
         if (cfg.tls.key_file.empty())
-            cfg.tls.key_file  = jstr(t, "keyFile", "");
-    };
-    parse_tls("tlsSettings");
+            cfg.tls.key_file = jstr(*tls, "keyFile", "");
+    }
 
-    auto parse_reality = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.reality = RealityConfig::FromJson(p->as_object());
-        }
-    };
-    parse_reality("realitySettings");
-    parse_reality("reality_settings");
+    if (const auto* reality = optional_object(
+            j, {"realitySettings", "reality_settings"})) {
+        cfg.reality = RealityConfig::FromJson(*reality);
+    }
     if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
         cfg.tls.server_name = cfg.reality.server_name;
     }
 
     // WS 配置
-    auto parse_ws = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.ws = WsConfig::FromJson(p->as_object());
-        }
-    };
-    parse_ws("wsSettings");
-    parse_ws("websocketSettings");
+    if (const auto* ws = optional_object(
+            j, {"wsSettings", "websocketSettings"})) {
+        cfg.ws = WsConfig::FromJson(*ws);
+    }
 
-    auto parse_http_upgrade = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.http_upgrade = HttpUpgradeConfig::FromJson(p->as_object());
-        }
-    };
-    parse_http_upgrade("httpupgradeSettings");
-    parse_http_upgrade("httpUpgradeSettings");
+    if (const auto* http_upgrade = optional_object(
+            j, {"httpupgradeSettings", "httpUpgradeSettings"})) {
+        cfg.http_upgrade = HttpUpgradeConfig::FromJson(*http_upgrade);
+    }
 
-    auto parse_http = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.http = HttpConfig::FromJson(p->as_object());
-        }
-    };
-    parse_http("httpSettings");
-    parse_http("h2Settings");
-    parse_http("http_settings");
+    if (const auto* http = optional_object(
+            j, {"httpSettings", "h2Settings", "http_settings"})) {
+        cfg.http = HttpConfig::FromJson(*http);
+    }
 
-    auto parse_grpc = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.grpc = GrpcConfig::FromJson(p->as_object());
-        }
-    };
-    parse_grpc("grpcSettings");
-    parse_grpc("grpc_settings");
+    if (const auto* grpc = optional_object(
+            j, {"grpcSettings", "grpc_settings"})) {
+        cfg.grpc = GrpcConfig::FromJson(*grpc);
+    }
 
-    auto parse_xhttp = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (p && p->is_object()) {
-            cfg.xhttp = XHttpConfig::FromJson(p->as_object());
-        }
-    };
-    parse_xhttp("xhttpSettings");
-    parse_xhttp("splithttpSettings");
-    parse_xhttp("xhttp_settings");
-    parse_xhttp("splithttp_settings");
+    if (const auto* xhttp = optional_object(j, {
+            "xhttpSettings", "splithttpSettings",
+            "xhttp_settings", "splithttp_settings"})) {
+        cfg.xhttp = XHttpConfig::FromJson(*xhttp);
+    }
 
     cfg.RecomputeModes();
     return cfg;
@@ -1179,28 +1146,23 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 
     cfg.port = required_port(j, "port");
 
-    if (j.contains("settings") && j.at("settings").is_object()) {
-        cfg.static_users = ParseStaticUserConfig(cfg.protocol, j.at("settings").as_object());
+    if (const auto* settings = optional_object(j, {"settings"})) {
+        cfg.static_users = ParseStaticUserConfig(cfg.protocol, *settings);
     }
 
-    if (j.contains("streamSettings") && j.at("streamSettings").is_object()) {
-        cfg.stream_settings = StreamSettings::FromJson(j.at("streamSettings").as_object());
-    } else if (j.contains("stream_settings") && j.at("stream_settings").is_object()) {
-        cfg.stream_settings = StreamSettings::FromJson(j.at("stream_settings").as_object());
+    if (const auto* stream_settings = optional_object(
+            j, {"streamSettings", "stream_settings"})) {
+        cfg.stream_settings = StreamSettings::FromJson(*stream_settings);
     }
 
     // Xray sniffing 配置
-    auto parse_sniffing = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (!p || !p->is_object()) return;
-        const auto& s = p->as_object();
-        cfg.sniffing.enabled = jbool(s, {"enabled"}, true);
+    if (const auto* sniffing = optional_object(j, {"sniffing"})) {
+        cfg.sniffing.enabled = jbool(*sniffing, {"enabled"}, true);
         cfg.sniffing.dest_override =
-            jstr_array(s, {"destOverride", "dest_override"});
+            jstr_array(*sniffing, {"destOverride", "dest_override"});
         cfg.sniffing.domains_excluded =
-            jstr_array(s, {"domainsExcluded", "domains_excluded"});
-    };
-    parse_sniffing("sniffing");
+            jstr_array(*sniffing, {"domainsExcluded", "domains_excluded"});
+    }
 
     cfg.routing_enabled = jbool(
         j, {"routingEnabled", "routing_enabled"}, cfg.routing_enabled);
@@ -1216,7 +1178,7 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
     Config cfg;
 
     try {
-        if (const auto* log = optional_object(j, "log")) {
+        if (const auto* log = optional_object(j, {"log"})) {
             cfg.log_ = LogConfig::FromJson(*log);
         }
 
@@ -1226,15 +1188,15 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
                 "workers must be between 0 and {}", defaults::kMaxWorkers));
         }
 
-        if (const auto* dns = optional_object(j, "dns")) {
+        if (const auto* dns = optional_object(j, {"dns"})) {
             cfg.dns_ = DnsConfig::FromJson(*dns);
         }
 
-        if (const auto* limits = optional_object(j, "limits")) {
+        if (const auto* limits = optional_object(j, {"limits"})) {
             cfg.limits_ = LimitsConfig::FromJson(*limits);
         }
 
-        if (const auto* timeouts = optional_object(j, "timeouts")) {
+        if (const auto* timeouts = optional_object(j, {"timeouts"})) {
             cfg.timeouts_ = TimeoutsConfig::FromJson(*timeouts);
         }
 

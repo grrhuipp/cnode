@@ -1,7 +1,9 @@
 #include "source_config.hpp"
+#include "acppnode/infra/json_object.hpp"
 
 #include <format>
 #include <stdexcept>
+#include <utility>
 
 namespace acpp::proxyman::outbound {
 
@@ -15,25 +17,24 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
         }
         return {};
     };
-    auto read_object = [&](std::string_view key) -> const json::object* {
-        if (const auto* value = j.if_contains(key);
-            value && value->is_object()) {
-            return &value->as_object();
-        }
-        return nullptr;
-    };
-
     cfg.tag = read_string("tag");
     cfg.protocol = read_string("protocol");
 
-    if (const auto* settings = read_object("settings")) {
-        cfg.settings = *settings;
+    auto settings = ParseAliasedJsonObject(j, {"settings"});
+    if (!settings) {
+        throw std::invalid_argument(std::move(settings.error()));
+    }
+    if (*settings) {
+        cfg.settings = **settings;
     }
 
-    if (const auto* camel_stream_settings = read_object("streamSettings")) {
-        cfg.stream_settings = StreamSettings::FromJson(*camel_stream_settings);
-    } else if (const auto* snake_stream_settings = read_object("stream_settings")) {
-        cfg.stream_settings = StreamSettings::FromJson(*snake_stream_settings);
+    auto stream_settings = ParseAliasedJsonObject(
+        j, {"streamSettings", "stream_settings"});
+    if (!stream_settings) {
+        throw std::invalid_argument(std::move(stream_settings.error()));
+    }
+    if (*stream_settings) {
+        cfg.stream_settings = StreamSettings::FromJson(**stream_settings);
     }
 
     const json::value* send_through = j.if_contains("sendThrough");

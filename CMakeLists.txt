@@ -275,6 +275,7 @@ set(CNODE_SOURCES
     src/infra/config.cpp
     src/infra/routing_ip_network.cpp
     src/infra/json_bool.cpp
+    src/infra/json_object.cpp
     src/infra/json_string.cpp
     src/infra/json_unsigned.cpp
     src/infra/http2_initial_window.cpp
@@ -894,6 +895,23 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_json_bool_test
         COMMAND cnode_json_bool_test)
+
+    add_executable(cnode_json_object_test
+        tests/json_object_test.cpp
+        src/infra/json_object.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_json_object_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
+    )
+    target_compile_options(cnode_json_object_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_json_object_test
+        COMMAND cnode_json_object_test)
 
     add_executable(cnode_json_string_test
         tests/json_string_test.cpp

@@ -116,6 +116,15 @@ expect_rejected(non_string_log_level
 expect_rejected(non_string_transport_network "{}" "outbounds.json"
     [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
     "network must be a string")
+expect_rejected(non_object_outbound_stream_settings "{}" "outbounds.json"
+    [=[[{"tag":"bad-stream-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":[]}]]=]
+    "streamSettings must be an object")
+expect_rejected(non_object_tls_settings "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":[]}}]]=]
+    "tlsSettings must be an object")
+expect_rejected(conflicting_outbound_stream_settings_aliases "{}" "outbounds.json"
+    [=[[{"tag":"bad-stream-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"none"},"stream_settings":{"network":"grpc","security":"none"}}]]=]
+    "streamSettings and stream_settings must match")
 expect_rejected(conflicting_grpc_service_names "{}" "outbounds.json"
     [=[[{"tag":"bad-grpc-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"one","service_name":"two"}}}]]=]
     "serviceName and service_name must match")
