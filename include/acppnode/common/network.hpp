@@ -28,6 +28,7 @@ constexpr const char* NetworkToString(Network n) {
 // 地址类型（内部表示，与具体协议无关）
 // ============================================================================
 enum class AddressType : uint8_t {
+    Invalid = 0,
     IPv4 = 1,
     Domain = 3,
     IPv6 = 4

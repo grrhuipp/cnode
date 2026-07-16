@@ -189,6 +189,13 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         inbound_control->ClearPhaseDeadline();
     }
 
+    if (ctx.content.network != Network::MUX &&
+        !ctx.outbound.target.IsValid()) {
+        stats.OnError();
+        LOG_CONN_DEBUG(ctx, "[Session] Reject invalid outbound target");
+        co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
     LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
 
@@ -305,18 +312,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                 const uint16_t final_port = result.port > 0
                     ? result.port
                     : ctx.outbound.original_target.port;
-                IoErrorCode sniff_ip_ec;
-                auto sniff_ip = net::ip::make_address(sniff_domain, sniff_ip_ec);
-                if (!sniff_ip_ec) {
-                    sniff_ip = iputil::NormalizeAddress(sniff_ip);
-                    ctx.outbound.target = TargetAddress(sniff_ip, final_port);
-                    ctx.outbound.route_target = ctx.outbound.target;
-                } else {
-                    TargetAddress final_target;
-                    final_target.type = AddressType::Domain;
-                    final_target.host.assign(sniff_domain);
-                    final_target.resolved_addr.reset();
-                    final_target.port = final_port;
+                TargetAddress final_target(sniff_domain, final_port);
+                if (final_target.IsValid()) {
                     ctx.outbound.target = std::move(final_target);
                     ctx.outbound.route_target = ctx.outbound.target;
                 }

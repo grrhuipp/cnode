@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/network.hpp"
 
@@ -15,7 +16,7 @@ namespace acpp {
 // 目标地址
 // ============================================================================
 struct TargetAddress {
-    AddressType type = AddressType::IPv4;
+    AddressType type = AddressType::Invalid;
     std::string host;                // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
@@ -32,18 +33,31 @@ struct TargetAddress {
 
     TargetAddress(const net::ip::address& addr, uint16_t p)
         : port(p) {
-        if (addr.is_v4()) {
+        const net::ip::address normalized = iputil::NormalizeAddress(addr);
+        if (normalized.is_v4()) {
             type = AddressType::IPv4;
-            resolved_addr = addr;
-        } else if (addr.is_v6()) {
+            resolved_addr = normalized;
+        } else if (normalized.is_v6()) {
             type = AddressType::IPv6;
-            resolved_addr = addr;
+            resolved_addr = normalized;
         }
     }
 
     // 判断是否有效
     bool IsValid() const {
-        return port > 0 && (!host.empty() || resolved_addr.has_value());
+        if (port == 0) return false;
+        switch (type) {
+            case AddressType::Domain:
+                return domain::IsValidDnsHostname(
+                    host, domain::TrailingDotPolicy::Allow);
+            case AddressType::IPv4:
+                return host.empty() && resolved_addr && resolved_addr->is_v4();
+            case AddressType::IPv6:
+                return host.empty() && resolved_addr && resolved_addr->is_v6();
+            case AddressType::Invalid:
+                return false;
+        }
+        return false;
     }
 
     // 判断是否为域名
@@ -108,9 +122,12 @@ private:
     }
 
     void DetermineType() {
+        type = AddressType::Invalid;
+        resolved_addr.reset();
         IoErrorCode ec;
         auto addr = net::ip::make_address(std::string_view(host.data(), host.size()), ec);
         if (!ec) {
+            addr = iputil::NormalizeAddress(addr);
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
                 resolved_addr = addr;
@@ -121,7 +138,12 @@ private:
                 host.clear();
             }
         } else {
-            type = AddressType::Domain;
+            if (domain::IsValidDnsHostname(
+                    host, domain::TrailingDotPolicy::Allow)) {
+                type = AddressType::Domain;
+            } else {
+                host.clear();
+            }
         }
     }
 };
@@ -162,7 +184,11 @@ inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) 
         return std::nullopt;
     }
 
-    return TargetAddress(host, port);
+    TargetAddress target(host, port);
+    if (!target.IsValid()) {
+        return std::nullopt;
+    }
+    return target;
 }
 
 }  // namespace acpp

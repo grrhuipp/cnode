@@ -26,7 +26,7 @@ AddressType FromMuxAddrType(uint8_t t) noexcept {
         case 1: return AddressType::IPv4;
         case 2: return AddressType::Domain;
         case 3: return AddressType::IPv6;
-        default: return AddressType::IPv4;
+        default: return AddressType::Invalid;
     }
 }
 
@@ -537,6 +537,8 @@ static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
         }
         break;
     }
+    case AddressType::Invalid:
+        return false;
     }
     return true;
 }

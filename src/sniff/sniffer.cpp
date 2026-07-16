@@ -7,11 +7,7 @@
 namespace acpp {
 
 TargetAddress SniffResult::ToTarget() const {
-    TargetAddress addr;
-    addr.type = AddressType::Domain;
-    addr.host.assign(domain.data(), domain.size());
-    addr.port = port;
-    return addr;
+    return TargetAddress(domain, port);
 }
 
 std::string SniffResult::ToString() const {

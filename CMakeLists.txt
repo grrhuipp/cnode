@@ -699,6 +699,28 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_domain_name_test
         COMMAND cnode_domain_name_test)
 
+    add_executable(cnode_target_address_test
+        tests/target_address_test.cpp
+    )
+    target_include_directories(cnode_target_address_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_target_address_test PRIVATE
+        asio::asio
+    )
+    if(WIN32)
+        target_link_libraries(cnode_target_address_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_target_address_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_target_address_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_target_address_test
+        COMMAND cnode_target_address_test)
+
     add_executable(cnode_reality_client_version_test
         tests/reality_client_version_test.cpp
         src/transport/internet/reality_client_version.cpp
