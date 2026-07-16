@@ -106,16 +106,6 @@ uint16_t required_port(const json::object& obj, std::string_view key) {
     throw std::invalid_argument(std::string(key) + " is invalid");
 }
 
-inline std::string jstr_or_int(const json::object& obj, std::string_view key,
-                               std::string_view def = "") {
-    auto* p = obj.if_contains(key);
-    if (!p) return std::string(def);
-    if (p->is_string()) return std::string(p->as_string());
-    if (p->is_int64()) return std::to_string(p->as_int64());
-    if (p->is_uint64()) return std::to_string(p->as_uint64());
-    return std::string(def);
-}
-
 // 从 JSON array 中提取 string vector
 inline std::vector<std::string> jstr_array(const json::value& v) {
     std::vector<std::string> result;
@@ -777,9 +767,10 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     RealityConfig cfg;
     cfg.show = jbool(j, "show", false);
     cfg.type = lower_ascii_copy(jstr(j, "type", ""));
-    cfg.dest = jstr_or_int(j, "dest", "");
-    if (cfg.dest.empty()) {
-        cfg.dest = jstr_or_int(j, "target", "");
+    if (j.contains("dest") || j.contains("target")) {
+        throw std::invalid_argument(
+            "REALITY dest/target is not supported; target fallback for "
+            "unauthenticated handshakes is not implemented");
     }
     auto xver = ParseAliasedJsonUint64(j, {"xver"}, 2);
     if (!xver) {

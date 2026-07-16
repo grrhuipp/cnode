@@ -142,7 +142,6 @@ struct RealityConfig {
     // 服务端字段
     bool show = false;
     std::string type;
-    std::string dest;
     std::vector<std::string> server_names;
     std::string private_key;
     std::vector<std::string> short_ids;

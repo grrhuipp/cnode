@@ -41,7 +41,6 @@
       "network": "tcp",
       "security": "reality",
       "realitySettings": {
-        "dest": "www.example.com:443",
         "serverNames": ["www.example.com"],
         "privateKey": "your-reality-private-key",
         "shortIds": ["0123456789abcdef"]
