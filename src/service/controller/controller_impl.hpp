@@ -46,17 +46,6 @@ struct Controller::Impl {
                                      const api::NodeInfo& node_config,
                                      const std::string& tag);
 
-    [[nodiscard]] bool syncUserList(
-        api::API* panel,
-        const std::string& tag,
-        const std::string& protocol,
-        const api::NodeInfo& node_config,
-        const std::vector<api::UserInfo>& api_users);
-    [[nodiscard]] bool applyUserList(
-        const std::string& tag,
-        const std::string& protocol,
-        const api::NodeInfo& node_config,
-        const std::vector<api::UserInfo>& api_users);
     void clearUsers(const std::string& tag, const std::string& protocol);
 
     [[nodiscard]] std::string BuildUserTag(std::string_view tag,
@@ -74,9 +63,13 @@ struct Controller::Impl {
     std::vector<std::unique_ptr<api::API>>         panels_;
     std::map<api::API*, PanelConfig>               panel_configs_;
     std::vector<api::API*>                         panel_nodes_;
-    std::map<api::API*, api::NodeInfo>             node_configs_;
-    std::map<api::API*, std::vector<api::UserInfo>> user_lists_;
-    std::map<api::API*, bool>                      inbound_started_;
+    struct CommittedNodeState {
+        api::NodeInfo config;
+        std::vector<api::UserInfo> users;
+        std::vector<api::DetectRule> rules;
+        bool inbound_started = false;
+    };
+    std::map<api::API*, CommittedNodeState> committed_nodes_;
 
     struct NodeStats {
         size_t   user_count   = 0;

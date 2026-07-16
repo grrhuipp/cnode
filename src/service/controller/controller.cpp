@@ -80,8 +80,9 @@ void Controller::Impl::Stop() {
 
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
     std::vector<NodeStatsInfo> result;
-    result.reserve(node_configs_.size());
-    for (const auto& [panel, cfg] : node_configs_) {
+    result.reserve(committed_nodes_.size());
+    for (const auto& [panel, state] : committed_nodes_) {
+        const auto& cfg = state.config;
         const auto client_info = panel->Describe();
         const int node_id = client_info.NodeID;
         const auto panel_cfg = panel_configs_.find(panel);
@@ -170,20 +171,18 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
         try {
             auto config_result = co_await panel->GetNodeInfo();
             if (config_result.missing) {
-                auto cfg_it = node_configs_.find(panel);
-                if (cfg_it != node_configs_.end()) {
+                auto state_it = committed_nodes_.find(panel);
+                if (state_it != committed_nodes_.end()) {
                     std::string old_protocol =
-                        naming::ResolveProtocolOrDefault(cfg_it->second.NodeType);
+                        naming::ResolveProtocolOrDefault(state_it->second.config.NodeType);
                     std::string old_tag = naming::BuildPanelNodeTag(
-                        panel_name, old_protocol, cfg_it->second.Port);
+                        panel_name, old_protocol, state_it->second.config.Port);
 
                     co_await removeInbound(old_tag);
                     co_await removeOutbound(old_tag);
                     clearUsers(old_tag, old_protocol);
                     co_await UpdateRule(old_tag, {});
-                    node_configs_.erase(cfg_it);
-                    user_lists_.erase(panel);
-                    inbound_started_.erase(panel);
+                    committed_nodes_.erase(state_it);
                     node_stats_.erase(stats_key);
 
                     LOG_CONSOLE("node removed panel={} node={} inbound={}",
@@ -203,22 +202,23 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             const std::string tag = naming::BuildPanelNodeTag(
                 panel_name, protocol, fetched_config.Port);
 
-            std::optional<api::NodeInfo> old_config;
-            if (const auto old = node_configs_.find(panel); old != node_configs_.end()) {
-                old_config = old->second;
+            std::optional<CommittedNodeState> old_state;
+            if (const auto committed = committed_nodes_.find(panel);
+                committed != committed_nodes_.end()) {
+                old_state = committed->second;
             }
-            const bool old_started = old_config &&
-                inbound_started_.find(panel) != inbound_started_.end() &&
-                inbound_started_.at(panel);
+            const api::NodeInfo* old_config =
+                old_state ? &old_state->config : nullptr;
+            const bool old_started = old_state && old_state->inbound_started;
             const auto transition = controller::PlanNodeTransition(
-                old_config ? &*old_config : nullptr,
+                old_config,
                 old_started,
                 fetched_config);
             const bool transitioning = transition.Transitioning();
 
             std::string old_protocol;
             std::string old_tag;
-            if (old_config) {
+            if (old_config != nullptr) {
                 old_protocol = naming::ResolveProtocolOrDefault(old_config->NodeType);
                 old_tag = naming::BuildPanelNodeTag(
                     panel_name, old_protocol, old_config->Port);
@@ -232,12 +232,27 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             }
 
             auto rules_result = co_await panel->GetNodeRule();
+            std::optional<std::vector<api::DetectRule>> next_rules;
             if (!rules_result.Ok()) {
+                if (transitioning) {
+                    throw std::runtime_error(ErrorMessage(
+                        rules_result.error, rules_result.error_msg));
+                }
                 LOG_WARN("Panel {}/{}: GetNodeRule failed: {}",
                          panel_name, node_id,
                          rules_result.error_msg.empty()
                             ? ErrorCodeToString(rules_result.error)
                             : rules_result.error_msg);
+            } else if (rules_result.not_modified) {
+                if (transitioning) {
+                    if (!old_state) {
+                        throw std::runtime_error(
+                            "panel returned rules not modified without a committed rule snapshot");
+                    }
+                    next_rules = old_state->rules;
+                }
+            } else {
+                next_rules = std::move(rules_result.rules);
             }
 
             auto users_result = co_await panel->GetUserList();
@@ -254,30 +269,81 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                             : users_result.error_msg);
             } else if (users_result.not_modified) {
                 if (transitioning) {
-                    if (const auto cached = user_lists_.find(panel);
-                        cached != user_lists_.end()) {
-                        next_users = cached->second;
-                    } else {
+                    if (!old_state) {
                         throw std::runtime_error(
                             "panel returned users not modified without a committed user snapshot");
                     }
+                    next_users = old_state->users;
                 }
             } else {
                 next_users = std::move(users_result.users);
             }
 
+            auto [stats_it, stats_inserted] = node_stats_.try_emplace(stats_key);
+            (void)stats_inserted;
+            NodeStats& committed_stats = stats_it->second;
+
             if (!transitioning) {
-                if (next_users &&
-                    !syncUserList(panel, tag, protocol, fetched_config, *next_users)) {
-                    throw std::runtime_error("failed to build panel user snapshot");
+                CommittedNodeState next_state = *old_state;
+                next_state.config = fetched_config;
+                std::optional<proxyman::inbound::UserSet> next_user_set;
+                std::optional<proxyman::inbound::UserSet> previous_user_set;
+                if (next_users) {
+                    next_user_set = BuildUsersForInbound(
+                        protocol, tag, fetched_config, *next_users);
+                    previous_user_set = BuildUsersForInbound(
+                        protocol, tag, old_state->config, old_state->users);
+                    if (!next_user_set || !previous_user_set) {
+                        throw std::runtime_error("failed to build panel user snapshot");
+                    }
+                    next_state.users = *next_users;
                 }
-                node_configs_[panel] = fetched_config;
-                if (rules_result.Ok() && !rules_result.not_modified) {
-                    co_await UpdateRule(tag, rules_result.rules);
+
+                bool rules_attempted = false;
+                bool users_attempted = false;
+                std::exception_ptr refresh_failure;
+                try {
+                    if (next_rules) {
+                        rules_attempted = true;
+                        co_await UpdateRule(tag, *next_rules);
+                        next_state.rules = *next_rules;
+                    }
+                    if (next_user_set) {
+                        users_attempted = true;
+                        proxyman::inbound::UserStore::ApplyUsers(
+                            tag, *next_user_set);
+                    }
+                    committed_nodes_.insert_or_assign(panel, std::move(next_state));
+                } catch (...) {
+                    refresh_failure = std::current_exception();
+                }
+                if (refresh_failure) {
+                    if (users_attempted) {
+                        try {
+                            proxyman::inbound::UserStore::ApplyUsers(
+                                tag, *previous_user_set);
+                        } catch (...) {
+                            LOG_ERROR("Node {}/{}: refresh user rollback incomplete",
+                                      panel_name, node_id);
+                        }
+                    }
+                    if (rules_attempted) {
+                        try {
+                            co_await UpdateRule(tag, old_state->rules);
+                        } catch (...) {
+                            LOG_ERROR("Node {}/{}: refresh rule rollback incomplete",
+                                      panel_name, node_id);
+                        }
+                    }
+                    std::rethrow_exception(refresh_failure);
+                }
+                if (next_users) {
+                    committed_stats.user_count = next_users->size();
                 }
             } else {
-                if (!next_users) {
-                    throw std::runtime_error("candidate node has no user snapshot");
+                if (!next_users || !next_rules) {
+                    throw std::runtime_error(
+                        "candidate node has no complete user and rule snapshot");
                 }
 
                 auto candidate_user_set = BuildUsersForInbound(
@@ -286,105 +352,158 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     throw std::runtime_error("failed to build candidate user snapshot");
                 }
 
-                const bool destructive_swap = transition.DestructiveSwap();
                 std::optional<proxyman::inbound::UserSet> rollback_user_set;
-                if (old_config && old_tag == tag) {
-                    const auto cached = user_lists_.find(panel);
-                    if (cached == user_lists_.end()) {
-                        throw std::runtime_error(
-                            "cannot safely replace node without rollback users");
-                    }
+                if (old_config != nullptr) {
                     rollback_user_set = BuildUsersForInbound(
-                        old_protocol, old_tag, *old_config, cached->second);
+                        old_protocol, old_tag, *old_config, old_state->users);
                     if (!rollback_user_set) {
                         throw std::runtime_error(
                             "failed to build rollback user snapshot");
                     }
                 }
 
+                bool candidate_users_applied = false;
+                bool candidate_outbound_attempted = false;
+                bool candidate_inbound_attempted = false;
+                bool candidate_rules_attempted = false;
+                bool old_inbound_retirement_attempted = false;
+                bool old_outbound_retirement_attempted = false;
+                bool old_users_cleared = false;
+                bool old_rules_retirement_attempted = false;
+
                 auto rollback = [&]() -> net::awaitable<bool> {
-                    try {
-                        bool restored = true;
-                        if (!old_config || old_tag != tag) {
+                    bool restored = true;
+                    if (candidate_inbound_attempted) {
+                        try {
+                            co_await removeInbound(tag);
+                        } catch (...) {
+                            restored = false;
+                        }
+                    }
+                    if (candidate_rules_attempted && old_tag != tag) {
+                        try {
+                            co_await UpdateRule(tag, {});
+                        } catch (...) {
+                            restored = false;
+                        }
+                    }
+                    if (candidate_outbound_attempted && old_tag != tag) {
+                        try {
                             co_await removeOutbound(tag);
+                        } catch (...) {
+                            restored = false;
+                        }
+                    }
+                    if (candidate_users_applied && old_tag != tag) {
+                        try {
                             clearUsers(tag, protocol);
-                        } else {
-                            if (rollback_user_set) {
+                        } catch (...) {
+                            restored = false;
+                        }
+                    }
+
+                    if (old_config != nullptr) {
+                        if ((old_tag == tag && candidate_users_applied)
+                            || old_users_cleared) {
+                            try {
                                 proxyman::inbound::UserStore::ApplyUsers(
                                     old_tag, *rollback_user_set);
+                            } catch (...) {
+                                restored = false;
                             }
-                            restored = co_await addOutbound(
-                                panel, *old_config, old_tag);
                         }
-
-                        if (transition.RestoreOldInboundOnRollback()
-                            && old_config && old_started) {
-                            bool inbound_restored = false;
-                            if (restored) {
-                                inbound_restored = co_await addInbound(panel, *old_config);
+                        if ((old_tag == tag && candidate_outbound_attempted)
+                            || old_outbound_retirement_attempted) {
+                            try {
+                                if (!co_await addOutbound(panel, *old_config, old_tag)) {
+                                    restored = false;
+                                }
+                            } catch (...) {
+                                restored = false;
                             }
-                            restored = restored && inbound_restored;
-                            inbound_started_[panel] = restored;
                         }
-                        co_return restored;
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("Node {}/{}: rollback raised: {}",
-                                  panel_name, node_id, e.what());
-                    } catch (...) {
-                        LOG_ERROR("Node {}/{}: rollback raised an unknown exception",
-                                  panel_name, node_id);
+                        if ((old_tag == tag && candidate_rules_attempted)
+                            || old_rules_retirement_attempted) {
+                            try {
+                                co_await UpdateRule(old_tag, old_state->rules);
+                            } catch (...) {
+                                restored = false;
+                            }
+                        }
+                        if (old_started
+                            && ((old_tag == tag && candidate_inbound_attempted)
+                                || old_inbound_retirement_attempted)) {
+                            try {
+                                if (!co_await addInbound(panel, *old_config)) {
+                                    restored = false;
+                                }
+                            } catch (...) {
+                                restored = false;
+                            }
+                        }
                     }
-                    co_return false;
+                    co_return restored;
                 };
 
-                if (destructive_swap) {
-                    co_await removeInbound(old_tag);
-                }
-
-                proxyman::inbound::UserStore::ApplyUsers(tag, *candidate_user_set);
-
-                std::exception_ptr candidate_failure;
+                std::exception_ptr transition_failure;
                 try {
+                    if (transition.DestructiveSwap()) {
+                        old_inbound_retirement_attempted = true;
+                        co_await removeInbound(old_tag);
+                    }
+
+                    candidate_users_applied = true;
+                    proxyman::inbound::UserStore::ApplyUsers(tag, *candidate_user_set);
+
+                    candidate_outbound_attempted = true;
                     if (!co_await addOutbound(panel, fetched_config, tag)) {
                         throw std::runtime_error("candidate outbound creation failed");
                     }
 
+                    candidate_inbound_attempted = true;
                     if (!co_await addInbound(panel, fetched_config)) {
                         throw std::runtime_error("candidate inbound creation failed");
                     }
+
+                    if (old_config != nullptr && old_tag != tag) {
+                        if (transition.RetireOldInboundBeforeCommit()) {
+                            old_inbound_retirement_attempted = true;
+                            co_await removeInbound(old_tag);
+                        }
+                        old_outbound_retirement_attempted = true;
+                        co_await removeOutbound(old_tag);
+                        old_users_cleared = true;
+                        clearUsers(old_tag, old_protocol);
+                        old_rules_retirement_attempted = true;
+                        co_await UpdateRule(old_tag, {});
+                    }
+
+                    candidate_rules_attempted = true;
+                    co_await UpdateRule(tag, *next_rules);
+
+                    CommittedNodeState next_state{
+                        .config = fetched_config,
+                        .users = *next_users,
+                        .rules = *next_rules,
+                        .inbound_started = true,
+                    };
+                    committed_nodes_.insert_or_assign(panel, std::move(next_state));
+                    committed_stats.user_count = next_users->size();
                 } catch (...) {
-                    candidate_failure = std::current_exception();
+                    transition_failure = std::current_exception();
                 }
-                if (candidate_failure) {
+                if (transition_failure) {
                     const bool restored = co_await rollback();
                     if (!restored) {
-                        LOG_ERROR("Node {}/{}: rollback failed after candidate prepare failure",
+                        LOG_ERROR("Node {}/{}: rollback incomplete after transition failure",
                                   panel_name, node_id);
                     }
-                    std::rethrow_exception(candidate_failure);
+                    std::rethrow_exception(transition_failure);
                 }
-
-                if (old_config && old_tag != tag) {
-                    if (transition.RetireOldInboundBeforeCommit()) {
-                        co_await removeInbound(old_tag);
-                    }
-                    co_await removeOutbound(old_tag);
-                    clearUsers(old_tag, old_protocol);
-                    co_await UpdateRule(old_tag, {});
-                }
-
-                if (rules_result.Ok() && !rules_result.not_modified) {
-                    co_await UpdateRule(tag, rules_result.rules);
-                }
-
-                node_configs_[panel] = fetched_config;
-                user_lists_[panel] = *next_users;
-                inbound_started_[panel] = true;
-                node_stats_[stats_key].user_count = next_users->size();
 
                 LOG_CONSOLE(
                     "node config_committed panel={} node={} tag={} replaced={}",
-                    panel_name, node_id, tag, old_config.has_value());
+                    panel_name, node_id, tag, old_config != nullptr);
             }
 
             co_await userInfoMonitor(panel, tag, protocol);

@@ -28,10 +28,6 @@ struct NodeTransitionPlan {
         return mode == NodeTransitionMode::StageNewEndpoint;
     }
 
-    [[nodiscard]] bool RestoreOldInboundOnRollback() const noexcept {
-        return mode == NodeTransitionMode::ReplaceInPlace
-            || mode == NodeTransitionMode::SwapSameEndpoint;
-    }
 };
 
 [[nodiscard]] bool NodeConfigChanged(const api::NodeInfo& current,

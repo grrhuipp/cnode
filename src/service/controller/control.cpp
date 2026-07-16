@@ -487,46 +487,4 @@ void Controller::Impl::clearUsers(const std::string& tag, const std::string& pro
     proxyman::inbound::UserStore::ClearUsers(*user_protocol, tag);
 }
 
-bool Controller::Impl::applyUserList(
-    const std::string& tag,
-    const std::string& protocol,
-    const api::NodeInfo& node_config,
-    const std::vector<api::UserInfo>& api_users) {
-    if (!proxyman::inbound::HasProxy(protocol)) {
-        LOG_WARN("applyUserList: unsupported protocol '{}'", protocol);
-        return false;
-    }
-
-    auto user_set = BuildUsersForInbound(protocol, tag, node_config, api_users);
-    if (!user_set) {
-        LOG_WARN("applyUserList: build users failed for protocol '{}'", protocol);
-        return false;
-    }
-    proxyman::inbound::UserStore::ApplyUsers(tag, *user_set);
-    return true;
-}
-
-bool Controller::Impl::syncUserList(
-    api::API* panel,
-    const std::string& tag,
-    const std::string& protocol,
-    const api::NodeInfo& node_config,
-    const std::vector<api::UserInfo>& api_users) {
-    const auto client_info = panel->Describe();
-    const int node_id = client_info.NodeID;
-    const auto panel_cfg_it = panel_configs_.find(panel);
-    const std::string panel_name =
-        (panel_cfg_it != panel_configs_.end() && !panel_cfg_it->second.Name.empty())
-            ? panel_cfg_it->second.Name
-            : client_info.APIHost;
-
-    if (!applyUserList(tag, protocol, node_config, api_users)) {
-        return false;
-    }
-    user_lists_[panel] = api_users;
-    std::string stats_key = naming::BuildPanelNodeStatsKey(panel_name, node_id);
-    node_stats_[stats_key].user_count = api_users.size();
-    return true;
-}
-
 }  // namespace acpp

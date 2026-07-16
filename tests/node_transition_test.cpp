@@ -24,10 +24,7 @@ bool HasMode(const NodeInfo* current,
         && plan.Transitioning() == (mode != NodeTransitionMode::Refresh)
         && plan.DestructiveSwap() == (mode == NodeTransitionMode::SwapSameEndpoint)
         && plan.RetireOldInboundBeforeCommit()
-            == (mode == NodeTransitionMode::StageNewEndpoint)
-        && plan.RestoreOldInboundOnRollback()
-            == (mode == NodeTransitionMode::ReplaceInPlace
-                || mode == NodeTransitionMode::SwapSameEndpoint);
+            == (mode == NodeTransitionMode::StageNewEndpoint);
 }
 
 }  // namespace
