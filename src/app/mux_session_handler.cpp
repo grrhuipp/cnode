@@ -12,7 +12,7 @@ namespace acpp::app {
 net::awaitable<RelayResult> MuxSessionHandler::Process(
     net::io_context& io_context,
     transport::Link inbound_link,
-    AsyncStream* inbound_control,
+    AsyncStream& inbound_control,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& parent_ctx,
@@ -24,12 +24,10 @@ net::awaitable<RelayResult> MuxSessionHandler::Process(
         relay_idle_timeout = std::min(
             relay_idle_timeout, std::chrono::seconds(pressure_idle_timeout));
     }
-    if (inbound_control) {
-        inbound_control->SetIdleTimeout(relay_idle_timeout);
-        inbound_control->SetReadTimeout(std::chrono::seconds(0));
-        inbound_control->SetWriteTimeout(
-            std::min(timeouts.WriteTimeout(), relay_idle_timeout));
-    }
+    inbound_control.SetIdleTimeout(relay_idle_timeout);
+    inbound_control.SetReadTimeout(std::chrono::seconds(0));
+    inbound_control.SetWriteTimeout(
+        std::min(timeouts.WriteTimeout(), relay_idle_timeout));
 
     UDPRelayConfig mux_config;
     mux_config.speed_limit = parent_ctx.content.speed_limit;

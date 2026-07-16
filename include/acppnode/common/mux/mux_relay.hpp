@@ -36,7 +36,7 @@ namespace acpp::mux {
 net::awaitable<RelayResult> DoMuxRelay(
     net::io_context& io_context,
     transport::Link client_link,
-    AsyncStream* client_control,
+    AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& parent_ctx,

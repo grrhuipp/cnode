@@ -897,7 +897,7 @@ net::awaitable<void> RunUdpSubDispatch(
 net::awaitable<RelayResult> DoMuxRelay(
     net::io_context& io_context,
     transport::Link client_link,
-    AsyncStream* client_control,
+    AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& parent_ctx,
@@ -961,7 +961,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                 }
             } catch (const IoSystemError&) {
                 ErrorCode ec = ErrorCode::OK;
-                if (client_control && ConsumeReadSideTimeout(*client_control)) {
+                if (ConsumeReadSideTimeout(client_control)) {
                     ec = ErrorCode::RELAY_TIMEOUT;
                 }
                 client_reads.MarkDone(ec);
@@ -996,7 +996,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                 release_write_frame();
                 co_return true;
             } catch (const IoSystemError&) {
-                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
+                if (ConsumeWriteSideTimeout(client_control)) {
                     result.error = ErrorCode::RELAY_TIMEOUT;
                 }
             } catch (...) {
@@ -1061,7 +1061,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                 release_write_frame();
                 co_return true;
             } catch (const IoSystemError&) {
-                if (client_control && ConsumeWriteSideTimeout(*client_control)) {
+                if (ConsumeWriteSideTimeout(client_control)) {
                     result.error = ErrorCode::RELAY_TIMEOUT;
                 }
             } catch (...) {
@@ -1510,9 +1510,7 @@ net::awaitable<RelayResult> DoMuxRelay(
     reply_queue.running = false;
     client_reads.running = false;
     client_reads.WakeSpace();
-    if (client_control) {
-        client_control->Cancel();
-    }
+    client_control.Cancel();
     while (!client_reads.done) {
         auto [ec] = co_await client_reads.done_signal.async_receive(
             net::as_tuple(net::use_awaitable));

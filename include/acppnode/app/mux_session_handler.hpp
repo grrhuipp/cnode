@@ -31,7 +31,7 @@ public:
     net::awaitable<RelayResult> Process(
         net::io_context& io_context,
         transport::Link inbound_link,
-        AsyncStream* inbound_control,
+        AsyncStream& inbound_control,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
         session::Context& parent_ctx,

@@ -221,13 +221,17 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             stats.OnError();
             co_return MakeRelayError(ErrorCode::INTERNAL);
         }
+        if (!inbound_control) {
+            stats.OnError();
+            co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
         LOG_ACCESS(FormatAccessLog(ctx));
 
         ActiveSessionScope relay_scope{ctx, session_tracking_};
         auto relay_result = co_await mux_session_handler_->Process(
             io_context,
             transport::Link{inbound_reader, inbound_writer, inbound_control},
-            inbound_control,
+            *inbound_control,
             *this,
             receiver,
             ctx,

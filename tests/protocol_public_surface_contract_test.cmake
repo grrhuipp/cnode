@@ -103,3 +103,22 @@ if(NOT MUX_RELAY_SOURCE MATCHES "catch [(]const std::bad_alloc&[)]")
     message(FATAL_ERROR
         "Mux relay must enter owned async cleanup after allocation failure")
 endif()
+
+foreach(MUX_CONTROL_HEADER IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/mux_session_handler.hpp"
+        "${SOURCE_DIR}/include/acppnode/common/mux/mux_relay.hpp")
+    file(READ "${MUX_CONTROL_HEADER}" MUX_CONTROL_HEADER_SOURCE)
+    if(MUX_CONTROL_HEADER_SOURCE MATCHES "AsyncStream[*]")
+        message(FATAL_ERROR
+            "Mux relay control stream must be a required non-null reference: ${MUX_CONTROL_HEADER}")
+    endif()
+endforeach()
+
+set(DEFAULT_DISPATCHER
+    "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp")
+file(READ "${DEFAULT_DISPATCHER}" DEFAULT_DISPATCHER_SOURCE)
+if(NOT DEFAULT_DISPATCHER_SOURCE MATCHES
+        "if [(]!inbound_control[)]")
+    message(FATAL_ERROR
+        "Dispatcher must reject Mux links without a cancellable control stream")
+endif()
