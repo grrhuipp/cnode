@@ -130,6 +130,18 @@ expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":65536,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}]]=])
+expect_rejected(unsupported_vmess_alter_id "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":64}}]]=])
+expect_rejected(unsupported_vmess_alter_id_alias "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alter_id":1}}]]=])
+expect_rejected(negative_vmess_alter_id "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":-1}}]]=])
+expect_rejected(non_integer_vmess_alter_id "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":"0"}}]]=])
+expect_rejected(conflicting_vmess_alter_id_aliases "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":0,"alter_id":64}}]]=])
+expect_rejected(nested_unsupported_vmess_alter_id "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":64}]}]}}]]=])
 expect_rejected(negative_vless_outbound_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vless","settings":{"server":"example.com","server_port":-1,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]]=])
 expect_rejected(string_trojan_outbound_port "{}" "outbounds.json"

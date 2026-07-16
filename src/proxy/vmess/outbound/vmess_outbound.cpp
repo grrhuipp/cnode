@@ -320,18 +320,15 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return {};
         };
-        auto json_int = [](const acpp::json::object& obj,
-                           std::string_view key,
-                           int fallback = 0) -> int {
-            if (const auto* v = obj.if_contains(key); v) {
-                if (v->is_uint64()) {
-                    return static_cast<int>(v->as_uint64());
-                }
-                if (v->is_int64()) {
-                    return static_cast<int>(v->as_int64());
-                }
+        auto has_supported_alter_id = [](const acpp::json::object& obj) {
+            for (const std::string_view key : {"alterId", "alter_id"}) {
+                const auto* value = obj.if_contains(key);
+                if (!value) continue;
+                if (value->is_int64() && value->as_int64() == 0) continue;
+                if (value->is_uint64() && value->as_uint64() == 0) continue;
+                return false;
             }
-            return fallback;
+            return true;
         };
         auto lower_ascii = [](std::string text) {
             std::transform(
@@ -391,8 +388,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 if (vmess_config.uuid.empty()) {
                     vmess_config.uuid = json_string(user, "uuid");
                 }
-                vmess_config.alter_id = json_int(
-                    user, "alterId", json_int(user, "alter_id", vmess_config.alter_id));
+                if (!has_supported_alter_id(user)) {
+                    return std::nullopt;
+                }
                 auto parsed_security = parse_security(json_string(user, "security"));
                 if (!parsed_security) {
                     return std::nullopt;
@@ -419,8 +417,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (vmess_config.uuid.empty()) {
                 vmess_config.uuid = json_string(s, "id");
             }
-            vmess_config.alter_id = json_int(
-                s, "alterId", json_int(s, "alter_id", vmess_config.alter_id));
+            if (!has_supported_alter_id(s)) {
+                return std::nullopt;
+            }
             auto parsed_security = parse_security(json_string(s, "security"));
             if (!parsed_security) {
                 return std::nullopt;

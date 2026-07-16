@@ -31,9 +31,6 @@ struct VMessOutboundConfig {
     std::string uuid;              // 用户 UUID
     vmess::Security security = vmess::Security::AES_128_GCM;
 
-    // 可选配置
-    int alter_id = 0;              // AlterID (现代客户端通常为 0)
-
     // 传输层配置（JSON 格式保持不变）
     StreamSettings stream_settings;
     OutboundBind send_through;
