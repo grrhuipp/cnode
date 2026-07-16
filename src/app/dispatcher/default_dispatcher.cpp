@@ -135,9 +135,6 @@ std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
     if (!outbound_manager_) {
         return nullptr;
     }
-    if (tag.empty()) {
-        return outbound_manager_->GetDefaultHandler();
-    }
     return outbound_manager_->GetHandler(tag);
 }
 

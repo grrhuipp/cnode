@@ -20,7 +20,6 @@ public:
     virtual ~Manager() noexcept = default;
 
     [[nodiscard]] virtual HandlerPtr GetHandler(std::string_view tag) noexcept = 0;
-    [[nodiscard]] virtual HandlerPtr GetDefaultHandler() noexcept = 0;
 };
 
 }  // namespace acpp::features::outbound

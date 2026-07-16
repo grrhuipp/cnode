@@ -15,7 +15,6 @@ struct Manager::Impl {
         TransparentStringEq>;
 
     HandlerMap handlers;
-    std::shared_ptr<Outbound> default_handler;
 };
 
 Manager::Manager()
@@ -28,10 +27,6 @@ Manager::~Manager() noexcept {
 Manager::HandlerPtr Manager::GetHandler(std::string_view tag) noexcept {
     auto it = impl_->handlers.find(tag);
     return it == impl_->handlers.end() ? nullptr : it->second;
-}
-
-Manager::HandlerPtr Manager::GetDefaultHandler() noexcept {
-    return impl_->default_handler;
 }
 
 Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
@@ -47,9 +42,6 @@ Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
         return nullptr;
     }
 
-    if (!impl_->default_handler) {
-        impl_->default_handler = it->second;
-    }
     return it->second;
 }
 
@@ -64,11 +56,7 @@ Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) {
         return AddHandler(std::move(handler));
     }
 
-    const bool replacing_default = impl_->default_handler == it->second;
     it->second = std::shared_ptr<Outbound>(std::move(handler));
-    if (replacing_default) {
-        impl_->default_handler = it->second;
-    }
     return it->second;
 }
 
@@ -78,20 +66,12 @@ void Manager::RemoveHandler(std::string_view tag) {
         return;
     }
 
-    const bool removing_default = impl_->default_handler == it->second;
     impl_->handlers.erase(it);
-
-    if (removing_default) {
-        impl_->default_handler = impl_->handlers.empty()
-            ? nullptr
-            : impl_->handlers.begin()->second;
-    }
 }
 
 void Manager::Clear() noexcept {
     impl_->handlers.clear();
     MaybeShrinkHashContainer(impl_->handlers, 8);
-    impl_->default_handler.reset();
 }
 
 }  // namespace acpp::proxyman::outbound

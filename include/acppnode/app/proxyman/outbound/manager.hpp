@@ -28,7 +28,6 @@ public:
     Manager& operator=(const Manager&) = delete;
 
     [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept override;
-    [[nodiscard]] HandlerPtr GetDefaultHandler() noexcept override;
 
     // Mutations allocate tag/map/shared ownership and propagate failures.
     [[nodiscard]] HandlerPtr AddHandler(std::unique_ptr<Outbound> handler);
