@@ -513,7 +513,7 @@ namespace {
 const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kFreedom,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
         acpp::proxy::freedom::outbound::FreedomSettings settings;
 
@@ -547,10 +547,7 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             settings.send_through = *cfg.send_through;
         }
 
-        acpp::proxyman::outbound::PreparedOutboundConfig prepared;
-        prepared.tag = cfg.tag;
-        prepared.protocol = cfg.protocol;
-        prepared.create =
+        return acpp::proxyman::outbound::PreparedOutboundCreator{
             [tag = cfg.tag, settings = std::move(settings)](
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
@@ -558,7 +555,6 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
                     tag, settings, dns, udp_mgr, timeout);
-            };
-        return prepared;
+            }};
     }), true);
 }  // namespace

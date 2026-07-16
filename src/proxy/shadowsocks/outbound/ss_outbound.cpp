@@ -753,7 +753,7 @@ namespace {
 const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kShadowsocks,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         auto json_string = [](const acpp::json::object& obj,
                               std::string_view key) -> std::string {
             if (const auto* v = obj.if_contains(key); v && v->is_string()) {
@@ -825,10 +825,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             ss_config.port == 0) {
             return std::nullopt;
         }
-        acpp::proxyman::outbound::PreparedOutboundConfig prepared;
-        prepared.tag = cfg.tag;
-        prepared.protocol = cfg.protocol;
-        prepared.create =
+        return acpp::proxyman::outbound::PreparedOutboundCreator{
             [ss_config = std::move(ss_config)](
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
@@ -838,7 +835,6 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
                     runtime_config, dns_service, udp_mgr);
-            };
-        return prepared;
+            }};
     }), true);
 }  // namespace

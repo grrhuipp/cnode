@@ -12,7 +12,7 @@ namespace {
 
 using CreatorMap = std::map<
     std::string,
-    std::optional<PreparedOutboundConfig> (*)(
+    std::optional<PreparedOutboundCreator> (*)(
         const OutboundSourceConfig& config),
     std::less<>>;
 
@@ -25,7 +25,7 @@ CreatorMap& Proxies() noexcept {
 
 void RegisterProxy(
     std::string_view protocol,
-    std::optional<PreparedOutboundConfig> (*creator)(
+    std::optional<PreparedOutboundCreator> (*creator)(
         const OutboundSourceConfig& config)) {
     if (protocol.empty() || !creator) {
         throw std::invalid_argument(
@@ -46,7 +46,15 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     if (it == proxies.end()) {
         return std::nullopt;
     }
-    return it->second(config);
+    auto creator = it->second(config);
+    if (!creator || !*creator) {
+        return std::nullopt;
+    }
+    return PreparedOutboundConfig{
+        .tag = config.tag,
+        .protocol = config.protocol,
+        .create = std::move(*creator),
+    };
 }
 
 std::unique_ptr<::acpp::Outbound> NewHandler(

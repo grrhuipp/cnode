@@ -90,10 +90,22 @@ std::optional<acpp::proxyman::inbound::UserSet> BuildTrojanUsers(
         acpp::proxyman::inbound::PreparedTrojanUsers{}};
 }
 
-std::optional<acpp::proxyman::outbound::PreparedOutboundConfig>
+std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateOutboundConfig(
     const acpp::proxyman::outbound::OutboundSourceConfig&) {
-    return acpp::proxyman::outbound::PreparedOutboundConfig{};
+    return acpp::proxyman::outbound::PreparedOutboundCreator{
+        [](acpp::net::io_context&,
+           acpp::app::dns::DNS&,
+           acpp::UDPSessionManager*,
+           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+            return nullptr;
+        }};
+}
+
+std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+CreateEmptyOutboundConfig(
+    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    return acpp::proxyman::outbound::PreparedOutboundCreator{};
 }
 
 bool TestInboundRegistration() {
@@ -250,7 +262,23 @@ bool TestOutboundRegistration() {
         })) {
         return false;
     }
-    return acpp::proxyman::outbound::HasProxy("test-outbound");
+    if (!acpp::proxyman::outbound::HasProxy("test-outbound")) {
+        return false;
+    }
+
+    acpp::proxyman::outbound::OutboundSourceConfig source;
+    source.tag = "source-owned-tag";
+    source.protocol = "test-outbound";
+    auto prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
+    if (!prepared || prepared->tag != source.tag ||
+        prepared->protocol != source.protocol || !prepared->create) {
+        return false;
+    }
+
+    acpp::proxyman::outbound::RegisterProxy(
+        "empty-outbound", &CreateEmptyOutboundConfig);
+    source.protocol = "empty-outbound";
+    return !acpp::proxyman::outbound::PrepareOutboundConfig(source);
 }
 
 }  // namespace

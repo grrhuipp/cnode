@@ -26,7 +26,7 @@ struct OutboundSourceConfig {
 // proxyman outbound headers expose only prepared runtime handler construction.
 void RegisterProxy(
     std::string_view protocol,
-    std::optional<PreparedOutboundConfig> (*)(
+    std::optional<PreparedOutboundCreator> (*)(
         const OutboundSourceConfig& config));
 
 [[nodiscard]] std::optional<PreparedOutboundConfig> PrepareOutboundConfig(

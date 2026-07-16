@@ -581,7 +581,7 @@ namespace {
 const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kTrojan,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
 
         auto json_string = [](const acpp::json::object& obj,
@@ -679,10 +679,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;  // 配置不完整
         }
 
-        acpp::proxyman::outbound::PreparedOutboundConfig prepared;
-        prepared.tag = cfg.tag;
-        prepared.protocol = cfg.protocol;
-        prepared.create =
+        return acpp::proxyman::outbound::PreparedOutboundCreator{
             [trojan_config = std::move(trojan_config)](
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
@@ -692,7 +689,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
                     runtime_config, dns);
-            };
-        return prepared;
+            }};
     }), true);
 }  // namespace

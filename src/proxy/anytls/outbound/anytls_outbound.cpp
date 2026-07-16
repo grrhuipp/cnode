@@ -1061,7 +1061,7 @@ namespace {
 const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kAnyTLS,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         auto settings = acpp::proxy::anytls::outbound::ParseSettings(cfg.settings);
         if (!settings) {
             LOG_ERROR("AnyTLS outbound '{}': invalid settings: {}",
@@ -1069,10 +1069,7 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
         settings->send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        acpp::proxyman::outbound::PreparedOutboundConfig prepared;
-        prepared.tag = cfg.tag;
-        prepared.protocol = cfg.protocol;
-        prepared.create =
+        return acpp::proxyman::outbound::PreparedOutboundCreator{
             [tag = cfg.tag,
              settings = std::move(*settings),
              stream_settings = cfg.stream_settings](
@@ -1095,7 +1092,6 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     runtime_stream_settings,
                     dial_timeout,
                     dns);
-            };
-        return prepared;
+            }};
     }), true);
 }  // namespace

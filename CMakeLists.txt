@@ -1441,6 +1441,7 @@ if(CNODE_BUILD_TESTS)
         src/app/proxyman/inbound/factory.cpp
         src/app/proxyman/inbound/user_store.cpp
         src/app/proxyman/outbound/factory.cpp
+        src/infra/json.cpp
     )
     target_include_directories(cnode_protocol_registration_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

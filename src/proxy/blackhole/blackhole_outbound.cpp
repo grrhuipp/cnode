@@ -67,7 +67,7 @@ namespace {
 const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kBlackhole,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
-        -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
+        -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         acpp::proxy::blackhole::outbound::BlackholeSettings settings;
         if (const auto* p = cfg.settings.if_contains("response")) {
             // Xray 格式: {"response": {"type": "http"}}
@@ -78,17 +78,13 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 }
             }
         }
-        acpp::proxyman::outbound::PreparedOutboundConfig prepared;
-        prepared.tag = cfg.tag;
-        prepared.protocol = cfg.protocol;
-        prepared.create =
+        return acpp::proxyman::outbound::PreparedOutboundCreator{
             [tag = cfg.tag, settings = std::move(settings)](
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& /*dns*/,
                 acpp::UDPSessionManager* /*udp_mgr*/,
                 std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(tag, settings);
-            };
-        return prepared;
+            }};
     }), true);
 }  // namespace
