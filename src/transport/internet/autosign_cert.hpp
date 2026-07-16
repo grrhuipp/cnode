@@ -5,7 +5,6 @@
 
 #include <chrono>
 #include <list>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -23,6 +22,7 @@ public:
     static constexpr size_t kMaxCachedCerts = 256;
     static constexpr auto kRotateInterval = std::chrono::minutes(5);
 
+    // Owned by one Worker-local TLS context; not thread-safe by design.
     AutoSignState() = default;
     ~AutoSignState();
 
@@ -38,17 +38,14 @@ private:
         std::list<std::string>::iterator lru_it;
     };
 
-    bool EnsureKeyLocked(Clock::time_point now);
-    void ClearCertCacheLocked();
+    bool EnsureKey(Clock::time_point now);
+    void ClearCertCache();
 
     EVP_PKEY* pkey_ = nullptr;
     Clock::time_point key_created_at_{};
-    std::mutex mu_;
     std::unordered_map<std::string, CachedCert> cert_cache_;
     std::list<std::string> cert_lru_;
     long next_serial_ = 1;
 };
-
-AutoSignState& GetAutoSignState();
 
 }  // namespace acpp::transport::internet

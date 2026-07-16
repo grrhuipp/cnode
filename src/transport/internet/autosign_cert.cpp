@@ -24,7 +24,7 @@ EVP_PKEY* GenerateEcP256Key() {
 }  // namespace
 
 AutoSignState::~AutoSignState() {
-    ClearCertCacheLocked();
+    ClearCertCache();
     if (pkey_) EVP_PKEY_free(pkey_);
 }
 
@@ -33,8 +33,7 @@ AutoSignMaterial AutoSignState::GetOrCreate(const std::string& cn) {
 }
 
 AutoSignMaterial AutoSignState::GetOrCreate(const std::string& cn, Clock::time_point now) {
-    std::lock_guard lock(mu_);
-    if (!EnsureKeyLocked(now)) {
+    if (!EnsureKey(now)) {
         return {};
     }
 
@@ -98,7 +97,7 @@ AutoSignMaterial AutoSignState::GetOrCreate(const std::string& cn, Clock::time_p
     return {x509, pkey_};
 }
 
-bool AutoSignState::EnsureKeyLocked(Clock::time_point now) {
+bool AutoSignState::EnsureKey(Clock::time_point now) {
     const bool expired = pkey_ && now - key_created_at_ >= kRotateInterval;
     if (pkey_ && !expired) {
         return true;
@@ -109,24 +108,19 @@ bool AutoSignState::EnsureKeyLocked(Clock::time_point now) {
         return pkey_ != nullptr;
     }
 
-    ClearCertCacheLocked();
+    ClearCertCache();
     if (pkey_) EVP_PKEY_free(pkey_);
     pkey_ = generated;
     key_created_at_ = now;
     return true;
 }
 
-void AutoSignState::ClearCertCacheLocked() {
+void AutoSignState::ClearCertCache() {
     for (auto& [_, cached] : cert_cache_) {
         X509_free(cached.cert);
     }
     cert_cache_.clear();
     cert_lru_.clear();
-}
-
-AutoSignState& GetAutoSignState() {
-    static AutoSignState state;
-    return state;
 }
 
 }  // namespace acpp::transport::internet

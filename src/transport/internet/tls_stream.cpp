@@ -133,6 +133,14 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
     return false;
 }
 
+struct AutoSignContextState {
+    explicit AutoSignContextState(std::string name)
+        : default_name(std::move(name)) {}
+
+    std::string default_name;
+    transport::internet::AutoSignState certificates;
+};
+
 std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     if (config.server_name.empty()) {
         return "localhost";
@@ -141,12 +149,12 @@ std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
 }
 
 int AutoSignCertCallback(SSL* ssl, void* arg) {
-    auto* default_name = static_cast<std::string*>(arg);
+    auto* state = static_cast<AutoSignContextState*>(arg);
     const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    const std::string certificate_name = sni ? std::string(sni) : *default_name;
+    const std::string certificate_name =
+        sni ? std::string(sni) : state->default_name;
 
-    auto& state = transport::internet::GetAutoSignState();
-    auto material = state.GetOrCreate(certificate_name);
+    auto material = state->certificates.GetOrCreate(certificate_name);
     if (!material.cert || !material.key) return 0;
 
     if (SSL_use_certificate(ssl, material.cert) != 1 ||
@@ -162,8 +170,8 @@ int AutoSignCertCallback(SSL* ssl, void* arg) {
 std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
     // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
     const std::string default_name = ResolveAutoSignDefaultName(config);
-    auto& state = transport::internet::GetAutoSignState();
-    auto default_material = state.GetOrCreate(default_name);
+    auto state = std::make_shared<AutoSignContextState>(default_name);
+    auto default_material = state->certificates.GetOrCreate(default_name);
     if (!default_material.cert || !default_material.key) {
         LOG_ERROR("默认自签证书生成失败");
         return nullptr;
@@ -183,13 +191,12 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     SSL_CTX_use_certificate(ctx, default_material.cert);
     SSL_CTX_use_PrivateKey(ctx, default_material.key);
 
-    auto default_name_state = std::make_shared<std::string>(default_name);
-    SSL_CTX_set_cert_cb(ctx, AutoSignCertCallback, default_name_state.get());
+    SSL_CTX_set_cert_cb(ctx, AutoSignCertCallback, state.get());
 
     LOG_INFO("TLS 自动签名模式已启用（按 SNI 动态生成证书，默认域名={}）",
              default_name);
     auto out = std::unique_ptr<SslContext>(
-        new SslContext(ctx, std::move(default_name_state)));
+        new SslContext(ctx, std::move(state)));
     if (!out->ConfigureServerAlpn(config.alpn)) {
         LOG_ERROR("Invalid auto-sign TLS ALPN policy");
         return nullptr;
