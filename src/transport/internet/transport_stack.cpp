@@ -145,27 +145,28 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     thread_local TlsContextCache cache;
     struct LastHit {
         const TlsConfig* config = nullptr;
-        bool is_server = false;
+        bool has_certificate = false;
         SslContext* ctx = nullptr;
     };
     thread_local LastHit last;
 
-    const bool is_server = config.IsServer();
-    if (last.config == &config && last.is_server == is_server && last.ctx) {
+    const bool has_certificate = config.HasCertificatePair();
+    if (last.config == &config &&
+        last.has_certificate == has_certificate && last.ctx) {
         return last.ctx;
     }
 
-    std::string key = is_server
+    std::string key = has_certificate
         ? MakeTlsCacheKey("server", config)
         : MakeTlsCacheKey("server-auto-sign", config);
 
     if (auto it = cache.find(key); it != cache.end()) {
-        last = LastHit{&config, is_server, it->second.get()};
+        last = LastHit{&config, has_certificate, it->second.get()};
         return it->second.get();
     }
 
     std::unique_ptr<SslContext> ctx;
-    if (is_server) {
+    if (has_certificate) {
         ctx = SslContext::CreateServer(config);
     } else {
         ctx = SslContext::CreateServerAutoSign(config);
@@ -174,7 +175,7 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     if (ctx) {
         auto* raw = ctx.get();
         InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
-        last = LastHit{&config, is_server, raw};
+        last = LastHit{&config, has_certificate, raw};
         return raw;
     }
     return nullptr;

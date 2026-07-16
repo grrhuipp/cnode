@@ -299,6 +299,7 @@ set(CNODE_SOURCES
     # Transport - Internet
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
+    src/transport/internet/tls_client_context.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_tls.cpp
@@ -571,6 +572,37 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
+
+    add_executable(cnode_tls_client_certificate_test
+        tests/tls_client_certificate_test.cpp
+        src/transport/internet/tls_client_context.cpp
+        src/transport/internet/autosign_cert.cpp
+        src/infra/log.cpp
+    )
+    target_include_directories(cnode_tls_client_certificate_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+        ${concurrentqueue_SOURCE_DIR}
+    )
+    target_link_libraries(cnode_tls_client_certificate_test PRIVATE
+        asio::asio
+        Threads::Threads
+        ssl
+        crypto
+        cnode_zlib
+    )
+    if(WIN32)
+        target_link_libraries(cnode_tls_client_certificate_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_tls_client_certificate_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_tls_client_certificate_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4324 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_tls_client_certificate_test
+        COMMAND cnode_tls_client_certificate_test)
 
     add_executable(cnode_uot_ss2022_test
         tests/uot_ss2022_test.cpp

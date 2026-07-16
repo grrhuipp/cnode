@@ -193,29 +193,6 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     return out;
 }
 
-std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
-    const SSL_METHOD* method = TLS_client_method();
-    SSL_CTX* ctx = SSL_CTX_new(method);
-    if (!ctx) {
-        LOG_ERROR("Failed to create SSL client context");
-        return nullptr;
-    }
-
-    // 设置 TLS 版本
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
-
-    if (config.allow_insecure) {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    } else {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-        SSL_CTX_set_default_verify_paths(ctx);
-    }
-
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
-}
-
 void SslContext::ConfigureServerAlpn(const std::vector<std::string>& protocols) {
     server_alpn_wire_.clear();
     for (const auto& proto : protocols) {
@@ -232,12 +209,6 @@ void SslContext::ConfigureServerAlpn(const std::vector<std::string>& protocols) 
     if (!server_alpn_wire_.empty()) {
         SSL_CTX_set_app_data(ctx_, this);
         SSL_CTX_set_alpn_select_cb(ctx_, SelectServerAlpnCallback, nullptr);
-    }
-}
-
-SslContext::~SslContext() {
-    if (ctx_) {
-        SSL_CTX_free(ctx_);
     }
 }
 
