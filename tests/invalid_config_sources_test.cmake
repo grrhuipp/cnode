@@ -116,6 +116,11 @@ expect_rejected(non_boolean_tls_allow_insecure "{}" "outbounds.json"
     "allowInsecure must be a boolean")
 expect_rejected(negative_read_timeout
     [=[{"timeouts":{"read":-1}}]=] "" "")
+expect_rejected(conflicting_idle_timeout_aliases
+    [=[{"timeouts":{"connIdle":30,"idle":60}}]=] "" ""
+    "connIdle and idle must match")
+expect_started(equal_idle_timeout_aliases
+    [=[{"workers":1,"timeouts":{"connIdle":30,"idle":30}}]=] "" "")
 expect_rejected(negative_connection_limit
     [=[{"limits":{"maxConnections":-1}}]=] "" "")
 expect_rejected(negative_dns_cache_size
