@@ -79,6 +79,15 @@ void TestInvalidNetworkHostIsRejected() {
     CheckInvalid(
         R"({"server_port":443,"networkSettings":{"headers":[]}})",
         "headers must be an object");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"path":"/ws\r\nInjected: yes"}})",
+        "valid HTTP request target");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"path":42}})",
+        "path must be a string");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"headers":{"Host":"bad host"}}})",
+        "valid HTTP authority");
 
     auto lowercase = ParseResponse(
         R"({"server_port":443,"networkSettings":{"headers":{"host":"edge.example"}}})");

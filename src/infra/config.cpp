@@ -126,6 +126,31 @@ std::string lower_ascii_copy(std::string value) {
     return value;
 }
 
+void require_http_request_target(
+    std::string_view value, std::string_view field) {
+    if (!value.empty() &&
+        !transport::internet::IsValidHttpRequestTarget(value)) {
+        throw std::invalid_argument(std::format(
+            "{} must be a valid HTTP request target", field));
+    }
+}
+
+void require_http_authority(
+    std::string_view value, std::string_view field) {
+    if (!value.empty() && !transport::internet::IsValidHttpAuthority(value)) {
+        throw std::invalid_argument(std::format(
+            "{} must be a valid HTTP authority", field));
+    }
+}
+
+void require_http_header_name(
+    std::string_view value, std::string_view field) {
+    if (!value.empty() && !transport::internet::IsValidHttpHeaderName(value)) {
+        throw std::invalid_argument(std::format(
+            "{} must be a valid HTTP header name", field));
+    }
+}
+
 void parse_http_headers(const json::object& j,
                         transport::internet::HttpHeaders& headers,
                         std::string_view key = "headers") {
@@ -149,6 +174,11 @@ void parse_http_headers(const json::object& j,
             throw std::invalid_argument(std::format(
                 "HTTP header '{}' contains invalid control characters",
                 normalized));
+        }
+        if (normalized == "host" &&
+            !transport::internet::IsValidHttpAuthority(value)) {
+            throw std::invalid_argument(
+                "HTTP header 'host' must be a valid HTTP authority");
         }
         const auto [existing, inserted] = headers.emplace(normalized, value);
         if (!inserted && existing->second != value) {
@@ -533,8 +563,10 @@ RoutingConfig RoutingConfig::FromJson(const json::object& j) {
 WsConfig WsConfig::FromJson(const json::object& j) {
     WsConfig cfg;
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
+    require_http_request_target(cfg.path, "ws path");
     parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
+    require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
 }
 
@@ -542,8 +574,12 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     HttpUpgradeConfig cfg;
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     cfg.host = jstr(j, "host", "");
+    require_http_request_target(cfg.path, "http upgrade path");
+    require_http_authority(cfg.host, "http upgrade host");
     parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
+    require_http_header_name(
+        cfg.real_ip_header, "http upgrade realIpHeader");
     cfg.accept_proxy_protocol = jbool(j, {"acceptProxyProtocol"}, false);
     return cfg;
 }
@@ -553,8 +589,15 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     cfg.host = jstr(j, "host", "");
     cfg.method = jstr(j, "method", "");
+    require_http_request_target(cfg.path, "http path");
+    require_http_authority(cfg.host, "http host");
+    if (!cfg.method.empty() &&
+        !transport::internet::IsValidHttpHeaderName(cfg.method)) {
+        throw std::invalid_argument("http method must be a valid HTTP token");
+    }
     parse_http_headers(j, cfg.headers);
     cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
+    require_http_header_name(cfg.real_ip_header, "http realIpHeader");
     cfg.force_http2 = jbool(j, {"forceHttp2", "force_http2"}, false);
     auto initial_window = ParseHttp2InitialWindow(j);
     if (!initial_window) {
@@ -570,6 +613,12 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     cfg.service_name = jstr(j, {"serviceName", "service_name"}, "");
     cfg.user_agent = jstr(j, {"userAgent", "user_agent"}, "");
     cfg.multi_mode = jbool(j, {"multiMode", "multi_mode"}, false);
+    require_http_authority(cfg.authority, "grpc authority");
+    require_http_request_target(cfg.RequestPath(), "grpc serviceName path");
+    if (!transport::internet::IsValidHttpHeaderValue(cfg.user_agent)) {
+        throw std::invalid_argument(
+            "grpc userAgent contains invalid control characters");
+    }
     if (j.contains("initial_windows_size")) {
         throw std::invalid_argument(
             "initial_windows_size is not supported; use initial_window_size");
@@ -683,6 +732,8 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     cfg.host = jstr(j, "host", "");
     cfg.mode = lower_ascii_copy(jstr(j, "mode", ""));
+    require_http_request_target(cfg.path, "xhttp path");
+    require_http_authority(cfg.host, "xhttp host");
     parse_http_headers(j, cfg.headers);
     cfg.no_grpc_header = jbool(j, {"noGRPCHeader", "no_grpc_header"}, false);
     cfg.no_sse_header = jbool(j, {"noSSEHeader", "no_sse_header"}, false);

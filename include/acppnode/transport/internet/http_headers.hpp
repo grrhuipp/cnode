@@ -39,6 +39,29 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     return true;
 }
 
+[[nodiscard]] inline bool IsValidHttpRequestTarget(
+    std::string_view target) noexcept {
+    if (target.empty() || target.front() != '/') return false;
+    for (const unsigned char ch : target) {
+        if (ch <= 0x20 || ch == 0x7f || ch == '#') {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool IsValidHttpAuthority(
+    std::string_view authority) noexcept {
+    if (authority.empty()) return false;
+    for (const unsigned char ch : authority) {
+        if (ch <= 0x20 || ch == 0x7f || ch == '/' || ch == '\\' ||
+            ch == '?' || ch == '#' || ch == '@') {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] inline std::string NormalizeHttpHeaderName(
     std::string_view name) {
     std::string normalized(name);

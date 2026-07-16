@@ -119,6 +119,30 @@ expect_rejected(non_string_transport_network "{}" "outbounds.json"
 expect_rejected(non_string_http_header "{}" "outbounds.json"
     [=[[{"tag":"bad-header-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":42,"X-Valid":"yes"}}}}]]=]
     "HTTP header 'Host' must be a string")
+expect_rejected(injected_ws_request_path "{}" "outbounds.json"
+    [=[[{"tag":"bad-ws-path","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws\r\nInjected: yes"}}}]]=]
+    "ws path must be a valid HTTP request target")
+expect_rejected(injected_http_upgrade_host "{}" "outbounds.json"
+    [=[[{"tag":"bad-http-upgrade-host","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"httpupgrade","security":"none","httpupgradeSettings":{"path":"/up","host":"example.com\r\nInjected: yes"}}}]]=]
+    "http upgrade host must be a valid HTTP authority")
+expect_rejected(invalid_http_method "{}" "outbounds.json"
+    [=[[{"tag":"bad-http-method","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","method":"GE T"}}}]]=]
+    "http method must be a valid HTTP token")
+expect_rejected(invalid_grpc_authority "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-authority","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"authority":"bad host","serviceName":"svc"}}}]]=]
+    "grpc authority must be a valid HTTP authority")
+expect_rejected(injected_grpc_user_agent "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-user-agent","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","userAgent":"grpc-go/1.0\r\nInjected: yes"}}}]]=]
+    "grpc userAgent contains invalid control characters")
+expect_rejected(invalid_ws_real_ip_header "{}" "outbounds.json"
+    [=[[{"tag":"bad-real-ip-header","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","realIpHeader":"Bad Header"}}}]]=]
+    "ws realIpHeader must be a valid HTTP header name")
+expect_rejected(invalid_host_header_authority "{}" "outbounds.json"
+    [=[[{"tag":"bad-host-authority","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"bad host"}}}}]]=]
+    "HTTP header 'host' must be a valid HTTP authority")
+expect_started(valid_safe_http_request_components
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-http-components","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws?ed=2048","realIpHeader":"X-Real-IP","headers":{"Host":"[2001:db8::1]:443"}}}}]]=])
 expect_rejected(non_object_http_headers "{}" "outbounds.json"
     [=[[{"tag":"bad-headers-shape","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":[]}}}]]=]
     "headers must be an object")

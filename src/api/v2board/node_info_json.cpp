@@ -50,9 +50,17 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
     if (const auto* network_settings = source.if_contains("networkSettings");
         network_settings && network_settings->is_object()) {
         const auto& settings = network_settings->as_object();
-        if (const auto* path = settings.if_contains("path");
-            path && path->is_string()) {
+        if (const auto* path = settings.if_contains("path")) {
+            if (!path->is_string()) {
+                return std::unexpected(
+                    "networkSettings path must be a string");
+            }
             config.Path = std::string(path->as_string());
+            if (!config.Path.empty() &&
+                !transport::internet::IsValidHttpRequestTarget(config.Path)) {
+                return std::unexpected(
+                    "networkSettings path must be a valid HTTP request target");
+            }
         }
         if (const auto* headers = settings.if_contains("headers")) {
             if (!headers->is_object()) {
@@ -72,6 +80,10 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                 if (!transport::internet::IsValidHttpHeaderValue(value)) {
                     return std::unexpected(
                         "networkSettings Host contains invalid control characters");
+                }
+                if (!transport::internet::IsValidHttpAuthority(value)) {
+                    return std::unexpected(
+                        "networkSettings Host must be a valid HTTP authority");
                 }
                 if (host && *host != value) {
                     return std::unexpected(
