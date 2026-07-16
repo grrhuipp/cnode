@@ -28,24 +28,20 @@ InboundBuild InboundBuilder(const std::string& panel_name,
         ? std::string(constants::protocol::kTcp)
         : node_config.TransportProtocol;
 
-    std::string cert_file = node_config.TLSCert;
-    std::string key_file = node_config.TLSKey;
     // TLSEnable only declares that this cnode instance can terminate TLS.
     // The panel node still decides whether this particular inbound uses TLS.
     const bool tls_enable = ShouldEnableInboundTls(panel_config, node_config);
 
     if (panel_config) {
-        if (tls_enable) {
-            if (!panel_config->TLSCert.empty()) cert_file = panel_config->TLSCert;
-            if (!panel_config->TLSKey.empty()) key_file = panel_config->TLSKey;
-        }
         build.proxy_protocol = panel_config->ProxyProtocol;
     }
 
     if (tls_enable) {
         build.stream_settings.security = std::string(constants::protocol::kTls);
-        build.stream_settings.tls.cert_file = cert_file;
-        build.stream_settings.tls.key_file = key_file;
+        if (panel_config) {
+            build.stream_settings.tls.cert_file = panel_config->TLSCert;
+            build.stream_settings.tls.key_file = panel_config->TLSKey;
+        }
         build.stream_settings.tls.server_name = node_config.TLSServerName;
     }
 

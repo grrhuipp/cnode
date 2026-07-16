@@ -11,8 +11,6 @@ bool NodeConfigChanged(const api::NodeInfo& current,
         || current.Host != candidate.Host
         || current.EnableTLS != candidate.EnableTLS
         || current.TLSServerName != candidate.TLSServerName
-        || current.TLSCert != candidate.TLSCert
-        || current.TLSKey != candidate.TLSKey
         || current.CypherMethod != candidate.CypherMethod
         || current.ShadowsocksServerKey != candidate.ShadowsocksServerKey
         || current.SniffEnabled != candidate.SniffEnabled

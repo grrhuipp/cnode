@@ -65,8 +65,6 @@ struct NodeInfo {
 
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
-    std::string TLSCert;
-    std::string TLSKey;
     bool SniffEnabled = true;
     std::vector<std::string> DestOverride = {
         std::string(constants::protocol::kTls),

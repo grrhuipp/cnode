@@ -5,6 +5,8 @@ if(NOT DEFINED TEST_ROOT)
     message(FATAL_ERROR "TEST_ROOT is required")
 endif()
 
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_FILE}" EXISTING_TEST_FILE)
+
 function(expect_rejected case_name main_content sidecar_name sidecar_content)
     set(case_dir "${TEST_ROOT}/${case_name}")
     file(REMOVE_RECURSE "${case_dir}")
@@ -85,6 +87,9 @@ expect_rejected(non_object_limits
     [=[{"limits":"none"}]=] "" "" "limits must be an object")
 expect_rejected(non_array_panels
     [=[{"panels":{}}]=] "" "" "panels must be an array")
+expect_rejected(orphan_panel_tls_certificate
+    "{\"panels\":[{\"Name\":\"orphan-tls\",\"Type\":\"V2board\",\"APIHost\":\"http://127.0.0.1\",\"Key\":\"secret\",\"NodeIDs\":[1],\"NodeType\":\"vmess\",\"TLSEnable\":true,\"TLSCert\":\"${EXISTING_TEST_FILE}\"}]}"
+    "" "")
 expect_rejected(overflow_workers
     [=[{"workers":4294967296}]=] "" "")
 expect_rejected(excessive_workers

@@ -154,6 +154,10 @@ bool PanelConfig::Validate() const {
         return false;
     }
     if (TLSEnable) {
+        if (TLSCert.empty() != TLSKey.empty()) {
+            LOG_ERROR("Panel {} TLSCert and TLSKey must be configured together", Name);
+            return false;
+        }
         if (!TLSCert.empty() && !std::filesystem::exists(TLSCert)) {
             LOG_ERROR("Panel {} TlsCert not found: {}", Name, TLSCert);
             return false;
