@@ -662,7 +662,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
         }
         trojan_config.stream_settings = cfg.stream_settings;
-        trojan_config.send_through = cfg.send_through;
+        trojan_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         acpp::NormalizeOutboundStreamSettings(
             trojan_config.stream_settings,
             acpp::OutboundStreamDefaults{

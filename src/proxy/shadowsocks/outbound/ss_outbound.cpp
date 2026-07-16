@@ -487,12 +487,11 @@ TargetAddress MakeServerTarget(const SsOutboundConfig& config) {
                          config.port);
 }
 
-std::string SelectUdpBindAddress(const SsOutboundConfig& config) {
-    if (!config.send_through.empty() &&
-        config.send_through != constants::binding::kAuto) {
-        return config.send_through;
+net::ip::address SelectUdpBindAddress(const SsOutboundConfig& config) {
+    if (config.send_through.GetMode() == OutboundBind::Mode::Explicit) {
+        return *config.send_through.ExplicitAddress();
     }
-    return std::string(constants::network::kAnyIpv4);
+    return net::ip::address_v4::any();
 }
 
 }  // namespace
@@ -867,7 +866,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
         }
         ss_config.stream_settings = cfg.stream_settings;
-        ss_config.send_through = cfg.send_through;
+        ss_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         acpp::NormalizeOutboundStreamSettings(
             ss_config.stream_settings,
             acpp::OutboundStreamDefaults{

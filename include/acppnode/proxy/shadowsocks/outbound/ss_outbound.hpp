@@ -5,6 +5,7 @@
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -34,7 +35,7 @@ struct SsOutboundConfig {
     std::string            password;
     std::string            method  = std::string(constants::protocol::kAes256Gcm);
     StreamSettings         stream_settings;
-    std::string            send_through;
+    OutboundBind           send_through;
     std::chrono::seconds   timeout{10};
     uint8_t                uot_version = 0;
 };

@@ -1,5 +1,8 @@
 #include "source_config.hpp"
 
+#include <format>
+#include <stdexcept>
+
 namespace acpp::proxyman::outbound {
 
 OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
@@ -33,9 +36,21 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
         cfg.stream_settings = StreamSettings::FromJson(*snake_stream_settings);
     }
 
-    cfg.send_through = read_string("sendThrough");
-    if (cfg.send_through.empty()) {
-        cfg.send_through = read_string("send_through");
+    const json::value* send_through = j.if_contains("sendThrough");
+    if (!send_through) {
+        send_through = j.if_contains("send_through");
+    }
+    if (send_through) {
+        if (!send_through->is_string()) {
+            throw std::invalid_argument("outbound sendThrough must be a string");
+        }
+        const auto text = send_through->as_string();
+        cfg.send_through = OutboundBind::Parse(text);
+        if (!cfg.send_through) {
+            throw std::invalid_argument(std::format(
+                "outbound sendThrough '{}' must be auto, wildcard, or an IP address",
+                text));
+        }
     }
 
     return cfg;

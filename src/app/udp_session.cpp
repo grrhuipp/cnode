@@ -165,16 +165,11 @@ UDPSession::~UDPSession() {
     }
 }
 
-ErrorCode UDPSession::Start(const std::string& bind_address) {
-    const std::string primary_bind = bind_address.empty()
-        ? std::string(constants::network::kAnyIpv4)
-        : bind_address;
+ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
     std::string last_error = "bind failed";
 
     try {
-        auto addr = net::ip::make_address(primary_bind);
-
-        udp::endpoint local_ep(addr, 0);  // 端口 0 = 自动分配
+        udp::endpoint local_ep(bind_address, 0);  // 端口 0 = 自动分配
         udp::socket sock(impl_->io_context);
         sock.open(local_ep.protocol());
         sock.set_option(udp::socket::reuse_address(true));
@@ -186,7 +181,8 @@ ErrorCode UDPSession::Start(const std::string& bind_address) {
 
         LOG_ACCESS_DEBUG("UDP session {} started on {}",
                          impl_->session_id,
-                         iputil::FormatEndpointForLog(primary_bind, impl_->local_port));
+                         iputil::FormatEndpointForLog(
+                             bind_address.to_string(), impl_->local_port));
         return ErrorCode::SUCCESS;
     } catch (const IoSystemError& e) {
         last_error = e.what();
@@ -656,7 +652,7 @@ UDPSessionManager::~UDPSessionManager() = default;
 
 UDPSession* UDPSessionManager::GetOrCreateSession(
     const std::string& session_id,
-    const std::string& bind_address) {
+    const net::ip::address& bind_address) {
 
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {

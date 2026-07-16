@@ -1145,7 +1145,7 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (!settings) {
             return std::nullopt;
         }
-        settings->send_through = cfg.send_through;
+        settings->send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         acpp::proxyman::outbound::PreparedOutboundConfig prepared;
         prepared.tag = cfg.tag;
         prepared.protocol = cfg.protocol;

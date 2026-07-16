@@ -42,6 +42,12 @@ bool WriteConfig(const fs::path& root, unsigned short port) {
         << '\n';
     if (!inbounds) return false;
 
+    std::ofstream outbounds(root / "outbounds.json", std::ios::binary);
+    outbounds
+        << R"([{"tag":"explicit-bind","protocol":"freedom","sendThrough":"127.0.0.1"}])"
+        << '\n';
+    if (!outbounds) return false;
+
     std::ofstream routing(root / "routing.json", std::ios::binary);
     routing
         << R"({"rules":[{"port":"80,443,1000-2000","sourcePort":[53,"1024-65535"],"outboundTag":"direct"}]})"

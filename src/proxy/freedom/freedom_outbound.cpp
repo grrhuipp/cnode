@@ -101,14 +101,12 @@ bool PreservesDnsOrder(Handler::DomainStrategy strategy) {
     }
 }
 
-std::string SelectUdpBindAddress(
+net::ip::address SelectUdpBindAddress(
     const FreedomSettings& settings,
     const session::Context& ctx) {
-    const bool auto_bind = settings.send_through == constants::binding::kAuto;
-    if (!settings.send_through.empty() &&
-        !auto_bind &&
-        !iputil::IsWildcardBindAddress(settings.send_through)) {
-        return settings.send_through;
+    const bool auto_bind = settings.send_through.GetMode() == OutboundBind::Mode::Auto;
+    if (settings.send_through.GetMode() == OutboundBind::Mode::Explicit) {
+        return *settings.send_through.ExplicitAddress();
     }
 
     const auto& target = ctx.outbound.target;
@@ -125,24 +123,37 @@ std::string SelectUdpBindAddress(
             ((target_is_v4 && inbound_local.is_v4()) ||
              (target_is_v6 && inbound_local.is_v6()) ||
              target.type == AddressType::Domain)) {
-            return inbound_local.to_string();
+            return inbound_local;
         }
     }
 
     if ((target.resolved_addr && target.resolved_addr->is_v6()) ||
         target.type == AddressType::IPv6) {
-        return "::";
+        return net::ip::address_v6::any();
     }
 
-    return std::string(constants::network::kAnyIpv4);
+    return net::ip::address_v4::any();
 }
 
-std::string MakeUdpSessionId(const std::string& bind_addr) {
+std::string MakeUdpSessionId(const net::ip::address& bind_addr) {
+    const auto text = bind_addr.to_string();
     std::string session_id;
-    session_id.reserve(4 + bind_addr.size());
+    session_id.reserve(4 + text.size());
     session_id.append("udp-");
-    session_id.append(bind_addr);
+    session_id.append(text);
     return session_id;
+}
+
+OutboundTransportTarget::BindMode ToTransportBindMode(OutboundBind::Mode mode) {
+    switch (mode) {
+        case OutboundBind::Mode::None:
+            return OutboundTransportTarget::BindMode::None;
+        case OutboundBind::Mode::Auto:
+            return OutboundTransportTarget::BindMode::Auto;
+        case OutboundBind::Mode::Explicit:
+            return OutboundTransportTarget::BindMode::Explicit;
+    }
+    return OutboundTransportTarget::BindMode::None;
 }
 
 }  // namespace
@@ -166,17 +177,9 @@ Handler::Handler(
         }
     }
 
-    if (settings_.send_through == constants::binding::kAuto) {
-        bind_mode_ = OutboundTransportTarget::BindMode::Auto;
-    } else if (!iputil::IsWildcardBindAddress(settings_.send_through)) {
-        bind_mode_ = OutboundTransportTarget::BindMode::Explicit;
-        IoErrorCode ec;
-        auto addr = net::ip::make_address(settings_.send_through, ec);
-        if (!ec) {
-            explicit_send_through_addr_ = addr;
-            explicit_udp_bind_addr_ = settings_.send_through;
-            explicit_udp_session_id_ = MakeUdpSessionId(*explicit_udp_bind_addr_);
-        }
+    if (settings_.send_through.GetMode() == OutboundBind::Mode::Explicit) {
+        explicit_udp_session_id_ =
+            MakeUdpSessionId(*settings_.send_through.ExplicitAddress());
     }
 
     domain_strategy_ = ParseDomainStrategy(settings_.domain_strategy);
@@ -245,7 +248,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target);
 
     OutboundTransportTarget transport_target;
-    transport_target.bind_mode = bind_mode_;
+    transport_target.bind_mode = ToTransportBindMode(settings_.send_through.GetMode());
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 
@@ -354,12 +357,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
 UDPSession* Handler::AcquireUdpSession(session::Context& ctx) {
     // Per-worker UDP session：同一 Worker 上同一出口 IP 共享一个 UDP socket。
-    std::string bind_addr_storage;
+    net::ip::address bind_addr_storage;
     std::string session_id_storage;
-    const std::string* bind_addr = nullptr;
+    const net::ip::address* bind_addr = nullptr;
     const std::string* session_id = nullptr;
-    if (explicit_udp_bind_addr_ && explicit_udp_session_id_) {
-        bind_addr = &*explicit_udp_bind_addr_;
+    if (settings_.send_through.GetMode() == OutboundBind::Mode::Explicit &&
+        explicit_udp_session_id_) {
+        bind_addr = &*settings_.send_through.ExplicitAddress();
         session_id = &*explicit_udp_session_id_;
     } else {
         bind_addr_storage = SelectUdpBindAddress(settings_, ctx);
@@ -457,7 +461,7 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
     const tcp::endpoint* inbound_local_addr,
     const net::ip::address& remote_addr) {
 
-    if (bind_mode_ == OutboundTransportTarget::BindMode::Auto) {
+    if (settings_.send_through.GetMode() == OutboundBind::Mode::Auto) {
         // auto 模式：源进源出
         // 使用入站连接的本地 IP 作为出站绑定地址
         // 这样可以实现「哪个 IP 进哪个 IP 出」
@@ -475,7 +479,7 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
         return std::nullopt;
     }
 
-    return explicit_send_through_addr_;
+    return settings_.send_through.ExplicitAddress();
 }
 
 }  // namespace acpp::proxy::freedom::outbound
@@ -491,13 +495,20 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         const auto& s = cfg.settings;
         acpp::proxy::freedom::outbound::FreedomSettings settings;
 
-        settings.send_through = std::string(acpp::constants::binding::kAuto);
-        if (const auto* camel_send_through = s.if_contains("sendThrough");
-            camel_send_through && camel_send_through->is_string()) {
-            settings.send_through = std::string(camel_send_through->as_string());
-        } else if (const auto* snake_send_through = s.if_contains("send_through");
-                   snake_send_through && snake_send_through->is_string()) {
-            settings.send_through = std::string(snake_send_through->as_string());
+        settings.send_through = acpp::OutboundBind::Auto();
+        const acpp::json::value* nested_send_through = s.if_contains("sendThrough");
+        if (!nested_send_through) {
+            nested_send_through = s.if_contains("send_through");
+        }
+        if (nested_send_through) {
+            if (!nested_send_through->is_string()) {
+                return std::nullopt;
+            }
+            auto parsed = acpp::OutboundBind::Parse(nested_send_through->as_string());
+            if (!parsed) {
+                return std::nullopt;
+            }
+            settings.send_through = std::move(*parsed);
         }
         settings.domain_strategy = std::string(acpp::constants::protocol::kAsIs);
         if (const auto* camel_domain_strategy = s.if_contains("domainStrategy");
@@ -512,8 +523,8 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         // Xray 顶级 sendThrough 优先于 settings 内的
-        if (!cfg.send_through.empty()) {
-            settings.send_through = cfg.send_through;
+        if (cfg.send_through) {
+            settings.send_through = *cfg.send_through;
         }
 
         acpp::proxyman::outbound::PreparedOutboundConfig prepared;

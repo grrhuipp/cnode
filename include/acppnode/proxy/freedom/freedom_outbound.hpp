@@ -4,7 +4,8 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/dial_target.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -30,7 +31,7 @@ namespace acpp::proxy::freedom::outbound {
 // Freedom 出站设置
 // ============================================================================
 struct FreedomSettings {
-    std::string send_through = std::string(constants::binding::kAuto);   // auto / 0.0.0.0 / 具体 IPv4
+    OutboundBind send_through = OutboundBind::Auto();
     std::string domain_strategy = std::string(constants::protocol::kAsIs);
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
     bool enable_udp = true;               // 是否启用 UDP
@@ -98,10 +99,7 @@ private:
     std::chrono::seconds dial_timeout_;
     std::optional<TargetAddress> redirect_target_;
     std::string redirect_target_text_;
-    OutboundTransportTarget::BindMode bind_mode_ = OutboundTransportTarget::BindMode::None;
     DomainStrategy domain_strategy_ = DomainStrategy::AsIs;
-    std::optional<net::ip::address> explicit_send_through_addr_;
-    std::optional<std::string> explicit_udp_bind_addr_;
     std::optional<std::string> explicit_udp_session_id_;
     StreamSettings stream_settings_;          // 默认 tcp/none
 };

@@ -2,6 +2,7 @@
 
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -34,7 +35,7 @@ struct TrojanOutboundConfig {
 
     // 传输层配置（保持现有 streamSettings JSON）
     StreamSettings stream_settings;
-    std::string send_through;
+    OutboundBind send_through;
 
     // 连接配置
     std::chrono::seconds timeout{10};

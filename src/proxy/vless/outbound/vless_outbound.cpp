@@ -1360,7 +1360,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         vless_config.stream_settings = cfg.stream_settings;
-        vless_config.send_through = cfg.send_through;
+        vless_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         acpp::NormalizeOutboundStreamSettings(
             vless_config.stream_settings,
             acpp::OutboundStreamDefaults{

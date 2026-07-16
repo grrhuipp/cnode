@@ -5,6 +5,7 @@
 #include "acppnode/proxy/vmess/account.hpp"
 #include "acppnode/proxy/vmess/types.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -35,7 +36,7 @@ struct VMessOutboundConfig {
 
     // 传输层配置（JSON 格式保持不变）
     StreamSettings stream_settings;
-    std::string send_through;
+    OutboundBind send_through;
 
     // 传输层拨号/握手超时
     std::chrono::seconds timeout{defaults::kDialTimeout};

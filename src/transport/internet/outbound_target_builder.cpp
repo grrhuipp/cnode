@@ -17,38 +17,14 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
 
 namespace {
 
-struct BindSelection {
-    OutboundTransportTarget::BindMode mode = OutboundTransportTarget::BindMode::None;
-    std::optional<net::ip::address> explicit_addr;
-};
-
-BindSelection ParseBindSelection(std::string_view send_through) {
-    BindSelection selection;
-    if (send_through.empty() || iputil::IsWildcardBindAddress(send_through)) {
-        return selection;
-    }
-    if (send_through == constants::binding::kAuto) {
-        selection.mode = OutboundTransportTarget::BindMode::Auto;
-        return selection;
-    }
-
-    IoErrorCode ec;
-    auto addr = net::ip::make_address(send_through, ec);
-    if (!ec) {
-        selection.mode = OutboundTransportTarget::BindMode::Explicit;
-        selection.explicit_addr = addr;
-    }
-    return selection;
-}
-
 std::optional<net::ip::address> SelectBindAddress(
-    const BindSelection& bind,
+    const OutboundBind& bind,
     const tcp::endpoint* inbound_local_addr,
     const net::ip::address& remote_addr) {
-    if (bind.mode == OutboundTransportTarget::BindMode::Explicit) {
-        return bind.explicit_addr;
+    if (bind.GetMode() == OutboundBind::Mode::Explicit) {
+        return bind.ExplicitAddress();
     }
-    if (bind.mode != OutboundTransportTarget::BindMode::Auto || !inbound_local_addr) {
+    if (bind.GetMode() != OutboundBind::Mode::Auto || !inbound_local_addr) {
         return std::nullopt;
     }
 
@@ -66,7 +42,7 @@ std::optional<net::ip::address> SelectBindAddress(
 
 void AppendCandidate(
     OutboundTransportTarget& target,
-    const BindSelection& bind,
+    const OutboundBind& bind,
     const tcp::endpoint* inbound_local_addr,
     const net::ip::address& remote_addr,
     uint16_t port) {
@@ -76,9 +52,9 @@ void AppendCandidate(
     target.candidates.push_back(std::move(candidate));
 }
 
-bool WantsIPv6(const BindSelection& bind, const tcp::endpoint* inbound_local_addr) noexcept {
-    if (bind.mode == OutboundTransportTarget::BindMode::Explicit) {
-        return bind.explicit_addr && bind.explicit_addr->is_v6();
+bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr) noexcept {
+    if (bind.GetMode() == OutboundBind::Mode::Explicit) {
+        return bind.ExplicitAddress() && bind.ExplicitAddress()->is_v6();
     }
     if (!inbound_local_addr) {
         return false;
@@ -310,10 +286,20 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
-    const auto bind = ParseBindSelection(options.send_through);
+    const auto& bind = options.send_through;
 
     OutboundTransportTarget target;
-    target.bind_mode = bind.mode;
+    switch (bind.GetMode()) {
+        case OutboundBind::Mode::None:
+            target.bind_mode = OutboundTransportTarget::BindMode::None;
+            break;
+        case OutboundBind::Mode::Auto:
+            target.bind_mode = OutboundTransportTarget::BindMode::Auto;
+            break;
+        case OutboundBind::Mode::Explicit:
+            target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
+            break;
+    }
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
     target.tls_server_name = options.tls_server_name;

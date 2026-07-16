@@ -2,6 +2,7 @@
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
 #include "acppnode/transport/internet/tls_config.hpp"
 #include <cstdint>
@@ -224,7 +225,7 @@ struct StreamSettings {
 struct XHttpDownloadSettings {
     std::string address;
     uint16_t port = 0;
-    std::string send_through;
+    OutboundBind send_through;
     StreamSettings stream_settings;
 };
 

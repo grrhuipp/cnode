@@ -622,10 +622,24 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
         settings->port = static_cast<uint16_t>(port);
     }
 
-    settings->send_through = jstr(j, "sendThrough", "");
-    if (settings->send_through.empty()) {
-        settings->send_through = jstr(j, "send_through", "");
+    const json::value* bind_value = j.if_contains("sendThrough");
+    if (!bind_value) {
+        bind_value = j.if_contains("send_through");
     }
+    std::string send_through;
+    if (bind_value) {
+        if (!bind_value->is_string()) {
+            throw std::invalid_argument("xhttp download sendThrough must be a string");
+        }
+        send_through = std::string(bind_value->as_string());
+    }
+    auto parsed_bind = OutboundBind::Parse(send_through);
+    if (!parsed_bind) {
+        throw std::invalid_argument(std::format(
+            "xhttp download sendThrough '{}' must be auto, wildcard, or an IP address",
+            send_through));
+    }
+    settings->send_through = std::move(*parsed_bind);
 
     settings->stream_settings = StreamSettings::FromJson(j);
     settings->stream_settings.xhttp.download_settings.reset();

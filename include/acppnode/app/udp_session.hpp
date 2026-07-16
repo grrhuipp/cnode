@@ -6,7 +6,6 @@
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/app/udp_types.hpp"
 #include "acppnode/common/defaults.hpp"
-#include "acppnode/core/constants.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -36,7 +35,7 @@ public:
     ~UDPSession();
 
     // 启动会话（绑定本地端口）
-    ErrorCode Start(const std::string& bind_address = std::string(constants::network::kAnyIpv4));
+    ErrorCode Start(const net::ip::address& bind_address);
 
     // UDP 发送/接收接口
     net::awaitable<ErrorCode> SendTo(
@@ -103,7 +102,7 @@ public:
     // 获取或创建会话
     UDPSession* GetOrCreateSession(
         const std::string& session_id,
-        const std::string& bind_address = std::string(constants::network::kAnyIpv4));
+        const net::ip::address& bind_address);
 
     // 获取现有会话
     UDPSession* GetSession(const std::string& session_id);

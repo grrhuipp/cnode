@@ -4,6 +4,7 @@
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/transport/internet/dial_target.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
@@ -33,7 +34,7 @@ struct OutboundTargetOptions {
     uint16_t port = 0;
     const StreamSettings* stream_settings = nullptr;
     std::chrono::seconds timeout{defaults::kDialTimeout};
-    std::string_view send_through;
+    OutboundBind send_through;
     const tcp::endpoint* inbound_local_addr = nullptr;
     std::string_view tls_server_name;
     std::string_view ws_host;

@@ -2,6 +2,7 @@
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/proxy_protocol_mode.hpp"
 
 #include <string>
@@ -24,7 +25,7 @@ struct PanelConfig {
     std::vector<int> NodeIDs;                 // 节点 ID 列表
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
     std::string ListenIP = std::string(constants::network::kDualStackAuto);
-    std::string SendIP = std::string(constants::binding::kAuto);
+    OutboundBind SendIP = OutboundBind::Auto();
     bool EnableDNS = true;
     std::string DNSType;
     ProxyProtocolMode ProxyProtocol = ProxyProtocolMode::Auto; // off / auto / on

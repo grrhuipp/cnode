@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace acpp {
 
@@ -112,7 +114,18 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.front());
     }
     cfg.ListenIP = jstr(j, "ListenIP", cfg.ListenIP);
-    cfg.SendIP = jstr(j, "SendIP", cfg.SendIP);
+    if (const auto* send_ip = j.if_contains("SendIP")) {
+        if (!send_ip->is_string()) {
+            throw std::invalid_argument("Panel SendIP must be a string");
+        }
+        auto parsed = OutboundBind::Parse(send_ip->as_string());
+        if (!parsed) {
+            throw std::invalid_argument(std::format(
+                "Panel SendIP '{}' must be auto, wildcard, or an IP address",
+                send_ip->as_string()));
+        }
+        cfg.SendIP = std::move(*parsed);
+    }
     cfg.EnableDNS = jbool(j, "EnableDNS", cfg.EnableDNS);
     cfg.DNSType = jstr(j, "DNSType", cfg.DNSType);
     cfg.ProxyProtocol = ParseProxyProtocolMode(j, "ProxyProtocol", cfg.ProxyProtocol);

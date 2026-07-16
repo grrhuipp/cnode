@@ -3,6 +3,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include <array>
 #include <chrono>
@@ -37,7 +38,7 @@ struct VlessOutboundConfig {
     bool packet_addr = false;
 
     StreamSettings stream_settings;
-    std::string send_through;
+    OutboundBind send_through;
     std::chrono::seconds timeout{10};
 };
 

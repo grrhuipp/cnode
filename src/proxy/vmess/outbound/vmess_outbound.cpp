@@ -429,7 +429,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         vmess_config.stream_settings = cfg.stream_settings;
-        vmess_config.send_through = cfg.send_through;
+        vmess_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         acpp::NormalizeOutboundStreamSettings(
             vmess_config.stream_settings,
             acpp::OutboundStreamDefaults{

@@ -2,6 +2,7 @@
 
 #include "acppnode/infra/json.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <optional>
@@ -16,7 +17,7 @@ struct OutboundSourceConfig {
     std::string protocol;
     json::object settings;
     StreamSettings stream_settings;
-    std::string send_through;
+    std::optional<OutboundBind> send_through;
 
     static OutboundSourceConfig FromJson(const json::object& j);
 };

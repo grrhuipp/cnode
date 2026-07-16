@@ -72,6 +72,9 @@ expect_rejected(trailing_panel_api_port
 expect_rejected(empty_panel_api_port
     [=[{"panels":[{"Name":"bad-port","Type":"V2board","APIHost":"http://127.0.0.1:","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     "" "")
+expect_rejected(invalid_panel_send_ip
+    [=[{"panels":[{"Name":"bad-bind","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess","SendIP":"not-an-ip"}]}]=]
+    "" "")
 expect_rejected(negative_route_port "{}" "routing.json"
     [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
 expect_rejected(overflow_route_port "{}" "routing.json"
@@ -90,6 +93,12 @@ expect_rejected(invalid_route_source_cidr "{}" "routing.json"
     [=[{"rules":[{"source":["not-an-ip"],"outboundTag":"direct"}]}]=])
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
+expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"
+    [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":"not-an-ip"}]]=])
+expect_rejected(non_string_outbound_send_through "{}" "outbounds.json"
+    [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":123}]]=])
+expect_rejected(invalid_xhttp_download_send_through "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-bind","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"sendThrough":"not-an-ip","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"
