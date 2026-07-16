@@ -86,7 +86,7 @@ public:
         proxyman::inbound::BuildRequest req);
 
     // 动态出站（线程安全）：XrayR Controller 面板节点 addOutbound/removeOutbound。
-    net::awaitable<bool> AddOutboundTask(
+    net::awaitable<void> AddOutboundTask(
         proxyman::outbound::PreparedOutboundConfig config);
     net::awaitable<void> RemoveOutboundTask(std::string tag);
 
@@ -139,7 +139,7 @@ private:
 
     void UnregisterListenerOnWorkerThread(std::string_view tag);
 
-    [[nodiscard]] bool AddOutboundOnWorkerThread(
+    void AddOutboundOnWorkerThread(
         proxyman::outbound::PreparedOutboundConfig config);
     void RemoveOutboundOnWorkerThread(std::string_view tag);
 

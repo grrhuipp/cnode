@@ -14,6 +14,8 @@ class UDPSessionManager;
 
 namespace acpp::proxyman::outbound {
 
+// Prepared configs are runtime invariants. Construction failures throw;
+// callers must not continue with a partially installed outbound table.
 [[nodiscard]] std::unique_ptr<::acpp::Outbound> NewHandler(
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,

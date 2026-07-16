@@ -54,13 +54,10 @@ net::awaitable<bool> Controller::Impl::addOutbound(api::API* panel,
         co_return false;
     }
     for (const auto& worker : workers_) {
-        const bool added = co_await net::co_spawn(
+        co_await net::co_spawn(
             worker->GetExecutor(),
             worker->AddOutboundTask(*prepared),
             net::use_awaitable);
-        if (!added) {
-            co_return false;
-        }
     }
     co_return true;
 }

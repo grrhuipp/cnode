@@ -162,6 +162,19 @@ CreateMismatchedOutboundConfig(
 }
 
 std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+CreateNullOutboundConfig(
+    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    return acpp::proxyman::outbound::PreparedOutboundCreator{
+        [](std::string_view,
+           acpp::net::io_context&,
+           acpp::app::dns::DNS&,
+           acpp::UDPSessionManager*,
+           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+            return nullptr;
+        }};
+}
+
+std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateEmptyOutboundConfig(
     const acpp::proxyman::outbound::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{};
@@ -345,9 +358,33 @@ bool TestOutboundRegistration() {
         "mismatched-outbound", &CreateMismatchedOutboundConfig);
     source.protocol = "mismatched-outbound";
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
-    if (!prepared || acpp::proxyman::outbound::NewHandler(
-            *prepared, io_context, dns, nullptr,
-            std::chrono::seconds(1))) {
+    if (!prepared || !Throws<std::logic_error>([&] {
+            (void)acpp::proxyman::outbound::NewHandler(
+                *prepared, io_context, dns, nullptr,
+                std::chrono::seconds(1));
+        })) {
+        return false;
+    }
+
+    acpp::proxyman::outbound::RegisterProxy(
+        "null-outbound", &CreateNullOutboundConfig);
+    source.protocol = "null-outbound";
+    prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
+    if (!prepared || !Throws<std::logic_error>([&] {
+            (void)acpp::proxyman::outbound::NewHandler(
+                *prepared, io_context, dns, nullptr,
+                std::chrono::seconds(1));
+        })) {
+        return false;
+    }
+
+    acpp::proxyman::outbound::PreparedOutboundConfig missing_creator;
+    missing_creator.tag = "missing-runtime-creator";
+    if (!Throws<std::logic_error>([&] {
+            (void)acpp::proxyman::outbound::NewHandler(
+                missing_creator, io_context, dns, nullptr,
+                std::chrono::seconds(1));
+        })) {
         return false;
     }
 

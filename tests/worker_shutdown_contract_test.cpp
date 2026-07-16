@@ -1,10 +1,15 @@
 #include "acppnode/app/worker.hpp"
+#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 
 #include <concepts>
 #include <utility>
 
 static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().ShutdownTask()),
+    acpp::net::awaitable<void>>);
+static_assert(std::same_as<
+    decltype(std::declval<acpp::Worker&>().AddOutboundTask(
+        std::declval<acpp::proxyman::outbound::PreparedOutboundConfig>())),
     acpp::net::awaitable<void>>);
 
 int main() {

@@ -41,6 +41,7 @@
 #include <atomic>
 #include <memory>
 #include <span>
+#include <stdexcept>
 
 namespace acpp {
 
@@ -272,15 +273,13 @@ void Worker::RuntimeState::InitOutbounds(
             *dns_service, udp_session_manager.get(),
             dial_timeout);
 
-        if (handler) {
-            LOG_DEBUG("Worker[{}]: registered {} outbound '{}'",
-                      worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
-            (void)outbound_manager->AddHandler(std::move(handler));
-        } else {
-            LOG_WARN("Worker[{}]: failed to create {} outbound '{}'"
-                     " (unregistered protocol or invalid config)",
-                     worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
+        if (!outbound_manager->AddHandler(std::move(handler))) {
+            throw std::logic_error(
+                "failed to install prepared outbound '" +
+                prepared_outbound.tag + "'");
         }
+        LOG_DEBUG("Worker[{}]: registered {} outbound '{}'",
+                  worker.id_, prepared_outbound.protocol, prepared_outbound.tag);
     }
 }
 
@@ -842,7 +841,7 @@ net::awaitable<bool> Worker::RegisterInboundTask(
         protocol, limiter, req, std::move(receiver));
 }
 
-bool Worker::AddOutboundOnWorkerThread(
+void Worker::AddOutboundOnWorkerThread(
     proxyman::outbound::PreparedOutboundConfig config) {
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
@@ -852,19 +851,12 @@ bool Worker::AddOutboundOnWorkerThread(
         *runtime_->dns_service, runtime_->udp_session_manager.get(),
         current_snapshot->timeouts.DialTimeout());
 
-    if (!handler) {
-        LOG_WARN("Worker[{}]: failed to create dynamic {} outbound '{}'",
-                 id_, config.protocol, config.tag);
-        return false;
+    if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
+        throw std::logic_error(
+            "failed to install dynamic outbound '" + config.tag + "'");
     }
-
     LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
               id_, config.protocol, config.tag);
-    if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
-        LOG_WARN("Worker[{}]: failed to replace dynamic outbound '{}'",
-                 id_, config.tag);
-        return false;
-    }
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
     auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
@@ -882,12 +874,12 @@ bool Worker::AddOutboundOnWorkerThread(
         next_snapshot->default_outbound_tag,
         runtime_->geo_manager);
     runtime_->StoreSnapshot(std::move(next_snapshot));
-    return true;
 }
 
-net::awaitable<bool> Worker::AddOutboundTask(
+net::awaitable<void> Worker::AddOutboundTask(
     proxyman::outbound::PreparedOutboundConfig config) {
-    co_return AddOutboundOnWorkerThread(std::move(config));
+    AddOutboundOnWorkerThread(std::move(config));
+    co_return;
 }
 
 void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {

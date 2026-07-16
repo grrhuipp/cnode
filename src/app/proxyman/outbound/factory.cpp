@@ -65,12 +65,19 @@ std::unique_ptr<::acpp::Outbound> NewHandler(
     std::chrono::seconds dial_timeout) {
 
     if (!config.create) {
-        return nullptr;
+        throw std::logic_error(
+            "prepared outbound '" + config.tag + "' has no creator");
     }
     auto proxy = config.create(
         config.tag, io_context, dns, udp_mgr, dial_timeout);
-    if (!proxy || proxy->Tag() != config.tag) {
-        return nullptr;
+    if (!proxy) {
+        throw std::logic_error(
+            "prepared outbound '" + config.tag + "' creator returned null");
+    }
+    if (proxy->Tag() != config.tag) {
+        throw std::logic_error(
+            "prepared outbound '" + config.tag +
+            "' created handler with tag '" + std::string(proxy->Tag()) + "'");
     }
     return proxy;
 }
