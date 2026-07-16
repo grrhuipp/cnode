@@ -5,6 +5,9 @@
 namespace acpp {
 namespace defaults {
 
+// 运行线程
+constexpr uint32_t kMaxWorkers = 1024;
+
 // 资源限制
 constexpr uint32_t kMaxConnections = 0;            // 最大并发连接数（0=不限制）
 constexpr uint32_t kMaxConnectionsPerIP = 0;       // 单 IP 最大连接数（0=不限制）

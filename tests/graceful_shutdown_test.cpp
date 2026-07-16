@@ -29,7 +29,9 @@ bool WriteConfig(const fs::path& root, unsigned short port) {
     if (ec) return false;
 
     std::ofstream main_config(root / "config.json", std::ios::binary);
-    main_config << "{}\n";
+    main_config
+        << R"({"workers":2,"dns":{"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5}})"
+        << '\n';
     if (!main_config) return false;
 
     std::ofstream inbounds(root / "inbounds.json", std::ios::binary);

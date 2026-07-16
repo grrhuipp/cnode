@@ -8,6 +8,11 @@
 namespace acpp {
 
 bool Config::Validate() const {
+    if (workers_ == 0 || workers_ > defaults::kMaxWorkers) {
+        LOG_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
+        return false;
+    }
+
     if (dns_.servers.empty()) {
         LOG_ERROR("At least one DNS server is required");
         return false;

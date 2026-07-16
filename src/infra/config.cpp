@@ -44,6 +44,39 @@ inline int64_t jint(const json::object& obj, std::string_view key,
     return def;
 }
 
+uint32_t juint32(const json::object& obj,
+                 std::string_view key,
+                 uint32_t def) {
+    const auto* value = obj.if_contains(key);
+    if (!value) {
+        return def;
+    }
+
+    uint64_t parsed = 0;
+    if (value->is_int64()) {
+        const int64_t signed_value = value->as_int64();
+        if (signed_value < 0) {
+            throw std::invalid_argument(std::format(
+                "{} must be an integer between 0 and {}",
+                key, std::numeric_limits<uint32_t>::max()));
+        }
+        parsed = static_cast<uint64_t>(signed_value);
+    } else if (value->is_uint64()) {
+        parsed = value->as_uint64();
+    } else {
+        throw std::invalid_argument(std::format(
+            "{} must be an integer between 0 and {}",
+            key, std::numeric_limits<uint32_t>::max()));
+    }
+
+    if (parsed > std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument(std::format(
+            "{} must be an integer between 0 and {}",
+            key, std::numeric_limits<uint32_t>::max()));
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
 uint16_t required_port(const json::object& obj, std::string_view key) {
     const auto result = ReadJsonPort(obj, {key});
     switch (result.error) {
@@ -242,10 +275,10 @@ DnsConfig DnsConfig::FromJson(const json::object& j) {
         auto parsed = jstr_array(*servers);
         if (!parsed.empty()) cfg.servers = std::move(parsed);
     }
-    cfg.timeout    = static_cast<uint32_t>(jint(j, "timeout",   cfg.timeout));
-    cfg.cache_size = static_cast<uint32_t>(jint(j, "cacheSize", cfg.cache_size));
-    cfg.min_ttl    = static_cast<uint32_t>(jint(j, "minTTL",    cfg.min_ttl));
-    cfg.max_ttl    = static_cast<uint32_t>(jint(j, "maxTTL",    cfg.max_ttl));
+    cfg.timeout    = juint32(j, "timeout", cfg.timeout);
+    cfg.cache_size = juint32(j, "cacheSize", cfg.cache_size);
+    cfg.min_ttl    = juint32(j, "minTTL", cfg.min_ttl);
+    cfg.max_ttl    = juint32(j, "maxTTL", cfg.max_ttl);
     return cfg;
 }
 
@@ -254,8 +287,10 @@ DnsConfig DnsConfig::FromJson(const json::object& j) {
 // ============================================================================
 LimitsConfig LimitsConfig::FromJson(const json::object& j) {
     LimitsConfig cfg;
-    cfg.max_connections        = static_cast<uint32_t>(jint(j, "maxConnections",      cfg.max_connections));
-    cfg.max_connections_per_ip = static_cast<uint32_t>(jint(j, "maxConnectionsPerIP", cfg.max_connections_per_ip));
+    cfg.max_connections = juint32(
+        j, "maxConnections", cfg.max_connections);
+    cfg.max_connections_per_ip = juint32(
+        j, "maxConnectionsPerIP", cfg.max_connections_per_ip);
     return cfg;
 }
 
@@ -264,14 +299,14 @@ LimitsConfig LimitsConfig::FromJson(const json::object& j) {
 // ============================================================================
 TimeoutsConfig TimeoutsConfig::FromJson(const json::object& j) {
     TimeoutsConfig cfg;
-    cfg.handshake     = static_cast<uint32_t>(jint(j, "handshake",     cfg.handshake));
-    cfg.dial          = static_cast<uint32_t>(jint(j, "dial",          cfg.dial));
-    cfg.read          = static_cast<uint32_t>(jint(j, "read",          cfg.read));
-    cfg.write         = static_cast<uint32_t>(jint(j, "write",         cfg.write));
-    cfg.idle          = static_cast<uint32_t>(jint(j, "connIdle",      cfg.idle));
-    cfg.idle          = static_cast<uint32_t>(jint(j, "idle",          cfg.idle));
-    cfg.uplink_only   = static_cast<uint32_t>(jint(j, "uplinkOnly",    cfg.uplink_only));
-    cfg.downlink_only = static_cast<uint32_t>(jint(j, "downlinkOnly",  cfg.downlink_only));
+    cfg.handshake = juint32(j, "handshake", cfg.handshake);
+    cfg.dial = juint32(j, "dial", cfg.dial);
+    cfg.read = juint32(j, "read", cfg.read);
+    cfg.write = juint32(j, "write", cfg.write);
+    cfg.idle = juint32(j, "connIdle", cfg.idle);
+    cfg.idle = juint32(j, "idle", cfg.idle);
+    cfg.uplink_only = juint32(j, "uplinkOnly", cfg.uplink_only);
+    cfg.downlink_only = juint32(j, "downlinkOnly", cfg.downlink_only);
     return cfg;
 }
 
@@ -1119,7 +1154,11 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
             cfg.log_ = LogConfig::FromJson(j.at("log").as_object());
         }
 
-        cfg.workers_ = static_cast<uint32_t>(jint(j, "workers", cfg.workers_));
+        cfg.workers_ = juint32(j, "workers", cfg.workers_);
+        if (cfg.workers_ > defaults::kMaxWorkers) {
+            throw std::invalid_argument(std::format(
+                "workers must be between 0 and {}", defaults::kMaxWorkers));
+        }
 
         if (j.contains("dns") && j.at("dns").is_object()) {
             cfg.dns_ = DnsConfig::FromJson(j.at("dns").as_object());

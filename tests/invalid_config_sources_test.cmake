@@ -41,6 +41,18 @@ expect_rejected(wrong_shape_routing "{}" "routing.json" [=[{"routing":[]}]=])
 expect_rejected(scalar_inbounds "{}" "inbounds.json" "42")
 expect_rejected(scalar_outbounds "{}" "outbounds.json" "42")
 expect_rejected(scalar_routing "{}" "routing.json" "42")
+expect_rejected(overflow_workers
+    [=[{"workers":4294967296}]=] "" "")
+expect_rejected(excessive_workers
+    [=[{"workers":4294967295}]=] "" "")
+expect_rejected(string_workers
+    [=[{"workers":"4"}]=] "" "")
+expect_rejected(negative_read_timeout
+    [=[{"timeouts":{"read":-1}}]=] "" "")
+expect_rejected(negative_connection_limit
+    [=[{"limits":{"maxConnections":-1}}]=] "" "")
+expect_rejected(negative_dns_cache_size
+    [=[{"dns":{"cacheSize":-1}}]=] "" "")
 expect_rejected(negative_route_port "{}" "routing.json"
     [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
 expect_rejected(overflow_route_port "{}" "routing.json"
