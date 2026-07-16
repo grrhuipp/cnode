@@ -141,3 +141,18 @@ if(VLESS_OUTBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "VLESS Mux request encoding failures must propagate to relay")
 endif()
+
+set(MUX_CODEC "${SOURCE_DIR}/src/common/mux/mux_codec.cpp")
+file(READ "${MUX_CODEC}" MUX_CODEC_SOURCE)
+string(REGEX MATCHALL "DecodeFrameMetadata"
+    MUX_METADATA_PARSER_REFERENCES "${MUX_CODEC_SOURCE}")
+list(LENGTH MUX_METADATA_PARSER_REFERENCES
+    MUX_METADATA_PARSER_REFERENCE_COUNT)
+if(NOT MUX_METADATA_PARSER_REFERENCE_COUNT EQUAL 4)
+    message(FATAL_ERROR
+        "all three Mux byte layouts must share one metadata parser")
+endif()
+if(MUX_CODEC_SOURCE MATCHES "Remaining[(][)] >= 8")
+    message(FATAL_ERROR
+        "Mux GlobalID must be exactly eight metadata bytes")
+endif()

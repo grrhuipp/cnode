@@ -1,9 +1,12 @@
 #include "acppnode/common/mux/mux_codec.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buffer_util.hpp"
 
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -18,6 +21,24 @@ void Check(bool condition, std::string_view message) {
     if (!condition) {
         Fail(message);
     }
+}
+
+void CheckInvalidAcrossLayouts(
+    std::span<const uint8_t> frame,
+    std::string_view message) {
+    const auto contiguous = acpp::mux::DecodeFrame(frame.data(), frame.size());
+    const auto prefix = acpp::mux::DecodeFramePrefix(
+        frame.data(), frame.size(), frame.size());
+
+    acpp::buf::MultiBuffer buffers;
+    Check(acpp::buf::AppendSpanToMultiBuffer(frame, buffers),
+          "failed to allocate fragmented Mux test input");
+    const auto fragmented = acpp::mux::DecodeFrame(buffers, 0, frame.size());
+
+    Check(contiguous.has_value() && contiguous->frame_size == 0 &&
+              prefix.has_value() && prefix->frame_size == 0 &&
+              fragmented.has_value() && fragmented->frame_size == 0,
+          message);
 }
 
 }  // namespace
@@ -76,6 +97,51 @@ int main() {
               encoded, 7, target, oversized.size()) &&
               encoded.empty(),
           "oversized Mux UDP header was truncated instead of rejected");
+
+    Check(mux::EncodeKeepDataTo(encoded, 7, nullptr, 0),
+          "failed to encode option validation fixture");
+    encoded[5] |= 0x80;
+    CheckInvalidAcrossLayouts(
+        encoded, "unknown Mux option bits were layout-dependent or accepted");
+
+    const std::vector<uint8_t> missing_new_target{
+        0x00, 0x04, 0x00, 0x07,
+        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00};
+    CheckInvalidAcrossLayouts(
+        missing_new_target, "Mux NEW without a target was accepted");
+
+    const std::vector<uint8_t> trailing_keepalive_metadata{
+        0x00, 0x05, 0x00, 0x00,
+        static_cast<uint8_t>(mux::SessionStatus::KEEPALIVE), 0x00, 0xaa};
+    CheckInvalidAcrossLayouts(
+        trailing_keepalive_metadata,
+        "Mux KEEPALIVE trailing metadata was accepted");
+
+    Check(mux::EncodeNewTo(
+              encoded,
+              7,
+              mux::NetworkType::UDP,
+              target,
+              nullptr,
+              0),
+          "failed to encode GlobalID fixture");
+    const uint16_t base_meta_len = static_cast<uint16_t>(
+        (static_cast<uint16_t>(encoded[0]) << 8) | encoded[1]);
+    encoded.insert(encoded.end(), 8, 0x42);
+    const uint16_t global_meta_len = static_cast<uint16_t>(base_meta_len + 8);
+    encoded[0] = static_cast<uint8_t>(global_meta_len >> 8);
+    encoded[1] = static_cast<uint8_t>(global_meta_len);
+    const auto global_id_frame = mux::DecodeFrame(encoded.data(), encoded.size());
+    Check(global_id_frame.has_value() && global_id_frame->frame_size != 0 &&
+              global_id_frame->has_global_id,
+          "exact eight-byte Mux GlobalID was rejected");
+
+    encoded.push_back(0x43);
+    const uint16_t oversized_global_meta_len = static_cast<uint16_t>(base_meta_len + 9);
+    encoded[0] = static_cast<uint8_t>(oversized_global_meta_len >> 8);
+    encoded[1] = static_cast<uint8_t>(oversized_global_meta_len);
+    CheckInvalidAcrossLayouts(
+        encoded, "oversized Mux GlobalID metadata was accepted");
 
     std::cout << "mux_codec_test: ok\n";
     return 0;

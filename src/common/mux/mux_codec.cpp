@@ -210,294 +210,211 @@ static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& targe
 // DecodeFrame
 // ============================================================================
 
-std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
-    // 至少需要 2 字节 MetaLen
-    if (len < 2) return std::nullopt;
+[[nodiscard]] static FrameHeader InvalidFrame() noexcept {
+    return FrameHeader{};
+}
 
-    ByteReader r(data, len);
+[[nodiscard]] static bool ReadGlobalId(
+    ByteReader& reader,
+    std::array<uint8_t, 8>& out) noexcept {
+    const auto bytes = reader.ReadBytes(out.size());
+    if (!reader.Ok()) {
+        return false;
+    }
+    std::memcpy(out.data(), bytes.data(), out.size());
+    return true;
+}
 
-    uint16_t meta_len = r.ReadU16BE();
-    if (!r.Ok()) return std::nullopt;
+[[nodiscard]] static bool ReadGlobalId(
+    MultiBufferFrameReader& reader,
+    std::array<uint8_t, 8>& out) noexcept {
+    return reader.ReadBytes(out) && reader.Ok();
+}
 
-    // MetaLen 最小为 4（SessionID:2 + Status:1 + Option:1）
-    if (meta_len < 4) {
-        FrameHeader bad;
-        bad.frame_size = 0;  // 非法帧
-        return bad;
+template <typename Reader>
+[[nodiscard]] bool DecodeFrameMetadata(Reader& meta, FrameHeader& out) {
+    const uint16_t session_id = meta.ReadU16BE();
+    const uint8_t status_raw = meta.ReadU8();
+    const uint8_t option = meta.ReadU8();
+    constexpr uint8_t kKnownOptions = kOptionData | kOptionError;
+    if (!meta.Ok() || status_raw < 1 || status_raw > 4 ||
+        (option & static_cast<uint8_t>(~kKnownOptions)) != 0) {
+        return false;
     }
 
-    // 确保元数据全部可读
-    if (len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+    out.session_id = session_id;
+    out.status = static_cast<SessionStatus>(status_raw);
+    out.option = option;
 
-    // 在元数据范围内创建子 reader
-    ByteReader meta(data + 2, meta_len);
-
-    uint16_t session_id = meta.ReadU16BE();
-    uint8_t  status_raw = meta.ReadU8();
-    uint8_t  option     = meta.ReadU8();
-    if (!meta.Ok()) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
-    }
-
-    // 验证 Status 合法性
-    if (status_raw < 1 || status_raw > 4) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
-    }
-    auto status = static_cast<SessionStatus>(status_raw);
-
-    FrameHeader h;
-    h.session_id = session_id;
-    h.status     = status;
-    h.option     = option;
-
-    // 地址解析：New 帧，或 Keep 帧且元数据 > 4 且第 5 字节 == 0x02（UDP）
-    bool read_address = false;
-    if (status == SessionStatus::NEW) {
+    bool read_address = out.status == SessionStatus::NEW;
+    if (out.status == SessionStatus::KEEP && meta.Remaining() > 0) {
+        const auto network = meta.Peek();
+        if (!network || *network != static_cast<uint8_t>(NetworkType::UDP)) {
+            return false;
+        }
         read_address = true;
-    } else if (status == SessionStatus::KEEP) {
-        // Keep 帧仅 UDP 子会话携带地址：第 5 字节 = NetworkType = 0x02
-        if (meta.Remaining() > 0) {
-            auto peek = meta.Peek();
-            if (peek && *peek == static_cast<uint8_t>(NetworkType::UDP)) {
-                read_address = true;
+    }
+
+    if (read_address) {
+        if (meta.Remaining() == 0) {
+            return false;
+        }
+        const uint8_t network_raw = meta.ReadU8();
+        if (!meta.Ok() ||
+            (network_raw != static_cast<uint8_t>(NetworkType::TCP) &&
+             network_raw != static_cast<uint8_t>(NetworkType::UDP))) {
+            return false;
+        }
+        out.network = static_cast<NetworkType>(network_raw);
+        out.has_target = true;
+        if (!ParsePortThenAddress(meta, out.target)) {
+            return false;
+        }
+
+        if (out.status == SessionStatus::NEW &&
+            out.network == NetworkType::UDP && meta.Remaining() == 8) {
+            if (!ReadGlobalId(meta, out.global_id)) {
+                return false;
             }
+            out.has_global_id = true;
         }
     }
 
-    if (read_address && meta.Remaining() > 0) {
-        uint8_t net_raw = meta.ReadU8();
-        if (!meta.Ok()) { FrameHeader bad; bad.frame_size = 0; return bad; }
+    return meta.Ok() && meta.Remaining() == 0;
+}
 
-        if (net_raw != 1 && net_raw != 2) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        h.network    = static_cast<NetworkType>(net_raw);
-        h.has_target = true;
-
-        if (!ParsePortThenAddress(meta, h.target)) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        // GlobalID：仅 New UDP 帧；元数据中地址之后恰好还剩 8 字节
-        if (status == SessionStatus::NEW &&
-            h.network == NetworkType::UDP &&
-            meta.Remaining() >= 8)
-        {
-            auto gid_span = meta.ReadBytes(8);
-            if (meta.Ok()) {
-                h.has_global_id = true;
-                std::memcpy(h.global_id.data(), gid_span.data(), 8);
-            }
-        }
+std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
+    if (!data || len < 2) {
+        return std::nullopt;
     }
 
-    // 计算帧总大小（元数据部分已固定，再加可选 DataLen+Payload）
-    size_t frame_size = 2 + meta_len;  // MetaLen(2) + 元数据
+    const uint16_t meta_len =
+        (static_cast<uint16_t>(data[0]) << 8) |
+        static_cast<uint16_t>(data[1]);
+    if (meta_len < 4) {
+        return InvalidFrame();
+    }
+    if (len < static_cast<size_t>(2 + meta_len)) {
+        return std::nullopt;
+    }
 
-    if (option & kOptionData) {
-        // 需要再读 2 字节 DataLen
-        if (len < frame_size + 2) return std::nullopt;  // DataLen 未到达
-        uint16_t data_len =
+    ByteReader meta(data + 2, meta_len);
+    FrameHeader out;
+    if (!DecodeFrameMetadata(meta, out)) {
+        return InvalidFrame();
+    }
+
+    size_t frame_size = 2 + meta_len;
+    if ((out.option & kOptionData) != 0) {
+        if (len < frame_size + 2) {
+            return std::nullopt;
+        }
+        const uint16_t data_len =
             (static_cast<uint16_t>(data[frame_size]) << 8) |
-             static_cast<uint16_t>(data[frame_size + 1]);
+            static_cast<uint16_t>(data[frame_size + 1]);
         frame_size += 2 + data_len;
-        if (len < frame_size) return std::nullopt;      // Payload 未到达
-
-        h.has_data = true;
-        h.data_len = data_len;
-        h.data_offset = frame_size - data_len;
+        if (len < frame_size) {
+            return std::nullopt;
+        }
+        out.has_data = true;
+        out.data_len = data_len;
+        out.data_offset = frame_size - data_len;
     }
-
-    h.frame_size = frame_size;
-    return h;
+    out.frame_size = frame_size;
+    return out;
 }
 
 std::optional<FrameHeader> DecodeFramePrefix(
     const uint8_t* data,
     size_t contiguous_len,
     size_t total_len) {
-    if (!data || total_len < 2 || contiguous_len < 2) return std::nullopt;
-
-    uint16_t meta_len =
-        (static_cast<uint16_t>(data[0]) << 8) |
-         static_cast<uint16_t>(data[1]);
-
-    if (meta_len < 4) {
-        FrameHeader bad;
-        bad.frame_size = 0;
-        return bad;
+    if (!data || contiguous_len < 2 || total_len < 2) {
+        return std::nullopt;
     }
 
-    if (total_len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
-    if (contiguous_len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+    const uint16_t meta_len =
+        (static_cast<uint16_t>(data[0]) << 8) |
+        static_cast<uint16_t>(data[1]);
+    if (meta_len < 4) {
+        return InvalidFrame();
+    }
+    const size_t metadata_end = 2 + meta_len;
+    if (total_len < metadata_end || contiguous_len < metadata_end) {
+        return std::nullopt;
+    }
 
     ByteReader meta(data + 2, meta_len);
-
-    uint16_t session_id = meta.ReadU16BE();
-    uint8_t  status_raw = meta.ReadU8();
-    uint8_t  option     = meta.ReadU8();
-    if (!meta.Ok()) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
+    FrameHeader out;
+    if (!DecodeFrameMetadata(meta, out)) {
+        return InvalidFrame();
     }
 
-    if (status_raw < 1 || status_raw > 4) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
-    }
-    auto status = static_cast<SessionStatus>(status_raw);
-
-    FrameHeader h;
-    h.session_id = session_id;
-    h.status     = status;
-    h.option     = option;
-
-    bool read_address = false;
-    if (status == SessionStatus::NEW) {
-        read_address = true;
-    } else if (status == SessionStatus::KEEP) {
-        if (meta.Remaining() > 0) {
-            auto peek = meta.Peek();
-            if (peek && *peek == static_cast<uint8_t>(NetworkType::UDP)) {
-                read_address = true;
-            }
+    size_t frame_size = metadata_end;
+    if ((out.option & kOptionData) != 0) {
+        if (total_len < frame_size + 2 || contiguous_len < frame_size + 2) {
+            return std::nullopt;
         }
-    }
-
-    if (read_address && meta.Remaining() > 0) {
-        uint8_t net_raw = meta.ReadU8();
-        if (!meta.Ok()) { FrameHeader bad; bad.frame_size = 0; return bad; }
-
-        if (net_raw != 1 && net_raw != 2) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        h.network    = static_cast<NetworkType>(net_raw);
-        h.has_target = true;
-
-        if (!ParsePortThenAddress(meta, h.target)) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        if (status == SessionStatus::NEW &&
-            h.network == NetworkType::UDP &&
-            meta.Remaining() >= 8)
-        {
-            auto gid_span = meta.ReadBytes(8);
-            if (meta.Ok()) {
-                h.has_global_id = true;
-                std::memcpy(h.global_id.data(), gid_span.data(), 8);
-            }
-        }
-    }
-
-    size_t frame_size = 2 + meta_len;
-
-    if (option & kOptionData) {
-        if (total_len < frame_size + 2) return std::nullopt;
-        if (contiguous_len < frame_size + 2) return std::nullopt;
-        uint16_t data_len =
+        const uint16_t data_len =
             (static_cast<uint16_t>(data[frame_size]) << 8) |
-             static_cast<uint16_t>(data[frame_size + 1]);
+            static_cast<uint16_t>(data[frame_size + 1]);
         frame_size += 2 + data_len;
-        if (total_len < frame_size) return std::nullopt;
-
-        h.has_data = true;
-        h.data_len = data_len;
-        h.data_offset = frame_size - data_len;
+        if (total_len < frame_size) {
+            return std::nullopt;
+        }
+        out.has_data = true;
+        out.data_len = data_len;
+        out.data_offset = frame_size - data_len;
     }
-
-    h.frame_size = frame_size;
-    return h;
+    out.frame_size = frame_size;
+    return out;
 }
 
 std::optional<FrameHeader> DecodeFrame(
     const buf::MultiBuffer& data,
     size_t offset,
     size_t len) {
-    if (len < 2) return std::nullopt;
-
-    MultiBufferFrameReader r(data, offset, len);
-    uint16_t meta_len = r.ReadU16BE();
-    if (!r.Ok()) return std::nullopt;
-
-    if (meta_len < 4) {
-        FrameHeader bad;
-        bad.frame_size = 0;
-        return bad;
+    if (len < 2) {
+        return std::nullopt;
     }
 
-    if (len < static_cast<size_t>(2 + meta_len)) return std::nullopt;
+    MultiBufferFrameReader frame_reader(data, offset, len);
+    const uint16_t meta_len = frame_reader.ReadU16BE();
+    if (!frame_reader.Ok()) {
+        return std::nullopt;
+    }
+    if (meta_len < 4) {
+        return InvalidFrame();
+    }
+    if (len < static_cast<size_t>(2 + meta_len)) {
+        return std::nullopt;
+    }
 
     MultiBufferFrameReader meta(data, offset + 2, meta_len);
-    uint16_t session_id = meta.ReadU16BE();
-    uint8_t status_raw = meta.ReadU8();
-    uint8_t option = meta.ReadU8();
-    if (!meta.Ok()) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
-    }
-
-    if (status_raw < 1 || status_raw > 4) {
-        FrameHeader bad; bad.frame_size = 0; return bad;
-    }
-    auto status = static_cast<SessionStatus>(status_raw);
-
-    FrameHeader h;
-    h.session_id = session_id;
-    h.status = status;
-    h.option = option;
-
-    bool read_address = false;
-    if (status == SessionStatus::NEW) {
-        read_address = true;
-    } else if (status == SessionStatus::KEEP) {
-        if (meta.Remaining() > 0) {
-            auto peek = meta.Peek();
-            if (peek && *peek == static_cast<uint8_t>(NetworkType::UDP)) {
-                read_address = true;
-            }
-        }
-    }
-
-    if (read_address && meta.Remaining() > 0) {
-        uint8_t net_raw = meta.ReadU8();
-        if (!meta.Ok()) { FrameHeader bad; bad.frame_size = 0; return bad; }
-        if (net_raw != 1 && net_raw != 2) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        h.network = static_cast<NetworkType>(net_raw);
-        h.has_target = true;
-
-        if (!ParsePortThenAddress(meta, h.target)) {
-            FrameHeader bad; bad.frame_size = 0; return bad;
-        }
-
-        if (status == SessionStatus::NEW &&
-            h.network == NetworkType::UDP &&
-            meta.Remaining() >= 8) {
-            if (meta.ReadBytes(std::span<uint8_t>(h.global_id.data(), h.global_id.size())) &&
-                meta.Ok()) {
-                h.has_global_id = true;
-            }
-        }
+    FrameHeader out;
+    if (!DecodeFrameMetadata(meta, out)) {
+        return InvalidFrame();
     }
 
     size_t frame_size = 2 + meta_len;
-    if (option & kOptionData) {
-        if (len < frame_size + 2) return std::nullopt;
+    if ((out.option & kOptionData) != 0) {
+        if (len < frame_size + 2) {
+            return std::nullopt;
+        }
         MultiBufferFrameReader data_len_reader(data, offset + frame_size, 2);
         const uint16_t data_len = data_len_reader.ReadU16BE();
-        if (!data_len_reader.Ok()) return std::nullopt;
+        if (!data_len_reader.Ok()) {
+            return std::nullopt;
+        }
         frame_size += 2 + data_len;
-        if (len < frame_size) return std::nullopt;
-
-        h.has_data = true;
-        h.data_len = data_len;
-        h.data_offset = frame_size - data_len;
+        if (len < frame_size) {
+            return std::nullopt;
+        }
+        out.has_data = true;
+        out.data_len = data_len;
+        out.data_offset = frame_size - data_len;
     }
-
-    h.frame_size = frame_size;
-    return h;
+    out.frame_size = frame_size;
+    return out;
 }
 
 // ============================================================================
