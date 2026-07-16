@@ -64,7 +64,7 @@ public:
     class PendingUdpReply;
     class ClientSession;
     using ClientSessionPtr = std::shared_ptr<ClientSession>;
-    using ReplyCallback = ::acpp::PacketCallback;
+    using ReplyCallback = ::acpp::RoutedPacketCallback;
 
     struct PendingUdpReplyDeleter {
         void operator()(PendingUdpReply* reply) const noexcept;
@@ -112,11 +112,13 @@ public:
         const std::string& client_key,
         net::io_context& io_context,
         ReplyCallback reply_callback,
+        udp::endpoint reply_endpoint,
         int64_t user_id,
         std::chrono::steady_clock::time_point now);
     [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
                                          const std::string& client_key,
                                          const TargetAddress& target,
+                                         udp::endpoint reply_endpoint,
                                          buf::MultiBuffer payload,
                                          std::chrono::steady_clock::time_point now);
     void CleanupIdleClientSessions(const std::string& socket_key,
@@ -150,6 +152,7 @@ class UdpWorker::ClientSession final
 public:
     ClientSession(net::io_context& io_context,
                   ReplyCallback reply_callback,
+                  udp::endpoint reply_endpoint,
                   int64_t user_id);
     ~ClientSession() noexcept override;
 
@@ -159,6 +162,7 @@ public:
     [[nodiscard]] int64_t UserId() const noexcept;
     [[nodiscard]] bool Closed() const noexcept;
 
+    void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     void Push(const TargetAddress& target, buf::MultiBuffer payload);
     void Close() noexcept;
 

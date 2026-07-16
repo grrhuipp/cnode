@@ -95,10 +95,12 @@ using UdpClientSessionMap =
 struct UdpWorker::ClientSession::Impl {
     Impl(net::io_context& io_context,
          ReplyCallback reply_callback,
+         udp::endpoint reply_endpoint,
          int64_t user_id)
         : io_context(io_context)
         , reader_signal(io_context, 1)
         , reply_callback(std::move(reply_callback))
+        , reply_endpoint(std::move(reply_endpoint))
         , user_id(user_id) {}
 
     void WakeReader() {
@@ -108,6 +110,7 @@ struct UdpWorker::ClientSession::Impl {
     net::io_context& io_context;
     net::experimental::channel<void(IoErrorCode)> reader_signal;
     ReplyCallback reply_callback;
+    udp::endpoint reply_endpoint;
     struct QueuedInput {
         buf::MultiBuffer payload;
         size_t bytes = 0;
@@ -122,9 +125,13 @@ struct UdpWorker::ClientSession::Impl {
 UdpWorker::ClientSession::ClientSession(
     net::io_context& io_context,
     ReplyCallback reply_callback,
+    udp::endpoint reply_endpoint,
     int64_t user_id)
     : impl_(std::make_unique<Impl>(
-          io_context, std::move(reply_callback), user_id)) {}
+          io_context,
+          std::move(reply_callback),
+          std::move(reply_endpoint),
+          user_id)) {}
 
 UdpWorker::ClientSession::~ClientSession() noexcept {
     Close();
@@ -136,6 +143,11 @@ int64_t UdpWorker::ClientSession::UserId() const noexcept {
 
 bool UdpWorker::ClientSession::Closed() const noexcept {
     return impl_->closed;
+}
+
+void UdpWorker::ClientSession::UpdateReplyEndpoint(
+    udp::endpoint endpoint) noexcept {
+    impl_->reply_endpoint = std::move(endpoint);
 }
 
 void UdpWorker::ClientSession::Push(
@@ -234,7 +246,9 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         payload = coalesced;
     }
 
-    if (!impl_->reply_callback(UDPPacketView{*datagram.target, payload})) {
+    if (!impl_->reply_callback(
+            UDPPacketView{*datagram.target, payload},
+            impl_->reply_endpoint)) {
         mb.clear();
         throw IoSystemError(
             io_error::fault, "UDP client reply callback failed");
@@ -366,7 +380,6 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->content.speed_limit = decoded->speed_limit;
 
         auto response_context = decoded->response_context;
-        udp::endpoint endpoint = datagram.client_endpoint;
         udp::socket* sock = datagram.sock;
         auto& reply_sink = datagram.reply_sink;
         const uint32_t worker_id = datagram.worker_id;
@@ -374,10 +387,10 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         auto reply_cb = [this,
                          socket_key,
                          sock,
-                         endpoint,
                          response_context = std::move(response_context),
                          &reply_sink,
-                         worker_id](UDPPacketView pkt) mutable {
+                         worker_id](UDPPacketView pkt,
+                                    const udp::endpoint& reply_endpoint) mutable {
             if (!impl_->proxy) {
                 return;
             }
@@ -386,7 +399,11 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
                 return;
             }
             reply_sink.EnqueueUdpReply(
-                socket_key, sock, endpoint, std::move(payload), worker_id);
+                socket_key,
+                sock,
+                reply_endpoint,
+                std::move(payload),
+                worker_id);
         };
 
         auto client_session = CreateClientSession(
@@ -394,6 +411,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
             client_session_key,
             datagram.io_context,
             std::move(reply_cb),
+            datagram.client_endpoint,
             decoded->user_id,
             now);
 
@@ -445,6 +463,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         socket_key,
         client_session_key,
         decoded->target,
+        datagram.client_endpoint,
         std::move(decoded->payload),
         now)) {
         LOG_ACCESS_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
@@ -577,10 +596,14 @@ UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
     const std::string& client_key,
     net::io_context& io_context,
     ReplyCallback reply_callback,
+    udp::endpoint reply_endpoint,
     int64_t user_id,
     std::chrono::steady_clock::time_point now) {
     auto session = std::make_shared<ClientSession>(
-        io_context, std::move(reply_callback), user_id);
+        io_context,
+        std::move(reply_callback),
+        std::move(reply_endpoint),
+        user_id);
     auto& sessions = impl_->client_sessions[socket_key];
     sessions.insert_or_assign(client_key, UdpClientSession{
         .link = session,
@@ -594,6 +617,7 @@ bool UdpWorker::PushClientPayload(
     const std::string& socket_key,
     const std::string& client_key,
     const TargetAddress& target,
+    udp::endpoint reply_endpoint,
     buf::MultiBuffer payload,
     std::chrono::steady_clock::time_point now) {
     auto sessions_it = impl_->client_sessions.find(socket_key);
@@ -611,6 +635,7 @@ bool UdpWorker::PushClientPayload(
 
     auto& session = session_it->second;
     session.last_active = now;
+    session.link->UpdateReplyEndpoint(std::move(reply_endpoint));
     session.link->Push(target, std::move(payload));
     return true;
 }

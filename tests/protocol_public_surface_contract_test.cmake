@@ -351,6 +351,15 @@ if(NOT UDP_WORKER_SOURCE MATCHES
     message(FATAL_ERROR
         "UDP ClientSession must preserve one datagram across Buffer chunks")
 endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "decoded->target,[\r\n ]+datagram[.]client_endpoint,[\r\n ]+std::move[(]decoded->payload[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "const udp::endpoint& reply_endpoint")
+    message(FATAL_ERROR
+        "UDP ClientSession must route replies to the latest authenticated client endpoint")
+endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
 if(WORKER_SOURCE MATCHES

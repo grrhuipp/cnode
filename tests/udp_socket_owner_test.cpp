@@ -84,10 +84,16 @@ int main() {
 
     acpp::net::io_context io_context;
     acpp::IoErrorCode ec;
+    const acpp::udp::endpoint reply_endpoint_a(
+        acpp::net::ip::address_v4::loopback(), 10001);
+    const acpp::udp::endpoint reply_endpoint_b(
+        acpp::net::ip::address_v4::loopback(), 10002);
 
     acpp::proxyman::inbound::UdpWorker::ClientSession failing_reply_session(
         io_context,
-        acpp::PacketCallback{[](acpp::UDPPacketView) { throw 9; }},
+        acpp::RoutedPacketCallback{
+            [](acpp::UDPPacketView, const acpp::udp::endpoint&) { throw 9; }},
+        reply_endpoint_a,
         1);
     acpp::buf::BufferGuard reply_buffer{acpp::buf::Buffer::New()};
     if (!reply_buffer) Fail("failed to allocate UDP callback test buffer");
@@ -123,15 +129,20 @@ int main() {
 
     size_t large_callback_count = 0;
     bool large_callback_matches = false;
+    acpp::udp::endpoint observed_reply_endpoint;
     acpp::proxyman::inbound::UdpWorker::ClientSession large_reply_session(
         io_context,
-        acpp::PacketCallback{[&](acpp::UDPPacketView packet) {
+        acpp::RoutedPacketCallback{[&](
+            acpp::UDPPacketView packet,
+            const acpp::udp::endpoint& reply_endpoint) {
             ++large_callback_count;
+            observed_reply_endpoint = reply_endpoint;
             large_callback_matches =
                 packet.data.size() == callback_large_payload.size() &&
                 std::equal(packet.data.begin(), packet.data.end(),
                            callback_large_payload.begin());
         }},
+        reply_endpoint_a,
         2);
     bool large_reply_failed = false;
     acpp::net::co_spawn(
@@ -142,11 +153,35 @@ int main() {
         });
     io_context.run();
     if (large_reply_failed || large_callback_count != 1 ||
-        !large_callback_matches) {
+        !large_callback_matches || observed_reply_endpoint != reply_endpoint_a) {
         std::cerr << "large_reply_failed=" << large_reply_failed
                   << " callback_count=" << large_callback_count
                   << " callback_matches=" << large_callback_matches << '\n';
         Fail("multi-buffer UDP reply was split into multiple datagrams");
+    }
+    io_context.restart();
+
+    acpp::buf::MultiBuffer migrated_reply_buffers;
+    if (!acpp::buf::AppendSpanToMultiBuffer(
+            callback_large_payload, migrated_reply_buffers)) {
+        Fail("failed to allocate migrated UDP reply payload");
+    }
+    for (acpp::buf::Buffer* buffer : migrated_reply_buffers) {
+        if (buffer && !buffer->IsEmpty()) {
+            buffer->SetUDP(callback_source);
+        }
+    }
+    large_reply_session.UpdateReplyEndpoint(reply_endpoint_b);
+    acpp::net::co_spawn(
+        io_context,
+        large_reply_session.WriteMultiBuffer(std::move(migrated_reply_buffers)),
+        [&](std::exception_ptr error) {
+            large_reply_failed = error != nullptr;
+        });
+    io_context.run();
+    if (large_reply_failed || large_callback_count != 2 ||
+        !large_callback_matches || observed_reply_endpoint != reply_endpoint_b) {
+        Fail("UDP client session kept replying to its stale endpoint");
     }
     io_context.restart();
 
