@@ -577,7 +577,8 @@ const bool kSsInboundRegistered = [] {
 
             for (const auto& client : config.clients) {
                 if (client.password.empty()) {
-                    continue;
+                    LOG_WARN("Static inbound '{}': SS password is empty", tag);
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedShadowsocksUser info;
                 info.password    = client.password;
@@ -591,7 +592,7 @@ const bool kSsInboundRegistered = [] {
                 if (info.derived_key.empty()) {
                     LOG_WARN("Static inbound '{}': invalid SS password for user '{}'",
                              tag, client.email);
-                    continue;
+                    return std::nullopt;
                 }
                 info.profile.email = client.email;
                 users.push_back(std::move(info));

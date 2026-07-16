@@ -4,11 +4,28 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
+
+#include <stdexcept>
+#include <utility>
 
 namespace acpp {
 
-std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
+namespace {
+
+struct PreparedStaticInbound {
+    StaticInboundRuntimeEntry entry;
+    proxyman::inbound::UserSet users;
+};
+
+[[nodiscard]] bool UserSetEmpty(const proxyman::inbound::UserSet& users) noexcept {
+    return users.vmess_accounts.empty() &&
+           users.vless_users.empty() &&
+           users.trojan_users.empty() &&
+           users.ss_users.empty() &&
+           users.anytls_users.empty();
+}
+
+PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
     const StaticInboundConfig& source) {
     StaticInboundRuntimeEntry entry;
     entry.protocol = source.protocol;
@@ -25,10 +42,9 @@ std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
     entry.routing_enabled = source.routing_enabled;
 
     if (!proxyman::inbound::HasProxy(entry.protocol)) {
-        LOG_WARN("Static inbound '{}': unsupported protocol '{}', skipped",
-                 entry.tag,
-                 entry.protocol);
-        return std::nullopt;
+        throw std::invalid_argument(
+            "static inbound '" + entry.tag + "' has unsupported protocol '" +
+            entry.protocol + "'");
     }
 
     entry.build_request.tag = entry.tag;
@@ -43,26 +59,39 @@ std::optional<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntry(
         entry.tag,
         source.static_users);
     if (!users) {
-        LOG_WARN("Static inbound '{}': load users failed, skipped", entry.tag);
-        return std::nullopt;
+        throw std::invalid_argument(
+            "static inbound '" + entry.tag + "' has invalid users or settings");
     }
-    proxyman::inbound::UserStore::ApplyUsers(entry.protocol, entry.tag, *users);
+    if (UserSetEmpty(*users)) {
+        throw std::invalid_argument(
+            "static inbound '" + entry.tag + "' has no valid users");
+    }
 
-    return entry;
+    return PreparedStaticInbound{
+        .entry = std::move(entry),
+        .users = std::move(*users),
+    };
 }
+
+}  // namespace
 
 std::vector<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntries(
     const std::vector<StaticInboundConfig>& sources) {
-    std::vector<StaticInboundRuntimeEntry> entries;
-    entries.reserve(sources.size());
-
+    std::vector<PreparedStaticInbound> prepared;
+    prepared.reserve(sources.size());
     for (const auto& source : sources) {
-        auto entry = BuildStaticInboundRuntimeEntry(source);
-        if (entry) {
-            entries.push_back(std::move(*entry));
-        }
+        prepared.push_back(PrepareStaticInboundRuntimeEntry(source));
     }
 
+    std::vector<StaticInboundRuntimeEntry> entries;
+    entries.reserve(prepared.size());
+    for (auto& inbound : prepared) {
+        proxyman::inbound::UserStore::ApplyUsers(
+            inbound.entry.protocol,
+            inbound.entry.tag,
+            inbound.users);
+        entries.push_back(std::move(inbound.entry));
+    }
     return entries;
 }
 

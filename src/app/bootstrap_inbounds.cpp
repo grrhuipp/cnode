@@ -26,12 +26,6 @@ std::vector<std::string> SetupStaticInbounds(
     }
 
     for (const auto& inbound : runtime_inbounds) {
-        if (!proxyman::inbound::HasProxy(inbound.protocol)) {
-            LOG_WARN("static_inbound skipped tag={} protocol={} reason=unsupported",
-                     inbound.tag, inbound.protocol);
-            continue;
-        }
-
         for (const auto& worker : workers) {
             auto* connection_limiter = connection_limiters[worker->Id()].get();
 

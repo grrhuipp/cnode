@@ -284,25 +284,29 @@ const bool kVmessInboundRegistered = [] {
         };
 
     reg.build_static_users =
-        [](std::string_view /*tag*/, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedVmessUser> users;
 
             for (const auto& client : config.clients) {
                 if (client.id.empty()) {
-                    continue;
+                    LOG_WARN("VMess inbound '{}': static user UUID is empty", tag);
+                    return std::nullopt;
                 }
-                if (auto user = acpp::vmess::MemoryAccount::FromUUID(
-                        client.id, 0, client.email, 0)) {
-                    users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
-                        .uuid = user->uuid,
-                        .uuid_bytes = user->uuid_bytes,
-                        .cmd_key = user->cmd_key,
-                        .auth_key = user->auth_key,
-                        .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
-                        .profile = user->profile,
-                    });
+                auto user = acpp::vmess::MemoryAccount::FromUUID(
+                    client.id, 0, client.email, 0);
+                if (!user) {
+                    LOG_WARN("VMess inbound '{}': invalid static user UUID", tag);
+                    return std::nullopt;
                 }
+                users.push_back(acpp::proxyman::inbound::PreparedVmessUser{
+                    .uuid = user->uuid,
+                    .uuid_bytes = user->uuid_bytes,
+                    .cmd_key = user->cmd_key,
+                    .auth_key = user->auth_key,
+                    .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
+                    .profile = user->profile,
+                });
             }
 
             acpp::proxyman::inbound::UserSet result;

@@ -941,7 +941,8 @@ const bool kVlessInboundRegistered = [] {
                 std::string uuid = client.id.empty() ? client.password : client.id;
                 auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
                 if (!uuid_bytes) {
-                    continue;
+                    LOG_WARN("VLESS inbound '{}': invalid static user UUID", tag);
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedVlessUser info;
                 info.uuid = std::move(uuid);

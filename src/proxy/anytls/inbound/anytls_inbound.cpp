@@ -1101,7 +1101,8 @@ const bool kInboundRegistered = [] {
                 const std::string& password =
                     client.password.empty() ? client.id : client.password;
                 if (password.empty()) {
-                    continue;
+                    LOG_WARN("AnyTLS inbound '{}': static user password is empty", tag);
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedAnyTlsUser info;
                 info.password_hash = acpp::anytls::PasswordHash(password);

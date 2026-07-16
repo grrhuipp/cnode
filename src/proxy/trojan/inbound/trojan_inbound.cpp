@@ -507,13 +507,14 @@ const bool kTrojanInboundRegistered = [] {
         };
 
     reg.build_static_users =
-        [](std::string_view /*tag*/, const acpp::StaticUserConfig& config)
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
             std::vector<acpp::proxyman::inbound::PreparedTrojanUser> users;
 
             for (const auto& client : config.clients) {
                 if (client.password.empty()) {
-                    continue;
+                    LOG_WARN("Trojan inbound '{}': static user password is empty", tag);
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedTrojanUser info;
                 info.password_hash = acpp::trojan::HashPassword(client.password);
