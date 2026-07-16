@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string_view>
 #include <utility>
 
@@ -27,6 +28,11 @@ public:
 
 static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().Close()));
+static_assert(noexcept(
+    std::declval<acpp::proxyman::inbound::UdpWorker&>().ReplaceHandler(
+        std::declval<std::unique_ptr<acpp::proxyman::inbound::UdpHandler>>())));
+static_assert(noexcept(
+    std::declval<acpp::proxyman::inbound::UdpWorker&>().CleanupAllClientSessions()));
 static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().CloseSocket(
         std::declval<const std::string&>())));
@@ -90,6 +96,19 @@ int main() {
     }
     if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
         Fail("duplicate attachment replaced the live UDP socket");
+    }
+
+    if (!worker.ReplaceHandler(std::make_unique<DummyUdpHandler>())) {
+        Fail("valid UDP handler replacement was rejected");
+    }
+    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+        Fail("UDP handler replacement disturbed the live socket");
+    }
+    if (worker.ReplaceHandler(nullptr)) {
+        Fail("null UDP handler replacement was accepted");
+    }
+    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+        Fail("rejected UDP handler replacement disturbed the live socket");
     }
 
     worker.CloseSocket("stable-socket");

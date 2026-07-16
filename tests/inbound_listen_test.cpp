@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/inbound_listen.hpp"
+#include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
 
 #include <array>
@@ -37,21 +38,38 @@ int main() {
         if (acpp::InboundListen::Parse(value)) return 5;
     }
 
+    auto socket_binding = acpp::MakePortBinding(
+        443, "vmess", "stable-inbound", *ipv4);
+    auto protocol_update = acpp::MakePortBinding(
+        443, "trojan", "stable-inbound", *ipv4);
+    auto port_update = acpp::MakePortBinding(
+        8443, "vmess", "stable-inbound", *ipv4);
+    auto address_update = acpp::MakePortBinding(
+        443, "vmess", "stable-inbound", *ipv6);
+    auto tag_update = acpp::MakePortBinding(
+        443, "vmess", "other-inbound", *ipv4);
+    if (!socket_binding.UsesSameSocket(protocol_update) ||
+        socket_binding.UsesSameSocket(port_update) ||
+        socket_binding.UsesSameSocket(address_update) ||
+        socket_binding.UsesSameSocket(tag_update)) {
+        return 6;
+    }
+
     acpp::net::io_context io_context;
     acpp::proxyman::inbound::TcpWorker worker("test-inbound");
     auto* acceptor = worker.CreateAcceptor("stable-listener", io_context);
-    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor) return 6;
+    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor) return 7;
 
     acpp::IoErrorCode ec;
     acceptor->open(acpp::tcp::v4(), ec);
-    if (ec || !acceptor->is_open()) return 7;
+    if (ec || !acceptor->is_open()) return 8;
 
-    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 8;
+    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 9;
     if (worker.FindAcceptor("stable-listener") != acceptor ||
-        !acceptor->is_open()) return 9;
+        !acceptor->is_open()) return 10;
 
     worker.CloseAcceptor("stable-listener");
-    if (worker.FindAcceptor("stable-listener") != nullptr) return 10;
+    if (worker.FindAcceptor("stable-listener") != nullptr) return 11;
 
     return 0;
 }

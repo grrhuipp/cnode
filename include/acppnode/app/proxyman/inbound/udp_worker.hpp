@@ -82,6 +82,8 @@ public:
 
     [[nodiscard]] std::string_view Tag() const noexcept;
 
+    // Keep Worker-local sockets stable while replacing cold-path protocol state.
+    [[nodiscard]] bool ReplaceHandler(std::unique_ptr<UdpHandler> proxy) noexcept;
     void Close() noexcept;
 
     void ProcessDatagram(const UdpDatagramContext& datagram);
@@ -120,8 +122,8 @@ public:
     void CleanupIdleClientSessions(const std::string& socket_key,
                                    std::chrono::steady_clock::time_point now,
                                    std::chrono::seconds idle_timeout);
-    void CleanupClientSessions(const std::string& socket_key);
-    void CleanupAllClientSessions();
+    void CleanupClientSessions(const std::string& socket_key) noexcept;
+    void CleanupAllClientSessions() noexcept;
 
     [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
         return std::make_unique<udp::socket>(io_context);

@@ -40,6 +40,7 @@
 #include <format>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 
@@ -51,6 +52,8 @@ struct Worker::ListenerSlot {
     // 由 slot 内的 tcp_worker 承载，避免每次 accept 后查 map。
     proxyman::inbound::Handler* handler = nullptr;
     std::unique_ptr<proxyman::inbound::TcpWorker> tcp_worker;
+    std::optional<PortBinding> tcp_binding;
+    std::optional<PortBinding> udp_binding;
 };
 
 struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
@@ -73,6 +76,8 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         const PortBinding& binding,
         std::unique_ptr<proxyman::inbound::UdpHandler> handler);
     [[nodiscard]] ListenerKeys CollectUdpSocketKeys(const std::string& tag) const;
+    void ResetUdpListening(const std::string& tag,
+                           ListenerKeys socket_keys) noexcept;
     void StopUdpListening(const std::string& tag,
                           ListenerKeys socket_keys) noexcept;
     void Shutdown();
@@ -313,20 +318,30 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 #endif
 
-    const bool replacing = std::ranges::any_of(
-        tcp_listener_tags,
-        [&](const auto& item) { return item.second == binding.tag; });
-    if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
-        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
-    }
-
     auto* inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
                   worker.id_, binding.tag);
         return false;
     }
+
+    const bool replacing = std::ranges::any_of(
+        tcp_listener_tags,
+        [&](const auto& item) { return item.second == binding.tag; });
+    auto existing_slot = listener_slots.find(binding.tag);
+    if (replacing && existing_slot != listener_slots.end() &&
+        existing_slot->second.tcp_worker &&
+        existing_slot->second.tcp_binding &&
+        existing_slot->second.tcp_binding->UsesSameSocket(binding)) {
+        return true;
+    }
+
+    PortBinding committed_binding = binding;
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
+        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
+    }
+
     auto& listener_slot = listener_slots[binding.tag];
     if (!listener_slot.tcp_worker) {
         listener_slot.tcp_worker = std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
@@ -335,6 +350,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     const auto fail_listener = [&]() -> bool {
         tcp_worker.Close();
         listener_slot.tcp_worker.reset();
+        listener_slot.tcp_binding.reset();
         return false;
     };
 
@@ -435,6 +451,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
                   worker.id_, binding.tag, binding.protocol);
         return fail_listener();
     }
+    listener_slot.tcp_binding = std::move(committed_binding);
     return true;
 }
 
@@ -462,6 +479,9 @@ void Worker::ListenerState::StopListening(
         tcp_listener_tags.erase(listener_key);
     }
     MaybeShrinkHashContainer(tcp_listener_tags, 8);
+    if (slot_it != listener_slots.end()) {
+        slot_it->second.tcp_binding.reset();
+    }
 }
 
 proxyman::inbound::UdpWorker*
@@ -501,7 +521,7 @@ Worker::ListenerState::CollectUdpSocketKeys(const std::string& tag) const {
     return socket_keys;
 }
 
-void Worker::ListenerState::StopUdpListening(
+void Worker::ListenerState::ResetUdpListening(
     const std::string& tag,
     ListenerKeys socket_keys) noexcept {
     for (const auto& socket_key : socket_keys) {
@@ -514,9 +534,22 @@ void Worker::ListenerState::StopUdpListening(
 
     MaybeShrinkHashContainer(udp_socket_tags, 8);
     if (auto it = udp_workers.find(tag); it != udp_workers.end()) {
-        it->second->Close();
-        udp_workers.erase(it);
+        if (it->second) {
+            it->second->Close();
+        }
+        it->second.reset();
     }
+    if (auto slot_it = listener_slots.find(tag);
+            slot_it != listener_slots.end()) {
+        slot_it->second.udp_binding.reset();
+    }
+}
+
+void Worker::ListenerState::StopUdpListening(
+    const std::string& tag,
+    ListenerKeys socket_keys) noexcept {
+    ResetUdpListening(tag, std::move(socket_keys));
+    udp_workers.erase(tag);
 }
 
 void Worker::ListenerState::Shutdown() {
@@ -1098,15 +1131,31 @@ bool Worker::ListenerState::StartUdpListening(
     const bool replacing = std::ranges::any_of(
         udp_socket_tags,
         [&](const auto& item) { return item.second == binding.tag; });
-    if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
-        StopUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
+    auto existing_slot = listener_slots.find(binding.tag);
+    auto existing_worker = udp_workers.find(binding.tag);
+    if (replacing && existing_slot != listener_slots.end() &&
+        existing_slot->second.udp_binding &&
+        existing_slot->second.udp_binding->UsesSameSocket(binding) &&
+        existing_worker != udp_workers.end() && existing_worker->second) {
+        return existing_worker->second->ReplaceHandler(std::move(handler));
     }
 
-    auto udp_worker =
-        std::make_unique<proxyman::inbound::UdpWorker>(binding.tag, std::move(handler));
-    udp_workers[binding.tag] = std::move(udp_worker);
-    auto& listener_slot = listener_slots[binding.tag];
+    PortBinding committed_binding = binding;
+    auto replacement_worker =
+        std::make_unique<proxyman::inbound::UdpWorker>(
+            binding.tag, std::move(handler));
+    auto slot_it = listener_slots.try_emplace(binding.tag).first;
+    auto worker_it = udp_workers.try_emplace(binding.tag).first;
+
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
+        ResetUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
+    } else if (worker_it->second) {
+        worker_it->second->Close();
+    }
+
+    worker_it->second = std::move(replacement_worker);
+    auto& listener_slot = slot_it->second;
 
     const auto listen_candidates = binding.listen.Candidates();
     size_t bound_count = 0;
@@ -1115,7 +1164,7 @@ bool Worker::ListenerState::StartUdpListening(
         const std::string listen_addr = addr.to_string();
         IoErrorCode ec;
         udp::endpoint ep(addr, binding.port);
-        auto* current_udp_worker = udp_workers[binding.tag].get();
+        auto* current_udp_worker = worker_it->second.get();
         auto candidate_sock =
             current_udp_worker->MakeSocket(worker.runtime_->io_context);
 
@@ -1188,11 +1237,15 @@ bool Worker::ListenerState::StartUdpListening(
     }
 
     if (bound_count == 0) {
-        udp_workers.erase(binding.tag);
+        worker_it->second->Close();
+        udp_workers.erase(worker_it);
+        listener_slot.udp_binding.reset();
         LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
+        return false;
     }
-    return bound_count != 0;
+    listener_slot.udp_binding = std::move(committed_binding);
+    return true;
 }
 
 // ============================================================================

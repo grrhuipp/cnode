@@ -55,3 +55,35 @@ if(NOT WORKER_SOURCE MATCHES
     message(FATAL_ERROR
         "prepared listener stop operations must remain non-throwing commit steps")
 endif()
+
+function(require_reuse_before_restart begin_marker end_marker reuse_marker restart_marker label)
+    string(FIND "${WORKER_SOURCE}" "${begin_marker}" method_begin)
+    string(FIND "${WORKER_SOURCE}" "${end_marker}" method_end)
+    if(method_begin EQUAL -1 OR method_end EQUAL -1 OR
+       NOT method_begin LESS method_end)
+        message(FATAL_ERROR "could not isolate ${label} listener start implementation")
+    endif()
+    math(EXPR method_length "${method_end} - ${method_begin}")
+    string(SUBSTRING "${WORKER_SOURCE}"
+        ${method_begin} ${method_length} method_source)
+    string(FIND "${method_source}" "${reuse_marker}" reuse_position)
+    string(FIND "${method_source}" "${restart_marker}" restart_position)
+    if(reuse_position EQUAL -1 OR restart_position EQUAL -1 OR
+       NOT reuse_position LESS restart_position)
+        message(FATAL_ERROR
+            "${label} listener must reuse an unchanged socket binding before restart")
+    endif()
+endfunction()
+
+require_reuse_before_restart(
+    "bool Worker::ListenerState::StartListening"
+    "Worker::ListenerState::CollectTcpListenerKeys"
+    "UsesSameSocket"
+    "StopListening"
+    "TCP")
+require_reuse_before_restart(
+    "bool Worker::ListenerState::StartUdpListening"
+    "net::awaitable<void> Worker::ListenerState::UdpReceiveLoop"
+    "ReplaceHandler"
+    "ResetUdpListening"
+    "UDP")

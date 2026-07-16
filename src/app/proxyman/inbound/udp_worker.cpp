@@ -255,6 +255,15 @@ std::string_view UdpWorker::Tag() const noexcept {
     return impl_->tag;
 }
 
+bool UdpWorker::ReplaceHandler(std::unique_ptr<UdpHandler> proxy) noexcept {
+    if (!proxy) {
+        return false;
+    }
+    CleanupAllClientSessions();
+    impl_->proxy = std::move(proxy);
+    return true;
+}
+
 void UdpWorker::Close() noexcept {
     CloseAllSockets();
     CleanupAllClientSessions();
@@ -611,7 +620,7 @@ void UdpWorker::CleanupIdleClientSessions(
     }
 }
 
-void UdpWorker::CleanupClientSessions(const std::string& socket_key) {
+void UdpWorker::CleanupClientSessions(const std::string& socket_key) noexcept {
     auto sessions_it = impl_->client_sessions.find(socket_key);
     if (sessions_it == impl_->client_sessions.end()) {
         return;
@@ -628,7 +637,7 @@ void UdpWorker::CleanupClientSessions(const std::string& socket_key) {
     MaybeShrinkHashContainer(impl_->client_sessions, 8);
 }
 
-void UdpWorker::CleanupAllClientSessions() {
+void UdpWorker::CleanupAllClientSessions() noexcept {
     while (!impl_->client_sessions.empty()) {
         CleanupClientSessions(impl_->client_sessions.begin()->first);
     }
