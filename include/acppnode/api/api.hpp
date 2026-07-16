@@ -35,7 +35,7 @@ struct UserInfo {
     int Port = 0;
     std::string Method;
     uint64_t SpeedLimit = 0;  // Bps, 0 = unlimited
-    int DeviceLimit = 0;
+    uint32_t DeviceLimit = 0;
     std::string Protocol;
     std::string ProtocolParam;
     std::string Obfs;

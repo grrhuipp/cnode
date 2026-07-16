@@ -14,10 +14,6 @@ std::string Controller::Impl::BuildUserTag(std::string_view tag,
     return std::format("{}|{}|{}", tag, user.Email, user.UID);
 }
 
-uint32_t Controller::Impl::DeviceLimitOf(const api::UserInfo& user) const noexcept {
-    return user.DeviceLimit > 0 ? static_cast<uint32_t>(user.DeviceLimit) : 0;
-}
-
 std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound(
     std::string_view protocol,
     std::string_view tag,
@@ -41,7 +37,7 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
         user.uuid = api_user.UUID;
         user.flow = api_user.Flow;
         user.speed_limit = api_user.SpeedLimit;
-        user.device_limit = DeviceLimitOf(api_user);
+        user.device_limit = api_user.DeviceLimit;
         users.push_back(std::move(user));
     }
 

@@ -7,6 +7,7 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "http_response.hpp"
 #include "node_info_json.hpp"
+#include "user_list_json.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
@@ -724,48 +725,13 @@ APIClient::Impl::GetUserList() {
         auto jv = json::parse(resp.body);
         auto& j = jv.as_object();
 
-        std::vector<::acpp::api::UserInfo> users;
-
-        auto* users_p = j.if_contains("users");
-        if (users_p && users_p->is_array()) {
-            const auto& users_array = users_p->as_array();
-            users.reserve(users_array.size());  // 预分配，避免多次重新分配
-
-            for (const auto& uv : users_array) {
-                auto& u = uv.as_object();
-                ::acpp::api::UserInfo user;
-
-                auto* id_p = u.if_contains("id");
-                user.UID = (id_p && id_p->is_int64()) ? id_p->as_int64() : 0;
-                auto* uuid_p = u.if_contains("uuid");
-                user.UUID = (uuid_p && uuid_p->is_string()) ? std::string(uuid_p->as_string()) : "";
-                user.Passwd = user.UUID;
-                auto* flow_p = u.if_contains("flow");
-                user.Flow = (flow_p && flow_p->is_string()) ? std::string(flow_p->as_string()) : "";
-
-                // speed_limit 和 device_limit 可能是 null
-                auto* sl_p = u.if_contains("speed_limit");
-                const int64_t speed_limit_mbps =
-                    (sl_p && sl_p->is_int64()) ? sl_p->as_int64() : 0;
-                user.SpeedLimit = speed_limit_mbps > 0
-                    ? static_cast<uint64_t>(speed_limit_mbps) * 1024ULL * 1024ULL / 8ULL
-                    : 0;
-
-                auto* dl_p = u.if_contains("device_limit");
-                user.DeviceLimit = (dl_p && dl_p->is_int64()) ? static_cast<int>(dl_p->as_int64()) : 0;
-
-                auto* email_p = u.if_contains("email");
-                user.Email = (email_p && email_p->is_string()) ? std::string(email_p->as_string()) : "";
-                // 如果没有 email，使用 user_id 作为标识
-                if (user.Email.empty() && user.UID > 0) {
-                    user.Email = std::to_string(user.UID);
-                }
-                user.Enabled = true;
-
-                if (!user.UUID.empty()) {
-                    users.push_back(std::move(user));  // 使用 move 避免拷贝
-                }
-            }
+        auto users = ParseUserList(j);
+        if (!users) {
+            LOG_ERROR("V2Board[{}]: parse users error: {}",
+                      config_.Name, users.error());
+            co_return UserListFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                std::move(users.error()));
         }
 
         // 保存 ETag
@@ -774,8 +740,8 @@ APIClient::Impl::GetUserList() {
         }
 
         LOG_DEBUG("V2Board[{}]: fetched {} users for node {}",
-                 config_.Name, users.size(), node_id);
-        co_return UserListFetchResult::Success(std::move(users));
+                 config_.Name, users->size(), node_id);
+        co_return UserListFetchResult::Success(std::move(*users));
 
     } catch (const std::exception& e) {
         LOG_ERROR("V2Board[{}]: parse users error: {}", config_.Name, e.what());
