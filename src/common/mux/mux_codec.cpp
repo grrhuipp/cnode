@@ -542,14 +542,13 @@ void EncodeKeepAliveTo(memory::ByteVector& out) {
 }
 
 template <class ByteContainer>
-static bool EncodeNewToImpl(ByteContainer& out,
-                            uint16_t session_id,
-                            NetworkType network,
-                            const TargetAddress& target,
-                            const uint8_t* data,
-                            size_t len) {
+static bool EncodeNewHeaderToImpl(ByteContainer& out,
+                                  uint16_t session_id,
+                                  NetworkType network,
+                                  const TargetAddress& target,
+                                  size_t payload_len) {
     if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
-        len > std::numeric_limits<uint16_t>::max()) {
+        payload_len > std::numeric_limits<uint16_t>::max()) {
         out.clear();
         return false;
     }
@@ -561,14 +560,34 @@ static bool EncodeNewToImpl(ByteContainer& out,
     }
 
     InitFrameBase(out, session_id, SessionStatus::NEW,
-                  len > 0 ? kOptionData : 0x00,
-                  addr_reserve + len);
+                  payload_len > 0 ? kOptionData : 0x00,
+                  addr_reserve);
     out.push_back(static_cast<uint8_t>(network));
     if (!AppendAddress(out, target)) {
         out.clear();
         return false;
     }
-    return FinalizeFrame(out, data, len, len > 0);
+    return FinalizeFrameHeader(out, payload_len, payload_len > 0);
+}
+
+template <class ByteContainer>
+static bool EncodeNewToImpl(ByteContainer& out,
+                            uint16_t session_id,
+                            NetworkType network,
+                            const TargetAddress& target,
+                            const uint8_t* data,
+                            size_t len) {
+    if (!EncodeNewHeaderToImpl(out, session_id, network, target, len)) {
+        return false;
+    }
+    if (len > 0 && !data) {
+        out.clear();
+        return false;
+    }
+    if (len > 0) {
+        out.insert(out.end(), data, data + len);
+    }
+    return true;
 }
 
 bool EncodeNewTo(memory::ByteVector& out,
@@ -578,6 +597,15 @@ bool EncodeNewTo(memory::ByteVector& out,
                  const uint8_t* data,
                  size_t len) {
     return EncodeNewToImpl(out, session_id, network, target, data, len);
+}
+
+bool EncodeNewHeaderTo(memory::ByteVector& out,
+                       uint16_t session_id,
+                       NetworkType network,
+                       const TargetAddress& target,
+                       size_t payload_len) {
+    return EncodeNewHeaderToImpl(
+        out, session_id, network, target, payload_len);
 }
 
 // ============================================================================

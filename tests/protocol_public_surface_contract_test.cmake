@@ -95,6 +95,34 @@ if(MUX_RELAY_SOURCE MATCHES "packet_len > buf::Buffer::kSize")
     message(FATAL_ERROR
         "XUDP wire packet length must not be limited by one internal Buffer")
 endif()
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+if(VLESS_OUTBOUND_SOURCE MATCHES "SameTargetAddress")
+    message(FATAL_ERROR
+        "VLESS must use the shared TargetAddress endpoint identity")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES "EncodeNewHeaderTo")
+    message(FATAL_ERROR
+        "VLESS Mux must encode one complete MultiBuffer datagram length")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES
+        "target, payload_size[)]")
+    message(FATAL_ERROR
+        "VLESS Mux header must use the complete datagram payload size")
+endif()
+set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
+file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
+if(NOT UDP_RELAY_SOURCE MATCHES
+        "if [(]buffer_count == 1[)]")
+    message(FATAL_ERROR
+        "UDP relay must preserve one ReadMultiBuffer as one datagram")
+endif()
+if(NOT UDP_RELAY_SOURCE MATCHES
+        "session[.]SendTo[\r\n ()*,a-zA-Z0-9_.]*datagram[.]data[(][)]")
+    message(FATAL_ERROR
+        "UDP relay must send the coalesced datagram instead of each Buffer")
+endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR
         "Mux detached sub-dispatch lifetime must be owned by its coroutine frame")

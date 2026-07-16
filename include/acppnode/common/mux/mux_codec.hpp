@@ -110,6 +110,11 @@ void EncodeKeepAliveTo(memory::ByteVector& out);
                                const TargetAddress& target,
                                const uint8_t* data,
                                size_t len);
+[[nodiscard]] bool EncodeNewHeaderTo(memory::ByteVector& out,
+                                     uint16_t session_id,
+                                     NetworkType network,
+                                     const TargetAddress& target,
+                                     size_t payload_len);
 void EncodeEndTo(memory::ByteVector& out,
                  uint16_t session_id, bool error = false);
 [[nodiscard]] bool EncodeKeepDataTo(memory::ByteVector& out,

@@ -31,6 +31,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -96,20 +97,6 @@ net::awaitable<bool> WriteVlessTcpInitial(
         co_return false;
     }
     co_return true;
-}
-
-[[nodiscard]] bool SameTargetAddress(const TargetAddress& lhs,
-                                     const TargetAddress& rhs) {
-    if (lhs.port != rhs.port) {
-        return false;
-    }
-    if (lhs.IsDomain() || rhs.IsDomain()) {
-        return lhs.IsDomain() && rhs.IsDomain() && lhs.host == rhs.host;
-    }
-    if (lhs.resolved_addr && rhs.resolved_addr) {
-        return *lhs.resolved_addr == *rhs.resolved_addr;
-    }
-    return false;
 }
 
 constexpr std::string_view kPacketAddrMagicAddress =
@@ -432,7 +419,7 @@ public:
                 mb.FreeSlot(buffer);
                 continue;
             }
-            if (buffer->HasUDP() && !SameTargetAddress(buffer->UDP(), udp_target_)) {
+            if (buffer->HasUDP() && !buffer->UDP().SameEndpoint(udp_target_)) {
                 if (!packet_addr_) {
                     mb.FreeSlot(buffer);
                     continue;
@@ -762,80 +749,36 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        for (buf::Buffer*& buffer : mb) {
+        const TargetAddress* target = nullptr;
+        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
+        for (const buf::Buffer* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
                 continue;
             }
-
-            const TargetAddress& target = buffer->HasUDP()
+            const TargetAddress& buffer_target = buffer->HasUDP()
                 ? buffer->UDP()
                 : udp_target_;
-            const auto bytes = buffer->Bytes();
-            bool encoded = false;
-            if (!session_started_) {
-                encoded = mux::EncodeNewTo(
-                    write_frame_,
-                    session_id_,
-                    mux::NetworkType::UDP,
-                    target,
-                    bytes.data(),
-                    bytes.size());
-                session_started_ = encoded;
-            } else {
-                encoded = mux::EncodeKeepUDPTo(
-                    write_frame_,
-                    session_id_,
-                    target,
-                    bytes.data(),
-                    bytes.size());
-            }
-
-            mb.FreeSlot(buffer);
-
-            if (!encoded || write_frame_.empty()) {
+            if (!target) {
+                target = std::addressof(buffer_target);
+            } else if (!target->SameEndpoint(buffer_target)) {
                 throw IoSystemError(
-                    io_error::connection_reset,
-                    "VLESS mux request encode failed");
+                    io_error::invalid_argument,
+                    "VLESS mux datagram contains mixed targets");
             }
-            co_await WriteVlessBytes(writer_, write_frame_);
+            const auto bytes = buffer->Bytes();
+            payload.Append(net::const_buffer(bytes.data(), bytes.size()));
         }
+        if (!target || payload.empty()) {
+            mb.clear();
+            co_return;
+        }
+
+        co_await WriteDatagram(*target, payload.Span());
         mb.clear();
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!data || buffer.size() == 0) {
-                continue;
-            }
-
-            bool encoded = false;
-            if (!session_started_) {
-                encoded = mux::EncodeNewTo(
-                    write_frame_,
-                    session_id_,
-                    mux::NetworkType::UDP,
-                    udp_target_,
-                    data,
-                    buffer.size());
-                session_started_ = encoded;
-            } else {
-                encoded = mux::EncodeKeepUDPTo(
-                    write_frame_,
-                    session_id_,
-                    udp_target_,
-                    data,
-                    buffer.size());
-            }
-
-            if (!encoded || write_frame_.empty()) {
-                throw IoSystemError(
-                    io_error::connection_reset,
-                    "VLESS mux request encode failed");
-            }
-            co_await WriteVlessBytes(writer_, write_frame_);
-        }
+        co_await WriteDatagram(udp_target_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -892,6 +835,42 @@ public:
     }
 
 private:
+    net::awaitable<void> WriteDatagram(
+        const TargetAddress& target,
+        std::span<const net::const_buffer> payload) {
+        size_t payload_size = 0;
+        for (const auto& buffer : payload) {
+            if (buffer.size() >
+                std::numeric_limits<uint16_t>::max() - payload_size) {
+                throw IoSystemError(
+                    io_error::message_size,
+                    "VLESS mux datagram exceeds wire length");
+            }
+            payload_size += buffer.size();
+        }
+        if (payload_size == 0) {
+            co_return;
+        }
+
+        const bool encoded = !session_started_
+            ? mux::EncodeNewHeaderTo(
+                  write_frame_, session_id_, mux::NetworkType::UDP,
+                  target, payload_size)
+            : mux::EncodeKeepUDPHeaderTo(
+                  write_frame_, session_id_, target, payload_size);
+        if (!encoded || write_frame_.empty()) {
+            throw IoSystemError(
+                io_error::connection_reset,
+                "VLESS mux request encode failed");
+        }
+
+        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity + 1> frame;
+        frame.Append(net::const_buffer(write_frame_.data(), write_frame_.size()));
+        frame.AppendBuffers(payload);
+        co_await writer_.WriteBuffers(frame.Span());
+        session_started_ = true;
+    }
+
     net::awaitable<bool> ReadResponseHeader() {
         uint8_t fixed[2]{};
         if (!co_await reader_.ReadExact(fixed, sizeof(fixed))) {

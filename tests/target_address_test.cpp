@@ -40,5 +40,15 @@ int main() {
     if (!Require(mapped.IsValid() && mapped.IsIPv4() &&
                      mapped.resolved_addr->to_string() == "192.0.2.1",
                  "an IPv4-mapped IPv6 target must be canonicalized")) return 7;
+
+    const acpp::TargetAddress same_domain("example.com", 443);
+    const acpp::TargetAddress different_port("example.com", 8443);
+    if (!Require(domain.SameEndpoint(same_domain) &&
+                     !domain.SameEndpoint(different_port),
+                 "endpoint identity must use canonical host and port")) return 8;
+
+    const acpp::TargetAddress same_mapped("192.0.2.1", 443);
+    if (!Require(mapped.SameEndpoint(same_mapped),
+                 "canonical IP endpoints must compare equal")) return 9;
     return 0;
 }

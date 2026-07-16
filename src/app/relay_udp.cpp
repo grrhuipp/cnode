@@ -191,48 +191,80 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 break;
             }
 
-            // 每个 buffer 携带自身目标，由协议 reader-writer helper
-            // 在入站侧解析填好；relay 只按 Buffer endpoint 逐包发往 Full Cone session。
-            bool has_payload = false;
-            for (buf::Buffer* buffer : read_mb) {
+            // UDP reader 的一次 ReadMultiBuffer 对应一份 datagram；多个 Buffer
+            // 只是同一报文的存储分块，不能拆成多次 SendTo。
+            const TargetAddress* target = nullptr;
+            const buf::Buffer* single_buffer = nullptr;
+            size_t buffer_count = 0;
+            size_t read_bytes = 0;
+            bool invalid_datagram = false;
+            for (const buf::Buffer* buffer : read_mb) {
                 if (!buffer || buffer->IsEmpty()) {
                     continue;
                 }
-                has_payload = true;
-                auto bytes = buffer->Bytes();
-                const size_t read_bytes = bytes.size();
-                ctx.traffic.bytes_up += read_bytes;
-                result.bytes_up += read_bytes;
-                stats_acc.AddBytesOut(read_bytes);
-                if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
-                    FlushUdpRelayStats(stats, stats_acc);
-                }
-
-                auto wait_time = upload_limiter.Consume(read_bytes);
-                if (wait_time.count() > 0) {
-                    co_await upload_rate_sleep.WaitFor(wait_time);
-                }
-
                 if (!buffer->HasUDP()) {
-                    LOG_CONN_DEBUG(ctx, "UDP relay: buffer without target dropped {}B",
-                                   buffer->Len());
-                    continue;
+                    invalid_datagram = true;
+                    break;
                 }
-                const TargetAddress& target = buffer->UDP();
-                LOG_CONN_DEBUG(ctx, "UDP send: target={}, data_len={}",
-                               target, bytes.size());
-                auto send_result = co_await session.SendTo(
-                    target, bytes.data(), bytes.size(), callback_id);
-                if (send_result != ErrorCode::OK) {
-                    LOG_CONN_DEBUG(ctx, "UDP send failed: {}", ErrorCodeToString(send_result));
+                if (!target) {
+                    target = std::addressof(buffer->UDP());
+                } else if (!target->SameEndpoint(buffer->UDP())) {
+                    invalid_datagram = true;
+                    break;
                 }
+                single_buffer = buffer;
+                ++buffer_count;
+                read_bytes += buffer->Len();
             }
-            if (!has_payload) {
+            if (buffer_count == 0) {
                 // 入站读到 EOF：client 关闭隧道，结束上行并触发回包收尾。
                 LOG_CONN_DEBUG(ctx, "UDP relay: client EOF, up={}B down={}B",
                                result.bytes_up, result.bytes_down);
                 result.client_closed_first = true;
                 break;
+            }
+            if (invalid_datagram || !target) {
+                LOG_CONN_DEBUG(ctx,
+                    "UDP relay: malformed multi-buffer datagram dropped {}B",
+                    buf::TotalLen(read_mb));
+                continue;
+            }
+
+            ctx.traffic.bytes_up += read_bytes;
+            result.bytes_up += read_bytes;
+            stats_acc.AddBytesOut(read_bytes);
+            if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
+                FlushUdpRelayStats(stats, stats_acc);
+            }
+
+            auto wait_time = upload_limiter.Consume(read_bytes);
+            if (wait_time.count() > 0) {
+                co_await upload_rate_sleep.WaitFor(wait_time);
+            }
+
+            std::span<const uint8_t> datagram;
+            memory::ByteVector coalesced;
+            if (buffer_count == 1) {
+                datagram = single_buffer->Bytes();
+            } else {
+                coalesced.reserve(read_bytes);
+                for (const buf::Buffer* buffer : read_mb) {
+                    if (!buffer || buffer->IsEmpty()) {
+                        continue;
+                    }
+                    const auto bytes = buffer->Bytes();
+                    coalesced.insert(coalesced.end(), bytes.begin(), bytes.end());
+                }
+                datagram = coalesced;
+            }
+
+            LOG_CONN_DEBUG(ctx, "UDP send: target={}, data_len={}",
+                           *target, datagram.size());
+            auto send_result = co_await session.SendTo(
+                *target, datagram.data(), datagram.size(), callback_id);
+            if (send_result != ErrorCode::OK) {
+                LOG_CONN_DEBUG(ctx, "UDP send failed: {}",
+                               ErrorCodeToString(send_result));
             }
         }
 

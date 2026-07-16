@@ -60,6 +60,17 @@ struct TargetAddress {
         return false;
     }
 
+    [[nodiscard]] bool SameEndpoint(const TargetAddress& other) const noexcept {
+        if (port != other.port) {
+            return false;
+        }
+        if (IsDomain() || other.IsDomain()) {
+            return IsDomain() && other.IsDomain() && host == other.host;
+        }
+        return resolved_addr && other.resolved_addr &&
+               *resolved_addr == *other.resolved_addr;
+    }
+
     // 判断是否为域名
     bool IsDomain() const {
         return type == AddressType::Domain;

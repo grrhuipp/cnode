@@ -23,20 +23,6 @@ namespace acpp {
 
 namespace {
 
-[[nodiscard]] bool SameTargetAddress(const TargetAddress& lhs,
-                                     const TargetAddress& rhs) {
-    if (lhs.port != rhs.port) {
-        return false;
-    }
-    if (lhs.IsDomain() || rhs.IsDomain()) {
-        return lhs.IsDomain() && rhs.IsDomain() && lhs.host == rhs.host;
-    }
-    if (lhs.resolved_addr && rhs.resolved_addr) {
-        return *lhs.resolved_addr == *rhs.resolved_addr;
-    }
-    return false;
-}
-
 class VMessOutboundEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
@@ -78,7 +64,8 @@ public:
                     mb.FreeSlot(buffer);
                     continue;
                 }
-                if (buffer->HasUDP() && !SameTargetAddress(buffer->UDP(), udp_target_)) {
+                if (buffer->HasUDP() &&
+                    !buffer->UDP().SameEndpoint(udp_target_)) {
                     mb.FreeSlot(buffer);
                     continue;
                 }

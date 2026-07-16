@@ -75,6 +75,20 @@ int main() {
               xudp_decoder.PendingBytes() == 0,
           "XUDP packet larger than one Buffer was rejected or truncated");
 
+    Check(mux::EncodeNewHeaderTo(
+              encoded,
+              9,
+              mux::NetworkType::UDP,
+              TargetAddress("example.com", 53),
+              large_xudp_packet.size()),
+          "large Mux NEW header was rejected");
+    encoded.insert(
+        encoded.end(), large_xudp_packet.begin(), large_xudp_packet.end());
+    const auto large_new_frame = mux::DecodeFrame(encoded.data(), encoded.size());
+    Check(large_new_frame.has_value() && large_new_frame->frame_size == encoded.size() &&
+              large_new_frame->data_len == large_xudp_packet.size(),
+          "Mux NEW header did not preserve a multi-buffer datagram length");
+
     Check(mux::EncodeKeepDataTo(
               encoded, 7, maximum.data(), maximum.size()),
           "maximum Mux payload was rejected");
