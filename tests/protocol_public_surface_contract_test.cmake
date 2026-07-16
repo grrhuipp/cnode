@@ -197,6 +197,27 @@ if(NOT VLESS_UDP_FRAMING_SOURCE MATCHES
     message(FATAL_ERROR
         "VLESS UDP framing must preserve complete MultiBuffer datagrams")
 endif()
+set(VMESS_SERVER_ENCODING
+    "${SOURCE_DIR}/src/proxy/vmess/encoding/server.cpp")
+set(VMESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp")
+file(READ "${VMESS_SERVER_ENCODING}" VMESS_SERVER_ENCODING_SOURCE)
+file(READ "${VMESS_OUTBOUND}" VMESS_OUTBOUND_SOURCE)
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode[)][ \t\r\n]*[{][ \t\r\n]*co_return co_await DecodeRequestBody")
+    message(FATAL_ERROR
+        "VMess UDP body reader must return exactly one authenticated chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode = request[.]command == Command::UDP")
+    message(FATAL_ERROR
+        "VMess request body state must derive packet mode from the command")
+endif()
+if(NOT VMESS_OUTBOUND_SOURCE MATCHES
+        "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
+    message(FATAL_ERROR
+        "VMess outbound must validate each complete UDP datagram atomically")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES

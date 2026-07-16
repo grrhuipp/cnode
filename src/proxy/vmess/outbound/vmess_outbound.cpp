@@ -1,5 +1,6 @@
 #include "vmess_outbound.hpp"
 #include "../encoding/client.hpp"
+#include "../udp_datagram.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
@@ -58,21 +59,13 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (is_udp_) {
-            buf::MultiBuffer filtered;
-            for (buf::Buffer*& buffer : mb) {
-                if (!buffer || buffer->IsEmpty()) {
-                    mb.FreeSlot(buffer);
-                    continue;
+            ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            for (buf::Buffer* buffer : mb) {
+                if (buffer) {
+                    buffer->ClearUDP();
                 }
-                if (buffer->HasUDP() &&
-                    !buffer->UDP().SameEndpoint(udp_target_)) {
-                    mb.FreeSlot(buffer);
-                    continue;
-                }
-                filtered.push_back(mb.ReleaseSlot(buffer));
             }
-            mb.clear();
-            co_await session_.EncodeRequestBody(stream_, std::move(filtered));
+            co_await session_.EncodeRequestBody(stream_, std::move(mb));
             co_return;
         }
         co_await session_.EncodeRequestBody(stream_, std::move(mb));

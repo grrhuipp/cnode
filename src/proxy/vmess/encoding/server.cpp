@@ -40,6 +40,7 @@ struct DecodeRequestBodyState final {
     std::optional<ShakeMask> mask;
     buf::MultiBuffer pending_read;
     bool global_padding = false;
+    bool packet_mode = false;
     bool eof = false;
     uint32_t chunk_count = 0;
 };
@@ -606,6 +607,10 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
 
 net::awaitable<buf::MultiBuffer> DecodeRequestBodyMultiBuffer(DecodeRequestBodyState& state,
                                                               AsyncStream& stream) {
+    if (state.packet_mode) {
+        co_return co_await DecodeRequestBody(state, stream);
+    }
+
     buf::MultiBuffer out;
     for (size_t i = 0; i < kStreamReadBatchChunks; ++i) {
         if (i > 0 && !buf::HasData(state.pending_read)) {
@@ -638,6 +643,7 @@ void InitRequestBodyState(DecodeRequestBodyState& state, VMessRequest& request) 
     std::memcpy(request_iv.data(), request.body_iv.data(), 16);
 
     state.request = &request;
+    state.packet_mode = request.command == Command::UDP;
     state.cipher.emplace(security, request_key.data(), request_iv.data());
     if ((option & Option::AUTHENTICATED_LENGTH) != 0 &&
         (security == Security::AES_128_GCM || security == Security::CHACHA20_POLY1305)) {

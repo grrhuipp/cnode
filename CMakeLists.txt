@@ -898,6 +898,30 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_vless_udp_framing_test
         COMMAND cnode_vless_udp_framing_test)
 
+    add_executable(cnode_vmess_udp_datagram_test
+        tests/vmess_udp_datagram_test.cpp
+    )
+    target_include_directories(cnode_vmess_udp_datagram_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess
+    )
+    target_link_libraries(cnode_vmess_udp_datagram_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_vmess_udp_datagram_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_vmess_udp_datagram_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_vmess_udp_datagram_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_vmess_udp_datagram_test
+        COMMAND cnode_vmess_udp_datagram_test)
+
     add_executable(cnode_uot_ss2022_test
         tests/uot_ss2022_test.cpp
         src/proxy/uot/uot.cpp
