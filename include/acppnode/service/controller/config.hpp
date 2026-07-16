@@ -2,6 +2,7 @@
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
+#include "acppnode/service/controller/panel_node_ids.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/inbound_listen.hpp"
 #include "acppnode/transport/internet/proxy_protocol_mode.hpp"
@@ -23,7 +24,7 @@ struct PanelConfig {
     std::string Type = std::string(constants::panel::kV2BoardType);  // 面板类型
     std::string APIHost;                      // API 地址
     std::string Key;                          // API 密钥
-    std::vector<int> NodeIDs;                 // 节点 ID 列表
+    PanelNodeIds NodeIDs;
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
     InboundListen ListenIP;
     OutboundBind SendIP = OutboundBind::Auto();

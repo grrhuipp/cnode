@@ -66,36 +66,6 @@ ProxyProtocolMode ParseProxyProtocolMode(const json::object& obj,
     return def;
 }
 
-inline std::vector<int> jint_array(const json::value& v) {
-    std::vector<int> result;
-    if (v.is_array()) {
-        for (const auto& item : v.as_array()) {
-            if (item.is_int64()) {
-                result.push_back(static_cast<int>(item.as_int64()));
-            } else if (item.is_uint64()) {
-                result.push_back(static_cast<int>(item.as_uint64()));
-            }
-        }
-    }
-    return result;
-}
-
-inline std::vector<int> jint_list(const json::object& obj,
-                                  std::string_view key) {
-    std::vector<int> result;
-    auto* p = obj.if_contains(key);
-    if (!p) return result;
-    if (p->is_array()) {
-        auto values = jint_array(*p);
-        result.insert(result.end(), values.begin(), values.end());
-    } else if (p->is_int64()) {
-        result.push_back(static_cast<int>(p->as_int64()));
-    } else if (p->is_uint64()) {
-        result.push_back(static_cast<int>(p->as_uint64()));
-    }
-    return result;
-}
-
 } // anonymous namespace
 
 PanelConfig PanelConfig::FromJson(const json::object& j) {
@@ -109,9 +79,11 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         jstr(j, "NodeType", std::string(constants::panel::kDefaultNodeType));
     cfg.NodeType = naming::NormalizePanelNodeProtocol(raw_node_type);
 
-    cfg.NodeIDs = jint_list(j, "NodeIDs");
-    if (cfg.Name.empty() && !cfg.NodeIDs.empty()) {
-        cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.front());
+    if (const auto* node_ids = j.if_contains("NodeIDs")) {
+        cfg.NodeIDs = PanelNodeIds::Parse(*node_ids);
+    }
+    if (cfg.Name.empty() && !cfg.NodeIDs.Empty()) {
+        cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.Front());
     }
     if (const auto* listen_ip = j.if_contains("ListenIP")) {
         if (!listen_ip->is_string()) {
@@ -159,7 +131,7 @@ bool PanelConfig::Validate() const {
         LOG_ERROR("Panel {} ApiKey is required", Name);
         return false;
     }
-    if (NodeIDs.empty()) {
+    if (NodeIDs.Empty()) {
         LOG_ERROR("Panel {} NodeIDs is required", Name);
         return false;
     }

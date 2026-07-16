@@ -1,9 +1,11 @@
 #include "acppnode/infra/config.hpp"
+#include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include "config_semantics.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace acpp {
 
@@ -26,6 +28,20 @@ bool Config::Validate() const {
     if (dns_.min_ttl > dns_.max_ttl) {
         LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
+    }
+
+    std::unordered_set<std::string> panel_nodes;
+    for (const auto& panel : panels_) {
+        if (!panel.Validate()) {
+            return false;
+        }
+        for (const int node_id : panel.NodeIDs.Values()) {
+            auto key = naming::BuildPanelNodeStatsKey(panel.Name, node_id);
+            if (!panel_nodes.insert(key).second) {
+                LOG_ERROR("Duplicate panel node identity: {}", key);
+                return false;
+            }
+        }
     }
 
     const auto inbound_semantic = ValidateStaticInboundSemantics(static_inbounds_);

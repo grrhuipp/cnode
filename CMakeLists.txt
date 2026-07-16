@@ -320,6 +320,7 @@ set(CNODE_SOURCES
     src/service/controller/awaitable_batch.cpp
     src/service/controller/node_transition.cpp
     src/service/controller/config.cpp
+    src/service/controller/panel_node_ids.cpp
     src/service/controller/inboundbuilder.cpp
     src/service/controller/outboundbuilder.cpp
     src/service/controller/userbuilder.cpp
@@ -825,6 +826,22 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_inbound_listen_test
         COMMAND cnode_inbound_listen_test)
+
+    add_executable(cnode_panel_node_ids_test
+        tests/panel_node_ids_test.cpp
+        src/service/controller/panel_node_ids.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_panel_node_ids_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(cnode_panel_node_ids_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_panel_node_ids_test
+        COMMAND cnode_panel_node_ids_test)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp

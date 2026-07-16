@@ -78,6 +78,30 @@ expect_rejected(invalid_panel_send_ip
 expect_rejected(invalid_panel_listen_ip
     [=[{"panels":[{"Name":"bad-listen","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess","ListenIP":"not-an-ip"}]}]=]
     "" "")
+expect_rejected(overflow_panel_node_id
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[4294967297],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(signed_overflow_panel_node_id
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[2147483648],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(negative_panel_node_id
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[-1],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(zero_panel_node_id
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[0],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(scalar_panel_node_ids
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":1,"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(mixed_type_panel_node_ids
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1,"2"],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(duplicate_panel_node_ids
+    [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1,1],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(duplicate_panel_entries
+    [=[{"panels":[{"Name":"same","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess"},{"Name":"same","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    "" "")
 expect_rejected(negative_route_port "{}" "routing.json"
     [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
 expect_rejected(overflow_route_port "{}" "routing.json"
