@@ -1,9 +1,15 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace acpp {
+
+enum class TlsVersion : uint8_t {
+    V1_2 = 2,
+    V1_3 = 3,
+};
 
 // ============================================================================
 // TLS 配置
@@ -19,10 +25,9 @@ struct TlsConfig {
     bool allow_insecure = false;        // 是否允许不验证证书
     std::vector<std::string> alpn;      // ALPN 协议列表
 
-    // 通用配置
-    std::string min_version = "1.2";    // 最低 TLS 版本
-    std::string max_version = "1.3";    // 最高 TLS 版本
-    std::vector<std::string> cipher_suites;  // 密码套件
+    // 通用协议版本策略
+    TlsVersion min_version = TlsVersion::V1_2;
+    TlsVersion max_version = TlsVersion::V1_3;
 
     [[nodiscard]] bool HasCertificatePair() const noexcept {
         return !cert_file.empty() && !key_file.empty();

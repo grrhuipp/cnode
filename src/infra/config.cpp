@@ -127,6 +127,14 @@ std::string lower_ascii_copy(std::string value) {
     return value;
 }
 
+TlsVersion ParseTlsVersion(
+    std::string_view value, std::string_view field) {
+    if (value == "1.2") return TlsVersion::V1_2;
+    if (value == "1.3") return TlsVersion::V1_3;
+    throw std::invalid_argument(std::format(
+        "tls {} must be 1.2 or 1.3", field));
+}
+
 void require_http_request_target(
     std::string_view value, std::string_view field) {
     if (!value.empty() &&
@@ -895,6 +903,8 @@ std::string GrpcConfig::RequestPath() const {
 StreamSettings StreamSettings::FromJson(
     const json::object& j, StreamEndpointRole role) {
     StreamSettings cfg;
+    bool min_version_declared = false;
+    bool max_version_declared = false;
 
     cfg.network  = lower_ascii_copy(
         jstr(j, "network",  std::string(constants::protocol::kTcp)));
@@ -903,6 +913,20 @@ StreamSettings StreamSettings::FromJson(
 
     // TLS 配置
     if (const auto* tls = optional_object(j, {"tlsSettings"})) {
+        min_version_declared =
+            tls->contains("minVersion") || tls->contains("min_version");
+        max_version_declared =
+            tls->contains("maxVersion") || tls->contains("max_version");
+        cfg.tls.min_version = ParseTlsVersion(
+            jstr(*tls, {"minVersion", "min_version"}, "1.2"),
+            "minVersion");
+        cfg.tls.max_version = ParseTlsVersion(
+            jstr(*tls, {"maxVersion", "max_version"}, "1.3"),
+            "maxVersion");
+        if (cfg.tls.min_version > cfg.tls.max_version) {
+            throw std::invalid_argument(
+                "tls minVersion must not exceed maxVersion");
+        }
         cfg.tls.server_name = jstr(*tls, "serverName", "");
         cfg.tls.allow_insecure = jbool(*tls, {"allowInsecure"}, false);
         cfg.tls.ca_file = jstr(*tls, {"caFile", "ca_file"}, "");
@@ -977,6 +1001,17 @@ StreamSettings StreamSettings::FromJson(
             j, {"realitySettings", "reality_settings"})) {
         cfg.reality = RealityConfig::FromJson(*reality);
     }
+    if (cfg.security == constants::protocol::kReality) {
+        if ((min_version_declared &&
+             cfg.tls.min_version != TlsVersion::V1_3) ||
+            (max_version_declared &&
+             cfg.tls.max_version != TlsVersion::V1_3)) {
+            throw std::invalid_argument(
+                "reality requires TLS minVersion and maxVersion 1.3");
+        }
+        cfg.tls.min_version = TlsVersion::V1_3;
+        cfg.tls.max_version = TlsVersion::V1_3;
+    }
     if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
         cfg.tls.server_name = cfg.reality.server_name;
     }
@@ -1045,6 +1080,8 @@ void StreamSettings::RecomputeModes() noexcept {
         security_mode = SecurityMode::Tls;
     } else if (security == constants::protocol::kReality) {
         security_mode = SecurityMode::Reality;
+        tls.min_version = TlsVersion::V1_3;
+        tls.max_version = TlsVersion::V1_3;
     } else {
         security_mode = SecurityMode::Unsupported;
     }

@@ -70,9 +70,12 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
         return nullptr;
     }
 
-    // 设置 TLS 版本
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    if (!ConfigureTlsProtocolVersions(
+            ctx, config.min_version, config.max_version)) {
+        LOG_ERROR("Invalid TLS server protocol version policy");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
     SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     // 加载证书
@@ -176,8 +179,12 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) return nullptr;
 
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    if (!ConfigureTlsProtocolVersions(
+            ctx, config.min_version, config.max_version)) {
+        LOG_ERROR("Invalid auto-sign TLS protocol version policy");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
     SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     SSL_CTX_use_certificate(ctx, default_material.cert);

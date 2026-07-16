@@ -12,6 +12,31 @@
 
 namespace acpp {
 
+namespace {
+
+uint16_t ToOpenSslVersion(TlsVersion version) noexcept {
+    switch (version) {
+        case TlsVersion::V1_2:
+            return TLS1_2_VERSION;
+        case TlsVersion::V1_3:
+            return TLS1_3_VERSION;
+    }
+    return 0;
+}
+
+}  // namespace
+
+bool ConfigureTlsProtocolVersions(
+    SSL_CTX* context,
+    TlsVersion min_version,
+    TlsVersion max_version) noexcept {
+    const uint16_t minimum = ToOpenSslVersion(min_version);
+    const uint16_t maximum = ToOpenSslVersion(max_version);
+    return context && minimum != 0 && maximum != 0 && minimum <= maximum &&
+        SSL_CTX_set_min_proto_version(context, minimum) == 1 &&
+        SSL_CTX_set_max_proto_version(context, maximum) == 1;
+}
+
 bool ConfigureTlsServerIdentity(
     SSL* ssl, std::string_view identity) noexcept {
     if (!ssl || identity.empty() || identity.find('\0') != std::string_view::npos) {
@@ -43,8 +68,12 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
         return nullptr;
     }
 
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    if (!ConfigureTlsProtocolVersions(
+            ctx, config.min_version, config.max_version)) {
+        LOG_ERROR("Invalid TLS client protocol version policy");
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
     SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 
     if (config.cert_file.empty() != config.key_file.empty()) {

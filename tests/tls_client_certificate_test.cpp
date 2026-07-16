@@ -152,37 +152,55 @@ int main() {
         return 7;
     }
 
+    acpp::TlsConfig tls13_config;
+    tls13_config.allow_insecure = true;
+    tls13_config.min_version = acpp::TlsVersion::V1_3;
+    tls13_config.max_version = acpp::TlsVersion::V1_3;
+    auto tls13_context = acpp::SslContext::CreateClient(tls13_config);
+    if (!Require(tls13_context != nullptr,
+                 "TLS 1.3-only client context must be created")) {
+        return 8;
+    }
+    if (!Require(
+            SSL_CTX_get_min_proto_version(tls13_context->Native()) ==
+                TLS1_3_VERSION &&
+            SSL_CTX_get_max_proto_version(tls13_context->Native()) ==
+                TLS1_3_VERSION,
+            "TLS 1.3-only policy must reach the client SSL context")) {
+        return 9;
+    }
+
     auto ip_material = certificates.GetOrCreate("192.0.2.1");
     SSL* ip_client = SSL_new(context->Native());
     if (!Require(ip_material.cert != nullptr && ip_material.key != nullptr &&
                      ip_client != nullptr,
                  "IP identity test material must be created")) {
         if (ip_client) SSL_free(ip_client);
-        return 8;
+        return 10;
     }
     if (!Require(ReplaceCommonName(
                      ip_material.cert, ip_material.key, "unrelated.example"),
                  "IP identity certificate common name must be replaced")) {
         SSL_free(ip_client);
-        return 9;
+        return 11;
     }
     if (!Require(acpp::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
                  "IP server identity must be configured")) {
         SSL_free(ip_client);
-        return 10;
+        return 12;
     }
     if (!Require(SSL_get_servername(
                      ip_client, TLSEXT_NAMETYPE_host_name) == nullptr,
                  "IP server identity must not be sent as SNI")) {
         SSL_free(ip_client);
-        return 11;
+        return 13;
     }
     const bool ip_verified = VerifyCertificate(
         ip_material.cert, SSL_get0_param(ip_client));
     SSL_free(ip_client);
     if (!Require(ip_verified,
                  "IP SAN certificate must verify for its configured identity")) {
-        return 12;
+        return 14;
     }
 
     SSL* wrong_ip_client = SSL_new(context->Native());
@@ -191,14 +209,14 @@ int main() {
                          wrong_ip_client, "192.0.2.2"),
                  "wrong IP identity must be configured for rejection test")) {
         if (wrong_ip_client) SSL_free(wrong_ip_client);
-        return 13;
+        return 15;
     }
     const bool wrong_ip_verified = VerifyCertificate(
         ip_material.cert, SSL_get0_param(wrong_ip_client));
     SSL_free(wrong_ip_client);
     if (!Require(!wrong_ip_verified,
                  "IP SAN certificate must reject a different IP identity")) {
-        return 14;
+        return 16;
     }
 
     SSL* dns_client = SSL_new(context->Native());
@@ -207,7 +225,7 @@ int main() {
                          dns_client, "client.example"),
                  "DNS server identity must be configured")) {
         if (dns_client) SSL_free(dns_client);
-        return 15;
+        return 17;
     }
     const char* configured_sni = SSL_get_servername(
         dns_client, TLSEXT_NAMETYPE_host_name);
@@ -217,12 +235,12 @@ int main() {
                      std::string_view(configured_sni) == "client.example",
                  "DNS server identity must be sent as SNI")) {
         SSL_free(dns_client);
-        return 16;
+        return 18;
     }
     SSL_free(dns_client);
     if (!Require(dns_verified,
                  "DNS SAN certificate must verify for its configured identity")) {
-        return 17;
+        return 19;
     }
     return 0;
 }

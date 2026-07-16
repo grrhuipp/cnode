@@ -90,14 +90,9 @@ std::string MakeTlsCacheKey(std::string_view role, const TlsConfig& config) {
     key.push_back('|');
     key.append(config.allow_insecure ? "1" : "0");
     key.push_back('|');
-    key.append(config.min_version);
+    key.push_back(static_cast<char>(config.min_version));
     key.push_back('|');
-    key.append(config.max_version);
-
-    for (const auto& suite : config.cipher_suites) {
-        key.push_back('|');
-        key.append(suite);
-    }
+    key.push_back(static_cast<char>(config.max_version));
     for (const auto& proto : config.alpn) {
         key.push_back('|');
         key.append(proto);

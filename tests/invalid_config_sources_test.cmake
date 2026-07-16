@@ -172,6 +172,24 @@ expect_rejected(non_object_tls_settings "{}" "outbounds.json"
 expect_rejected(non_object_tls_certificate "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[42]}}}]]=]
     "tls certificates entries must be objects")
+expect_rejected(non_string_tls_min_version "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-min-version-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":1.3}}}]]=]
+    "minVersion must be a string")
+expect_rejected(unsupported_tls_min_version "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-min-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.1"}}}]]=]
+    "tls minVersion must be 1.2 or 1.3")
+expect_rejected(inverted_tls_versions "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-version-order","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","maxVersion":"1.2"}}}]]=]
+    "tls minVersion must not exceed maxVersion")
+expect_rejected(conflicting_tls_min_version_aliases "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-min-version-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.2","min_version":"1.3"}}}]]=]
+    "minVersion and min_version must match")
+expect_rejected(incompatible_reality_tls_version "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-tls-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","tlsSettings":{"minVersion":"1.2"},"realitySettings":{"serverName":"example.com","publicKey":"invalid-until-after-version-validation"}}}]]=]
+    "reality requires TLS minVersion and maxVersion 1.3")
+expect_started(equal_tls_version_aliases
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-tls-version-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","min_version":"1.3","maxVersion":"1.3","max_version":"1.3"}}}]]=])
 expect_rejected(non_string_tls_ca "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":42}}}]]=]
     "caFile must be a string")
