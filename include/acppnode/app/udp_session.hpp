@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <string>
 
@@ -81,10 +82,12 @@ public:
     // 获取本地端口
     uint16_t LocalPort() const;
 
-    // 获取会话 ID
-    const std::string& SessionId() const;
-
 private:
+    friend class UDPSessionManager;
+
+    [[nodiscard]] bool UsesBindAddress(
+        const net::ip::address& bind_address) const;
+
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };
@@ -99,16 +102,10 @@ public:
                                 std::chrono::seconds session_timeout = std::chrono::seconds(defaults::kUdpSessionTimeout));
     ~UDPSessionManager();
 
-    // 获取或创建会话
-    UDPSession* GetOrCreateSession(
+    // 获取或创建会话；容量耗尽、ID/bind 冲突和绑定失败均返回精确错误。
+    std::expected<UDPSession*, ErrorCode> AcquireSession(
         const std::string& session_id,
         const net::ip::address& bind_address);
-
-    // 获取现有会话
-    UDPSession* GetSession(const std::string& session_id);
-
-    // 移除会话
-    void RemoveSession(const std::string& session_id);
 
     // 启动清理定时器
     void StartCleanup();

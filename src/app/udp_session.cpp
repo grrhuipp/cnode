@@ -204,6 +204,7 @@ struct UDPSession::Impl {
     uint64_t next_callback_id = 1;
 
     udp::socket socket;
+    net::ip::address bind_address;
     uint16_t local_port = 0;
     udp::endpoint sender_endpoint;
 
@@ -248,6 +249,7 @@ ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
         sock.bind(local_ep);
 
         impl_->socket = std::move(sock);
+        impl_->bind_address = iputil::NormalizeAddress(bind_address);
         impl_->local_port = impl_->socket.local_endpoint().port();
         impl_->running = true;
 
@@ -733,8 +735,9 @@ uint16_t UDPSession::LocalPort() const {
     return impl_->local_port;
 }
 
-const std::string& UDPSession::SessionId() const {
-    return impl_->session_id;
+bool UDPSession::UsesBindAddress(
+    const net::ip::address& bind_address) const {
+    return impl_->bind_address == iputil::NormalizeAddress(bind_address);
 }
 
 // ============================================================================
@@ -742,6 +745,8 @@ const std::string& UDPSession::SessionId() const {
 // ============================================================================
 
 struct UDPSessionManager::Impl {
+    static constexpr size_t kMaxSessions = 4096;
+
     Impl(net::io_context& io_context,
          ::acpp::app::dns::DNS& dns_service,
          std::chrono::seconds session_timeout)
@@ -780,23 +785,43 @@ UDPSessionManager::~UDPSessionManager() {
     StopAll();
 }
 
-UDPSession* UDPSessionManager::GetOrCreateSession(
+std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
     const std::string& session_id,
     const net::ip::address& bind_address) {
 
+    if (session_id.empty()) {
+        return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {
+        if (!it->second->UsesBindAddress(bind_address)) {
+            LOG_CONN_FAIL("UDP session {} bind address conflict", session_id);
+            return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        }
         it->second->Touch();
         return it->second.get();
+    }
+    if (impl_->sessions.size() >= Impl::kMaxSessions) {
+        LOG_CONN_FAIL("UDP session capacity exhausted: {}", Impl::kMaxSessions);
+        return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     // 创建新会话
     memory::ThreadLocalAllocator<UDPSession> alloc;
-    UDPSession* raw_session = alloc.allocate(1);
+    UDPSession* raw_session = nullptr;
     try {
+        raw_session = alloc.allocate(1);
         std::construct_at(raw_session, impl_->io_context, session_id, impl_->dns_service);
+    } catch (const std::bad_alloc&) {
+        if (raw_session) {
+            alloc.deallocate(raw_session, 1);
+        }
+        return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (...) {
-        alloc.deallocate(raw_session, 1);
+        if (raw_session) {
+            alloc.deallocate(raw_session, 1);
+        }
         throw;
     }
     Impl::SessionPtr session(raw_session);
@@ -804,35 +829,26 @@ UDPSession* UDPSessionManager::GetOrCreateSession(
 
     if (err != ErrorCode::SUCCESS) {
         LOG_CONN_FAIL("Failed to create UDP session {}: {}", session_id, ErrorCodeToString(err));
-        return nullptr;
+        return std::unexpected(err);
     }
 
-    UDPSession* session_ptr = session.get();
-    impl_->sessions[session_id] = std::move(session);
+    UDPSession* session_ptr = nullptr;
+    try {
+        auto [inserted_it, inserted] =
+            impl_->sessions.try_emplace(session_id, std::move(session));
+        if (!inserted) {
+            return std::unexpected(ErrorCode::INTERNAL);
+        }
+        session_ptr = inserted_it->second.get();
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
     session_ptr->StartReceive();
 
     LOG_ACCESS_DEBUG("Created UDP session {} on port {}, total sessions: {}",
              session_id, session_ptr->LocalPort(), impl_->sessions.size());
 
     return session_ptr;
-}
-
-UDPSession* UDPSessionManager::GetSession(const std::string& session_id) {
-    auto it = impl_->sessions.find(session_id);
-    if (it != impl_->sessions.end()) {
-        return it->second.get();
-    }
-    return nullptr;
-}
-
-void UDPSessionManager::RemoveSession(const std::string& session_id) {
-    auto it = impl_->sessions.find(session_id);
-    if (it != impl_->sessions.end()) {
-        it->second->Stop();
-        impl_->sessions.erase(it);
-        MaybeShrinkHashContainer(impl_->sessions, 64);
-        LOG_ACCESS_DEBUG("Removed UDP session {}, remaining: {}", session_id, impl_->sessions.size());
-    }
 }
 
 void UDPSessionManager::StartCleanup() {

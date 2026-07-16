@@ -233,21 +233,22 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         if (!settings_.enable_udp) {
             co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
         }
-        UDPSession* session = nullptr;
+        std::expected<UDPSession*, ErrorCode> session_result;
         try {
-            session = AcquireUdpSession(ctx);
+            session_result = AcquireUdpSession(ctx);
         } catch (const std::exception& e) {
             LOG_CONN_FAIL_CTX(ctx, "UDP_DIAL_FAILED {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag, e.what());
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
         }
-        if (!session) {
+        if (!session_result) {
             LOG_CONN_FAIL_CTX(ctx, "UDP_DIAL_FAILED {} -> {} via {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag);
-            co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
+            co_return std::unexpected(session_result.error());
         }
+        UDPSession* session = *session_result;
         UDPRelayConfig udp_cfg;
         udp_cfg.speed_limit = ctx.content.speed_limit;
         co_return co_await DoUDPRelayLink(
@@ -377,7 +378,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
 }
 
-UDPSession* Handler::AcquireUdpSession(session::Context& ctx) {
+std::expected<UDPSession*, ErrorCode>
+Handler::AcquireUdpSession(session::Context& ctx) {
     // Per-worker UDP session：同一 Worker 上同一出口 IP 共享一个 UDP socket。
     net::ip::address bind_addr_storage;
     std::string session_id_storage;
@@ -396,16 +398,16 @@ UDPSession* Handler::AcquireUdpSession(session::Context& ctx) {
 
     if (!udp_session_manager_) {
         LOG_CONN_FAIL("Freedom UDP: UDPSessionManager not available");
-        return nullptr;
+        return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
     }
 
-    auto* session = udp_session_manager_->GetOrCreateSession(*session_id, *bind_addr);
+    auto session = udp_session_manager_->AcquireSession(*session_id, *bind_addr);
     if (!session) {
-        return nullptr;
+        return std::unexpected(session.error());
     }
 
-    LOG_CONN_DEBUG(ctx, "Freedom UDP session {} port {}", *session_id, session->LocalPort());
-    return session;
+    LOG_CONN_DEBUG(ctx, "Freedom UDP session {} port {}", *session_id, (*session)->LocalPort());
+    return *session;
 }
 
 net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>

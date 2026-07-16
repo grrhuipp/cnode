@@ -380,6 +380,17 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSession callbacks and target mappings must be bounded and transactional")
 endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+        "kMaxSessions = 4096" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "[!]it->second->UsesBindAddress[(]bind_address[)]" OR
+   NOT UDP_SESSION_HEADER_SOURCE MATCHES
+        "std::expected<UDPSession[*], ErrorCode> AcquireSession" OR
+   UDP_SESSION_HEADER_SOURCE MATCHES
+        "GetOrCreateSession|GetSession[(]|RemoveSession[(]|SessionId[(]")
+    message(FATAL_ERROR
+        "UDPSessionManager acquisition must be bounded, bind-safe and expose exact errors")
+endif()
 if(NOT UDP_TYPES_HEADER_SOURCE MATCHES
         "return invoke_bool_[(]storage_, std::forward<Args>[(]args[)][.][.][.][)]")
     message(FATAL_ERROR

@@ -88,8 +88,9 @@ private:
         const net::ip::address& remote_addr);
 
     // 取得（或创建）当前 Worker 的 Full Cone UDP socket。仅由 Process 的
-    // UDP 数据面调用；返回 nullptr 表示拨号失败。
-    ::acpp::UDPSession* AcquireUdpSession(session::Context& ctx);
+    // UDP 数据面调用；保留 manager 返回的精确容量/绑定错误。
+    std::expected<::acpp::UDPSession*, ErrorCode> AcquireUdpSession(
+        session::Context& ctx);
 
     std::string tag_;
     FreedomSettings settings_;

@@ -570,13 +570,17 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         session_id.append(tag_);
         session_id.push_back('-');
         session_id.append(conn_id_buf, conn_id_end);
-        auto* udp_session = udp_session_manager_->GetOrCreateSession(
+        auto udp_session_result = udp_session_manager_->AcquireSession(
             session_id, bind_addr);
-        if (!udp_session) {
-            LOG_CONN_FAIL_CTX(ctx, "[SsOutbound] UDP session create failed via {}",
-                              ctx.outbound.tag);
-            co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
+        if (!udp_session_result) {
+            LOG_CONN_FAIL_CTX(
+                ctx,
+                "[SsOutbound] UDP session create failed via {}: {}",
+                ctx.outbound.tag,
+                ErrorCodeToString(udp_session_result.error()));
+            co_return std::unexpected(udp_session_result.error());
         }
+        auto* udp_session = *udp_session_result;
 
         ShadowsocksUdpOutboundEndpoint target_endpoint(
             io_context,
