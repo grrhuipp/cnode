@@ -887,6 +887,52 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_rule_lifecycle_test
         COMMAND cnode_rule_lifecycle_test)
 
+    add_executable(cnode_worker_shutdown_contract_test
+        tests/worker_shutdown_contract_test.cpp
+    )
+    target_include_directories(cnode_worker_shutdown_contract_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_worker_shutdown_contract_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_worker_shutdown_contract_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_worker_shutdown_contract_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_worker_shutdown_contract_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_worker_shutdown_contract_test
+        COMMAND cnode_worker_shutdown_contract_test)
+
+    add_executable(cnode_graceful_shutdown_test
+        tests/graceful_shutdown_test.cpp
+    )
+    target_link_libraries(cnode_graceful_shutdown_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_graceful_shutdown_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_graceful_shutdown_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_graceful_shutdown_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_graceful_shutdown_test
+        COMMAND cnode_graceful_shutdown_test
+            $<TARGET_FILE:cnode>
+            ${CMAKE_CURRENT_BINARY_DIR}/graceful_shutdown_test)
+    set_tests_properties(cnode_graceful_shutdown_test PROPERTIES TIMEOUT 15)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}

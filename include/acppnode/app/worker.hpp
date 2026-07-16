@@ -4,7 +4,6 @@
 #include "acppnode/common/asio_types.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -68,8 +67,8 @@ public:
     // 动态控制面使用：必须在 Worker executor 上执行，并返回真实 bind 结果。
     net::awaitable<bool> AddListenerTask(PortBinding binding);
 
-    // 进程关闭冷路径：在 Worker 线程关闭一组监听，并在下一轮事件循环回调。
-    void ShutdownListenersAsync(std::vector<std::string> tags, std::function<void()> on_done);
+    // 进程关闭冷路径：在 Worker 线程关闭一组监听，并等待取消事件进入队列。
+    net::awaitable<void> ShutdownListenersTask(std::vector<std::string> tags);
 
     // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行。
     net::awaitable<bool> RegisterInboundTask(

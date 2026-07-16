@@ -108,6 +108,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
     StartRuntimeMonitoring(ctx, runtime_state);
 
     ctx.main_ctx.run();
+    shutdown_signals.reset();
 
     for (auto& t : worker_threads) {
         if (t.joinable()) t.join();

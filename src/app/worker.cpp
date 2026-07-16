@@ -800,20 +800,16 @@ net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
     co_return runtime_->listener_state->StartListening(*this, binding);
 }
 
-void Worker::ShutdownListenersAsync(std::vector<std::string> tags,
-                                    std::function<void()> on_done) {
-    net::post(runtime_->io_context,
-        [this, tags = std::move(tags), on_done = std::move(on_done)]() mutable {
-            for (const auto& tag : tags) {
-                runtime_->listener_state->StopListening(*this, tag);
-                runtime_->listener_state->StopUdpListening(*this, tag);
-            }
-            net::post(runtime_->io_context, [on_done = std::move(on_done)]() mutable {
-                if (on_done) {
-                    on_done();
-                }
-            });
-        });
+net::awaitable<void> Worker::ShutdownListenersTask(
+    std::vector<std::string> tags) {
+    for (const auto& tag : tags) {
+        runtime_->listener_state->StopListening(*this, tag);
+        runtime_->listener_state->StopUdpListening(*this, tag);
+    }
+
+    // Yield once so accept/receive cancellation handlers queued above can run
+    // before the main thread stops this Worker io_context.
+    co_await net::post(runtime_->io_context, net::use_awaitable);
 }
 
 bool Worker::RegisterInboundOnWorkerThread(

@@ -29,10 +29,10 @@ namespace acpp {
 
 struct WorkerPool {
     // Destruction order is the reverse of this declaration:
-    // work guards release first, io_contexts then destroy pending coroutine
-    // frames, and Workers/handlers/validators remain alive for that cleanup.
-    std::vector<std::unique_ptr<Worker>> workers;
+    // work guards release first, then Workers destroy every socket/service
+    // while its io_context is still alive; io_contexts are destroyed last.
     std::vector<std::unique_ptr<net::io_context>> io_contexts;
+    std::vector<std::unique_ptr<Worker>> workers;
     std::vector<net::executor_work_guard<net::io_context::executor_type>> work_guards;
 };
 
