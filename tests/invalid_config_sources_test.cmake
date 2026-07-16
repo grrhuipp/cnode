@@ -41,6 +41,16 @@ expect_rejected(wrong_shape_routing "{}" "routing.json" [=[{"routing":[]}]=])
 expect_rejected(scalar_inbounds "{}" "inbounds.json" "42")
 expect_rejected(scalar_outbounds "{}" "outbounds.json" "42")
 expect_rejected(scalar_routing "{}" "routing.json" "42")
+expect_rejected(negative_route_port "{}" "routing.json"
+    [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
+expect_rejected(overflow_route_port "{}" "routing.json"
+    [=[{"rules":[{"port":"70000","outboundTag":"direct"}]}]=])
+expect_rejected(trailing_route_port "{}" "routing.json"
+    [=[{"rules":[{"port":"80junk","outboundTag":"direct"}]}]=])
+expect_rejected(reversed_route_port_range "{}" "routing.json"
+    [=[{"rules":[{"port":"1000-200","outboundTag":"direct"}]}]=])
+expect_rejected(floating_route_source_port "{}" "routing.json"
+    [=[{"rules":[{"sourcePort":443.0,"outboundTag":"direct"}]}]=])
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"

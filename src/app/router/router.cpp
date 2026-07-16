@@ -394,14 +394,14 @@ struct CompoundRoutingRule {
         SortUniqueStrings(user_values);
     }
 
-    void SetPortCondition(const std::vector<std::string>& ports) {
+    void SetPortCondition(const std::vector<RoutingPortRange>& ports) {
         has_port_condition = true;
-        AssignPortRanges(port_ranges, ports);
+        port_ranges.assign(ports.begin(), ports.end());
     }
 
-    void SetSourcePortCondition(const std::vector<std::string>& ports) {
+    void SetSourcePortCondition(const std::vector<RoutingPortRange>& ports) {
         has_source_port_condition = true;
-        AssignPortRanges(source_port_ranges, ports);
+        source_port_ranges.assign(ports.begin(), ports.end());
     }
 
     [[nodiscard]] bool HasAnyCondition() const noexcept {
@@ -424,8 +424,8 @@ struct CompoundRoutingRule {
     StringVector protocol_values;
     StringVector inbound_tag_values;
     StringVector user_values;
-    memory::ThreadLocalVector<std::pair<uint16_t, uint16_t>> port_ranges;
-    memory::ThreadLocalVector<std::pair<uint16_t, uint16_t>> source_port_ranges;
+    memory::ThreadLocalVector<RoutingPortRange> port_ranges;
+    memory::ThreadLocalVector<RoutingPortRange> source_port_ranges;
 
     [[nodiscard]] bool Match(
         const session::Context& ctx,
@@ -489,30 +489,11 @@ private:
         return ContainsSortedString(user_values, ctx.inbound.user_email);
     }
 
-    static void AssignPortRanges(
-        memory::ThreadLocalVector<std::pair<uint16_t, uint16_t>>& ranges,
-        const std::vector<std::string>& ports) {
-        ranges.clear();
-        ranges.reserve(ports.size());
-        for (const auto& value : ports) {
-            auto dash = value.find('-');
-            if (dash != std::string::npos) {
-                ranges.push_back({
-                    static_cast<uint16_t>(std::stoi(value.substr(0, dash))),
-                    static_cast<uint16_t>(std::stoi(value.substr(dash + 1))),
-                });
-            } else {
-                auto port = static_cast<uint16_t>(std::stoi(value));
-                ranges.push_back({port, port});
-            }
-        }
-    }
-
     [[nodiscard]] static bool MatchPortRanges(
-        const memory::ThreadLocalVector<std::pair<uint16_t, uint16_t>>& ranges,
+        const memory::ThreadLocalVector<RoutingPortRange>& ranges,
         uint16_t port) noexcept {
-        for (const auto& [start, end] : ranges) {
-            if (port >= start && port <= end) return true;
+        for (const auto& range : ranges) {
+            if (port >= range.start && port <= range.end) return true;
         }
         return false;
     }

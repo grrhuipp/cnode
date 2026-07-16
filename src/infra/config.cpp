@@ -4,6 +4,7 @@
 #include "acppnode/infra/log.hpp"
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -100,6 +101,105 @@ void parse_http_headers(const json::object& j,
             }
         }
     }
+}
+
+std::string_view TrimRoutingPortToken(std::string_view value) noexcept {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+uint16_t ParseRoutingPortNumber(std::string_view value,
+                                std::string_view field) {
+    value = TrimRoutingPortToken(value);
+    uint32_t parsed = 0;
+    const auto [end, ec] = std::from_chars(
+        value.data(), value.data() + value.size(), parsed);
+    if (value.empty() || ec != std::errc{} ||
+        end != value.data() + value.size() || parsed == 0 ||
+        parsed > std::numeric_limits<uint16_t>::max()) {
+        throw std::invalid_argument(std::format(
+            "routing {} value '{}' must be an integer between 1 and 65535",
+            field, value));
+    }
+    return static_cast<uint16_t>(parsed);
+}
+
+RoutingPortRange ParseRoutingPortRange(std::string_view value,
+                                       std::string_view field) {
+    value = TrimRoutingPortToken(value);
+    const size_t dash = value.find('-');
+    if (dash == std::string_view::npos) {
+        const uint16_t port = ParseRoutingPortNumber(value, field);
+        return {.start = port, .end = port};
+    }
+    if (dash == 0 || dash + 1 == value.size() ||
+        value.find('-', dash + 1) != std::string_view::npos) {
+        throw std::invalid_argument(std::format(
+            "routing {} port range '{}' is invalid", field, value));
+    }
+
+    const uint16_t start = ParseRoutingPortNumber(value.substr(0, dash), field);
+    const uint16_t end = ParseRoutingPortNumber(value.substr(dash + 1), field);
+    if (start > end) {
+        throw std::invalid_argument(std::format(
+            "routing {} port range '{}' must be ascending", field, value));
+    }
+    return {.start = start, .end = end};
+}
+
+void AppendRoutingPortText(std::vector<RoutingPortRange>& out,
+                           std::string_view text,
+                           std::string_view field) {
+    size_t start = 0;
+    for (;;) {
+        const size_t comma = text.find(',', start);
+        const size_t end = comma == std::string_view::npos ? text.size() : comma;
+        out.push_back(ParseRoutingPortRange(text.substr(start, end - start), field));
+        if (comma == std::string_view::npos) {
+            return;
+        }
+        start = comma + 1;
+    }
+}
+
+void AppendRoutingPortValue(std::vector<RoutingPortRange>& out,
+                            const json::value& value,
+                            std::string_view field) {
+    if (value.is_string()) {
+        AppendRoutingPortText(out, value.as_string(), field);
+        return;
+    }
+    if (value.is_int64()) {
+        AppendRoutingPortText(out, std::to_string(value.as_int64()), field);
+        return;
+    }
+    if (value.is_uint64()) {
+        AppendRoutingPortText(out, std::to_string(value.as_uint64()), field);
+        return;
+    }
+    throw std::invalid_argument(std::format(
+        "routing {} must be a port, range, or array of ports and ranges", field));
+}
+
+void AppendRoutingPortField(const json::object& object,
+                            std::string_view key,
+                            std::vector<RoutingPortRange>& out) {
+    const auto* value = object.if_contains(key);
+    if (!value) {
+        return;
+    }
+    if (value->is_array()) {
+        for (const auto& item : value->as_array()) {
+            AppendRoutingPortValue(out, item, key);
+        }
+        return;
+    }
+    AppendRoutingPortValue(out, *value, key);
 }
 
 
@@ -298,10 +398,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     };
 
     // 端口（支持 Xray 格式: "53,443,1000-2000"）
-    {
-        auto vals = parse_str_or_array("port");
-        rule.port.insert(rule.port.end(), vals.begin(), vals.end());
-    }
+    AppendRoutingPortField(j, "port", rule.port);
 
     // 网络类型（支持 Xray 格式: "tcp,udp"）
     {
@@ -332,12 +429,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
 
     // 来源端口（Xray sourcePort 字段）
-    {
-        auto vals = parse_str_or_array("sourcePort");
-        rule.source_port.insert(rule.source_port.end(), vals.begin(), vals.end());
-        vals = parse_str_or_array("source_port");
-        rule.source_port.insert(rule.source_port.end(), vals.begin(), vals.end());
-    }
+    AppendRoutingPortField(j, "sourcePort", rule.source_port);
+    AppendRoutingPortField(j, "source_port", rule.source_port);
 
     // 嗅探协议（Xray protocol 字段）
     {

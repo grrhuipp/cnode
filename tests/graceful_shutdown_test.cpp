@@ -38,7 +38,13 @@ bool WriteConfig(const fs::path& root, unsigned short port) {
         << port
         << R"(,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}])"
         << '\n';
-    return static_cast<bool>(inbounds);
+    if (!inbounds) return false;
+
+    std::ofstream routing(root / "routing.json", std::ios::binary);
+    routing
+        << R"({"rules":[{"port":"80,443,1000-2000","sourcePort":[53,"1024-65535"],"outboundTag":"direct"}]})"
+        << '\n';
+    return static_cast<bool>(routing);
 }
 
 #ifdef _WIN32

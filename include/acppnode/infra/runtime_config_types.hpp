@@ -71,6 +71,11 @@ struct TimeoutsConfig {
 // ============================================================================
 // 路由规则配置
 // ============================================================================
+struct RoutingPortRange {
+    uint16_t start = 0;
+    uint16_t end = 0;
+};
+
 struct RouteRuleConfig {
     // 匹配条件（可多选）
     std::vector<std::string> domain;         // 域名匹配
@@ -81,12 +86,12 @@ struct RouteRuleConfig {
     std::vector<std::string> geosite;        // GeoSite tag (e.g., "cn", "category-ads")
     std::vector<std::string> ip;             // IP/CIDR
     std::vector<std::string> geoip;          // GeoIP tag (e.g., "cn", "private")
-    std::vector<std::string> port;           // 端口 (e.g., "80", "443", "1000-2000")
+    std::vector<RoutingPortRange> port;       // 归一化后的目标端口区间
     std::vector<std::string> network;        // 网络类型 (tcp/udp)
     std::vector<std::string> inbound_tag;    // 入站标签
     std::vector<std::string> user;           // 用户 email
     std::vector<std::string> source;         // 来源 IP/CIDR
-    std::vector<std::string> source_port;    // 来源端口
+    std::vector<RoutingPortRange> source_port; // 归一化后的来源端口区间
     std::vector<std::string> protocol;       // 嗅探协议 (http/tls/bittorrent)
 
     std::string outbound_tag;                // 目标出站
