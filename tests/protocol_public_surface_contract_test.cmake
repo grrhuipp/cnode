@@ -388,6 +388,12 @@ if(NOT UDP_WORKER_SOURCE MATCHES
     message(FATAL_ERROR
         "UDP session key collisions must not cross authenticated owners")
 endif()
+if(NOT UDP_HANDLER_HEADER_SOURCE MATCHES "ScopeSessionKey" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "decoded->session_owner[.]ScopeSessionKey[(]protocol_session_key[)]")
+    message(FATAL_ERROR
+        "UDP protocol session IDs must be scoped by authenticated owner identity")
+endif()
 if(UDP_HANDLER_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
    UDP_WORKER_SOURCE MATCHES "impl_->proxy->EncodeUdpResponse" OR
    NOT UDP_WORKER_SOURCE MATCHES "response_context->Encode[(]pkt[)]")

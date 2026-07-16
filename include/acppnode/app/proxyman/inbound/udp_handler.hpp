@@ -41,6 +41,24 @@ struct UdpSessionOwner {
             std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
     }
 
+    // Protocol session IDs are only unique inside one authenticated identity.
+    // Prefix the opaque protocol key with the credential identity so two users
+    // can never block or reuse each other's relay when their IDs collide.
+    [[nodiscard]] std::string ScopeSessionKey(
+        std::string_view protocol_session_key) const {
+        if (size == 0 || protocol_session_key.empty()) {
+            return {};
+        }
+        std::string scoped;
+        scoped.reserve(1 + size + protocol_session_key.size());
+        scoped.push_back(static_cast<char>(size));
+        scoped.append(
+            reinterpret_cast<const char*>(bytes.data()),
+            static_cast<size_t>(size));
+        scoped.append(protocol_session_key);
+        return scoped;
+    }
+
     std::array<uint8_t, kMaxBytes> bytes{};
     uint8_t size = 0;
 };
@@ -51,8 +69,9 @@ struct UdpDecodeResult {
     // Optional protocol-provided opaque session key. Empty means "use client endpoint".
     // UdpWorker does not inspect the value; it only uses it to group datagrams.
     std::string session_key;
-    // Authenticated credential identity. A session key collision must never
-    // transfer an existing relay, response cipher, or accounting context.
+    // Authenticated credential identity. UdpWorker scopes the protocol session
+    // key by this identity; a collision must never transfer or block a relay,
+    // response cipher, or accounting context owned by another credential.
     UdpSessionOwner session_owner;
     int64_t user_id = 0;
     std::string user_email;

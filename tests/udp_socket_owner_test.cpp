@@ -298,9 +298,17 @@ int main() {
     if (!owner_a.Assign(owner_a_bytes) || !owner_b.Assign(owner_b_bytes)) {
         Fail("failed to initialize UDP session owners");
     }
+    const std::string owner_a_session_key =
+        owner_a.ScopeSessionKey("shared-session-id");
+    const std::string owner_b_session_key =
+        owner_b.ScopeSessionKey("shared-session-id");
+    if (owner_a_session_key.empty() || owner_b_session_key.empty() ||
+        owner_a_session_key == owner_b_session_key) {
+        Fail("UDP protocol session key was not scoped by authenticated owner");
+    }
     const auto owner_session = worker.CreateClientSession(
         "owner-socket",
-        "shared-session-id",
+        owner_a_session_key,
         io_context,
         acpp::RoutedPacketCallback{
             [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
@@ -316,7 +324,7 @@ int main() {
     };
     if (worker.PushClientPayload(
             "owner-socket",
-            "shared-session-id",
+            owner_a_session_key,
             callback_source,
             reply_endpoint_b,
             owner_b,
@@ -326,13 +334,33 @@ int main() {
     }
     if (!worker.PushClientPayload(
             "owner-socket",
-            "shared-session-id",
+            owner_a_session_key,
             callback_source,
             reply_endpoint_b,
             owner_a,
             make_owner_payload(),
             std::chrono::steady_clock::now())) {
         Fail("UDP session rejected its authenticated owner");
+    }
+    const auto second_owner_session = worker.CreateClientSession(
+        "owner-socket",
+        owner_b_session_key,
+        io_context,
+        acpp::RoutedPacketCallback{
+            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        reply_endpoint_a,
+        owner_b,
+        std::chrono::steady_clock::now());
+    if (!second_owner_session || second_owner_session == owner_session ||
+        !worker.PushClientPayload(
+            "owner-socket",
+            owner_b_session_key,
+            callback_source,
+            reply_endpoint_b,
+            owner_b,
+            make_owner_payload(),
+            std::chrono::steady_clock::now())) {
+        Fail("UDP session ID collision blocked a different authenticated owner");
     }
     auto* attached = worker.AttachSocket("stable-socket", std::move(second));
     if (!attached || worker.FindSocket("stable-socket") != attached ||

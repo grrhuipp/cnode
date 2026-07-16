@@ -332,11 +332,20 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     auto client_key_log = [&]() {
         return iputil::FormatEndpointForLog(client_ip, datagram.client_endpoint.port());
     };
-    std::string client_session_key;
+    std::string protocol_session_key;
     if (!decoded->session_key.empty()) {
-        client_session_key = decoded->session_key;
+        protocol_session_key = decoded->session_key;
     } else {
-        client_session_key = client_key_log();
+        protocol_session_key = client_key_log();
+    }
+    std::string client_session_key =
+        decoded->session_owner.ScopeSessionKey(protocol_session_key);
+    if (client_session_key.empty()) {
+        LOG_ACCESS_DEBUG(
+            "Worker[{}]: UDP decode missing authenticated session owner for client={}",
+            datagram.worker_id,
+            client_key_log());
+        return;
     }
 
     const bool need_new_session = !HasClientSession(socket_key, client_session_key);
