@@ -1,13 +1,10 @@
 #include "acppnode/app/worker.hpp"
 
 #include <concepts>
-#include <string>
 #include <utility>
-#include <vector>
 
 static_assert(std::same_as<
-    decltype(std::declval<acpp::Worker&>().ShutdownListenersTask(
-        std::declval<std::vector<std::string>>())),
+    decltype(std::declval<acpp::Worker&>().ShutdownTask()),
     acpp::net::awaitable<void>>);
 
 int main() {

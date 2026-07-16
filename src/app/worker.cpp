@@ -68,6 +68,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         const PortBinding& binding,
         std::unique_ptr<proxyman::inbound::UdpHandler> handler);
     void StopUdpListening(Worker& worker, const std::string& tag);
+    void Shutdown(Worker& worker);
     void RetireInboundHandler(Worker& worker, const std::string& tag);
     void DrainRetiredHandlersIfIdle(Worker& worker);
 
@@ -257,12 +258,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     runtime_->InitRouter(*this, runtime_snapshot->routing, default_outbound_tag, geo_manager);
 }
 
-Worker::~Worker() {
-    while (!runtime_->listener_state->udp_workers.empty()) {
-        runtime_->listener_state->StopUdpListening(*this, runtime_->listener_state->udp_workers.begin()->first);
-    }
-    runtime_->udp_session_manager->StopAll();
-}
+Worker::~Worker() = default;
 
 net::io_context::executor_type Worker::GetExecutor() {
     return runtime_->io_context.get_executor();
@@ -524,6 +520,18 @@ void Worker::ListenerState::StopUdpListening(Worker& worker, const std::string& 
         udp_workers.erase(it);
     }
     (void)worker;
+}
+
+void Worker::ListenerState::Shutdown(Worker& worker) {
+    while (!tcp_listener_tags.empty()) {
+        StopListening(worker, tcp_listener_tags.begin()->second);
+    }
+    while (!udp_workers.empty()) {
+        StopUdpListening(worker, udp_workers.begin()->first);
+    }
+    while (!udp_socket_tags.empty()) {
+        StopUdpListening(worker, udp_socket_tags.begin()->second);
+    }
 }
 
 void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
@@ -800,15 +808,12 @@ net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
     co_return runtime_->listener_state->StartListening(*this, binding);
 }
 
-net::awaitable<void> Worker::ShutdownListenersTask(
-    std::vector<std::string> tags) {
-    for (const auto& tag : tags) {
-        runtime_->listener_state->StopListening(*this, tag);
-        runtime_->listener_state->StopUdpListening(*this, tag);
-    }
+net::awaitable<void> Worker::ShutdownTask() {
+    runtime_->listener_state->Shutdown(*this);
+    runtime_->udp_session_manager->StopAll();
 
-    // Yield once so accept/receive cancellation handlers queued above can run
-    // before the main thread stops this Worker io_context.
+    // Yield once so listener/session cancellation handlers queued above can
+    // run before the main thread stops this Worker io_context.
     co_await net::post(runtime_->io_context, net::use_awaitable);
 }
 

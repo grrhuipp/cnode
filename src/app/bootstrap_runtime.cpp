@@ -19,12 +19,8 @@ namespace acpp {
 
 namespace {
 
-net::awaitable<void> RemoveStartupInbounds(
-    Worker& worker,
-    std::vector<std::string> tags) {
-    for (auto it = tags.rbegin(); it != tags.rend(); ++it) {
-        co_await worker.UnregisterListenerTask(*it);
-    }
+net::awaitable<void> ShutdownStartupWorker(Worker& worker) {
+    co_await worker.ShutdownTask();
 }
 
 }  // namespace
@@ -61,7 +57,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
         for (const auto& worker : ctx.workers) {
             cleanup_results.push_back(net::co_spawn(
                 worker->GetExecutor(),
-                RemoveStartupInbounds(*worker, ctx.inbound_startup.tags),
+                ShutdownStartupWorker(*worker),
                 net::use_future));
         }
         for (auto& cleanup : cleanup_results) {

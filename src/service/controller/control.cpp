@@ -28,9 +28,6 @@ net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
             worker->UnregisterListenerTask(tag),
             net::use_awaitable);
     }
-    registered_tags_.erase(
-        std::remove(registered_tags_.begin(), registered_tags_.end(), tag),
-        registered_tags_.end());
     co_return;
 }
 
@@ -146,11 +143,6 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
             co_await removeInbound(inbound.tag);
             co_return false;
         }
-    }
-
-    if (std::find(registered_tags_.begin(), registered_tags_.end(), inbound.tag)
-            == registered_tags_.end()) {
-        registered_tags_.push_back(inbound.tag);
     }
 
     LOG_CONSOLE("inbound ready tag={} port={} protocol={} workers={} accept=SO_REUSEPORT",

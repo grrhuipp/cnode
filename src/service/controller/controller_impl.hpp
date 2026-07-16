@@ -27,9 +27,6 @@ struct Controller::Impl {
     void Stop();
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
-    [[nodiscard]] const std::vector<std::string>& RegisteredTags() const noexcept {
-        return registered_tags_;
-    }
 
     net::awaitable<void> runNodeInfoMonitors();
     net::awaitable<void> nodeInfoMonitor(api::API* panel);
@@ -92,7 +89,6 @@ struct Controller::Impl {
         uint64_t bytes_down   = 0;
     };
     std::map<std::string, NodeStats> node_stats_;
-    std::vector<std::string>         registered_tags_;
     bool running_ = false;
 };
 

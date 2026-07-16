@@ -12,24 +12,21 @@
 #include <csignal>
 #include <exception>
 #include <memory>
-#include <vector>
 
 namespace acpp {
 namespace {
 
-net::awaitable<void> ShutdownWorkers(
-    const RuntimeContext& ctx,
-    std::vector<std::string> tags) {
+net::awaitable<void> ShutdownWorkers(const RuntimeContext& ctx) {
     for (const auto& worker : ctx.workers) {
         try {
             co_await net::co_spawn(
                 worker->GetExecutor(),
-                worker->ShutdownListenersTask(tags),
+                worker->ShutdownTask(),
                 net::use_awaitable);
         } catch (const std::exception& e) {
-            LOG_ERROR("Worker[{}]: listener shutdown failed: {}", worker->Id(), e.what());
+            LOG_ERROR("Worker[{}]: shutdown failed: {}", worker->Id(), e.what());
         } catch (...) {
-            LOG_ERROR("Worker[{}]: listener shutdown failed with unknown exception", worker->Id());
+            LOG_ERROR("Worker[{}]: shutdown failed with unknown exception", worker->Id());
         }
     }
 
@@ -64,17 +61,9 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
 
         ctx.controller.Stop();
 
-        std::vector<std::string> tags;
-        for (const auto& tag : ctx.controller.RegisteredTags()) {
-            tags.push_back(tag);
-        }
-        for (const auto& tag : ctx.inbound_startup.tags) {
-            tags.push_back(tag);
-        }
-
         net::co_spawn(
             ctx.main_ctx.get_executor(),
-            ShutdownWorkers(ctx, std::move(tags)),
+            ShutdownWorkers(ctx),
             net::detached);
     });
 

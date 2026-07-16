@@ -54,10 +54,6 @@ std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
     return impl_->GetNodeStats();
 }
 
-const std::vector<std::string>& Controller::RegisteredTags() const {
-    return impl_->RegisteredTags();
-}
-
 Controller::Impl::Impl(net::io_context& io_context,
                        std::vector<std::unique_ptr<Worker>>& workers,
                        const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)

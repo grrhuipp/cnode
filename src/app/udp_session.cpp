@@ -652,9 +652,7 @@ UDPSessionManager::UDPSessionManager(net::io_context& io_context,
     : impl_(std::make_unique<Impl>(io_context, dns_service, session_timeout)) {
 }
 
-UDPSessionManager::~UDPSessionManager() {
-    StopAll();
-}
+UDPSessionManager::~UDPSessionManager() = default;
 
 UDPSession* UDPSessionManager::GetOrCreateSession(
     const std::string& session_id,

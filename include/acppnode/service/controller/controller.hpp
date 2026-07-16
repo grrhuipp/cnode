@@ -55,8 +55,6 @@ public:
     };
     [[nodiscard]] std::vector<NodeStatsInfo> GetNodeStats() const;
 
-    [[nodiscard]] const std::vector<std::string>& RegisteredTags() const;
-
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
