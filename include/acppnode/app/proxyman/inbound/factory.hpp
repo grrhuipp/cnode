@@ -97,7 +97,9 @@ struct ProxyRegistration {
         std::span<const RuntimeUser> users) = nullptr;
 };
 
-bool RegisterProxy(std::string_view protocol, ProxyRegistration registration);
+// Registration errors are programming errors during static initialization and
+// therefore fail fast instead of returning an ignorable status.
+void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 
 [[nodiscard]] bool HasProxy(std::string_view protocol);
 

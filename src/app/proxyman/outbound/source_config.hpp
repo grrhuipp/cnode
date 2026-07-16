@@ -24,7 +24,7 @@ struct OutboundSourceConfig {
 
 // Private cold-path API: protocols register source parsers here; public
 // proxyman outbound headers expose only prepared runtime handler construction.
-bool RegisterProxy(
+void RegisterProxy(
     std::string_view protocol,
     std::optional<PreparedOutboundConfig> (*)(
         const OutboundSourceConfig& config));

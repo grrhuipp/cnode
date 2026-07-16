@@ -5,6 +5,7 @@
 
 #include <map>
 #include <ranges>
+#include <stdexcept>
 
 namespace acpp::proxyman::inbound {
 
@@ -19,7 +20,7 @@ RegistrationMap& Registrations() noexcept {
 
 }  // namespace
 
-bool RegisterProxy(
+void RegisterProxy(
     std::string_view protocol,
     ProxyRegistration registration) {
     const bool has_user_builders = registration.build_static_users ||
@@ -27,10 +28,16 @@ bool RegisterProxy(
     if (protocol.empty() || !registration.create_runtime ||
         !registration.create_tcp_handler ||
         has_user_builders != registration.user_protocol.has_value()) {
-        return false;
+        throw std::invalid_argument(
+            "invalid inbound protocol registration for '" +
+            std::string(protocol) + "'");
     }
-    return Registrations().try_emplace(
-        std::string(protocol), std::move(registration)).second;
+    if (!Registrations().try_emplace(
+            std::string(protocol), std::move(registration)).second) {
+        throw std::logic_error(
+            "duplicate inbound protocol registration for '" +
+            std::string(protocol) + "'");
+    }
 }
 
 bool HasProxy(std::string_view protocol) {

@@ -4,6 +4,7 @@
 
 #include <map>
 #include <ranges>
+#include <stdexcept>
 
 namespace acpp::proxyman::outbound {
 
@@ -22,15 +23,20 @@ CreatorMap& Proxies() noexcept {
 
 }  // namespace
 
-bool RegisterProxy(
+void RegisterProxy(
     std::string_view protocol,
     std::optional<PreparedOutboundConfig> (*creator)(
         const OutboundSourceConfig& config)) {
     if (protocol.empty() || !creator) {
-        return false;
+        throw std::invalid_argument(
+            "invalid outbound protocol registration for '" +
+            std::string(protocol) + "'");
     }
-    return Proxies().try_emplace(
-        std::string(protocol), creator).second;
+    if (!Proxies().try_emplace(std::string(protocol), creator).second) {
+        throw std::logic_error(
+            "duplicate outbound protocol registration for '" +
+            std::string(protocol) + "'");
+    }
 }
 
 std::optional<PreparedOutboundConfig> PrepareOutboundConfig(

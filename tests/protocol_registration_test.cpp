@@ -5,8 +5,21 @@
 #include "source_config.hpp"
 
 #include <iostream>
+#include <stdexcept>
 
 namespace {
+
+template <typename Exception, typename Function>
+bool Throws(Function&& function) {
+    try {
+        function();
+    } catch (const Exception&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
+    return false;
+}
 
 class DummyRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
@@ -56,43 +69,53 @@ bool TestInboundRegistration() {
     valid.create_runtime = &CreateInboundRuntime;
     valid.create_tcp_handler = &CreateInboundHandler;
 
-    if (acpp::proxyman::inbound::RegisterProxy("", valid)) return false;
+    if (!Throws<std::invalid_argument>([&] {
+            acpp::proxyman::inbound::RegisterProxy("", valid);
+        })) {
+        return false;
+    }
 
     auto missing_runtime = valid;
     missing_runtime.create_runtime = nullptr;
-    if (acpp::proxyman::inbound::RegisterProxy(
-            "missing-runtime", missing_runtime)) {
+    if (!Throws<std::invalid_argument>([&] {
+            acpp::proxyman::inbound::RegisterProxy(
+                "missing-runtime", missing_runtime);
+        })) {
         return false;
     }
 
     auto missing_handler = valid;
     missing_handler.create_tcp_handler = nullptr;
-    if (acpp::proxyman::inbound::RegisterProxy(
-            "missing-handler", missing_handler)) {
+    if (!Throws<std::invalid_argument>([&] {
+            acpp::proxyman::inbound::RegisterProxy(
+                "missing-handler", missing_handler);
+        })) {
         return false;
     }
 
     auto missing_user_protocol = valid;
     missing_user_protocol.build_users = &BuildVmessUsers;
-    if (acpp::proxyman::inbound::RegisterProxy(
-            "missing-user-protocol", missing_user_protocol)) {
+    if (!Throws<std::invalid_argument>([&] {
+            acpp::proxyman::inbound::RegisterProxy(
+                "missing-user-protocol", missing_user_protocol);
+        })) {
         return false;
     }
 
     auto orphan_user_protocol = valid;
     orphan_user_protocol.user_protocol =
         acpp::proxyman::inbound::UserProtocol::Vmess;
-    if (acpp::proxyman::inbound::RegisterProxy(
-            "orphan-user-protocol", orphan_user_protocol)) {
+    if (!Throws<std::invalid_argument>([&] {
+            acpp::proxyman::inbound::RegisterProxy(
+                "orphan-user-protocol", orphan_user_protocol);
+        })) {
         return false;
     }
 
-    if (!acpp::proxyman::inbound::RegisterProxy(
-            "test-inbound", valid)) {
-        return false;
-    }
-    if (acpp::proxyman::inbound::RegisterProxy(
-            "test-inbound", valid)) {
+    acpp::proxyman::inbound::RegisterProxy("test-inbound", valid);
+    if (!Throws<std::logic_error>([&] {
+            acpp::proxyman::inbound::RegisterProxy("test-inbound", valid);
+        })) {
         return false;
     }
     if (!acpp::proxyman::inbound::HasProxy("test-inbound")) return false;
@@ -104,10 +127,7 @@ bool TestInboundRegistration() {
     typed_users.user_protocol =
         acpp::proxyman::inbound::UserProtocol::Vmess;
     typed_users.build_users = &BuildVmessUsers;
-    if (!acpp::proxyman::inbound::RegisterProxy(
-            "vmess-alias", typed_users)) {
-        return false;
-    }
+    acpp::proxyman::inbound::RegisterProxy("vmess-alias", typed_users);
     if (acpp::proxyman::inbound::RegisteredUserProtocol("vmess-alias") !=
         acpp::proxyman::inbound::UserProtocol::Vmess) {
         return false;
@@ -130,29 +150,31 @@ bool TestInboundRegistration() {
 
     auto mismatched_users = typed_users;
     mismatched_users.build_users = &BuildTrojanUsers;
-    if (!acpp::proxyman::inbound::RegisterProxy(
-            "mismatched-users", mismatched_users)) {
-        return false;
-    }
+    acpp::proxyman::inbound::RegisterProxy(
+        "mismatched-users", mismatched_users);
     return !acpp::proxyman::inbound::BuildUsers(
         "mismatched-users", request, {});
 }
 
 bool TestOutboundRegistration() {
-    if (acpp::proxyman::outbound::RegisterProxy(
-            "", &CreateOutboundConfig)) {
+    if (!Throws<std::invalid_argument>([] {
+            acpp::proxyman::outbound::RegisterProxy(
+                "", &CreateOutboundConfig);
+        })) {
         return false;
     }
-    if (acpp::proxyman::outbound::RegisterProxy(
-            "missing-creator", nullptr)) {
+    if (!Throws<std::invalid_argument>([] {
+            acpp::proxyman::outbound::RegisterProxy(
+                "missing-creator", nullptr);
+        })) {
         return false;
     }
-    if (!acpp::proxyman::outbound::RegisterProxy(
-            "test-outbound", &CreateOutboundConfig)) {
-        return false;
-    }
-    if (acpp::proxyman::outbound::RegisterProxy(
-            "test-outbound", &CreateOutboundConfig)) {
+    acpp::proxyman::outbound::RegisterProxy(
+        "test-outbound", &CreateOutboundConfig);
+    if (!Throws<std::logic_error>([] {
+            acpp::proxyman::outbound::RegisterProxy(
+                "test-outbound", &CreateOutboundConfig);
+        })) {
         return false;
     }
     return acpp::proxyman::outbound::HasProxy("test-outbound");
