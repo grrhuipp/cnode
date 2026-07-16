@@ -27,6 +27,7 @@ class Manager;
 namespace app {
 class SessionTrackingState;
 class MuxSessionHandler;
+class RequestLoadState;
 namespace dns {
 class DNS;
 }  // namespace dns
@@ -52,6 +53,7 @@ public:
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
     void BindDnsService(app::dns::DNS& dns_service) noexcept;
     void BindMuxSessionHandler(app::MuxSessionHandler& mux_session_handler) noexcept;
+    void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
@@ -61,8 +63,7 @@ public:
         InitialPayload first_packet,
         session::Context& ctx,
         StatsShard& stats,
-        const TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout = 0) override;
+        const TimeoutsConfig& timeouts) override;
 
     [[nodiscard]] routing::DispatchResult Route(
         session::Context& ctx,
@@ -105,6 +106,7 @@ private:
     app::SessionTrackingState* session_tracking_ = nullptr;
     app::dns::DNS* dns_service_ = nullptr;
     app::MuxSessionHandler* mux_session_handler_ = nullptr;
+    app::RequestLoadState* request_load_ = nullptr;
 };
 
 }  // namespace app::dispatcher

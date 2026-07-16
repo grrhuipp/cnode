@@ -20,6 +20,7 @@ struct WorkerRuntimeStatsSnapshot {
     WorkerMemoryStats memory;
     ::acpp::app::dns::DnsCacheStats dns_cache;
     StatsSnapshot stats;
+    // Effective Worker load: max(physical transports, active dispatches).
     uint32_t active_connections = 0;
 };
 

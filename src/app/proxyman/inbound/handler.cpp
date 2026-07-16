@@ -100,14 +100,12 @@ public:
                                routing::Dispatcher& dispatcher,
                                StatsShard& stats,
                                const TimeoutsConfig& timeouts,
-                               const session::Context& base_ctx,
-                               uint32_t pressure_idle_timeout)
+                               const session::Context& base_ctx)
         : handler_(std::move(handler))
         , io_context_(io_context)
         , dispatcher_(dispatcher)
         , stats_(stats)
-        , timeouts_(timeouts)
-        , pressure_idle_timeout_(pressure_idle_timeout) {
+        , timeouts_(timeouts) {
         CopyTransportBaseContext(base_ctx, base_ctx_);
         base_ctx_.conn_id = base_ctx.conn_id;
         base_ctx_.accept_time_us = base_ctx.accept_time_us;
@@ -129,8 +127,7 @@ public:
                     self->stats_,
                     self->timeouts_,
                     std::move(stream),
-                    ctx,
-                    self->pressure_idle_timeout_);
+                    ctx);
             },
             net::detached);
     }
@@ -141,7 +138,6 @@ private:
     routing::Dispatcher& dispatcher_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
-    uint32_t pressure_idle_timeout_ = 0;
     session::Context base_ctx_;
 };
 
@@ -157,8 +153,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> stream,
-    session::Context& ctx,
-    uint32_t pressure_idle_timeout) {
+    session::Context& ctx) {
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
@@ -220,8 +215,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             listener,
             io_context,
             ctx,
-            timeouts,
-            pressure_idle_timeout);
+            timeouts);
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: {}", e.what());
@@ -238,8 +232,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> raw_conn,
-    session::Context& ctx,
-    uint32_t pressure_idle_timeout) {
+    session::Context& ctx) {
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
@@ -286,8 +279,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             dispatcher,
             stats,
             timeouts,
-            ctx,
-            pressure_idle_timeout);
+            ctx);
     }
 
     std::string ws_real_ip;
@@ -355,8 +347,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             listener,
             io_context,
             ctx,
-            timeouts,
-            pressure_idle_timeout);
+            timeouts);
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: {}", e.what());

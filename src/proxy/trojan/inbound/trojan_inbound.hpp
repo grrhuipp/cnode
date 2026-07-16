@@ -27,8 +27,7 @@ public:
         const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
         ::acpp::net::io_context& io_context,
         ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+        const ::acpp::TimeoutsConfig& timeouts) override;
 
 private:
     ::acpp::trojan::Validator& validator_;

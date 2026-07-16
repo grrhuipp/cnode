@@ -142,8 +142,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
+    const TimeoutsConfig& timeouts) {
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
@@ -292,8 +291,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             InitialPayload{},
             ctx,
             *stats_,
-            timeouts,
-            pressure_idle_timeout);
+            timeouts);
     }
 
     co_return co_await dispatcher.Dispatch(
@@ -304,8 +302,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         std::move(session_result->initial_payload),
         ctx,
         *stats_,
-        timeouts,
-        pressure_idle_timeout);
+        timeouts);
 }
 
 std::optional<acpp::proxyman::inbound::UdpDecodeResult>

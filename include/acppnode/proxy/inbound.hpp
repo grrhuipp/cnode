@@ -51,8 +51,7 @@ public:
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) = 0;
+        const TimeoutsConfig& timeouts) = 0;
 };
 
 }  // namespace acpp

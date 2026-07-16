@@ -51,8 +51,7 @@ public:
         InitialPayload first_packet,
         session::Context& ctx,
         StatsShard& stats,
-        const TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout = 0) = 0;
+        const TimeoutsConfig& timeouts) = 0;
 
     [[nodiscard]] virtual DispatchResult Route(
         session::Context& ctx,

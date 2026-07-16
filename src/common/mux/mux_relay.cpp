@@ -764,7 +764,6 @@ net::awaitable<void> RunTcpSubDispatch(
     TcpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout,
     UDPRelayConfig config)
 {
     (void)config;
@@ -782,8 +781,7 @@ net::awaitable<void> RunTcpSubDispatch(
             InitialPayload{},
             sub->ctx,
             stats,
-            timeouts,
-            pressure_idle_timeout);
+            timeouts);
     } catch (...) {
         sub->Cancel();
     }
@@ -798,7 +796,6 @@ net::awaitable<void> RunUdpSubDispatch(
     UdpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout,
     UDPRelayConfig config)
 {
     (void)config;
@@ -816,8 +813,7 @@ net::awaitable<void> RunUdpSubDispatch(
             InitialPayload{},
             sub->ctx,
             stats,
-            timeouts,
-            pressure_idle_timeout);
+            timeouts);
     } catch (...) {
         sub->Cancel();
     }
@@ -1252,7 +1248,6 @@ net::awaitable<RelayResult> DoMuxRelay(
                             sub_ptr,
                             stats,
                             timeouts,
-                            pressure_idle_timeout,
                             config),
                         net::detached);
 
@@ -1325,7 +1320,6 @@ net::awaitable<RelayResult> DoMuxRelay(
                             sub_ptr,
                             stats,
                             timeouts,
-                            pressure_idle_timeout,
                             config),
                         net::detached);
                 }

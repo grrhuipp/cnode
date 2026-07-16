@@ -46,8 +46,7 @@ public:
         StatsShard& stats,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> raw_conn,
-        session::Context& ctx,
-        uint32_t pressure_idle_timeout = 0);
+        session::Context& ctx);
 
     net::awaitable<void> ProcessPreparedTransportStream(
         net::io_context& io_context,
@@ -55,8 +54,7 @@ public:
         StatsShard& stats,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> stream,
-        session::Context& ctx,
-        uint32_t pressure_idle_timeout = 0);
+        session::Context& ctx);
 
 private:
     inbound::ReceiverSettings receiver_;

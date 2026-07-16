@@ -396,8 +396,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
                         InitialPayload{},
                         *ctx,
                         *stats,
-                        timeouts,
-                        0);
+                        timeouts);
                     if (relay_result.error != ErrorCode::OK) {
                         auto& log_ctx = *ctx;
                         LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",

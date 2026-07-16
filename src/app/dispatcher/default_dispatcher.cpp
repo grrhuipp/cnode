@@ -4,6 +4,7 @@
 
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/mux_session_handler.hpp"
+#include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/ip_utils.hpp"
@@ -130,6 +131,11 @@ void DefaultDispatcher::BindMuxSessionHandler(
     mux_session_handler_ = &mux_session_handler;
 }
 
+void DefaultDispatcher::BindRequestLoadState(
+    app::RequestLoadState& request_load) noexcept {
+    request_load_ = &request_load;
+}
+
 std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
@@ -146,8 +152,11 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     InitialPayload first_packet,
     session::Context& ctx,
     StatsShard& stats,
-    const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
+    const TimeoutsConfig& timeouts) {
+    app::RequestLoadState::DispatchScope load_scope(request_load_);
+    const uint32_t pressure_idle_timeout = request_load_
+        ? request_load_->PressureIdleTimeout()
+        : 0;
     app::AccessLogSession access_log(ctx);
     if (ctx.content.network == Network::MUX) {
         // The Mux control connection contains framing bytes and would double

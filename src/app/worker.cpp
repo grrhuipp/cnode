@@ -15,6 +15,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/mux_session_handler.hpp"
+#include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
@@ -135,6 +136,8 @@ struct Worker::RuntimeState {
         , runtime_snapshot(std::make_shared<WorkerRuntimeConfig>(runtime_config))
         , stats(stats_ref)
         , geo_manager(geo_manager_ref)
+        , request_load(runtime_config.pressure_threshold,
+                       runtime_config.pressure_idle_timeout)
         , listener_state(std::make_unique<ListenerState>())
         , inbound_manager(std::make_unique<proxyman::inbound::Manager>(stats))
         , session_tracking(std::make_unique<app::SessionTrackingState>())
@@ -154,6 +157,9 @@ struct Worker::RuntimeState {
     }
 
     void StoreSnapshot(std::shared_ptr<const WorkerRuntimeConfig> snapshot) noexcept {
+        request_load.Configure(
+            snapshot->pressure_threshold,
+            snapshot->pressure_idle_timeout);
         runtime_snapshot.store(std::move(snapshot), std::memory_order_release);
     }
 
@@ -168,7 +174,7 @@ struct Worker::RuntimeState {
     std::atomic<std::shared_ptr<const WorkerRuntimeConfig>> runtime_snapshot;
     StatsShard& stats;
     geo::GeoManager* geo_manager = nullptr;
-    uint32_t active_connections = 0;
+    app::RequestLoadState request_load;
 
     std::unique_ptr<ListenerState> listener_state;
     std::unique_ptr<proxyman::inbound::Manager> inbound_manager;
@@ -246,6 +252,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
     runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
     runtime_->dispatcher->BindMuxSessionHandler(*runtime_->mux_session_handler);
+    runtime_->dispatcher->BindRequestLoadState(runtime_->request_load);
     runtime_->udp_session_manager->StartCleanup();
     const auto runtime_snapshot = runtime_->Snapshot();
     LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
@@ -713,8 +720,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
-        ++worker.runtime_->active_connections;
-
         net::co_spawn(worker.runtime_->io_context.get_executor(),
                       ProcessReceivedConnection(
                           worker, std::move(socket), remote_ep,
@@ -731,7 +736,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                                             worker.id_);
                               }
                           }
-                          --worker.runtime_->active_connections;
                       });
     }
 }
@@ -745,6 +749,8 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     tcp::socket socket,
     tcp::endpoint remote_ep,
     std::shared_ptr<proxyman::inbound::Handler> inbound_handler) {
+    app::RequestLoadState::PhysicalConnectionScope physical_scope(
+        worker.runtime_->request_load);
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: no inbound handler for accepted connection", worker.id_);
         socket.close();
@@ -773,10 +779,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         ctx.inbound.source_ip = "unknown";
     }
     const auto runtime_snapshot = worker.runtime_->Snapshot();
-    uint32_t pressure_idle_timeout = 0;
-    if (worker.runtime_->active_connections >= runtime_snapshot->pressure_threshold) {
-        pressure_idle_timeout = runtime_snapshot->pressure_idle_timeout;
-    }
     LOG_CONN_DEBUG(ctx, "Worker[{}]: accepted TCP tag={} from {}:{}",
                    worker.id_,
                    ctx.inbound.tag,
@@ -829,8 +831,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 
     co_await inbound_handler->ProcessAcceptedTCP(
         worker.runtime_->io_context, *worker.runtime_->dispatcher, worker.runtime_->stats, runtime_snapshot->timeouts,
-        std::move(tcp_stream), ctx,
-        pressure_idle_timeout);
+        std::move(tcp_stream), ctx);
 }
 
 // ============================================================================
@@ -1069,7 +1070,7 @@ Worker::CollectRuntimeStatsTask() const {
     snapshot.memory = GetMemoryStats();
     snapshot.dns_cache = runtime_->dns_service->GetCacheStats();
     snapshot.stats = runtime_->stats.Snapshot();
-    snapshot.active_connections = runtime_->active_connections;
+    snapshot.active_connections = runtime_->request_load.ActiveConnections();
     co_return snapshot;
 }
 

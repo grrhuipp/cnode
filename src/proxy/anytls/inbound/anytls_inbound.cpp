@@ -399,7 +399,6 @@ public:
                        const session::Context& base_ctx,
                        StatsShard& stats,
                        const TimeoutsConfig& timeouts,
-                       uint32_t pressure_idle_timeout,
                        std::string padding_scheme_raw,
                        std::string padding_scheme_md5)
         : stream_(std::move(stream))
@@ -408,7 +407,6 @@ public:
         , io_context_(io_context)
         , stats_(stats)
         , timeouts_(timeouts)
-        , pressure_idle_timeout_(pressure_idle_timeout)
         , padding_scheme_raw_(std::move(padding_scheme_raw))
         , padding_scheme_md5_(std::move(padding_scheme_md5))
         , write_signal_(io_context, 1) {
@@ -585,7 +583,6 @@ private:
     session::Context base_ctx_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
-    uint32_t pressure_idle_timeout_ = 0;
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
     net::experimental::channel<void(IoErrorCode)> write_signal_;
@@ -697,8 +694,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
             InitialPayload{},
             ctx,
             stats_,
-            timeouts_,
-            pressure_idle_timeout_);
+            timeouts_);
     } else {
         result = co_await dispatcher_.Dispatch(
             io_context_,
@@ -708,8 +704,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
             InitialPayload{},
             ctx,
             stats_,
-            timeouts_,
-            pressure_idle_timeout_);
+            timeouts_);
     }
     (void)result;
     RemoveStream(sub->Sid());
@@ -960,8 +955,7 @@ Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
+    const TimeoutsConfig& timeouts) {
     if (!stream) {
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -1033,7 +1027,6 @@ Handler::Process(
         ctx,
         *stats_,
         timeouts,
-        pressure_idle_timeout,
         padding_scheme_raw_,
         padding_scheme_md5_);
     co_return co_await demux->Run();
