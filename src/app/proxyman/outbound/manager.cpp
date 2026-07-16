@@ -81,15 +81,14 @@ void Manager::RemoveHandler(std::string_view tag) {
         return;
     }
 
-    if (impl_->default_handler == it->second.get()) {
-        impl_->default_handler = nullptr;
-    }
-
+    const bool removing_default = impl_->default_handler == it->second.get();
     impl_->retired_handlers.push_back(std::move(it->second));
     impl_->handlers.erase(it);
 
-    if (!impl_->default_handler && !impl_->handlers.empty()) {
-        impl_->default_handler = impl_->handlers.begin()->second.get();
+    if (removing_default) {
+        impl_->default_handler = impl_->handlers.empty()
+            ? nullptr
+            : impl_->handlers.begin()->second.get();
     }
 }
 

@@ -116,5 +116,18 @@ int main() {
     if (manager.GetHandler("direct") != second_raw ||
         manager.GetDefaultHandler() != second_raw) return 14;
 
+    auto fallback = std::make_unique<TestOutbound>("fallback", 3);
+    auto* fallback_raw = fallback.get();
+    if (manager.AddHandler(std::move(fallback)) != fallback_raw) return 15;
+    if (manager.GetDefaultHandler() != second_raw) return 16;
+
+    manager.RemoveHandler("direct");
+    if (manager.GetHandler("direct") != nullptr) return 17;
+    if (manager.GetHandler("fallback") != fallback_raw) return 18;
+    if (manager.GetDefaultHandler() != fallback_raw) return 19;
+
+    manager.DrainRetiredHandlers();
+    if (manager.GetDefaultHandler() != fallback_raw) return 20;
+
     return 0;
 }

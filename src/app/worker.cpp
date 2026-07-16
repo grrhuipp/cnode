@@ -145,7 +145,7 @@ struct Worker::RuntimeState {
         return runtime_snapshot.load(std::memory_order_acquire);
     }
 
-    void StoreSnapshot(std::shared_ptr<const WorkerRuntimeConfig> snapshot) {
+    void StoreSnapshot(std::shared_ptr<const WorkerRuntimeConfig> snapshot) noexcept {
         runtime_snapshot.store(std::move(snapshot), std::memory_order_release);
     }
 
@@ -864,29 +864,35 @@ void Worker::AddOutboundOnWorkerThread(
         *runtime_->dns_service, runtime_->udp_session_manager.get(),
         current_snapshot->timeouts.DialTimeout());
 
-    if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
-        throw std::logic_error(
-            "failed to install dynamic outbound '" + config.tag + "'");
-    }
-    LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
-              id_, config.protocol, config.tag);
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-
     auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == config.tag; });
     next_snapshot->outbounds.push_back(std::move(config));
     if (next_snapshot->default_outbound_tag.empty()) {
-        next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
-            ? std::string(constants::protocol::kDirect)
-            : next_snapshot->outbounds.front().tag;
+        next_snapshot->default_outbound_tag = next_snapshot->outbounds.front().tag;
     }
-    runtime_->InitRouter(
-        *this,
-        next_snapshot->routing,
-        next_snapshot->default_outbound_tag,
-        runtime_->geo_manager);
+
+    const bool update_router_default =
+        runtime_->router->DefaultOutbound() != next_snapshot->default_outbound_tag;
+    std::string next_router_default;
+    if (update_router_default) {
+        next_router_default = next_snapshot->default_outbound_tag;
+    }
+    const std::string_view installed_protocol = next_snapshot->outbounds.back().protocol;
+    const std::string_view installed_tag = next_snapshot->outbounds.back().tag;
+
+    if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
+        throw std::logic_error(
+            "failed to install dynamic outbound '" + std::string(installed_tag) + "'");
+    }
+    if (update_router_default) {
+        runtime_->router->SetDefaultOutbound(std::move(next_router_default));
+    }
     runtime_->StoreSnapshot(std::move(next_snapshot));
+
+    LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
+              id_, installed_protocol, installed_tag);
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 }
 
 net::awaitable<void> Worker::AddOutboundTask(
@@ -897,7 +903,6 @@ net::awaitable<void> Worker::AddOutboundTask(
 
 void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
     auto current_snapshot = runtime_->Snapshot();
-    runtime_->outbound_manager->RemoveHandler(tag);
     auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == tag; });
@@ -906,11 +911,18 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
             ? std::string(constants::protocol::kDirect)
             : next_snapshot->outbounds.front().tag;
     }
-    runtime_->InitRouter(
-        *this,
-        next_snapshot->routing,
-        next_snapshot->default_outbound_tag,
-        runtime_->geo_manager);
+
+    const bool update_router_default =
+        runtime_->router->DefaultOutbound() != next_snapshot->default_outbound_tag;
+    std::string next_router_default;
+    if (update_router_default) {
+        next_router_default = next_snapshot->default_outbound_tag;
+    }
+
+    runtime_->outbound_manager->RemoveHandler(tag);
+    if (update_router_default) {
+        runtime_->router->SetDefaultOutbound(std::move(next_router_default));
+    }
     runtime_->StoreSnapshot(std::move(next_snapshot));
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 }

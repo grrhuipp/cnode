@@ -15,6 +15,7 @@
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -856,6 +857,10 @@ void Router::Configure(
         }
         impl_->compound_rules.push_back(std::move(compound));
     }
+}
+
+void Router::SetDefaultOutbound(std::string default_outbound_tag) noexcept {
+    impl_->default_outbound_tag = std::move(default_outbound_tag);
 }
 
 std::string_view Router::DefaultOutbound() const {

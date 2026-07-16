@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace acpp::geo {
@@ -37,6 +38,9 @@ public:
         const RoutingConfig& routing,
         std::string_view default_outbound_tag,
         ::acpp::geo::GeoManager* geo_manager);
+
+    // Cold path: switch only the fallback outbound without rebuilding matchers.
+    void SetDefaultOutbound(std::string default_outbound_tag) noexcept;
 
     // Hot path: return the selected outbound tag, or the configured default tag.
     [[nodiscard]] std::string_view Route(const session::Context& ctx) const;
