@@ -91,6 +91,10 @@ if(NOT MUX_RELAY_SOURCE MATCHES
     message(FATAL_ERROR
         "Mux dispatch completion must remove the unified session entry")
 endif()
+if(MUX_RELAY_SOURCE MATCHES "packet_len > buf::Buffer::kSize")
+    message(FATAL_ERROR
+        "XUDP wire packet length must not be limited by one internal Buffer")
+endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR
         "Mux detached sub-dispatch lifetime must be owned by its coroutine frame")

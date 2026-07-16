@@ -869,6 +869,7 @@ if(CNODE_BUILD_TESTS)
     )
     target_include_directories(cnode_mux_codec_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common/mux
     )
     target_link_libraries(cnode_mux_codec_test PRIVATE
         asio::asio

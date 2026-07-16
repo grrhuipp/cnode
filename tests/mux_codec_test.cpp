@@ -1,7 +1,9 @@
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "xudp_packet_buffer.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -50,6 +52,28 @@ int main() {
     std::vector<uint8_t> maximum(kMaxPayload, 0x5a);
     std::vector<uint8_t> oversized(kMaxPayload + 1, 0x6b);
     memory::ByteVector encoded;
+
+    std::vector<uint8_t> large_xudp_packet(buf::Buffer::kSize + 257, 0x39);
+    std::vector<uint8_t> xudp_wire(large_xudp_packet.size() + 2);
+    xudp_wire[0] = static_cast<uint8_t>(large_xudp_packet.size() >> 8);
+    xudp_wire[1] = static_cast<uint8_t>(large_xudp_packet.size());
+    std::copy(
+        large_xudp_packet.begin(), large_xudp_packet.end(), xudp_wire.begin() + 2);
+    buf::MultiBuffer xudp_input;
+    Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input),
+          "failed to allocate large XUDP fixture");
+    mux::detail::XudpPacketBuffer xudp_decoder;
+    xudp_decoder.Append(std::move(xudp_input));
+    buf::MultiBuffer decoded_xudp_packet;
+    const auto xudp_result = xudp_decoder.Pop(decoded_xudp_packet);
+    std::vector<uint8_t> recovered_xudp_packet(large_xudp_packet.size());
+    const size_t recovered_xudp_bytes =
+        decoded_xudp_packet.CopyPrefixTo(recovered_xudp_packet);
+    Check(xudp_result == mux::detail::XudpPacketBuffer::PopResult::Packet &&
+              recovered_xudp_bytes == large_xudp_packet.size() &&
+              recovered_xudp_packet == large_xudp_packet &&
+              xudp_decoder.PendingBytes() == 0,
+          "XUDP packet larger than one Buffer was rejected or truncated");
 
     Check(mux::EncodeKeepDataTo(
               encoded, 7, maximum.data(), maximum.size()),

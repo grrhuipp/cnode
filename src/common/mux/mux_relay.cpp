@@ -1,6 +1,7 @@
 #include "acppnode/common/mux/mux_relay.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
+#include "xudp_packet_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -709,6 +710,7 @@ public:
         input_done_ = true;
         WakeInputReader();
         input_queue_.clear();
+        xudp_packets_.Clear();
         queued_bytes_ = 0;
         shrink_input_queue_on_drain_ = false;
     }
@@ -757,8 +759,7 @@ private:
     uint64_t parent_conn_id_ = 0;
     TargetAddress default_target_;
     bool xudp_packet_mode_ = false;
-    buf::MultiBuffer xudp_pending_;
-    size_t xudp_pending_bytes_ = 0;
+    detail::XudpPacketBuffer xudp_packets_;
     struct QueuedInput {
         QueuedInput(buf::MultiBuffer p, size_t n) noexcept
             : payload(std::move(p))
@@ -806,43 +807,25 @@ private:
     }
 
     void FeedXudpPackets(buf::MultiBuffer mb) {
-        const size_t bytes = buf::TotalLen(mb);
-        if (bytes == 0) {
+        if (!buf::HasData(mb)) {
             return;
         }
-        mb.MoveTo(xudp_pending_);
-        xudp_pending_bytes_ += bytes;
+        xudp_packets_.Append(std::move(mb));
 
-        while (xudp_pending_bytes_ >= 2) {
-            std::array<uint8_t, 2> len_bytes{};
-            if (xudp_pending_.CopyPrefixTo(len_bytes) != len_bytes.size()) {
-                return;
-            }
-            const size_t packet_len =
-                (static_cast<size_t>(len_bytes[0]) << 8) |
-                static_cast<size_t>(len_bytes[1]);
-            if (packet_len > buf::Buffer::kSize) {
-                xudp_pending_.clear();
-                xudp_pending_bytes_ = 0;
-                Cancel();
-                return;
-            }
-            if (xudp_pending_bytes_ < 2 + packet_len) {
-                return;
-            }
-
-            xudp_pending_.DropPrefixBytes(2);
-            xudp_pending_bytes_ -= 2;
+        while (!cancelled_) {
             buf::MultiBuffer payload;
-            if (!xudp_pending_.MovePrefixTo(payload, packet_len)) {
-                xudp_pending_.clear();
-                xudp_pending_bytes_ = 0;
+            const auto result = xudp_packets_.Pop(payload);
+            if (result == detail::XudpPacketBuffer::PopResult::NeedMore) {
+                return;
+            }
+            if (result == detail::XudpPacketBuffer::PopResult::Invalid) {
                 Cancel();
                 return;
             }
-            xudp_pending_bytes_ -= packet_len;
+            const size_t packet_len = buf::TotalLen(payload);
             QueueDecodedPayload(std::move(payload), packet_len);
         }
+        xudp_packets_.Clear();
     }
 };
 
