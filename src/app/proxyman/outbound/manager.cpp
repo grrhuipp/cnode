@@ -53,6 +53,27 @@ Outbound* Manager::AddHandler(std::unique_ptr<Outbound> handler) noexcept {
     return raw;
 }
 
+Outbound* Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) noexcept {
+    if (!handler) {
+        return nullptr;
+    }
+
+    std::string tag(handler->Tag());
+    auto it = impl_->handlers.find(tag);
+    if (it == impl_->handlers.end()) {
+        return AddHandler(std::move(handler));
+    }
+
+    Outbound* raw = handler.get();
+    const bool replacing_default = impl_->default_handler == it->second.get();
+    impl_->retired_handlers.push_back(std::move(it->second));
+    it->second = std::move(handler);
+    if (replacing_default) {
+        impl_->default_handler = raw;
+    }
+    return raw;
+}
+
 void Manager::RemoveHandler(std::string_view tag) noexcept {
     auto it = impl_->handlers.find(tag);
     if (it == impl_->handlers.end()) {

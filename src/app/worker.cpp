@@ -879,8 +879,6 @@ void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config)
     net::post(runtime_->io_context,
         [this, cfg = std::move(config)]() mutable {
             runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-            runtime_->outbound_manager->RemoveHandler(cfg.tag);
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
             auto current_snapshot = runtime_->Snapshot();
             auto handler = proxyman::outbound::NewHandler(
@@ -896,11 +894,12 @@ void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config)
 
             LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
                       id_, cfg.protocol, cfg.tag);
-            if (!runtime_->outbound_manager->AddHandler(std::move(handler))) {
-                LOG_WARN("Worker[{}]: failed to add dynamic outbound '{}'",
+            if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
+                LOG_WARN("Worker[{}]: failed to replace dynamic outbound '{}'",
                          id_, cfg.tag);
                 return;
             }
+            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
             auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
             std::erase_if(next_snapshot->outbounds,

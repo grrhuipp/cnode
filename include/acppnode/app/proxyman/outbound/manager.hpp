@@ -29,6 +29,7 @@ public:
     [[nodiscard]] Outbound* GetDefaultHandler() noexcept override;
 
     [[nodiscard]] Outbound* AddHandler(std::unique_ptr<Outbound> handler) noexcept;
+    [[nodiscard]] Outbound* ReplaceHandler(std::unique_ptr<Outbound> handler) noexcept;
     void RemoveHandler(std::string_view tag) noexcept;
     void Clear() noexcept;
     void DrainRetiredHandlers() noexcept;
