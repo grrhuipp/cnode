@@ -225,6 +225,12 @@ expect_rejected(non_integer_http2_initial_window "{}" "outbounds.json"
 expect_started(valid_zero_grpc_initial_window
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-grpc-zero-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_window_size":0}}}]]=])
+expect_rejected(non_integer_reality_max_time_diff "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":"60000"}}}]]=])
+expect_rejected(negative_reality_max_time_diff "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":-1}}}]]=])
+expect_rejected(conflicting_reality_max_time_diff "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":60000,"max_time_diff":30000}}}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"

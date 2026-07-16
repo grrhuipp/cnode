@@ -3,6 +3,7 @@
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
 #include "http2_initial_window.hpp"
+#include "json_unsigned.hpp"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -810,8 +811,12 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     if (cfg.max_client_ver.empty()) {
         cfg.max_client_ver = jstr(j, "max_client_ver", "");
     }
-    cfg.max_time_diff = static_cast<uint64_t>(
-        std::max<int64_t>(0, jint(j, "maxTimeDiff", jint(j, "max_time_diff", 0))));
+    auto max_time_diff = ParseAliasedJsonUint64(
+        j, {"maxTimeDiff", "max_time_diff"});
+    if (!max_time_diff) {
+        throw std::invalid_argument(std::move(max_time_diff.error()));
+    }
+    cfg.max_time_diff = max_time_diff->value_or(0);
     cfg.mldsa65_seed = jstr(j, "mldsa65Seed", "");
     if (cfg.mldsa65_seed.empty()) {
         cfg.mldsa65_seed = jstr(j, "mldsa65_seed", "");
