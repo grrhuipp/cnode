@@ -160,6 +160,45 @@ void TestMalformedChunkTerminatorRejected() {
           "malformed chunk error lost its cause");
 }
 
+void TestMalformedContentLengthRejected() {
+    auto trailing = ReadResponse({
+        "HTTP/1.1 200 OK\r\nContent-Length: 5junk\r\n\r\nhello",
+    });
+    Check(trailing.status == -1,
+          "Content-Length with trailing garbage was accepted");
+
+    auto negative = ReadResponse({
+        "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+    });
+    Check(negative.status == -1,
+          "negative Content-Length was accepted");
+
+    auto conflicting = ReadResponse({
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 4\r\n\r\nhello",
+    });
+    Check(conflicting.status == -1,
+          "conflicting Content-Length values were accepted");
+}
+
+void TestOversizedBodiesRejectedBeforeRead() {
+    auto fixed = ReadResponse({
+        "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
+    });
+    Check(fixed.status == -1, "oversized fixed body was accepted");
+    Check(fixed.body.find("body too large") != std::string::npos,
+          "oversized fixed body lost its cause");
+
+    auto chunked = ReadResponse({
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4000001\r\n",
+    });
+    Check(chunked.status == -1, "oversized chunked body was accepted");
+    Check(chunked.body.find("body too large") != std::string::npos,
+          "oversized chunked body lost its cause");
+}
+
 }  // namespace
 
 int main() {
@@ -167,6 +206,8 @@ int main() {
     TestFragmentedChunksExtensionsAndTrailers();
     TestContentLengthStillUsesPrefetchedBody();
     TestMalformedChunkTerminatorRejected();
+    TestMalformedContentLengthRejected();
+    TestOversizedBodiesRejectedBeforeRead();
     std::cout << "v2board_http_response_test: ok\n";
     return 0;
 }

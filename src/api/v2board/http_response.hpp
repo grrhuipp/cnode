@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <expected>
 #include <istream>
 #include <limits>
@@ -21,6 +22,8 @@
 #include <string_view>
 
 namespace acpp::api::v2board::http {
+
+inline constexpr size_t kMaxHttpBodySize = 64 * 1024 * 1024;
 
 struct Response {
     int status = 0;
@@ -76,9 +79,28 @@ inline std::optional<size_t> ParseChunkSize(std::string_view line) noexcept {
     return has_digit ? std::optional<size_t>{size} : std::nullopt;
 }
 
-inline void AppendStreambuf(net::streambuf& buffer, std::string& out) {
+inline bool AppendStreambuf(net::streambuf& buffer, std::string& out) {
+    if (out.size() > kMaxHttpBodySize ||
+        buffer.size() > kMaxHttpBodySize - out.size()) {
+        return false;
+    }
     std::istream is(&buffer);
     out.append(std::istreambuf_iterator<char>(is), std::istreambuf_iterator<char>());
+    return true;
+}
+
+inline std::optional<size_t> ParseContentLength(std::string_view value) noexcept {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    size_t length = 0;
+    const auto [end, ec] = std::from_chars(
+        value.data(), value.data() + value.size(), length);
+    if (ec != std::errc{} || end != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    return length;
 }
 
 inline std::optional<size_t> FindCrlf(const net::streambuf& buffer) {
@@ -164,7 +186,8 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
             }
         }
 
-        if (*chunk_size > decoded.max_size() - decoded.size() ||
+        if (decoded.size() > kMaxHttpBodySize ||
+            *chunk_size > kMaxHttpBodySize - decoded.size() ||
             *chunk_size > static_cast<size_t>(
                 std::numeric_limits<std::streamsize>::max())) {
             co_return std::unexpected("invalid chunked HTTP response: body too large");
@@ -254,15 +277,22 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
             }
             is_chunked = lowered.find("chunked") != std::string::npos;
         } else if (name == "content-length") {
-            try {
-                content_length = static_cast<size_t>(std::stoull(value));
-                has_content_length = true;
-            } catch (...) {
+            const auto parsed_length = ParseContentLength(value);
+            if (!parsed_length ||
+                (has_content_length && content_length != *parsed_length)) {
                 result.status = -1;
                 result.body = "invalid Content-Length";
                 co_return result;
             }
+            content_length = *parsed_length;
+            has_content_length = true;
         }
+    }
+
+    if (has_content_length && content_length > kMaxHttpBodySize) {
+        result.status = -1;
+        result.body = "HTTP body too large";
+        co_return result;
     }
 
     if (is_chunked) {
@@ -276,7 +306,11 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
         co_return result;
     }
 
-    AppendStreambuf(buffer, result.body);
+    if (!AppendStreambuf(buffer, result.body)) {
+        result.status = -1;
+        result.body = "HTTP body too large";
+        co_return result;
+    }
 
     if (has_content_length) {
         if (result.body.size() < content_length) {
@@ -285,7 +319,11 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                 buffer,
                 net::transfer_exactly(content_length - result.body.size()),
                 net::use_awaitable);
-            AppendStreambuf(buffer, result.body);
+            if (!AppendStreambuf(buffer, result.body)) {
+                result.status = -1;
+                result.body = "HTTP body too large";
+                co_return result;
+            }
         } else if (result.body.size() > content_length) {
             result.body.resize(content_length);
         }
@@ -295,7 +333,11 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                 buffer.prepare(8192), net::as_tuple(net::use_awaitable));
             if (bytes > 0) {
                 buffer.commit(bytes);
-                AppendStreambuf(buffer, result.body);
+                if (!AppendStreambuf(buffer, result.body)) {
+                    result.status = -1;
+                    result.body = "HTTP body too large";
+                    co_return result;
+                }
             }
             if (read_ec == io_error::eof) break;
             if (read_ec) {
