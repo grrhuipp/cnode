@@ -1059,9 +1059,10 @@ Handler::Process(
         }
     }
 
-    // The authenticated socket is a multiplexing control transport. Only its
-    // successfully completed logical TCP/UDP child streams are access events.
-    ctx.content.network = Network::MUX;
+    // The authenticated socket is only the AnyTLS control transport. Suppress
+    // its outer access event without changing protocol/session semantics. Each
+    // logical child gets a fresh Context and reports independently.
+    ctx.access_event_submitted = true;
 
     auto demux = std::make_shared<AnyTLSDemuxSession>(
         std::move(stream),
