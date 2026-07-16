@@ -298,13 +298,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             LOG_CONN_DEBUG(ctx, "[Session] Sniff: proto={} domain={}",
                            result.protocol, sniff_domain);
 
-            bool excluded = false;
-            for (const auto& ex : receiver.sniff_config.domains_excluded) {
-                if (sniff_domain == ex) {
-                    excluded = true;
-                    break;
-                }
-            }
+            const bool excluded =
+                receiver.sniff_config.IsDomainExcluded(sniff_domain);
 
             if (receiver.sniff_config.MatchesDestOverride(result.protocol) && !excluded) {
                 const uint16_t final_port = result.port > 0

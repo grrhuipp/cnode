@@ -663,6 +663,20 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_http_sniffer_test
         COMMAND cnode_http_sniffer_test)
 
+    add_executable(cnode_sniff_config_test
+        tests/sniff_config_test.cpp
+    )
+    target_include_directories(cnode_sniff_config_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(cnode_sniff_config_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_sniff_config_test
+        COMMAND cnode_sniff_config_test)
+
     add_executable(cnode_reality_client_version_test
         tests/reality_client_version_test.cpp
         src/transport/internet/reality_client_version.cpp
