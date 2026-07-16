@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -89,7 +90,7 @@ private:
 
     // 取得（或创建）当前 Worker 的 Full Cone UDP socket。仅由 Process 的
     // UDP 数据面调用；保留 manager 返回的精确容量/绑定错误。
-    std::expected<::acpp::UDPSession*, ErrorCode> AcquireUdpSession(
+    std::expected<std::shared_ptr<::acpp::UDPSession>, ErrorCode> AcquireUdpSession(
         session::Context& ctx);
 
     std::string tag_;

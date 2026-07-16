@@ -143,13 +143,13 @@ class ShadowsocksUdpOutboundEndpoint final
     , public transport::MultiBufferWriter {
 public:
     ShadowsocksUdpOutboundEndpoint(net::io_context& io_context,
-                                   UDPSession& session,
+                                   std::shared_ptr<UDPSession> session,
                                    TargetAddress server,
                                    const ss::SsCipherInfo& cipher_info,
                                    const ss::KeyBytes& master_key,
                                    std::span<const ss::KeyBytes> psk_chain)
         : io_context_(io_context)
-        , session_(session)
+        , session_(std::move(session))
         , server_(std::move(server))
         , cipher_info_(cipher_info)
         , master_key_(master_key)
@@ -166,7 +166,7 @@ public:
     }
 
     [[nodiscard]] bool Start() {
-        callback_id_ = session_.RegisterCallback(
+        callback_id_ = session_->RegisterCallback(
             PacketCallback{[this](UDPPacketView pkt) { OnPacket(pkt); }});
         return callback_id_ != 0;
     }
@@ -178,7 +178,7 @@ public:
     void Stop() noexcept {
         try {
             if (callback_id_ != 0) {
-                session_.UnregisterCallback(callback_id_);
+                session_->UnregisterCallback(callback_id_);
                 callback_id_ = 0;
             }
         } catch (...) {
@@ -248,7 +248,7 @@ public:
                     io_error::fault, "Shadowsocks UDP packet encoding failed");
             }
             encoded->Produce(static_cast<uint32_t>(written));
-            send_result = co_await session_.SendTo(
+            send_result = co_await session_->SendTo(
                 server_, encoded->Bytes().data(), encoded->Len(), callback_id_);
         } else {
             memory::ByteVector scratch(encoded_len);
@@ -258,7 +258,7 @@ public:
                 throw IoSystemError(
                     io_error::fault, "Shadowsocks UDP packet encoding failed");
             }
-            send_result = co_await session_.SendTo(
+            send_result = co_await session_->SendTo(
                 server_, scratch.data(), scratch.size(), callback_id_);
         }
         if (send_result != ErrorCode::OK) {
@@ -466,7 +466,7 @@ private:
     }
 
     net::io_context& io_context_;
-    UDPSession& session_;
+    std::shared_ptr<UDPSession> session_;
     TargetAddress server_;
     ss::SsCipherInfo cipher_info_;
     ss::KeyBytes master_key_;
@@ -580,11 +580,12 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 ErrorCodeToString(udp_session_result.error()));
             co_return std::unexpected(udp_session_result.error());
         }
-        auto* udp_session = *udp_session_result;
+        std::shared_ptr<UDPSession> udp_session =
+            std::move(*udp_session_result);
 
         ShadowsocksUdpOutboundEndpoint target_endpoint(
             io_context,
-            *udp_session,
+            std::move(udp_session),
             std::move(server),
             cipher_info_,
             master_key_,

@@ -52,12 +52,12 @@ public:
         buf::MultiBuffer payload,
         uint64_t callback_id);
 
-    // 注册 Full Cone 回调并取得 session 存活租约，返回 callback_id
-    // 用于后续释放；session 未运行、回调为空或容量耗尽时返回 0。
+    // 注册 Full Cone 回调，返回 callback_id 用于后续取消；
+    // session 未运行、回调为空或容量耗尽时返回 0。
     // 注意：Per-Worker 模式，无需 executor 参数，回调在同一线程执行
     uint64_t RegisterCallback(PacketCallback callback);
 
-    // 取消注册并释放 session 存活租约。释放后不得再使用该 session。
+    // 取消注册
     void UnregisterCallback(uint64_t callback_id);
 
     // 获取本地端口
@@ -71,7 +71,6 @@ private:
     void Touch();
     void Stop();
     [[nodiscard]] bool IsRunning() const noexcept;
-    [[nodiscard]] bool HasConsumers() const noexcept;
     [[nodiscard]] bool CanRetire(std::chrono::seconds timeout) const;
     [[nodiscard]] bool UsesBindAddress(
         const net::ip::address& bind_address) const;
@@ -90,8 +89,9 @@ public:
                                 std::chrono::seconds session_timeout = std::chrono::seconds(defaults::kUdpSessionTimeout));
     ~UDPSessionManager();
 
-    // 获取或创建会话；容量耗尽、ID/bind 冲突和绑定失败均返回精确错误。
-    std::expected<UDPSession*, ErrorCode> AcquireSession(
+    // 获取或创建 Worker-local owning handle；容量耗尽、ID/bind
+    // 冲突和绑定失败均返回精确错误。句柄不得跨 Worker 传递。
+    std::expected<std::shared_ptr<UDPSession>, ErrorCode> AcquireSession(
         const std::string& session_id,
         const net::ip::address& bind_address);
 

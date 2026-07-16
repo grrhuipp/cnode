@@ -760,14 +760,7 @@ bool UDPSession::IsRunning() const noexcept {
     return impl_->running && impl_->receive_started;
 }
 
-bool UDPSession::HasConsumers() const noexcept {
-    return !impl_->registered_callbacks.empty();
-}
-
 bool UDPSession::CanRetire(std::chrono::seconds timeout) const {
-    if (HasConsumers()) {
-        return false;
-    }
     return !IsRunning() ||
         std::chrono::steady_clock::now() - impl_->last_active > timeout;
 }
@@ -795,26 +788,15 @@ struct UDPSessionManager::Impl {
         , dns_service(dns_service)
         , session_timeout(session_timeout) {}
 
-    struct SessionDeleter {
-        void operator()(UDPSession* session) const noexcept;
-    };
-    using SessionPtr = std::unique_ptr<UDPSession, SessionDeleter>;
-
     net::io_context& io_context;
     ::acpp::app::dns::DNS& dns_service;
     std::chrono::seconds session_timeout;
-    memory::ThreadLocalUnorderedMap<std::string, SessionPtr> sessions;
+    memory::ThreadLocalUnorderedMap<
+        std::string,
+        std::shared_ptr<UDPSession>> sessions;
     TimeoutToken cleanup_token;
     bool running = false;
 };
-
-void UDPSessionManager::Impl::SessionDeleter::operator()(UDPSession* session) const noexcept {
-    if (!session) {
-        return;
-    }
-    std::destroy_at(session);
-    memory::ThreadLocalAllocator<UDPSession>{}.deallocate(session, 1);
-}
 
 UDPSessionManager::UDPSessionManager(net::io_context& io_context,
                                      ::acpp::app::dns::DNS& dns_service,
@@ -826,7 +808,8 @@ UDPSessionManager::~UDPSessionManager() {
     StopAll();
 }
 
-std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
+std::expected<std::shared_ptr<UDPSession>, ErrorCode>
+UDPSessionManager::AcquireSession(
     const std::string& session_id,
     const net::ip::address& bind_address) {
 
@@ -837,8 +820,8 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {
         if (!it->second->IsRunning()) {
-            if (it->second->HasConsumers()) {
-                LOG_CONN_FAIL("UDP session {} stopped while consumers are still attached",
+            if (it->second.use_count() != 1) {
+                LOG_CONN_FAIL("UDP session {} stopped while owning handles are still attached",
                               session_id);
                 return std::unexpected(ErrorCode::NETWORK_IO_ERROR);
             }
@@ -852,7 +835,7 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
                 return std::unexpected(ErrorCode::INVALID_ARGUMENT);
             }
             it->second->Touch();
-            return it->second.get();
+            return it->second;
         }
     }
     if (impl_->sessions.size() >= Impl::kMaxSessions) {
@@ -861,23 +844,16 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
     }
 
     // 创建新会话
-    memory::ThreadLocalAllocator<UDPSession> alloc;
-    UDPSession* raw_session = nullptr;
+    std::shared_ptr<UDPSession> session;
     try {
-        raw_session = alloc.allocate(1);
-        std::construct_at(raw_session, impl_->io_context, session_id, impl_->dns_service);
+        session = std::allocate_shared<UDPSession>(
+            memory::ThreadLocalAllocator<UDPSession>{},
+            impl_->io_context,
+            session_id,
+            impl_->dns_service);
     } catch (const std::bad_alloc&) {
-        if (raw_session) {
-            alloc.deallocate(raw_session, 1);
-        }
         return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (...) {
-        if (raw_session) {
-            alloc.deallocate(raw_session, 1);
-        }
-        throw;
     }
-    Impl::SessionPtr session(raw_session);
     auto err = session->Start(bind_address);
 
     if (err != ErrorCode::SUCCESS) {
@@ -885,27 +861,27 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
         return std::unexpected(err);
     }
 
-    UDPSession* session_ptr = nullptr;
+    std::shared_ptr<UDPSession> session_handle;
     try {
         auto [inserted_it, inserted] =
             impl_->sessions.try_emplace(session_id, std::move(session));
         if (!inserted) {
             return std::unexpected(ErrorCode::INTERNAL);
         }
-        session_ptr = inserted_it->second.get();
+        session_handle = inserted_it->second;
     } catch (const std::bad_alloc&) {
         return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
-    const auto receive_error = session_ptr->StartReceive();
+    const auto receive_error = session_handle->StartReceive();
     if (receive_error != ErrorCode::SUCCESS) {
         impl_->sessions.erase(session_id);
         return std::unexpected(receive_error);
     }
 
     LOG_ACCESS_DEBUG("Created UDP session {} on port {}, total sessions: {}",
-             session_id, session_ptr->LocalPort(), impl_->sessions.size());
+             session_id, session_handle->LocalPort(), impl_->sessions.size());
 
-    return session_ptr;
+    return session_handle;
 }
 
 void UDPSessionManager::StartCleanup() {
@@ -920,7 +896,8 @@ void UDPSessionManager::CleanupExpiredSessions() {
     if (!impl_->running) return;
     bool removed_session = false;
     for (auto it = impl_->sessions.begin(); it != impl_->sessions.end(); ) {
-        if (it->second->CanRetire(impl_->session_timeout)) {
+        if (it->second.use_count() == 1 &&
+            it->second->CanRetire(impl_->session_timeout)) {
             LOG_ACCESS_DEBUG("UDP session {} inactive or expired, removing", it->first);
             it->second->Stop();
             it = impl_->sessions.erase(it);

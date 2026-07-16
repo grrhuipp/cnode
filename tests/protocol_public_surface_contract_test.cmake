@@ -358,25 +358,41 @@ if(NOT UDP_SESSION_SOURCE MATCHES
    NOT UDP_SESSION_SOURCE MATCHES
         "[!]it->second->IsRunning[(][)]" OR
    NOT UDP_SESSION_SOURCE MATCHES
-        "const auto receive_error = session_ptr->StartReceive[(][)]")
+        "const auto receive_error = session_handle->StartReceive[(][)]")
     message(FATAL_ERROR
         "UDPSession must reject duplicate receive loops and replace dead sessions")
 endif()
 if(NOT UDP_SESSION_SOURCE MATCHES
-        "if [(]HasConsumers[(][)][)]" OR
+        "it->second[.]use_count[(][)] != 1" OR
    NOT UDP_SESSION_SOURCE MATCHES
-        "if [(]it->second->HasConsumers[(][)][)]" OR
+        "it->second[.]use_count[(][)] == 1" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "std::allocate_shared<UDPSession>" OR
    NOT UDP_SESSION_SOURCE MATCHES
         "it->second->CanRetire[(]impl_->session_timeout[)]" OR
    NOT UDP_SESSION_SOURCE MATCHES
         "return std::unexpected[(]ErrorCode::NETWORK_IO_ERROR[)]")
     message(FATAL_ERROR
-        "UDPSessionManager must not retire sessions while consumers hold callbacks")
+        "UDPSessionManager must retain sessions while Worker-local owning handles exist")
 endif()
 if(UDP_SESSION_HEADER_SOURCE MATCHES
         "const uint8_t[*] data,[\r\n ]+size_t len[\r\n ]*[)];")
     message(FATAL_ERROR
-        "UDPSession sends must carry a registered callback lease")
+        "UDPSession sends must carry a registered callback identity")
+endif()
+set(FREEDOM_OUTBOUND_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/freedom/freedom_outbound.cpp")
+file(READ "${FREEDOM_OUTBOUND_SOURCE_PATH}" FREEDOM_OUTBOUND_SOURCE)
+if(NOT FREEDOM_OUTBOUND_SOURCE MATCHES
+        "std::shared_ptr<UDPSession> session =" OR
+   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "std::shared_ptr<UDPSession> session_" OR
+   FREEDOM_OUTBOUND_SOURCE MATCHES
+        "UDPSession[*] session =" OR
+   SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "UDPSession& session_")
+    message(FATAL_ERROR
+        "UDP-capable outbounds must retain Worker-local owning session handles")
 endif()
 string(FIND "${UDP_SESSION_HEADER_SOURCE}" "private:" UDP_SESSION_PRIVATE_OFFSET)
 string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode Start(" UDP_SESSION_START_OFFSET)
@@ -423,9 +439,9 @@ if(NOT UDP_SESSION_SOURCE MATCHES
    NOT UDP_SESSION_SOURCE MATCHES
         "[!]it->second->UsesBindAddress[(]bind_address[)]" OR
    NOT UDP_SESSION_HEADER_SOURCE MATCHES
-        "std::expected<UDPSession[*], ErrorCode> AcquireSession" OR
+        "std::expected<std::shared_ptr<UDPSession>, ErrorCode> AcquireSession" OR
    UDP_SESSION_HEADER_SOURCE MATCHES
-        "GetOrCreateSession|GetSession[(]|RemoveSession[(]|SessionId[(]")
+        "GetOrCreateSession|GetSession[(]|RemoveSession[(]|SessionId[(]|expected<UDPSession[*]")
     message(FATAL_ERROR
         "UDPSessionManager acquisition must be bounded, bind-safe and expose exact errors")
 endif()

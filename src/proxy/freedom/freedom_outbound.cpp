@@ -233,7 +233,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         if (!settings_.enable_udp) {
             co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
         }
-        std::expected<UDPSession*, ErrorCode> session_result;
+        std::expected<std::shared_ptr<UDPSession>, ErrorCode> session_result;
         try {
             session_result = AcquireUdpSession(ctx);
         } catch (const std::exception& e) {
@@ -248,7 +248,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                               ctx.outbound.tag);
             co_return std::unexpected(session_result.error());
         }
-        UDPSession* session = *session_result;
+        std::shared_ptr<UDPSession> session = std::move(*session_result);
         UDPRelayConfig udp_cfg;
         udp_cfg.speed_limit = ctx.content.speed_limit;
         co_return co_await DoUDPRelayLink(
@@ -378,7 +378,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
 }
 
-std::expected<UDPSession*, ErrorCode>
+std::expected<std::shared_ptr<UDPSession>, ErrorCode>
 Handler::AcquireUdpSession(session::Context& ctx) {
     // Per-worker UDP session：同一 Worker 上同一出口 IP 共享一个 UDP socket。
     net::ip::address bind_addr_storage;
