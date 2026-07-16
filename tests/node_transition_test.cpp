@@ -24,7 +24,10 @@ bool HasMode(const NodeInfo* current,
         && plan.Transitioning() == (mode != NodeTransitionMode::Refresh)
         && plan.DestructiveSwap() == (mode == NodeTransitionMode::SwapSameEndpoint)
         && plan.RetireOldAfterCommit()
-            == (mode == NodeTransitionMode::StageNewEndpoint);
+            == (mode == NodeTransitionMode::StageNewEndpoint)
+        && plan.RestoreOldInboundOnRollback()
+            == (mode == NodeTransitionMode::ReplaceInPlace
+                || mode == NodeTransitionMode::SwapSameEndpoint);
 }
 
 }  // namespace
@@ -48,25 +51,41 @@ int main() {
     NodeInfo same_port_changed = current;
     same_port_changed.EnableTLS = true;
     if (!HasMode(&current, true, same_port_changed,
-                 NodeTransitionMode::SwapSameEndpoint)) {
+                 NodeTransitionMode::ReplaceInPlace)) {
         return 3;
+    }
+
+    NodeInfo same_port_new_protocol = current;
+    same_port_new_protocol.NodeType = "shadowsocks";
+    if (!HasMode(&current, true, same_port_new_protocol,
+                 NodeTransitionMode::SwapSameEndpoint)) {
+        return 4;
+    }
+
+    NodeInfo default_protocol = current;
+    default_protocol.NodeType.clear();
+    NodeInfo explicit_default = default_protocol;
+    explicit_default.NodeType = "vmess";
+    if (acpp::controller::NodeConfigChanged(
+            default_protocol, explicit_default)) {
+        return 5;
     }
 
     NodeInfo changed = current;
     changed.TransportProtocol = "ws";
-    if (!acpp::controller::NodeConfigChanged(current, changed)) return 4;
-    changed = current;
-    changed.Path = "/proxy";
-    if (!acpp::controller::NodeConfigChanged(current, changed)) return 5;
-    changed = current;
-    changed.NodeType = "shadowsocks";
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 6;
     changed = current;
-    changed.SniffEnabled = !current.SniffEnabled;
+    changed.Path = "/proxy";
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 7;
     changed = current;
-    changed.DestOverride = {"http"};
+    changed.NodeType = "shadowsocks";
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 8;
+    changed = current;
+    changed.SniffEnabled = !current.SniffEnabled;
+    if (!acpp::controller::NodeConfigChanged(current, changed)) return 9;
+    changed = current;
+    changed.DestOverride = {"http"};
+    if (!acpp::controller::NodeConfigChanged(current, changed)) return 10;
 
     return 0;
 }

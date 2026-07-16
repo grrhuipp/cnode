@@ -225,6 +225,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             }
 
             if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
+                || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
                 || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
                 LOG_CONSOLE("node config_changed panel={} node={} action=recreate",
                             panel_name, node_id);
@@ -316,7 +317,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                                 panel, *old_config, old_tag);
                         }
 
-                        if (destructive_swap && old_config && old_started) {
+                        if (transition.RestoreOldInboundOnRollback()
+                            && old_config && old_started) {
                             bool inbound_restored = false;
                             if (restored) {
                                 inbound_restored = co_await addInbound(panel, *old_config);

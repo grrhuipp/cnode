@@ -9,6 +9,7 @@ enum class NodeTransitionMode {
     Create,
     Recover,
     StageNewEndpoint,
+    ReplaceInPlace,
     SwapSameEndpoint,
 };
 
@@ -25,6 +26,11 @@ struct NodeTransitionPlan {
 
     [[nodiscard]] bool RetireOldAfterCommit() const noexcept {
         return mode == NodeTransitionMode::StageNewEndpoint;
+    }
+
+    [[nodiscard]] bool RestoreOldInboundOnRollback() const noexcept {
+        return mode == NodeTransitionMode::ReplaceInPlace
+            || mode == NodeTransitionMode::SwapSameEndpoint;
     }
 };
 

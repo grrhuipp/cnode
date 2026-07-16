@@ -1,11 +1,25 @@
 #include "node_transition.hpp"
 
+#include "acppnode/core/constants.hpp"
+
+#include <string_view>
+
 namespace acpp::controller {
+
+namespace {
+
+std::string_view EffectiveProtocol(const api::NodeInfo& node) noexcept {
+    return node.NodeType.empty()
+        ? std::string_view(constants::protocol::kDefaultNodeProtocol)
+        : std::string_view(node.NodeType);
+}
+
+}  // namespace
 
 bool NodeConfigChanged(const api::NodeInfo& current,
                        const api::NodeInfo& candidate) noexcept {
     return current.Port != candidate.Port
-        || current.NodeType != candidate.NodeType
+        || EffectiveProtocol(current) != EffectiveProtocol(candidate)
         || current.TransportProtocol != candidate.TransportProtocol
         || current.Path != candidate.Path
         || current.Host != candidate.Host
@@ -31,6 +45,9 @@ NodeTransitionPlan PlanNodeTransition(const api::NodeInfo* current,
     }
     if (current->Port != candidate.Port) {
         return {NodeTransitionMode::StageNewEndpoint};
+    }
+    if (EffectiveProtocol(*current) == EffectiveProtocol(candidate)) {
+        return {NodeTransitionMode::ReplaceInPlace};
     }
     return {NodeTransitionMode::SwapSameEndpoint};
 }
