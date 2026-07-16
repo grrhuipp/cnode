@@ -150,6 +150,18 @@ expect_rejected(overflow_ss_outbound_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":65536,"method":"aes-256-gcm","password":"secret"}}]]=])
 expect_rejected(invalid_anytls_preferred_port "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":"bad","port":443,"password":"secret"}}]]=])
+expect_rejected(non_integer_anytls_idle_check_interval "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":"30"}}]]=])
+expect_rejected(zero_anytls_idle_timeout "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":0}}]]=])
+expect_rejected(overflow_anytls_idle_timeout "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":18446744073709551615}}]]=])
+expect_rejected(negative_anytls_min_idle_sessions "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","minIdleSession":-1}}]]=])
+expect_rejected(non_integer_anytls_min_idle_sessions "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","minIdleSession":"1"}}]]=])
+expect_rejected(conflicting_anytls_idle_timeout_aliases "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":60,"idle_session_timeout":61}}]]=])
 expect_rejected(unsupported_inbound "{}" "inbounds.json"
     [=[[{"tag":"bad","protocol":"does-not-exist","port":12001,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
 expect_rejected(invalid_ss_inbound "{}" "inbounds.json"

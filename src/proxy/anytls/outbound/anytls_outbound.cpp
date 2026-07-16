@@ -1,4 +1,5 @@
 #include "acppnode/proxy/anytls/outbound/anytls_outbound.hpp"
+#include "anytls_outbound_settings.hpp"
 
 #include "../anytls_codec.hpp"
 #include "../../uot/uot.hpp"
@@ -12,7 +13,6 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
-#include "acppnode/infra/json_port.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -36,85 +36,6 @@ namespace {
 
 constexpr size_t kMaxLogicalQueuedPayloadBytes = acpp::anytls::kMaxFramePayload;
 constexpr size_t kLogicalQueueShrinkItems = 64;
-
-std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
-    const acpp::json::object& settings) {
-    acpp::proxy::anytls::outbound::Settings result;
-
-    auto read_string = [&](std::string_view key) -> std::string {
-        if (const auto* value = settings.if_contains(key); value && value->is_string()) {
-            return std::string(value->as_string());
-        }
-        return {};
-    };
-
-    if (const auto value = read_string("address"); !value.empty()) {
-        result.address = value;
-    }
-    if (result.address.empty()) {
-        result.address = read_string("server");
-    }
-    const auto port = acpp::ReadJsonPort(
-        settings, {"server_port", "port"});
-    if (port.Invalid()) {
-        return std::nullopt;
-    }
-    if (port.Valid()) {
-        result.port = port.value;
-    }
-    if (const auto value = read_string("password"); !value.empty()) {
-        result.password = value;
-    }
-    if (result.password.empty()) {
-        result.password = read_string("key");
-    }
-    auto read_seconds = [&](std::string_view key, std::chrono::seconds fallback) {
-        if (const auto* value = settings.if_contains(key); value) {
-            const auto raw = value->is_int64()
-                ? value->as_int64()
-                : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : 0);
-            if (raw > 0) {
-                return std::chrono::seconds(raw);
-            }
-        }
-        return fallback;
-    };
-    result.idle_session_check_interval =
-        read_seconds("idleSessionCheckInterval", result.idle_session_check_interval);
-    result.idle_session_check_interval =
-        read_seconds("idle_session_check_interval", result.idle_session_check_interval);
-    result.idle_session_timeout =
-        read_seconds("idleSessionTimeout", result.idle_session_timeout);
-    result.idle_session_timeout =
-        read_seconds("idle_session_timeout", result.idle_session_timeout);
-    if (const auto* value = settings.if_contains("minIdleSession"); value) {
-        const auto raw = value->is_int64()
-            ? value->as_int64()
-            : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : -1);
-        if (raw >= 0) {
-            result.min_idle_sessions = static_cast<size_t>(raw);
-        }
-    }
-    if (const auto* value = settings.if_contains("min_idle_session"); value) {
-        const auto raw = value->is_int64()
-            ? value->as_int64()
-            : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : -1);
-        if (raw >= 0) {
-            result.min_idle_sessions = static_cast<size_t>(raw);
-        }
-    }
-
-    acpp::IoErrorCode addr_ec;
-    auto literal_addr = acpp::net::ip::make_address(result.address, addr_ec);
-    if (!addr_ec) {
-        result.literal_address = literal_addr;
-    }
-
-    if (result.address.empty() || result.password.empty() || result.port == 0) {
-        return std::nullopt;
-    }
-    return result;
-}
 
 }  // namespace
 
@@ -1141,8 +1062,10 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kAnyTLS,
     [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundConfig> {
-        auto settings = ParseSettings(cfg.settings);
+        auto settings = acpp::proxy::anytls::outbound::ParseSettings(cfg.settings);
         if (!settings) {
+            LOG_ERROR("AnyTLS outbound '{}': invalid settings: {}",
+                      cfg.tag, settings.error());
             return std::nullopt;
         }
         settings->send_through = cfg.send_through.value_or(acpp::OutboundBind{});

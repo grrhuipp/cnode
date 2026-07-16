@@ -400,6 +400,7 @@ set(CNODE_SOURCES
     src/proxy/anytls/anytls_codec.cpp
     src/proxy/anytls/validator.cpp
     src/proxy/anytls/inbound/anytls_inbound.cpp
+    src/proxy/anytls/outbound/anytls_outbound_settings.cpp
     src/proxy/anytls/outbound/anytls_outbound.cpp
 
     # Proxy - Freedom
@@ -692,6 +693,32 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_v2board_user_list_json_test
         COMMAND cnode_v2board_user_list_json_test)
+
+    add_executable(cnode_anytls_outbound_settings_test
+        tests/anytls_outbound_settings_test.cpp
+        src/proxy/anytls/outbound/anytls_outbound_settings.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_anytls_outbound_settings_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound
+    )
+    target_link_libraries(cnode_anytls_outbound_settings_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_anytls_outbound_settings_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_anytls_outbound_settings_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_anytls_outbound_settings_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_anytls_outbound_settings_test
+        COMMAND cnode_anytls_outbound_settings_test)
 
     add_executable(cnode_inbound_tls_policy_test
         tests/inbound_tls_policy_test.cpp
