@@ -273,6 +273,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 inbound_started_[panel] = ok;
                 if (!ok) {
                     LOG_WARN("Node {}/{} bind failed, will retry", panel_name, node_id);
+                    throw std::runtime_error("inbound listener bind failed");
                 }
             }
 

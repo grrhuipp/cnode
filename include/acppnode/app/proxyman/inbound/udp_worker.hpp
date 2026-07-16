@@ -59,6 +59,8 @@ struct UdpDatagramContext {
 // ============================================================================
 class UdpWorker final {
 public:
+    using SocketPtr = std::unique_ptr<udp::socket>;
+
     class PendingUdpReply;
     class ClientSession;
     using ClientSessionPtr = std::shared_ptr<ClientSession>;
@@ -123,8 +125,12 @@ public:
     void CleanupClientSessions(const std::string& socket_key);
     void CleanupAllClientSessions();
 
-    [[nodiscard]] udp::socket* MakeSocket(net::io_context& io_context);
-    [[nodiscard]] udp::socket* AttachSocket(const std::string& socket_key, udp::socket* socket);
+    [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
+        return std::make_unique<udp::socket>(io_context);
+    }
+    [[nodiscard]] udp::socket* AttachSocket(
+        const std::string& socket_key,
+        SocketPtr socket);
     [[nodiscard]] udp::socket* FindSocket(const std::string& socket_key) noexcept;
     [[nodiscard]] const udp::socket* FindSocket(const std::string& socket_key) const noexcept;
     [[nodiscard]] std::vector<std::string> SocketKeys() const;

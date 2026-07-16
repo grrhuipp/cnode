@@ -86,18 +86,6 @@ using UdpClientSessionMap =
         std::string,
         UdpClientSession>;
 
-struct UdpSocketDeleter {
-    void operator()(udp::socket* socket) const noexcept {
-        if (!socket) {
-            return;
-        }
-        std::destroy_at(socket);
-        memory::ThreadLocalAllocator<udp::socket>{}.deallocate(socket, 1);
-    }
-};
-
-using UdpSocketPtr = std::unique_ptr<udp::socket, UdpSocketDeleter>;
-
 }  // namespace
 
 struct UdpWorker::ClientSession::Impl {
@@ -234,7 +222,7 @@ UdpWorker::ClientSession::WriteBuffers(std::span<const net::const_buffer>) {
 
 struct UdpWorker::Impl {
     using UdpSocketMap =
-        memory::ThreadLocalUnorderedMap<std::string, UdpSocketPtr>;
+        memory::ThreadLocalUnorderedMap<std::string, UdpWorker::SocketPtr>;
 
     Impl(std::string tag, std::unique_ptr<UdpHandler> proxy)
         : tag(std::move(tag))
@@ -243,7 +231,7 @@ struct UdpWorker::Impl {
     std::string tag;
     std::unique_ptr<UdpHandler> proxy;
     UdpSocketMap udp_sockets;
-    memory::ThreadLocalVector<UdpSocketPtr> retired_udp_sockets;
+    memory::ThreadLocalVector<UdpWorker::SocketPtr> retired_udp_sockets;
     memory::ThreadLocalUnorderedMap<std::string, UdpReplyQueueState> reply_queues;
     memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap> client_sessions;
 };
@@ -649,25 +637,14 @@ void UdpWorker::CleanupAllClientSessions() {
     }
 }
 
-udp::socket* UdpWorker::MakeSocket(net::io_context& io_context) {
-    memory::ThreadLocalAllocator<udp::socket> alloc;
-    udp::socket* raw = alloc.allocate(1);
-    try {
-        std::construct_at(raw, io_context);
-    } catch (...) {
-        alloc.deallocate(raw, 1);
-        throw;
-    }
-    return raw;
-}
-
-udp::socket* UdpWorker::AttachSocket(const std::string& socket_key, udp::socket* socket) {
+udp::socket* UdpWorker::AttachSocket(
+    const std::string& socket_key,
+    SocketPtr socket) {
     if (!socket) {
         return nullptr;
     }
-    UdpSocketPtr owned(socket);
-    auto* raw = owned.get();
-    impl_->udp_sockets[socket_key] = std::move(owned);
+    auto* raw = socket.get();
+    impl_->udp_sockets[socket_key] = std::move(socket);
     return raw;
 }
 

@@ -23,7 +23,10 @@ namespace acpp {
 
 net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
     for (const auto& worker : workers_) {
-        worker->UnregisterListenerAsync(tag);
+        co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->UnregisterListenerTask(tag),
+            net::use_awaitable);
     }
     registered_tags_.erase(
         std::remove(registered_tags_.begin(), registered_tags_.end(), tag),
@@ -103,22 +106,39 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
         if (!registered) {
             LOG_WARN("Node {}/{}: create inbound handler failed, protocol={}",
                      panel_name, node_id, inbound.protocol);
-            for (const auto& w : workers_) {
-                w->UnregisterListenerAsync(inbound.tag);
-            }
+            co_await removeInbound(inbound.tag);
             co_return false;
         }
     }
 
     for (const auto& worker : workers_) {
-        worker->AddListenerAsync(inbound.binding);
+        const bool tcp_bound = co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->AddListenerTask(inbound.binding),
+            net::use_awaitable);
+        if (!tcp_bound) {
+            LOG_WARN("Node {}/{}: TCP bind failed, tag={}",
+                     panel_name, node_id, inbound.tag);
+            co_await removeInbound(inbound.tag);
+            co_return false;
+        }
+
         auto* limiter = limiters_[worker->Id()].get();
-        worker->AddUdpListenerAsync(
-            inbound.binding,
-            inbound.protocol,
-            limiter,
-            inbound.handler_request,
-            ban_tracking_enabled);
+        const bool udp_bound = co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->AddUdpListenerTask(
+                inbound.binding,
+                inbound.protocol,
+                limiter,
+                inbound.handler_request,
+                ban_tracking_enabled),
+            net::use_awaitable);
+        if (!udp_bound) {
+            LOG_WARN("Node {}/{}: UDP bind failed, tag={}",
+                     panel_name, node_id, inbound.tag);
+            co_await removeInbound(inbound.tag);
+            co_return false;
+        }
     }
 
     if (std::find(registered_tags_.begin(), registered_tags_.end(), inbound.tag)

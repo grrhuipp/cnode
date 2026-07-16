@@ -61,9 +61,9 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<proxyman::inbound::UdpWorker>>
         udp_workers;
 
-    void StartListening(Worker& worker, const PortBinding& binding);
+    [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
     void StopListening(Worker& worker, const std::string& tag);
-    void StartUdpListening(
+    [[nodiscard]] bool StartUdpListening(
         Worker& worker,
         const PortBinding& binding,
         std::unique_ptr<proxyman::inbound::UdpHandler> handler);
@@ -313,13 +313,13 @@ void Worker::RuntimeState::InitRouter(
 // SO_REUSEPORT 监听管理（仅在 Worker io_context 上调用）
 // ============================================================================
 
-void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
+bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
 #ifdef _WIN32
     // Windows has no SO_REUSEPORT-equivalent listener distribution.  Keep the
     // accepted socket on its owning Worker instead of exporting Worker pointers
     // and native handles across io_context boundaries.
     if (worker.Id() != 0) {
-        return;
+        return true;
     }
 #endif
 
@@ -335,7 +335,7 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
                   worker.id_, binding.tag);
-        return;
+        return false;
     }
     auto& listener_slot = listener_slots[binding.tag];
     if (!listener_slot.tcp_worker) {
@@ -353,7 +353,7 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (ec) {
             LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
                       worker.id_, listen_addr, ec.message());
-            if (listen_candidates.size() == 1) return;
+            if (listen_candidates.size() == 1) return false;
             continue;
         }
 
@@ -387,14 +387,14 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         candidate_acceptor->open(ep.protocol(), ec);
         if (ec) {
             if (fail_candidate("open", ec.message())) continue;
-            return;
+            return false;
         }
 
         if (addr.is_v6()) {
             candidate_acceptor->set_option(net::ip::v6_only(true), ec);
             if (ec) {
                 if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
-                return;
+                return false;
             }
         }
 
@@ -406,20 +406,20 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
-            return;
+            return false;
         }
 #endif
 
         candidate_acceptor->bind(ep, ec);
         if (ec) {
             if (fail_candidate("bind", ec.message())) continue;
-            return;
+            return false;
         }
 
         candidate_acceptor->listen(net::socket_base::max_listen_connections, ec);
         if (ec) {
             if (fail_candidate("listen", ec.message())) continue;
-            return;
+            return false;
         }
 
         tcp::acceptor* acceptor = candidate_acceptor;
@@ -446,6 +446,7 @@ void Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         LOG_ERROR("Worker[{}]: no TCP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
     }
+    return bound_count != 0;
 }
 
 void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag) {
@@ -792,8 +793,12 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 void Worker::AddListenerAsync(const PortBinding& binding) {
     net::post(runtime_->io_context,
         [this, b = binding] {
-            runtime_->listener_state->StartListening(*this, b);
+            (void)runtime_->listener_state->StartListening(*this, b);
         });
+}
+
+net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
+    co_return runtime_->listener_state->StartListening(*this, binding);
 }
 
 void Worker::ShutdownListenersAsync(std::vector<std::string> tags,
@@ -963,15 +968,25 @@ void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
 void Worker::UnregisterListenerAsync(std::string tag) {
     net::post(runtime_->io_context,
         [this, t = std::move(tag)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->listener_state->StopListening(*this, t);
-            runtime_->listener_state->StopUdpListening(*this, t);
-            runtime_->listener_state->RetireInboundHandler(*this, t);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            RemoveInboundRuntimeFromSnapshot(*next_snapshot, t);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+            UnregisterListenerOnWorkerThread(t);
         });
+}
+
+void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
+    auto current_snapshot = runtime_->Snapshot();
+    const std::string owned_tag(tag);
+    runtime_->listener_state->StopListening(*this, owned_tag);
+    runtime_->listener_state->StopUdpListening(*this, owned_tag);
+    runtime_->listener_state->RetireInboundHandler(*this, owned_tag);
+    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    RemoveInboundRuntimeFromSnapshot(*next_snapshot, tag);
+    runtime_->StoreSnapshot(std::move(next_snapshot));
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+}
+
+net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
+    UnregisterListenerOnWorkerThread(tag);
+    co_return;
 }
 
 void Worker::EnableBanTrackingAsync(std::string tag) {
@@ -1078,11 +1093,27 @@ void Worker::AddUdpListenerAsync(const PortBinding& binding,
                 return;
             }
             handler->SetBanTrackingEnabled(ban_tracking_enabled);
-            runtime_->listener_state->StartUdpListening(*this, b, std::move(handler));
+            (void)runtime_->listener_state->StartUdpListening(
+                *this, b, std::move(handler));
         });
 }
 
-void Worker::ListenerState::StartUdpListening(
+net::awaitable<bool> Worker::AddUdpListenerTask(
+    PortBinding binding,
+    std::string protocol,
+    ConnectionLimiterPtr limiter,
+    proxyman::inbound::BuildRequest req,
+    bool ban_tracking_enabled) {
+    auto handler = runtime_->inbound_manager->NewUdpHandler(protocol, limiter, req);
+    if (!handler) {
+        co_return true;
+    }
+    handler->SetBanTrackingEnabled(ban_tracking_enabled);
+    co_return runtime_->listener_state->StartUdpListening(
+        *this, binding, std::move(handler));
+}
+
+bool Worker::ListenerState::StartUdpListening(
     Worker& worker,
     const PortBinding& binding,
     std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
@@ -1090,7 +1121,7 @@ void Worker::ListenerState::StartUdpListening(
     // TCP follows the same ownership rule above.  A UDP socket and its client
     // session table stay on the Worker that bound the socket.
     if (worker.Id() != 0) {
-        return;
+        return true;
     }
 #endif
 
@@ -1117,12 +1148,12 @@ void Worker::ListenerState::StartUdpListening(
         if (ec) {
             LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
                       worker.id_, listen_addr, ec.message());
-            if (listen_candidates.size() == 1) return;
+            if (listen_candidates.size() == 1) break;
             continue;
         }
         udp::endpoint ep(addr, binding.port);
         auto* current_udp_worker = udp_workers[binding.tag].get();
-        udp::socket* candidate_sock =
+        auto candidate_sock =
             current_udp_worker->MakeSocket(worker.runtime_->io_context);
 
         auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
@@ -1142,14 +1173,14 @@ void Worker::ListenerState::StartUdpListening(
         candidate_sock->open(ep.protocol(), ec);
         if (ec) {
             if (fail_candidate("open", ec.message())) continue;
-            return;
+            break;
         }
 
         if (addr.is_v6()) {
             candidate_sock->set_option(net::ip::v6_only(true), ec);
             if (ec) {
                 if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
-                return;
+                break;
             }
         }
 
@@ -1161,19 +1192,19 @@ void Worker::ListenerState::StartUdpListening(
         if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
-            return;
+            break;
         }
 #endif
 
         candidate_sock->bind(ep, ec);
         if (ec) {
             if (fail_candidate("bind", ec.message())) continue;
-            return;
+            break;
         }
 
         const std::string socket_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
         udp::socket* bound_sock =
-            current_udp_worker->AttachSocket(socket_key, candidate_sock);
+            current_udp_worker->AttachSocket(socket_key, std::move(candidate_sock));
         if (!bound_sock) {
             LOG_ERROR("Worker[{}]: failed to attach UDP socket tag={} key={}",
                       worker.id_, binding.tag, socket_key);
@@ -1198,6 +1229,7 @@ void Worker::ListenerState::StartUdpListening(
         LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
     }
+    return bound_count != 0;
 }
 
 // ============================================================================
