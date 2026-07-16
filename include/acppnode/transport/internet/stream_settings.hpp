@@ -148,13 +148,11 @@ struct RealityConfig {
     std::string min_client_ver;
     std::string max_client_ver;
     uint64_t max_time_diff = 0;
-    std::string mldsa65_seed;
 
     // 客户端字段
     std::string server_name;
     std::string public_key;
     std::string short_id;
-    std::string mldsa65_verify;
 
     // 调试/兼容字段
     std::string master_key_log;

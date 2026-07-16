@@ -815,9 +815,11 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(std::move(max_time_diff.error()));
     }
     cfg.max_time_diff = max_time_diff->value_or(0);
-    cfg.mldsa65_seed = jstr(j, "mldsa65Seed", "");
-    if (cfg.mldsa65_seed.empty()) {
-        cfg.mldsa65_seed = jstr(j, "mldsa65_seed", "");
+    if (j.contains("mldsa65Seed") || j.contains("mldsa65_seed") ||
+        j.contains("mldsa65Verify") || j.contains("mldsa65_verify")) {
+        throw std::invalid_argument(
+            "REALITY ML-DSA-65 certificate signing and verification are not "
+            "supported");
     }
     if (j.contains("fingerprint")) {
         throw std::invalid_argument(
@@ -843,10 +845,6 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "REALITY spiderX/spider_x is not supported; the REALITY crawler "
             "is not implemented");
-    }
-    cfg.mldsa65_verify = jstr(j, "mldsa65Verify", "");
-    if (cfg.mldsa65_verify.empty()) {
-        cfg.mldsa65_verify = jstr(j, "mldsa65_verify", "");
     }
     cfg.master_key_log = jstr(j, "masterKeyLog", "");
     if (cfg.master_key_log.empty()) {

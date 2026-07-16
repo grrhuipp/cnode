@@ -177,7 +177,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - AnyTLS 按 xray-core wire model 实现：TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写、`settings.users` 和 `settings.paddingScheme` 语义。
-- REALITY 当前只实现原生 TLS 1.3 认证握手，不实现未认证连接的 `dest` / `target` 回落、uTLS `fingerprint` 模拟或 `spiderX` 爬虫；配置这些字段或启用非零 `xver` 会在启动时明确拒绝。
+- REALITY 当前只实现原生 TLS 1.3 + Ed25519 认证握手，不实现未认证连接的 `dest` / `target` 回落、uTLS `fingerprint` 模拟、`spiderX` 爬虫或 ML-DSA-65 证书附加签名/验证；配置这些字段或启用非零 `xver` 会在启动时明确拒绝。
 
 ## 运行时状态
 
