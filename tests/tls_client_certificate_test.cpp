@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "autosign_cert.hpp"
+#include "tls_client_context.hpp"
 
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -57,6 +58,40 @@ bool Require(bool condition, const char* message) {
     return condition;
 }
 
+bool VerifyCertificate(X509* certificate, const X509_VERIFY_PARAM* parameters) {
+    X509_STORE* store = X509_STORE_new();
+    X509_STORE_CTX* store_context = X509_STORE_CTX_new();
+    if (!store || !store_context ||
+        X509_STORE_add_cert(store, certificate) != 1 ||
+        X509_STORE_CTX_init(store_context, store, certificate, nullptr) != 1 ||
+        X509_VERIFY_PARAM_set1(
+            X509_STORE_CTX_get0_param(store_context), parameters) != 1) {
+        if (store_context) X509_STORE_CTX_free(store_context);
+        if (store) X509_STORE_free(store);
+        return false;
+    }
+    const bool verified = X509_verify_cert(store_context) == 1;
+    X509_STORE_CTX_free(store_context);
+    X509_STORE_free(store);
+    return verified;
+}
+
+bool ReplaceCommonName(X509* certificate,
+                       EVP_PKEY* private_key,
+                       const char* common_name) {
+    X509_NAME* name = X509_NAME_new();
+    if (!name) return false;
+    const bool updated =
+        X509_NAME_add_entry_by_txt(
+            name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>(common_name),
+            -1, -1, 0) == 1 &&
+        X509_set_subject_name(certificate, name) == 1 &&
+        X509_set_issuer_name(certificate, name) == 1;
+    X509_NAME_free(name);
+    return updated && X509_sign(certificate, private_key, EVP_sha256()) > 0;
+}
+
 }  // namespace
 
 int main() {
@@ -88,6 +123,79 @@ int main() {
     if (!Require(SSL_CTX_check_private_key(context->Native()) == 1,
                  "client certificate and private key must match")) {
         return 5;
+    }
+
+    auto ip_material = certificates.GetOrCreate("192.0.2.1");
+    SSL* ip_client = SSL_new(context->Native());
+    if (!Require(ip_material.cert != nullptr && ip_material.key != nullptr &&
+                     ip_client != nullptr,
+                 "IP identity test material must be created")) {
+        if (ip_client) SSL_free(ip_client);
+        return 6;
+    }
+    if (!Require(ReplaceCommonName(
+                     ip_material.cert, ip_material.key, "unrelated.example"),
+                 "IP identity certificate common name must be replaced")) {
+        SSL_free(ip_client);
+        return 7;
+    }
+    if (!Require(acpp::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
+                 "IP server identity must be configured")) {
+        SSL_free(ip_client);
+        return 8;
+    }
+    if (!Require(SSL_get_servername(
+                     ip_client, TLSEXT_NAMETYPE_host_name) == nullptr,
+                 "IP server identity must not be sent as SNI")) {
+        SSL_free(ip_client);
+        return 9;
+    }
+    const bool ip_verified = VerifyCertificate(
+        ip_material.cert, SSL_get0_param(ip_client));
+    SSL_free(ip_client);
+    if (!Require(ip_verified,
+                 "IP SAN certificate must verify for its configured identity")) {
+        return 10;
+    }
+
+    SSL* wrong_ip_client = SSL_new(context->Native());
+    if (!Require(wrong_ip_client != nullptr &&
+                     acpp::ConfigureTlsServerIdentity(
+                         wrong_ip_client, "192.0.2.2"),
+                 "wrong IP identity must be configured for rejection test")) {
+        if (wrong_ip_client) SSL_free(wrong_ip_client);
+        return 11;
+    }
+    const bool wrong_ip_verified = VerifyCertificate(
+        ip_material.cert, SSL_get0_param(wrong_ip_client));
+    SSL_free(wrong_ip_client);
+    if (!Require(!wrong_ip_verified,
+                 "IP SAN certificate must reject a different IP identity")) {
+        return 12;
+    }
+
+    SSL* dns_client = SSL_new(context->Native());
+    if (!Require(dns_client != nullptr &&
+                     acpp::ConfigureTlsServerIdentity(
+                         dns_client, "client.example"),
+                 "DNS server identity must be configured")) {
+        if (dns_client) SSL_free(dns_client);
+        return 13;
+    }
+    const char* configured_sni = SSL_get_servername(
+        dns_client, TLSEXT_NAMETYPE_host_name);
+    const bool dns_verified = VerifyCertificate(
+        material.cert, SSL_get0_param(dns_client));
+    if (!Require(configured_sni != nullptr &&
+                     std::string_view(configured_sni) == "client.example",
+                 "DNS server identity must be sent as SNI")) {
+        SSL_free(dns_client);
+        return 14;
+    }
+    SSL_free(dns_client);
+    if (!Require(dns_verified,
+                 "DNS SAN certificate must verify for its configured identity")) {
+        return 15;
     }
     return 0;
 }

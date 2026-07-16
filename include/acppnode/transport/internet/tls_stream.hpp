@@ -6,6 +6,7 @@
 #include <openssl/ssl.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acpp {
@@ -77,8 +78,8 @@ public:
     TlsStream(TlsStream&& other) noexcept;
     TlsStream& operator=(TlsStream&& other) noexcept;
 
-    // 设置 SNI（客户端调用）
-    void SetServerName(const std::string& name);
+    // 设置客户端验证身份；DNS 名称同时作为 SNI，IP 地址只做 IP SAN 校验。
+    [[nodiscard]] bool SetServerIdentity(std::string_view identity);
 
     // 设置 ALPN（客户端调用）
     void SetAlpn(const std::vector<std::string>& protocols);

@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "tls_client_context.hpp"
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/common/buffer_util.hpp"
@@ -403,12 +404,9 @@ const TcpStream* TlsStream::BaseTcpStream() const {
     return impl_ ? &impl_->stream.next_layer().Tcp() : nullptr;
 }
 
-void TlsStream::SetServerName(const std::string& name) {
+bool TlsStream::SetServerIdentity(std::string_view identity) {
     SSL* ssl = NativeSsl();
-    if (!is_server_ && ssl) {
-        SSL_set_tlsext_host_name(ssl, name.c_str());
-        SSL_set1_host(ssl, name.c_str());
-    }
+    return !is_server_ && ConfigureTlsServerIdentity(ssl, identity);
 }
 
 void TlsStream::SetAlpn(const std::vector<std::string>& protocols) {
@@ -660,8 +658,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
 
     auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
 
-    if (!server_name.empty()) {
-        stream->SetServerName(server_name);
+    if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
+        co_return nullptr;
     }
     if (!alpn.empty()) {
         stream->SetAlpn(alpn);
@@ -683,8 +681,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
 
     auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
 
-    if (!server_name.empty()) {
-        stream->SetServerName(server_name);
+    if (!server_name.empty() && !stream->SetServerIdentity(server_name)) {
+        co_return nullptr;
     }
     if (!alpn.empty()) {
         stream->SetAlpn(alpn);

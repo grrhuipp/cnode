@@ -1,10 +1,40 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
 
+#include "tls_client_context.hpp"
+
+#include "acppnode/common/asio_types.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
+#include <string>
 
 namespace acpp {
+
+bool ConfigureTlsServerIdentity(
+    SSL* ssl, std::string_view identity) noexcept {
+    if (!ssl || identity.empty() || identity.find('\0') != std::string_view::npos) {
+        return false;
+    }
+
+    const std::string identity_text(identity);
+    IoErrorCode parse_error;
+    const auto address = net::ip::make_address(identity_text, parse_error);
+    if (!parse_error) {
+        (void)address;
+        X509_VERIFY_PARAM* parameters = SSL_get0_param(ssl);
+        return parameters &&
+            X509_VERIFY_PARAM_set1_ip_asc(
+                parameters, identity_text.c_str()) == 1;
+    }
+
+    if (SSL_set_tlsext_host_name(ssl, identity_text.c_str()) != 1) {
+        return false;
+    }
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+    return SSL_set1_host(ssl, identity_text.c_str()) == 1;
+}
 
 std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());

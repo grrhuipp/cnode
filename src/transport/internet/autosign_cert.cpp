@@ -64,8 +64,11 @@ AutoSignMaterial AutoSignState::GetOrCreate(const std::string& cn, Clock::time_p
     X509V3_CTX v3ctx;
     X509V3_set_ctx_nodb(&v3ctx);
     X509V3_set_ctx(&v3ctx, x509, x509, nullptr, nullptr, 0);
-    std::string san_val = "DNS:" + cn;
-    if (cn.size() > 2 && cn[0] == '*' && cn[1] == '.') {
+    ASN1_OCTET_STRING* ip_address = a2i_IPADDRESS(cn.c_str());
+    const bool is_ip_address = ip_address != nullptr;
+    if (ip_address) ASN1_OCTET_STRING_free(ip_address);
+    std::string san_val = (is_ip_address ? "IP:" : "DNS:") + cn;
+    if (!is_ip_address && cn.size() > 2 && cn[0] == '*' && cn[1] == '.') {
         san_val += ",DNS:" + cn.substr(2);
     }
     X509_EXTENSION* san_ext = X509V3_EXT_nconf_nid(
