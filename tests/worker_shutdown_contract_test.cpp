@@ -11,6 +11,9 @@ static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().ShutdownTask()),
     acpp::net::awaitable<void>>);
 static_assert(std::same_as<
+    decltype(std::declval<acpp::Worker&>().StartWorkerLocalServices()),
+    void>);
+static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().AddOutboundTask(
         std::declval<acpp::proxyman::outbound::PreparedOutboundConfig>())),
     acpp::net::awaitable<void>>);

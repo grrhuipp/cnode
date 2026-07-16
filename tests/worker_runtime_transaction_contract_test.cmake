@@ -3,6 +3,40 @@ if(NOT DEFINED SOURCE_DIR)
 endif()
 
 file(READ "${SOURCE_DIR}/src/app/worker.cpp" WORKER_SOURCE)
+file(READ "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp" BOOTSTRAP_RUNTIME_SOURCE)
+
+string(FIND "${WORKER_SOURCE}" "Worker::Worker(" WORKER_CTOR_BEGIN)
+string(FIND "${WORKER_SOURCE}" "Worker::~Worker" WORKER_CTOR_END)
+if(WORKER_CTOR_BEGIN EQUAL -1 OR WORKER_CTOR_END EQUAL -1 OR
+   NOT WORKER_CTOR_BEGIN LESS WORKER_CTOR_END)
+    message(FATAL_ERROR "could not isolate Worker constructor")
+endif()
+math(EXPR WORKER_CTOR_LENGTH "${WORKER_CTOR_END} - ${WORKER_CTOR_BEGIN}")
+string(SUBSTRING "${WORKER_SOURCE}"
+    ${WORKER_CTOR_BEGIN} ${WORKER_CTOR_LENGTH} WORKER_CTOR_SOURCE)
+if(WORKER_CTOR_SOURCE MATCHES "StartCleanup[(][)]" OR
+   NOT WORKER_SOURCE MATCHES
+       "Worker::StartWorkerLocalServices[(][)] \\{[\r\n ]+runtime_->udp_session_manager->StartCleanup[(][)]")
+    message(FATAL_ERROR
+        "Worker construction must not start Worker-local timers on the control thread")
+endif()
+
+string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
+    "TimeoutScheduler::ForIoContext(*ctx.io_contexts[i])" SCHEDULER_START_POS)
+string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
+    "ctx.workers[i]->StartWorkerLocalServices()" WORKER_SERVICES_POS)
+string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
+    "ctx.io_contexts[i]->run()" WORKER_RUN_POS)
+string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
+    "TimeoutScheduler::ReleaseForIoContext(*ctx.io_contexts[i])" SCHEDULER_RELEASE_POS)
+if(SCHEDULER_START_POS EQUAL -1 OR WORKER_SERVICES_POS EQUAL -1 OR
+   WORKER_RUN_POS EQUAL -1 OR SCHEDULER_RELEASE_POS EQUAL -1 OR
+   NOT SCHEDULER_START_POS LESS WORKER_SERVICES_POS OR
+   NOT WORKER_SERVICES_POS LESS WORKER_RUN_POS OR
+   NOT WORKER_RUN_POS LESS SCHEDULER_RELEASE_POS)
+    message(FATAL_ERROR
+        "Worker-local services must start and release inside the owning Worker thread")
+endif()
 
 if(WORKER_SOURCE MATCHES "RetireInboundHandler")
     message(FATAL_ERROR

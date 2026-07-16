@@ -254,10 +254,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
     runtime_->dispatcher->BindMuxSessionHandler(*runtime_->mux_session_handler);
     runtime_->dispatcher->BindRequestLoadState(runtime_->request_load);
-    runtime_->udp_session_manager->StartCleanup();
     const auto runtime_snapshot = runtime_->Snapshot();
-    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
-              id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
     runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
     runtime_->dispatcher->BindOutboundManager(*runtime_->outbound_manager);
     const std::string_view default_outbound_tag = runtime_snapshot->default_outbound_tag.empty()
@@ -270,6 +267,13 @@ Worker::~Worker() = default;
 
 net::io_context::executor_type Worker::GetExecutor() {
     return runtime_->io_context.get_executor();
+}
+
+void Worker::StartWorkerLocalServices() {
+    runtime_->udp_session_manager->StartCleanup();
+    const auto runtime_snapshot = runtime_->Snapshot();
+    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
+              id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
 }
 
 // ============================================================================

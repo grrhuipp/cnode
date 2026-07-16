@@ -34,6 +34,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
             [[maybe_unused]] memory::ThreadScope worker_thread_allocator_scope;
             memory::MarkThreadPoolThread();
             (void)TimeoutScheduler::ForIoContext(*ctx.io_contexts[i]);
+            ctx.workers[i]->StartWorkerLocalServices();
             ctx.io_contexts[i]->run();
             TimeoutScheduler::ReleaseForIoContext(*ctx.io_contexts[i]);
         });

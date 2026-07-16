@@ -62,6 +62,10 @@ public:
     [[nodiscard]] uint32_t Id() const noexcept { return id_; }
     [[nodiscard]] net::io_context::executor_type GetExecutor();
 
+    // Worker thread entrypoint only: starts Worker-local timers/services after
+    // this thread has installed the io_context-local scheduler cache.
+    void StartWorkerLocalServices();
+
     // ── 监听管理（线程安全，内部 net::post 到 Worker 线程）─────────────────
 
     // 动态控制面使用：必须在 Worker executor 上执行，并返回真实 bind 结果。
