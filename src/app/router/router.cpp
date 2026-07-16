@@ -29,26 +29,6 @@ void ToLowerInPlace(std::string& s) {
     std::ranges::transform(s, s.begin(), ToLowerAscii);
 }
 
-std::string LowerAsciiString(std::string_view value) {
-    std::string lower;
-    lower.reserve(value.size());
-    for (const auto ch : value) {
-        lower.push_back(ToLowerAscii(static_cast<unsigned char>(ch)));
-    }
-    return lower;
-}
-
-RoutingDomainStrategy ParseRoutingDomainStrategy(std::string_view value) {
-    const auto lower = LowerAsciiString(value);
-    if (lower == LowerAsciiString(constants::protocol::kIPIfNonMatch)) {
-        return RoutingDomainStrategy::IPIfNonMatch;
-    }
-    if (lower == LowerAsciiString(constants::protocol::kIPOnDemand)) {
-        return RoutingDomainStrategy::IPOnDemand;
-    }
-    return RoutingDomainStrategy::AsIs;
-}
-
 auto LowerBoundTrieChild(auto& children, char ch) {
     return std::lower_bound(
         children.begin(), children.end(), ch,
@@ -787,7 +767,7 @@ void Router::Configure(
     ::acpp::geo::GeoManager* geo_manager) {
     impl_->compound_rules.clear();
     impl_->default_outbound_tag = std::string(constants::protocol::kDirect);
-    impl_->domain_strategy = ParseRoutingDomainStrategy(routing.domain_strategy);
+    impl_->domain_strategy = routing.domain_strategy;
     impl_->geo_manager = geo_manager;
 
     if (!default_outbound_tag.empty()) {
@@ -882,7 +862,7 @@ std::string_view Router::DefaultOutbound() const {
     return impl_->default_outbound_tag;
 }
 
-RoutingDomainStrategy Router::DomainStrategy() const noexcept {
+::acpp::RoutingDomainStrategy Router::DomainStrategy() const noexcept {
     return impl_->domain_strategy;
 }
 

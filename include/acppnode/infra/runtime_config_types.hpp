@@ -1,7 +1,6 @@
 #pragma once
 
 #include "acppnode/common/defaults.hpp"
-#include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
 
 #include <array>
@@ -125,8 +124,14 @@ struct RouteRuleConfig {
     static RouteRuleConfig FromJson(const json::object& j);
 };
 
+enum class RoutingDomainStrategy : uint8_t {
+    AsIs,
+    IPIfNonMatch,
+    IPOnDemand,
+};
+
 struct RoutingConfig {
-    std::string domain_strategy = std::string(constants::protocol::kAsIs);
+    RoutingDomainStrategy domain_strategy = RoutingDomainStrategy::AsIs;
     std::vector<RouteRuleConfig> rules;
 
     static RoutingConfig FromJson(const json::object& j);

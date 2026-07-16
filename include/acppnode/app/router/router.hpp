@@ -10,18 +10,13 @@ class GeoManager;
 
 namespace acpp {
 struct RoutingConfig;
+enum class RoutingDomainStrategy : uint8_t;
 namespace session {
 struct Context;
 }  // namespace session
 }  // namespace acpp
 
 namespace acpp::app::router {
-
-enum class RoutingDomainStrategy : uint8_t {
-    AsIs,
-    IPIfNonMatch,
-    IPOnDemand,
-};
 
 struct RouteDecision {
     std::string_view outbound_tag;
@@ -54,7 +49,7 @@ public:
         std::string_view default_outbound_tag) const;
 
     [[nodiscard]] std::string_view DefaultOutbound() const;
-    [[nodiscard]] RoutingDomainStrategy DomainStrategy() const noexcept;
+    [[nodiscard]] ::acpp::RoutingDomainStrategy DomainStrategy() const noexcept;
 
 private:
     struct Impl;

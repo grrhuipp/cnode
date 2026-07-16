@@ -386,9 +386,15 @@ expect_rejected(conflicting_route_outbound_tag_aliases "{}" "routing.json"
 expect_rejected(conflicting_route_domain_strategy_aliases "{}" "routing.json"
     [=[{"domainStrategy":"AsIs","domain_strategy":"IPIfNonMatch","rules":[{"network":"tcp","outboundTag":"direct"}]}]=]
     "domainStrategy and domain_strategy must match")
+expect_rejected(unsupported_route_domain_strategy "{}" "routing.json"
+    [=[{"domainStrategy":"IPIfNonMacth","rules":[{"network":"tcp","outboundTag":"direct"}]}]=]
+    "routing domainStrategy contains unsupported value")
+expect_started(canonical_route_domain_strategy
+    [=[{"workers":1}]=] "routing.json"
+    [=[{"domainStrategy":"ipondemand","rules":[{"network":"tcp","outboundTag":"direct"}]}]=])
 expect_started(equal_normalized_route_aliases
     [=[{"workers":1}]=] "routing.json"
-    [=[{"domainStrategy":"AsIs","domain_strategy":"AsIs","rules":[{"inboundTag":"in-a,in-b","inbound_tag":["in-a","in-b"],"sourcePort":"80,443","source_port":[80,443],"outboundTag":"direct","outbound_tag":"direct"}]}]=])
+    [=[{"domainStrategy":"AsIs","domain_strategy":"asis","rules":[{"inboundTag":"in-a,in-b","inbound_tag":["in-a","in-b"],"sourcePort":"80,443","source_port":[80,443],"outboundTag":"direct","outbound_tag":"direct"}]}]=])
 expect_rejected(empty_route_domain_keyword "{}" "routing.json"
     [=[{"rules":[{"domain":["keyword:"],"outboundTag":"direct"}]}]=]
     "routing domain keyword must not be empty")

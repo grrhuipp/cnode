@@ -532,7 +532,7 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
     }
 
     const auto strategy = router_->DomainStrategy();
-    if (strategy == app::router::RoutingDomainStrategy::AsIs || !dns_service_) {
+    if (strategy == RoutingDomainStrategy::AsIs || !dns_service_) {
         co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
     }
 
@@ -558,7 +558,7 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
             return last;
         };
 
-    if (strategy == app::router::RoutingDomainStrategy::IPIfNonMatch) {
+    if (strategy == RoutingDomainStrategy::IPIfNonMatch) {
         auto initial = SelectRoute(ctx, receiver);
         if (initial.error != ErrorCode::OK || initial.fixed || initial.matched) {
             co_return FinishRoute(ctx, initial);

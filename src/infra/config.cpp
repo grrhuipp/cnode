@@ -118,6 +118,51 @@ namespace {
     return value;
 }
 
+[[nodiscard]] RoutingDomainStrategy RequireRoutingDomainStrategy(
+    std::string value) {
+    const std::string original = value;
+    value = RequireRoutingSelector(
+        std::move(value), "domainStrategy", true);
+    if (value == "asis") {
+        return RoutingDomainStrategy::AsIs;
+    }
+    if (value == "ipifnonmatch") {
+        return RoutingDomainStrategy::IPIfNonMatch;
+    }
+    if (value == "ipondemand") {
+        return RoutingDomainStrategy::IPOnDemand;
+    }
+    throw std::invalid_argument(std::format(
+        "routing domainStrategy contains unsupported value '{}'", original));
+}
+
+[[nodiscard]] RoutingDomainStrategy ParseRoutingDomainStrategy(
+    const json::object& object) {
+    std::optional<RoutingDomainStrategy> parsed;
+    std::string_view first_key;
+    for (const std::string_view key : {"domainStrategy", "domain_strategy"}) {
+        const auto* value = object.if_contains(key);
+        if (!value) {
+            continue;
+        }
+        if (!value->is_string()) {
+            throw std::invalid_argument(std::format(
+                "{} must be a string", key));
+        }
+        const auto candidate = RequireRoutingDomainStrategy(
+            std::string(value->as_string()));
+        if (parsed && *parsed != candidate) {
+            throw std::invalid_argument(std::format(
+                "{} and {} must match", first_key, key));
+        }
+        if (!parsed) {
+            parsed = candidate;
+            first_key = key;
+        }
+    }
+    return parsed.value_or(RoutingDomainStrategy::AsIs);
+}
+
 // 从 object 中取 string，不存在则返回默认值
 inline std::string jstr(
     const json::object& obj,
@@ -742,8 +787,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 // ============================================================================
 RoutingConfig RoutingConfig::FromJson(const json::object& j) {
     RoutingConfig cfg;
-    cfg.domain_strategy = jstr(
-        j, {"domainStrategy", "domain_strategy"}, cfg.domain_strategy);
+    cfg.domain_strategy = ParseRoutingDomainStrategy(j);
     if (j.contains("rules")) {
         for (const auto& rule : j.at("rules").as_array()) {
             cfg.rules.push_back(RouteRuleConfig::FromJson(rule.as_object()));
