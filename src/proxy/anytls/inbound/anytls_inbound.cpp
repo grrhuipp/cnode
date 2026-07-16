@@ -409,7 +409,8 @@ public:
         , timeouts_(timeouts)
         , padding_scheme_raw_(std::move(padding_scheme_raw))
         , padding_scheme_md5_(std::move(padding_scheme_md5))
-        , write_signal_(io_context, 1) {
+        , write_signal_(io_context, 1)
+        , dispatch_completion_(io_context) {
         CopySessionContext(base_ctx, base_ctx_);
     }
 
@@ -575,6 +576,14 @@ private:
         TargetAddress target,
         buf::MultiBuffer initial_uot_payload,
         std::optional<proxy::uot::Version> uot_version);
+    void SpawnDispatch(
+        std::shared_ptr<AnyTLSSubStream> sub,
+        TargetAddress target,
+        buf::MultiBuffer initial_uot_payload,
+        std::optional<proxy::uot::Version> uot_version);
+    void CompleteDispatch() noexcept;
+    net::awaitable<void> WaitForDispatches();
+    net::awaitable<RelayResult> FinishRun(RelayResult result);
 
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
@@ -586,12 +595,14 @@ private:
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
     net::experimental::channel<void(IoErrorCode)> write_signal_;
+    net::steady_timer dispatch_completion_;
     memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>
         streams_;
     memory::ThreadLocalUnorderedMap<uint32_t, StreamState> stream_states_;
     bool write_busy_ = false;
     bool cancelled_ = false;
     bool handshake_done_ = false;
+    size_t active_dispatches_ = 0;
 };
 
 net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
@@ -708,6 +719,88 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     }
     (void)result;
     RemoveStream(sub->Sid());
+}
+
+void AnyTLSDemuxSession::SpawnDispatch(
+    std::shared_ptr<AnyTLSSubStream> sub,
+    TargetAddress target,
+    buf::MultiBuffer initial_uot_payload,
+    std::optional<proxy::uot::Version> uot_version) {
+    if (!sub) {
+        return;
+    }
+
+    const uint32_t sid = sub->Sid();
+    ++active_dispatches_;
+    try {
+        auto self = shared_from_this();
+        net::co_spawn(
+            io_context_.get_executor(),
+            [self,
+             sub = std::move(sub),
+             target = std::move(target),
+             initial = std::move(initial_uot_payload),
+             uot_version,
+             sid]() mutable -> net::awaitable<void> {
+                auto completion = std::unique_ptr<void, void(*)(void*)>{
+                    self.get(),
+                    [](void* session) {
+                        static_cast<AnyTLSDemuxSession*>(session)->CompleteDispatch();
+                    }};
+                (void)completion;
+                try {
+                    co_await self->StartDispatch(
+                        std::move(sub),
+                        std::move(target),
+                        std::move(initial),
+                        uot_version);
+                } catch (const std::exception& e) {
+                    LOG_ACCESS_DEBUG(
+                        "[AnyTLS] child dispatch failed sid={} error={}",
+                        sid,
+                        e.what());
+                    self->RemoveStream(sid);
+                } catch (...) {
+                    LOG_ACCESS_DEBUG(
+                        "[AnyTLS] child dispatch failed sid={} error=unknown",
+                        sid);
+                    self->RemoveStream(sid);
+                }
+            },
+            net::detached);
+    } catch (...) {
+        RemoveStream(sid);
+        CompleteDispatch();
+    }
+}
+
+void AnyTLSDemuxSession::CompleteDispatch() noexcept {
+    if (active_dispatches_ == 0) {
+        return;
+    }
+    --active_dispatches_;
+    if (active_dispatches_ == 0) {
+        IoErrorCode ignored;
+        dispatch_completion_.cancel(ignored);
+    }
+}
+
+net::awaitable<void> AnyTLSDemuxSession::WaitForDispatches() {
+    while (active_dispatches_ != 0) {
+        dispatch_completion_.expires_at(net::steady_timer::time_point::max());
+        (void)co_await dispatch_completion_.async_wait(
+            net::as_tuple(net::use_awaitable));
+    }
+}
+
+net::awaitable<RelayResult>
+AnyTLSDemuxSession::FinishRun(RelayResult result) {
+    CancelAll();
+    co_await WaitForDispatches();
+    if (result.error == ErrorCode::CONNECTION_CLOSED) {
+        result.error = ErrorCode::OK;
+    }
+    co_return result;
 }
 
 net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
@@ -851,13 +944,11 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                 payload->clear();
                 if (!target) {
                     result.error = ErrorCode::PROTOCOL_INVALID_ADDRESS;
-                    CancelAll();
-                    co_return result;
+                    co_return co_await FinishRun(std::move(result));
                 }
                 if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid, {}); !ok) {
                     result.error = ok.error();
-                    CancelAll();
-                    co_return result;
+                    co_return co_await FinishRun(std::move(result));
                 }
                 if (const auto uot_version =
                         proxy::uot::VersionFromMagicAddress(*target)) {
@@ -866,39 +957,19 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                         break;
                     }
                     state_it->second = StreamState::Started;
-                    auto self = shared_from_this();
-                    net::co_spawn(
-                        io_context_.get_executor(),
-                        [self, sub]() mutable -> net::awaitable<void> {
-                            co_await self->StartDispatch(
-                                std::move(sub), {}, {}, proxy::uot::Version::V1);
-                        },
-                        net::detached);
+                    SpawnDispatch(
+                        std::move(sub), {}, {}, proxy::uot::Version::V1);
                     break;
                 }
                 state_it->second = StreamState::Started;
-                auto self = shared_from_this();
-                net::co_spawn(
-                    io_context_.get_executor(),
-                    [self, sub, target = std::move(*target)]() mutable -> net::awaitable<void> {
-                        co_await self->StartDispatch(
-                            std::move(sub), std::move(target), {}, std::nullopt);
-                    },
-                    net::detached);
+                SpawnDispatch(
+                    std::move(sub), std::move(*target), {}, std::nullopt);
                 break;
             }
             case StreamState::PendingUotRequest: {
                 state_it->second = StreamState::Started;
-                auto self = shared_from_this();
-                net::co_spawn(
-                    io_context_.get_executor(),
-                    [self,
-                     sub,
-                     initial = std::move(*payload)]() mutable -> net::awaitable<void> {
-                        co_await self->StartDispatch(
-                            std::move(sub), {}, std::move(initial), proxy::uot::Version::V2);
-                    },
-                    net::detached);
+                SpawnDispatch(
+                    std::move(sub), {}, std::move(*payload), proxy::uot::Version::V2);
                 break;
             }
             case StreamState::Started:
@@ -911,11 +982,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         }
     }
 
-    CancelAll();
-    if (result.error == ErrorCode::CONNECTION_CLOSED) {
-        result.error = ErrorCode::OK;
-    }
-    co_return result;
+    co_return co_await FinishRun(std::move(result));
 }
 
 net::awaitable<std::expected<void, ErrorCode>> ReadAuth(

@@ -32,3 +32,15 @@ if(INBOUND_MANAGER_SOURCE MATCHES "constants::protocol::")
     message(FATAL_ERROR
         "inbound Manager must not branch on concrete protocol tags")
 endif()
+
+set(ANYTLS_INBOUND
+    "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp")
+file(READ "${ANYTLS_INBOUND}" ANYTLS_INBOUND_SOURCE)
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES "co_await WaitForDispatches\\(\\)")
+    message(FATAL_ERROR
+        "AnyTLS demux must await every owned child dispatch before Run returns")
+endif()
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES "active_dispatches_")
+    message(FATAL_ERROR
+        "AnyTLS demux must own explicit child dispatch lifetime state")
+endif()
