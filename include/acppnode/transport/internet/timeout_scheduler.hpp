@@ -44,6 +44,8 @@ public:
     // 访问已销毁的 reactor。仅在对应 io_context 停止且线程已退出后调用。
     static void ReleaseForIoContext(net::io_context& io_context);
 
+    // Callback exceptions are isolated inside the scheduler: one failed
+    // timeout must not unwind the owning Worker io_context or skip its batch.
     [[nodiscard]] TimeoutToken ScheduleAfter(
         std::chrono::milliseconds delay,
         Callback cb);

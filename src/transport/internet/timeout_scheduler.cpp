@@ -132,7 +132,14 @@ struct TimeoutScheduler::Impl {
             }
             Callback cb = std::move(it->second.cb);
             events.erase(it);
-            if (cb) cb();
+            try {
+                if (cb) cb();
+            } catch (...) {
+                // Asio propagates handler exceptions out of io_context::run().
+                // Worker thread entrypoints intentionally have no catch-all;
+                // isolate each timeout so one owner cannot terminate a Worker
+                // or suppress later callbacks in the same ready batch.
+            }
             if (released) {
                 break;
             }
