@@ -5,10 +5,30 @@
 #include "acppnode/proxy/inbound.hpp"
 #include "source_config.hpp"
 
+#include <concepts>
 #include <iostream>
 #include <stdexcept>
 
+namespace acpp::app::dns {
+class DNS {};
+}  // namespace acpp::app::dns
+
 namespace {
+
+using OutboundCreator = acpp::proxyman::outbound::PreparedOutboundCreator;
+static_assert(std::invocable<
+    OutboundCreator&,
+    std::string_view,
+    acpp::net::io_context&,
+    acpp::app::dns::DNS&,
+    acpp::UDPSessionManager*,
+    std::chrono::seconds>);
+static_assert(!std::invocable<
+    OutboundCreator&,
+    acpp::net::io_context&,
+    acpp::app::dns::DNS&,
+    acpp::UDPSessionManager*,
+    std::chrono::seconds>);
 
 template <typename Exception, typename Function>
 bool Throws(Function&& function) {
@@ -47,6 +67,31 @@ public:
         const acpp::proxyman::inbound::UdpResponseContext&) const override {
         return {};
     }
+};
+
+class DummyOutbound final : public acpp::Outbound {
+public:
+    explicit DummyOutbound(std::string tag) : tag_(std::move(tag)) {}
+
+    std::string_view Tag() const noexcept override { return tag_; }
+
+    acpp::net::awaitable<acpp::OutboundProcessResult> Process(
+        acpp::net::io_context&,
+        const acpp::tcp::endpoint*,
+        acpp::session::Context&,
+        const acpp::TimeoutsConfig&,
+        acpp::transport::Link,
+        acpp::StatsShard&,
+        const acpp::RelayConfig&,
+        std::span<const uint8_t>,
+        acpp::buf::MultiBuffer&,
+        std::chrono::seconds,
+        std::chrono::seconds) override {
+        co_return acpp::RelayResult{};
+    }
+
+private:
+    std::string tag_;
 };
 
 std::unique_ptr<acpp::proxyman::inbound::ProtocolRuntime>
@@ -94,11 +139,25 @@ std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateOutboundConfig(
     const acpp::proxyman::outbound::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
-        [](acpp::net::io_context&,
+        [](std::string_view tag,
+           acpp::net::io_context&,
            acpp::app::dns::DNS&,
            acpp::UDPSessionManager*,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
-            return nullptr;
+            return std::make_unique<DummyOutbound>(std::string(tag));
+        }};
+}
+
+std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
+CreateMismatchedOutboundConfig(
+    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    return acpp::proxyman::outbound::PreparedOutboundCreator{
+        [](std::string_view,
+           acpp::net::io_context&,
+           acpp::app::dns::DNS&,
+           acpp::UDPSessionManager*,
+           std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+            return std::make_unique<DummyOutbound>("wrong-tag");
         }};
 }
 
@@ -272,6 +331,23 @@ bool TestOutboundRegistration() {
     auto prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || prepared->tag != source.tag ||
         prepared->protocol != source.protocol || !prepared->create) {
+        return false;
+    }
+    acpp::net::io_context io_context;
+    acpp::app::dns::DNS dns;
+    auto handler = acpp::proxyman::outbound::NewHandler(
+        *prepared, io_context, dns, nullptr, std::chrono::seconds(1));
+    if (!handler || handler->Tag() != source.tag) {
+        return false;
+    }
+
+    acpp::proxyman::outbound::RegisterProxy(
+        "mismatched-outbound", &CreateMismatchedOutboundConfig);
+    source.protocol = "mismatched-outbound";
+    prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
+    if (!prepared || acpp::proxyman::outbound::NewHandler(
+            *prepared, io_context, dns, nullptr,
+            std::chrono::seconds(1))) {
         return false;
     }
 

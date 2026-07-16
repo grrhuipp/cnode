@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace acpp {
 class Outbound;
@@ -18,6 +19,7 @@ class DNS;
 namespace acpp::proxyman::outbound {
 
 using PreparedOutboundCreator = std::function<std::unique_ptr<::acpp::Outbound>(
+    std::string_view tag,
     ::acpp::net::io_context& io_context,
     ::acpp::app::dns::DNS& dns,
     ::acpp::UDPSessionManager* udp_mgr,

@@ -1070,9 +1070,9 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
         settings->send_through = cfg.send_through.value_or(acpp::OutboundBind{});
         return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [tag = cfg.tag,
-             settings = std::move(*settings),
+            [settings = std::move(*settings),
              stream_settings = cfg.stream_settings](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* /*udp_mgr*/,
@@ -1087,7 +1087,7 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                         .alpn = {},
                     });
                 return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
-                    tag,
+                    std::string(tag),
                     settings,
                     runtime_stream_settings,
                     dial_timeout,

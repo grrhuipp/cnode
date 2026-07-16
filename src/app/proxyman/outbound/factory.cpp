@@ -67,8 +67,9 @@ std::unique_ptr<::acpp::Outbound> NewHandler(
     if (!config.create) {
         return nullptr;
     }
-    auto proxy = config.create(io_context, dns, udp_mgr, dial_timeout);
-    if (!proxy) {
+    auto proxy = config.create(
+        config.tag, io_context, dns, udp_mgr, dial_timeout);
+    if (!proxy || proxy->Tag() != config.tag) {
         return nullptr;
     }
     return proxy;

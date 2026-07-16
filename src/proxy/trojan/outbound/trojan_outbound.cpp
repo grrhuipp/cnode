@@ -389,9 +389,11 @@ private:
 // proxy/trojan/outbound.Handler 实现
 // ============================================================================
 
-proxy::trojan::outbound::Handler::Handler(const TrojanOutboundConfig& config,
+proxy::trojan::outbound::Handler::Handler(std::string tag,
+                                          const TrojanOutboundConfig& config,
                                           ::acpp::app::dns::DNS& dns_service)
-    : config_(config)
+    : tag_(std::move(tag))
+    , config_(config)
     , dns_service_(dns_service) {
     config_.literal_address = ParseLiteralAddress(config_.address);
     NormalizeOutboundStreamSettings(
@@ -644,7 +646,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::TrojanOutboundConfig trojan_config;
-        trojan_config.tag = cfg.tag;
 
         bool parsed_xray = false;
         if (const auto* servers_p = s.if_contains("servers");
@@ -681,6 +682,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [trojan_config = std::move(trojan_config)](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* /*udp_mgr*/,
@@ -688,7 +690,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = trojan_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
-                    runtime_config, dns);
+                    std::string(tag), runtime_config, dns);
             }};
     }), true);
 }  // namespace

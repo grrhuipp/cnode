@@ -33,7 +33,6 @@ enum class SsUotVersion : uint8_t {
 };
 
 struct SsOutboundConfig {
-    std::string            tag;
     std::string            address;
     std::optional<net::ip::address> literal_address;
     uint16_t               port    = 8388;
@@ -53,7 +52,8 @@ namespace proxy::shadowsocks::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(const ::acpp::SsOutboundConfig& config,
+    Handler(std::string tag,
+            const ::acpp::SsOutboundConfig& config,
             ::acpp::app::dns::DNS& dns_service,
             ::acpp::UDPSessionManager* udp_session_manager);
 
@@ -72,9 +72,10 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    [[nodiscard]] std::string_view Tag() const noexcept override { return config_.tag; }
+    [[nodiscard]] std::string_view Tag() const noexcept override { return tag_; }
 
 private:
+    std::string tag_;
     ::acpp::SsOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
     ::acpp::UDPSessionManager* udp_session_manager_ = nullptr;

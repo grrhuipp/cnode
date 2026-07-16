@@ -539,10 +539,10 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         }
         std::string session_id;
         session_id.reserve(
-            std::string_view("ssudp--").size() + config_.tag.size() +
+            std::string_view("ssudp--").size() + tag_.size() +
             static_cast<size_t>(conn_id_end - conn_id_buf));
         session_id.append("ssudp-");
-        session_id.append(config_.tag);
+        session_id.append(tag_);
         session_id.push_back('-');
         session_id.append(conn_id_buf, conn_id_end);
         auto* udp_session = udp_session_manager_->GetOrCreateSession(
@@ -698,10 +698,12 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     co_return co_await relay_endpoint(target_endpoint);
 }
 
-proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
+proxy::shadowsocks::outbound::Handler::Handler(std::string tag,
+                                               const SsOutboundConfig& config,
                                                ::acpp::app::dns::DNS& dns_service,
                                                ::acpp::UDPSessionManager* udp_session_manager)
-    : config_(config)
+    : tag_(std::move(tag))
+    , config_(config)
     , dns_service_(dns_service)
     , udp_session_manager_(udp_session_manager) {
     config_.literal_address = ParseLiteralAddress(config_.address);
@@ -728,7 +730,7 @@ proxy::shadowsocks::outbound::Handler::Handler(const SsOutboundConfig& config,
         if (!psk_chain_.empty()) {
             master_key_ = psk_chain_.back();
         } else {
-            LOG_WARN("[SsOutbound] invalid SS2022 password/key for '{}'", config_.tag);
+            LOG_WARN("[SsOutbound] invalid SS2022 password/key for '{}'", tag_);
         }
     } else {
         master_key_ = ss::DeriveKey(config_.password, cipher_info_.key_size);
@@ -794,7 +796,6 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::SsOutboundConfig ss_config;
-        ss_config.tag = cfg.tag;
 
         bool parsed_xray = false;
         if (const auto* servers_p = cfg.settings.if_contains("servers");
@@ -827,6 +828,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [ss_config = std::move(ss_config)](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
                 acpp::UDPSessionManager* udp_mgr,
@@ -834,7 +836,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = ss_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
-                    runtime_config, dns_service, udp_mgr);
+                    std::string(tag), runtime_config, dns_service, udp_mgr);
             }};
     }), true);
 }  // namespace

@@ -548,13 +548,14 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [tag = cfg.tag, settings = std::move(settings)](
+            [settings = std::move(settings)](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* udp_mgr,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
-                    tag, settings, dns, udp_mgr, timeout);
+                    std::string(tag), settings, dns, udp_mgr, timeout);
             }};
     }), true);
 }  // namespace

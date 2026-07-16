@@ -906,9 +906,11 @@ private:
 
 }  // namespace
 
-proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
+proxy::vless::outbound::Handler::Handler(std::string tag,
+                                          const VlessOutboundConfig& config,
                                           ::acpp::app::dns::DNS& dns_service)
-    : config_(config)
+    : tag_(std::move(tag))
+    , config_(config)
     , dns_service_(dns_service) {
     config_.literal_address = ParseLiteralAddress(config_.address);
     config_.flow = ::acpp::vless::NormalizeFlow(config_.flow);
@@ -929,7 +931,7 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
             } else {
                 encryption_ok = false;
                 LOG_ERROR("VLESS outbound '{}': invalid encryption '{}': {}",
-                          config_.tag,
+                          tag_,
                           config_.encryption,
                           ::acpp::vless::VlessEncryptionParseErrorMessage(
                               parsed.error));
@@ -940,10 +942,10 @@ proxy::vless::outbound::Handler::Handler(const VlessOutboundConfig& config,
     if (!config_valid_) {
         if (::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
             LOG_ERROR("VLESS outbound '{}': invalid UUID or unsupported flow '{}'",
-                      config_.tag, config_.flow);
+                      tag_, config_.flow);
         } else {
             LOG_ERROR("VLESS outbound '{}': invalid UUID, unsupported flow '{}', or invalid encryption",
-                      config_.tag, config_.flow);
+                      tag_, config_.flow);
         }
     }
 
@@ -1260,7 +1262,6 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::VlessOutboundConfig vless_config;
-        vless_config.tag = cfg.tag;
 
         const auto& s = cfg.settings;
         std::string packet_encoding;
@@ -1379,6 +1380,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [vless_config = std::move(vless_config)](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* /*udp_mgr*/,
@@ -1386,7 +1388,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = vless_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vless::outbound::Handler>(
-                    runtime_config, dns);
+                    std::string(tag), runtime_config, dns);
             }};
     }), true);
 }  // namespace

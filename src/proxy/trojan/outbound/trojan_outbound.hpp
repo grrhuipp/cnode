@@ -22,7 +22,6 @@ class DNS;
 // Trojan Outbound 配置
 // ============================================================================
 struct TrojanOutboundConfig {
-    std::string tag;                // 出站标识
     std::string address;            // 服务器地址
     std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
     uint16_t port = 443;            // 服务器端口
@@ -52,7 +51,8 @@ namespace proxy::trojan::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(const ::acpp::TrojanOutboundConfig& config,
+    Handler(std::string tag,
+            const ::acpp::TrojanOutboundConfig& config,
             ::acpp::app::dns::DNS& dns_service);
 
     ~Handler() override;
@@ -70,9 +70,10 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return config_.tag; }
+    std::string_view Tag() const noexcept override { return tag_; }
 
 private:
+    std::string tag_;
     ::acpp::TrojanOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
 };

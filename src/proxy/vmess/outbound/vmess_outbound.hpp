@@ -24,7 +24,6 @@ class DNS;
 // VMess Outbound 配置
 // ============================================================================
 struct VMessOutboundConfig {
-    std::string tag;
     std::string address;           // 服务器地址
     std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
     uint16_t port = 443;           // 服务器端口
@@ -46,7 +45,8 @@ namespace proxy::vmess::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(const ::acpp::VMessOutboundConfig& config,
+    Handler(std::string tag,
+            const ::acpp::VMessOutboundConfig& config,
             ::acpp::app::dns::DNS& dns_service);
 
     // Outbound 接口
@@ -62,9 +62,10 @@ public:
         ::acpp::buf::MultiBuffer& first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
-    std::string_view Tag() const noexcept override { return config_.tag; }
+    std::string_view Tag() const noexcept override { return tag_; }
 
 private:
+    std::string tag_;
     ::acpp::VMessOutboundConfig config_;
     std::optional<::acpp::vmess::MemoryAccount> user_;
     ::acpp::app::dns::DNS& dns_service_;

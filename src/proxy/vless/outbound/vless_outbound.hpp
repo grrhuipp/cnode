@@ -26,7 +26,6 @@ struct VlessEncryptionClientTicketCache;
 }  // namespace vless
 
 struct VlessOutboundConfig {
-    std::string tag;
     std::string address;
     std::optional<net::ip::address> literal_address;
     uint16_t port = 443;
@@ -46,7 +45,8 @@ namespace proxy::vless::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(const ::acpp::VlessOutboundConfig& config,
+    Handler(std::string tag,
+            const ::acpp::VlessOutboundConfig& config,
             ::acpp::app::dns::DNS& dns_service);
 
     ~Handler() override;
@@ -64,9 +64,10 @@ public:
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return config_.tag; }
+    std::string_view Tag() const noexcept override { return tag_; }
 
 private:
+    std::string tag_;
     ::acpp::VlessOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> encryption_;

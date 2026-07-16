@@ -156,15 +156,17 @@ private:
 // proxy/vmess/outbound.Handler 实现
 // ============================================================================
 
-proxy::vmess::outbound::Handler::Handler(const VMessOutboundConfig& config,
+proxy::vmess::outbound::Handler::Handler(std::string tag,
+                                         const VMessOutboundConfig& config,
                                          ::acpp::app::dns::DNS& dns_service)
-    : config_(config)
+    : tag_(std::move(tag))
+    , config_(config)
     , dns_service_(dns_service) {
     config_.literal_address = ParseLiteralAddress(config_.address);
 
     user_ = ::acpp::vmess::MemoryAccount::FromUUID(config_.uuid);
     if (!user_) {
-        LOG_ERROR("VMess outbound '{}': invalid UUID", config_.tag);
+        LOG_ERROR("VMess outbound '{}': invalid UUID", tag_);
     }
 
     NormalizeOutboundStreamSettings(
@@ -176,7 +178,7 @@ proxy::vmess::outbound::Handler::Handler(const VMessOutboundConfig& config,
             .alpn = {},
         });
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
-              config_.tag, config_.address, config_.port,
+              tag_, config_.address, config_.port,
               config_.stream_settings.network,
               config_.stream_settings.security);
 }
@@ -362,7 +364,6 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::VMessOutboundConfig vmess_config;
-        vmess_config.tag = cfg.tag;
 
         bool parsed_xray = false;
         if (const auto* vnext_p = s.if_contains("vnext");
@@ -445,6 +446,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [vmess_config = std::move(vmess_config)](
+                std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 acpp::UDPSessionManager* /*udp_mgr*/,
@@ -452,7 +454,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = vmess_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
-                    runtime_config, dns);
+                    std::string(tag), runtime_config, dns);
             }};
     }), true);
 }  // namespace
