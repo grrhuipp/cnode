@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <utility>
 
 namespace acpp {
 
@@ -16,11 +17,37 @@ class TimeoutSchedulerService;
 // ============================================================================
 // TimeoutToken - 共享定时调度器句柄
 // ============================================================================
-struct TimeoutToken {
-    uint64_t id = 0;
+class TimeoutToken {
+public:
+    TimeoutToken() noexcept = default;
+    TimeoutToken(const TimeoutToken&) = delete;
+    TimeoutToken& operator=(const TimeoutToken&) = delete;
 
-    [[nodiscard]] bool Valid() const noexcept { return id != 0; }
-    void Reset() noexcept { id = 0; }
+    TimeoutToken(TimeoutToken&& other) noexcept
+        : id_(std::exchange(other.id_, 0))
+        , owner_(std::exchange(other.owner_, nullptr)) {}
+
+    TimeoutToken& operator=(TimeoutToken&& other) noexcept {
+        if (this != &other) {
+            id_ = std::exchange(other.id_, 0);
+            owner_ = std::exchange(other.owner_, nullptr);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool Valid() const noexcept {
+        return id_ != 0 && owner_ != nullptr;
+    }
+    void Reset() noexcept {
+        id_ = 0;
+        owner_ = nullptr;
+    }
+
+private:
+    friend class TimeoutScheduler;
+
+    uint64_t id_ = 0;
+    const void* owner_ = nullptr;
 };
 
 // ============================================================================

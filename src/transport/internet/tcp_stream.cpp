@@ -170,10 +170,6 @@ TcpStream::TcpStream(tcp::socket socket)
 TcpStream::TcpStream(TcpStream&& other) noexcept
     : impl_(std::make_unique<Impl>(std::move(other.impl_->socket))) {
     impl_->pending_data = std::move(other.impl_->pending_data);
-    impl_->idle_timer_token = other.impl_->idle_timer_token;
-    impl_->read_deadline_token = other.impl_->read_deadline_token;
-    impl_->write_deadline_token = other.impl_->write_deadline_token;
-    impl_->phase_deadline_token = other.impl_->phase_deadline_token;
     impl_->write_deadline_at = other.impl_->write_deadline_at;
     impl_->read_alloc_count = other.impl_->read_alloc_count;
     impl_->read_grow_streak = other.impl_->read_grow_streak;
@@ -188,10 +184,6 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     other.CancelReadDeadline();
     other.CancelWriteDeadline();
     other.CancelPhaseDeadline();
-    impl_->idle_timer_token.Reset();
-    impl_->read_deadline_token.Reset();
-    impl_->write_deadline_token.Reset();
-    impl_->phase_deadline_token.Reset();
     other.impl_->idle_timeout_sec = 0;
     other.impl_->read_timeout_sec = 0;
     other.impl_->write_timeout_sec = 0;
@@ -212,10 +204,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         ReleasePendingData();
         impl_->timeout_scheduler = &TimeoutScheduler::ForIoContext(SocketIoContext(impl_->socket));
         impl_->pending_data = std::move(other.impl_->pending_data);
-        impl_->idle_timer_token = other.impl_->idle_timer_token;
-        impl_->read_deadline_token = other.impl_->read_deadline_token;
-        impl_->write_deadline_token = other.impl_->write_deadline_token;
-        impl_->phase_deadline_token = other.impl_->phase_deadline_token;
         impl_->read_alloc_count = other.impl_->read_alloc_count;
         impl_->read_grow_streak = other.impl_->read_grow_streak;
         impl_->stream_label = other.impl_->stream_label;
@@ -232,10 +220,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         other.CancelReadDeadline();
         other.CancelWriteDeadline();
         other.CancelPhaseDeadline();
-        impl_->idle_timer_token.Reset();
-        impl_->read_deadline_token.Reset();
-        impl_->write_deadline_token.Reset();
-        impl_->phase_deadline_token.Reset();
         other.impl_->idle_timeout_sec = 0;
         other.impl_->read_timeout_sec = 0;
         other.impl_->write_timeout_sec = 0;

@@ -80,6 +80,46 @@ int main() {
     }
     runner.join();
 
+    acpp::net::io_context left_io_context;
+    acpp::net::io_context right_io_context;
+    auto& left_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(left_io_context);
+    auto& right_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(right_io_context);
+    bool left_ran = false;
+    bool right_ran = false;
+    auto left_token = left_scheduler.ScheduleAfter(1ms, [&]() {
+        left_ran = true;
+    });
+    auto right_token = right_scheduler.ScheduleAfter(1ms, [&]() {
+        right_ran = true;
+    });
+
+    // Both scheduler shards start at event ID 1. Passing the other shard's
+    // token must neither invalidate it nor cancel this shard's same-ID event.
+    left_scheduler.Cancel(right_token);
+    if (!right_token.Valid()) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 7;
+    }
+
+    std::this_thread::sleep_for(10ms);
+    left_io_context.run();
+    right_io_context.run();
+    if (!left_ran || !right_ran) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 8;
+    }
+
+    left_scheduler.Cancel(left_token);
+    right_scheduler.Cancel(right_token);
+    acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
+    acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
+
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;
 }

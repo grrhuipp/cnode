@@ -259,11 +259,12 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
     }
 
     TimeoutToken token;
-    token.id = impl_->next_id++;
+    token.id_ = impl_->next_id++;
+    token.owner_ = impl_.get();
     const auto deadline = std::chrono::steady_clock::now() + delay;
 
-    impl_->events.emplace(token.id, Impl::Event{deadline, std::move(cb)});
-    impl_->PushHeap(Impl::HeapEntry{deadline, token.id});
+    impl_->events.emplace(token.id_, Impl::Event{deadline, std::move(cb)});
+    impl_->PushHeap(Impl::HeapEntry{deadline, token.id_});
     impl_->ArmTimer();
 
     return token;
@@ -271,9 +272,12 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
 
 void TimeoutScheduler::Cancel(TimeoutToken& token) {
     if (!token.Valid()) return;
+    if (token.owner_ != impl_.get()) {
+        return;
+    }
 
     if (!impl_->released) {
-        const bool removed = impl_->events.erase(token.id) != 0;
+        const bool removed = impl_->events.erase(token.id_) != 0;
         if (removed) {
             impl_->ReconcileTimerAfterCancellation();
         }
