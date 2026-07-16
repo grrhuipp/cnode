@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -88,13 +89,14 @@ int main() {
         acpp::net::ip::address_v4::loopback(), 10001);
     const acpp::udp::endpoint reply_endpoint_b(
         acpp::net::ip::address_v4::loopback(), 10002);
+    const acpp::proxyman::inbound::UdpSessionOwner default_owner;
 
     acpp::proxyman::inbound::UdpWorker::ClientSession failing_reply_session(
         io_context,
         acpp::RoutedPacketCallback{
             [](acpp::UDPPacketView, const acpp::udp::endpoint&) { throw 9; }},
         reply_endpoint_a,
-        1);
+        default_owner);
     acpp::buf::BufferGuard reply_buffer{acpp::buf::Buffer::New()};
     if (!reply_buffer) Fail("failed to allocate UDP callback test buffer");
     reply_buffer->Tail()[0] = 0x33;
@@ -143,7 +145,7 @@ int main() {
                            callback_large_payload.begin());
         }},
         reply_endpoint_a,
-        2);
+        default_owner);
     bool large_reply_failed = false;
     acpp::net::co_spawn(
         io_context,
@@ -259,6 +261,54 @@ int main() {
 
     acpp::proxyman::inbound::UdpWorker worker(
         "test-inbound", std::make_unique<DummyUdpHandler>());
+
+    acpp::proxyman::inbound::UdpSessionOwner owner_a;
+    acpp::proxyman::inbound::UdpSessionOwner owner_b;
+    std::array<uint8_t, 16> owner_a_bytes{};
+    std::array<uint8_t, 16> owner_b_bytes{};
+    owner_a_bytes.fill(0x11);
+    owner_b_bytes.fill(0x22);
+    if (!owner_a.Assign(owner_a_bytes) || !owner_b.Assign(owner_b_bytes)) {
+        Fail("failed to initialize UDP session owners");
+    }
+    const auto owner_session = worker.CreateClientSession(
+        "owner-socket",
+        "shared-session-id",
+        io_context,
+        acpp::RoutedPacketCallback{
+            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        reply_endpoint_a,
+        owner_a,
+        std::chrono::steady_clock::now());
+    auto make_owner_payload = [&]() {
+        acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+        if (!buffer) Fail("failed to allocate UDP owner payload");
+        buffer->Tail()[0] = 0x44;
+        buffer->Produce(1);
+        return acpp::buf::MultiBuffer{buffer.release()};
+    };
+    if (worker.PushClientPayload(
+            "owner-socket",
+            "shared-session-id",
+            callback_source,
+            reply_endpoint_b,
+            owner_b,
+            make_owner_payload(),
+            std::chrono::steady_clock::now())) {
+        Fail("UDP session key collision crossed authenticated owners");
+    }
+    if (!worker.PushClientPayload(
+            "owner-socket",
+            "shared-session-id",
+            callback_source,
+            reply_endpoint_b,
+            owner_a,
+            make_owner_payload(),
+            std::chrono::steady_clock::now())) {
+        Fail("UDP session rejected its authenticated owner");
+    }
+    owner_session->Close();
+
     auto* attached = worker.AttachSocket("stable-socket", std::move(second));
     if (!attached || worker.FindSocket("stable-socket") != attached ||
         !attached->is_open()) {

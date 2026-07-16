@@ -338,6 +338,9 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     const auto& profile = *user.profile;
 
     proxyman::inbound::UdpDecodeResult result;
+    if (!result.session_owner.Assign(user.derived_key.span())) {
+        return std::nullopt;
+    }
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
     result.session_key = std::string(decoded->session_key.begin(), decoded->session_key.end());

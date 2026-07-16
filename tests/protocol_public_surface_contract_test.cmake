@@ -277,8 +277,11 @@ set(SHADOWSOCKS_UDP_HEADER
     "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.hpp")
 set(SHADOWSOCKS_UDP_SOURCE
     "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.cpp")
+set(SHADOWSOCKS_INBOUND_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/shadowsocks/inbound/ss_inbound.cpp")
 file(READ "${SHADOWSOCKS_UDP_HEADER}" SHADOWSOCKS_UDP_HEADER_SOURCE)
 file(READ "${SHADOWSOCKS_UDP_SOURCE}" SHADOWSOCKS_UDP_SOURCE)
+file(READ "${SHADOWSOCKS_INBOUND_SOURCE_PATH}" SHADOWSOCKS_INBOUND_SOURCE)
 if(NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
         "class Ss2022UdpReplayWindow" OR
    NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
@@ -289,6 +292,11 @@ if(NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
         "receive_replay_cache[.]Accept[(]server_session_id, packet_id[)]")
     message(FATAL_ERROR
         "Shadowsocks 2022 UDP request and response paths must reject replayed packet IDs")
+endif()
+if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "session_owner[.]Assign[(]user[.]derived_key[.]span[(][)][)]")
+    message(FATAL_ERROR
+        "Shadowsocks UDP sessions must bind protocol session IDs to authenticated credentials")
 endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
@@ -354,11 +362,16 @@ endif()
 if(NOT UDP_WORKER_SOURCE MATCHES
         "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR
    NOT UDP_WORKER_SOURCE MATCHES
-        "decoded->target,[\r\n ]+datagram[.]client_endpoint,[\r\n ]+std::move[(]decoded->payload[)]" OR
+        "decoded->target,[\r\n ]+datagram[.]client_endpoint,[\r\n ]+decoded->session_owner,[\r\n ]+std::move[(]decoded->payload[)]" OR
    NOT UDP_WORKER_SOURCE MATCHES
         "const udp::endpoint& reply_endpoint")
     message(FATAL_ERROR
         "UDP ClientSession must route replies to the latest authenticated client endpoint")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "[!]session_it->second[.]link->Owns[(]session_owner[)]")
+    message(FATAL_ERROR
+        "UDP session key collisions must not cross authenticated owners")
 endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)

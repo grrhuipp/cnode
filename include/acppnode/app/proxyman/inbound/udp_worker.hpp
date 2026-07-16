@@ -113,12 +113,13 @@ public:
         net::io_context& io_context,
         ReplyCallback reply_callback,
         udp::endpoint reply_endpoint,
-        int64_t user_id,
+        UdpSessionOwner session_owner,
         std::chrono::steady_clock::time_point now);
     [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
                                          const std::string& client_key,
                                          const TargetAddress& target,
                                          udp::endpoint reply_endpoint,
+                                         const UdpSessionOwner& session_owner,
                                          buf::MultiBuffer payload,
                                          std::chrono::steady_clock::time_point now);
     void CleanupIdleClientSessions(const std::string& socket_key,
@@ -153,14 +154,14 @@ public:
     ClientSession(net::io_context& io_context,
                   ReplyCallback reply_callback,
                   udp::endpoint reply_endpoint,
-                  int64_t user_id);
+                  UdpSessionOwner session_owner);
     ~ClientSession() noexcept override;
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;
 
-    [[nodiscard]] int64_t UserId() const noexcept;
     [[nodiscard]] bool Closed() const noexcept;
+    [[nodiscard]] bool Owns(const UdpSessionOwner& owner) const noexcept;
 
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     void Push(const TargetAddress& target, buf::MultiBuffer payload);
