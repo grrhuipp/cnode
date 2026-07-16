@@ -83,12 +83,6 @@ public:
     // 获取会话 ID
     const std::string& SessionId() const;
 
-    // 统计
-    uint64_t PacketsSent() const;
-    uint64_t PacketsReceived() const;
-    uint64_t BytesSent() const;
-    uint64_t BytesReceived() const;
-
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
@@ -123,10 +117,6 @@ public:
 
     // 获取活跃会话数量
     size_t ActiveSessionCount() const;
-
-    // 统计
-    uint64_t TotalPacketsSent() const;
-    uint64_t TotalPacketsReceived() const;
 
 private:
     void CleanupExpiredSessions();

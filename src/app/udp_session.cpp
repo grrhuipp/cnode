@@ -657,22 +657,6 @@ const std::string& UDPSession::SessionId() const {
     return impl_->session_id;
 }
 
-uint64_t UDPSession::PacketsSent() const {
-    return impl_->packets_sent;
-}
-
-uint64_t UDPSession::PacketsReceived() const {
-    return impl_->packets_received;
-}
-
-uint64_t UDPSession::BytesSent() const {
-    return impl_->bytes_sent;
-}
-
-uint64_t UDPSession::BytesReceived() const {
-    return impl_->bytes_received;
-}
-
 // ============================================================================
 // UDPSessionManager (Per-Worker, 单线程访问，无需锁)
 // ============================================================================
@@ -696,8 +680,6 @@ struct UDPSessionManager::Impl {
     memory::ThreadLocalUnorderedMap<std::string, SessionPtr> sessions;
     TimeoutToken cleanup_token;
     bool running = false;
-    uint64_t total_packets_sent = 0;
-    uint64_t total_packets_received = 0;
 };
 
 void UDPSessionManager::Impl::SessionDeleter::operator()(UDPSession* session) const noexcept {
@@ -774,6 +756,9 @@ void UDPSessionManager::RemoveSession(const std::string& session_id) {
 }
 
 void UDPSessionManager::StartCleanup() {
+    if (impl_->running) {
+        return;
+    }
     impl_->running = true;
     CleanupExpiredSessions();
 }
@@ -784,8 +769,6 @@ void UDPSessionManager::CleanupExpiredSessions() {
     for (auto it = impl_->sessions.begin(); it != impl_->sessions.end(); ) {
         if (it->second->IsExpired(impl_->session_timeout)) {
             LOG_ACCESS_DEBUG("UDP session {} expired, removing", it->first);
-            impl_->total_packets_sent += it->second->PacketsSent();
-            impl_->total_packets_received += it->second->PacketsReceived();
             it->second->Stop();
             it = impl_->sessions.erase(it);
             removed_session = true;
@@ -822,14 +805,6 @@ void UDPSessionManager::StopAll() {
 
 size_t UDPSessionManager::ActiveSessionCount() const {
     return impl_->sessions.size();
-}
-
-uint64_t UDPSessionManager::TotalPacketsSent() const {
-    return impl_->total_packets_sent;
-}
-
-uint64_t UDPSessionManager::TotalPacketsReceived() const {
-    return impl_->total_packets_received;
 }
 
 }  // namespace acpp

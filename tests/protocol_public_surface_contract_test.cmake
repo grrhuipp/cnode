@@ -318,7 +318,9 @@ if(NOT UDP_RELAY_SOURCE MATCHES
         "UDP relay must preserve one ReadMultiBuffer as one datagram")
 endif()
 set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
+set(UDP_SESSION_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp")
 file(READ "${UDP_SESSION}" UDP_SESSION_SOURCE)
+file(READ "${UDP_SESSION_HEADER}" UDP_SESSION_HEADER_SOURCE)
 if(UDP_SESSION_SOURCE MATCHES
         "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*buf::Buffer::kSize")
     message(FATAL_ERROR
@@ -355,6 +357,15 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     "UDPSessionManager::~UDPSessionManager[(][)] \\{[\r\n ]+StopAll[(][)];")
     message(FATAL_ERROR
         "UDPSessionManager destruction must cancel cleanup and live sessions")
+endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+        "StartCleanup[(][)] \\{[\r\n ]+if [(]impl_->running[)]" OR
+   UDP_SESSION_HEADER_SOURCE MATCHES
+        "TotalPackets(Sent|Received)" OR
+   UDP_SESSION_HEADER_SOURCE MATCHES
+        "(Packets|Bytes)(Sent|Received)[(][)] const")
+    message(FATAL_ERROR
+        "UDPSession cleanup must be idempotent and dead aggregate stats must stay removed")
 endif()
 if(NOT UDP_SESSION_SOURCE MATCHES
     "RegisterCallback[(]PacketCallback callback[)] \\{[\r\n ]+if [(][!]callback[)]")
