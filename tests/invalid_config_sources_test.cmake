@@ -53,6 +53,15 @@ expect_rejected(negative_connection_limit
     [=[{"limits":{"maxConnections":-1}}]=] "" "")
 expect_rejected(negative_dns_cache_size
     [=[{"dns":{"cacheSize":-1}}]=] "" "")
+expect_rejected(overflow_panel_api_port
+    [=[{"panels":[{"Name":"bad-port","Type":"V2board","APIHost":"http://127.0.0.1:70000","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(trailing_panel_api_port
+    [=[{"panels":[{"Name":"bad-port","Type":"V2board","APIHost":"http://127.0.0.1:80junk","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    "" "")
+expect_rejected(empty_panel_api_port
+    [=[{"panels":[{"Name":"bad-port","Type":"V2board","APIHost":"http://127.0.0.1:","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    "" "")
 expect_rejected(negative_route_port "{}" "routing.json"
     [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
 expect_rejected(overflow_route_port "{}" "routing.json"

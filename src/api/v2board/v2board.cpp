@@ -16,9 +16,12 @@
 #include <asio/write.hpp>
 #include <asio/steady_timer.hpp>
 #include <cctype>
+#include <charconv>
 #include <format>
+#include <limits>
 #include <map>
 #include <regex>
+#include <stdexcept>
 #include <vector>
 #include <openssl/x509_vfy.h>
 
@@ -99,7 +102,7 @@ enum class HttpMethod : uint8_t {
 struct UrlParts {
     bool use_ssl = false;
     std::string host;
-    std::string port;
+    uint16_t port = 0;
     std::string path_prefix;
     std::optional<net::ip::address> literal_address;
 };
@@ -169,6 +172,18 @@ std::string MethodName(HttpMethod method) {
         case HttpMethod::Post: return "POST";
     }
     return "GET";
+}
+
+std::optional<uint16_t> ParseHttpPort(std::string_view value) noexcept {
+    uint32_t parsed = 0;
+    const auto [end, ec] = std::from_chars(
+        value.data(), value.data() + value.size(), parsed);
+    if (value.empty() || ec != std::errc{} ||
+        end != value.data() + value.size() || parsed == 0 ||
+        parsed > std::numeric_limits<uint16_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<uint16_t>(parsed);
 }
 
 std::string JoinRouteMatches(const json::array& matches) {
@@ -296,11 +311,11 @@ APIClient::Impl::Impl(net::io_context& io_context,
     , dns_service_(dns_service) {
 
     auto parts = ParseUrl(config.APIHost);
-    if (parts) {
-        url_parts_ = *parts;
-    } else {
-        LOG_ERROR("V2Board[{}]: invalid API host: {}", config.Name, config.APIHost);
+    if (!parts) {
+        throw std::invalid_argument(std::format(
+            "V2Board[{}]: invalid API host: {}", config.Name, config.APIHost));
     }
+    url_parts_ = std::move(*parts);
 }
 
 ::acpp::api::ClientInfo APIClient::Impl::Describe() const {
@@ -344,6 +359,8 @@ static std::optional<UrlParts> ParseUrl(const std::string& url) {
         return std::nullopt;
     }
 
+    std::string_view explicit_port;
+    bool has_explicit_port = false;
     if (authority.front() == '[') {
         const size_t close_bracket = authority.find(']');
         if (close_bracket == std::string_view::npos) {
@@ -355,14 +372,16 @@ static std::optional<UrlParts> ParseUrl(const std::string& url) {
             if (authority[close_bracket + 1] != ':') {
                 return std::nullopt;
             }
-            parts.port = std::string(authority.substr(close_bracket + 2));
+            has_explicit_port = true;
+            explicit_port = authority.substr(close_bracket + 2);
         }
     } else {
         const size_t first_colon = authority.find(':');
         const size_t last_colon = authority.rfind(':');
         if (first_colon != std::string_view::npos && first_colon == last_colon) {
             parts.host = std::string(authority.substr(0, first_colon));
-            parts.port = std::string(authority.substr(last_colon + 1));
+            has_explicit_port = true;
+            explicit_port = authority.substr(last_colon + 1);
         } else {
             parts.host = std::string(authority);
         }
@@ -371,8 +390,14 @@ static std::optional<UrlParts> ParseUrl(const std::string& url) {
     if (parts.host.empty()) {
         return std::nullopt;
     }
-    if (parts.port.empty()) {
-        parts.port = parts.use_ssl ? "443" : "80";
+    if (has_explicit_port) {
+        const auto parsed_port = ParseHttpPort(explicit_port);
+        if (!parsed_port) {
+            return std::nullopt;
+        }
+        parts.port = *parsed_port;
+    } else {
+        parts.port = parts.use_ssl ? 443 : 80;
     }
 
     IoErrorCode ec;
@@ -426,7 +451,7 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
     HttpResponse result;
 
     try {
-        if (url_parts_.host.empty() || url_parts_.port.empty()) {
+        if (url_parts_.host.empty() || url_parts_.port == 0) {
             result.status = -1;
             result.body = "invalid API host";
             co_return result;
@@ -434,7 +459,7 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
 
         // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
         std::vector<tcp::endpoint> endpoints;
-        uint16_t port = static_cast<uint16_t>(std::stoi(url_parts_.port));
+        const uint16_t port = url_parts_.port;
 
         if (url_parts_.literal_address) {
             endpoints.emplace_back(*url_parts_.literal_address, port);
