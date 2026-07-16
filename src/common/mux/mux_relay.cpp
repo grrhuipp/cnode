@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <deque>
 #include <memory>
+#include <new>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -36,6 +37,13 @@ constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
 constexpr size_t kMuxQueueShrinkItems    = 128;
 constexpr size_t kMuxFrameBufKeepCap     = 512;
 constexpr size_t kMuxReplyOverhead       = 128;
+
+[[nodiscard]] constexpr bool QueueBytesWouldExceed(
+    size_t queued,
+    size_t incoming,
+    size_t limit) noexcept {
+    return queued > limit || incoming > limit - queued;
+}
 
 using SignalChannel = net::experimental::channel<void(IoErrorCode)>;
 
@@ -74,16 +82,26 @@ struct ReplyQueueState {
     size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
 
     bool CanPushUdp(size_t payload_bytes) const noexcept {
-        return udp_queued_bytes + payload_bytes + kMuxReplyOverhead <= kMuxQueueHighWaterBytes;
+        if (payload_bytes > kMuxQueueHighWaterBytes - kMuxReplyOverhead) {
+            return false;
+        }
+        return !QueueBytesWouldExceed(
+            udp_queued_bytes,
+            payload_bytes + kMuxReplyOverhead,
+            kMuxQueueHighWaterBytes);
     }
 
     bool PushTcp(MuxReply&& reply) {
-        const size_t reply_bytes = reply.PayloadSize() + kMuxReplyOverhead;
-        if (tcp_queued_bytes + reply_bytes > kMuxQueueEmergencyBytes) {
+        if (reply.PayloadSize() > kMuxQueueEmergencyBytes - kMuxReplyOverhead) {
             return false;
         }
-        tcp_queued_bytes += reply_bytes;
+        const size_t reply_bytes = reply.PayloadSize() + kMuxReplyOverhead;
+        if (QueueBytesWouldExceed(
+                tcp_queued_bytes, reply_bytes, kMuxQueueEmergencyBytes)) {
+            return false;
+        }
         queue.push_back(std::move(reply));
+        tcp_queued_bytes += reply_bytes;
         if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
             shrink_queue_on_drain = true;
         }
@@ -92,8 +110,8 @@ struct ReplyQueueState {
     }
 
     void PushUdpPrepared(MuxReply&& reply, size_t reply_bytes) {
-        udp_queued_bytes += reply_bytes;
         queue.push_back(std::move(reply));
+        udp_queued_bytes += reply_bytes;
         if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
             shrink_queue_on_drain = true;
         }
@@ -227,12 +245,13 @@ struct ClientReadQueueState {
     }
 
     [[nodiscard]] bool Push(buf::MultiBuffer mb, size_t bytes) {
-        if (queued_bytes + bytes > kMuxQueueEmergencyBytes) {
+        if (QueueBytesWouldExceed(
+                queued_bytes, bytes, kMuxQueueEmergencyBytes)) {
             mb.clear();
             return false;
         }
-        queued_bytes += bytes;
         queue.emplace_back(std::move(mb), bytes);
+        queued_bytes += bytes;
         if (queue.size() >= kMuxQueueShrinkItems ||
             queued_bytes >= kMuxQueueHighWaterBytes) {
             shrink_queue_on_drain = true;
@@ -304,8 +323,14 @@ public:
             mb.clear();
             return true;
         }
-        queued_bytes_ += bytes;
+        if (QueueBytesWouldExceed(
+                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
+            mb.clear();
+            Cancel();
+            return false;
+        }
         input_queue_.emplace_back(std::move(mb), bytes);
+        queued_bytes_ += bytes;
         if (input_queue_.size() >= kMuxQueueShrinkItems ||
             queued_bytes_ >= kMuxQueueHighWaterBytes) {
             shrink_input_queue_on_drain_ = true;
@@ -539,7 +564,8 @@ public:
             mb.clear();
             return;
         }
-        if (queued_bytes_ + bytes > kMuxQueueEmergencyBytes) {
+        if (QueueBytesWouldExceed(
+                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
             mb.clear();
             Cancel();
             return;
@@ -549,8 +575,8 @@ public:
             return;
         }
         StampDefaultTarget(mb);
-        queued_bytes_ += bytes;
         input_queue_.emplace_back(std::move(mb), bytes);
+        queued_bytes_ += bytes;
         if (input_queue_.size() >= kMuxQueueShrinkItems ||
             queued_bytes_ >= kMuxQueueHighWaterBytes) {
             shrink_input_queue_on_drain_ = true;
@@ -733,14 +759,15 @@ private:
             payload.clear();
             return;
         }
-        if (queued_bytes_ + bytes > kMuxQueueEmergencyBytes) {
+        if (QueueBytesWouldExceed(
+                queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
             payload.clear();
             Cancel();
             return;
         }
         StampDefaultTarget(payload);
-        queued_bytes_ += bytes;
         input_queue_.emplace_back(std::move(payload), bytes);
+        queued_bytes_ += bytes;
         if (input_queue_.size() >= kMuxQueueShrinkItems ||
             queued_bytes_ >= kMuxQueueHighWaterBytes) {
             shrink_input_queue_on_drain_ = true;
@@ -1044,9 +1071,10 @@ net::awaitable<RelayResult> DoMuxRelay(
             co_return false;
         };
 
-    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
+    try {
+        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
 
-    while (running) {
+        while (running) {
         // --------------------------------------------------------------------
         // 1. 排空回包队列 → 序列化写回客户端
         // --------------------------------------------------------------------
@@ -1466,6 +1494,11 @@ net::awaitable<RelayResult> DoMuxRelay(
 
             }  // switch (hdr.status)
         }
+        }
+    } catch (const std::bad_alloc&) {
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+    } catch (...) {
+        result.error = ErrorCode::INTERNAL;
     }
 
     release_write_frame();

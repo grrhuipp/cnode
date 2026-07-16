@@ -92,3 +92,14 @@ if(NOT MUX_NOEXCEPT_DISPATCH_COMPLETION_COUNT EQUAL 2)
     message(FATAL_ERROR
         "TCP and UDP Mux dispatch completion must not strand loop ownership")
 endif()
+string(REGEX MATCHALL "QueueBytesWouldExceed"
+    MUX_BOUNDED_QUEUE_CHECKS "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_BOUNDED_QUEUE_CHECKS MUX_BOUNDED_QUEUE_CHECK_COUNT)
+if(MUX_BOUNDED_QUEUE_CHECK_COUNT LESS 7)
+    message(FATAL_ERROR
+        "every Mux input and reply queue must use overflow-safe byte limits")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES "catch [(]const std::bad_alloc&[)]")
+    message(FATAL_ERROR
+        "Mux relay must enter owned async cleanup after allocation failure")
+endif()
