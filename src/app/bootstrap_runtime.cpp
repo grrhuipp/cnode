@@ -9,9 +9,25 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
+#include <asio/use_future.hpp>
+
+#include <exception>
+#include <stdexcept>
 #include <thread>
 
 namespace acpp {
+
+namespace {
+
+net::awaitable<void> RemoveStartupInbounds(
+    Worker& worker,
+    std::vector<std::string> tags) {
+    for (auto it = tags.rbegin(); it != tags.rend(); ++it) {
+        co_await worker.UnregisterListenerTask(*it);
+    }
+}
+
+}  // namespace
 
 void RunApplicationRuntime(const RuntimeContext& ctx) {
     std::vector<std::thread> worker_threads;
@@ -24,6 +40,58 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
             ctx.io_contexts[i]->run();
             TimeoutScheduler::ReleaseForIoContext(*ctx.io_contexts[i]);
         });
+    }
+
+    bool inbound_startup_ok = true;
+    std::exception_ptr inbound_startup_error;
+    for (auto& result : ctx.inbound_startup.worker_results) {
+        try {
+            inbound_startup_ok = result.get() && inbound_startup_ok;
+        } catch (...) {
+            inbound_startup_ok = false;
+            if (!inbound_startup_error) {
+                inbound_startup_error = std::current_exception();
+            }
+        }
+    }
+    ctx.inbound_startup.worker_results.clear();
+    if (!inbound_startup_ok) {
+        std::vector<std::future<void>> cleanup_results;
+        cleanup_results.reserve(ctx.workers.size());
+        for (const auto& worker : ctx.workers) {
+            cleanup_results.push_back(net::co_spawn(
+                worker->GetExecutor(),
+                RemoveStartupInbounds(*worker, ctx.inbound_startup.tags),
+                net::use_future));
+        }
+        for (auto& cleanup : cleanup_results) {
+            try {
+                cleanup.get();
+            } catch (...) {
+                if (!inbound_startup_error) {
+                    inbound_startup_error = std::current_exception();
+                }
+            }
+        }
+        for (const auto& io_context : ctx.io_contexts) {
+            io_context->stop();
+        }
+        for (auto& thread : worker_threads) {
+            if (thread.joinable()) thread.join();
+        }
+        ctx.workers.clear();
+        if (inbound_startup_error) {
+            std::rethrow_exception(inbound_startup_error);
+        }
+        throw std::runtime_error("configured inbound startup failed");
+    }
+
+    for (const auto& inbound : ctx.inbound_startup.entries) {
+        LOG_CONSOLE("static_inbound ready tag={} port={} protocol={} network={}",
+                    inbound.tag,
+                    inbound.port,
+                    inbound.protocol,
+                    inbound.stream_settings.network);
     }
 
     LOG_CONSOLE("");

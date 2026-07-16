@@ -26,7 +26,7 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
         for (const auto& tag : ctx.controller.RegisteredTags()) {
             tags->push_back(tag);
         }
-        for (const auto& tag : ctx.static_inbound_tags) {
+        for (const auto& tag : ctx.inbound_startup.tags) {
             tags->push_back(tag);
         }
 

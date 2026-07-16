@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/app/bootstrap_inbounds.hpp"
 #include "acppnode/common/asio_types.hpp"
 
 #include <asio/executor_work_guard.hpp>
@@ -23,7 +24,7 @@ struct RuntimeContext {
     Controller&                                     controller;
     std::vector<std::unique_ptr<net::io_context>>&        io_contexts;
     std::vector<net::executor_work_guard<net::io_context::executor_type>>& work_guards;
-    const std::vector<std::string>&                       static_inbound_tags;
+    InboundStartup&                                      inbound_startup;
     bool                                                  enable_controller = false;
 };
 

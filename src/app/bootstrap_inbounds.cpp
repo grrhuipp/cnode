@@ -5,50 +5,105 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/static_inbound_prepared_config.hpp"
 #include "acppnode/app/worker.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/api/api.hpp"
 
+#include <asio/use_future.hpp>
+
+#include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace acpp {
 
-std::vector<std::string> SetupStaticInbounds(
-    const std::vector<StaticInboundRuntimeEntry>& runtime_inbounds,
-    std::vector<std::unique_ptr<Worker>>& workers,
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters) {
-    std::vector<std::string> static_inbound_tags;
+namespace {
 
-    if (runtime_inbounds.empty()) {
-        return static_inbound_tags;
+StaticInboundRuntimeEntry BuildTestModeInbound() {
+    const std::string protocol = std::string(constants::protocol::kDefaultNodeProtocol);
+    constexpr std::string_view kTestTag = constants::test::kTestInboundTag;
+
+    StreamSettings stream_settings;
+    stream_settings.network = std::string(constants::protocol::kTcp);
+    stream_settings.security = std::string(constants::protocol::kNone);
+    stream_settings.RecomputeModes();
+
+    SniffConfig sniffing;
+    sniffing.enabled = true;
+    sniffing.dest_override = {
+        std::string(constants::protocol::kTls),
+        std::string(constants::protocol::kHttp),
+    };
+
+    StaticUserConfig user_config;
+    user_config.clients.push_back(StaticUser{
+        .id = std::string(constants::test::kTestVmessUuid),
+        .password = {},
+        .email = "test@example.com",
+        .flow = {},
+    });
+    auto users = proxyman::inbound::BuildStaticUsers(protocol, kTestTag, user_config);
+    if (!users) {
+        throw std::runtime_error("test mode VMess user preparation failed");
     }
+    proxyman::inbound::UserStore::ApplyUsers(protocol, kTestTag, *users);
 
-    for (const auto& inbound : runtime_inbounds) {
-        for (const auto& worker : workers) {
-            auto* connection_limiter = connection_limiters[worker->Id()].get();
+    StaticInboundRuntimeEntry entry;
+    entry.protocol = protocol;
+    entry.tag = kTestTag;
+    entry.all_tags = {entry.tag};
+    entry.port = constants::test::kTestPort;
+    entry.stream_settings = std::move(stream_settings);
+    entry.sniffing = std::move(sniffing);
+    entry.build_request.tag = entry.tag;
+    entry.build_request.protocol = protocol;
+    return entry;
+}
 
-            auto route_policy = inbound.routing_enabled
-                ? proxyman::inbound::RoutePolicy::RouteWithFallback(
-                      std::string(constants::protocol::kDirect))
-                : proxyman::inbound::RoutePolicy::Fixed(
-                      std::string(constants::protocol::kDirect));
-            auto receiver = proxyman::inbound::MakeReceiverSettings(
-                inbound.tag,
-                inbound.all_tags,
-                inbound.protocol,
-                inbound.stream_settings,
-                inbound.sniffing,
-                connection_limiter,
-                ProxyProtocolMode::Auto,
-                std::move(route_policy));
-            worker->RegisterInboundAsync(
+net::awaitable<void> RemoveInstalledInbounds(
+    Worker& worker,
+    const std::vector<std::string>& installed,
+    std::string_view current_tag) {
+    if (!current_tag.empty()) {
+        co_await worker.UnregisterListenerTask(std::string(current_tag));
+    }
+    for (auto it = installed.rbegin(); it != installed.rend(); ++it) {
+        co_await worker.UnregisterListenerTask(*it);
+    }
+}
+
+net::awaitable<bool> SetupWorkerInbounds(
+    Worker& worker,
+    std::vector<StaticInboundRuntimeEntry> inbounds,
+    ConnectionLimiterPtr connection_limiter) {
+    std::vector<std::string> installed;
+    installed.reserve(inbounds.size());
+
+    for (const auto& inbound : inbounds) {
+        auto route_policy = inbound.routing_enabled
+            ? proxyman::inbound::RoutePolicy::RouteWithFallback(
+                  std::string(constants::protocol::kDirect))
+            : proxyman::inbound::RoutePolicy::Fixed(
+                  std::string(constants::protocol::kDirect));
+        auto receiver = proxyman::inbound::MakeReceiverSettings(
+            inbound.tag,
+            inbound.all_tags,
+            inbound.protocol,
+            inbound.stream_settings,
+            inbound.sniffing,
+            connection_limiter,
+            ProxyProtocolMode::Auto,
+            std::move(route_policy));
+
+        if (!co_await worker.RegisterInboundTask(
                 inbound.protocol,
                 connection_limiter,
                 inbound.build_request,
                 std::move(receiver),
-                true);
+                true)) {
+            co_await RemoveInstalledInbounds(worker, installed, inbound.tag);
+            co_return false;
         }
 
         auto binding = MakePortBinding(
@@ -56,98 +111,65 @@ std::vector<std::string> SetupStaticInbounds(
             inbound.protocol,
             inbound.tag,
             inbound.listen);
-        for (const auto& worker : workers) {
-            worker->AddListenerAsync(binding);
-            auto* connection_limiter = connection_limiters[worker->Id()].get();
-            worker->AddUdpListenerAsync(
+        if (!co_await worker.AddListenerTask(binding)) {
+            co_await RemoveInstalledInbounds(worker, installed, inbound.tag);
+            co_return false;
+        }
+
+        if (!co_await worker.AddUdpListenerTask(
                 binding,
                 inbound.protocol,
                 connection_limiter,
                 inbound.build_request,
-                true);
+                true)) {
+            co_await RemoveInstalledInbounds(worker, installed, inbound.tag);
+            co_return false;
         }
-        static_inbound_tags.push_back(inbound.tag);
-        LOG_CONSOLE("static_inbound ready tag={} port={} protocol={} network={}",
-                    inbound.tag,
-                    inbound.port,
-                    inbound.protocol,
-                    inbound.stream_settings.network);
+
+        installed.push_back(inbound.tag);
     }
 
-    return static_inbound_tags;
+    co_return true;
 }
 
-void SetupTestMode(
+}  // namespace
+
+InboundStartup QueueInboundStartup(
+    const std::vector<StaticInboundRuntimeEntry>& runtime_inbounds,
     std::vector<std::unique_ptr<Worker>>& workers,
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters) {
-    const std::string protocol = std::string(constants::protocol::kDefaultNodeProtocol);
-
-    LOG_CONSOLE("");
-    LOG_CONSOLE("test_mode enabled port={} uuid={}",
-                constants::test::kTestPort,
-                constants::test::kTestVmessUuid);
-
-    constexpr const char* kTestTag = constants::test::kTestInboundTag.data();
-
-    StreamSettings ss;
-    ss.network  = std::string(constants::protocol::kTcp);
-    ss.security = std::string(constants::protocol::kNone);
-    ss.RecomputeModes();
-
-    SniffConfig sniff;
-    sniff.enabled      = true;
-    sniff.dest_override = {
-        std::string(constants::protocol::kTls),
-        std::string(constants::protocol::kHttp),
-    };
-
-    StaticUserConfig test_user_config;
-    test_user_config.clients.push_back(StaticUser{
-        .id = std::string(constants::test::kTestVmessUuid),
-        .password = {},
-        .email = "test@example.com",
-        .flow = {},
-    });
-    auto test_users =
-        proxyman::inbound::BuildStaticUsers(protocol, kTestTag, test_user_config);
-    if (!test_users) {
-        LOG_WARN("test_mode failed reason=build_vmess_test_user");
-        return;
+    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters,
+    bool enable_test_mode) {
+    InboundStartup startup;
+    startup.entries = runtime_inbounds;
+    if (enable_test_mode) {
+        LOG_CONSOLE("");
+        LOG_CONSOLE("test_mode enabled port={} uuid={}",
+                    constants::test::kTestPort,
+                    constants::test::kTestVmessUuid);
+        startup.entries.push_back(BuildTestModeInbound());
     }
-    proxyman::inbound::UserStore::ApplyUsers(protocol, kTestTag, *test_users);
 
-    proxyman::inbound::BuildRequest req;
-    req.tag = kTestTag;
-    req.protocol = protocol;
+    startup.tags.reserve(startup.entries.size());
+    for (const auto& inbound : startup.entries) {
+        startup.tags.push_back(inbound.tag);
+    }
 
+    if (startup.entries.empty()) {
+        return startup;
+    }
+
+    startup.worker_results.reserve(workers.size());
     for (const auto& worker : workers) {
-        auto* connection_limiter = connection_limiters[worker->Id()].get();
-
-        auto receiver = proxyman::inbound::MakeReceiverSettings(
-            kTestTag,
-            std::vector<std::string>{kTestTag},
-            protocol,
-            ss,
-            sniff,
-            connection_limiter);
-
-        worker->RegisterInboundAsync(
-            protocol,
-            connection_limiter,
-            req,
-            std::move(receiver),
-            true);
+        if (worker->Id() >= connection_limiters.size()) {
+            throw std::runtime_error("worker has no matching connection limiter");
+        }
+        auto* limiter = connection_limiters[worker->Id()].get();
+        startup.worker_results.push_back(net::co_spawn(
+            worker->GetExecutor(),
+            SetupWorkerInbounds(*worker, startup.entries, limiter),
+            net::use_future));
     }
-
-    auto test_binding = MakePortBinding(
-        constants::test::kTestPort,
-        protocol,
-        kTestTag);
-
-    for (const auto& worker : workers) {
-        // AddListenerAsync：post 到 Worker 线程，在 run() 启动后 SO_REUSEPORT bind
-        worker->AddListenerAsync(test_binding);
-    }
+    return startup;
 }
 
 }  // namespace acpp

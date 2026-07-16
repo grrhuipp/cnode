@@ -172,12 +172,13 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         *env.main_ctx, env.worker_pool.workers, env.connection_limiters);
 
     SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
-    env.static_inbound_tags = SetupStaticInbounds(
-        worker_runtime_config.static_inbounds, env.worker_pool.workers, env.connection_limiters);
-
-    if (test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty())) {
-        SetupTestMode(env.worker_pool.workers, env.connection_limiters);
-    }
+    const bool enable_test_mode =
+        test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
+    env.inbound_startup = QueueInboundStartup(
+        worker_runtime_config.static_inbounds,
+        env.worker_pool.workers,
+        env.connection_limiters,
+        enable_test_mode);
 
     env.enable_controller = !config.GetPanels().empty();
     return env;
@@ -191,7 +192,7 @@ RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {
         *env.controller,
         env.worker_pool.io_contexts,
         env.worker_pool.work_guards,
-        env.static_inbound_tags,
+        env.inbound_startup,
         env.enable_controller,
     };
 }

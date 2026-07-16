@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/app/bootstrap_inbounds.hpp"
 #include "acppnode/common/asio_types.hpp"
 
 #include <asio/executor_work_guard.hpp>
@@ -50,7 +51,7 @@ struct BootstrapEnvironment {
     std::vector<std::unique_ptr<ConnectionLimiter>> connection_limiters;
     WorkerPool worker_pool;
     std::unique_ptr<Controller> controller;
-    std::vector<std::string> static_inbound_tags;
+    InboundStartup inbound_startup;
     bool enable_controller = false;
 };
 

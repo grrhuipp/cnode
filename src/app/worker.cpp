@@ -342,6 +342,11 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         listener_slot.tcp_worker = std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
     }
     auto& tcp_worker = *listener_slot.tcp_worker;
+    const auto fail_listener = [&]() -> bool {
+        tcp_worker.Close();
+        listener_slot.tcp_worker.reset();
+        return false;
+    };
 
     const auto listen_candidates = BuildListenCandidates(binding.listen);
     size_t bound_count = 0;
@@ -353,7 +358,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (ec) {
             LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
                       worker.id_, listen_addr, ec.message());
-            if (listen_candidates.size() == 1) return false;
+            if (listen_candidates.size() == 1) return fail_listener();
             continue;
         }
 
@@ -387,14 +392,14 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         candidate_acceptor->open(ep.protocol(), ec);
         if (ec) {
             if (fail_candidate("open", ec.message())) continue;
-            return false;
+            return fail_listener();
         }
 
         if (addr.is_v6()) {
             candidate_acceptor->set_option(net::ip::v6_only(true), ec);
             if (ec) {
                 if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
-                return false;
+                return fail_listener();
             }
         }
 
@@ -406,20 +411,20 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
-            return false;
+            return fail_listener();
         }
 #endif
 
         candidate_acceptor->bind(ep, ec);
         if (ec) {
             if (fail_candidate("bind", ec.message())) continue;
-            return false;
+            return fail_listener();
         }
 
         candidate_acceptor->listen(net::socket_base::max_listen_connections, ec);
         if (ec) {
             if (fail_candidate("listen", ec.message())) continue;
-            return false;
+            return fail_listener();
         }
 
         tcp::acceptor* acceptor = candidate_acceptor;
@@ -445,8 +450,9 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     if (bound_count == 0) {
         LOG_ERROR("Worker[{}]: no TCP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
+        return fail_listener();
     }
-    return bound_count != 0;
+    return true;
 }
 
 void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag) {
@@ -790,13 +796,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 // 线程安全 Async 接口（主线程调用，post 到 Worker 线程）
 // ============================================================================
 
-void Worker::AddListenerAsync(const PortBinding& binding) {
-    net::post(runtime_->io_context,
-        [this, b = binding] {
-            (void)runtime_->listener_state->StartListening(*this, b);
-        });
-}
-
 net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
     co_return runtime_->listener_state->StartListening(*this, binding);
 }
@@ -860,24 +859,6 @@ net::awaitable<bool> Worker::RegisterInboundTask(
     bool ban_tracking_enabled) {
     co_return RegisterInboundOnWorkerThread(
         protocol, limiter, req, std::move(receiver), ban_tracking_enabled);
-}
-
-void Worker::RegisterInboundAsync(
-    std::string protocol,
-    ConnectionLimiterPtr limiter,
-    proxyman::inbound::BuildRequest req,
-    proxyman::inbound::ReceiverSettings receiver,
-    bool ban_tracking_enabled) {
-    net::post(runtime_->io_context,
-        [this,
-         p = std::move(protocol),
-         limiter,
-         r = std::move(req),
-         receiver = std::move(receiver),
-         ban_tracking_enabled]() mutable {
-            (void)RegisterInboundOnWorkerThread(
-                p, limiter, r, std::move(receiver), ban_tracking_enabled);
-        });
 }
 
 bool Worker::AddOutboundOnWorkerThread(
@@ -969,13 +950,6 @@ void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
     }
     worker.runtime_->inbound_manager->DrainRetiredHandlers();
     worker.runtime_->outbound_manager->DrainRetiredHandlers();
-}
-
-void Worker::UnregisterListenerAsync(std::string tag) {
-    net::post(runtime_->io_context,
-        [this, t = std::move(tag)] {
-            UnregisterListenerOnWorkerThread(t);
-        });
 }
 
 void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
@@ -1081,28 +1055,6 @@ Worker::CollectRuntimeStatsTask() const {
 // 具体的解码、认证和 ban 逻辑委托给 inbound UdpHandler；Worker 只维护监听
 // socket 与当前 Worker-local UdpWorker 生命周期。
 // ============================================================================
-
-void Worker::AddUdpListenerAsync(const PortBinding& binding,
-                                 std::string protocol,
-                                 ConnectionLimiterPtr limiter,
-                                 proxyman::inbound::BuildRequest req,
-                                 bool ban_tracking_enabled) {
-    net::post(runtime_->io_context,
-        [this,
-         b = binding,
-         p = std::move(protocol),
-         limiter,
-         r = std::move(req),
-         ban_tracking_enabled]() mutable {
-            auto handler = runtime_->inbound_manager->NewUdpHandler(p, limiter, r);
-            if (!handler) {
-                return;
-            }
-            handler->SetBanTrackingEnabled(ban_tracking_enabled);
-            (void)runtime_->listener_state->StartUdpListening(
-                *this, b, std::move(handler));
-        });
-}
 
 net::awaitable<bool> Worker::AddUdpListenerTask(
     PortBinding binding,

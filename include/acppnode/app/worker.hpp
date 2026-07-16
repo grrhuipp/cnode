@@ -65,25 +65,14 @@ public:
 
     // ── 监听管理（线程安全，内部 net::post 到 Worker 线程）─────────────────
 
-    // 添加监听：SO_REUSEPORT bind，为该 tag 启动一个独立 accept 协程
-    void AddListenerAsync(const PortBinding& binding);
-
     // 动态控制面使用：必须在 Worker executor 上执行，并返回真实 bind 结果。
     net::awaitable<bool> AddListenerTask(PortBinding binding);
 
     // 进程关闭冷路径：在 Worker 线程关闭一组监听，并在下一轮事件循环回调。
     void ShutdownListenersAsync(std::vector<std::string> tags, std::function<void()> on_done);
 
-    // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行；
-    // Async 版本可从控制面直接调用，内部投递到 Worker 线程。
+    // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行。
     net::awaitable<bool> RegisterInboundTask(
-        std::string protocol,
-        ConnectionLimiterPtr limiter,
-        proxyman::inbound::BuildRequest req,
-        proxyman::inbound::ReceiverSettings receiver,
-        bool ban_tracking_enabled);
-
-    void RegisterInboundAsync(
         std::string protocol,
         ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req,
@@ -92,12 +81,6 @@ public:
 
     // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）。协议 handler 在
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
-    void AddUdpListenerAsync(const PortBinding& binding,
-                             std::string protocol,
-                             ConnectionLimiterPtr limiter,
-                             proxyman::inbound::BuildRequest req,
-                             bool ban_tracking_enabled);
-
     net::awaitable<bool> AddUdpListenerTask(
         PortBinding binding,
         std::string protocol,
@@ -109,9 +92,6 @@ public:
     net::awaitable<bool> AddOutboundTask(
         proxyman::outbound::PreparedOutboundConfig config);
     net::awaitable<void> RemoveOutboundTask(std::string tag);
-
-    // 注销监听上下文（线程安全）
-    void UnregisterListenerAsync(std::string tag);
 
     // 动态控制面使用：必须在 Worker executor 上执行，完成后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);

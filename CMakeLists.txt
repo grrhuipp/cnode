@@ -797,6 +797,29 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_node_transition_test
         COMMAND cnode_node_transition_test)
 
+    add_executable(cnode_static_inbound_startup_test
+        tests/static_inbound_startup_test.cpp
+    )
+    target_link_libraries(cnode_static_inbound_startup_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_static_inbound_startup_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_static_inbound_startup_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_static_inbound_startup_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_static_inbound_startup_test
+        COMMAND cnode_static_inbound_startup_test
+            $<TARGET_FILE:cnode>
+            ${CMAKE_CURRENT_BINARY_DIR}/static_inbound_startup_test)
+    set_tests_properties(cnode_static_inbound_startup_test PROPERTIES TIMEOUT 15)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}
