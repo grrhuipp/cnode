@@ -1,4 +1,5 @@
 #include "reality_tls.hpp"
+#include "reality_key_share.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_server_name.hpp"
@@ -42,8 +43,6 @@ constexpr size_t kRealitySessionIdSize = 32;
 constexpr size_t kRealityPlainAuthSize = 16;
 constexpr size_t kRealityShortIdSize = transport::internet::kRealityShortIdSize;
 constexpr size_t kRealityAesGcmNonceSize = 12;
-constexpr uint16_t kTlsGroupX25519 = 29;
-constexpr uint16_t kTlsGroupX25519MlKem768 = 0x11ec;
 
 struct EvpPkeyDeleter {
     void operator()(EVP_PKEY* key) const noexcept {
@@ -75,11 +74,6 @@ struct RealityServerState {
     static const int index = SSL_CTX_get_ex_new_index(
         0, nullptr, nullptr, nullptr, nullptr);
     return index;
-}
-
-[[nodiscard]] uint16_t ReadBigEndianU16(const uint8_t* data) noexcept {
-    return static_cast<uint16_t>((static_cast<uint16_t>(data[0]) << 8) |
-                                 static_cast<uint16_t>(data[1]));
 }
 
 enum class RealitySniParseResult {
@@ -121,46 +115,13 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
             TLSEXT_TYPE_key_share,
             &ext,
             &ext_len) != 1 ||
-        !ext ||
-        ext_len < 2) {
+        !ext) {
         return std::nullopt;
     }
-
-    const uint16_t list_len = ReadBigEndianU16(ext);
-    if (static_cast<size_t>(list_len) + 2 > ext_len) {
-        return std::nullopt;
-    }
-
-    std::optional<std::array<uint8_t, kRealityX25519KeySize>> mlkem_x25519;
-    size_t pos = 2;
-    const size_t end = 2 + static_cast<size_t>(list_len);
-    while (pos + 4 <= end) {
-        const uint16_t group = ReadBigEndianU16(ext + pos);
-        pos += 2;
-        const uint16_t key_len = ReadBigEndianU16(ext + pos);
-        pos += 2;
-        if (pos + key_len > end) {
-            return std::nullopt;
-        }
-
-        const uint8_t* key = ext + pos;
-        if (group == kTlsGroupX25519 && key_len == kRealityX25519KeySize) {
-            std::array<uint8_t, kRealityX25519KeySize> out{};
-            std::copy_n(key, out.size(), out.begin());
-            return out;
-        }
-        if (group == kTlsGroupX25519MlKem768 &&
-            key_len >= kRealityX25519KeySize) {
-            std::array<uint8_t, kRealityX25519KeySize> out{};
-            std::copy_n(
-                key + key_len - kRealityX25519KeySize,
-                out.size(),
-                out.begin());
-            mlkem_x25519 = out;
-        }
-        pos += key_len;
-    }
-    return mlkem_x25519;
+    auto parsed = transport::internet::ParseRealityClientKeyShareExtension(
+        std::span<const uint8_t>(ext, ext_len));
+    if (!parsed) return std::nullopt;
+    return *parsed;
 }
 
 [[nodiscard]] std::vector<uint8_t> BuildRealityClientHelloAad(
