@@ -45,6 +45,16 @@ expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
+expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":65536,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}]]=])
+expect_rejected(negative_vless_outbound_port "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"vless","settings":{"server":"example.com","server_port":-1,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]]=])
+expect_rejected(string_trojan_outbound_port "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"trojan","settings":{"server":"example.com","server_port":"443","password":"secret"}}]]=])
+expect_rejected(overflow_ss_outbound_port "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":65536,"method":"aes-256-gcm","password":"secret"}}]]=])
+expect_rejected(invalid_anytls_preferred_port "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":"bad","port":443,"password":"secret"}}]]=])
 expect_rejected(unsupported_inbound "{}" "inbounds.json"
     [=[[{"tag":"bad","protocol":"does-not-exist","port":12001,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
 expect_rejected(invalid_ss_inbound "{}" "inbounds.json"

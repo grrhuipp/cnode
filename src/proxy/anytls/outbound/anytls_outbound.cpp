@@ -12,6 +12,7 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/settings_json.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -46,17 +47,6 @@ std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
         }
         return {};
     };
-    auto read_port = [&](std::string_view key, uint16_t fallback) -> uint16_t {
-        if (const auto* value = settings.if_contains(key); value) {
-            const auto raw = value->is_int64()
-                ? value->as_int64()
-                : (value->is_uint64() ? static_cast<int64_t>(value->as_uint64()) : 0);
-            if (raw > 0 && raw <= 65535) {
-                return static_cast<uint16_t>(raw);
-            }
-        }
-        return fallback;
-    };
 
     if (const auto value = read_string("address"); !value.empty()) {
         result.address = value;
@@ -64,7 +54,14 @@ std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     if (result.address.empty()) {
         result.address = read_string("server");
     }
-    result.port = read_port("server_port", read_port("port", result.port));
+    const auto port = acpp::proxyman::outbound::ParsePort(
+        settings, {"server_port", "port"});
+    if (!port.valid) {
+        return std::nullopt;
+    }
+    if (port.present) {
+        result.port = port.value;
+    }
     if (const auto value = read_string("password"); !value.empty()) {
         result.password = value;
     }

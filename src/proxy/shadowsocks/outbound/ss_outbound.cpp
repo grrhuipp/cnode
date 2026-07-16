@@ -5,6 +5,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/settings_json.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -760,19 +761,6 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return {};
         };
-        auto json_port = [](const acpp::json::object& obj,
-                            std::string_view key,
-                            uint16_t fallback = 0) -> uint16_t {
-            if (const auto* v = obj.if_contains(key); v) {
-                if (v->is_uint64()) {
-                    return static_cast<uint16_t>(v->as_uint64());
-                }
-                if (v->is_int64()) {
-                    return static_cast<uint16_t>(v->as_int64());
-                }
-            }
-            return fallback;
-        };
         auto json_uot_version = [](const acpp::json::object& obj) -> uint8_t {
             const acpp::json::value* value = obj.if_contains("udp_over_tcp");
             if (!value) {
@@ -842,8 +830,14 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (config.address.empty()) {
                 config.address = json_string(obj, "server");
             }
-            config.port = json_port(
-                obj, "server_port", json_port(obj, "port", config.port));
+            const auto port = acpp::proxyman::outbound::ParsePort(
+                obj, {"server_port", "port"});
+            if (!port.valid) {
+                return false;
+            }
+            if (port.present) {
+                config.port = port.value;
+            }
             config.password = json_string(obj, "password");
             if (config.password.empty()) {
                 config.password = json_string(obj, "key");
@@ -852,6 +846,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 config.method = method;
             }
             config.uot_version = json_uot_version(obj);
+            return true;
         };
 
         acpp::SsOutboundConfig ss_config;
@@ -861,11 +856,15 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (const auto* servers_p = cfg.settings.if_contains("servers");
                 servers_p && servers_p->is_array() && !servers_p->as_array().empty() &&
                 servers_p->as_array()[0].is_object()) {
-            read_ss_server(servers_p->as_array()[0].as_object(), ss_config);
+            if (!read_ss_server(servers_p->as_array()[0].as_object(), ss_config)) {
+                return std::nullopt;
+            }
             parsed_xray = true;
         }
         if (!parsed_xray) {
-            read_ss_server(cfg.settings, ss_config);
+            if (!read_ss_server(cfg.settings, ss_config)) {
+                return std::nullopt;
+            }
         }
         ss_config.stream_settings = cfg.stream_settings;
         ss_config.send_through = cfg.send_through;
@@ -878,7 +877,8 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .alpn = {},
             });
 
-        if (ss_config.address.empty() || ss_config.password.empty()) {
+        if (ss_config.address.empty() || ss_config.password.empty() ||
+            ss_config.port == 0) {
             return std::nullopt;
         }
         acpp::proxyman::outbound::PreparedOutboundConfig prepared;

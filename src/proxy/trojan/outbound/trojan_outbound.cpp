@@ -3,6 +3,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/settings_json.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
@@ -590,19 +591,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return {};
         };
-        auto json_port = [](const acpp::json::object& obj,
-                            std::string_view key,
-                            uint16_t fallback = 0) -> uint16_t {
-            if (const auto* v = obj.if_contains(key); v) {
-                if (v->is_uint64()) {
-                    return static_cast<uint16_t>(v->as_uint64());
-                }
-                if (v->is_int64()) {
-                    return static_cast<uint16_t>(v->as_int64());
-                }
-            }
-            return fallback;
-        };
         auto json_bool = [](const acpp::json::object& obj,
                             std::string_view key,
                             bool fallback = false) -> bool {
@@ -631,8 +619,14 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (config.address.empty()) {
                 config.address = json_string(obj, "server");
             }
-            config.port = json_port(
-                obj, "server_port", json_port(obj, "port", config.port));
+            const auto port = acpp::proxyman::outbound::ParsePort(
+                obj, {"server_port", "port"});
+            if (!port.valid) {
+                return false;
+            }
+            if (port.present) {
+                config.port = port.value;
+            }
             config.password = json_string(obj, "password");
             config.server_name = json_string(obj, "serverName");
             if (config.server_name.empty()) {
@@ -646,6 +640,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 "allowInsecure",
                 json_bool(obj, "allow_insecure", config.allow_insecure));
             config.alpn = json_string_array(obj, "alpn");
+            return true;
         };
 
         acpp::TrojanOutboundConfig trojan_config;
@@ -655,11 +650,16 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         if (const auto* servers_p = s.if_contains("servers");
                 servers_p && servers_p->is_array() && !servers_p->as_array().empty() &&
                 servers_p->as_array()[0].is_object()) {
-            read_trojan_server(servers_p->as_array()[0].as_object(), trojan_config);
+            if (!read_trojan_server(
+                    servers_p->as_array()[0].as_object(), trojan_config)) {
+                return std::nullopt;
+            }
             parsed_xray = true;
         }
         if (!parsed_xray) {
-            read_trojan_server(s, trojan_config);
+            if (!read_trojan_server(s, trojan_config)) {
+                return std::nullopt;
+            }
         }
         trojan_config.stream_settings = cfg.stream_settings;
         trojan_config.send_through = cfg.send_through;
@@ -674,7 +674,8 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     trojan_config.alpn.size()),
             });
 
-        if (trojan_config.address.empty() || trojan_config.password.empty()) {
+        if (trojan_config.address.empty() || trojan_config.password.empty() ||
+            trojan_config.port == 0) {
             return std::nullopt;  // 配置不完整
         }
 
