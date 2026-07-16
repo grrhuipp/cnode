@@ -131,6 +131,39 @@ if(NOT UOT_SOURCE_TEXT MATCHES
     message(FATAL_ERROR
         "UoT must encode one complete MultiBuffer datagram per frame")
 endif()
+set(TROJAN_UDP_FRAMING
+    "${SOURCE_DIR}/src/proxy/trojan/udp_framing.cpp")
+set(TROJAN_INBOUND
+    "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp")
+set(TROJAN_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/trojan/outbound/trojan_outbound.cpp")
+file(READ "${TROJAN_UDP_FRAMING}" TROJAN_UDP_FRAMING_SOURCE)
+file(READ "${TROJAN_INBOUND}" TROJAN_INBOUND_SOURCE)
+file(READ "${TROJAN_OUTBOUND}" TROJAN_OUTBOUND_SOURCE)
+foreach(TROJAN_ENDPOINT_SOURCE IN ITEMS
+        TROJAN_INBOUND_SOURCE TROJAN_OUTBOUND_SOURCE)
+    if(${TROJAN_ENDPOINT_SOURCE} MATCHES "class TrojanUdpFramer")
+        message(FATAL_ERROR
+            "Trojan endpoints must not duplicate UDP stream framing")
+    endif()
+    if(NOT ${TROJAN_ENDPOINT_SOURCE} MATCHES
+            "trojan::WriteUdpDatagram")
+        message(FATAL_ERROR
+            "Trojan endpoints must use the shared datagram writer")
+    endif()
+    if(NOT ${TROJAN_ENDPOINT_SOURCE} MATCHES
+            "co_return std::move[(]packet[.]payload[)]")
+        message(FATAL_ERROR
+            "Trojan UDP readers must return exactly one logical datagram")
+    endif()
+endforeach()
+if(NOT TROJAN_UDP_FRAMING_SOURCE MATCHES
+        "buf::InspectUdpDatagram[(]payload[)]" OR
+   NOT TROJAN_UDP_FRAMING_SOURCE MATCHES
+        "buf::AppendSpanToMultiBuffer")
+    message(FATAL_ERROR
+        "Trojan UDP framing must preserve complete MultiBuffer datagrams")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES

@@ -433,6 +433,7 @@ set(CNODE_SOURCES
     # Proxy - Trojan
     src/proxy/trojan/validator.cpp
     src/proxy/trojan/trojan_codec.cpp
+    src/proxy/trojan/udp_framing.cpp
     src/proxy/trojan/inbound/trojan_inbound.cpp
     src/proxy/trojan/outbound/trojan_outbound.cpp
 
@@ -836,6 +837,36 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_reality_short_id_test
         COMMAND cnode_reality_short_id_test)
+
+    add_executable(cnode_trojan_udp_framing_test
+        tests/trojan_udp_framing_test.cpp
+        src/infra/log.cpp
+        src/proxy/trojan/trojan_codec.cpp
+        src/proxy/trojan/udp_framing.cpp
+    )
+    target_include_directories(cnode_trojan_udp_framing_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/trojan
+        ${concurrentqueue_SOURCE_DIR}
+    )
+    target_link_libraries(cnode_trojan_udp_framing_test PRIVATE
+        asio::asio
+        Threads::Threads
+        crypto
+        cnode_zlib
+    )
+    if(WIN32)
+        target_link_libraries(cnode_trojan_udp_framing_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_trojan_udp_framing_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_trojan_udp_framing_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_trojan_udp_framing_test
+        COMMAND cnode_trojan_udp_framing_test)
 
     add_executable(cnode_uot_ss2022_test
         tests/uot_ss2022_test.cpp

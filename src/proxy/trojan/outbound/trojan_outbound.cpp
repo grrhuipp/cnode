@@ -1,5 +1,6 @@
 #include "trojan_outbound.hpp"
 #include "../trojan_codec.hpp"
+#include "../udp_framing.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
@@ -23,8 +24,6 @@
 namespace acpp {
 
 namespace {
-
-constexpr size_t kUdpFrameQueueShrinkItems = 64;
 
 net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t len) {
     if (len == 0) {
@@ -87,143 +86,6 @@ net::awaitable<bool> WriteTrojanTcpInitial(
     co_return true;
 }
 
-class TrojanUdpFramer {
-public:
-    struct FramedUdpPacket {
-        TargetAddress target;
-        buf::BufferGuard payload;
-    };
-
-    void Feed(const uint8_t* data, size_t len) {
-        while (len > 0) {
-            if (!pending_) {
-                pending_ = buf::BufferGuard{buf::Buffer::New()};
-                if (!pending_) {
-                    return;
-                }
-            }
-
-            if (pending_->Available() == 0 && pending_->start > 0) {
-                Compact();
-            }
-            if (pending_->Available() == 0) {
-                ClearBuffer();
-                return;
-            }
-
-            const size_t n = std::min<size_t>(len, pending_->Available());
-            std::memcpy(pending_->Tail().data(), data, n);
-            pending_->Produce(static_cast<uint32_t>(n));
-            data += n;
-            len -= n;
-
-            Parse();
-        }
-    }
-
-    bool Next(FramedUdpPacket& out) {
-        if (queue_.empty()) {
-            return false;
-        }
-        out = std::move(queue_.front());
-        queue_.pop_front();
-        if (queue_.empty() && shrink_queue_on_drain_) {
-            TryShrinkSequence(queue_);
-            shrink_queue_on_drain_ = false;
-        }
-        return true;
-    }
-
-private:
-    buf::BufferGuard pending_;
-    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
-    bool shrink_queue_on_drain_ = false;
-
-    void Compact() {
-        if (!pending_ || pending_->start == 0) {
-            return;
-        }
-        const uint32_t remaining = pending_->Len();
-        if (remaining == 0) {
-            ClearBuffer();
-            return;
-        }
-        std::memmove(pending_->data, pending_->Bytes().data(), remaining);
-        pending_->start = 0;
-        pending_->end = remaining;
-    }
-
-    const uint8_t* Data() const {
-        return pending_ ? pending_->Bytes().data() : nullptr;
-    }
-
-    size_t Size() const {
-        return pending_ ? pending_->Len() : 0;
-    }
-
-    void ClearBuffer() {
-        pending_ = buf::BufferGuard{};
-    }
-
-    [[nodiscard]] bool TryTakePacket(const TargetAddress& target,
-                                     std::span<const uint8_t> payload) {
-        buf::BufferGuard taken;
-        if (!buf::TakeBufferSuffix(pending_, payload, taken)) {
-            return false;
-        }
-
-        FramedUdpPacket pkt;
-        pkt.target = target;
-        pkt.payload = std::move(taken);
-        queue_.push_back(std::move(pkt));
-        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-            shrink_queue_on_drain_ = true;
-        }
-        return true;
-    }
-
-    void Parse() {
-        while (Size() > 0) {
-            auto parsed = trojan::TrojanCodec::ParseUdpPacket(Data(), Size());
-            if (parsed.result == trojan::TrojanCodec::UdpParseResult::SUCCESS) {
-                if (parsed.packet &&
-                    TryTakePacket(parsed.packet->target, parsed.packet->payload)) {
-                    continue;
-                }
-                FramedUdpPacket pkt;
-                pkt.target = parsed.packet->target;
-                pkt.payload = buf::BufferGuard{buf::Buffer::New()};
-                if (pkt.payload) {
-                    const auto payload = parsed.packet->payload;
-                    const size_t n = std::min<size_t>(
-                        payload.size(),
-                        static_cast<size_t>(pkt.payload->Available()));
-                    std::memcpy(pkt.payload->Tail().data(), payload.data(), n);
-                    pkt.payload->Produce(static_cast<uint32_t>(n));
-                    queue_.push_back(std::move(pkt));
-                    if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-                        shrink_queue_on_drain_ = true;
-                    }
-                }
-                pending_->Advance(static_cast<uint32_t>(parsed.consumed));
-                continue;
-            }
-            if (parsed.result == trojan::TrojanCodec::UdpParseResult::INCOMPLETE) {
-                break;
-            }
-            pending_->Advance(1);
-            if (Size() < 8) {
-                ClearBuffer();
-                break;
-            }
-        }
-
-        if (pending_ && pending_->IsEmpty()) {
-            ClearBuffer();
-        }
-    }
-};
-
 class TrojanUdpOutboundEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
@@ -234,17 +96,14 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
-            buf::MultiBuffer out;
-            TrojanUdpFramer::FramedUdpPacket pkt;
-            while (framer_.Next(pkt)) {
-                if (!pkt.payload || pkt.payload->IsEmpty()) {
-                    continue;
+            trojan::FramedUdpPacket packet;
+            if (framer_.Next(packet)) {
+                for (buf::Buffer* buffer : packet.payload) {
+                    if (buffer && !buffer->IsEmpty()) {
+                        buffer->SetUDP(packet.target);
+                    }
                 }
-                pkt.payload->SetUDP(std::move(pkt.target));
-                out.push_back(pkt.payload.release());
-            }
-            if (buf::HasData(out)) {
-                co_return out;
+                co_return std::move(packet.payload);
             }
 
             buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
@@ -261,71 +120,12 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        buf::MultiBuffer out;
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            const TargetAddress& target =
-                buffer->HasUDP() ? buffer->UDP() : fallback_target_;
-            buf::BufferGuard header{buf::Buffer::New()};
-            if (!header) {
-                throw std::bad_alloc();
-            }
-            const size_t written = trojan::TrojanCodec::EncodeUdpPacketHeaderTo(
-                target,
-                buffer->Len(),
-                header->Tail().data(),
-                header->Available());
-            if (written == 0) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            header->Produce(static_cast<uint32_t>(written));
-            out.push_back(header.release());
-            buffer->ClearUDP();
-            out.push_back(mb.ReleaseSlot(buffer));
-        }
-        mb.clear();
-        if (buf::HasData(out)) {
-            co_await stream_.WriteMultiBuffer(std::move(out));
-        }
+        co_await trojan::WriteUdpDatagram(stream_, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        buf::MultiBuffer header_owner;
-        memory::ThreadLocalVector<net::const_buffer> out;
-        header_owner.reserve(buffers.size());
-        out.reserve(buffers.size() * 2);
-
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!data || buffer.size() == 0) {
-                continue;
-            }
-            buf::BufferGuard header{buf::Buffer::New()};
-            if (!header) {
-                throw std::bad_alloc();
-            }
-            const size_t written = trojan::TrojanCodec::EncodeUdpPacketHeaderTo(
-                fallback_target_,
-                buffer.size(),
-                header->Tail().data(),
-                header->Available());
-            if (written == 0) {
-                throw IoSystemError(io_error::fault, "Trojan UDP header allocation failed");
-            }
-            header->Produce(static_cast<uint32_t>(written));
-            const auto header_bytes = header->Bytes();
-            out.emplace_back(header_bytes.data(), header_bytes.size());
-            header_owner.push_back(header.release());
-            out.emplace_back(data, buffer.size());
-        }
-
-        if (!out.empty()) {
-            co_await stream_.WriteBuffers(out);
-        }
+        co_await trojan::WriteUdpDatagram(
+            stream_, fallback_target_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -380,7 +180,7 @@ public:
 private:
     AsyncStream& stream_;
     TargetAddress fallback_target_;
-    TrojanUdpFramer framer_;
+    trojan::UdpFramer framer_;
 };
 
 }  // namespace
