@@ -199,6 +199,40 @@ void TestOversizedBodiesRejectedBeforeRead() {
           "oversized chunked body lost its cause");
 }
 
+void TestOversizedHeadersRejected() {
+    std::string oversized_line = "HTTP/1.1 200 OK\r\nX-Large: ";
+    oversized_line.append(64 * 1024, 'x');
+    oversized_line += "\r\n\r\n";
+    auto line_response = ReadResponse({std::move(oversized_line)});
+    Check(line_response.status == -1,
+          "oversized regular header line was accepted");
+    Check(line_response.body.find("line too large") != std::string::npos,
+          "oversized header line lost its cause");
+
+    std::string oversized_section = "HTTP/1.1 200 OK\r\n";
+    for (int i = 0; i < 5; ++i) {
+        oversized_section += "X-Part: ";
+        oversized_section.append(60 * 1024, 'y');
+        oversized_section += "\r\n";
+    }
+    oversized_section += "\r\n";
+    auto section_response = ReadResponse({std::move(oversized_section)});
+    Check(section_response.status == -1,
+          "oversized regular header section was accepted");
+    Check(section_response.body.find("headers too large") != std::string::npos,
+          "oversized header section lost its cause");
+}
+
+void TestIncompleteHeadersReturnStructuredError() {
+    auto response = ReadResponse({
+        "HTTP/1.1 200 OK\r\nX-Incomplete: value",
+    });
+    Check(response.status == -1,
+          "unterminated response headers were accepted");
+    Check(response.body.find("invalid HTTP response headers") != std::string::npos,
+          "unterminated response headers escaped structured error handling");
+}
+
 }  // namespace
 
 int main() {
@@ -208,6 +242,8 @@ int main() {
     TestMalformedChunkTerminatorRejected();
     TestMalformedContentLengthRejected();
     TestOversizedBodiesRejectedBeforeRead();
+    TestOversizedHeadersRejected();
+    TestIncompleteHeadersReturnStructuredError();
     std::cout << "v2board_http_response_test: ok\n";
     return 0;
 }

@@ -5,7 +5,6 @@
 #include <asio/as_tuple.hpp>
 #include <asio/buffers_iterator.hpp>
 #include <asio/read.hpp>
-#include <asio/read_until.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
 
@@ -24,6 +23,8 @@
 namespace acpp::api::v2board::http {
 
 inline constexpr size_t kMaxHttpBodySize = 64 * 1024 * 1024;
+inline constexpr size_t kMaxHttpLineSize = 64 * 1024;
+inline constexpr size_t kMaxHttpHeaderSize = 256 * 1024;
 
 struct Response {
     int status = 0;
@@ -120,8 +121,6 @@ template <typename Stream>
 net::awaitable<std::expected<std::string, std::string>> ReadCrlfLine(
     Stream& stream,
     net::streambuf& buffer) {
-    constexpr size_t kMaxHttpLineSize = 64 * 1024;
-
     for (;;) {
         if (const auto line_size = FindCrlf(buffer)) {
             if (*line_size > kMaxHttpLineSize) {
@@ -227,14 +226,14 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
     Response result;
     net::streambuf buffer;
 
-    co_await net::async_read_until(stream, buffer, "\r\n\r\n", net::use_awaitable);
-
-    std::istream header_stream(&buffer);
-    std::string status_line;
-    std::getline(header_stream, status_line);
-    if (!status_line.empty() && status_line.back() == '\r') {
-        status_line.pop_back();
+    auto status_line_result = co_await ReadCrlfLine(stream, buffer);
+    if (!status_line_result) {
+        result.status = -1;
+        result.body = "invalid HTTP response headers: " + status_line_result.error();
+        co_return result;
     }
+    std::string status_line = std::move(*status_line_result);
+    size_t header_size = status_line.size() + 2;
 
     std::istringstream status_parser(status_line);
     std::string http_version;
@@ -250,12 +249,23 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
     bool has_content_length = false;
     bool is_chunked = false;
 
-    std::string line;
-    while (std::getline(header_stream, line)) {
-        if (line == "\r" || line.empty()) break;
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+    for (;;) {
+        auto line_result = co_await ReadCrlfLine(stream, buffer);
+        if (!line_result) {
+            result.status = -1;
+            result.body = "invalid HTTP response headers: " + line_result.error();
+            co_return result;
         }
+        if (header_size > kMaxHttpHeaderSize - 2 ||
+            line_result->size() > kMaxHttpHeaderSize - header_size - 2) {
+            result.status = -1;
+            result.body = "HTTP response headers too large";
+            co_return result;
+        }
+        header_size += line_result->size() + 2;
+        if (line_result->empty()) break;
+
+        const std::string& line = *line_result;
 
         const size_t colon = line.find(':');
         if (colon == std::string::npos) continue;
