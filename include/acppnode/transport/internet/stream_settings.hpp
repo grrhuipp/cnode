@@ -143,7 +143,6 @@ struct RealityConfig {
     bool show = false;
     std::string type;
     std::string dest;
-    uint8_t xver = 0;
     std::vector<std::string> server_names;
     std::string private_key;
     std::vector<std::string> short_ids;

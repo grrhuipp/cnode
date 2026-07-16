@@ -29,6 +29,13 @@ function(expect_rejected case_name main_content sidecar_name sidecar_content)
         message(FATAL_ERROR
             "${case_name}: cnode did not reject promptly: ${result}\nstdout=${stdout}\nstderr=${stderr}")
     endif()
+    if(ARGC GREATER 4)
+        set(output "${stdout}\n${stderr}")
+        if(NOT "${output}" MATCHES "${ARGV4}")
+            message(FATAL_ERROR
+                "${case_name}: rejection lost expected cause '${ARGV4}'\nstdout=${stdout}\nstderr=${stderr}")
+        endif()
+    endif()
 endfunction()
 
 function(expect_started case_name main_content sidecar_name sidecar_content)
@@ -231,6 +238,18 @@ expect_rejected(negative_reality_max_time_diff "{}" "outbounds.json"
     [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":-1}}}]]=])
 expect_rejected(conflicting_reality_max_time_diff "{}" "outbounds.json"
     [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":60000,"max_time_diff":30000}}}]]=])
+expect_rejected(unsupported_reality_proxy_protocol "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","xver":1,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "PROXY protocol forwarding")
+expect_rejected(out_of_range_reality_proxy_protocol "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","xver":3,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "between 0 and 2")
+expect_rejected(non_integer_reality_proxy_protocol "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","xver":"1","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "must be an integer between 0 and 2")
+expect_started(valid_zero_reality_proxy_protocol
+    [=[{"workers":1}]=] "inbounds.json"
+    [=[[{"tag":"valid-reality-xver-zero","protocol":"vless","listen":"127.0.0.1","port":12101,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","xver":0,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"

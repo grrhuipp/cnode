@@ -781,8 +781,15 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     if (cfg.dest.empty()) {
         cfg.dest = jstr_or_int(j, "target", "");
     }
-    const int64_t xver = jint(j, "xver", 0);
-    cfg.xver = xver < 0 ? 0 : static_cast<uint8_t>(std::min<int64_t>(xver, 255));
+    auto xver = ParseAliasedJsonUint64(j, {"xver"}, 2);
+    if (!xver) {
+        throw std::invalid_argument(std::move(xver.error()));
+    }
+    if (xver->value_or(0) != 0) {
+        throw std::invalid_argument(
+            "REALITY xver 1 and 2 are not supported; PROXY protocol forwarding "
+            "to the REALITY target is not implemented");
+    }
     if (auto* p = j.if_contains("serverNames"); p && p->is_array()) {
         cfg.server_names = jstr_array(*p);
     }
