@@ -71,6 +71,7 @@ struct ReceiverSettings {
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
     RoutePolicy      route_policy;
     ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
+    uint32_t         access_source_ref = 0;    // 集中访问日志来源，0 表示不集中上报。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
         return has_route_inbound_tags ? &inbound_tags : nullptr;
@@ -85,7 +86,8 @@ struct ReceiverSettings {
     SniffConfig sniff_config,
     ConnectionLimiter* limiter,
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto,
-    RoutePolicy route_policy = {}) {
+    RoutePolicy route_policy = {},
+    uint32_t access_source_ref = 0) {
     ReceiverSettings settings;
     settings.inbound_tag     = std::move(inbound_tag);
     settings.inbound_tags    = std::move(inbound_tags);
@@ -100,6 +102,7 @@ struct ReceiverSettings {
           settings.inbound_tags.front() == settings.inbound_tag);
     settings.route_policy    = std::move(route_policy);
     settings.limiter         = limiter;
+    settings.access_source_ref = access_source_ref;
     return settings;
 }
 

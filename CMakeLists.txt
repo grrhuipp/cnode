@@ -212,6 +212,40 @@ target_compile_definitions(cnode_blake3 PRIVATE
 )
 message(STATUS "Using BLAKE3 via FetchContent")
 
+FetchContent_Declare(
+    zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG v1.5.7
+    SOURCE_SUBDIR cnode-no-upstream-cmake
+)
+FetchContent_MakeAvailable(zstd)
+add_library(cnode_zstd STATIC
+    ${zstd_SOURCE_DIR}/lib/common/debug.c
+    ${zstd_SOURCE_DIR}/lib/common/entropy_common.c
+    ${zstd_SOURCE_DIR}/lib/common/error_private.c
+    ${zstd_SOURCE_DIR}/lib/common/fse_decompress.c
+    ${zstd_SOURCE_DIR}/lib/common/pool.c
+    ${zstd_SOURCE_DIR}/lib/common/threading.c
+    ${zstd_SOURCE_DIR}/lib/common/xxhash.c
+    ${zstd_SOURCE_DIR}/lib/common/zstd_common.c
+    ${zstd_SOURCE_DIR}/lib/compress/fse_compress.c
+    ${zstd_SOURCE_DIR}/lib/compress/hist.c
+    ${zstd_SOURCE_DIR}/lib/compress/huf_compress.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_compress.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_compress_literals.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_compress_sequences.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_compress_superblock.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_double_fast.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_fast.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_lazy.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_ldm.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_opt.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstd_preSplit.c
+    ${zstd_SOURCE_DIR}/lib/compress/zstdmt_compress.c
+)
+target_include_directories(cnode_zstd PUBLIC ${zstd_SOURCE_DIR}/lib)
+message(STATUS "Using zstd compression library via FetchContent")
+
 if(CNODE_USE_MIMALLOC)
     set(MI_OVERRIDE ON CACHE BOOL "Override malloc/free so C++ new/delete reaches mimalloc through libstdc++" FORCE)
     set(MI_LIBC_MUSL ON CACHE BOOL "Build mimalloc for musl libc" FORCE)
@@ -271,6 +305,9 @@ set(CNODE_SOURCES
 
     # Infra (logging, config)
     src/infra/log.cpp
+    src/infra/access_log_identity.cpp
+    src/infra/access_log_encoding.cpp
+    src/infra/access_log_reporter.cpp
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/routing_ip_network.cpp
@@ -318,6 +355,7 @@ set(CNODE_SOURCES
     src/transport/internet/proxy_protocol.cpp
 
     # App (Application layer)
+    src/app/access_log_session.cpp
     src/app/dispatcher/default_dispatcher.cpp
     src/app/mux_session_handler.cpp
     src/app/proxyman/inbound/factory.cpp
@@ -453,6 +491,7 @@ target_link_libraries(cnode PRIVATE
     crypto
     cnode_blake3
     cnode_zlib
+    cnode_zstd
 )
 
 if(CNODE_USE_MIMALLOC)
@@ -500,7 +539,7 @@ target_link_options(cnode PRIVATE
 
 # 平台链接库
 if(WIN32)
-    target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi)
+    target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi crypt32)
 elseif(UNIX AND NOT APPLE)
     # glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
     find_library(LIBDL dl)
@@ -1247,6 +1286,32 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_panel_node_ids_test
         COMMAND cnode_panel_node_ids_test)
+
+    add_executable(cnode_access_log_wire_test
+        tests/access_log_wire_test.cpp
+        src/infra/access_log_identity.cpp
+        src/infra/access_log_encoding.cpp
+    )
+    target_include_directories(cnode_access_log_wire_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
+    )
+    target_link_libraries(cnode_access_log_wire_test PRIVATE
+        asio::asio
+        cnode_zstd
+    )
+    if(WIN32)
+        target_link_libraries(cnode_access_log_wire_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_access_log_wire_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_access_log_wire_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_access_log_wire_test
+        COMMAND cnode_access_log_wire_test)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp

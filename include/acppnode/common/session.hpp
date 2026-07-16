@@ -38,9 +38,14 @@ struct Inbound {
     uint16_t source_port = 0;
     std::optional<tcp::endpoint> local_endpoint;
     std::string_view tag;
+    std::string_view protocol;
     const std::vector<std::string>* tags = nullptr;
     int64_t user_id = 0;
     std::string user_email;
+    // Opaque reference into the process-level immutable access-log source
+    // registry. Panel fields stay in the control plane and never enter the
+    // Worker hot-path Context.
+    uint32_t access_source_ref = 0;
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。
@@ -87,6 +92,10 @@ struct Context {
     int64_t accept_time_us = 0;
 
     uint32_t worker_id = 0;
+
+    // Worker-local idempotency bit shared by the inbound fallback guard and
+    // Dispatcher terminal-event guard.
+    bool access_event_submitted = false;
 
     Context() {
         accept_time_us = NowMicros();

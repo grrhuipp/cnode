@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package acpp.accesslog.v1;
+
+enum AccessResult {
+  ACCESS_RESULT_UNSPECIFIED = 0;
+  ACCESS_RESULT_COMPLETED = 1;
+  ACCESS_RESULT_REJECTED = 2;
+  ACCESS_RESULT_FAILED = 3;
+  ACCESS_RESULT_CANCELLED = 4;
+}
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_TCP = 1;
+  NETWORK_UDP = 2;
+  NETWORK_MUX = 3;
+}
+
+enum CloseSide {
+  CLOSE_SIDE_UNSPECIFIED = 0;
+  CLOSE_SIDE_CLIENT = 1;
+  CLOSE_SIDE_REMOTE = 2;
+  CLOSE_SIDE_LOCAL = 3;
+}
+
+message SourceDescriptor {
+  uint32 source_ref = 1;
+  string panel_name = 2;
+  string panel_api_host = 3;
+  string node_type = 4;
+  uint64 node_id = 5;
+}
+
+message AccessEvent {
+  uint32 source_ref = 1;
+  bytes event_id = 2;
+  uint64 sequence = 3;
+  uint64 conn_id = 4;
+  uint32 worker_id = 5;
+  sint64 user_id = 6;
+  int64 started_at_unix_us = 7;
+  int64 ended_at_unix_us = 8;
+  uint64 duration_ms = 9;
+  string user_email = 10;
+  string inbound_tag = 11;
+  string outbound_tag = 12;
+  string protocol = 13;
+  Network network = 14;
+  string source_ip = 15;
+  uint32 source_port = 16;
+  string target_host = 17;
+  uint32 target_port = 18;
+  string remote_ip = 19;
+  string local_ip = 20;
+  uint64 uplink_bytes = 21;
+  uint64 downlink_bytes = 22;
+  AccessResult result = 23;
+  int32 error_code = 24;
+  CloseSide close_side = 25;
+  uint32 dns_state = 26;
+  string sniff_protocol = 27;
+  string sniff_domain = 28;
+}
+
+message AccessBatch {
+  uint32 schema_version = 1;
+  bytes batch_id = 2;
+  string server_id = 3;
+  bytes boot_id = 4;
+  uint64 first_sequence = 5;
+  uint64 last_sequence = 6;
+  repeated SourceDescriptor sources = 7;
+  repeated AccessEvent events = 8;
+}

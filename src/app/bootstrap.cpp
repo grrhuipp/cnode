@@ -2,6 +2,7 @@
 #include "acppnode/app/bootstrap_cli.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/access_log_reporter.hpp"
 #include "acppnode/app/bootstrap_setup.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
 #include "acppnode/service/controller/controller.hpp"
@@ -122,13 +123,20 @@ int RunFromCommandLine(int argc, char* argv[]) {
 
     if (!config.Validate()) {
         std::cerr << "Invalid configuration\n";
+        Log::Shutdown();
         return 1;
+    }
+
+    if (!accesslog::Reporter::Instance().Initialize(config.GetLog().log_dir)) {
+        LOG_ERROR("Failed to initialize centralized access-log reporter");
     }
 
     try {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
         RunApplicationRuntime(MakeRuntimeContext(env));
     } catch (const std::exception& e) {
+        accesslog::Reporter::Instance().Shutdown();
+        Log::Shutdown();
         std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;
     }

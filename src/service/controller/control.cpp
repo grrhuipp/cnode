@@ -11,6 +11,7 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
+#include "acppnode/infra/access_log_reporter.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/common/online_device.hpp"
@@ -77,6 +78,17 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
 
     auto inbound = controller::InboundBuilder(panel_name, panel_cfg, node_config);
 
+    const uint32_t access_source_ref = accesslog::Reporter::Instance().RegisterSource({
+        .panel_name = panel_name,
+        .panel_api_host = client_info.APIHost,
+        .node_type = inbound.protocol,
+        .node_id = static_cast<uint64_t>(node_id),
+    });
+    if (access_source_ref == 0) {
+        LOG_ERROR("Node {}/{}: centralized access-log source registration failed api={}",
+                  panel_name, node_id, client_info.APIHost);
+    }
+
     if (!proxyman::inbound::HasProxy(inbound.protocol)) {
         LOG_WARN("Node {}/{}: unsupported inbound protocol '{}'",
                  panel_name, node_id, inbound.protocol);
@@ -94,7 +106,8 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
             inbound.sniff,
             limiter,
             inbound.proxy_protocol,
-            proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag));
+            proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag),
+            access_source_ref);
 
         const bool registered = co_await net::co_spawn(
             worker->GetExecutor(),

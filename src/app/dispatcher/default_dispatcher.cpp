@@ -1,5 +1,7 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 
+#include "acppnode/app/access_log_session.hpp"
+
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -149,7 +151,14 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    co_return co_await DispatchPreparedLink(
+    app::AccessLogSession access_log(ctx);
+    if (ctx.content.network == Network::MUX) {
+        // The Mux control connection contains framing bytes and would double
+        // count traffic. Its logical TCP/UDP sub-sessions are reported instead.
+        access_log.Cancel();
+    }
+
+    RelayResult result = co_await DispatchPreparedLink(
         io_context,
         receiver,
         std::move(inbound),
@@ -159,6 +168,8 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         stats,
         timeouts,
         pressure_idle_timeout);
+    access_log.Complete(result);
+    co_return result;
 }
 
 net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(

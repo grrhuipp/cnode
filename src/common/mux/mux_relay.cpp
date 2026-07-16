@@ -1217,9 +1217,11 @@ net::awaitable<RelayResult> DoMuxRelay(
                     sub_ctx.inbound.source_ip        = parent_ctx.inbound.source_ip;
                     sub_ctx.inbound.local_endpoint   = parent_ctx.inbound.local_endpoint;
                     sub_ctx.inbound.tag              = parent_ctx.inbound.tag;
+                    sub_ctx.inbound.protocol         = parent_ctx.inbound.protocol;
                     sub_ctx.inbound.tags             = parent_ctx.inbound.tags;
                     sub_ctx.inbound.user_id          = parent_ctx.inbound.user_id;
                     sub_ctx.inbound.user_email       = parent_ctx.inbound.user_email;
+                    sub_ctx.inbound.access_source_ref = parent_ctx.inbound.access_source_ref;
                     sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
                     sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
                     sub_ctx.content.network          = Network::UDP;
@@ -1284,9 +1286,11 @@ net::awaitable<RelayResult> DoMuxRelay(
                     sub_ctx.inbound.source_ip        = parent_ctx.inbound.source_ip;
                     sub_ctx.inbound.local_endpoint   = parent_ctx.inbound.local_endpoint;
                     sub_ctx.inbound.tag              = parent_ctx.inbound.tag;
+                    sub_ctx.inbound.protocol         = parent_ctx.inbound.protocol;
                     sub_ctx.inbound.tags             = parent_ctx.inbound.tags;
                     sub_ctx.inbound.user_id          = parent_ctx.inbound.user_id;
                     sub_ctx.inbound.user_email       = parent_ctx.inbound.user_email;
+                    sub_ctx.inbound.access_source_ref = parent_ctx.inbound.access_source_ref;
                     sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
                     sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
                     sub_ctx.content.network          = Network::TCP;

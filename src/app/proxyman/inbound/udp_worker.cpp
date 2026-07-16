@@ -337,6 +337,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->outbound.target = decoded->target;
         ctx->inbound.user_id = decoded->user_id;
         ctx->inbound.user_email = decoded->user_email;
+        ctx->inbound.access_source_ref = receiver->access_source_ref;
+        ctx->inbound.protocol = receiver->protocol;
         ctx->content.speed_limit = decoded->speed_limit;
 
         auto response_context = decoded->response_context;

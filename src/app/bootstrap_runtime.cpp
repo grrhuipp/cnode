@@ -4,6 +4,7 @@
 #include "acppnode/app/bootstrap_shutdown.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/access_log_reporter.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
@@ -113,6 +114,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
     ctx.main_ctx.run_for(std::chrono::milliseconds(100));
     TimeoutScheduler::ReleaseForIoContext(ctx.main_ctx);
 
+    accesslog::Reporter::Instance().Shutdown();
     LOG_CONSOLE("cnode stopped");
     Log::Shutdown();
 }

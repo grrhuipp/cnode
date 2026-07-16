@@ -6,6 +6,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 
 - `README.md` 面向使用者和贡献者，说明项目定位、运行架构、配置入口、关键语义和代码组织。
 - `AGENTS.md` 面向代码修改和自动化协作者，记录必须遵守的职责边界、禁止项、审查清单和硬性删除规则。
+- [`docs/centralized_access_logging.md`](docs/centralized_access_logging.md) 记录集中访问日志、面板节点身份、上报协议和 ClickHouse 存储设计。
 
 如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
 
