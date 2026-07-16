@@ -3,6 +3,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/session.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/app/udp_session.hpp"
@@ -25,76 +26,99 @@ std::string LowerAscii(std::string_view value) {
     return lower;
 }
 
-Handler::DomainStrategy ParseDomainStrategy(std::string_view value) {
+std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
     const auto lower = LowerAscii(value);
-    if (lower == LowerAscii(constants::protocol::kUseIP)) {
-        return Handler::DomainStrategy::UseIP;
+    if (lower == "asis") {
+        return DomainStrategy::AsIs;
     }
-    if (lower == LowerAscii(constants::protocol::kUseIPv6v4)) {
-        return Handler::DomainStrategy::UseIPv6v4;
+    if (lower == "useip") {
+        return DomainStrategy::UseIP;
     }
-    if (lower == LowerAscii(constants::protocol::kUseIPv6)) {
-        return Handler::DomainStrategy::UseIPv6;
+    if (lower == "useipv6v4") {
+        return DomainStrategy::UseIPv6v4;
     }
-    if (lower == LowerAscii(constants::protocol::kUseIPv4v6)) {
-        return Handler::DomainStrategy::UseIPv4v6;
+    if (lower == "useipv6") {
+        return DomainStrategy::UseIPv6;
     }
-    if (lower == LowerAscii(constants::protocol::kUseIPv4)) {
-        return Handler::DomainStrategy::UseIPv4;
+    if (lower == "useipv4v6") {
+        return DomainStrategy::UseIPv4v6;
     }
-    if (lower == LowerAscii(constants::protocol::kForceIP)) {
-        return Handler::DomainStrategy::ForceIP;
+    if (lower == "useipv4") {
+        return DomainStrategy::UseIPv4;
     }
-    if (lower == LowerAscii(constants::protocol::kForceIPv6v4)) {
-        return Handler::DomainStrategy::ForceIPv6v4;
+    if (lower == "forceip") {
+        return DomainStrategy::ForceIP;
     }
-    if (lower == LowerAscii(constants::protocol::kForceIPv6)) {
-        return Handler::DomainStrategy::ForceIPv6;
+    if (lower == "forceipv6v4") {
+        return DomainStrategy::ForceIPv6v4;
     }
-    if (lower == LowerAscii(constants::protocol::kForceIPv4v6)) {
-        return Handler::DomainStrategy::ForceIPv4v6;
+    if (lower == "forceipv6") {
+        return DomainStrategy::ForceIPv6;
     }
-    if (lower == LowerAscii(constants::protocol::kForceIPv4)) {
-        return Handler::DomainStrategy::ForceIPv4;
+    if (lower == "forceipv4v6") {
+        return DomainStrategy::ForceIPv4v6;
     }
-    return Handler::DomainStrategy::AsIs;
+    if (lower == "forceipv4") {
+        return DomainStrategy::ForceIPv4;
+    }
+    return std::nullopt;
 }
 
-bool AcceptsIPv4(Handler::DomainStrategy strategy) {
+std::optional<DomainStrategy> ParseConfiguredDomainStrategy(
+    const json::object& settings) {
+    DomainStrategy parsed = DomainStrategy::AsIs;
+    bool present = false;
+    for (const std::string_view key : {"domainStrategy", "domain_strategy"}) {
+        const auto* value = settings.if_contains(key);
+        if (!value || !value->is_string()) {
+            if (value) return std::nullopt;
+            continue;
+        }
+        const auto candidate = ParseDomainStrategy(value->as_string());
+        if (!candidate || (present && parsed != *candidate)) {
+            return std::nullopt;
+        }
+        parsed = *candidate;
+        present = true;
+    }
+    return parsed;
+}
+
+bool AcceptsIPv4(DomainStrategy strategy) {
     switch (strategy) {
-        case Handler::DomainStrategy::UseIPv6:
-        case Handler::DomainStrategy::ForceIPv6:
+        case DomainStrategy::UseIPv6:
+        case DomainStrategy::ForceIPv6:
             return false;
         default:
             return true;
     }
 }
 
-bool AcceptsIPv6(Handler::DomainStrategy strategy) {
+bool AcceptsIPv6(DomainStrategy strategy) {
     switch (strategy) {
-        case Handler::DomainStrategy::UseIPv4:
-        case Handler::DomainStrategy::ForceIPv4:
+        case DomainStrategy::UseIPv4:
+        case DomainStrategy::ForceIPv4:
             return false;
         default:
             return true;
     }
 }
 
-bool PreferIPv6First(Handler::DomainStrategy strategy) {
+bool PreferIPv6First(DomainStrategy strategy) {
     switch (strategy) {
-        case Handler::DomainStrategy::UseIPv6v4:
-        case Handler::DomainStrategy::ForceIPv6v4:
+        case DomainStrategy::UseIPv6v4:
+        case DomainStrategy::ForceIPv6v4:
             return true;
         default:
             return false;
     }
 }
 
-bool PreservesDnsOrder(Handler::DomainStrategy strategy) {
+bool PreservesDnsOrder(DomainStrategy strategy) {
     switch (strategy) {
-        case Handler::DomainStrategy::AsIs:
-        case Handler::DomainStrategy::UseIP:
-        case Handler::DomainStrategy::ForceIP:
+        case DomainStrategy::AsIs:
+        case DomainStrategy::UseIP:
+        case DomainStrategy::ForceIP:
             return true;
         default:
             return false;
@@ -181,8 +205,6 @@ Handler::Handler(
         explicit_udp_session_id_ =
             MakeUdpSessionId(*settings_.send_through.ExplicitAddress());
     }
-
-    domain_strategy_ = ParseDomainStrategy(settings_.domain_strategy);
 
     stream_settings_.network = std::string(constants::protocol::kTcp);
     stream_settings_.security = std::string(constants::protocol::kNone);
@@ -423,25 +445,25 @@ Handler::ResolveTargets(session::Context& ctx) {
         }
     };
 
-    if (PreservesDnsOrder(domain_strategy_)) {
+    if (PreservesDnsOrder(settings_.domain_strategy)) {
         for (const auto& dns_addr : dns_result.addresses) {
-            if ((dns_addr.is_v4() && AcceptsIPv4(domain_strategy_)) ||
-                (dns_addr.is_v6() && AcceptsIPv6(domain_strategy_))) {
+            if ((dns_addr.is_v4() && AcceptsIPv4(settings_.domain_strategy)) ||
+                (dns_addr.is_v6() && AcceptsIPv6(settings_.domain_strategy))) {
                 addresses.push_back(dns_addr);
             }
         }
-    } else if (PreferIPv6First(domain_strategy_)) {
-        if (AcceptsIPv6(domain_strategy_)) {
+    } else if (PreferIPv6First(settings_.domain_strategy)) {
+        if (AcceptsIPv6(settings_.domain_strategy)) {
             append_family(true);
         }
-        if (AcceptsIPv4(domain_strategy_)) {
+        if (AcceptsIPv4(settings_.domain_strategy)) {
             append_family(false);
         }
     } else {
-        if (AcceptsIPv4(domain_strategy_)) {
+        if (AcceptsIPv4(settings_.domain_strategy)) {
             append_family(false);
         }
-        if (AcceptsIPv6(domain_strategy_)) {
+        if (AcceptsIPv6(settings_.domain_strategy)) {
             append_family(true);
         }
     }
@@ -510,14 +532,12 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             settings.send_through = std::move(*parsed);
         }
-        settings.domain_strategy = std::string(acpp::constants::protocol::kAsIs);
-        if (const auto* camel_domain_strategy = s.if_contains("domainStrategy");
-            camel_domain_strategy && camel_domain_strategy->is_string()) {
-            settings.domain_strategy = std::string(camel_domain_strategy->as_string());
-        } else if (const auto* snake_domain_strategy = s.if_contains("domain_strategy");
-                   snake_domain_strategy && snake_domain_strategy->is_string()) {
-            settings.domain_strategy = std::string(snake_domain_strategy->as_string());
+        const auto domain_strategy =
+            acpp::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);
+        if (!domain_strategy) {
+            return std::nullopt;
         }
+        settings.domain_strategy = *domain_strategy;
         if (const auto* v = s.if_contains("redirect"); v && v->is_string()) {
             settings.redirect = std::string(v->as_string());
         }

@@ -439,6 +439,18 @@ expect_rejected(conditionless_route_rule "{}" "routing.json"
     "routing rule must contain at least one condition")
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
+expect_rejected(unsupported_freedom_domain_strategy "{}" "outbounds.json"
+    [=[[{"tag":"bad-freedom-strategy","protocol":"freedom","settings":{"domainStrategy":"UsePI"}}]]=]
+    "unsupported or invalid")
+expect_rejected(non_string_freedom_domain_strategy "{}" "outbounds.json"
+    [=[[{"tag":"bad-freedom-strategy-type","protocol":"freedom","settings":{"domainStrategy":1}}]]=]
+    "unsupported or invalid")
+expect_rejected(conflicting_freedom_domain_strategy_aliases "{}" "outbounds.json"
+    [=[[{"tag":"bad-freedom-strategy-alias","protocol":"freedom","settings":{"domainStrategy":"UseIP","domain_strategy":"ForceIP"}}]]=]
+    "unsupported or invalid")
+expect_started(equal_normalized_freedom_domain_strategy_aliases
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"normalized-freedom-strategy","protocol":"freedom","settings":{"domainStrategy":"UseIPv6v4","domain_strategy":"useipv6v4"}}]]=])
 expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"
     [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":"not-an-ip"}]]=])
 expect_rejected(non_string_outbound_send_through "{}" "outbounds.json"

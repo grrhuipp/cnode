@@ -2,7 +2,6 @@
 
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/target_address.hpp"
-#include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
@@ -27,12 +26,26 @@ class DNS;
 
 namespace acpp::proxy::freedom::outbound {
 
+enum class DomainStrategy : uint8_t {
+    AsIs,
+    UseIP,
+    UseIPv6v4,
+    UseIPv4,
+    UseIPv4v6,
+    UseIPv6,
+    ForceIP,
+    ForceIPv6v4,
+    ForceIPv6,
+    ForceIPv4v6,
+    ForceIPv4,
+};
+
 // ============================================================================
 // Freedom 出站设置
 // ============================================================================
 struct FreedomSettings {
     OutboundBind send_through = OutboundBind::Auto();
-    std::string domain_strategy = std::string(constants::protocol::kAsIs);
+    DomainStrategy domain_strategy = DomainStrategy::AsIs;
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
     bool enable_udp = true;               // 是否启用 UDP
     int udp_timeout = defaults::kUdpSessionTimeout;     // UDP 会话超时（秒）
@@ -64,20 +77,6 @@ public:
 
     std::string_view Tag() const noexcept override { return tag_; }
 
-    enum class DomainStrategy : uint8_t {
-        AsIs,
-        UseIP,
-        UseIPv6v4,
-        UseIPv4,
-        UseIPv4v6,
-        UseIPv6,
-        ForceIP,
-        ForceIPv6v4,
-        ForceIPv6,
-        ForceIPv4v6,
-        ForceIPv4,
-    };
-
 private:
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
     net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
@@ -99,7 +98,6 @@ private:
     std::chrono::seconds dial_timeout_;
     std::optional<TargetAddress> redirect_target_;
     std::string redirect_target_text_;
-    DomainStrategy domain_strategy_ = DomainStrategy::AsIs;
     std::optional<std::string> explicit_udp_session_id_;
     StreamSettings stream_settings_;          // 默认 tcp/none
 };
