@@ -198,6 +198,36 @@ void TestConnectPacketRoundTrip() {
     });
 }
 
+void TestLargeConnectPacketRoundTrip() {
+    const TargetAddress target("1.1.1.1", 53);
+    const std::string large_payload(buf::Buffer::kSize + 257, '\x6d');
+
+    CaptureWriter capture;
+    proxy::uot::PacketWriter writer(capture, true, target);
+    Run([&]() -> net::awaitable<void> {
+        co_await writer.WriteMultiBuffer(MakePacket(large_payload, target));
+    });
+
+    Check(capture.bytes.size() == large_payload.size() + 2,
+          "large UoT datagram was split into multiple frames");
+    const size_t wire_length =
+        (static_cast<size_t>(capture.bytes[0]) << 8) | capture.bytes[1];
+    Check(wire_length == large_payload.size(),
+          "large UoT frame length did not cover the complete datagram");
+
+    FragmentReader source(
+        capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
+    proxy::uot::PacketReader reader(source, true, target);
+    Run([&]() -> net::awaitable<void> {
+        auto decoded = co_await reader.ReadMultiBuffer();
+        Check(Flatten(decoded) == std::vector<uint8_t>(
+            large_payload.begin(), large_payload.end()),
+            "large UoT datagram round-trip mismatch");
+        Check(decoded.size() > 1,
+              "large UoT datagram did not exercise multi-buffer storage");
+    });
+}
+
 void TestNonConnectRequestAndPackets() {
     const TargetAddress initial("dns.example", 53);
     const TargetAddress second("8.8.8.8", 5353);
@@ -247,6 +277,7 @@ int main() {
     TestV2BoardSs2022Keys();
     TestMagicAndRequestCodec();
     TestConnectPacketRoundTrip();
+    TestLargeConnectPacketRoundTrip();
     TestNonConnectRequestAndPackets();
     std::cout << "uot_ss2022_test: ok\n";
     return 0;

@@ -118,6 +118,19 @@ if(NOT VLESS_OUTBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "VLESS Mux header must use the complete datagram payload size")
 endif()
+set(UOT_SOURCE "${SOURCE_DIR}/src/proxy/uot/uot.cpp")
+file(READ "${UOT_SOURCE}" UOT_SOURCE_TEXT)
+if(UOT_SOURCE_TEXT MATCHES "payload_size > buf::Buffer::kSize")
+    message(FATAL_ERROR
+        "UoT datagram length must not be limited by one Buffer")
+endif()
+if(NOT UOT_SOURCE_TEXT MATCHES
+        "buf::InspectUdpDatagram[(]mb[)]" OR
+   NOT UOT_SOURCE_TEXT MATCHES
+        "WritePacket[(][*]target, payload[.]Span[(][)][)]")
+    message(FATAL_ERROR
+        "UoT must encode one complete MultiBuffer datagram per frame")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES

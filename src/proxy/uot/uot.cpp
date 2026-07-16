@@ -313,9 +313,6 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         }
         const size_t length_offset = header_size - 2;
         const size_t payload_size = ReadU16BE(header.data() + length_offset);
-        if (payload_size > buf::Buffer::kSize) {
-            ThrowDecodeFailure();
-        }
         if (co_await EnsurePending(reader_, pending_, header_size + payload_size) !=
             PendingStatus::Ready) {
             ThrowDecodeFailure();
@@ -350,10 +347,11 @@ net::awaitable<void> PacketWriter::WritePacket(
     std::span<const net::const_buffer> payload) {
     size_t payload_size = 0;
     for (const auto& buffer : payload) {
+        if (buffer.size() >
+            std::numeric_limits<uint16_t>::max() - payload_size) {
+            ThrowDecodeFailure();
+        }
         payload_size += buffer.size();
-    }
-    if (payload_size > std::numeric_limits<uint16_t>::max()) {
-        ThrowDecodeFailure();
     }
 
     std::array<uint8_t, kMaxAddressSize + 2> header{};
@@ -375,22 +373,33 @@ net::awaitable<void> PacketWriter::WritePacket(
 }
 
 net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-    for (buf::Buffer* buffer : mb) {
+    const TargetAddress* target = nullptr;
+    if (is_connect_) {
+        if (!destination_.IsValid()) {
+            ThrowDecodeFailure();
+        }
+        target = std::addressof(destination_);
+    } else {
+        const auto datagram = buf::InspectUdpDatagram(mb);
+        if (datagram.status == buf::UdpDatagramStatus::Empty) {
+            co_return;
+        }
+        if (!datagram.Valid() || !datagram.target->IsValid()) {
+            ThrowDecodeFailure();
+        }
+        target = datagram.target;
+    }
+
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> payload;
+    for (const buf::Buffer* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
             continue;
         }
-        const TargetAddress* target = is_connect_
-            ? std::addressof(destination_)
-            : buffer->MaybeUDP();
-        if (!target && destination_.IsValid()) {
-            target = std::addressof(destination_);
-        }
-        if (!target || !target->IsValid()) {
-            ThrowDecodeFailure();
-        }
-        const std::array<net::const_buffer, 1> payload{
-            net::buffer(buffer->Bytes())};
-        co_await WritePacket(*target, payload);
+        const auto bytes = buffer->Bytes();
+        payload.Append(net::const_buffer(bytes.data(), bytes.size()));
+    }
+    if (!payload.empty()) {
+        co_await WritePacket(*target, payload.Span());
     }
 }
 
