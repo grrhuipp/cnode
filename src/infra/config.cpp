@@ -976,120 +976,126 @@ void StreamSettings::RecomputeModes() noexcept {
 // ============================================================================
 namespace {
 
-std::string_view StaticUserArrayKeyForProtocol(std::string_view protocol) noexcept {
-    if (protocol == constants::protocol::kAnyTLS) {
-        return "users";
-    }
-    return "clients";
-}
-
 StaticUserConfig ParseStaticUserConfig(
     std::string_view protocol,
     const json::object& settings) {
     StaticUserConfig config;
-    if (const auto* method = settings.if_contains("method");
-            method && method->is_string()) {
-        config.method = std::string(method->as_string());
-    }
+    config.method = jstr(settings, "method", config.method);
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = jstr(
             settings,
             "decryption",
             std::string(constants::protocol::kNone));
     }
-    auto parse_padding_scheme = [&](std::string_view key) {
-        if (!config.padding_scheme.empty()) {
-            return;
-        }
+    std::optional<std::string> padding_scheme;
+    std::string_view padding_key;
+    for (const std::string_view key : {"paddingScheme", "padding_scheme"}) {
         const auto* padding = settings.if_contains(key);
-        if (!padding) {
-            return;
-        }
+        if (!padding) continue;
+
+        std::string parsed;
         if (padding->is_string()) {
-            config.padding_scheme = std::string(padding->as_string());
-            return;
-        }
-        if (padding->is_array()) {
+            parsed = std::string(padding->as_string());
+        } else if (padding->is_array()) {
             bool first = true;
             for (const auto& item : padding->as_array()) {
                 if (!item.is_string()) {
-                    continue;
+                    throw std::invalid_argument(std::format(
+                        "{} must contain only strings", key));
                 }
                 if (!first) {
-                    config.padding_scheme.push_back('\n');
+                    parsed.push_back('\n');
                 }
-                config.padding_scheme.append(std::string(item.as_string()));
+                parsed.append(item.as_string());
                 first = false;
             }
+        } else {
+            throw std::invalid_argument(std::format(
+                "{} must be a string or array of strings", key));
         }
-    };
-    parse_padding_scheme("paddingScheme");
-    parse_padding_scheme("padding_scheme");
+        if (padding_scheme && *padding_scheme != parsed) {
+            throw std::invalid_argument(std::format(
+                "{} and {} must match", padding_key, key));
+        }
+        if (!padding_scheme) {
+            padding_scheme = std::move(parsed);
+            padding_key = key;
+        }
+    }
+    config.padding_scheme = std::move(padding_scheme).value_or("");
 
     const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
     StaticUser top_level_user;
     if (protocol == constants::protocol::kShadowsocks ||
         protocol == constants::protocol::kTrojan ||
         protocol == constants::protocol::kAnyTLS) {
-        if (const auto* password = settings.if_contains("password");
-                password && password->is_string()) {
-            top_level_user.password = std::string(password->as_string());
-            if (protocol == constants::protocol::kShadowsocks) {
-                config.identity_password = top_level_user.password;
-            }
+        top_level_user.password = jstr(settings, "password", "");
+        if (protocol == constants::protocol::kShadowsocks) {
+            config.identity_password = top_level_user.password;
         }
-        if (const auto* email = settings.if_contains("email");
-                email && email->is_string()) {
-            top_level_user.email = std::string(email->as_string());
-        }
+        top_level_user.email = jstr(settings, "email", "");
     }
 
-    bool saw_user_array = false;
-    auto parse_user_array = [&](std::string_view key) {
-        if (const auto* users = settings.if_contains(key);
-                users && users->is_array()) {
-            saw_user_array = !users->as_array().empty();
+    auto parse_user_arrays = [&](std::initializer_list<std::string_view> aliases)
+            -> std::optional<std::vector<StaticUser>> {
+        std::optional<std::vector<StaticUser>> parsed;
+        std::string_view first_key;
+        for (const std::string_view key : aliases) {
+            const auto* users = settings.if_contains(key);
+            if (!users) continue;
+            if (!users->is_array()) {
+                throw std::invalid_argument(std::format(
+                    "{} must be an array", key));
+            }
+
+            std::vector<StaticUser> candidates;
+            candidates.reserve(users->as_array().size());
             for (const auto& client : users->as_array()) {
                 if (!client.is_object()) {
-                    continue;
+                    throw std::invalid_argument(std::format(
+                        "{} entries must be objects", key));
                 }
                 const auto& client_obj = client.as_object();
 
                 StaticUser user;
-                if (const auto* id = client_obj.if_contains("id");
-                        id && id->is_string()) {
-                    user.id = std::string(id->as_string());
-                }
-                if (user.id.empty()) {
-                    if (const auto* uuid = client_obj.if_contains("uuid");
-                            uuid && uuid->is_string()) {
-                        user.id = std::string(uuid->as_string());
-                    }
-                }
-                if (const auto* password = client_obj.if_contains("password");
-                        password && password->is_string()) {
-                    user.password = std::string(password->as_string());
-                }
-                if (const auto* email = client_obj.if_contains("email");
-                        email && email->is_string()) {
-                    user.email = std::string(email->as_string());
-                }
-                if (const auto* flow = client_obj.if_contains("flow");
-                        flow && flow->is_string()) {
-                    user.flow = std::string(flow->as_string());
-                }
-                config.clients.push_back(std::move(user));
+                user.id = jstr(client_obj, {"id", "uuid"}, "");
+                user.password = jstr(client_obj, "password", "");
+                user.email = jstr(client_obj, "email", "");
+                user.flow = jstr(client_obj, "flow", "");
+                candidates.push_back(std::move(user));
+            }
+
+            auto users_match = [](const StaticUser& lhs, const StaticUser& rhs) {
+                return lhs.id == rhs.id &&
+                       lhs.password == rhs.password &&
+                       lhs.email == rhs.email &&
+                       lhs.flow == rhs.flow;
+            };
+            if (parsed &&
+                (parsed->size() != candidates.size() ||
+                 !std::ranges::equal(*parsed, candidates, users_match))) {
+                throw std::invalid_argument(std::format(
+                    "{} and {} must match", first_key, key));
+            }
+            if (!parsed) {
+                parsed = std::move(candidates);
+                first_key = key;
             }
         }
+        return parsed;
     };
 
-    const auto user_array_key = StaticUserArrayKeyForProtocol(protocol);
-    parse_user_array(user_array_key);
-    if (protocol == constants::protocol::kVless && user_array_key != std::string_view("users")) {
-        parse_user_array("users");
+    std::optional<std::vector<StaticUser>> users;
+    if (protocol == constants::protocol::kAnyTLS) {
+        users = parse_user_arrays({"users", "clients"});
+    } else if (protocol == constants::protocol::kVless) {
+        users = parse_user_arrays({"clients", "users"});
+    } else {
+        users = parse_user_arrays({"clients"});
     }
-    if (protocol == constants::protocol::kAnyTLS && config.clients.empty()) {
-        parse_user_array("clients");
+    const bool saw_user_array = users && !users->empty();
+    if (users) {
+        config.clients = std::move(*users);
     }
 
     if (protocol == constants::protocol::kShadowsocks &&
