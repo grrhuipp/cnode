@@ -19,21 +19,22 @@ namespace acpp::proxyman::outbound {
 // ============================================================================
 class Manager final : public features::outbound::Manager {
 public:
+    using HandlerPtr = features::outbound::Manager::HandlerPtr;
+
     Manager();
     ~Manager() noexcept override;
 
     Manager(const Manager&) = delete;
     Manager& operator=(const Manager&) = delete;
 
-    [[nodiscard]] Outbound* GetHandler(std::string_view tag) noexcept override;
-    [[nodiscard]] Outbound* GetDefaultHandler() noexcept override;
+    [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept override;
+    [[nodiscard]] HandlerPtr GetDefaultHandler() noexcept override;
 
-    // Mutations allocate tag/map/retirement storage and propagate failures.
-    [[nodiscard]] Outbound* AddHandler(std::unique_ptr<Outbound> handler);
-    [[nodiscard]] Outbound* ReplaceHandler(std::unique_ptr<Outbound> handler);
+    // Mutations allocate tag/map/shared ownership and propagate failures.
+    [[nodiscard]] HandlerPtr AddHandler(std::unique_ptr<Outbound> handler);
+    [[nodiscard]] HandlerPtr ReplaceHandler(std::unique_ptr<Outbound> handler);
     void RemoveHandler(std::string_view tag);
     void Clear() noexcept;
-    void DrainRetiredHandlers() noexcept;
 
 private:
     struct Impl;

@@ -87,7 +87,7 @@ private:
         StatsShard& stats,
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout);
-    [[nodiscard]] Outbound* ResolveOutboundHandler(
+    [[nodiscard]] std::shared_ptr<Outbound> ResolveOutboundHandler(
         std::string_view tag) const noexcept;
     [[nodiscard]] RouteSelection SelectRoute(
         session::Context& ctx,

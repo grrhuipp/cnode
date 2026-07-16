@@ -81,7 +81,6 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     void StopUdpListening(const std::string& tag,
                           ListenerKeys socket_keys) noexcept;
     void Shutdown();
-    void DrainRetiredOutboundsIfIdle(Worker& worker);
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
@@ -733,7 +732,6 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                               }
                           }
                           --worker.runtime_->active_connections;
-                          worker.runtime_->listener_state->DrainRetiredOutboundsIfIdle(worker);
                       });
     }
 }
@@ -863,7 +861,6 @@ bool Worker::RegisterInboundOnWorkerThread(
                  id_, receiver.inbound_tag, protocol);
         return false;
     }
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
     auto inbound_handler =
         std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(handler));
     auto& settings = inbound_handler->ReceiverSettings();
@@ -893,7 +890,6 @@ bool Worker::RegisterInboundOnWorkerThread(
         return false;
     }
     slot_it->second.handler = registered;
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
     return true;
 }
 
@@ -908,8 +904,6 @@ net::awaitable<bool> Worker::RegisterInboundTask(
 
 void Worker::AddOutboundOnWorkerThread(
     proxyman::outbound::PreparedOutboundConfig config) {
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
-
     auto current_snapshot = runtime_->Snapshot();
     auto handler = proxyman::outbound::NewHandler(
         config, runtime_->io_context,
@@ -944,7 +938,6 @@ void Worker::AddOutboundOnWorkerThread(
 
     LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
               id_, installed_protocol, installed_tag);
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::AddOutboundTask(
@@ -976,19 +969,11 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
         runtime_->router->SetDefaultOutbound(std::move(next_router_default));
     }
     runtime_->StoreSnapshot(std::move(next_snapshot));
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
     RemoveOutboundOnWorkerThread(tag);
     co_return;
-}
-
-void Worker::ListenerState::DrainRetiredOutboundsIfIdle(Worker& worker) {
-    if (worker.runtime_->active_connections != 0) {
-        return;
-    }
-    worker.runtime_->outbound_manager->DrainRetiredHandlers();
 }
 
 void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
@@ -1014,7 +999,6 @@ void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
     runtime_->listener_state->StopUdpListening(
         owned_tag, std::move(udp_socket_keys));
     runtime_->StoreSnapshot(std::move(next_snapshot));
-    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {

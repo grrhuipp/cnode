@@ -130,7 +130,7 @@ void DefaultDispatcher::BindMuxSessionHandler(
     mux_session_handler_ = &mux_session_handler;
 }
 
-Outbound* DefaultDispatcher::ResolveOutboundHandler(
+std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
         return nullptr;
@@ -337,8 +337,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
     }
 
-    const routing::DispatchResult dispatch = co_await RouteAsync(ctx, &receiver);
-    auto* outbound_handler = dispatch.handler;
+    routing::DispatchResult dispatch = co_await RouteAsync(ctx, &receiver);
+    auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
             LOG_CONN_FAIL_CTX(ctx, "RULE_REJECT user={} target={}",
@@ -471,7 +471,7 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
         }
     }
 
-    auto* handler = ResolveOutboundHandler(selection.outbound_tag);
+    auto handler = ResolveOutboundHandler(selection.outbound_tag);
     if (handler && ctx.outbound.tag.empty()) {
         const auto handler_tag = handler->Tag();
         ctx.outbound.tag = handler_tag;
@@ -481,7 +481,7 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
     }
 
     return routing::DispatchResult{
-        .handler = handler,
+        .handler = std::move(handler),
         .error = ErrorCode::OK,
     };
 }

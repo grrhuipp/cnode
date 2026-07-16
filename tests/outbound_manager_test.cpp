@@ -70,6 +70,10 @@ static_assert(!noexcept(std::declval<OutboundManager&>().ReplaceHandler(
     std::declval<std::unique_ptr<acpp::Outbound>>())));
 static_assert(!noexcept(std::declval<OutboundManager&>().RemoveHandler(
     std::declval<std::string_view>())));
+static_assert(std::is_same_v<
+    decltype(std::declval<OutboundManager&>().GetHandler(
+        std::declval<std::string_view>())),
+    std::shared_ptr<acpp::Outbound>>);
 
 using InboundManager = acpp::proxyman::inbound::Manager;
 static_assert(std::is_same_v<
@@ -88,51 +92,51 @@ int main() {
 
     auto first = std::make_unique<TestOutbound>("direct", 1);
     auto* first_raw = first.get();
-    if (manager.AddHandler(std::move(first)) != first_raw) return 1;
-    if (manager.GetHandler("direct") != first_raw) return 2;
-    if (manager.GetDefaultHandler() != first_raw) return 3;
+    auto first_owner = manager.AddHandler(std::move(first));
+    if (first_owner.get() != first_raw) return 1;
+    if (manager.GetHandler("direct").get() != first_raw) return 2;
+    if (manager.GetDefaultHandler().get() != first_raw) return 3;
 
     if (manager.ReplaceHandler(nullptr) != nullptr) return 4;
-    if (manager.GetHandler("direct") != first_raw) return 5;
+    if (manager.GetHandler("direct").get() != first_raw) return 5;
 
     auto second = std::make_unique<TestOutbound>("direct", 2);
     auto* second_raw = second.get();
-    if (manager.ReplaceHandler(std::move(second)) != second_raw) return 6;
-    if (manager.GetHandler("direct") != second_raw) return 7;
-    if (manager.GetDefaultHandler() != second_raw) return 8;
-    if (static_cast<TestOutbound*>(manager.GetHandler("direct"))->Generation() != 2) return 9;
+    auto second_owner = manager.ReplaceHandler(std::move(second));
+    if (second_owner.get() != second_raw) return 6;
+    if (manager.GetHandler("direct").get() != second_raw) return 7;
+    if (manager.GetDefaultHandler().get() != second_raw) return 8;
+    if (static_cast<TestOutbound*>(manager.GetHandler("direct").get())->Generation() != 2) return 9;
 
-    manager.DrainRetiredHandlers();
-    if (manager.GetHandler("direct") != second_raw) return 10;
+    if (static_cast<TestOutbound*>(first_owner.get())->Generation() != 1) return 10;
 
     try {
         (void)manager.AddHandler(std::make_unique<OversizedTagOutbound>());
         return 11;
     } catch (const std::length_error&) {
     }
-    if (manager.GetHandler("direct") != second_raw ||
-        manager.GetDefaultHandler() != second_raw) return 12;
+    if (manager.GetHandler("direct").get() != second_raw ||
+        manager.GetDefaultHandler().get() != second_raw) return 12;
 
     try {
         (void)manager.ReplaceHandler(std::make_unique<OversizedTagOutbound>());
         return 13;
     } catch (const std::length_error&) {
     }
-    if (manager.GetHandler("direct") != second_raw ||
-        manager.GetDefaultHandler() != second_raw) return 14;
+    if (manager.GetHandler("direct").get() != second_raw ||
+        manager.GetDefaultHandler().get() != second_raw) return 14;
 
     auto fallback = std::make_unique<TestOutbound>("fallback", 3);
     auto* fallback_raw = fallback.get();
-    if (manager.AddHandler(std::move(fallback)) != fallback_raw) return 15;
-    if (manager.GetDefaultHandler() != second_raw) return 16;
+    if (manager.AddHandler(std::move(fallback)).get() != fallback_raw) return 15;
+    if (manager.GetDefaultHandler().get() != second_raw) return 16;
 
     manager.RemoveHandler("direct");
     if (manager.GetHandler("direct") != nullptr) return 17;
-    if (manager.GetHandler("fallback") != fallback_raw) return 18;
-    if (manager.GetDefaultHandler() != fallback_raw) return 19;
+    if (manager.GetHandler("fallback").get() != fallback_raw) return 18;
+    if (manager.GetDefaultHandler().get() != fallback_raw) return 19;
 
-    manager.DrainRetiredHandlers();
-    if (manager.GetDefaultHandler() != fallback_raw) return 20;
+    if (static_cast<TestOutbound*>(second_owner.get())->Generation() != 2) return 20;
 
     return 0;
 }

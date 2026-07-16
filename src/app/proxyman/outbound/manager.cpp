@@ -10,13 +10,12 @@ namespace acpp::proxyman::outbound {
 struct Manager::Impl {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
         std::string,
-        std::unique_ptr<Outbound>,
+        std::shared_ptr<Outbound>,
         TransparentStringHash,
         TransparentStringEq>;
 
     HandlerMap handlers;
-    memory::ThreadLocalVector<std::unique_ptr<Outbound>> retired_handlers;
-    Outbound* default_handler = nullptr;
+    std::shared_ptr<Outbound> default_handler;
 };
 
 Manager::Manager()
@@ -26,35 +25,35 @@ Manager::~Manager() noexcept {
     Clear();
 }
 
-Outbound* Manager::GetHandler(std::string_view tag) noexcept {
+Manager::HandlerPtr Manager::GetHandler(std::string_view tag) noexcept {
     auto it = impl_->handlers.find(tag);
-    return it == impl_->handlers.end() ? nullptr : it->second.get();
+    return it == impl_->handlers.end() ? nullptr : it->second;
 }
 
-Outbound* Manager::GetDefaultHandler() noexcept {
+Manager::HandlerPtr Manager::GetDefaultHandler() noexcept {
     return impl_->default_handler;
 }
 
-Outbound* Manager::AddHandler(std::unique_ptr<Outbound> handler) {
+Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
     if (!handler) {
         return nullptr;
     }
 
     std::string tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Outbound>(std::move(handler));
     auto [it, inserted] = impl_->handlers.try_emplace(
-        std::move(tag), std::move(handler));
+        std::move(tag), std::move(shared_handler));
     if (!inserted) {
         return nullptr;
     }
 
-    Outbound* raw = it->second.get();
     if (!impl_->default_handler) {
-        impl_->default_handler = raw;
+        impl_->default_handler = it->second;
     }
-    return raw;
+    return it->second;
 }
 
-Outbound* Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) {
+Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) {
     if (!handler) {
         return nullptr;
     }
@@ -65,14 +64,12 @@ Outbound* Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) {
         return AddHandler(std::move(handler));
     }
 
-    Outbound* raw = handler.get();
-    const bool replacing_default = impl_->default_handler == it->second.get();
-    impl_->retired_handlers.push_back(std::move(it->second));
-    it->second = std::move(handler);
+    const bool replacing_default = impl_->default_handler == it->second;
+    it->second = std::shared_ptr<Outbound>(std::move(handler));
     if (replacing_default) {
-        impl_->default_handler = raw;
+        impl_->default_handler = it->second;
     }
-    return raw;
+    return it->second;
 }
 
 void Manager::RemoveHandler(std::string_view tag) {
@@ -81,28 +78,20 @@ void Manager::RemoveHandler(std::string_view tag) {
         return;
     }
 
-    const bool removing_default = impl_->default_handler == it->second.get();
-    impl_->retired_handlers.push_back(std::move(it->second));
+    const bool removing_default = impl_->default_handler == it->second;
     impl_->handlers.erase(it);
 
     if (removing_default) {
         impl_->default_handler = impl_->handlers.empty()
             ? nullptr
-            : impl_->handlers.begin()->second.get();
+            : impl_->handlers.begin()->second;
     }
 }
 
 void Manager::Clear() noexcept {
     impl_->handlers.clear();
-    impl_->retired_handlers.clear();
     MaybeShrinkHashContainer(impl_->handlers, 8);
-    TryShrinkSequence(impl_->retired_handlers);
-    impl_->default_handler = nullptr;
-}
-
-void Manager::DrainRetiredHandlers() noexcept {
-    impl_->retired_handlers.clear();
-    TryShrinkSequence(impl_->retired_handlers);
+    impl_->default_handler.reset();
 }
 
 }  // namespace acpp::proxyman::outbound

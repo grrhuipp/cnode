@@ -28,7 +28,7 @@ struct TimeoutsConfig;
 namespace routing {
 
 struct DispatchResult {
-    Outbound* handler = nullptr;
+    std::shared_ptr<Outbound> handler;
     ErrorCode error = ErrorCode::OK;
 };
 
