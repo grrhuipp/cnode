@@ -73,6 +73,24 @@ endif()
 
 set(MUX_RELAY "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
 file(READ "${MUX_RELAY}" MUX_RELAY_SOURCE)
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions")
+    message(FATAL_ERROR
+        "Mux TCP and UDP substreams must share one session-id namespace")
+endif()
+if(MUX_RELAY_SOURCE MATCHES "udp_subs|tcp_subs")
+    message(FATAL_ERROR
+        "Mux must not restore per-network session-id namespaces")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES "bool dispatch_done = false")
+    message(FATAL_ERROR
+        "Mux substream completion must notify cleanup independently from wire END")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "if [(]reply[.]dispatch_done[)][\r\n \t{]*sub_sessions[.]erase")
+    message(FATAL_ERROR
+        "Mux dispatch completion must remove the unified session entry")
+endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR
         "Mux detached sub-dispatch lifetime must be owned by its coroutine frame")

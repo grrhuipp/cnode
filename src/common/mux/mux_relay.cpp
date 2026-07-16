@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstring>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace acpp::mux {
@@ -52,6 +53,7 @@ using SignalChannel = net::experimental::channel<void(IoErrorCode)>;
 struct MuxReply {
     uint16_t session_id = 0;
     bool is_end = false;
+    bool dispatch_done = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
     TargetAddress udp_src;   // UDP 源地址（is_udp == true 时有效）
     buf::MultiBuffer payload;
@@ -499,13 +501,22 @@ private:
     }
 
     void PushEnd() {
-        if (end_sent_ || !reply_queue_.running) {
+        if (!reply_queue_.running) {
+            return;
+        }
+        const bool send_end = !end_sent_;
+        const bool notify_dispatch_done =
+            dispatch_done_ && !dispatch_done_notified_;
+        if (!send_end && !notify_dispatch_done) {
             return;
         }
         MuxReply reply;
         reply.session_id = session_id_;
-        reply.is_end = true;
-        end_sent_ = true;
+        reply.is_end = send_end;
+        reply.dispatch_done = notify_dispatch_done;
+        end_sent_ = end_sent_ || send_end;
+        dispatch_done_notified_ =
+            dispatch_done_notified_ || notify_dispatch_done;
         if (!reply_queue_.PushTcp(std::move(reply))) {
             reply_queue_.tcp_overflowed = true;
             Cancel();
@@ -532,6 +543,7 @@ private:
     bool cancelled_ = false;
     bool end_sent_ = false;
     bool dispatch_done_ = false;
+    bool dispatch_done_notified_ = false;
 };
 
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
@@ -716,13 +728,22 @@ private:
     }
 
     void PushEnd() {
-        if (end_sent_ || !reply_queue_.running) {
+        if (!reply_queue_.running) {
+            return;
+        }
+        const bool send_end = !end_sent_;
+        const bool notify_dispatch_done =
+            dispatch_done_ && !dispatch_done_notified_;
+        if (!send_end && !notify_dispatch_done) {
             return;
         }
         MuxReply reply;
         reply.session_id = session_id_;
-        reply.is_end = true;
-        end_sent_ = true;
+        reply.is_end = send_end;
+        reply.dispatch_done = notify_dispatch_done;
+        end_sent_ = end_sent_ || send_end;
+        dispatch_done_notified_ =
+            dispatch_done_notified_ || notify_dispatch_done;
         if (!reply_queue_.PushTcp(std::move(reply))) {
             reply_queue_.tcp_overflowed = true;
             Cancel();
@@ -753,6 +774,7 @@ private:
     bool cancelled_ = false;
     bool end_sent_ = false;
     bool dispatch_done_ = false;
+    bool dispatch_done_notified_ = false;
 
     void StampDefaultTarget(buf::MultiBuffer& mb) {
         for (auto* buffer : mb) {
@@ -825,6 +847,7 @@ private:
 };
 
 using UdpSubInfo = std::unique_ptr<UdpSubState>;
+using MuxSubInfo = std::variant<TcpSubInfo, UdpSubInfo>;
 
 net::awaitable<void> RunTcpSubDispatch(
     net::io_context& io_context,
@@ -927,9 +950,8 @@ net::awaitable<RelayResult> DoMuxRelay(
     ReplyQueueState reply_queue{io_context, main_signal};
     ClientReadQueueState client_reads{io_context, main_signal};
 
-    // 子会话集合
-    memory::ThreadLocalUnorderedMap<uint16_t, UdpSubInfo> udp_subs;
-    memory::ThreadLocalUnorderedMap<uint16_t, TcpSubInfo> tcp_subs;
+    // TCP / UDP 共用同一个 session_id 命名空间。
+    memory::ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions;
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
@@ -1088,17 +1110,15 @@ net::awaitable<RelayResult> DoMuxRelay(
         // --------------------------------------------------------------------
         MuxReply reply;
         while (reply_queue.Pop(reply)) {
-            if (reply.is_end) {
-                mux::EncodeEndTo(write_frame, reply.session_id);
-                // 子会话已结束，清理本地记录
-                if (auto udp_it = udp_subs.find(reply.session_id); udp_it != udp_subs.end()) {
-                    if (udp_it->second->DispatchDone()) {
-                        udp_subs.erase(udp_it);
-                    }
+            if (reply.is_end || reply.dispatch_done) {
+                if (reply.is_end) {
+                    mux::EncodeEndTo(write_frame, reply.session_id);
                 }
-                if (auto tcp_it = tcp_subs.find(reply.session_id); tcp_it != tcp_subs.end() &&
-                    tcp_it->second->DispatchDone()) {
-                    tcp_subs.erase(tcp_it);
+                if (reply.dispatch_done) {
+                    sub_sessions.erase(reply.session_id);
+                }
+                if (!reply.is_end) {
+                    continue;
                 }
             } else if (reply.is_udp) {
                 const size_t payload_size = reply.PayloadSize();
@@ -1271,7 +1291,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                         hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
 
                     uint16_t sid = hdr.session_id;
-                    if (!hdr.has_target || udp_subs.find(sid) != udp_subs.end()) {
+                    if (!hdr.has_target || sub_sessions.contains(sid)) {
                         mux::EncodeEndTo(write_frame, hdr.session_id, true);
                         (void)co_await write_frame_to_client(write_frame);
                         break;
@@ -1312,11 +1332,12 @@ net::awaitable<RelayResult> DoMuxRelay(
                         sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
                     }
 
-                    auto [insert_it, inserted] = udp_subs.try_emplace(
+                    auto [insert_it, inserted] = sub_sessions.try_emplace(
                         sid,
-                        std::move(sub_state));
+                        UdpSubInfo{std::move(sub_state)});
                     (void)inserted;
-                    UdpSubState* sub_ptr = insert_it->second.get();
+                    UdpSubState* sub_ptr =
+                        std::get<UdpSubInfo>(insert_it->second).get();
 
                     try {
                         net::co_spawn(io_context.get_executor(),
@@ -1349,7 +1370,7 @@ net::awaitable<RelayResult> DoMuxRelay(
 
                     uint16_t    sid  = hdr.session_id;
 
-                    if (tcp_subs.find(sid) != tcp_subs.end()) {
+                    if (sub_sessions.contains(sid)) {
                         LOG_CONN_DEBUG(parent_ctx,
                             "[MuxRelay] duplicate TCP sid={}", sid);
                         mux::EncodeEndTo(write_frame, hdr.session_id, true);
@@ -1389,11 +1410,12 @@ net::awaitable<RelayResult> DoMuxRelay(
                         break;
                     }
 
-                    auto [insert_it, inserted] = tcp_subs.try_emplace(
+                    auto [insert_it, inserted] = sub_sessions.try_emplace(
                         sid,
-                        std::move(sub_state));
+                        TcpSubInfo{std::move(sub_state)});
                     (void)inserted;
-                    TcpSubState* sub_ptr = insert_it->second.get();
+                    TcpSubState* sub_ptr =
+                        std::get<TcpSubInfo>(insert_it->second).get();
 
                     // SubLoopLease 随协程帧持有计数，DoMuxRelay 退出前等待其析构，
                     // 保证 TcpSubState 生命周期覆盖 detached coroutine。
@@ -1421,8 +1443,11 @@ net::awaitable<RelayResult> DoMuxRelay(
 
             // ----------------------------------------------------------------
             case mux::SessionStatus::KEEP: {
-                auto udp_it = udp_subs.find(hdr.session_id);
-                if (udp_it != udp_subs.end()) {
+                auto session_it = sub_sessions.find(hdr.session_id);
+                auto* udp_sub = session_it == sub_sessions.end()
+                    ? nullptr
+                    : std::get_if<UdpSubInfo>(&session_it->second);
+                if (udp_sub) {
                     if (hdr.has_target && buf::HasData(frame_payload)) {
                         for (auto* buffer : frame_payload) {
                             if (buffer && !buffer->IsEmpty()) {
@@ -1431,21 +1456,21 @@ net::awaitable<RelayResult> DoMuxRelay(
                         }
                     }
                     if (buf::HasData(frame_payload)) {
-                        udp_it->second->PushClientPayload(std::move(frame_payload), hdr.data_len);
+                        (*udp_sub)->PushClientPayload(std::move(frame_payload), hdr.data_len);
                     }
                 } else {
                     // TCP 数据
-                    auto it = tcp_subs.find(hdr.session_id);
+                    auto* tcp_sub = session_it == sub_sessions.end()
+                        ? nullptr
+                        : std::get_if<TcpSubInfo>(&session_it->second);
                     bool tcp_write_failed = false;
-                    if (it != tcp_subs.end() && buf::HasData(frame_payload)) {
-                        if (!it->second->PushClientPayload(std::move(frame_payload))) {
+                    if (tcp_sub && buf::HasData(frame_payload)) {
+                        if (!(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
                             tcp_write_failed = true;
                         }
                     }
                     if (tcp_write_failed) {
-                        if (it != tcp_subs.end()) {
-                            it->second->Cancel();
-                        }
+                        (*tcp_sub)->Cancel();
                         mux::EncodeEndTo(write_frame, hdr.session_id);
                         if (!co_await write_frame_to_client(write_frame)) {
                             running = false;
@@ -1458,39 +1483,36 @@ net::awaitable<RelayResult> DoMuxRelay(
             // ----------------------------------------------------------------
             case mux::SessionStatus::END: {
                 uint16_t sid = hdr.session_id;
-                bool known_session = false;
+                auto session_it = sub_sessions.find(sid);
+                const bool known_session = session_it != sub_sessions.end();
 
-                // 注销 UDP 子会话
-                auto udp_it = udp_subs.find(sid);
-                if (udp_it != udp_subs.end()) {
-                    known_session = true;
-                    if (hdr.has_target && buf::HasData(frame_payload)) {
-                        for (auto* buffer : frame_payload) {
-                            if (buffer && !buffer->IsEmpty()) {
-                                buffer->SetUDP(hdr.target);
+                if (known_session) {
+                    if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
+                        if (hdr.has_target && buf::HasData(frame_payload)) {
+                            for (auto* buffer : frame_payload) {
+                                if (buffer && !buffer->IsEmpty()) {
+                                    buffer->SetUDP(hdr.target);
+                                }
                             }
                         }
-                    }
-                    if (buf::HasData(frame_payload)) {
-                        udp_it->second->PushClientPayload(std::move(frame_payload), hdr.data_len);
-                    }
-                    udp_it->second->CloseClientInput();
-                    if (udp_it->second->DispatchDone()) {
-                        udp_subs.erase(udp_it);
-                    }
-                }
-
-                // 取消 TCP 子会话
-                auto tcp_it = tcp_subs.find(sid);
-                if (tcp_it != tcp_subs.end()) {
-                    known_session = true;
-                    if (buf::HasData(frame_payload) &&
-                        !tcp_it->second->PushClientPayload(std::move(frame_payload))) {
-                        tcp_it->second->Cancel();
-                    }
-                    tcp_it->second->CloseClientInput();
-                    if (tcp_it->second->DispatchDone()) {
-                        tcp_subs.erase(tcp_it);
+                        if (buf::HasData(frame_payload)) {
+                            (*udp_sub)->PushClientPayload(
+                                std::move(frame_payload), hdr.data_len);
+                        }
+                        (*udp_sub)->CloseClientInput();
+                        if ((*udp_sub)->DispatchDone()) {
+                            sub_sessions.erase(session_it);
+                        }
+                    } else if (auto* tcp_sub =
+                                   std::get_if<TcpSubInfo>(&session_it->second)) {
+                        if (buf::HasData(frame_payload) &&
+                            !(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
+                            (*tcp_sub)->Cancel();
+                        }
+                        (*tcp_sub)->CloseClientInput();
+                        if ((*tcp_sub)->DispatchDone()) {
+                            sub_sessions.erase(session_it);
+                        }
                     }
                 }
 
@@ -1533,14 +1555,11 @@ net::awaitable<RelayResult> DoMuxRelay(
     }
     co_await net::post(io_context.get_executor(), net::use_awaitable);
 
-    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: UDP={} TCP={}",
-        udp_subs.size(), tcp_subs.size());
+    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: sub_sessions={}",
+        sub_sessions.size());
 
-    for (auto& [sid, udp_sub] : udp_subs) {
-        udp_sub->Cancel();
-    }
-    for (auto& [sid, tcp_sub] : tcp_subs) {
-        tcp_sub->Cancel();
+    for (auto& [sid, sub] : sub_sessions) {
+        std::visit([](auto& state) { state->Cancel(); }, sub);
     }
     while (reply_queue.active_sub_loops > 0) {
         auto [ec] = co_await reply_queue.sub_done_signal.async_receive(
