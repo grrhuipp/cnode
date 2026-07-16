@@ -592,14 +592,17 @@ struct MuxFramePayload {
 
 class MuxFrameFramer {
 public:
-    void Feed(const uint8_t* data, size_t len) {
+    [[nodiscard]] bool Feed(const uint8_t* data, size_t len) {
+        if (failed_) {
+            return false;
+        }
         if (!data || len == 0) {
-            return;
+            return true;
         }
         CompactConsumed();
         EnsureAppendCapacity(pending_, len, buf::Buffer::kSize);
         pending_.insert(pending_.end(), data, data + len);
-        Parse();
+        return Parse();
     }
 
     bool Next(MuxFramePayload& out) {
@@ -620,8 +623,9 @@ private:
     memory::ThreadLocalDeque<MuxFramePayload> queue_;
     size_t pending_offset_ = 0;
     bool shrink_queue_on_drain_ = false;
+    bool failed_ = false;
 
-    void Parse() {
+    [[nodiscard]] bool Parse() {
         while (pending_offset_ < pending_.size()) {
             const uint8_t* frame_base = pending_.data() + pending_offset_;
             const size_t available = pending_.size() - pending_offset_;
@@ -630,8 +634,8 @@ private:
                 break;
             }
             if (parsed->frame_size == 0) {
-                ++pending_offset_;
-                continue;
+                Fail();
+                return false;
             }
 
             MuxFramePayload packet;
@@ -644,9 +648,8 @@ private:
                             pending_.data() + payload_offset,
                             parsed->data_len),
                         packet.payload)) {
-                    pending_.clear();
-                    queue_.clear();
-                    return;
+                    Fail();
+                    return false;
                 }
             }
             queue_.push_back(std::move(packet));
@@ -656,6 +659,15 @@ private:
             pending_offset_ += parsed->frame_size;
         }
         CompactConsumed();
+        return true;
+    }
+
+    void Fail() noexcept {
+        failed_ = true;
+        pending_.clear();
+        pending_offset_ = 0;
+        queue_.clear();
+        shrink_queue_on_drain_ = false;
     }
 
     void CompactConsumed() {
@@ -706,6 +718,14 @@ public:
         while (true) {
             MuxFramePayload frame;
             while (framer_.Next(frame)) {
+                if (frame.header.status == mux::SessionStatus::KEEPALIVE) {
+                    continue;
+                }
+                if (frame.header.session_id != session_id_) {
+                    throw IoSystemError(
+                        io_error::connection_reset,
+                        "VLESS mux response session id mismatch");
+                }
                 if (frame.header.status == mux::SessionStatus::END) {
                     co_return buf::MultiBuffer{};
                 }
@@ -729,7 +749,12 @@ public:
             }
             for (buf::Buffer* buffer : raw) {
                 if (buffer && !buffer->IsEmpty()) {
-                    framer_.Feed(buffer->Bytes().data(), buffer->Len());
+                    if (!framer_.Feed(
+                            buffer->Bytes().data(), buffer->Len())) {
+                        throw IoSystemError(
+                            io_error::connection_reset,
+                            "invalid VLESS mux response frame");
+                    }
                 }
             }
             raw.clear();

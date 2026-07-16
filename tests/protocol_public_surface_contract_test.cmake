@@ -122,3 +122,17 @@ if(NOT DEFAULT_DISPATCHER_SOURCE MATCHES
     message(FATAL_ERROR
         "Dispatcher must reject Mux links without a cancellable control stream")
 endif()
+
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+if(VLESS_OUTBOUND_SOURCE MATCHES
+        "[+]\+pending_offset_[;]")
+    message(FATAL_ERROR
+        "VLESS outbound must not scan through invalid Mux frame bytes")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES
+        "frame[.]header[.]session_id != session_id_")
+    message(FATAL_ERROR
+        "VLESS Mux UDP responses must remain bound to their logical session")
+endif()
