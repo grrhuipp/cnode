@@ -40,9 +40,6 @@ public:
     UDPSession(UDPSession&&) = delete;
     UDPSession& operator=(UDPSession&&) = delete;
 
-    // 启动会话（绑定本地端口）
-    ErrorCode Start(const net::ip::address& bind_address);
-
     // UDP 发送/接收接口
     net::awaitable<ErrorCode> SendTo(
         const TargetAddress& target,
@@ -60,8 +57,6 @@ public:
         const uint8_t* data,
         size_t len);
 
-    void Touch();
-
     // 注册 Full Cone 回调，返回 callback_id 用于后续取消；session 未运行、
     // 回调为空或容量耗尽时返回 0。
     // 注意：Per-Worker 模式，无需 executor 参数，回调在同一线程执行
@@ -70,21 +65,18 @@ public:
     // 取消注册
     void UnregisterCallback(uint64_t callback_id);
 
-    // 开始接收循环
-    void StartReceive();
-
-    // 停止会话
-    void Stop();
-
-    // 检查是否过期
-    bool IsExpired(std::chrono::seconds timeout) const;
-
     // 获取本地端口
     uint16_t LocalPort() const;
 
 private:
     friend class UDPSessionManager;
 
+    ErrorCode Start(const net::ip::address& bind_address);
+    ErrorCode StartReceive();
+    void Touch();
+    void Stop();
+    [[nodiscard]] bool IsRunning() const noexcept;
+    [[nodiscard]] bool IsExpired(std::chrono::seconds timeout) const;
     [[nodiscard]] bool UsesBindAddress(
         const net::ip::address& bind_address) const;
 

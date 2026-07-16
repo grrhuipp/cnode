@@ -211,6 +211,7 @@ struct UDPSession::Impl {
     std::chrono::steady_clock::time_point last_active;
     time_point next_target_prune_at{};
     bool running = false;
+    bool receive_started = false;
 
     static constexpr auto kTargetMappingTtl = std::chrono::seconds(defaults::kUdpTargetMappingTtl);
     static constexpr auto kTargetPruneInterval = std::chrono::seconds(defaults::kUdpTargetPruneInterval);
@@ -232,10 +233,10 @@ UDPSession::UDPSession(net::io_context& io_context,
 }
 
 UDPSession::~UDPSession() {
-    if (impl_->running) {
+    if (impl_->running || impl_->receive_started || impl_->socket.is_open()) {
         LOG_ACCESS_DEBUG("UDP session {} destroyed without Stop(), forced close", impl_->session_id);
-        Stop();
     }
+    Stop();
 }
 
 ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
@@ -408,12 +409,25 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
     co_return co_await SendTo(target, data, len, 0);
 }
 
-void UDPSession::StartReceive() {
-    if (!impl_->running) return;
-    net::co_spawn(
-        impl_->io_context.get_executor(),
-        Impl::RunReceive(impl_),
-        [](std::exception_ptr) {});
+ErrorCode UDPSession::StartReceive() {
+    if (!impl_->running || impl_->receive_started) {
+        return ErrorCode::INTERNAL;
+    }
+
+    impl_->receive_started = true;
+    try {
+        net::co_spawn(
+            impl_->io_context.get_executor(),
+            Impl::RunReceive(impl_),
+            [](std::exception_ptr) {});
+    } catch (const std::bad_alloc&) {
+        impl_->receive_started = false;
+        return ErrorCode::RESOURCE_EXHAUSTED;
+    } catch (...) {
+        impl_->receive_started = false;
+        return ErrorCode::INTERNAL;
+    }
+    return ErrorCode::SUCCESS;
 }
 
 // Per-Worker 简化版：无需 executor 参数
@@ -467,7 +481,25 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
 }
 
 net::awaitable<void> UDPSession::Impl::RunReceive(std::shared_ptr<Impl> self) {
-    co_await self->DoReceive();
+    try {
+        co_await self->DoReceive();
+    } catch (const std::exception& e) {
+        LOG_CONN_FAIL("UDP session {} receive loop failed: {}",
+                      self->session_id, e.what());
+    } catch (...) {
+        LOG_CONN_FAIL("UDP session {} receive loop failed with unknown error",
+                      self->session_id);
+    }
+
+    self->receive_started = false;
+    if (self->running) {
+        LOG_CONN_FAIL("UDP session {} receive loop stopped unexpectedly",
+                      self->session_id);
+        self->running = false;
+        IoErrorCode ec;
+        self->socket.cancel(ec);
+        self->socket.close(ec);
+    }
 }
 
 net::awaitable<void> UDPSession::Impl::DoReceive() {
@@ -705,7 +737,9 @@ void UDPSession::Impl::RefreshTargetMapping(
 }
 
 void UDPSession::Stop() {
-    if (!impl_->running) return;
+    const bool was_active = impl_->running || impl_->socket.is_open() ||
+        !impl_->registered_callbacks.empty() ||
+        !impl_->target_to_callbacks.empty();
     impl_->running = false;
 
     IoErrorCode ec;
@@ -718,9 +752,11 @@ void UDPSession::Stop() {
     MaybeShrinkHashContainer(impl_->registered_callbacks, 16);
     MaybeShrinkHashContainer(impl_->target_to_callbacks, 16);
 
-    LOG_ACCESS_DEBUG("UDP session {} stopped, sent: {} pkts/{} bytes, recv: {} pkts/{} bytes",
-              impl_->session_id, impl_->packets_sent, impl_->bytes_sent,
-              impl_->packets_received, impl_->bytes_received);
+    if (was_active) {
+        LOG_ACCESS_DEBUG("UDP session {} stopped, sent: {} pkts/{} bytes, recv: {} pkts/{} bytes",
+                  impl_->session_id, impl_->packets_sent, impl_->bytes_sent,
+                  impl_->packets_received, impl_->bytes_received);
+    }
 }
 
 void UDPSession::Touch() {
@@ -729,6 +765,10 @@ void UDPSession::Touch() {
 
 bool UDPSession::IsExpired(std::chrono::seconds timeout) const {
     return std::chrono::steady_clock::now() - impl_->last_active > timeout;
+}
+
+bool UDPSession::IsRunning() const noexcept {
+    return impl_->running && impl_->receive_started;
 }
 
 uint16_t UDPSession::LocalPort() const {
@@ -795,12 +835,19 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
 
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {
-        if (!it->second->UsesBindAddress(bind_address)) {
-            LOG_CONN_FAIL("UDP session {} bind address conflict", session_id);
-            return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        if (!it->second->IsRunning()) {
+            LOG_CONN_FAIL("UDP session {} is no longer receiving; replacing it",
+                          session_id);
+            it->second->Stop();
+            impl_->sessions.erase(it);
+        } else {
+            if (!it->second->UsesBindAddress(bind_address)) {
+                LOG_CONN_FAIL("UDP session {} bind address conflict", session_id);
+                return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+            }
+            it->second->Touch();
+            return it->second.get();
         }
-        it->second->Touch();
-        return it->second.get();
     }
     if (impl_->sessions.size() >= Impl::kMaxSessions) {
         LOG_CONN_FAIL("UDP session capacity exhausted: {}", Impl::kMaxSessions);
@@ -843,7 +890,11 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
     } catch (const std::bad_alloc&) {
         return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
-    session_ptr->StartReceive();
+    const auto receive_error = session_ptr->StartReceive();
+    if (receive_error != ErrorCode::SUCCESS) {
+        impl_->sessions.erase(session_id);
+        return std::unexpected(receive_error);
+    }
 
     LOG_ACCESS_DEBUG("Created UDP session {} on port {}, total sessions: {}",
              session_id, session_ptr->LocalPort(), impl_->sessions.size());
@@ -863,8 +914,9 @@ void UDPSessionManager::CleanupExpiredSessions() {
     if (!impl_->running) return;
     bool removed_session = false;
     for (auto it = impl_->sessions.begin(); it != impl_->sessions.end(); ) {
-        if (it->second->IsExpired(impl_->session_timeout)) {
-            LOG_ACCESS_DEBUG("UDP session {} expired, removing", it->first);
+        if (!it->second->IsRunning() ||
+            it->second->IsExpired(impl_->session_timeout)) {
+            LOG_ACCESS_DEBUG("UDP session {} inactive or expired, removing", it->first);
             it->second->Stop();
             it = impl_->sessions.erase(it);
             removed_session = true;

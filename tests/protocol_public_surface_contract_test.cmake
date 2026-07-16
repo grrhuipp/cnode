@@ -351,6 +351,28 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSession receive loop must own Impl until cancellation completes")
 endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+        "receive_started = false" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "if [(]self->running[)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "[!]it->second->IsRunning[(][)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "const auto receive_error = session_ptr->StartReceive[(][)]")
+    message(FATAL_ERROR
+        "UDPSession must reject duplicate receive loops and replace dead sessions")
+endif()
+string(FIND "${UDP_SESSION_HEADER_SOURCE}" "private:" UDP_SESSION_PRIVATE_OFFSET)
+string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode Start(" UDP_SESSION_START_OFFSET)
+string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode StartReceive(" UDP_SESSION_RECEIVE_OFFSET)
+string(FIND "${UDP_SESSION_HEADER_SOURCE}" "void Stop(" UDP_SESSION_STOP_OFFSET)
+if(UDP_SESSION_PRIVATE_OFFSET LESS 0 OR
+   UDP_SESSION_START_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET OR
+   UDP_SESSION_RECEIVE_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET OR
+   UDP_SESSION_STOP_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET)
+    message(FATAL_ERROR
+        "UDPSession lifecycle must remain manager-owned private state")
+endif()
 if(UDP_SESSION_SOURCE MATCHES "retired_sessions")
     message(FATAL_ERROR
         "UDPSessionManager must not retain every removed session until shutdown")
