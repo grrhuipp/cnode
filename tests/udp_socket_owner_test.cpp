@@ -55,8 +55,55 @@ static_assert(noexcept(
 }  // namespace
 
 int main() {
+    acpp::TargetAddress callback_source;
+    std::array<uint8_t, 1> callback_payload{0x5a};
+    acpp::UDPPacketView callback_packet{callback_source, callback_payload};
+
+    acpp::PacketCallback empty_callback;
+    if (empty_callback(callback_packet)) {
+        Fail("empty UDP callback reported successful delivery");
+    }
+
+    acpp::PacketCallback throwing_callback{
+        [](acpp::UDPPacketView) { throw 7; }};
+    if (throwing_callback(callback_packet)) {
+        Fail("throwing UDP callback reported successful delivery");
+    }
+
+    bool callback_invoked = false;
+    acpp::PacketCallback valid_callback{
+        [&](acpp::UDPPacketView packet) {
+            callback_invoked = packet.data.size() == 1 && packet.data[0] == 0x5a;
+        }};
+    if (!valid_callback(callback_packet) || !callback_invoked) {
+        Fail("valid UDP callback was not delivered");
+    }
+
     acpp::net::io_context io_context;
     acpp::IoErrorCode ec;
+
+    acpp::proxyman::inbound::UdpWorker::ClientSession failing_reply_session(
+        io_context,
+        acpp::PacketCallback{[](acpp::UDPPacketView) { throw 9; }},
+        1);
+    acpp::buf::BufferGuard reply_buffer{acpp::buf::Buffer::New()};
+    if (!reply_buffer) Fail("failed to allocate UDP callback test buffer");
+    reply_buffer->Tail()[0] = 0x33;
+    reply_buffer->Produce(1);
+    reply_buffer->SetUDP(callback_source);
+    acpp::buf::MultiBuffer reply_payload{reply_buffer.release()};
+    bool reply_failure_reported = false;
+    acpp::net::co_spawn(
+        io_context,
+        failing_reply_session.WriteMultiBuffer(std::move(reply_payload)),
+        [&](std::exception_ptr error) {
+            reply_failure_reported = error != nullptr;
+        });
+    io_context.run();
+    if (!reply_failure_reported) {
+        Fail("UDP client reply callback failure was silently ignored");
+    }
+    io_context.restart();
 
     auto first = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
     first->open(acpp::udp::v4(), ec);

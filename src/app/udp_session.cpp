@@ -388,6 +388,12 @@ void UDPSession::StartReceive() {
 
 // Per-Worker 简化版：无需 executor 参数
 uint64_t UDPSession::RegisterCallback(PacketCallback callback) {
+    if (!callback) {
+        LOG_ACCESS_DEBUG("UDP session {} rejected empty Full Cone callback",
+                         impl_->session_id);
+        return 0;
+    }
+
     uint64_t id = impl_->next_callback_id++;
     impl_->registered_callbacks[id] = CallbackEntry{
         std::move(callback), {}};
@@ -505,8 +511,13 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
                 auto cb_it = registered_callbacks.find(cb_id);
                 if (cb_it != registered_callbacks.end()) {
                     RefreshTargetMapping(sender_key, cb_id, now);
-                    cb_it->second.callback(packet_view);
-                    delivered = true;
+                    if (cb_it->second.callback(packet_view)) {
+                        delivered = true;
+                    } else {
+                        LOG_ACCESS_DEBUG(
+                            "UDP session {} callback {} rejected packet from {}",
+                            session_id, cb_id, EndpointKeyToString(sender_key));
+                    }
                 }
             };
 
@@ -519,8 +530,13 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
         } else if (registered_callbacks.size() == 1) {
             auto cb_it = registered_callbacks.begin();
             RefreshTargetMapping(sender_key, cb_it->first, now);
-            cb_it->second.callback(packet_view);
-            delivered = true;
+            if (cb_it->second.callback(packet_view)) {
+                delivered = true;
+            } else {
+                LOG_ACCESS_DEBUG(
+                    "UDP session {} callback {} rejected packet from {}",
+                    session_id, cb_it->first, EndpointKeyToString(sender_key));
+            }
         } else {
             std::string known_keys;
             for (const auto& [key, _] : target_to_callbacks) {

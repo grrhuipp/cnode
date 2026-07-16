@@ -81,8 +81,17 @@ public:
         return invoke_ != nullptr;
     }
 
-    void operator()(UDPPacketView pkt) {
-        invoke_(storage_, pkt);
+    // 回调异常不能逃出 Worker UDP 接收/回包循环；false 表示空回调或执行失败。
+    [[nodiscard]] bool operator()(UDPPacketView pkt) noexcept {
+        if (!invoke_) {
+            return false;
+        }
+        try {
+            invoke_(storage_, pkt);
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 
     void Reset() noexcept {

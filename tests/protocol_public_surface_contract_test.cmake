@@ -157,6 +157,11 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSessionManager destruction must cancel cleanup and live sessions")
 endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+    "RegisterCallback[(]PacketCallback callback[)] \\{[\r\n ]+if [(][!]callback[)]")
+    message(FATAL_ERROR
+        "UDPSession must reject empty receive callbacks")
+endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
 if(WORKER_SOURCE MATCHES

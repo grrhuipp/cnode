@@ -210,10 +210,14 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
         if (!buffer || buffer->IsEmpty() || !buffer->HasUDP()) {
             continue;
         }
-        impl_->reply_callback(UDPPacketView{
-            buffer->UDP(),
-            buffer->Bytes(),
-        });
+        if (!impl_->reply_callback(UDPPacketView{
+                buffer->UDP(),
+                buffer->Bytes(),
+            })) {
+            mb.clear();
+            throw IoSystemError(
+                io_error::fault, "UDP client reply callback failed");
+        }
     }
     mb.clear();
     co_return;
