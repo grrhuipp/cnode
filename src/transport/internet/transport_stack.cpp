@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "http2_settings.hpp"
+#include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
@@ -36,33 +37,10 @@ constexpr size_t kTlsContextCacheMaxEntries = 16;
 constexpr size_t kXHttpPacketSessionPruneThreshold = 1024;
 constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
 
-using TlsContextCache =
+using TlsContextMap =
     memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<SslContext>>;
-
-template <typename Cache>
-void PruneTlsContextCache(Cache& cache,
-                          std::string_view keep_key,
-                          const SslContext* protected_ctx) {
-    if (cache.size() < kTlsContextCacheMaxEntries) {
-        return;
-    }
-
-    for (auto it = cache.begin(); it != cache.end(); ++it) {
-        if (it->first != keep_key && it->second.get() != protected_ctx) {
-            cache.erase(it);
-            return;
-        }
-    }
-}
-
-template <typename Cache>
-void InsertTlsContext(Cache& cache,
-                      std::string key,
-                      std::unique_ptr<SslContext> ctx,
-                      const SslContext* protected_ctx) {
-    PruneTlsContextCache(cache, key, protected_ctx);
-    cache.emplace(std::move(key), std::move(ctx));
-}
+using TlsContextCache = transport::internet::BoundedTlsContextCache<
+    SslContext, TlsContextMap>;
 
 [[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key) {
     constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -77,28 +55,14 @@ void InsertTlsContext(Cache& cache,
 }
 
 SslContext* AcquireServerTlsContext(const TlsConfig& config) {
-    thread_local TlsContextCache cache;
-    struct LastHit {
-        const TlsConfig* config = nullptr;
-        bool has_certificate = false;
-        SslContext* ctx = nullptr;
-    };
-    thread_local LastHit last;
+    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
 
     const bool has_certificate = config.HasCertificatePair();
-    if (last.config == &config &&
-        last.has_certificate == has_certificate && last.ctx) {
-        return last.ctx;
-    }
-
     std::string key = has_certificate
         ? transport::internet::MakeTlsContextCacheKey("server", config)
         : transport::internet::MakeTlsContextCacheKey("server-auto-sign", config);
 
-    if (auto it = cache.find(key); it != cache.end()) {
-        last = LastHit{&config, has_certificate, it->second.get()};
-        return it->second.get();
-    }
+    if (auto* cached = cache.Find(key)) return cached;
 
     std::unique_ptr<SslContext> ctx;
     if (has_certificate) {
@@ -108,105 +72,56 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     }
 
     if (ctx) {
-        auto* raw = ctx.get();
-        InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
-        last = LastHit{&config, has_certificate, raw};
-        return raw;
+        return cache.Insert(std::move(key), std::move(ctx));
     }
     return nullptr;
 }
 
 SslContext* AcquireServerRealityContext(const RealityConfig& reality,
                                         const TlsConfig& tls_config) {
-    thread_local TlsContextCache cache;
-    struct LastHit {
-        const RealityConfig* reality = nullptr;
-        const TlsConfig* tls = nullptr;
-        SslContext* ctx = nullptr;
-    };
-    thread_local LastHit last;
-
-    if (last.reality == &reality && last.tls == &tls_config && last.ctx) {
-        return last.ctx;
-    }
+    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
 
     std::string key = transport::internet::MakeRealityServerContextCacheKey(
         reality, tls_config);
-    if (auto it = cache.find(key); it != cache.end()) {
-        last = LastHit{&reality, &tls_config, it->second.get()};
-        return it->second.get();
-    }
+    if (auto* cached = cache.Find(key)) return cached;
 
     auto ctx = SslContext::CreateServerReality(reality, tls_config);
     if (!ctx) {
         return nullptr;
     }
 
-    auto* raw = ctx.get();
-    InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
-    last = LastHit{&reality, &tls_config, raw};
-    return raw;
+    return cache.Insert(std::move(key), std::move(ctx));
 }
 
 SslContext* AcquireClientTlsContext(const TlsConfig& config) {
-    thread_local TlsContextCache cache;
-    thread_local const TlsConfig* last_config = nullptr;
-    thread_local SslContext* last_ctx = nullptr;
-
-    if (last_config == &config && last_ctx) {
-        return last_ctx;
-    }
+    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
 
     std::string key =
         transport::internet::MakeTlsContextCacheKey("client", config);
 
-    if (auto it = cache.find(key); it != cache.end()) {
-        last_config = &config;
-        last_ctx = it->second.get();
-        return it->second.get();
-    }
+    if (auto* cached = cache.Find(key)) return cached;
 
     std::unique_ptr<SslContext> ctx = SslContext::CreateClient(config);
     if (ctx) {
-        auto* raw = ctx.get();
-        InsertTlsContext(cache, std::move(key), std::move(ctx), last_ctx);
-        last_config = &config;
-        last_ctx = raw;
-        return raw;
+        return cache.Insert(std::move(key), std::move(ctx));
     }
     return nullptr;
 }
 
 SslContext* AcquireClientRealityContext(const RealityConfig& reality,
                                         const TlsConfig& tls_config) {
-    thread_local TlsContextCache cache;
-    struct LastHit {
-        const RealityConfig* reality = nullptr;
-        const TlsConfig* tls = nullptr;
-        SslContext* ctx = nullptr;
-    };
-    thread_local LastHit last;
-
-    if (last.reality == &reality && last.tls == &tls_config && last.ctx) {
-        return last.ctx;
-    }
+    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
 
     std::string key = transport::internet::MakeRealityClientContextCacheKey(
         reality, tls_config);
-    if (auto it = cache.find(key); it != cache.end()) {
-        last = LastHit{&reality, &tls_config, it->second.get()};
-        return it->second.get();
-    }
+    if (auto* cached = cache.Find(key)) return cached;
 
     auto ctx = SslContext::CreateClientReality(reality, tls_config);
     if (!ctx) {
         return nullptr;
     }
 
-    auto* raw = ctx.get();
-    InsertTlsContext(cache, std::move(key), std::move(ctx), last.ctx);
-    last = LastHit{&reality, &tls_config, raw};
-    return raw;
+    return cache.Insert(std::move(key), std::move(ctx));
 }
 
 [[nodiscard]] char LowerAsciiChar(char ch) {
