@@ -99,6 +99,18 @@ expect_rejected(conflicting_log_compression
     "gzip and compress must match")
 expect_started(equal_log_compression_aliases
     [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
+expect_rejected(non_string_log_level
+    [=[{"log":{"loglevel":123}}]=] "" ""
+    "loglevel must be a string")
+expect_rejected(non_string_transport_network "{}" "outbounds.json"
+    [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
+    "network must be a string")
+expect_rejected(conflicting_grpc_service_names "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"one","service_name":"two"}}}]]=]
+    "serviceName and service_name must match")
+expect_started(equal_grpc_service_name_aliases
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-grpc-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"same","service_name":"same"}}}]]=])
 expect_rejected(non_boolean_tls_allow_insecure "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-bool","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":"true"}}}]]=]
     "allowInsecure must be a boolean")

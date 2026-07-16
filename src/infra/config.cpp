@@ -4,6 +4,7 @@
 #include "acppnode/infra/log.hpp"
 #include "http2_initial_window.hpp"
 #include "json_bool.hpp"
+#include "json_string.hpp"
 #include "json_unsigned.hpp"
 #include <algorithm>
 #include <cctype>
@@ -33,11 +34,25 @@ namespace {
 }
 
 // 从 object 中取 string，不存在则返回默认值
-inline std::string jstr(const json::object& obj, std::string_view key,
-                        std::string_view def = "") {
-    auto* p = obj.if_contains(key);
-    if (!p || !p->is_string()) return std::string(def);
-    return std::string(p->as_string());
+inline std::string jstr(
+    const json::object& obj,
+    std::initializer_list<std::string_view> aliases,
+    std::string_view def = "") {
+    auto parsed = ParseAliasedJsonString(obj, aliases);
+    if (!parsed) {
+        throw std::invalid_argument(std::move(parsed.error()));
+    }
+    if (!*parsed) {
+        return std::string(def);
+    }
+    return std::move(**parsed);
+}
+
+inline std::string jstr(
+    const json::object& obj,
+    std::string_view key,
+    std::string_view def = "") {
+    return jstr(obj, {key}, def);
 }
 
 // 从 object 中取 bool，不存在则返回默认值
@@ -534,10 +549,7 @@ WsConfig WsConfig::FromJson(const json::object& j) {
     WsConfig cfg;
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, "realIpHeader", "");
-    if (cfg.real_ip_header.empty()) {
-        cfg.real_ip_header = jstr(j, "real_ip_header", "");
-    }
+    cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
     return cfg;
 }
 
@@ -546,10 +558,7 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     cfg.host = jstr(j, "host", "");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, "realIpHeader", "");
-    if (cfg.real_ip_header.empty()) {
-        cfg.real_ip_header = jstr(j, "real_ip_header", "");
-    }
+    cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
     cfg.accept_proxy_protocol = jbool(j, {"acceptProxyProtocol"}, false);
     return cfg;
 }
@@ -560,10 +569,7 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
     cfg.host = jstr(j, "host", "");
     cfg.method = jstr(j, "method", "");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, "realIpHeader", "");
-    if (cfg.real_ip_header.empty()) {
-        cfg.real_ip_header = jstr(j, "real_ip_header", "");
-    }
+    cfg.real_ip_header = jstr(j, {"realIpHeader", "real_ip_header"}, "");
     cfg.force_http2 = jbool(j, {"forceHttp2", "force_http2"}, false);
     auto initial_window = ParseHttp2InitialWindow(j);
     if (!initial_window) {
@@ -575,18 +581,9 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
 
 GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     GrpcConfig cfg;
-    cfg.authority = jstr(j, "authority", "");
-    if (cfg.authority.empty()) {
-        cfg.authority = jstr(j, "host", "");
-    }
-    cfg.service_name = jstr(j, "serviceName", "");
-    if (cfg.service_name.empty()) {
-        cfg.service_name = jstr(j, "service_name", "");
-    }
-    cfg.user_agent = jstr(j, "user_agent", "");
-    if (cfg.user_agent.empty()) {
-        cfg.user_agent = jstr(j, "userAgent", "");
-    }
+    cfg.authority = jstr(j, {"authority", "host"}, "");
+    cfg.service_name = jstr(j, {"serviceName", "service_name"}, "");
+    cfg.user_agent = jstr(j, {"userAgent", "user_agent"}, "");
     cfg.multi_mode = jbool(j, {"multiMode", "multi_mode"}, false);
     if (j.contains("initial_windows_size")) {
         throw std::invalid_argument(
@@ -779,10 +776,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             cfg.server_names = jstr_array(*p);
         }
     }
-    cfg.private_key = jstr(j, "privateKey", "");
-    if (cfg.private_key.empty()) {
-        cfg.private_key = jstr(j, "private_key", "");
-    }
+    cfg.private_key = jstr(j, {"privateKey", "private_key"}, "");
     if (auto* p = j.if_contains("shortIds"); p && p->is_array()) {
         cfg.short_ids = jstr_array(*p);
     }
@@ -791,14 +785,8 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             cfg.short_ids = jstr_array(*p);
         }
     }
-    cfg.min_client_ver = jstr(j, "minClientVer", "");
-    if (cfg.min_client_ver.empty()) {
-        cfg.min_client_ver = jstr(j, "min_client_ver", "");
-    }
-    cfg.max_client_ver = jstr(j, "maxClientVer", "");
-    if (cfg.max_client_ver.empty()) {
-        cfg.max_client_ver = jstr(j, "max_client_ver", "");
-    }
+    cfg.min_client_ver = jstr(j, {"minClientVer", "min_client_ver"}, "");
+    cfg.max_client_ver = jstr(j, {"maxClientVer", "max_client_ver"}, "");
     auto max_time_diff = ParseAliasedJsonUint64(
         j, {"maxTimeDiff", "max_time_diff"});
     if (!max_time_diff) {
@@ -816,30 +804,17 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "REALITY fingerprint is not supported; ClientHello fingerprint "
             "emulation is not implemented");
     }
-    cfg.server_name = jstr(j, "serverName", "");
-    if (cfg.server_name.empty()) {
-        cfg.server_name = jstr(j, "server_name", "");
-    }
-    cfg.public_key = jstr(j, "publicKey", "");
-    if (cfg.public_key.empty()) {
-        cfg.public_key = jstr(j, "public_key", "");
-    }
-    if (cfg.public_key.empty()) {
-        cfg.public_key = jstr(j, "password", "");
-    }
-    cfg.short_id = jstr(j, "shortId", "");
-    if (cfg.short_id.empty()) {
-        cfg.short_id = jstr(j, "short_id", "");
-    }
+    cfg.server_name = jstr(j, {"serverName", "server_name"}, "");
+    cfg.public_key = jstr(
+        j, {"publicKey", "public_key", "password"}, "");
+    cfg.short_id = jstr(j, {"shortId", "short_id"}, "");
     if (j.contains("spiderX") || j.contains("spider_x")) {
         throw std::invalid_argument(
             "REALITY spiderX/spider_x is not supported; the REALITY crawler "
             "is not implemented");
     }
-    cfg.master_key_log = jstr(j, "masterKeyLog", "");
-    if (cfg.master_key_log.empty()) {
-        cfg.master_key_log = jstr(j, "master_key_log", "");
-    }
+    cfg.master_key_log = jstr(
+        j, {"masterKeyLog", "master_key_log"}, "");
     return cfg;
 }
 
