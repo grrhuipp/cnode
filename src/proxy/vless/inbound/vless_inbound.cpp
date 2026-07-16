@@ -628,7 +628,7 @@ proxy::vless::inbound::Handler::Process(
     };
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}]",
+        LOG_ACCESS_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail_abortive(ErrorCode::BLOCKED);
@@ -783,7 +783,7 @@ proxy::vless::inbound::Handler::Process(
         tracked_uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(
                 tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,

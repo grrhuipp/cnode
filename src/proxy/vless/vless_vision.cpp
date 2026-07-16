@@ -92,20 +92,6 @@ void AppendBytesToMultiBuffer(buf::MultiBuffer& out, std::span<const uint8_t> da
     }
 }
 
-void AppendZerosToMultiBuffer(buf::MultiBuffer& out, size_t len) {
-    while (len > 0) {
-        buf::BufferGuard b{buf::Buffer::New()};
-        if (!b) {
-            return;
-        }
-        const size_t n = std::min<size_t>(len, b->Available());
-        std::memset(b->Tail().data(), 0, n);
-        b->Produce(static_cast<uint32_t>(n));
-        out.push_back(b.release());
-        len -= n;
-    }
-}
-
 }  // namespace
 
 bool IsVisionFlow(std::string_view flow) noexcept {

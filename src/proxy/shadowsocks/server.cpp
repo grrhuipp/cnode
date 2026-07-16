@@ -117,20 +117,6 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
     return result;
 }
 
-net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t len) {
-    if (len == 0) {
-        co_return true;
-    }
-    net::const_buffer buffer{buf, len};
-    try {
-        co_await stream.WriteBuffers(
-            std::span<const net::const_buffer>{&buffer, 1});
-    } catch (...) {
-        co_return false;
-    }
-    co_return true;
-}
-
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
     RequestBodyReader(SsCipherType cipher_type,

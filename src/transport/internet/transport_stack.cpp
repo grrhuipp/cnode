@@ -2724,7 +2724,6 @@ public:
         return session_.lock();
     }
 
-    bool PushH2Data(memory::ByteVector data);
     bool PushH2Data(memory::ByteVector data, size_t offset, size_t size);
     void CloseInput();
     void CancelFromSession() noexcept;
@@ -3529,11 +3528,6 @@ GrpcServerSubStreamState::GrpcServerSubStreamState(
     , stream_id_(stream_id)
     , payload_codec_(payload_codec)
     , conn_id_(conn_id) {}
-
-bool GrpcServerSubStreamState::PushH2Data(memory::ByteVector data) {
-    const size_t size = data.size();
-    return PushH2Data(std::move(data), 0, size);
-}
 
 bool GrpcServerSubStreamState::PushH2Data(
     memory::ByteVector data,

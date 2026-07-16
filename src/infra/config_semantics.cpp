@@ -14,7 +14,7 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
     std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
     std::span<const RouteRuleConfig> rules) {
     if (outbounds.empty()) {
-        return {.error = ConfigSemanticError::NoOutbounds};
+        return {.error = ConfigSemanticError::NoOutbounds, .index = 0, .tag = {}};
     }
 
     std::unordered_set<std::string_view> tags;
@@ -25,6 +25,7 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
             return {
                 .error = ConfigSemanticError::EmptyOutboundTag,
                 .index = i,
+                .tag = {},
             };
         }
         if (!tags.insert(tag).second) {
@@ -42,6 +43,7 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
             return {
                 .error = ConfigSemanticError::EmptyRouteOutboundTag,
                 .index = i,
+                .tag = {},
             };
         }
         if (!tags.contains(tag)) {
@@ -96,6 +98,8 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             return {
                 .error = StaticInboundSemanticError::InvalidPort,
                 .index = i,
+                .conflicting_index = 0,
+                .detail = {},
             };
         }
 
@@ -106,6 +110,8 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             return {
                 .error = StaticInboundSemanticError::EmptyTag,
                 .index = i,
+                .conflicting_index = 0,
+                .detail = {},
             };
         }
         if (const auto [it, inserted] = tags.emplace(tag, i); !inserted) {

@@ -173,9 +173,8 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     if (listener.limiter &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}] (logical)",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "rejected ip_banned (logical) src={}:{}",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
         co_return;
     }
@@ -184,20 +183,18 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     if (listener.limiter) {
         auto reject = listener.limiter->TryAcceptGlobal();
         if (reject != ConnectionLimiter::RejectReason::NONE) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
-                ConnectionLimiter::RejectReasonToString(reject));
+            LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port,
+                           ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
         reject = listener.limiter->TryAcceptIP(ctx.inbound.tag, ctx.inbound.source_ip);
         if (reject != ConnectionLimiter::RejectReason::NONE) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
-                ConnectionLimiter::RejectReasonToString(reject));
+            LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port,
+                           ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
             co_return;
         }
@@ -252,9 +249,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     if (listener.limiter &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}] (early)",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
+        LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
+                       ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
         co_return;
     }
@@ -263,10 +259,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     if (listener.limiter) {
         auto reject = listener.limiter->TryAcceptGlobal();
         if (reject != ConnectionLimiter::RejectReason::NONE) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
-                ConnectionLimiter::RejectReasonToString(reject));
+            LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port,
+                           ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
             co_return;
         }
@@ -336,10 +331,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         connection_limit->UpdateIP(ctx.inbound.source_ip);
         auto reject = listener.limiter->TryAcceptIP(ctx.inbound.tag, ctx.inbound.source_ip);
         if (reject != ConnectionLimiter::RejectReason::NONE) {
-            LOG_ACCESS_FMT("{} from {}:{} rejected conn_limit [{}] reason={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
-                ConnectionLimiter::RejectReasonToString(reject));
+            LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
+                           ctx.inbound.source_ip, ctx.inbound.source_port,
+                           ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
             co_return;
         }

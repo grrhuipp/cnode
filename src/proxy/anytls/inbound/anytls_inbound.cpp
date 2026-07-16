@@ -7,7 +7,6 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
-#include "acppnode/common/byte_reader.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
@@ -126,44 +125,6 @@ std::string ParseSettingsPaddingMd5(std::string_view text) {
         text.remove_prefix(line_end + 1);
     }
     return {};
-}
-
-std::optional<TargetAddress> ParseSocksAddress(std::span<const uint8_t> data) {
-    if (data.empty()) {
-        return std::nullopt;
-    }
-    ByteReader reader(data.data(), data.size());
-    const uint8_t atype = reader.ReadU8();
-    if (atype == 0x01) {
-        auto raw = reader.ReadBytes(4);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) {
-            return std::nullopt;
-        }
-        net::ip::address_v4::bytes_type bytes{};
-        std::copy(raw.begin(), raw.end(), bytes.begin());
-        return TargetAddress(net::ip::make_address_v4(bytes), port);
-    }
-    if (atype == 0x04) {
-        auto raw = reader.ReadBytes(16);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) {
-            return std::nullopt;
-        }
-        net::ip::address_v6::bytes_type bytes{};
-        std::copy(raw.begin(), raw.end(), bytes.begin());
-        return TargetAddress(net::ip::make_address_v6(bytes), port);
-    }
-    if (atype == 0x03) {
-        const uint8_t len = reader.ReadU8();
-        auto host = reader.ReadStringView(len);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok() || len == 0) {
-            return std::nullopt;
-        }
-        return TargetAddress(host, port);
-    }
-    return std::nullopt;
 }
 
 class MultiBufferByteReader {
@@ -1041,7 +1002,7 @@ Handler::Process(
         if (uid != 0) {
             if (!validator_.CanAcceptDevice(
                     ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-                LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+                LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                     FormatTimestamp(ctx.accept_time_us),
                     ctx.inbound.source_ip,
                     ctx.inbound.source_port,

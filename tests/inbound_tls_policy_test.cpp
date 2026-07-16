@@ -16,5 +16,11 @@ int main() {
     node.EnableTLS = false;
     if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 5;
 
+    node.NodeType = "anytls";
+    if (!acpp::controller::ShouldEnableInboundTls(&panel, node)) return 6;
+
+    panel.TLSEnable = false;
+    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 7;
+
     return 0;
 }

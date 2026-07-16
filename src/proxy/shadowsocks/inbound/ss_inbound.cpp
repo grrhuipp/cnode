@@ -157,7 +157,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}]",
+        LOG_ACCESS_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
@@ -204,7 +204,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
     int64_t uid = profile.user_id;
     if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-        LOG_ACCESS_FMT("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
             profile.device_limit,
@@ -316,7 +316,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     size_t len) const {
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(tag, client_ip)) {
-        LOG_ACCESS_FMT("{} from {} rejected ip_banned [{}] (udp)",
+        LOG_ACCESS_DEBUG("{} from {} rejected ip_banned [{}] (udp)",
                        LogLocalNow(), client_ip, tag);
         return std::nullopt;
     }

@@ -121,7 +121,7 @@ ParseUotVersion(const json::object& source) {
 
     std::optional<SsUotVersion> result;
     bool parsed_one = false;
-    for (const auto entry : {
+    for (const auto& entry : {
              std::pair<std::string_view, const json::value*>{"udp_over_tcp", udp_over_tcp},
              std::pair<std::string_view, const json::value*>{"uot", uot}}) {
         if (!entry.second) continue;
