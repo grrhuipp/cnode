@@ -1,5 +1,7 @@
 #include "udp_datagram.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -19,10 +21,13 @@ void Check(bool condition, std::string_view message) {
     }
 }
 
-buf::Buffer* MakeBuffer(size_t size, const TargetAddress* target) {
+buf::Buffer* MakeBuffer(size_t size,
+                        const TargetAddress* target,
+                        uint8_t value = 0x6d) {
     buf::Buffer* buffer = buf::Buffer::New();
     Check(buffer != nullptr && size <= buffer->Available(),
           "failed to allocate VMess UDP test buffer");
+    std::fill_n(buffer->Tail().data(), size, value);
     buffer->Produce(static_cast<uint32_t>(size));
     if (target) {
         buffer->SetUDP(*target);
@@ -48,9 +53,30 @@ int main() {
     const TargetAddress other("8.8.8.8", 53);
 
     buf::MultiBuffer valid;
-    valid.push_back(MakeBuffer(4096, &target));
-    valid.push_back(MakeBuffer(1024, &target));
+    valid.push_back(MakeBuffer(buf::Buffer::kSize, &target, 0x11));
+    valid.push_back(MakeBuffer(257, &target, 0x22));
     vmess::ValidateFixedUdpDatagram(valid, target);
+    const vmess::ContiguousUdpDatagram contiguous(valid);
+    Check(contiguous.Bytes().size() == buf::Buffer::kSize + 257 &&
+          std::all_of(
+              contiguous.Bytes().begin(),
+              contiguous.Bytes().begin() + buf::Buffer::kSize,
+              [](uint8_t value) { return value == 0x11; }) &&
+          std::all_of(
+              contiguous.Bytes().begin() + buf::Buffer::kSize,
+              contiguous.Bytes().end(),
+              [](uint8_t value) { return value == 0x22; }),
+          "VMess multi-buffer UDP datagram was not coalesced exactly once");
+
+    const std::array<uint8_t, 32> first{};
+    const std::array<uint8_t, 48> second{};
+    const std::array<net::const_buffer, 2> scatter{
+        net::buffer(first),
+        net::buffer(second),
+    };
+    const vmess::ContiguousUdpDatagram scatter_packet(scatter);
+    Check(scatter_packet.Bytes().size() == first.size() + second.size(),
+          "VMess scatter UDP datagram was split into multiple payloads");
 
     buf::MultiBuffer mixed;
     mixed.push_back(MakeBuffer(4096, &target));

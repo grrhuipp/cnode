@@ -4,6 +4,7 @@
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/infra/log.hpp"
 #include "../vmess_cipher.hpp"
+#include "../udp_datagram.hpp"
 #include <openssl/rand.h>
 #include <algorithm>
 #include <cstring>
@@ -29,6 +30,7 @@ struct EncodeResponseBodyState final {
     std::optional<ShakeMask> mask;
     buf::MultiBuffer pending_prefix;
     bool global_padding = false;
+    bool packet_mode = false;
     bool eof_sent = false;
     uint32_t chunk_count = 0;
 };
@@ -201,7 +203,6 @@ net::awaitable<bool> EncodeResponseHeader(
 }
 
 struct ResponseBodyEncodeBudget final {
-    size_t length_header_size = 0;
     size_t stream_chunk_size = 0;
 };
 
@@ -217,7 +218,74 @@ struct ResponseBodyEncodeBudget final {
     const size_t stream_chunk_size = std::min(
         size_t(MAX_CHUNK_SIZE - overhead),
         size_t(buf::Buffer::kSize - length_header_size - overhead - max_padding_len));
-    return ResponseBodyEncodeBudget{length_header_size, stream_chunk_size};
+    return ResponseBodyEncodeBudget{stream_chunk_size};
+}
+
+void EncodeResponseBodyChunk(EncodeResponseBodyState& state,
+                             std::span<const uint8_t> bytes,
+                             buf::MultiBuffer& out_mb) {
+    const size_t overhead = state.cipher->Overhead();
+    if (bytes.empty() || bytes.size() > MAX_CHUNK_SIZE - overhead) {
+        throw IoSystemError(
+            io_error::message_size,
+            "VMess UDP datagram exceeds one authenticated chunk");
+    }
+
+    size_t padding_len = 0;
+    if (state.global_padding && state.mask) {
+        const uint16_t padding_mask = state.mask->NextMask();
+        padding_len = padding_mask % 64;
+    }
+    const size_t length_header_size = state.length_cipher
+        ? state.length_cipher->Overhead() + 2
+        : 2;
+    const size_t output_capacity =
+        length_header_size + bytes.size() + overhead + padding_len;
+
+    buf::BufferGuard pooled;
+    memory::ByteVector scratch;
+    uint8_t* dst = nullptr;
+    if (output_capacity <= buf::Buffer::kSize) {
+        pooled = buf::BufferGuard{buf::Buffer::New()};
+        if (!pooled) {
+            throw std::bad_alloc();
+        }
+        dst = pooled->Tail().data();
+    } else {
+        dst = PrepareScratch(scratch, output_capacity);
+    }
+
+    const ssize_t enc_len = state.cipher->Encrypt(
+        bytes.data(), bytes.size(), dst + length_header_size);
+    if (enc_len < 0) {
+        ThrowVMessWriteError("VMess encoding packet encrypt failed");
+    }
+
+    const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
+    size_t encoded_length_size = 0;
+    if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
+                           state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
+                           total_len,
+                           dst,
+                           encoded_length_size)) {
+        ThrowVMessWriteError("VMess encoding length encrypt failed");
+    }
+    if (padding_len > 0) {
+        RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
+    }
+
+    const size_t output_size =
+        encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
+    ++state.chunk_count;
+    if (pooled) {
+        pooled->Produce(static_cast<uint32_t>(output_size));
+        out_mb.push_back(pooled.release());
+        return;
+    }
+    if (!buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(dst, output_size), out_mb)) {
+        throw std::bad_alloc();
+    }
 }
 
 void EncodeResponseBodyBytes(EncodeResponseBodyState& state,
@@ -234,45 +302,10 @@ void EncodeResponseBodyBytes(EncodeResponseBodyState& state,
 
     while (offset < len) {
         const size_t chunk_size = std::min(len - offset, budget.stream_chunk_size);
-        buf::BufferGuard out{buf::Buffer::New()};
-        if (!out) {
-            throw std::bad_alloc();
-        }
-
-        uint8_t* dst = out->Tail().data();
-        ssize_t enc_len = state.cipher->Encrypt(
-            data + offset, chunk_size, dst + budget.length_header_size);
-        if (enc_len < 0) {
-            ThrowVMessWriteError("VMess encoding stream encrypt failed");
-        }
-
-        size_t padding_len = 0;
-        if (state.global_padding && state.mask) {
-            const uint16_t padding_mask = state.mask->NextMask();
-            padding_len = padding_mask % 64;
-        }
-
-        const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
-        ++state.chunk_count;
-
-        size_t encoded_length_size = 0;
-        if (!EncodeChunkLength(state.length_cipher ? &*state.length_cipher : nullptr,
-                               state.length_cipher ? nullptr : (state.mask ? &*state.mask : nullptr),
-                               total_len,
-                               dst,
-                               encoded_length_size)) {
-            ThrowVMessWriteError("VMess encoding length encrypt failed");
-        }
-
-        if (padding_len > 0) {
-            RAND_bytes(dst + encoded_length_size + enc_len, static_cast<int>(padding_len));
-        }
-
-        const size_t output_size =
-            encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
-        out->Produce(static_cast<uint32_t>(output_size));
-        out_mb.push_back(out.release());
-
+        EncodeResponseBodyChunk(
+            state,
+            std::span<const uint8_t>(data + offset, chunk_size),
+            out_mb);
         offset += chunk_size;
     }
 }
@@ -305,6 +338,14 @@ net::awaitable<void> EncodeResponseBodyMultiBuffer(EncodeResponseBodyState& stat
         co_return;
     }
 
+    if (state.packet_mode) {
+        const ::acpp::vmess::ContiguousUdpDatagram packet(mb);
+        buf::MultiBuffer out_mb;
+        EncodeResponseBodyChunk(state, packet.Bytes(), out_mb);
+        co_await FlushResponseBody(state, stream, std::move(out_mb));
+        co_return;
+    }
+
     const ResponseBodyEncodeBudget budget = MakeResponseBodyEncodeBudget(state);
     buf::MultiBuffer out_mb;
     out_mb.reserve(mb.size());
@@ -332,6 +373,14 @@ net::awaitable<void> EncodeResponseBodyBuffers(
         }
     }
     if (!has_data) {
+        co_return;
+    }
+
+    if (state.packet_mode) {
+        const ::acpp::vmess::ContiguousUdpDatagram packet(buffers);
+        buf::MultiBuffer out_mb;
+        EncodeResponseBodyChunk(state, packet.Bytes(), out_mb);
+        co_await FlushResponseBody(state, stream, std::move(out_mb));
         co_return;
     }
 
@@ -706,6 +755,7 @@ void InitResponseBodyState(EncodeResponseBodyState& state, const VMessRequest& r
     }
     state.global_padding = (option & Option::GLOBAL_PADDING) != 0 &&
         !(security == Security::NONE && request.command != Command::UDP);
+    state.packet_mode = request.command == Command::UDP;
     if ((option & Option::CHUNK_MASKING) != 0) {
         state.mask.emplace(response_iv.data());
     }
@@ -1132,14 +1182,18 @@ private:
 class ResponseBodyWriter final : public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const VMessRequest& request, AsyncStream& stream)
-        : stream_(&stream) {
+        : stream_(&stream)
+        , packet_mode_(request.command == Command::UDP)
+        , udp_target_(request.target) {
         InitResponseBodyState(response_body_state_, request);
     }
 
     ResponseBodyWriter(const VMessRequest& request,
                        AsyncStream& stream,
                        std::array<uint8_t, 38> response_header)
-        : stream_(&stream) {
+        : stream_(&stream)
+        , packet_mode_(request.command == Command::UDP)
+        , udp_target_(request.target) {
         InitResponseBodyState(response_body_state_, request);
         if (!buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(response_header.data(), response_header.size()),
@@ -1156,6 +1210,14 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!stream_) {
             throw IoSystemError(io_error::not_connected, "VMess response writer has no stream");
+        }
+        if (packet_mode_) {
+            ::acpp::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            for (buf::Buffer* buffer : mb) {
+                if (buffer) {
+                    buffer->ClearUDP();
+                }
+            }
         }
         co_await EncodeResponseBodyMultiBuffer(response_body_state_, *stream_, std::move(mb));
     }
@@ -1179,6 +1241,8 @@ public:
 private:
     EncodeResponseBodyState response_body_state_;
     AsyncStream* stream_ = nullptr;
+    bool packet_mode_ = false;
+    TargetAddress udp_target_;
 };
 
 }  // namespace

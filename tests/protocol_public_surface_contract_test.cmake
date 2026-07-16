@@ -199,9 +199,12 @@ if(NOT VLESS_UDP_FRAMING_SOURCE MATCHES
 endif()
 set(VMESS_SERVER_ENCODING
     "${SOURCE_DIR}/src/proxy/vmess/encoding/server.cpp")
+set(VMESS_CLIENT_ENCODING
+    "${SOURCE_DIR}/src/proxy/vmess/encoding/client.cpp")
 set(VMESS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp")
 file(READ "${VMESS_SERVER_ENCODING}" VMESS_SERVER_ENCODING_SOURCE)
+file(READ "${VMESS_CLIENT_ENCODING}" VMESS_CLIENT_ENCODING_SOURCE)
 file(READ "${VMESS_OUTBOUND}" VMESS_OUTBOUND_SOURCE)
 if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
         "state[.]packet_mode[)][ \t\r\n]*[{][ \t\r\n]*co_return co_await DecodeRequestBody")
@@ -213,10 +216,42 @@ if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
     message(FATAL_ERROR
         "VMess request body state must derive packet mode from the command")
 endif()
+string(REGEX MATCHALL
+    "state[.]packet_mode = request[.]command == Command::UDP"
+    VMESS_PACKET_MODE_INITIALIZERS "${VMESS_SERVER_ENCODING_SOURCE}")
+list(LENGTH VMESS_PACKET_MODE_INITIALIZERS
+    VMESS_PACKET_MODE_INITIALIZER_COUNT)
+if(NOT VMESS_PACKET_MODE_INITIALIZER_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "VMess request reader and response writer must both derive packet mode")
+endif()
 if(NOT VMESS_OUTBOUND_SOURCE MATCHES
         "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
     message(FATAL_ERROR
         "VMess outbound must validate each complete UDP datagram atomically")
+endif()
+if(NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "request_body_state_[.]packet_mode = command_ == Command::UDP" OR
+   NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "ContiguousUdpDatagram packet[(]mb[)]" OR
+   NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "EncodeRequestBodyChunk")
+    message(FATAL_ERROR
+        "VMess client UDP writer must encode one complete datagram per chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode = request[.]command == Command::UDP" OR
+   NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "ContiguousUdpDatagram packet[(]mb[)]" OR
+   NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "EncodeResponseBodyChunk[(]state, packet[.]Bytes[(][)], out_mb[)]")
+    message(FATAL_ERROR
+        "VMess server UDP writer must encode one complete datagram per chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
+    message(FATAL_ERROR
+        "VMess server response writer must validate each UDP datagram atomically")
 endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)

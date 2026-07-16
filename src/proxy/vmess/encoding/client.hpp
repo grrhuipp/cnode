@@ -20,6 +20,7 @@ struct EncodeRequestBodyState final {
     std::optional<VMessCipher> length_cipher;
     std::optional<ShakeMask> mask;
     bool global_padding = false;
+    bool packet_mode = false;
     bool eof_sent = false;
 };
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include "acppnode/common/buffer_util.hpp"
+#include "../udp_datagram.hpp"
 
 namespace acpp {
 
@@ -17,7 +18,6 @@ constexpr size_t kVMessHandshakeHeaderMax = 512;
 constexpr size_t kVMessHandshakeHeaderEncMax = kVMessHandshakeHeaderMax + 16;
 constexpr size_t kVMessHandshakePacketMax = 16 + 18 + 8 + kVMessHandshakeHeaderEncMax;
 constexpr size_t kVMessResponseHeaderMax = 1024;
-constexpr size_t kVMessBodyMaxChunkSize = 16 * 1024;
 constexpr size_t kStreamMaxPaddingLen = 64;
 
 [[noreturn]] void ThrowVMessWriteError(const char* what) {
@@ -134,6 +134,10 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
                                             AsyncStream& stream,
                                             const uint8_t* data,
                                             size_t len) {
+    if (len > ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
+        co_return false;
+    }
+
     size_t padding_len = 0;
     if (state.global_padding && state.mask) {
         const uint16_t padding_mask = state.mask->NextMask();
@@ -225,7 +229,7 @@ struct RequestBodyEncodeBudget final {
         ThrowVMessWriteError("VMess client buffer budget too small");
     }
     const size_t stream_chunk_size = std::min(
-        size_t(kVMessBodyMaxChunkSize - overhead),
+        size_t(::acpp::vmess::MAX_CHUNK_SIZE - overhead),
         size_t(buf::Buffer::kSize - length_header_size - overhead - max_padding_len));
     return RequestBodyEncodeBudget{length_header_size, stream_chunk_size};
 }
@@ -294,6 +298,22 @@ net::awaitable<void> EncodeRequestBodyMultiBuffer(EncodeRequestBodyState& state,
         co_return;
     }
 
+    if (state.packet_mode) {
+        const ::acpp::vmess::ContiguousUdpDatagram packet(mb);
+        const auto bytes = packet.Bytes();
+        if (bytes.size() >
+            ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
+            throw IoSystemError(
+                io_error::message_size,
+                "VMess UDP datagram exceeds one authenticated chunk");
+        }
+        if (!co_await EncodeRequestBodyChunk(
+                state, stream, bytes.data(), bytes.size())) {
+            ThrowVMessWriteError("VMess client packet write failed");
+        }
+        co_return;
+    }
+
     const RequestBodyEncodeBudget budget = MakeRequestBodyEncodeBudget(state);
     buf::MultiBuffer out_mb;
     out_mb.reserve(mb.size());
@@ -323,6 +343,22 @@ net::awaitable<void> EncodeRequestBodyBuffers(
         }
     }
     if (!has_data) {
+        co_return;
+    }
+
+    if (state.packet_mode) {
+        const ::acpp::vmess::ContiguousUdpDatagram packet(buffers);
+        const auto bytes = packet.Bytes();
+        if (bytes.size() >
+            ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
+            throw IoSystemError(
+                io_error::message_size,
+                "VMess UDP datagram exceeds one authenticated chunk");
+        }
+        if (!co_await EncodeRequestBodyChunk(
+                state, stream, bytes.data(), bytes.size())) {
+            ThrowVMessWriteError("VMess client packet write failed");
+        }
         co_return;
     }
 
@@ -459,7 +495,8 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
         co_return buf::MultiBuffer{};
     }
 
-    if (chunk_len < overhead + padding_len || chunk_len > kVMessBodyMaxChunkSize + overhead + 64) {
+    if (chunk_len < overhead + padding_len ||
+        chunk_len > ::acpp::vmess::MAX_CHUNK_SIZE + overhead + 64) {
         LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody INVALID length raw_len={} chunk_len={} "
                          "overhead={} padding={}", raw_len, chunk_len, overhead, padding_len);
         state.eof = true;
@@ -554,6 +591,21 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
     EncodeRequestBodyState& state,
     AsyncStream& stream,
     std::span<const uint8_t> payload) {
+    if (state.packet_mode) {
+        if (payload.empty()) {
+            co_return VMessHandshakeResult{};
+        }
+        if (payload.size() >
+            ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        if (!co_await EncodeRequestBodyChunk(
+                state, stream, payload.data(), payload.size())) {
+            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        }
+        co_return VMessHandshakeResult{};
+    }
+
     const size_t overhead = state.cipher->Overhead();
     const size_t max_padding_len =
         (state.global_padding && state.mask) ? kStreamMaxPaddingLen : 0;
@@ -561,7 +613,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
         co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const size_t max_chunk_size = std::min(
-        size_t(kVMessBodyMaxChunkSize - overhead),
+        size_t(::acpp::vmess::MAX_CHUNK_SIZE - overhead),
         size_t(buf::Buffer::kSize - 2 - overhead - max_padding_len));
 
     size_t offset = 0;
@@ -934,6 +986,7 @@ ClientSession::ClientSession(const MemoryAccount& user,
     }
     request_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0 &&
         !(security_ == Security::NONE && command_ != Command::UDP);
+    request_body_state_.packet_mode = command_ == Command::UDP;
     if ((options_ & Option::CHUNK_MASKING) != 0) {
         request_body_state_.mask.emplace(request_body_iv_.data());
     }
