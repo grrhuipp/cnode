@@ -167,7 +167,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     app::AccessLogSession access_log(ctx);
 
     if (!stream) {
-        access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
         stats.OnError();
         co_return;
     }
@@ -177,7 +176,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}] (logical)",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
-        access_log.Reject(ErrorCode::PERMISSION_DENIED);
         stats.OnError();
         co_return;
     }
@@ -190,7 +188,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
                 ConnectionLimiter::RejectReasonToString(reject));
-            access_log.Reject(ErrorCode::RESOURCE_EXHAUSTED);
             stats.OnError();
             co_return;
         }
@@ -201,7 +198,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
                 ConnectionLimiter::RejectReasonToString(reject));
-            access_log.Reject(ErrorCode::RESOURCE_EXHAUSTED);
             stats.OnError();
             co_return;
         }
@@ -217,7 +213,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                    listener.stream_settings.network);
 
     if (!proxy_) {
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
         co_return;
     }
@@ -233,11 +228,9 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: {}", e.what());
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
     } catch (...) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: unknown");
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
     }
 }
@@ -262,7 +255,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_ACCESS_FMT("{} from {}:{} rejected ip_banned [{}] (early)",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
-        access_log.Reject(ErrorCode::PERMISSION_DENIED);
         stats.OnError();
         co_return;
     }
@@ -275,7 +267,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
                 ConnectionLimiter::RejectReasonToString(reject));
-            access_log.Reject(ErrorCode::RESOURCE_EXHAUSTED);
             stats.OnError();
             co_return;
         }
@@ -316,9 +307,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_DEBUG(ctx, "[Session] Transport handshake failed ({}/{})",
                        listener.stream_settings.security,
                        listener.stream_settings.network);
-        access_log.Fail(listener.stream_settings.IsTlsLike()
-            ? ErrorCode::TLS_HANDSHAKE_FAILED
-            : ErrorCode::PROTOCOL_DECODE_FAILED);
         stats.OnError();
         co_return;
     }
@@ -352,7 +340,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag,
                 ConnectionLimiter::RejectReasonToString(reject));
-            access_log.Reject(ErrorCode::RESOURCE_EXHAUSTED);
             stats.OnError();
             co_return;
         }
@@ -364,7 +351,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.network);
 
     if (!proxy_) {
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
         co_return;
     }
@@ -380,11 +366,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: {}", e.what());
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
     } catch (...) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: unknown");
-        access_log.Fail(ErrorCode::INTERNAL);
         stats.OnError();
     }
 }

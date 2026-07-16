@@ -24,22 +24,6 @@ accesslog::Network ToAccessNetwork(::acpp::Network network) noexcept {
     }
 }
 
-bool IsRejectedError(ErrorCode error) noexcept {
-    switch (error) {
-        case ErrorCode::PERMISSION_DENIED:
-        case ErrorCode::RESOURCE_EXHAUSTED:
-        case ErrorCode::PROTOCOL_AUTH_FAILED:
-        case ErrorCode::BLOCKED:
-        case ErrorCode::VMESS_INVALID_USER:
-        case ErrorCode::VMESS_REPLAY_ATTACK:
-        case ErrorCode::PANEL_USER_DISABLED:
-        case ErrorCode::PANEL_TRAFFIC_EXCEEDED:
-            return true;
-        default:
-            return false;
-    }
-}
-
 std::string AddressString(const net::ip::address& address) {
     if (address.is_unspecified()) {
         return {};
@@ -51,8 +35,6 @@ std::string AddressString(const net::ip::address& address) {
 
 accesslog::Event BuildAccessLogEvent(
     const session::Context& ctx,
-    accesslog::Result result,
-    ErrorCode error,
     accesslog::CloseSide close_side,
     uint64_t bytes_up,
     uint64_t bytes_down) {
@@ -91,8 +73,8 @@ accesslog::Event BuildAccessLogEvent(
 
     event.uplink_bytes = std::max(bytes_up, ctx.traffic.bytes_up);
     event.downlink_bytes = std::max(bytes_down, ctx.traffic.bytes_down);
-    event.result = result;
-    event.error_code = error;
+    event.result = accesslog::Result::Completed;
+    event.error_code = ErrorCode::OK;
     event.close_side = close_side;
     event.dns_state = static_cast<uint8_t>(ctx.content.dns_result);
     event.sniff_protocol = ctx.content.protocol;
@@ -104,7 +86,7 @@ AccessLogSession::AccessLogSession(session::Context& ctx) noexcept
     : ctx_(&ctx) {}
 
 AccessLogSession::~AccessLogSession() noexcept {
-    if (!ctx_ || cancelled_ || ctx_->access_event_submitted ||
+    if (!ctx_ || !completed_ || cancelled_ || ctx_->access_event_submitted ||
         ctx_->inbound.access_source_ref == 0) {
         return;
     }
@@ -112,41 +94,30 @@ AccessLogSession::~AccessLogSession() noexcept {
     ctx_->access_event_submitted = true;
     try {
         (void)accesslog::Reporter::Instance().Submit(BuildAccessLogEvent(
-            *ctx_, result_, error_, close_side_, bytes_up_, bytes_down_));
+            *ctx_, close_side_, bytes_up_, bytes_down_));
     } catch (...) {
         // Reporting is fail-open and must never unwind into the proxy path.
     }
 }
 
 void AccessLogSession::Complete(const RelayResult& result) noexcept {
+    // Mux/control transports are not logical proxy requests. Their child
+    // sessions are reported independently by Dispatcher::Dispatch.
+    if (ctx_ && ctx_->content.network == Network::MUX) {
+        Cancel();
+        return;
+    }
+    if (result.error != ErrorCode::OK) {
+        Cancel();
+        return;
+    }
+
     bytes_up_ = result.bytes_up;
     bytes_down_ = result.bytes_down;
-    error_ = result.error;
     close_side_ = result.client_closed_first
         ? accesslog::CloseSide::Client
         : accesslog::CloseSide::Remote;
-
-    if (result.error == ErrorCode::OK) {
-        result_ = accesslog::Result::Completed;
-    } else if (result.error == ErrorCode::CANCELLED) {
-        result_ = accesslog::Result::Cancelled;
-    } else if (IsRejectedError(result.error)) {
-        result_ = accesslog::Result::Rejected;
-    } else {
-        result_ = accesslog::Result::Failed;
-    }
-}
-
-void AccessLogSession::Reject(ErrorCode error) noexcept {
-    result_ = accesslog::Result::Rejected;
-    error_ = error;
-}
-
-void AccessLogSession::Fail(ErrorCode error) noexcept {
-    result_ = error == ErrorCode::CANCELLED
-        ? accesslog::Result::Cancelled
-        : accesslog::Result::Failed;
-    error_ = error;
+    completed_ = true;
 }
 
 void AccessLogSession::Cancel() noexcept {

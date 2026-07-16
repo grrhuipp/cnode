@@ -85,7 +85,6 @@ void CopySessionContext(const session::Context& source, session::Context& target
     target.content = source.content;
     target.traffic = {};
     target.sockopt = source.sockopt;
-    target.accept_time_us = source.accept_time_us;
     target.worker_id = source.worker_id;
 }
 
@@ -1059,6 +1058,10 @@ Handler::Process(
             user_session.emplace(validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
         }
     }
+
+    // The authenticated socket is a multiplexing control transport. Only its
+    // successfully completed logical TCP/UDP child streams are access events.
+    ctx.content.network = Network::MUX;
 
     auto demux = std::make_shared<AnyTLSDemuxSession>(
         std::move(stream),
