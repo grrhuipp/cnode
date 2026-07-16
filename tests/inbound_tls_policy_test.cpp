@@ -22,5 +22,12 @@ int main() {
     panel.TLSEnable = false;
     if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 7;
 
+    node.NodeType = "trojan";
+    panel.TLSEnable = true;
+    if (!acpp::controller::ShouldEnableInboundTls(&panel, node)) return 8;
+
+    panel.TLSEnable = false;
+    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 9;
+
     return 0;
 }

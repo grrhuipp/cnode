@@ -13,11 +13,12 @@ namespace acpp::controller {
         return false;
     }
 
-    // V2Board AnyTLS nodes may omit the generic `tls` flag even though the
-    // subscription protocol always connects through TLS. The local panel
+    // V2Board AnyTLS and Trojan nodes do not expose the generic `tls` field;
+    // both subscription protocols always connect through TLS. The local panel
     // switch is authoritative for whether this process may terminate TLS.
     return node_config.EnableTLS ||
-        node_config.NodeType == constants::protocol::kAnyTLS;
+        node_config.NodeType == constants::protocol::kAnyTLS ||
+        node_config.NodeType == constants::protocol::kTrojan;
 }
 
 }  // namespace acpp::controller
