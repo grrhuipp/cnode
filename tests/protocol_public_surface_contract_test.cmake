@@ -298,10 +298,15 @@ if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "Shadowsocks UDP sessions must bind protocol session IDs to authenticated credentials")
 endif()
+if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "udp_replay_cache_ = std::move[(]previous_handler->udp_replay_cache_[)]")
+    message(FATAL_ERROR
+        "Shadowsocks handler replacement must preserve Worker-local UDP replay state")
+endif()
 if(SHADOWSOCKS_INBOUND_SOURCE MATCHES
         "Handler::EncodeUdpResponse" OR
    SHADOWSOCKS_INBOUND_SOURCE MATCHES
-        "dynamic_cast.*UdpResponseContext")
+        "dynamic_cast<ShadowsocksUdpResponseContext")
     message(FATAL_ERROR
         "Shadowsocks UDP response encoding must belong to its captured session context")
 endif()
@@ -388,6 +393,14 @@ if(UDP_HANDLER_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
    NOT UDP_WORKER_SOURCE MATCHES "response_context->Encode[(]pkt[)]")
     message(FATAL_ERROR
         "live UDP sessions must encode replies through their captured response context")
+endif()
+if(NOT UDP_HANDLER_HEADER_SOURCE MATCHES "AdoptWorkerStateFrom" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "proxy->AdoptWorkerStateFrom[(][*]impl_->proxy[)]" OR
+   UDP_WORKER_SOURCE MATCHES
+        "ReplaceHandler[(][^)]*[)][^{]*[{][^}]*CleanupAllClientSessions")
+    message(FATAL_ERROR
+        "UDP handler replacement must preserve live sessions and protocol Worker state")
 endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)

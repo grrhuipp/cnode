@@ -297,7 +297,9 @@ bool UdpWorker::ReplaceHandler(std::unique_ptr<UdpHandler> proxy) noexcept {
     if (!proxy) {
         return false;
     }
-    CleanupAllClientSessions();
+    if (impl_->proxy) {
+        proxy->AdoptWorkerStateFrom(*impl_->proxy);
+    }
     impl_->proxy = std::move(proxy);
     return true;
 }

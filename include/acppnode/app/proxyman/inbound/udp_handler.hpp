@@ -64,6 +64,11 @@ class UdpHandler {
 public:
     virtual ~UdpHandler() noexcept = default;
 
+    // Called by the owning Worker before an atomic handler replacement. Only
+    // protocol-local security/lifecycle state may move; live session objects
+    // keep their already captured response contexts.
+    virtual void AdoptWorkerStateFrom(UdpHandler&) noexcept {}
+
     // Called only by the owning Worker. Protocol decoders may update
     // Worker-local session state such as replay windows after authentication.
     [[nodiscard]] virtual std::optional<UdpDecodeResult> DecodeUdp(

@@ -20,6 +20,22 @@ namespace {
 
 class DummyUdpHandler final : public acpp::proxyman::inbound::UdpHandler {
 public:
+    explicit DummyUdpHandler(
+        std::shared_ptr<int> adopted_state = {})
+        : adopted_state_(std::move(adopted_state)) {}
+
+    void AdoptWorkerStateFrom(
+        acpp::proxyman::inbound::UdpHandler& previous) noexcept override {
+        const auto* old = dynamic_cast<const DummyUdpHandler*>(&previous);
+        if (!old) {
+            return;
+        }
+        worker_state_ = old->worker_state_;
+        if (adopted_state_) {
+            *adopted_state_ = worker_state_;
+        }
+    }
+
     std::optional<acpp::proxyman::inbound::UdpDecodeResult> DecodeUdp(
         std::string_view,
         std::string_view,
@@ -27,6 +43,10 @@ public:
         size_t) override {
         return std::nullopt;
     }
+
+private:
+    std::shared_ptr<int> adopted_state_;
+    int worker_state_ = 73;
 };
 
 class CountingUdpResponseContext final
@@ -314,8 +334,6 @@ int main() {
             std::chrono::steady_clock::now())) {
         Fail("UDP session rejected its authenticated owner");
     }
-    owner_session->Close();
-
     auto* attached = worker.AttachSocket("stable-socket", std::move(second));
     if (!attached || worker.FindSocket("stable-socket") != attached ||
         !attached->is_open()) {
@@ -344,8 +362,16 @@ int main() {
             }},
         reply_endpoint_a,
         default_owner);
-    if (!worker.ReplaceHandler(std::make_unique<DummyUdpHandler>())) {
+    auto adopted_worker_state = std::make_shared<int>(-1);
+    if (!worker.ReplaceHandler(
+            std::make_unique<DummyUdpHandler>(adopted_worker_state))) {
         Fail("valid UDP handler replacement was rejected");
+    }
+    if (*adopted_worker_state != 73) {
+        Fail("UDP handler replacement discarded Worker-local protocol state");
+    }
+    if (owner_session->Closed()) {
+        Fail("UDP handler replacement closed a live client session");
     }
     acpp::buf::BufferGuard snapshot_reply{acpp::buf::Buffer::New()};
     if (!snapshot_reply) Fail("failed to allocate snapshot UDP reply");
@@ -375,6 +401,8 @@ int main() {
     if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
         Fail("rejected UDP handler replacement disturbed the live socket");
     }
+
+    owner_session->Close();
 
     worker.CloseSocket("stable-socket");
     if (worker.FindSocket("stable-socket") != nullptr) {

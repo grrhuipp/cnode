@@ -39,6 +39,12 @@ public:
     static constexpr size_t kMaxSessions = 16384;
     static constexpr auto kRetention = std::chrono::seconds(65);
 
+    Ss2022UdpReplayCache() = default;
+    Ss2022UdpReplayCache(const Ss2022UdpReplayCache&) = delete;
+    Ss2022UdpReplayCache& operator=(const Ss2022UdpReplayCache&) = delete;
+    Ss2022UdpReplayCache(Ss2022UdpReplayCache&&) = default;
+    Ss2022UdpReplayCache& operator=(Ss2022UdpReplayCache&&) = default;
+
     [[nodiscard]] bool Accept(
         std::span<const uint8_t, 8> session_id,
         uint64_t packet_id,

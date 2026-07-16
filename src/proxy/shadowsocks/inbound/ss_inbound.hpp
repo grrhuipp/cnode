@@ -26,6 +26,9 @@ public:
             ::acpp::ConnectionLimiterPtr limiter,
             std::string cipher_method);
 
+    void AdoptWorkerStateFrom(
+        ::acpp::proxyman::inbound::UdpHandler& previous) noexcept override;
+
     // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
     ::acpp::net::awaitable<::acpp::RelayResult> Process(
         std::unique_ptr<::acpp::AsyncStream> stream,

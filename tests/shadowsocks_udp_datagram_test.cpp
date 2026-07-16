@@ -144,9 +144,16 @@ void Check2022(const TargetAddress& target,
               cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
           "Shadowsocks 2022 accepted a replayed request packet");
 
-    ss::Ss2022UdpSessionState response_encoder = encoder;
-    response_encoder.next_packet_id = 0;
-    ss::Ss2022UdpSessionState response_decoder = response_encoder;
+    auto make_response_state = [&]() {
+        ss::Ss2022UdpSessionState state;
+        state.cipher_info = encoder.cipher_info;
+        state.key = encoder.key;
+        state.client_session_id = encoder.client_session_id;
+        state.server_session_id = encoder.server_session_id;
+        return state;
+    };
+    ss::Ss2022UdpSessionState response_encoder = make_response_state();
+    ss::Ss2022UdpSessionState response_decoder = make_response_state();
     const size_t response_size = ss::Encode2022UdpResponsePacketTo(
         target, payload.data(), payload.size(), response_encoder, nullptr, 0);
     std::vector<uint8_t> response(response_size);
@@ -189,6 +196,14 @@ void Check2022ReplayWindow() {
           !cache.Accept(session_id, 7, started + std::chrono::seconds(64)) &&
           cache.Accept(session_id, 7, started + std::chrono::seconds(66)),
           "Shadowsocks 2022 replay cache retention is incorrect");
+
+    ss::Ss2022UdpReplayCache previous_cache;
+    Check(previous_cache.Accept(session_id, 9, started),
+          "failed to seed Shadowsocks 2022 replay cache");
+    ss::Ss2022UdpReplayCache adopted_cache = std::move(previous_cache);
+    Check(!adopted_cache.Accept(
+              session_id, 9, started + std::chrono::seconds(1)),
+          "Shadowsocks 2022 replay cache lost state during handler adoption");
 }
 
 }  // namespace

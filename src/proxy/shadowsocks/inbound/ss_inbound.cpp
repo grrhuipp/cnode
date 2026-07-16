@@ -107,6 +107,15 @@ proxy::shadowsocks::inbound::Handler::Handler(
     }
 }
 
+void proxy::shadowsocks::inbound::Handler::AdoptWorkerStateFrom(
+    proxyman::inbound::UdpHandler& previous) noexcept {
+    auto* previous_handler = dynamic_cast<Handler*>(&previous);
+    if (!previous_handler) {
+        return;
+    }
+    udp_replay_cache_ = std::move(previous_handler->udp_replay_cache_);
+}
+
 // ----------------------------------------------------------------------------
 // Process
 // 流程：
