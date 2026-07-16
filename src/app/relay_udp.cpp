@@ -19,6 +19,8 @@ namespace acpp {
 namespace {
 
 constexpr uint64_t kUdpRelayStatsFlushBytes = 64 * 1024;
+constexpr size_t kMaxUdpRelayQueuedReplies = 256;
+constexpr size_t kMaxUdpRelayQueuedBytes = 512 * 1024;
 
 void FlushUdpRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
     if (acc.bytes_in == 0 && acc.bytes_out == 0) {
@@ -80,24 +82,30 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             (void)reply_signal.try_send(IoErrorCode{});
         }
 
-        void push(UdpRelayReply&& pkt) {
+        [[nodiscard]] bool push(UdpRelayReply&& pkt) {
             const size_t pkt_bytes = pkt.payload_size;
+            if (reply_queue.size() >= kMaxUdpRelayQueuedReplies ||
+                pkt_bytes > kMaxUdpRelayQueuedBytes ||
+                queued_bytes > kMaxUdpRelayQueuedBytes - pkt_bytes) {
+                return false;
+            }
             queued_bytes += pkt_bytes;
             reply_queue.push_back(std::move(pkt));
             if (reply_queue.size() >= 64 || queued_bytes >= 256 * 1024) {
                 shrink_queue_on_drain = true;
             }
             WakeReplyReader();
+            return true;
         }
 
-        void push(UDPPacketView pkt) {
+        [[nodiscard]] bool push(UDPPacketView pkt) {
             UdpRelayReply owned;
             owned.target = pkt.target;
             if (!buf::AppendSpanToMultiBuffer(pkt.data, owned.payload)) {
-                return;
+                return false;
             }
             owned.payload_size = pkt.data.size();
-            push(std::move(owned));
+            return push(std::move(owned));
         }
 
         bool pop(UdpRelayReply& pkt) {
@@ -119,12 +127,16 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     const uint64_t conn_id = ctx.conn_id;
     uint64_t callback_id = session.RegisterCallback(
         [&state, conn_id](UDPPacketView pkt) {
-            if (!state.running) return;
+            if (!state.running) return false;
             LOG_ACCESS_DEBUG("[conn={}] UDP Full Cone received {} bytes from {}",
                       conn_id, pkt.data.size(), pkt.target);
             ++state.total_replies;
-            state.push(pkt);
+            return state.push(pkt);
         });
+    if (callback_id == 0) {
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        co_return result;
+    }
     LOG_CONN_DEBUG(ctx, "Registered Full Cone callback {}", callback_id);
 
     // 上行/下行各自独立的限速器与限速计时器，避免两个协程共享同一 timer。

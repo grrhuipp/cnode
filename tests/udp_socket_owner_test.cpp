@@ -110,6 +110,12 @@ int main() {
         Fail("valid UDP callback was not delivered");
     }
 
+    acpp::PacketCallback rejecting_callback{
+        [](acpp::UDPPacketView) { return false; }};
+    if (rejecting_callback(callback_packet)) {
+        Fail("UDP callback rejection was converted to delivery success");
+    }
+
     acpp::net::io_context io_context;
     acpp::IoErrorCode ec;
     const acpp::udp::endpoint reply_endpoint_a(

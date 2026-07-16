@@ -165,9 +165,10 @@ public:
         }
     }
 
-    void Start() {
+    [[nodiscard]] bool Start() {
         callback_id_ = session_.RegisterCallback(
             PacketCallback{[this](UDPPacketView pkt) { OnPacket(pkt); }});
+        return callback_id_ != 0;
     }
 
     ~ShadowsocksUdpOutboundEndpoint() noexcept override {
@@ -584,7 +585,9 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             cipher_info_,
             master_key_,
             psk_chain_);
-        target_endpoint.Start();
+        if (!target_endpoint.Start()) {
+            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
 
         RelayResult result;
         std::exception_ptr relay_error;

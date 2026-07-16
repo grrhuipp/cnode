@@ -319,8 +319,10 @@ if(NOT UDP_RELAY_SOURCE MATCHES
 endif()
 set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
 set(UDP_SESSION_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp")
+set(UDP_TYPES_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_types.hpp")
 file(READ "${UDP_SESSION}" UDP_SESSION_SOURCE)
 file(READ "${UDP_SESSION_HEADER}" UDP_SESSION_HEADER_SOURCE)
+file(READ "${UDP_TYPES_HEADER}" UDP_TYPES_HEADER_SOURCE)
 if(UDP_SESSION_SOURCE MATCHES
         "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*buf::Buffer::kSize")
     message(FATAL_ERROR
@@ -368,9 +370,20 @@ if(NOT UDP_SESSION_SOURCE MATCHES
         "UDPSession cleanup must be idempotent and dead aggregate stats must stay removed")
 endif()
 if(NOT UDP_SESSION_SOURCE MATCHES
-    "RegisterCallback[(]PacketCallback callback[)] \\{[\r\n ]+if [(][!]callback[)]")
+        "registered_callbacks[.]size[(][)] >= Impl::kMaxCallbacks" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "kMaxTargetsPerCallback = 256" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "kMaxTargetMappings = 4096" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "RemoveTargetMapping[(][*]new_target_mapping, callback_id[)]")
     message(FATAL_ERROR
-        "UDPSession must reject empty receive callbacks")
+        "UDPSession callbacks and target mappings must be bounded and transactional")
+endif()
+if(NOT UDP_TYPES_HEADER_SOURCE MATCHES
+        "return invoke_bool_[(]storage_, std::forward<Args>[(]args[)][.][.][.][)]")
+    message(FATAL_ERROR
+        "UDP callback rejection must propagate through inline type erasure")
 endif()
 set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
@@ -467,6 +480,17 @@ if(NOT UDP_RELAY_SOURCE MATCHES
         "session[.]SendTo[\r\n ()*,a-zA-Z0-9_.]*datagram[.]data[(][)]")
     message(FATAL_ERROR
         "UDP relay must send the coalesced datagram instead of each Buffer")
+endif()
+if(NOT UDP_RELAY_SOURCE MATCHES
+        "kMaxUdpRelayQueuedReplies = 256" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+        "kMaxUdpRelayQueuedBytes = 512 [*] 1024" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+        "if [(]callback_id == 0[)]" OR
+   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
+        "if [(][!]target_endpoint[.]Start[(][)][)]")
+    message(FATAL_ERROR
+        "UDP relay queues and callback registration must expose bounded failure")
 endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR

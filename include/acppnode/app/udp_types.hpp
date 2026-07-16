@@ -62,9 +62,17 @@ public:
                       "UDP PacketCallback capture alignment is too large");
 
         new (storage_) F(std::forward<Fn>(fn));
-        invoke_ = [](void* ptr, Args... args) {
-            (*static_cast<F*>(ptr))(std::forward<Args>(args)...);
-        };
+        using Result = std::invoke_result_t<F&, Args...>;
+        if constexpr (std::is_void_v<Result>) {
+            invoke_void_ = [](void* ptr, Args... args) {
+                (*static_cast<F*>(ptr))(std::forward<Args>(args)...);
+            };
+        } else {
+            invoke_bool_ = [](void* ptr, Args... args) -> bool {
+                return static_cast<bool>(
+                    (*static_cast<F*>(ptr))(std::forward<Args>(args)...));
+            };
+        }
         move_ = [](void* dst, void* src) {
             new (dst) F(std::move(*static_cast<F*>(src)));
             static_cast<F*>(src)->~F();
@@ -79,16 +87,20 @@ public:
     }
 
     explicit operator bool() const noexcept {
-        return invoke_ != nullptr;
+        return invoke_void_ != nullptr || invoke_bool_ != nullptr;
     }
 
-    // 回调异常不能逃出 Worker UDP 接收/回包循环；false 表示空回调或执行失败。
+    // 回调异常不能逃出 Worker UDP 接收/回包循环；bool 回调的背压结果原样
+    // 传播，false 也可表示空回调或执行失败。
     [[nodiscard]] bool operator()(Args... args) noexcept {
-        if (!invoke_) {
+        if (!invoke_void_ && !invoke_bool_) {
             return false;
         }
         try {
-            invoke_(storage_, std::forward<Args>(args)...);
+            if (invoke_bool_) {
+                return invoke_bool_(storage_, std::forward<Args>(args)...);
+            }
+            invoke_void_(storage_, std::forward<Args>(args)...);
             return true;
         } catch (...) {
             return false;
@@ -99,26 +111,30 @@ public:
         if (destroy_) {
             destroy_(storage_);
         }
-        invoke_ = nullptr;
+        invoke_void_ = nullptr;
+        invoke_bool_ = nullptr;
         move_ = nullptr;
         destroy_ = nullptr;
     }
 
 private:
     void MoveFrom(InlineUdpCallback&& other) noexcept {
-        invoke_ = other.invoke_;
+        invoke_void_ = other.invoke_void_;
+        invoke_bool_ = other.invoke_bool_;
         move_ = other.move_;
         destroy_ = other.destroy_;
         if (move_) {
             move_(storage_, other.storage_);
-            other.invoke_ = nullptr;
+            other.invoke_void_ = nullptr;
+            other.invoke_bool_ = nullptr;
             other.move_ = nullptr;
             other.destroy_ = nullptr;
         }
     }
 
     alignas(std::max_align_t) std::byte storage_[kInlineBytes]{};
-    void (*invoke_)(void*, Args...) = nullptr;
+    void (*invoke_void_)(void*, Args...) = nullptr;
+    bool (*invoke_bool_)(void*, Args...) = nullptr;
     void (*move_)(void*, void*) = nullptr;
     void (*destroy_)(void*) = nullptr;
 };

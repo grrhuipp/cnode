@@ -104,6 +104,9 @@ static std::optional<net::ip::address> SelectAddressForSocket(
 struct UDPSession::Impl {
     static constexpr size_t kMaxIpv4UdpPayload = 65507;
     static constexpr size_t kMaxIpv6UdpPayload = 65527;
+    static constexpr size_t kMaxCallbacks = 1024;
+    static constexpr size_t kMaxTargetsPerCallback = 256;
+    static constexpr size_t kMaxTargetMappings = 4096;
 
     Impl(net::io_context& io_context,
          const std::string& session_id,
@@ -120,7 +123,12 @@ struct UDPSession::Impl {
     net::awaitable<void> DoReceive();
     net::awaitable<std::pair<ErrorCode, udp::endpoint>> ResolveEndpoint(
         const TargetAddress& target);
-    void AddTargetMapping(const UdpEndpointKey& target_key, uint64_t callback_id);
+    [[nodiscard]] std::pair<ErrorCode, bool> AddTargetMapping(
+        const UdpEndpointKey& target_key,
+        uint64_t callback_id);
+    void RemoveTargetMapping(
+        const UdpEndpointKey& target_key,
+        uint64_t callback_id) noexcept;
     void MaybePruneTargetMappings(steady_clock::time_point now);
     void RefreshTargetMapping(const UdpEndpointKey& target_key,
                               uint64_t callback_id,
@@ -142,16 +150,27 @@ struct UDPSession::Impl {
             co_return ErrorCode::INVALID_ARGUMENT;
         }
 
+        std::optional<UdpEndpointKey> new_target_mapping;
         try {
             if (callback_id > 0) {
                 const UdpEndpointKey target_key = MakeEndpointKey(
                     remote_ep.address(), remote_ep.port());
-                AddTargetMapping(target_key, callback_id);
+                auto [mapping_error, inserted] =
+                    AddTargetMapping(target_key, callback_id);
+                if (mapping_error != ErrorCode::OK) {
+                    co_return mapping_error;
+                }
+                if (inserted) {
+                    new_target_mapping = target_key;
+                }
             }
 
             const size_t sent = co_await socket.async_send_to(
                 buffers, remote_ep, net::use_awaitable);
             if (sent != payload_size) {
+                if (new_target_mapping) {
+                    RemoveTargetMapping(*new_target_mapping, callback_id);
+                }
                 co_return ErrorCode::NETWORK_IO_ERROR;
             }
             ++packets_sent;
@@ -159,8 +178,16 @@ struct UDPSession::Impl {
             Touch();
             co_return ErrorCode::SUCCESS;
         } catch (const IoSystemError& e) {
+            if (new_target_mapping) {
+                RemoveTargetMapping(*new_target_mapping, callback_id);
+            }
             LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
             co_return ErrorCode::NETWORK_IO_ERROR;
+        } catch (const std::bad_alloc&) {
+            if (new_target_mapping) {
+                RemoveTargetMapping(*new_target_mapping, callback_id);
+            }
+            co_return ErrorCode::RESOURCE_EXHAUSTED;
         }
     }
 
@@ -173,6 +200,7 @@ struct UDPSession::Impl {
         UdpEndpointKey,
         CallbackIdList,
         UdpEndpointKeyHash> target_to_callbacks;
+    size_t target_mapping_count = 0;
     uint64_t next_callback_id = 1;
 
     udp::socket socket;
@@ -388,9 +416,13 @@ void UDPSession::StartReceive() {
 
 // Per-Worker 简化版：无需 executor 参数
 uint64_t UDPSession::RegisterCallback(PacketCallback callback) {
-    if (!callback) {
-        LOG_ACCESS_DEBUG("UDP session {} rejected empty Full Cone callback",
-                         impl_->session_id);
+    if (!impl_->running || !callback ||
+        impl_->registered_callbacks.size() >= Impl::kMaxCallbacks) {
+        LOG_ACCESS_DEBUG(
+            "UDP session {} rejected Full Cone callback running={} registered={}",
+            impl_->session_id,
+            impl_->running,
+            impl_->registered_callbacks.size());
         return 0;
     }
 
@@ -419,6 +451,9 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
                 }
             }
         }
+        impl_->target_mapping_count -= std::min(
+            impl_->target_mapping_count,
+            it->second.sent_targets.size());
 
         LOG_ACCESS_DEBUG("UDP session {} unregistered Full Cone callback {}", impl_->session_id, callback_id);
         impl_->registered_callbacks.erase(it);
@@ -555,18 +590,61 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
     co_return;
 }
 
-void UDPSession::Impl::AddTargetMapping(const UdpEndpointKey& target_key, uint64_t callback_id) {
+std::pair<ErrorCode, bool> UDPSession::Impl::AddTargetMapping(
+    const UdpEndpointKey& target_key,
+    uint64_t callback_id) {
     const auto now = steady_clock::now();
     MaybePruneTargetMappings(now);
 
     auto it = registered_callbacks.find(callback_id);
-    if (it != registered_callbacks.end()) {
-        auto insert_result = it->second.sent_targets.insert_or_assign(target_key, now);
-        if (insert_result.second) {
-            target_to_callbacks[target_key].Push(callback_id);
-            LOG_ACCESS_DEBUG("UDP session {} added target mapping {} -> callback {}",
-                     session_id, EndpointKeyToString(target_key), callback_id);
+    if (it == registered_callbacks.end()) {
+        return {ErrorCode::INVALID_ARGUMENT, false};
+    }
+
+    auto existing = it->second.sent_targets.find(target_key);
+    if (existing != it->second.sent_targets.end()) {
+        existing->second = now;
+        return {ErrorCode::OK, false};
+    }
+    if (it->second.sent_targets.size() >= kMaxTargetsPerCallback ||
+        target_mapping_count >= kMaxTargetMappings) {
+        return {ErrorCode::RESOURCE_EXHAUSTED, false};
+    }
+
+    it->second.sent_targets.emplace(target_key, now);
+    try {
+        target_to_callbacks[target_key].Push(callback_id);
+    } catch (...) {
+        it->second.sent_targets.erase(target_key);
+        auto reverse_it = target_to_callbacks.find(target_key);
+        if (reverse_it != target_to_callbacks.end() && reverse_it->second.Empty()) {
+            target_to_callbacks.erase(reverse_it);
         }
+        throw;
+    }
+    ++target_mapping_count;
+    LOG_ACCESS_DEBUG("UDP session {} added target mapping {} -> callback {}",
+             session_id, EndpointKeyToString(target_key), callback_id);
+    return {ErrorCode::OK, true};
+}
+
+void UDPSession::Impl::RemoveTargetMapping(
+    const UdpEndpointKey& target_key,
+    uint64_t callback_id) noexcept {
+    auto callback_it = registered_callbacks.find(callback_id);
+    if (callback_it == registered_callbacks.end() ||
+        callback_it->second.sent_targets.erase(target_key) == 0) {
+        return;
+    }
+    target_mapping_count -= std::min<size_t>(target_mapping_count, 1);
+
+    auto reverse_it = target_to_callbacks.find(target_key);
+    if (reverse_it == target_to_callbacks.end()) {
+        return;
+    }
+    auto& callbacks = reverse_it->second;
+    if (callbacks.Remove(callback_id) && callbacks.Empty()) {
+        target_to_callbacks.erase(reverse_it);
     }
 }
 
@@ -597,6 +675,7 @@ void UDPSession::Impl::MaybePruneTargetMappings(steady_clock::time_point now) {
                 }
             }
             it = entry.sent_targets.erase(it);
+            target_mapping_count -= std::min<size_t>(target_mapping_count, 1);
             pruned_entry_targets = true;
         }
         if (pruned_entry_targets) {
@@ -633,6 +712,7 @@ void UDPSession::Stop() {
 
     impl_->registered_callbacks.clear();
     impl_->target_to_callbacks.clear();
+    impl_->target_mapping_count = 0;
     MaybeShrinkHashContainer(impl_->registered_callbacks, 16);
     MaybeShrinkHashContainer(impl_->target_to_callbacks, 16);
 

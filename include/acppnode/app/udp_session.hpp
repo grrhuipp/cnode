@@ -61,7 +61,8 @@ public:
 
     void Touch();
 
-    // 注册 Full Cone 回调，返回 callback_id 用于后续取消；空回调返回 0。
+    // 注册 Full Cone 回调，返回 callback_id 用于后续取消；session 未运行、
+    // 回调为空或容量耗尽时返回 0。
     // 注意：Per-Worker 模式，无需 executor 参数，回调在同一线程执行
     uint64_t RegisterCallback(PacketCallback callback);
 
