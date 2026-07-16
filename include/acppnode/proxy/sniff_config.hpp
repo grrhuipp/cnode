@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/constants.hpp"
 
 #include <cstdint>
@@ -27,6 +28,9 @@ struct SniffConfig {
         for (const auto& protocol : dest_override) {
             dest_override_mask |= OverrideBit(protocol);
         }
+        for (auto& excluded : domains_excluded) {
+            domain::NormalizeDnsHostnameInPlace(excluded);
+        }
     }
 
     [[nodiscard]] bool MatchesDestOverride(std::string_view protocol) const {
@@ -43,21 +47,9 @@ struct SniffConfig {
         return false;
     }
 
-    [[nodiscard]] bool IsDomainExcluded(std::string_view domain) const noexcept {
+    [[nodiscard]] bool IsDomainExcluded(std::string_view hostname) const noexcept {
         for (const auto& excluded : domains_excluded) {
-            if (excluded.size() != domain.size()) {
-                continue;
-            }
-
-            bool equal = true;
-            for (size_t i = 0; i < domain.size(); ++i) {
-                if (ToLowerAscii(static_cast<unsigned char>(excluded[i])) !=
-                    ToLowerAscii(static_cast<unsigned char>(domain[i]))) {
-                    equal = false;
-                    break;
-                }
-            }
-            if (equal) {
+            if (domain::DnsHostnamesEqual(excluded, hostname)) {
                 return true;
             }
         }
@@ -84,12 +76,6 @@ struct SniffConfig {
 private:
     static constexpr uint8_t kOverrideTls = 1u << 0;
     static constexpr uint8_t kOverrideHttp = 1u << 1;
-
-    [[nodiscard]] static constexpr char ToLowerAscii(unsigned char ch) noexcept {
-        return ch >= 'A' && ch <= 'Z'
-            ? static_cast<char>(ch + ('a' - 'A'))
-            : static_cast<char>(ch);
-    }
 
     [[nodiscard]] static constexpr uint8_t OverrideBit(std::string_view protocol) noexcept {
         if (protocol == constants::protocol::kTls) {

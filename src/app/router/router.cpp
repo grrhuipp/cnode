@@ -2,6 +2,7 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/core/constants.hpp"
@@ -455,7 +456,7 @@ DomainTrie::~DomainTrie() noexcept = default;
 
 void DomainTrie::AddSuffix(const std::string& suffix) {
     std::string lower = suffix;
-    ToLowerInPlace(lower);
+    ::acpp::domain::NormalizeDnsHostnameInPlace(lower);
 
     size_t node_index = 0;
     for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
@@ -509,7 +510,7 @@ DomainMatcher::~DomainMatcher() noexcept = default;
 
 void DomainMatcher::AddDomain(const std::string& domain) {
     std::string lower = domain;
-    ToLowerInPlace(lower);
+    ::acpp::domain::NormalizeDnsHostnameInPlace(lower);
     domains_.insert(std::move(lower));
 }
 
@@ -532,6 +533,7 @@ void DomainMatcher::AddRegex(const std::string& pattern) {
 }
 
 bool DomainMatcher::Match(std::string_view domain) const {
+    domain = ::acpp::domain::WithoutTrailingRootDot(domain);
     char stack_buf[256];
     memory::ThreadLocalVector<char> heap_buf;
     char* lower_ptr = stack_buf;

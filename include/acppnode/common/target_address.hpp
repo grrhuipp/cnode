@@ -140,6 +140,7 @@ private:
         } else {
             if (domain::IsValidDnsHostname(
                     host, domain::TrailingDotPolicy::Allow)) {
+                domain::NormalizeDnsHostnameInPlace(host);
                 type = AddressType::Domain;
             } else {
                 host.clear();

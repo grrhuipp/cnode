@@ -15,6 +15,8 @@ bool Require(bool condition, const char* message) {
 int main() {
     using acpp::domain::IsIpv4AddressLiteral;
     using acpp::domain::IsValidDnsHostname;
+    using acpp::domain::DnsHostnamesEqual;
+    using acpp::domain::NormalizeDnsHostnameInPlace;
     using acpp::domain::TrailingDotPolicy;
 
     if (!Require(IsValidDnsHostname("example.com", TrailingDotPolicy::Forbid),
@@ -48,5 +50,11 @@ int main() {
                  "an incomplete IPv4 literal must be rejected")) return 10;
     if (!Require(!IsIpv4AddressLiteral("192.00.2.1"),
                  "a non-canonical leading zero must not become an IP literal")) return 11;
+    if (!Require(DnsHostnamesEqual("Example.COM.", "example.com"),
+                 "DNS hostname equality must ignore case and the root dot")) return 12;
+    std::string canonical = "Example.COM.";
+    NormalizeDnsHostnameInPlace(canonical);
+    if (!Require(canonical == "example.com",
+                 "DNS hostname storage must use one canonical form")) return 13;
     return 0;
 }

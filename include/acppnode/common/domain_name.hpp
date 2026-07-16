@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <string_view>
 
 namespace acpp::domain {
@@ -9,6 +10,51 @@ enum class TrailingDotPolicy {
     Forbid,
     Allow,
 };
+
+[[nodiscard]] constexpr char ToLowerAscii(unsigned char ch) noexcept {
+    return ch >= 'A' && ch <= 'Z'
+        ? static_cast<char>(ch + ('a' - 'A'))
+        : static_cast<char>(ch);
+}
+
+[[nodiscard]] inline std::string_view WithoutTrailingRootDot(
+    std::string_view hostname) noexcept {
+    if (!hostname.empty() && hostname.back() == '.') {
+        hostname.remove_suffix(1);
+    }
+    return hostname;
+}
+
+[[nodiscard]] inline bool DnsHostnamesEqual(
+    std::string_view lhs,
+    std::string_view rhs) noexcept {
+    lhs = WithoutTrailingRootDot(lhs);
+    rhs = WithoutTrailingRootDot(rhs);
+    if (lhs.size() != rhs.size()) return false;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (ToLowerAscii(static_cast<unsigned char>(lhs[i])) !=
+            ToLowerAscii(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void NormalizeDnsHostnameInPlace(std::string& hostname) noexcept {
+    if (!hostname.empty() && hostname.back() == '.') {
+        hostname.pop_back();
+    }
+    for (char& ch : hostname) {
+        ch = ToLowerAscii(static_cast<unsigned char>(ch));
+    }
+}
+
+[[nodiscard]] inline std::string CanonicalDnsHostname(
+    std::string_view hostname) {
+    std::string canonical(hostname);
+    NormalizeDnsHostnameInPlace(canonical);
+    return canonical;
+}
 
 [[nodiscard]] inline bool IsValidDnsHostname(
     std::string_view hostname,

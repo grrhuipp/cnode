@@ -28,8 +28,9 @@ int main() {
                  "TargetAddress::Parse must reject malformed hostnames")) return 4;
 
     const acpp::TargetAddress domain("example.com.", 443);
-    if (!Require(domain.IsValid() && domain.IsDomain(),
-                 "an absolute DNS hostname must remain a valid target")) return 5;
+    if (!Require(domain.IsValid() && domain.IsDomain() &&
+                     domain.host == "example.com",
+                 "an absolute DNS hostname must be stored canonically")) return 5;
 
     const auto ipv6 = acpp::TargetAddress::Parse("[2001:db8::1]:443");
     if (!Require(ipv6 && ipv6->IsValid() && ipv6->IsIPv6(),

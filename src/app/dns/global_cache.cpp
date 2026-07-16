@@ -1,13 +1,13 @@
 #include "global_cache.hpp"
 
 #include "acppnode/common/clock.hpp"
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/string_hash.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <memory>
 #include <unordered_map>
@@ -101,19 +101,6 @@ size_t ShardIndex(std::string_view domain, const Settings& settings) noexcept {
     return std::hash<std::string_view>{}(domain) % active;
 }
 
-std::string CanonicalDomain(std::string_view domain) {
-    while (!domain.empty() && domain.back() == '.') {
-        domain.remove_suffix(1);
-    }
-
-    std::string out;
-    out.reserve(domain.size());
-    for (unsigned char ch : domain) {
-        out.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return out;
-}
-
 uint32_t ClampTtl(uint32_t ttl, const Settings& settings) noexcept {
     return std::max(settings.min_ttl, std::min(settings.max_ttl, ttl));
 }
@@ -186,7 +173,7 @@ std::optional<PreparedUpdate> PrepareUpdate(
     const GlobalDnsCacheUpdate& update,
     const Settings& settings,
     time_point now) {
-    auto domain = CanonicalDomain(update.domain);
+    auto domain = ::acpp::domain::CanonicalDnsHostname(update.domain);
     if (domain.empty()) {
         return std::nullopt;
     }
@@ -287,7 +274,7 @@ std::optional<DnsResult> GlobalDnsCache::Lookup(std::string_view domain) {
         return std::nullopt;
     }
 
-    auto canonical = CanonicalDomain(domain);
+    auto canonical = ::acpp::domain::CanonicalDnsHostname(domain);
     if (canonical.empty()) {
         return std::nullopt;
     }
