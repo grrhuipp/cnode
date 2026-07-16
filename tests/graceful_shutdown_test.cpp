@@ -1,5 +1,6 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -23,14 +24,18 @@ namespace {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
-bool WriteConfig(const fs::path& root, unsigned short port) {
+bool WriteConfig(const fs::path& root,
+                 unsigned short port,
+                 unsigned short panel_port) {
     std::error_code ec;
     fs::create_directories(root, ec);
     if (ec) return false;
 
     std::ofstream main_config(root / "config.json", std::ios::binary);
     main_config
-        << R"({"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5}})"
+        << R"({"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5},"panels":[{"Name":"shutdown-panel","Type":"V2board","APIHost":"http://127.0.0.1:)"
+        << panel_port
+        << R"(","Key":"shutdown-key","NodeIDs":[1],"NodeType":"vmess","ListenIP":"auto","SendIP":"auto"}]})"
         << '\n';
     if (!main_config) return false;
 
@@ -198,9 +203,45 @@ int main(int argc, char** argv) {
     if (ec || port == 0) return 4;
     port_reservation.close(ec);
 
-    if (!WriteConfig(root, port)) return 5;
+    asio::io_context panel_io;
+    asio::ip::tcp::acceptor panel_acceptor(panel_io);
+    panel_acceptor.open(asio::ip::tcp::v4(), ec);
+    if (ec) return 5;
+    panel_acceptor.set_option(asio::socket_base::reuse_address(true), ec);
+    if (ec) return 5;
+    panel_acceptor.bind({asio::ip::address_v4::loopback(), 0}, ec);
+    if (ec) return 5;
+    panel_acceptor.listen(asio::socket_base::max_listen_connections, ec);
+    if (ec) return 5;
+    const auto panel_port = panel_acceptor.local_endpoint(ec).port();
+    if (ec || panel_port == 0) return 5;
+
+    if (!WriteConfig(root, port, panel_port)) return 5;
+
+    std::shared_ptr<asio::ip::tcp::socket> hanging_panel_socket;
+    auto panel_work = asio::make_work_guard(panel_io);
+    panel_acceptor.async_accept(
+        [&](const std::error_code& accept_error,
+            asio::ip::tcp::socket socket) {
+            if (!accept_error) {
+                hanging_panel_socket =
+                    std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+            }
+        });
+    std::thread panel_thread([&] { panel_io.run(); });
+
     const fs::path output_path = root / "child-output.log";
     const int exit_code = RunAndSignal(executable, root, output_path);
+
+    asio::post(panel_io, [&] {
+        if (hanging_panel_socket) {
+            hanging_panel_socket->close(ec);
+        }
+        panel_acceptor.close(ec);
+        panel_work.reset();
+    });
+    panel_thread.join();
+    const bool panel_connected = static_cast<bool>(hanging_panel_socket);
 
     std::ifstream output_file(output_path, std::ios::binary);
     const std::string output{
@@ -209,6 +250,10 @@ int main(int argc, char** argv) {
     if (exit_code != 0) {
         std::cerr << "unexpected child exit code: " << exit_code << "\n" << output;
         return 6;
+    }
+    if (!panel_connected) {
+        std::cerr << "child never reached hanging panel endpoint\n" << output;
+        return 8;
     }
     if (output.find("status=stopping") == std::string::npos ||
         output.find("cnode stopped") == std::string::npos) {

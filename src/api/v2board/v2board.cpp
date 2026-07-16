@@ -16,6 +16,7 @@
 #include <asio/read_until.hpp>
 #include <asio/write.hpp>
 #include <asio/steady_timer.hpp>
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <format>
@@ -60,6 +61,7 @@ public:
     ~APIClient() override;
 
     ::acpp::api::ClientInfo Describe() const override;
+    void CancelPending() noexcept override;
 
     net::awaitable<NodeInfoFetchResult>
     GetNodeInfo() override;
@@ -251,6 +253,33 @@ net::awaitable<void> WriteHttpRequest(Stream& stream, const std::string& request
     co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
 }
 
+class ActiveSocketRegistration {
+public:
+    using Socket = tcp::socket::lowest_layer_type;
+
+    ActiveSocketRegistration(
+        std::vector<Socket*>& sockets,
+        Socket& socket)
+        : sockets_(sockets)
+        , socket_(&socket) {
+        sockets_.push_back(socket_);
+    }
+
+    ~ActiveSocketRegistration() {
+        const auto entry = std::ranges::find(sockets_, socket_);
+        if (entry != sockets_.end()) {
+            sockets_.erase(entry);
+        }
+    }
+
+    ActiveSocketRegistration(const ActiveSocketRegistration&) = delete;
+    ActiveSocketRegistration& operator=(const ActiveSocketRegistration&) = delete;
+
+private:
+    std::vector<Socket*>& sockets_;
+    Socket* socket_;
+};
+
 }  // namespace
 
 // ============================================================================
@@ -288,6 +317,7 @@ struct APIClient::Impl {
     net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
     net::awaitable<RuleListFetchResult> GetNodeRule();
     net::awaitable<bool> ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results);
+    void CancelPending() noexcept;
     void Debug();
 
     net::io_context& io_context_;
@@ -301,6 +331,8 @@ struct APIClient::Impl {
     std::optional<::acpp::api::NodeInfo> cached_config_;
     std::vector<::acpp::api::DetectRule> cached_route_rules_;
     std::unique_ptr<net::ssl::context> https_context_;
+    std::vector<ActiveSocketRegistration::Socket*> active_sockets_;
+    uint64_t cancel_epoch_ = 0;
     bool debug_enabled_ = false;
 };
 
@@ -450,6 +482,10 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
                           const std::string& if_none_match) {
 
     HttpResponse result;
+    const uint64_t request_epoch = cancel_epoch_;
+    const auto cancelled = [&]() noexcept {
+        return request_epoch != cancel_epoch_;
+    };
 
     try {
         if (url_parts_.host.empty() || url_parts_.port == 0) {
@@ -466,6 +502,11 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
             endpoints.emplace_back(*url_parts_.literal_address, port);
         } else {
             auto dns_result = co_await dns_service_.Resolve(url_parts_.host);
+            if (cancelled()) {
+                result.status = -1;
+                result.body = "request cancelled";
+                co_return result;
+            }
             if (!dns_result.Ok() || dns_result.addresses.empty()) {
                 result.status = 0;
                 result.body = "DNS resolve failed for " + url_parts_.host;
@@ -536,8 +577,15 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
 
             std::string last_error;
             for (const auto& endpoint : endpoints) {
+                if (cancelled()) {
+                    result.status = -1;
+                    result.body = "request cancelled";
+                    co_return result;
+                }
                 try {
                     ssl::stream<tcp::socket> stream(io_context_, *ssl_ctx);
+                    ActiveSocketRegistration socket_registration(
+                        active_sockets_, stream.lowest_layer());
                     if (url_parts_.literal_address) {
                         auto* verify_param = SSL_get0_param(stream.native_handle());
                         if (!verify_param ||
@@ -570,6 +618,11 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
                     co_await stream.async_shutdown(net::redirect_error(net::use_awaitable, ec));
                     co_return result;
                 } catch (const std::exception& e) {
+                    if (cancelled()) {
+                        result.status = -1;
+                        result.body = "request cancelled";
+                        co_return result;
+                    }
                     last_error = e.what();
                     LOG_DEBUG("V2Board[{}]: HTTPS endpoint {} failed: {}",
                               config_.Name,
@@ -584,8 +637,15 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
             // HTTP
             std::string last_error;
             for (const auto& endpoint : endpoints) {
+                if (cancelled()) {
+                    result.status = -1;
+                    result.body = "request cancelled";
+                    co_return result;
+                }
                 try {
                     tcp::socket stream(io_context_);
+                    ActiveSocketRegistration socket_registration(
+                        active_sockets_, stream);
 
                     co_await stream.async_connect(endpoint, net::use_awaitable);
 
@@ -601,6 +661,11 @@ APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
                     stream.close(ec);
                     co_return result;
                 } catch (const std::exception& e) {
+                    if (cancelled()) {
+                        result.status = -1;
+                        result.body = "request cancelled";
+                        co_return result;
+                    }
                     last_error = e.what();
                     LOG_DEBUG("V2Board[{}]: HTTP endpoint {} failed: {}",
                               config_.Name,
@@ -834,6 +899,15 @@ APIClient::Impl::GetNodeRule() {
     co_return RuleListFetchResult::Success(cached_route_rules_);
 }
 
+void APIClient::Impl::CancelPending() noexcept {
+    ++cancel_epoch_;
+    for (ActiveSocketRegistration::Socket* socket : active_sockets_) {
+        IoErrorCode ignored;
+        socket->cancel(ignored);
+        socket->close(ignored);
+    }
+}
+
 net::awaitable<bool>
 APIClient::Impl::ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results) {
     (void)detect_results;
@@ -853,6 +927,10 @@ APIClient::~APIClient() = default;
 
 ::acpp::api::ClientInfo APIClient::Describe() const {
     return impl_->Describe();
+}
+
+void APIClient::CancelPending() noexcept {
+    impl_->CancelPending();
 }
 
 net::awaitable<NodeInfoFetchResult>

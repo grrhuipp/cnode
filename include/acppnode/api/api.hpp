@@ -195,6 +195,8 @@ class API {
 public:
     virtual ~API() noexcept = default;
 
+    virtual void CancelPending() noexcept = 0;
+
     virtual net::awaitable<NodeInfoFetchResult>
     GetNodeInfo() = 0;
 

@@ -36,12 +36,12 @@ public:
 
     Controller(const Controller&) = delete;
     Controller& operator=(const Controller&) = delete;
-    Controller(Controller&&) noexcept;
-    Controller& operator=(Controller&&) noexcept;
+    Controller(Controller&&) = delete;
+    Controller& operator=(Controller&&) = delete;
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
     void Start();
-    void Stop();
+    net::awaitable<void> Stop();
 
     struct NodeStatsInfo {
         std::string panel_name;
@@ -57,7 +57,7 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace acpp

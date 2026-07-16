@@ -14,18 +14,21 @@
 
 namespace acpp {
 
-struct Controller::Impl {
+struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     Impl(net::io_context& io_context,
          std::vector<std::unique_ptr<Worker>>& workers,
          const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
     void Start();
-    void Stop();
+    net::awaitable<void> Stop();
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
 
     net::awaitable<void> runPanelMonitors(uint64_t generation);
+    static net::awaitable<void> runPanelMonitorsOwned(
+        std::shared_ptr<Impl> self,
+        uint64_t generation);
     net::awaitable<void> panelMonitor(api::API* panel, uint64_t generation);
     net::awaitable<void> nodeInfoMonitor(api::API* panel);
     net::awaitable<void> userInfoMonitor(api::API* panel,
@@ -58,6 +61,7 @@ struct Controller::Impl {
         const std::vector<api::UserInfo>& api_users) const;
 
     net::io_context&                       io_context_;
+    net::steady_timer                      monitor_completion_;
     std::vector<std::unique_ptr<Worker>>&  workers_;
     const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters_;
 
@@ -79,7 +83,9 @@ struct Controller::Impl {
         uint64_t bytes_down   = 0;
     };
     std::map<std::string, NodeStats> node_stats_;
+    std::vector<net::steady_timer*> monitor_timers_;
     bool running_ = false;
+    bool monitors_active_ = false;
     uint64_t monitor_generation_ = 0;
 };
 

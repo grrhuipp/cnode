@@ -12,6 +12,7 @@
 #include <chrono>
 #include <exception>
 #include <stdexcept>
+#include <vector>
 
 namespace acpp {
 
@@ -27,16 +28,39 @@ std::string ResolvePanelName(api::API* panel,
     return client_info.APIHost;
 }
 
+class MonitorTimerRegistration {
+public:
+    MonitorTimerRegistration(
+        std::vector<net::steady_timer*>& timers,
+        net::steady_timer& timer)
+        : timers_(timers)
+        , timer_(&timer) {
+        timers_.push_back(timer_);
+    }
+
+    ~MonitorTimerRegistration() {
+        const auto entry = std::ranges::find(timers_, timer_);
+        if (entry != timers_.end()) {
+            timers_.erase(entry);
+        }
+    }
+
+    MonitorTimerRegistration(const MonitorTimerRegistration&) = delete;
+    MonitorTimerRegistration& operator=(const MonitorTimerRegistration&) = delete;
+
+private:
+    std::vector<net::steady_timer*>& timers_;
+    net::steady_timer* timer_;
+};
+
 }  // namespace
 
 Controller::Controller(net::io_context& io_context,
                        std::vector<std::unique_ptr<Worker>>& workers,
                        const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
-    : impl_(std::make_unique<Impl>(io_context, workers, limiters)) {}
+    : impl_(std::make_shared<Impl>(io_context, workers, limiters)) {}
 
 Controller::~Controller() = default;
-Controller::Controller(Controller&&) noexcept = default;
-Controller& Controller::operator=(Controller&&) noexcept = default;
 
 void Controller::AddPanel(std::unique_ptr<api::API> panel,
                           const PanelConfig& panel_config) {
@@ -47,8 +71,8 @@ void Controller::Start() {
     impl_->Start();
 }
 
-void Controller::Stop() {
-    impl_->Stop();
+net::awaitable<void> Controller::Stop() {
+    co_await impl_->Stop();
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
@@ -59,6 +83,7 @@ Controller::Impl::Impl(net::io_context& io_context,
                        std::vector<std::unique_ptr<Worker>>& workers,
                        const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
     : io_context_(io_context)
+    , monitor_completion_(io_context)
     , workers_(workers)
     , limiters_(limiters) {}
 
@@ -76,15 +101,29 @@ void Controller::Impl::Start() {
     }
     running_ = true;
     const uint64_t generation = ++monitor_generation_;
+    monitor_completion_.expires_at(net::steady_timer::time_point::max());
+    monitors_active_ = true;
     net::co_spawn(
         io_context_.get_executor(),
-        runPanelMonitors(generation),
+        runPanelMonitorsOwned(shared_from_this(), generation),
         net::detached);
 }
 
-void Controller::Impl::Stop() {
+net::awaitable<void> Controller::Impl::Stop() {
     running_ = false;
     ++monitor_generation_;
+    for (const auto& panel : panels_) {
+        panel->CancelPending();
+    }
+    for (net::steady_timer* timer : monitor_timers_) {
+        IoErrorCode ignored;
+        timer->cancel(ignored);
+    }
+    if (monitors_active_) {
+        (void)co_await monitor_completion_.async_wait(
+            net::as_tuple(net::use_awaitable));
+    }
+    co_return;
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
@@ -138,6 +177,21 @@ net::awaitable<void> Controller::Impl::runPanelMonitors(uint64_t generation) {
     co_return;
 }
 
+net::awaitable<void> Controller::Impl::runPanelMonitorsOwned(
+    std::shared_ptr<Impl> self,
+    uint64_t generation) {
+    try {
+        co_await self->runPanelMonitors(generation);
+    } catch (const std::exception& e) {
+        LOG_ERROR("panel monitor owner failed: {}", e.what());
+    } catch (...) {
+        LOG_ERROR("panel monitor owner failed with unknown exception");
+    }
+    self->monitors_active_ = false;
+    IoErrorCode ignored;
+    self->monitor_completion_.cancel(ignored);
+}
+
 net::awaitable<void> Controller::Impl::panelMonitor(
     api::API* panel,
     uint64_t generation) {
@@ -146,6 +200,8 @@ net::awaitable<void> Controller::Impl::panelMonitor(
     const std::string panel_name = ResolvePanelName(panel, panel_configs_);
     auto next_pull = Clock::now();
     auto next_push = next_pull;
+    net::steady_timer timer(io_context_);
+    MonitorTimerRegistration timer_registration(monitor_timers_, timer);
 
     const auto interval = [&](bool pull) {
         if (const auto state = committed_nodes_.find(panel);
@@ -216,7 +272,6 @@ net::awaitable<void> Controller::Impl::panelMonitor(
         if (!running_ || generation != monitor_generation_) {
             break;
         }
-        net::steady_timer timer(io_context_);
         timer.expires_at(std::min(next_pull, next_push));
         (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
     }
@@ -237,6 +292,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             LOG_WARN("Panel {}/{}: retry {}/{} in {}s",
                      panel_name, node_id, attempt, kMaxAttempts - 1, delay);
             net::steady_timer timer(io_context_);
+            MonitorTimerRegistration timer_registration(monitor_timers_, timer);
             timer.expires_after(std::chrono::seconds(delay));
             (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
             if (!running_) co_return;
@@ -583,6 +639,9 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             co_return;
 
         } catch (const std::exception& e) {
+            if (!running_) {
+                co_return;
+            }
             if (attempt + 1 < kMaxAttempts) {
                 LOG_WARN("Panel {}/{}: attempt {}/{} failed: {}",
                          panel_name, node_id, attempt + 1, kMaxAttempts, e.what());

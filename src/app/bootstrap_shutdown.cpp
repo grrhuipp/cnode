@@ -39,6 +39,11 @@ net::awaitable<void> ShutdownWorkers(const RuntimeContext& ctx) {
     });
 }
 
+net::awaitable<void> ShutdownRuntime(const RuntimeContext& ctx) {
+    co_await ctx.controller.Stop();
+    co_await ShutdownWorkers(ctx);
+}
+
 }  // namespace
 
 std::unique_ptr<net::signal_set> InstallShutdownHandler(
@@ -59,11 +64,9 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
         LOG_CONSOLE("shutdown signal={} status=stopping", signo);
         state.running = false;
 
-        ctx.controller.Stop();
-
         net::co_spawn(
             ctx.main_ctx.get_executor(),
-            ShutdownWorkers(ctx),
+            ShutdownRuntime(ctx),
             net::detached);
     });
 
