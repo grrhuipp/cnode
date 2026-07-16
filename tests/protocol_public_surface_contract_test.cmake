@@ -70,3 +70,25 @@ if(STREAM_REMOVAL_GUARD_DESTRUCTOR EQUAL -1)
     message(FATAL_ERROR
         "HTTP/2 server stream removal must run while unwinding failed writes")
 endif()
+
+set(MUX_RELAY "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+file(READ "${MUX_RELAY}" MUX_RELAY_SOURCE)
+if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
+    message(FATAL_ERROR
+        "Mux detached sub-dispatch lifetime must be owned by its coroutine frame")
+endif()
+string(REGEX MATCHALL "SubLoopLease[{]reply_queue[}]"
+    MUX_SUB_LOOP_LEASES "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_SUB_LOOP_LEASES MUX_SUB_LOOP_LEASE_COUNT)
+if(NOT MUX_SUB_LOOP_LEASE_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "every TCP and UDP Mux sub-dispatch must receive an owned loop lease")
+endif()
+string(REGEX MATCHALL "void MarkDispatchDone[(][)] noexcept"
+    MUX_NOEXCEPT_DISPATCH_COMPLETIONS "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_NOEXCEPT_DISPATCH_COMPLETIONS
+    MUX_NOEXCEPT_DISPATCH_COMPLETION_COUNT)
+if(NOT MUX_NOEXCEPT_DISPATCH_COMPLETION_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "TCP and UDP Mux dispatch completion must not strand loop ownership")
+endif()

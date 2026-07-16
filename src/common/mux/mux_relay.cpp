@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace acpp::mux {
@@ -150,6 +151,31 @@ struct ReplyQueueState {
         (void)sub_done_signal.try_send(IoErrorCode{});
         WakeReplyWriter();
     }
+};
+
+class SubLoopLease final {
+public:
+    explicit SubLoopLease(ReplyQueueState& state) noexcept
+        : state_(&state) {
+        state_->AddSubLoop();
+    }
+
+    ~SubLoopLease() noexcept {
+        if (state_) {
+            state_->MarkSubLoopDone();
+        }
+    }
+
+    SubLoopLease(const SubLoopLease&) = delete;
+    SubLoopLease& operator=(const SubLoopLease&) = delete;
+
+    SubLoopLease(SubLoopLease&& other) noexcept
+        : state_(std::exchange(other.state_, nullptr)) {}
+
+    SubLoopLease& operator=(SubLoopLease&&) = delete;
+
+private:
+    ReplyQueueState* state_ = nullptr;
 };
 
 struct ClientReadQueueState {
@@ -296,10 +322,14 @@ public:
         WakeInputReader();
     }
 
-    void MarkDispatchDone() {
+    void MarkDispatchDone() noexcept {
         dispatch_done_ = true;
-        PushEnd();
-        reply_queue_.MarkSubLoopDone();
+        try {
+            PushEnd();
+        } catch (...) {
+            reply_queue_.tcp_overflowed = true;
+            Cancel();
+        }
     }
 
     [[nodiscard]] bool DispatchDone() const noexcept {
@@ -536,10 +566,14 @@ public:
         WakeInputReader();
     }
 
-    void MarkDispatchDone() {
+    void MarkDispatchDone() noexcept {
         dispatch_done_ = true;
-        PushEnd();
-        reply_queue_.MarkSubLoopDone();
+        try {
+            PushEnd();
+        } catch (...) {
+            reply_queue_.tcp_overflowed = true;
+            Cancel();
+        }
     }
 
     [[nodiscard]] bool DispatchDone() const noexcept {
@@ -764,9 +798,11 @@ net::awaitable<void> RunTcpSubDispatch(
     TcpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    UDPRelayConfig config)
+    UDPRelayConfig config,
+    SubLoopLease sub_loop)
 {
     (void)config;
+    (void)sub_loop;
     transport::Link link{
         static_cast<transport::MultiBufferReader*>(sub),
         static_cast<transport::MultiBufferWriter*>(sub)
@@ -796,9 +832,11 @@ net::awaitable<void> RunUdpSubDispatch(
     UdpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    UDPRelayConfig config)
+    UDPRelayConfig config,
+    SubLoopLease sub_loop)
 {
     (void)config;
+    (void)sub_loop;
     transport::Link link{
         static_cast<transport::MultiBufferReader*>(sub),
         static_cast<transport::MultiBufferWriter*>(sub)
@@ -1239,17 +1277,24 @@ net::awaitable<RelayResult> DoMuxRelay(
                     (void)inserted;
                     UdpSubState* sub_ptr = insert_it->second.get();
 
-                    reply_queue.AddSubLoop();
-                    net::co_spawn(io_context.get_executor(),
-                        RunUdpSubDispatch(
-                            io_context,
-                            dispatcher,
-                            receiver,
-                            sub_ptr,
-                            stats,
-                            timeouts,
-                            config),
-                        net::detached);
+                    try {
+                        net::co_spawn(io_context.get_executor(),
+                            RunUdpSubDispatch(
+                                io_context,
+                                dispatcher,
+                                receiver,
+                                sub_ptr,
+                                stats,
+                                timeouts,
+                                config,
+                                SubLoopLease{reply_queue}),
+                            net::detached);
+                    } catch (...) {
+                        sub_ptr->Cancel();
+                        sub_ptr->MarkDispatchDone();
+                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                        running = false;
+                    }
 
                 } else {
                     // ---- 新建 TCP 子会话 ----
@@ -1309,19 +1354,26 @@ net::awaitable<RelayResult> DoMuxRelay(
                     (void)inserted;
                     TcpSubState* sub_ptr = insert_it->second.get();
 
-                    // 启动 dispatcher.Dispatch；DoMuxRelay 退出前等待 active_sub_loops
-                    // 归零，保证 TcpSubState 生命周期覆盖 detached coroutine。
-                    reply_queue.AddSubLoop();
-                    net::co_spawn(io_context.get_executor(),
-                        RunTcpSubDispatch(
-                            io_context,
-                            dispatcher,
-                            receiver,
-                            sub_ptr,
-                            stats,
-                            timeouts,
-                            config),
-                        net::detached);
+                    // SubLoopLease 随协程帧持有计数，DoMuxRelay 退出前等待其析构，
+                    // 保证 TcpSubState 生命周期覆盖 detached coroutine。
+                    try {
+                        net::co_spawn(io_context.get_executor(),
+                            RunTcpSubDispatch(
+                                io_context,
+                                dispatcher,
+                                receiver,
+                                sub_ptr,
+                                stats,
+                                timeouts,
+                                config,
+                                SubLoopLease{reply_queue}),
+                            net::detached);
+                    } catch (...) {
+                        sub_ptr->Cancel();
+                        sub_ptr->MarkDispatchDone();
+                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                        running = false;
+                    }
                 }
                 break;
             }
