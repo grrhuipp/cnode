@@ -706,6 +706,13 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_config_semantics_test
         COMMAND cnode_config_semantics_test)
 
+    add_test(
+        NAME cnode_invalid_config_sources_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DCNODE_EXE=$<TARGET_FILE:cnode>"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/invalid_config_sources_test"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/invalid_config_sources_test.cmake)
+
 endif()
 
 # ============================================================================

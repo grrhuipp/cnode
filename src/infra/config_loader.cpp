@@ -6,6 +6,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -50,12 +51,18 @@ void LoadConfigItems(const json::value& value, AddFn&& add) {
         }
     } else if (value.is_object()) {
         add(value.as_object());
+    } else {
+        throw std::invalid_argument("config list must be an object or array");
     }
 }
 
 const json::value& SelectConfigList(const json::value& value, std::string_view key) {
     if (value.is_object()) {
         if (const auto* nested = value.as_object().if_contains(key); nested) {
+            if (!nested->is_array()) {
+                throw std::invalid_argument(
+                    std::string(key) + " wrapper field must be an array");
+            }
             return *nested;
         }
     }
@@ -64,7 +71,10 @@ const json::value& SelectConfigList(const json::value& value, std::string_view k
 
 RoutingConfig ParseRoutingConfigValue(const json::value& value) {
     const auto& obj = value.as_object();
-    if (auto* routing = obj.if_contains("routing"); routing && routing->is_object()) {
+    if (auto* routing = obj.if_contains("routing")) {
+        if (!routing->is_object()) {
+            throw std::invalid_argument("routing wrapper field must be an object");
+        }
         return RoutingConfig::FromJson(routing->as_object());
     }
     return RoutingConfig::FromJson(obj);
@@ -124,7 +134,13 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         LOG_CONSOLE("config mode=directory dir={}", config_dir.string());
 
         auto config_path = path / constants::paths::kDefaultConfigFile;
-        if (auto j = LoadJsonFile(config_path)) {
+        if (std::filesystem::exists(config_path)) {
+            auto j = LoadJsonFile(config_path);
+            if (!j) {
+                LOG_ERROR("config.main_load_failed file={}",
+                          config_path.filename().string());
+                return std::nullopt;
+            }
             main_config = std::move(*j);
             LOG_CONSOLE("config.main loaded file={}", config_path.filename().string());
         } else {
@@ -169,41 +185,62 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     cfg.config_dir_ = config_dir;
 
     const auto default_inbound_path = config_dir / constants::paths::kInboundFile;
-    if (auto j = LoadJsonFile(default_inbound_path)) {
+    if (std::filesystem::exists(default_inbound_path)) {
+        auto j = LoadJsonFile(default_inbound_path);
+        if (!j) {
+            LOG_ERROR("config.sidecar_load_failed file={}",
+                      constants::paths::kInboundFile);
+            return std::nullopt;
+        }
         try {
             LoadInboundItems(
                 cfg.static_inbounds_,
                 SelectConfigList(*j, "inbounds"),
                 constants::paths::kInboundFile);
         } catch (const std::exception& e) {
-            LOG_WARN("config.sidecar_parse_failed file={} error={}",
-                     constants::paths::kInboundFile, e.what());
+            LOG_ERROR("config.sidecar_parse_failed file={} error={}",
+                      constants::paths::kInboundFile, e.what());
+            return std::nullopt;
         }
     }
 
     const auto default_outbound_path = config_dir / constants::paths::kOutboundFile;
-    if (auto j = LoadJsonFile(default_outbound_path)) {
+    if (std::filesystem::exists(default_outbound_path)) {
+        auto j = LoadJsonFile(default_outbound_path);
+        if (!j) {
+            LOG_ERROR("config.sidecar_load_failed file={}",
+                      constants::paths::kOutboundFile);
+            return std::nullopt;
+        }
         try {
             LoadOutboundItems(
                 cfg.prepared_outbounds_,
                 SelectConfigList(*j, "outbounds"),
                 constants::paths::kOutboundFile);
         } catch (const std::exception& e) {
-            LOG_WARN("config.sidecar_parse_failed file={} error={}",
-                     constants::paths::kOutboundFile, e.what());
+            LOG_ERROR("config.sidecar_parse_failed file={} error={}",
+                      constants::paths::kOutboundFile, e.what());
+            return std::nullopt;
         }
     }
 
     const auto default_route_path = config_dir / constants::paths::kRouteFile;
-    if (auto j = LoadJsonFile(default_route_path)) {
+    if (std::filesystem::exists(default_route_path)) {
+        auto j = LoadJsonFile(default_route_path);
+        if (!j) {
+            LOG_ERROR("config.sidecar_load_failed file={}",
+                      constants::paths::kRouteFile);
+            return std::nullopt;
+        }
         try {
             cfg.routing_ = ParseRoutingConfigValue(*j);
             LOG_CONSOLE("config.sidecar loaded file={} rules={}",
                         constants::paths::kRouteFile,
                         cfg.routing_.rules.size());
         } catch (const std::exception& e) {
-            LOG_WARN("config.sidecar_parse_failed file={} error={}",
-                     constants::paths::kRouteFile, e.what());
+            LOG_ERROR("config.sidecar_parse_failed file={} error={}",
+                      constants::paths::kRouteFile, e.what());
+            return std::nullopt;
         }
     }
 
