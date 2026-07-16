@@ -5,7 +5,6 @@
 #include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/string_hash.hpp"
 
@@ -14,7 +13,7 @@ namespace acpp::proxyman::inbound {
 struct Manager::Impl {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
         std::string,
-        std::unique_ptr<Handler>,
+        std::shared_ptr<Handler>,
         TransparentStringHash,
         TransparentStringEq>;
     using RuntimeMap = memory::ThreadLocalUnorderedMap<
@@ -47,7 +46,6 @@ struct Manager::Impl {
     StatsShard& stats;
     RuntimeMap runtimes;
     HandlerMap handlers;
-    memory::ThreadLocalVector<std::unique_ptr<Handler>> retired_handlers;
 };
 
 Manager::Manager(StatsShard& stats)
@@ -55,14 +53,15 @@ Manager::Manager(StatsShard& stats)
 
 Manager::~Manager() noexcept = default;
 
-Handler* Manager::GetHandler(std::string_view tag) noexcept {
+Manager::HandlerPtr Manager::GetHandler(std::string_view tag) noexcept {
     auto it = impl_->handlers.find(tag);
-    return it == impl_->handlers.end() ? nullptr : it->second.get();
+    return it == impl_->handlers.end() ? nullptr : it->second;
 }
 
-const Handler* Manager::GetHandler(std::string_view tag) const noexcept {
+std::shared_ptr<const Handler>
+Manager::GetHandler(std::string_view tag) const noexcept {
     auto it = impl_->handlers.find(tag);
-    return it == impl_->handlers.end() ? nullptr : it->second.get();
+    return it == impl_->handlers.end() ? nullptr : it->second;
 }
 
 std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
@@ -81,22 +80,22 @@ UdpHandlerBuildResult Manager::NewUdpHandler(
         protocol, impl_->Deps(protocol), std::move(limiter), req);
 }
 
-Handler* Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
+Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
     if (!handler) {
         return nullptr;
     }
 
     std::string tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Handler>(std::move(handler));
     auto it = impl_->handlers.find(tag);
     if (it == impl_->handlers.end()) {
         auto [inserted_it, inserted] = impl_->handlers.try_emplace(
-            std::move(tag), std::move(handler));
-        return inserted ? inserted_it->second.get() : nullptr;
+            std::move(tag), std::move(shared_handler));
+        return inserted ? inserted_it->second : nullptr;
     }
 
-    impl_->retired_handlers.push_back(std::move(it->second));
-    it->second = std::move(handler);
-    return it->second.get();
+    it->second = std::move(shared_handler);
+    return it->second;
 }
 
 void Manager::RemoveHandler(std::string_view tag) {
@@ -105,13 +104,7 @@ void Manager::RemoveHandler(std::string_view tag) {
         return;
     }
 
-    impl_->retired_handlers.push_back(std::move(it->second));
     impl_->handlers.erase(it);
-}
-
-void Manager::DrainRetiredHandlers() {
-    impl_->retired_handlers.clear();
-    TryShrinkSequence(impl_->retired_handlers);
 }
 
 std::vector<::acpp::OnlineDevice>

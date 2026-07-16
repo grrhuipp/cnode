@@ -19,14 +19,14 @@ namespace acpp::proxyman::inbound {
 // receiver settings 和 proxy.Inbound 实例。Worker 仍拥有
 // SO_REUSEPORT socket，但不再分散持有 receiver settings 与协议对象。
 // ============================================================================
-class Handler final {
+class Handler final : public std::enable_shared_from_this<Handler> {
 public:
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy);
 
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
-    Handler(Handler&&) noexcept = default;
-    Handler& operator=(Handler&&) noexcept = default;
+    Handler(Handler&&) = delete;
+    Handler& operator=(Handler&&) = delete;
 
     [[nodiscard]] std::string_view Tag() const noexcept {
         return receiver_.inbound_tag;

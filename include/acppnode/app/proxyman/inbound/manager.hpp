@@ -32,8 +32,11 @@ public:
     Manager(const Manager&) = delete;
     Manager& operator=(const Manager&) = delete;
 
-    [[nodiscard]] Handler* GetHandler(std::string_view tag) noexcept;
-    [[nodiscard]] const Handler* GetHandler(std::string_view tag) const noexcept;
+    using HandlerPtr = std::shared_ptr<Handler>;
+
+    [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept;
+    [[nodiscard]] std::shared_ptr<const Handler>
+    GetHandler(std::string_view tag) const noexcept;
 
     [[nodiscard]] std::unique_ptr<::acpp::Inbound> NewHandler(
         std::string_view protocol,
@@ -45,15 +48,12 @@ public:
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
-    // ReplaceHandler 原子替换同 tag handler；旧对象进入 retired 列表，
-    // 在分配失败时保持原 handler 不变。
-    [[nodiscard]] Handler* ReplaceHandler(std::unique_ptr<Handler> handler);
+    // ReplaceHandler 原子替换同 tag handler。调用方持有的 shared_ptr 让在途
+    // 物理连接和 detached 逻辑子流继续使用原 handler。
+    [[nodiscard]] HandlerPtr ReplaceHandler(std::unique_ptr<Handler> handler);
 
-    // RemoveHandler 关闭 handler，并把它移入 retired 列表；retired handler
-    // 的生命周期持续到 DrainRetiredHandlers，覆盖在途连接的 receiver 借用。
+    // RemoveHandler 只撤销 manager 所有权；在途请求按 shared_ptr 自然收尾。
     void RemoveHandler(std::string_view tag);
-
-    void DrainRetiredHandlers();
 
     [[nodiscard]] std::vector<::acpp::OnlineDevice>
     GetOnlineDevices(std::string_view protocol, std::string_view tag) const;

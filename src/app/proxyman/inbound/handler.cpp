@@ -95,14 +95,14 @@ class LogicalTransportStreamSink final
     : public InboundTransportStreamHandler
     , public std::enable_shared_from_this<LogicalTransportStreamSink> {
 public:
-    LogicalTransportStreamSink(Handler& handler,
+    LogicalTransportStreamSink(std::shared_ptr<Handler> handler,
                                net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
                                StatsShard& stats,
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
                                uint32_t pressure_idle_timeout)
-        : handler_(handler)
+        : handler_(std::move(handler))
         , io_context_(io_context)
         , dispatcher_(dispatcher)
         , stats_(stats)
@@ -123,7 +123,7 @@ public:
             [self, stream = std::move(stream)]() mutable -> net::awaitable<void> {
                 session::Context ctx;
                 CopyTransportBaseContext(self->base_ctx_, ctx);
-                co_await self->handler_.ProcessPreparedTransportStream(
+                co_await self->handler_->ProcessPreparedTransportStream(
                     self->io_context_,
                     self->dispatcher_,
                     self->stats_,
@@ -136,7 +136,7 @@ public:
     }
 
 private:
-    Handler& handler_;
+    std::shared_ptr<Handler> handler_;
     net::io_context& io_context_;
     routing::Dispatcher& dispatcher_;
     StatsShard& stats_;
@@ -281,7 +281,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         listener.stream_settings.IsHttp() ||
         listener.stream_settings.IsXHttp()) {
         logical_stream_handler = std::make_shared<LogicalTransportStreamSink>(
-            *this,
+            shared_from_this(),
             io_context,
             dispatcher,
             stats,

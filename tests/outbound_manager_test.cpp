@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -71,6 +72,10 @@ static_assert(!noexcept(std::declval<OutboundManager&>().RemoveHandler(
     std::declval<std::string_view>())));
 
 using InboundManager = acpp::proxyman::inbound::Manager;
+static_assert(std::is_same_v<
+    decltype(std::declval<InboundManager&>().GetHandler(
+        std::declval<std::string_view>())),
+    std::shared_ptr<acpp::proxyman::inbound::Handler>>);
 static_assert(!noexcept(std::declval<InboundManager&>().ReplaceHandler(
     std::declval<std::unique_ptr<acpp::proxyman::inbound::Handler>>())));
 static_assert(!noexcept(std::declval<InboundManager&>().RemoveHandler(

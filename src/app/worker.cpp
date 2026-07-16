@@ -48,9 +48,9 @@ namespace acpp {
 
 struct Worker::ListenerSlot {
     // Worker 线程内稳定的 per-tag slot。AcceptLoop 持有 slot 指针；
-    // 配置热更新只替换当前 inbound handler 指针，TCP acceptor 生命周期
-    // 由 slot 内的 tcp_worker 承载，避免每次 accept 后查 map。
-    proxyman::inbound::Handler* handler = nullptr;
+    // 配置热更新只替换当前 inbound handler；每个已接受连接复制 shared_ptr，
+    // 让 HTTP/2/gRPC/XHTTP detached 逻辑子流覆盖 handler 的完整生命周期。
+    std::shared_ptr<proxyman::inbound::Handler> handler;
     std::unique_ptr<proxyman::inbound::TcpWorker> tcp_worker;
     std::optional<PortBinding> tcp_binding;
     std::optional<PortBinding> udp_binding;
@@ -81,7 +81,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     void StopUdpListening(const std::string& tag,
                           ListenerKeys socket_keys) noexcept;
     void Shutdown();
-    void DrainRetiredHandlersIfIdle(Worker& worker);
+    void DrainRetiredOutboundsIfIdle(Worker& worker);
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
@@ -94,7 +94,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         Worker& worker,
         tcp::socket socket,
         tcp::endpoint remote_ep,
-        proxyman::inbound::Handler* inbound_handler);
+        std::shared_ptr<proxyman::inbound::Handler> inbound_handler);
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
@@ -318,7 +318,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 #endif
 
-    auto* inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
+    auto inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
                   worker.id_, binding.tag);
@@ -707,7 +707,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
         IoErrorCode ep_ec;
         remote_ep = socket.remote_endpoint(ep_ec);
 
-        auto* inbound_handler = slot ? slot->handler : nullptr;
+        auto inbound_handler = slot ? slot->handler : nullptr;
         if (!inbound_handler) {
             LOG_ERROR("Worker[{}]: no inbound handler for tag={}", worker.id_, tag);
             socket.close();
@@ -717,7 +717,9 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
         ++worker.runtime_->active_connections;
 
         net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      ProcessReceivedConnection(worker, std::move(socket), remote_ep, inbound_handler),
+                      ProcessReceivedConnection(
+                          worker, std::move(socket), remote_ep,
+                          std::move(inbound_handler)),
                       [&worker](std::exception_ptr ep) {
                           if (ep) {
                               try {
@@ -731,7 +733,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
                               }
                           }
                           --worker.runtime_->active_connections;
-                          worker.runtime_->listener_state->DrainRetiredHandlersIfIdle(worker);
+                          worker.runtime_->listener_state->DrainRetiredOutboundsIfIdle(worker);
                       });
     }
 }
@@ -744,7 +746,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     Worker& worker,
     tcp::socket socket,
     tcp::endpoint remote_ep,
-    proxyman::inbound::Handler* inbound_handler) {
+    std::shared_ptr<proxyman::inbound::Handler> inbound_handler) {
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: no inbound handler for accepted connection", worker.id_);
         socket.close();
@@ -861,7 +863,7 @@ bool Worker::RegisterInboundOnWorkerThread(
                  id_, receiver.inbound_tag, protocol);
         return false;
     }
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
     auto inbound_handler =
         std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(handler));
     auto& settings = inbound_handler->ReceiverSettings();
@@ -873,7 +875,7 @@ bool Worker::RegisterInboundOnWorkerThread(
     const std::string key(settings.inbound_tag);
     auto [slot_it, slot_inserted] =
         runtime_->listener_state->listener_slots.try_emplace(key);
-    proxyman::inbound::Handler* registered = nullptr;
+    std::shared_ptr<proxyman::inbound::Handler> registered;
     try {
         registered = runtime_->inbound_manager->ReplaceHandler(
             std::move(inbound_handler));
@@ -891,7 +893,7 @@ bool Worker::RegisterInboundOnWorkerThread(
         return false;
     }
     slot_it->second.handler = registered;
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
     return true;
 }
 
@@ -906,7 +908,7 @@ net::awaitable<bool> Worker::RegisterInboundTask(
 
 void Worker::AddOutboundOnWorkerThread(
     proxyman::outbound::PreparedOutboundConfig config) {
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 
     auto current_snapshot = runtime_->Snapshot();
     auto handler = proxyman::outbound::NewHandler(
@@ -942,7 +944,7 @@ void Worker::AddOutboundOnWorkerThread(
 
     LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
               id_, installed_protocol, installed_tag);
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::AddOutboundTask(
@@ -974,7 +976,7 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
         runtime_->router->SetDefaultOutbound(std::move(next_router_default));
     }
     runtime_->StoreSnapshot(std::move(next_snapshot));
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
@@ -982,11 +984,10 @@ net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
     co_return;
 }
 
-void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
+void Worker::ListenerState::DrainRetiredOutboundsIfIdle(Worker& worker) {
     if (worker.runtime_->active_connections != 0) {
         return;
     }
-    worker.runtime_->inbound_manager->DrainRetiredHandlers();
     worker.runtime_->outbound_manager->DrainRetiredHandlers();
 }
 
@@ -1001,19 +1002,19 @@ void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
     auto udp_socket_keys =
         runtime_->listener_state->CollectUdpSocketKeys(owned_tag);
 
-    auto* retiring = runtime_->inbound_manager->GetHandler(owned_tag);
+    auto retiring = runtime_->inbound_manager->GetHandler(owned_tag);
     runtime_->inbound_manager->RemoveHandler(owned_tag);
     if (auto slot_it = runtime_->listener_state->listener_slots.find(owned_tag);
             slot_it != runtime_->listener_state->listener_slots.end() &&
             slot_it->second.handler == retiring) {
-        slot_it->second.handler = nullptr;
+        slot_it->second.handler.reset();
     }
     runtime_->listener_state->StopListening(
         owned_tag, std::move(tcp_listener_keys));
     runtime_->listener_state->StopUdpListening(
         owned_tag, std::move(udp_socket_keys));
     runtime_->StoreSnapshot(std::move(next_snapshot));
-    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    runtime_->listener_state->DrainRetiredOutboundsIfIdle(*this);
 }
 
 net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
@@ -1050,7 +1051,7 @@ void Worker::AddUserTraffic(std::string_view tag,
 
 net::awaitable<std::vector<OnlineDevice>>
 Worker::GetOnlineDeviceTask(std::string tag) {
-    auto* handler = runtime_->inbound_manager->GetHandler(tag);
+    auto handler = runtime_->inbound_manager->GetHandler(tag);
     if (!handler) {
         co_return std::vector<OnlineDevice>{};
     }
