@@ -99,10 +99,12 @@ int main() {
     }
 
     acpp::RealityConfig joined_client;
-    joined_client.public_key = "a|b";
+    joined_client.public_key =
+        acpp::transport::internet::RealityKey{1, 2};
     joined_client.server_name = "c";
     acpp::RealityConfig split_client;
-    split_client.public_key = "a";
+    split_client.public_key =
+        acpp::transport::internet::RealityKey{1};
     split_client.server_name = "b|c";
     if (!Require(MakeRealityClientContextCacheKey(joined_client, tls) !=
                      MakeRealityClientContextCacheKey(split_client, tls),

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/transport/internet/reality_client_version.hpp"
+#include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
 
 #include "acppnode/core/constants.hpp"
@@ -151,7 +152,7 @@ struct RealityConfig {
     bool show = false;
     std::string type;
     std::vector<std::string> server_names;
-    std::string private_key;
+    std::optional<transport::internet::RealityKey> private_key;
     std::vector<transport::internet::RealityShortId> short_ids;
     std::optional<transport::internet::RealityClientVersion> min_client_version;
     std::optional<transport::internet::RealityClientVersion> max_client_version;
@@ -159,14 +160,14 @@ struct RealityConfig {
 
     // 客户端字段
     std::string server_name;
-    std::string public_key;
+    std::optional<transport::internet::RealityKey> public_key;
     transport::internet::RealityShortId short_id{};
 
     // 调试/兼容字段
     std::string master_key_log;
 
-    [[nodiscard]] bool IsServer() const noexcept { return !private_key.empty(); }
-    [[nodiscard]] bool IsClient() const noexcept { return !public_key.empty(); }
+    [[nodiscard]] bool IsServer() const noexcept { return private_key.has_value(); }
+    [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
 
     static RealityConfig FromJson(const json::object& j);
 };

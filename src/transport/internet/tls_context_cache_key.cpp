@@ -37,6 +37,12 @@ public:
         for (const auto& short_id : short_ids) AppendRealityShortId(short_id);
     }
 
+    void AppendRealityKey(const std::optional<RealityKey>& key) {
+        AppendByte(key ? 1 : 0);
+        if (!key) return;
+        for (const uint8_t value : *key) AppendByte(value);
+    }
+
     void AppendByte(uint8_t value) {
         key_.push_back(static_cast<char>(value));
     }
@@ -78,7 +84,7 @@ std::string MakeRealityServerContextCacheKey(
     const TlsConfig& tls_config) {
     CacheKeyBuilder key;
     key.AppendString(MakeTlsContextCacheKey("server-reality", tls_config));
-    key.AppendString(reality.private_key);
+    key.AppendRealityKey(reality.private_key);
     key.AppendRealityVersion(reality.min_client_version);
     key.AppendRealityVersion(reality.max_client_version);
     key.AppendUint64(reality.max_time_diff);
@@ -92,7 +98,7 @@ std::string MakeRealityClientContextCacheKey(
     const TlsConfig& tls_config) {
     CacheKeyBuilder key;
     key.AppendString(MakeTlsContextCacheKey("client-reality", tls_config));
-    key.AppendString(reality.public_key);
+    key.AppendRealityKey(reality.public_key);
     key.AppendString(reality.server_name);
     key.AppendRealityShortId(reality.short_id);
     return std::move(key).Finish();

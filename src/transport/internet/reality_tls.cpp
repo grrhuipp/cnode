@@ -1,5 +1,6 @@
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
+#include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
@@ -73,42 +74,6 @@ struct RealityServerState {
     static const int index = SSL_CTX_get_ex_new_index(
         0, nullptr, nullptr, nullptr, nullptr);
     return index;
-}
-
-[[nodiscard]] int Base64RawUrlValue(char c) noexcept {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '-') return 62;
-    if (c == '_') return 63;
-    return -1;
-}
-
-[[nodiscard]] std::optional<std::vector<uint8_t>> DecodeBase64RawUrl(
-    std::string_view value) {
-    if (value.empty() ||
-        value.find('=') != std::string_view::npos ||
-        value.size() % 4 == 1) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> out;
-    out.reserve(value.size() * 3 / 4);
-    uint32_t bits = 0;
-    int bit_count = 0;
-    for (char c : value) {
-        const int v = Base64RawUrlValue(c);
-        if (v < 0) {
-            return std::nullopt;
-        }
-        bits = (bits << 6) | static_cast<uint32_t>(v);
-        bit_count += 6;
-        if (bit_count >= 8) {
-            bit_count -= 8;
-            out.push_back(static_cast<uint8_t>((bits >> bit_count) & 0xff));
-        }
-    }
-    return out;
 }
 
 [[nodiscard]] uint16_t ReadBigEndianU16(const uint8_t* data) noexcept {
@@ -399,13 +364,12 @@ struct RealityClientState {
 
 [[nodiscard]] std::shared_ptr<RealityClientState> BuildRealityClientState(
     const RealityConfig& config) {
-    auto key = DecodeBase64RawUrl(config.public_key);
-    if (!key || key->size() != kRealityX25519KeySize) {
-        LOG_ERROR("REALITY client publicKey is invalid");
+    if (!config.public_key) {
+        LOG_ERROR("REALITY client publicKey is empty");
         return {};
     }
     auto state = std::make_shared<RealityClientState>();
-    std::copy_n(key->data(), state->server_public.size(), state->server_public.begin());
+    state->server_public = *config.public_key;
     state->short_id = config.short_id;
     return state;
 }
@@ -687,9 +651,8 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
 
 [[nodiscard]] std::shared_ptr<RealityServerState> BuildRealityServerState(
     const RealityConfig& config) {
-    auto key = DecodeBase64RawUrl(config.private_key);
-    if (!key || key->size() != kRealityX25519KeySize) {
-        LOG_ERROR("REALITY server privateKey is invalid");
+    if (!config.private_key) {
+        LOG_ERROR("REALITY server privateKey is empty");
         return {};
     }
     if (config.server_names.empty()) {
@@ -702,7 +665,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     }
 
     auto state = std::make_shared<RealityServerState>();
-    std::copy_n(key->data(), state->private_key.size(), state->private_key.begin());
+    state->private_key = *config.private_key;
     state->server_names = config.server_names;
     state->max_time_diff_ms = config.max_time_diff;
     state->min_client_version = config.min_client_version;

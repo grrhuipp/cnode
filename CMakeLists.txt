@@ -303,6 +303,7 @@ set(CNODE_SOURCES
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_client_version.cpp
+    src/transport/internet/reality_key.cpp
     src/transport/internet/reality_short_id.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
@@ -642,6 +643,21 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_reality_client_version_test
         COMMAND cnode_reality_client_version_test)
+
+    add_executable(cnode_reality_key_test
+        tests/reality_key_test.cpp
+        src/transport/internet/reality_key.cpp
+    )
+    target_include_directories(cnode_reality_key_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(cnode_reality_key_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_reality_key_test
+        COMMAND cnode_reality_key_test)
 
     add_executable(cnode_reality_short_id_test
         tests/reality_short_id_test.cpp

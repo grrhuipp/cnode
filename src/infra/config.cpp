@@ -813,7 +813,15 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "to the REALITY target is not implemented");
     }
     cfg.server_names = jstr_array(j, {"serverNames", "server_names"});
-    cfg.private_key = jstr(j, {"privateKey", "private_key"}, "");
+    const std::string private_key =
+        jstr(j, {"privateKey", "private_key"}, "");
+    if (!private_key.empty()) {
+        auto parsed = transport::internet::ParseRealityKey(private_key);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY privateKey is invalid");
+        }
+        cfg.private_key = *parsed;
+    }
     const auto short_ids = jstr_array(j, {"shortIds", "short_ids"});
     cfg.short_ids.reserve(short_ids.size());
     for (const auto& short_id : short_ids) {
@@ -862,8 +870,15 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "emulation is not implemented");
     }
     cfg.server_name = jstr(j, {"serverName", "server_name"}, "");
-    cfg.public_key = jstr(
+    const std::string public_key = jstr(
         j, {"publicKey", "public_key", "password"}, "");
+    if (!public_key.empty()) {
+        auto parsed = transport::internet::ParseRealityKey(public_key);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY publicKey is invalid");
+        }
+        cfg.public_key = *parsed;
+    }
     auto short_id = transport::internet::ParseRealityShortId(
         jstr(j, {"shortId", "short_id"}, ""));
     if (!short_id) {

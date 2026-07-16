@@ -7,6 +7,18 @@ endif()
 
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_FILE}" EXISTING_TEST_FILE)
 string(REPEAT "a" 256 ALPN_TOO_LONG)
+set(VALID_REALITY_KEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+
+function(normalize_test_sidecar input output)
+    set(normalized "${input}")
+    string(REPLACE "unused-before-dial" "${VALID_REALITY_KEY}"
+        normalized "${normalized}")
+    string(REPLACE "unused-before-handshake" "${VALID_REALITY_KEY}"
+        normalized "${normalized}")
+    string(REPLACE "invalid-until-after-version-validation"
+        "${VALID_REALITY_KEY}" normalized "${normalized}")
+    set(${output} "${normalized}" PARENT_SCOPE)
+endfunction()
 
 function(expect_rejected case_name main_content sidecar_name sidecar_content)
     set(case_dir "${TEST_ROOT}/${case_name}")
@@ -14,7 +26,8 @@ function(expect_rejected case_name main_content sidecar_name sidecar_content)
     file(MAKE_DIRECTORY "${case_dir}")
     file(WRITE "${case_dir}/config.json" "${main_content}")
     if(NOT "${sidecar_name}" STREQUAL "")
-        file(WRITE "${case_dir}/${sidecar_name}" "${sidecar_content}")
+        normalize_test_sidecar("${sidecar_content}" normalized_sidecar)
+        file(WRITE "${case_dir}/${sidecar_name}" "${normalized_sidecar}")
     endif()
 
     execute_process(
@@ -47,7 +60,8 @@ function(expect_started case_name main_content sidecar_name sidecar_content)
     file(MAKE_DIRECTORY "${case_dir}")
     file(WRITE "${case_dir}/config.json" "${main_content}")
     if(NOT "${sidecar_name}" STREQUAL "")
-        file(WRITE "${case_dir}/${sidecar_name}" "${sidecar_content}")
+        normalize_test_sidecar("${sidecar_content}" normalized_sidecar)
+        file(WRITE "${case_dir}/${sidecar_name}" "${normalized_sidecar}")
     endif()
 
     execute_process(
@@ -453,6 +467,12 @@ expect_rejected(invalid_reality_client_short_id "{}" "outbounds.json"
 expect_rejected(invalid_reality_server_short_id "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-short-id","protocol":"vless","listen":"127.0.0.1","port":12102,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["not-hex"]}}}]]=]
     "REALITY shortIds contains an invalid value")
+expect_rejected(invalid_reality_public_key "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-public-key","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"not-base64url","shortId":"0123456789abcdef"}}}]]=]
+    "REALITY publicKey is invalid")
+expect_rejected(invalid_reality_private_key "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-private-key","protocol":"vless","listen":"127.0.0.1","port":12103,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"not-base64url","shortIds":["0123456789abcdef"]}}}]]=]
+    "REALITY privateKey is invalid")
 expect_rejected(unsupported_reality_target_fallback "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "target fallback")
