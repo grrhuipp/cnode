@@ -46,6 +46,21 @@ int main() {
     AutoSignState state;
     const auto t0 = AutoSignState::Clock::time_point{};
 
+    auto injected_dns = state.GetOrCreate(
+        "first.example,DNS:second.example", t0);
+    if (!Require(injected_dns.cert != nullptr,
+                 "literal DNS injection input must produce test material")) return 1;
+    if (!Require(X509_check_host(injected_dns.cert, "second.example", 0,
+                                 X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr) == 0,
+                 "certificate name must not inject a second DNS SAN")) return 1;
+
+    auto injected_ip = state.GetOrCreate(
+        "first.example,IP:192.0.2.55", t0);
+    if (!Require(injected_ip.cert != nullptr,
+                 "literal IP injection input must produce test material")) return 1;
+    if (!Require(X509_check_ip_asc(injected_ip.cert, "192.0.2.55", 0) == 0,
+                 "certificate name must not inject an IP SAN")) return 1;
+
     auto public_suffix = state.GetOrCreate("example.co.uk", t0);
     if (!Require(public_suffix.cert != nullptr,
                  "public-suffix domain certificate must be generated")) return 1;
