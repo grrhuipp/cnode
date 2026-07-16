@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -287,8 +288,9 @@ struct CompoundRoutingRule {
                 network_mask |= kNetworkTcp;
             } else if (network == constants::protocol::kUdp) {
                 network_mask |= kNetworkUdp;
-            } else if (network == "tcp,udp" || network == "udp,tcp") {
-                network_mask |= kNetworkTcp | kNetworkUdp;
+            } else {
+                throw std::logic_error(
+                    "non-normalized routing network reached runtime");
             }
         }
     }
@@ -868,9 +870,11 @@ void Router::Configure(
             compound.conditions.push_back(GeoIPCondition{rc.geoip, geo_manager});
         }
 
-        if (compound.HasAnyCondition()) {
-            impl_->compound_rules.push_back(std::move(compound));
+        if (!compound.HasAnyCondition()) {
+            throw std::logic_error(
+                "routing rule without conditions reached runtime");
         }
+        impl_->compound_rules.push_back(std::move(compound));
     }
 }
 

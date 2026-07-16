@@ -386,6 +386,30 @@ expect_rejected(invalid_route_domain_regexp "{}" "routing.json"
 expect_rejected(invalid_route_domain_name "{}" "routing.json"
     [=[{"rules":[{"domain":["domain:bad..example"],"outboundTag":"direct"}]}]=]
     "routing domain suffix contains invalid DNS hostname")
+expect_rejected(unsupported_route_network "{}" "routing.json"
+    [=[{"rules":[{"network":"quic","outboundTag":"direct"}]}]=]
+    "routing network contains unsupported value")
+expect_rejected(integer_route_network "{}" "routing.json"
+    [=[{"rules":[{"network":1,"outboundTag":"direct"}]}]=]
+    "routing network must be a string or array of strings")
+expect_rejected(empty_route_network_array "{}" "routing.json"
+    [=[{"rules":[{"network":[],"domain":["example.com"],"outboundTag":"direct"}]}]=]
+    "routing network must not be empty")
+expect_started(canonical_route_network_list
+    [=[{"workers":1}]=] "routing.json"
+    [=[{"rules":[{"network":"TCP, UDP","outboundTag":"direct"}]}]=])
+expect_rejected(empty_route_protocol "{}" "routing.json"
+    [=[{"rules":[{"protocol":[""],"outboundTag":"direct"}]}]=]
+    "routing protocol must not be empty")
+expect_rejected(empty_route_user "{}" "routing.json"
+    [=[{"rules":[{"user":[""],"outboundTag":"direct"}]}]=]
+    "routing user must not be empty")
+expect_rejected(empty_route_geosite "{}" "routing.json"
+    [=[{"rules":[{"geosite":[""],"outboundTag":"direct"}]}]=]
+    "routing geosite tag must not be empty")
+expect_rejected(conditionless_route_rule "{}" "routing.json"
+    [=[{"rules":[{"outboundTag":"direct"}]}]=]
+    "routing rule must contain at least one condition")
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"

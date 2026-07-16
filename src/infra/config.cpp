@@ -87,6 +87,37 @@ namespace {
     return value;
 }
 
+[[nodiscard]] std::string RequireRoutingSelector(
+    std::string value,
+    std::string_view field,
+    bool lowercase) {
+    if (value.empty()) {
+        throw std::invalid_argument(std::format(
+            "routing {} must not be empty", field));
+    }
+    for (char& ch : value) {
+        const unsigned char byte = static_cast<unsigned char>(ch);
+        if (byte < 0x20 || byte == 0x7f) {
+            throw std::invalid_argument(std::format(
+                "routing {} contains control characters", field));
+        }
+        if (lowercase) {
+            ch = domain::ToLowerAscii(byte);
+        }
+    }
+    return value;
+}
+
+[[nodiscard]] std::string RequireRoutingNetwork(std::string value) {
+    value = RequireRoutingSelector(std::move(value), "network", true);
+    if (value != constants::protocol::kTcp &&
+        value != constants::protocol::kUdp) {
+        throw std::invalid_argument(std::format(
+            "routing network contains unsupported value '{}'", value));
+    }
+    return value;
+}
+
 // 从 object 中取 string，不存在则返回默认值
 inline std::string jstr(
     const json::object& obj,
@@ -457,7 +488,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
             // 解析前缀
             if (val.substr(0, 8) == "geosite:") {
-                rule.geosite.push_back(val.substr(8));
+                rule.geosite.push_back(RequireRoutingSelector(
+                    val.substr(8), "geosite tag", true));
             } else if (val.substr(0, 5) == "full:") {
                 rule.domain_full.push_back(RequireRoutingDomainName(
                     val.substr(5), "full"));
@@ -511,7 +543,14 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("geosite")) {
         auto arr = jstr_array(j, {"geosite"});
-        rule.geosite.insert(rule.geosite.end(), arr.begin(), arr.end());
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing geosite tag must not be empty");
+        }
+        for (auto& value : arr) {
+            rule.geosite.push_back(RequireRoutingSelector(
+                std::move(value), "geosite tag", true));
+        }
     }
 
     // IP 匹配 - 处理 xray 格式 (ip 数组可能包含 geoip:xxx)
@@ -519,7 +558,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         for (std::string val : jstr_array(j, {"ip"})) {
 
             if (val.substr(0, 6) == "geoip:") {
-                rule.geoip.push_back(val.substr(6));
+                rule.geoip.push_back(RequireRoutingSelector(
+                    val.substr(6), "geoip tag", true));
             } else {
                 rule.ip.push_back(RequireRoutingIpNetwork(val, "ip"));
             }
@@ -527,38 +567,56 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
     if (j.contains("geoip")) {
         auto arr = jstr_array(j, {"geoip"});
-        rule.geoip.insert(rule.geoip.end(), arr.begin(), arr.end());
+        if (arr.empty()) {
+            throw std::invalid_argument(
+                "routing geoip tag must not be empty");
+        }
+        for (auto& value : arr) {
+            rule.geoip.push_back(RequireRoutingSelector(
+                std::move(value), "geoip tag", true));
+        }
     }
 
     // 辅助：将逗号分隔的字符串拆为 vector
     auto split_comma = [](const std::string& s) -> std::vector<std::string> {
         std::vector<std::string> result;
         size_t start = 0;
-        while (start < s.size()) {
+        while (true) {
             auto pos = s.find(',', start);
             if (pos == std::string::npos) pos = s.size();
             auto token = s.substr(start, pos - start);
             // 去除首尾空格
-            auto b = token.find_first_not_of(' ');
-            auto e = token.find_last_not_of(' ');
+            auto b = token.find_first_not_of(" \t");
+            auto e = token.find_last_not_of(" \t");
             if (b != std::string::npos) {
                 result.push_back(token.substr(b, e - b + 1));
+            } else {
+                result.emplace_back();
             }
+            if (pos == s.size()) break;
             start = pos + 1;
         }
         return result;
     };
 
-    // 辅助：解析字符串/整数/数组字段，支持逗号分隔字符串（Xray 格式）
+    // 辅助：解析字符串/数组字段，支持逗号分隔字符串（Xray 格式）
     auto parse_str_or_array = [&](std::string_view key) -> std::vector<std::string> {
         auto* p = j.if_contains(key);
         if (!p) return {};
-        if (p->is_array()) return jstr_array(j, {key});
-        if (p->is_string()) return split_comma(std::string(p->as_string()));
-        if (p->is_int64()) return {std::to_string(p->as_int64())};
-        if (p->is_uint64()) return {std::to_string(p->as_uint64())};
-        throw std::invalid_argument(std::format(
-            "routing {} must be a string, integer, or array of strings", key));
+        std::vector<std::string> values;
+        if (p->is_array()) {
+            values = jstr_array(j, {key});
+        } else if (p->is_string()) {
+            values = split_comma(std::string(p->as_string()));
+        } else {
+            throw std::invalid_argument(std::format(
+                "routing {} must be a string or array of strings", key));
+        }
+        if (values.empty()) {
+            throw std::invalid_argument(std::format(
+                "routing {} must not be empty", key));
+        }
+        return values;
     };
 
     // 端口（支持 Xray 格式: "53,443,1000-2000"）
@@ -567,21 +625,32 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 网络类型（支持 Xray 格式: "tcp,udp"）
     {
         auto vals = parse_str_or_array("network");
-        rule.network.insert(rule.network.end(), vals.begin(), vals.end());
+        for (auto& value : vals) {
+            rule.network.push_back(RequireRoutingNetwork(std::move(value)));
+        }
     }
 
     // 入站标签
     {
         auto vals = parse_str_or_array("inboundTag");
-        rule.inbound_tag.insert(rule.inbound_tag.end(), vals.begin(), vals.end());
+        for (auto& value : vals) {
+            rule.inbound_tag.push_back(RequireRoutingSelector(
+                std::move(value), "inboundTag", false));
+        }
         vals = parse_str_or_array("inbound_tag");
-        rule.inbound_tag.insert(rule.inbound_tag.end(), vals.begin(), vals.end());
+        for (auto& value : vals) {
+            rule.inbound_tag.push_back(RequireRoutingSelector(
+                std::move(value), "inboundTag", false));
+        }
     }
 
     // 用户 email（Xray user 字段）
     {
         auto vals = parse_str_or_array("user");
-        rule.user.insert(rule.user.end(), vals.begin(), vals.end());
+        for (auto& value : vals) {
+            rule.user.push_back(RequireRoutingSelector(
+                std::move(value), "user", false));
+        }
     }
 
     // 来源 IP/CIDR（Xray source 字段）
@@ -603,7 +672,10 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     // 嗅探协议（Xray protocol 字段）
     {
         auto vals = parse_str_or_array("protocol");
-        rule.protocol.insert(rule.protocol.end(), vals.begin(), vals.end());
+        for (auto& value : vals) {
+            rule.protocol.push_back(RequireRoutingSelector(
+                std::move(value), "protocol", true));
+        }
     }
 
     // 目标出站
@@ -611,6 +683,19 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         rule.outbound_tag = std::string(j.at("outboundTag").as_string());
     } else if (j.contains("outbound_tag")) {
         rule.outbound_tag = std::string(j.at("outbound_tag").as_string());
+    }
+
+    const bool has_condition =
+        !rule.domain.empty() || !rule.domain_suffix.empty() ||
+        !rule.domain_keyword.empty() || !rule.domain_full.empty() ||
+        !rule.domain_regex.empty() || !rule.geosite.empty() ||
+        !rule.ip.empty() || !rule.geoip.empty() || !rule.port.empty() ||
+        !rule.network.empty() || !rule.inbound_tag.empty() ||
+        !rule.user.empty() || !rule.source.empty() ||
+        !rule.source_port.empty() || !rule.protocol.empty();
+    if (!has_condition) {
+        throw std::invalid_argument(
+            "routing rule must contain at least one condition");
     }
 
     return rule;
