@@ -273,6 +273,7 @@ set(CNODE_SOURCES
     src/infra/log.cpp
     src/infra/json.cpp
     src/infra/config.cpp
+    src/infra/routing_ip_network.cpp
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
     src/infra/config_validation.cpp
@@ -749,6 +750,30 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_json_port_test
         COMMAND cnode_json_port_test)
+
+    add_executable(cnode_routing_ip_network_test
+        tests/routing_ip_network_test.cpp
+        src/infra/routing_ip_network.cpp
+    )
+    target_include_directories(cnode_routing_ip_network_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_routing_ip_network_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_routing_ip_network_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_routing_ip_network_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_routing_ip_network_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_routing_ip_network_test
+        COMMAND cnode_routing_ip_network_test)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp

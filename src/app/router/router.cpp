@@ -9,15 +9,8 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
 #include <algorithm>
 #include <cstring>
-#include <optional>
 #include <regex>
 #include <string>
 #include <variant>
@@ -79,24 +72,6 @@ bool MatchIPv6Prefix(const net::ip::address_v6::bytes_type& ip,
     return (ip[full_bytes] & mask) == (network[full_bytes] & mask);
 }
 
-void MaskIPv6Network(net::ip::address_v6::bytes_type& bytes, uint8_t prefix) {
-    const size_t full_bytes = prefix / 8;
-    const uint8_t remaining_bits = prefix % 8;
-
-    if (full_bytes >= bytes.size()) {
-        return;
-    }
-
-    if (remaining_bits != 0) {
-        bytes[full_bytes] &= static_cast<uint8_t>(0xFFu << (8 - remaining_bits));
-    }
-
-    const size_t zero_start = full_bytes + (remaining_bits != 0 ? 1 : 0);
-    for (size_t i = zero_start; i < bytes.size(); ++i) {
-        bytes[i] = 0;
-    }
-}
-
 using StringVector = memory::ThreadLocalVector<std::string>;
 
 void SortUniqueStrings(StringVector& values) {
@@ -113,51 +88,6 @@ void SortUniqueStrings(StringVector& values) {
             return std::string_view(lhs) < rhs;
         });
     return it != values.end() && std::string_view(*it) == value;
-}
-
-[[nodiscard]] std::optional<uint32_t> ParseIPv4(std::string_view ip) {
-    char stack_buf[16];
-    std::string heap_buf;
-    const char* ip_cstr = stack_buf;
-
-    if (ip.size() < sizeof(stack_buf)) {
-        std::memcpy(stack_buf, ip.data(), ip.size());
-        stack_buf[ip.size()] = '\0';
-    } else {
-        heap_buf.assign(ip);
-        ip_cstr = heap_buf.c_str();
-    }
-
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip_cstr, &addr) != 1) {
-        return std::nullopt;
-    }
-    return ntohl(addr.s_addr);
-}
-
-[[nodiscard]] bool ParseCIDR(const std::string& cidr, uint32_t& network, uint32_t& mask) {
-    auto slash_pos = cidr.find('/');
-    if (slash_pos == std::string::npos) {
-        auto ip = ParseIPv4(cidr);
-        if (!ip) return false;
-        network = *ip;
-        mask = 0xFFFFFFFF;
-        return true;
-    }
-
-    std::string ip_part = cidr.substr(0, slash_pos);
-    int prefix_len = std::stoi(cidr.substr(slash_pos + 1));
-
-    if (prefix_len < 0 || prefix_len > 32) {
-        return false;
-    }
-
-    auto ip = ParseIPv4(ip_part);
-    if (!ip) return false;
-
-    mask = (prefix_len == 0) ? 0U : (0xFFFFFFFFU << (32 - prefix_len));
-    network = *ip & mask;
-    return true;
 }
 
 class DomainTrie {
@@ -225,7 +155,7 @@ public:
     IPMatcher();
     ~IPMatcher() noexcept;
 
-    void AddCIDR(const std::string& cidr);
+    void AddNetwork(const RoutingIpNetwork& network);
     void BuildIndex();
 
     [[nodiscard]] bool Match(const net::ip::address& ip) const;
@@ -646,36 +576,24 @@ bool DomainMatcher::Match(std::string_view domain) const {
 IPMatcher::IPMatcher() = default;
 IPMatcher::~IPMatcher() noexcept = default;
 
-void IPMatcher::AddCIDR(const std::string& cidr) {
-    uint32_t network, mask;
-    if (ParseCIDR(cidr, network, mask)) {
-        rules_.push_back({network, mask});
+void IPMatcher::AddNetwork(const RoutingIpNetwork& network) {
+    const auto& bytes = network.Network();
+    if (!network.IsV6()) {
+        const uint32_t address =
+            (static_cast<uint32_t>(bytes[0]) << 24) |
+            (static_cast<uint32_t>(bytes[1]) << 16) |
+            (static_cast<uint32_t>(bytes[2]) << 8) |
+            static_cast<uint32_t>(bytes[3]);
+        const uint32_t mask = network.Prefix() == 0
+            ? 0U
+            : 0xFFFFFFFFU << (32 - network.Prefix());
+        rules_.push_back({address, mask});
         return;
     }
 
-    std::string ip_part;
-    uint8_t prefix = 128;
-    const size_t slash_pos = cidr.find('/');
-    if (slash_pos == std::string::npos) {
-        ip_part = cidr;
-    } else {
-        ip_part = cidr.substr(0, slash_pos);
-        int prefix_len = std::stoi(cidr.substr(slash_pos + 1));
-        if (prefix_len < 0 || prefix_len > 128) {
-            return;
-        }
-        prefix = static_cast<uint8_t>(prefix_len);
-    }
-
-    IoErrorCode ec;
-    auto addr = net::ip::make_address(ip_part, ec);
-    if (ec || !addr.is_v6()) {
-        return;
-    }
-
-    auto bytes = addr.to_v6().to_bytes();
-    MaskIPv6Network(bytes, prefix);
-    rules_v6_.push_back({bytes, prefix});
+    net::ip::address_v6::bytes_type ipv6_bytes{};
+    std::ranges::copy(bytes, ipv6_bytes.begin());
+    rules_v6_.push_back({ipv6_bytes, network.Prefix()});
 }
 
 void IPMatcher::BuildIndex() {
@@ -907,7 +825,7 @@ void Router::Configure(
         {
             IPMatcher source_ip_matcher;
             for (const auto& value : rc.source) {
-                source_ip_matcher.AddCIDR(value);
+                source_ip_matcher.AddNetwork(value);
             }
             if (!source_ip_matcher.Empty()) {
                 source_ip_matcher.BuildIndex();
@@ -917,7 +835,7 @@ void Router::Configure(
 
         IPMatcher ip_matcher;
         for (const auto& value : rc.ip) {
-            ip_matcher.AddCIDR(value);
+            ip_matcher.AddNetwork(value);
         }
         if (!ip_matcher.Empty()) {
             ip_matcher.BuildIndex();

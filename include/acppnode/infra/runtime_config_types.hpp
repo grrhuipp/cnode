@@ -4,9 +4,12 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acpp {
@@ -76,6 +79,29 @@ struct RoutingPortRange {
     uint16_t end = 0;
 };
 
+class RoutingIpNetwork {
+public:
+    RoutingIpNetwork(const RoutingIpNetwork&) = default;
+    RoutingIpNetwork& operator=(const RoutingIpNetwork&) = default;
+    RoutingIpNetwork(RoutingIpNetwork&&) noexcept = default;
+    RoutingIpNetwork& operator=(RoutingIpNetwork&&) noexcept = default;
+
+    [[nodiscard]] const std::array<uint8_t, 16>& Network() const noexcept {
+        return network_;
+    }
+    [[nodiscard]] uint8_t Prefix() const noexcept { return prefix_; }
+    [[nodiscard]] bool IsV6() const noexcept { return is_v6_; }
+    [[nodiscard]] static std::optional<RoutingIpNetwork> Parse(
+        std::string_view value);
+
+private:
+    RoutingIpNetwork() = default;
+
+    std::array<uint8_t, 16> network_{};
+    uint8_t prefix_ = 0;
+    bool is_v6_ = false;
+};
+
 struct RouteRuleConfig {
     // 匹配条件（可多选）
     std::vector<std::string> domain;         // 域名匹配
@@ -84,13 +110,13 @@ struct RouteRuleConfig {
     std::vector<std::string> domain_full;    // 完整域名
     std::vector<std::string> domain_regex;   // 正则域名
     std::vector<std::string> geosite;        // GeoSite tag (e.g., "cn", "category-ads")
-    std::vector<std::string> ip;             // IP/CIDR
+    std::vector<RoutingIpNetwork> ip;        // 归一化后的目标 IP 网络
     std::vector<std::string> geoip;          // GeoIP tag (e.g., "cn", "private")
     std::vector<RoutingPortRange> port;       // 归一化后的目标端口区间
     std::vector<std::string> network;        // 网络类型 (tcp/udp)
     std::vector<std::string> inbound_tag;    // 入站标签
     std::vector<std::string> user;           // 用户 email
-    std::vector<std::string> source;         // 来源 IP/CIDR
+    std::vector<RoutingIpNetwork> source;    // 归一化后的来源 IP 网络
     std::vector<RoutingPortRange> source_port; // 归一化后的来源端口区间
     std::vector<std::string> protocol;       // 嗅探协议 (http/tls/bittorrent)
 

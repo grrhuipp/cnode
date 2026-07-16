@@ -72,6 +72,12 @@ expect_rejected(reversed_route_port_range "{}" "routing.json"
     [=[{"rules":[{"port":"1000-200","outboundTag":"direct"}]}]=])
 expect_rejected(floating_route_source_port "{}" "routing.json"
     [=[{"rules":[{"sourcePort":443.0,"outboundTag":"direct"}]}]=])
+expect_rejected(trailing_route_ipv4_prefix "{}" "routing.json"
+    [=[{"rules":[{"ip":["192.0.2.0/24junk"],"outboundTag":"direct"}]}]=])
+expect_rejected(trailing_route_ipv6_prefix "{}" "routing.json"
+    [=[{"rules":[{"ip":["2001:db8::/32junk"],"outboundTag":"direct"}]}]=])
+expect_rejected(invalid_route_source_cidr "{}" "routing.json"
+    [=[{"rules":[{"source":["not-an-ip"],"outboundTag":"direct"}]}]=])
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"

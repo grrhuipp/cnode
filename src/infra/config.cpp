@@ -18,6 +18,16 @@ namespace acpp {
 
 namespace {
 
+[[nodiscard]] RoutingIpNetwork RequireRoutingIpNetwork(
+    std::string_view value, std::string_view field) {
+    auto parsed = RoutingIpNetwork::Parse(value);
+    if (!parsed) {
+        throw std::invalid_argument(std::format(
+            "routing field '{}' contains invalid IP network '{}'", field, value));
+    }
+    return std::move(*parsed);
+}
+
 // 从 object 中取 string，不存在则返回默认值
 inline std::string jstr(const json::object& obj, std::string_view key,
                         std::string_view def = "") {
@@ -393,7 +403,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
             if (val.substr(0, 6) == "geoip:") {
                 rule.geoip.push_back(val.substr(6));
             } else {
-                rule.ip.push_back(val);
+                rule.ip.push_back(RequireRoutingIpNetwork(val, "ip"));
             }
         }
     }
@@ -457,10 +467,14 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 来源 IP/CIDR（Xray source 字段）
     if (j.contains("source") && j.at("source").is_array()) {
-        rule.source = jstr_array(j.at("source"));
+        for (const auto& value : jstr_array(j.at("source"))) {
+            rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
+        }
     } else {
         auto vals = parse_str_or_array("source");
-        rule.source.insert(rule.source.end(), vals.begin(), vals.end());
+        for (const auto& value : vals) {
+            rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
+        }
     }
 
     // 来源端口（Xray sourcePort 字段）
