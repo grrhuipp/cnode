@@ -18,28 +18,61 @@
 #include "acppnode/common/serverstatus.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <exception>
 #include <unordered_map>
+#include <vector>
 
 namespace acpp {
 
-net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
-    for (const auto& worker : workers_) {
-        co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->UnregisterListenerTask(tag),
-            net::use_awaitable);
+namespace {
+
+template <typename WorkerRange, typename TaskFactory>
+net::awaitable<void> RunWorkerMutationBatch(
+    net::any_io_executor executor,
+    WorkerRange& workers,
+    TaskFactory task_factory) {
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers.size());
+    for (size_t i = 0; i < workers.size(); ++i) {
+        tasks.push_back(task_factory(*workers[i], i));
     }
-    co_return;
+    co_await controller::RunAwaitableBatch(executor, std::move(tasks));
+}
+
+struct WorkerBindResult {
+    bool tcp = false;
+    bool udp = false;
+};
+
+}  // namespace
+
+net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [tag](Worker& worker, size_t) {
+            return [](Worker* current, std::string current_tag)
+                       -> net::awaitable<void> {
+                co_await net::co_spawn(
+                    current->GetExecutor(),
+                    current->UnregisterListenerTask(std::move(current_tag)),
+                    net::use_awaitable);
+            }(&worker, tag);
+        });
 }
 
 net::awaitable<void> Controller::Impl::removeOutbound(const std::string& tag) {
-    for (const auto& worker : workers_) {
-        co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->RemoveOutboundTask(tag),
-            net::use_awaitable);
-    }
-    co_return;
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [tag](Worker& worker, size_t) {
+            return [](Worker* current, std::string current_tag)
+                       -> net::awaitable<void> {
+                co_await net::co_spawn(
+                    current->GetExecutor(),
+                    current->RemoveOutboundTask(std::move(current_tag)),
+                    net::use_awaitable);
+            }(&worker, tag);
+        });
 }
 
 net::awaitable<bool> Controller::Impl::addOutbound(api::API* panel,
@@ -54,12 +87,18 @@ net::awaitable<bool> Controller::Impl::addOutbound(api::API* panel,
     if (!prepared) {
         co_return false;
     }
-    for (const auto& worker : workers_) {
-        co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->AddOutboundTask(*prepared),
-            net::use_awaitable);
-    }
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [&prepared](Worker& worker, size_t) {
+            return [](Worker* current,
+                      proxyman::outbound::PreparedOutboundConfig config)
+                       -> net::awaitable<void> {
+                co_await net::co_spawn(
+                    current->GetExecutor(),
+                    current->AddOutboundTask(std::move(config)),
+                    net::use_awaitable);
+            }(&worker, *prepared);
+        });
     co_return true;
 }
 
@@ -78,6 +117,12 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
 
     auto inbound = controller::InboundBuilder(panel_name, panel_cfg, node_config);
 
+    if (!proxyman::inbound::HasProxy(inbound.protocol)) {
+        LOG_WARN("Node {}/{}: unsupported inbound protocol '{}'",
+                 panel_name, node_id, inbound.protocol);
+        co_return false;
+    }
+
     const uint32_t access_source_ref = accesslog::Reporter::Instance().RegisterSource({
         .panel_name = panel_name,
         .panel_api_host = client_info.APIHost,
@@ -89,70 +134,114 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                   panel_name, node_id, client_info.APIHost);
     }
 
-    if (!proxyman::inbound::HasProxy(inbound.protocol)) {
-        LOG_WARN("Node {}/{}: unsupported inbound protocol '{}'",
-                 panel_name, node_id, inbound.protocol);
-        co_return false;
-    }
+    std::exception_ptr publish_failure;
+    try {
+        std::vector<uint8_t> registered(workers_.size(), 0);
+        co_await RunWorkerMutationBatch(
+            io_context_.get_executor(), workers_,
+            [&](Worker& worker, size_t index) {
+                auto* limiter = limiters_[worker.Id()].get();
+                auto receiver = proxyman::inbound::MakeReceiverSettings(
+                    inbound.tag,
+                    std::vector<std::string>{
+                        inbound.tag, std::string(constants::protocol::kNode)},
+                    inbound.protocol,
+                    inbound.stream_settings,
+                    inbound.sniff,
+                    limiter,
+                    inbound.proxy_protocol,
+                    proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag),
+                    access_source_ref);
+                return [](Worker* current,
+                          std::string protocol,
+                          ConnectionLimiterPtr current_limiter,
+                          proxyman::inbound::BuildRequest request,
+                          proxyman::inbound::ReceiverSettings current_receiver,
+                          uint8_t* result) -> net::awaitable<void> {
+                    *result = co_await net::co_spawn(
+                        current->GetExecutor(),
+                        current->RegisterInboundTask(
+                            std::move(protocol),
+                            current_limiter,
+                            std::move(request),
+                            std::move(current_receiver)),
+                        net::use_awaitable);
+                }(&worker,
+                  inbound.protocol,
+                  limiter,
+                  inbound.handler_request,
+                  std::move(receiver),
+                  &registered[index]);
+            });
 
-    for (const auto& worker : workers_) {
-        auto* limiter = limiters_[worker->Id()].get();
-
-        auto receiver = proxyman::inbound::MakeReceiverSettings(
-            inbound.tag,
-            std::vector<std::string>{inbound.tag, std::string(constants::protocol::kNode)},
-            inbound.protocol,
-            inbound.stream_settings,
-            inbound.sniff,
-            limiter,
-            inbound.proxy_protocol,
-            proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag),
-            access_source_ref);
-
-        const bool registered = co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->RegisterInboundTask(
-                inbound.protocol,
-                limiter,
-                inbound.handler_request,
-                std::move(receiver)),
-            net::use_awaitable);
-
-        if (!registered) {
+        if (std::ranges::find(registered, uint8_t{0}) != registered.end()) {
             LOG_WARN("Node {}/{}: create inbound handler failed, protocol={}",
                      panel_name, node_id, inbound.protocol);
             co_await removeInbound(inbound.tag);
             co_return false;
         }
+
+        std::vector<WorkerBindResult> bound(workers_.size());
+        co_await RunWorkerMutationBatch(
+            io_context_.get_executor(), workers_,
+            [&](Worker& worker, size_t index) {
+                auto* limiter = limiters_[worker.Id()].get();
+                return [](Worker* current,
+                          PortBinding binding,
+                          std::string protocol,
+                          ConnectionLimiterPtr current_limiter,
+                          proxyman::inbound::BuildRequest request,
+                          WorkerBindResult* result) -> net::awaitable<void> {
+                    result->tcp = co_await net::co_spawn(
+                        current->GetExecutor(),
+                        current->AddListenerTask(binding),
+                        net::use_awaitable);
+                    if (!result->tcp) {
+                        co_return;
+                    }
+                    result->udp = co_await net::co_spawn(
+                        current->GetExecutor(),
+                        current->AddUdpListenerTask(
+                            std::move(binding),
+                            std::move(protocol),
+                            current_limiter,
+                            std::move(request)),
+                        net::use_awaitable);
+                }(&worker,
+                  inbound.binding,
+                  inbound.protocol,
+                  limiter,
+                  inbound.handler_request,
+                  &bound[index]);
+            });
+
+        const auto failed_bind = std::ranges::find_if(
+            bound, [](const WorkerBindResult& result) {
+                return !result.tcp || !result.udp;
+            });
+        if (failed_bind != bound.end()) {
+            LOG_WARN("Node {}/{}: {} bind failed, tag={}",
+                     panel_name, node_id,
+                     failed_bind->tcp ? "UDP" : "TCP",
+                     inbound.tag);
+            co_await removeInbound(inbound.tag);
+            co_return false;
+        }
+    } catch (...) {
+        publish_failure = std::current_exception();
     }
 
-    for (const auto& worker : workers_) {
-        const bool tcp_bound = co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->AddListenerTask(inbound.binding),
-            net::use_awaitable);
-        if (!tcp_bound) {
-            LOG_WARN("Node {}/{}: TCP bind failed, tag={}",
-                     panel_name, node_id, inbound.tag);
+    if (publish_failure) {
+        try {
             co_await removeInbound(inbound.tag);
-            co_return false;
+        } catch (const std::exception& cleanup_error) {
+            LOG_ERROR("Node {}/{}: inbound cleanup after publish failure raised: {}",
+                      panel_name, node_id, cleanup_error.what());
+        } catch (...) {
+            LOG_ERROR("Node {}/{}: inbound cleanup after publish failure raised unknown exception",
+                      panel_name, node_id);
         }
-
-        auto* limiter = limiters_[worker->Id()].get();
-        const bool udp_bound = co_await net::co_spawn(
-            worker->GetExecutor(),
-            worker->AddUdpListenerTask(
-                inbound.binding,
-                inbound.protocol,
-                limiter,
-                inbound.handler_request),
-            net::use_awaitable);
-        if (!udp_bound) {
-            LOG_WARN("Node {}/{}: UDP bind failed, tag={}",
-                     panel_name, node_id, inbound.tag);
-            co_await removeInbound(inbound.tag);
-            co_return false;
-        }
+        std::rethrow_exception(publish_failure);
     }
 
     LOG_CONSOLE("inbound ready tag={} port={} protocol={} workers={} accept=SO_REUSEPORT",

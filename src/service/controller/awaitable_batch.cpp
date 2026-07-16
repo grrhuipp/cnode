@@ -51,11 +51,25 @@ net::awaitable<void> RunAwaitableBatch(
     }
 
     auto state = std::make_shared<BatchState>(executor, tasks.size());
-    for (auto& task : tasks) {
-        net::co_spawn(
-            executor,
-            RunBatchTask(state, std::move(task)),
-            net::detached);
+    size_t spawned = 0;
+    try {
+        for (auto& task : tasks) {
+            net::co_spawn(
+                executor,
+                RunBatchTask(state, std::move(task)),
+                net::detached);
+            ++spawned;
+        }
+    } catch (...) {
+        if (!state->failure) {
+            state->failure = std::current_exception();
+        }
+        const size_t not_spawned = tasks.size() - spawned;
+        state->remaining -= not_spawned;
+        if (state->remaining == 0) {
+            IoErrorCode ignored;
+            state->completion.cancel(ignored);
+        }
     }
 
     if (state->remaining != 0) {
