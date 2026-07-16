@@ -91,9 +91,7 @@
       "realitySettings": {
         "serverName": "vless.example.com",
         "publicKey": "your-reality-public-key",
-        "shortId": "0123456789abcdef",
-        "fingerprint": "chrome",
-        "spiderX": "/"
+        "shortId": "0123456789abcdef"
       }
     }
   },

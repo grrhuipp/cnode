@@ -151,11 +151,9 @@ struct RealityConfig {
     std::string mldsa65_seed;
 
     // 客户端字段
-    std::string fingerprint;
     std::string server_name;
     std::string public_key;
     std::string short_id;
-    std::string spider_x;
     std::string mldsa65_verify;
 
     // 调试/兼容字段

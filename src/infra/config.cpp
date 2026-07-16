@@ -819,7 +819,11 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     if (cfg.mldsa65_seed.empty()) {
         cfg.mldsa65_seed = jstr(j, "mldsa65_seed", "");
     }
-    cfg.fingerprint = lower_ascii_copy(jstr(j, "fingerprint", ""));
+    if (j.contains("fingerprint")) {
+        throw std::invalid_argument(
+            "REALITY fingerprint is not supported; ClientHello fingerprint "
+            "emulation is not implemented");
+    }
     cfg.server_name = jstr(j, "serverName", "");
     if (cfg.server_name.empty()) {
         cfg.server_name = jstr(j, "server_name", "");
@@ -835,9 +839,10 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     if (cfg.short_id.empty()) {
         cfg.short_id = jstr(j, "short_id", "");
     }
-    cfg.spider_x = jstr(j, "spiderX", "");
-    if (cfg.spider_x.empty()) {
-        cfg.spider_x = jstr(j, "spider_x", "");
+    if (j.contains("spiderX") || j.contains("spider_x")) {
+        throw std::invalid_argument(
+            "REALITY spiderX/spider_x is not supported; the REALITY crawler "
+            "is not implemented");
     }
     cfg.mldsa65_verify = jstr(j, "mldsa65Verify", "");
     if (cfg.mldsa65_verify.empty()) {

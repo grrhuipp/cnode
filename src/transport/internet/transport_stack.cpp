@@ -135,13 +135,9 @@ std::string MakeRealityClientCacheKey(const RealityConfig& reality,
     key.push_back('|');
     key.append(reality.public_key);
     key.push_back('|');
-    key.append(reality.fingerprint);
-    key.push_back('|');
     key.append(reality.server_name);
     key.push_back('|');
     key.append(reality.short_id);
-    key.push_back('|');
-    key.append(reality.spider_x);
     return key;
 }
 
