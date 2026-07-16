@@ -314,6 +314,7 @@ set(CNODE_SOURCES
     src/app/proxyman/outbound/manager.cpp
     src/app/worker.cpp
     src/service/controller/controller.cpp
+    src/service/controller/node_transition.cpp
     src/service/controller/config.cpp
     src/service/controller/inboundbuilder.cpp
     src/service/controller/outboundbuilder.cpp
@@ -770,6 +771,31 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_udp_socket_owner_test
         COMMAND cnode_udp_socket_owner_test)
+
+    add_executable(cnode_node_transition_test
+        tests/node_transition_test.cpp
+        src/service/controller/node_transition.cpp
+    )
+    target_include_directories(cnode_node_transition_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
+    )
+    target_link_libraries(cnode_node_transition_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_node_transition_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_node_transition_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_node_transition_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_node_transition_test
+        COMMAND cnode_node_transition_test)
 
     add_test(
         NAME cnode_invalid_config_sources_test

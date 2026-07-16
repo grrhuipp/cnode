@@ -1,11 +1,14 @@
 #include "controller_impl.hpp"
+#include "node_transition.hpp"
 
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <stdexcept>
 
 namespace acpp {
@@ -192,40 +195,37 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
 
             const api::NodeInfo& fetched_config = *config_result.node_info;
 
-            std::string protocol = naming::ResolveProtocolOrDefault(fetched_config.NodeType);
-            std::string tag = naming::BuildPanelNodeTag(
+            const std::string protocol =
+                naming::ResolveProtocolOrDefault(fetched_config.NodeType);
+            const std::string tag = naming::BuildPanelNodeTag(
                 panel_name, protocol, fetched_config.Port);
 
-            bool need_create   = (node_configs_.find(panel) == node_configs_.end());
-            bool need_recreate = false;
+            std::optional<api::NodeInfo> old_config;
+            if (const auto old = node_configs_.find(panel); old != node_configs_.end()) {
+                old_config = old->second;
+            }
+            const bool old_started = old_config &&
+                inbound_started_.find(panel) != inbound_started_.end() &&
+                inbound_started_.at(panel);
+            const auto transition = controller::PlanNodeTransition(
+                old_config ? &*old_config : nullptr,
+                old_started,
+                fetched_config);
+            const bool transitioning = transition.Transitioning();
 
-            if (!need_create && !inbound_started_[panel]) {
-                need_create = true;
-            } else if (!need_create && ConfigChanged(node_configs_[panel], fetched_config)) {
-                need_recreate = true;
+            std::string old_protocol;
+            std::string old_tag;
+            if (old_config) {
+                old_protocol = naming::ResolveProtocolOrDefault(old_config->NodeType);
+                old_tag = naming::BuildPanelNodeTag(
+                    panel_name, old_protocol, old_config->Port);
+            }
+
+            if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
+                || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
                 LOG_CONSOLE("node config_changed panel={} node={} action=recreate",
                             panel_name, node_id);
             }
-
-            if (need_recreate) {
-                std::string old_protocol =
-                    naming::ResolveProtocolOrDefault(node_configs_[panel].NodeType);
-                std::string old_tag = naming::BuildPanelNodeTag(
-                    panel_name, old_protocol, node_configs_[panel].Port);
-                if (old_tag != tag) {
-                    co_await removeInbound(old_tag);
-                    co_await removeOutbound(old_tag);
-                    clearUsers(old_tag, old_protocol);
-                    user_lists_.erase(panel);
-                    inbound_started_[panel] = false;
-                } else {
-                    co_await removeOutbound(old_tag);
-                    LOG_CONSOLE("node config_changed panel={} node={} action=update_in_place",
-                                panel_name, node_id);
-                }
-            }
-
-            node_configs_[panel] = fetched_config;
 
             auto rules_result = co_await panel->GetNodeRule();
             if (!rules_result.Ok()) {
@@ -234,47 +234,166 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                          rules_result.error_msg.empty()
                             ? ErrorCodeToString(rules_result.error)
                             : rules_result.error_msg);
-            } else if (!rules_result.not_modified) {
-                UpdateRule(tag, rules_result.rules);
             }
 
             auto users_result = co_await panel->GetUserList();
-            if (users_result.Ok()) {
-                if (!users_result.not_modified) {
-                    syncUserList(
-                        panel, tag, protocol, fetched_config, users_result.users,
-                        need_create || need_recreate);
-                } else if (need_create || need_recreate) {
-                    if (auto cached_users = user_lists_.find(panel);
-                            cached_users != user_lists_.end()) {
-                        syncUserList(
-                            panel, tag, protocol, fetched_config,
-                            cached_users->second, true);
-                    }
+            std::optional<std::vector<api::UserInfo>> next_users;
+            if (!users_result.Ok()) {
+                if (transitioning) {
+                    throw std::runtime_error(ErrorMessage(
+                        users_result.error, users_result.error_msg));
                 }
-                if (ban_tracking_tags_.insert(tag).second) {
-                    for (const auto& worker : workers_) {
-                        worker->EnableBanTrackingAsync(tag);
-                    }
-                    LOG_CONSOLE("node ban_tracking=enabled panel={} node={} tag={}",
-                                panel_name, node_id, tag);
-                }
-            } else {
                 LOG_WARN("Panel {}/{}: user sync skipped: {}",
                          panel_name, node_id,
                          users_result.error_msg.empty()
                             ? ErrorCodeToString(users_result.error)
                             : users_result.error_msg);
+            } else if (users_result.not_modified) {
+                if (transitioning) {
+                    if (const auto cached = user_lists_.find(panel);
+                        cached != user_lists_.end()) {
+                        next_users = cached->second;
+                    } else {
+                        throw std::runtime_error(
+                            "panel returned users not modified without a committed user snapshot");
+                    }
+                }
+            } else {
+                next_users = std::move(users_result.users);
             }
 
-            if (need_create || need_recreate) {
-                (void)co_await addOutbound(panel, fetched_config, tag);
-                bool ok = co_await addInbound(panel, fetched_config);
-                inbound_started_[panel] = ok;
-                if (!ok) {
-                    LOG_WARN("Node {}/{} bind failed, will retry", panel_name, node_id);
-                    throw std::runtime_error("inbound listener bind failed");
+            if (!transitioning) {
+                if (next_users &&
+                    !syncUserList(panel, tag, protocol, fetched_config, *next_users)) {
+                    throw std::runtime_error("failed to build panel user snapshot");
                 }
+                node_configs_[panel] = fetched_config;
+                if (rules_result.Ok() && !rules_result.not_modified) {
+                    UpdateRule(tag, rules_result.rules);
+                }
+            } else {
+                if (!next_users) {
+                    throw std::runtime_error("candidate node has no user snapshot");
+                }
+
+                auto candidate_user_set = BuildUsersForInbound(
+                    protocol, tag, fetched_config, *next_users);
+                if (!candidate_user_set) {
+                    throw std::runtime_error("failed to build candidate user snapshot");
+                }
+
+                const bool destructive_swap = transition.DestructiveSwap();
+                std::optional<proxyman::inbound::UserSet> rollback_user_set;
+                if (old_config && old_tag == tag) {
+                    const auto cached = user_lists_.find(panel);
+                    if (cached == user_lists_.end()) {
+                        throw std::runtime_error(
+                            "cannot safely replace node without rollback users");
+                    }
+                    rollback_user_set = BuildUsersForInbound(
+                        old_protocol, old_tag, *old_config, cached->second);
+                    if (!rollback_user_set) {
+                        throw std::runtime_error(
+                            "failed to build rollback user snapshot");
+                    }
+                }
+
+                auto rollback = [&]() -> net::awaitable<bool> {
+                    try {
+                        bool restored = true;
+                        if (!old_config || old_tag != tag) {
+                            co_await removeOutbound(tag);
+                            clearUsers(tag, protocol);
+                        } else {
+                            if (rollback_user_set) {
+                                proxyman::inbound::UserStore::ApplyUsers(
+                                    old_protocol, old_tag, *rollback_user_set);
+                            }
+                            restored = co_await addOutbound(
+                                panel, *old_config, old_tag);
+                        }
+
+                        if (destructive_swap && old_config && old_started) {
+                            bool inbound_restored = false;
+                            if (restored) {
+                                inbound_restored = co_await addInbound(panel, *old_config);
+                            }
+                            restored = restored && inbound_restored;
+                            inbound_started_[panel] = restored;
+                            if (restored && ban_tracking_tags_.insert(old_tag).second) {
+                                for (const auto& worker : workers_) {
+                                    worker->EnableBanTrackingAsync(old_tag);
+                                }
+                            }
+                        }
+                        co_return restored;
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Node {}/{}: rollback raised: {}",
+                                  panel_name, node_id, e.what());
+                    } catch (...) {
+                        LOG_ERROR("Node {}/{}: rollback raised an unknown exception",
+                                  panel_name, node_id);
+                    }
+                    co_return false;
+                };
+
+                if (destructive_swap) {
+                    co_await removeInbound(old_tag);
+                }
+
+                proxyman::inbound::UserStore::ApplyUsers(
+                    protocol, tag, *candidate_user_set);
+
+                std::exception_ptr candidate_failure;
+                try {
+                    if (!co_await addOutbound(panel, fetched_config, tag)) {
+                        throw std::runtime_error("candidate outbound creation failed");
+                    }
+
+                    if (!co_await addInbound(panel, fetched_config)) {
+                        throw std::runtime_error("candidate inbound creation failed");
+                    }
+                } catch (...) {
+                    candidate_failure = std::current_exception();
+                }
+                if (candidate_failure) {
+                    const bool restored = co_await rollback();
+                    if (!restored) {
+                        LOG_ERROR("Node {}/{}: rollback failed after candidate prepare failure",
+                                  panel_name, node_id);
+                    }
+                    std::rethrow_exception(candidate_failure);
+                }
+
+                node_configs_[panel] = fetched_config;
+                user_lists_[panel] = *next_users;
+                inbound_started_[panel] = true;
+                node_stats_[stats_key].user_count = next_users->size();
+
+                if (rules_result.Ok() && !rules_result.not_modified) {
+                    UpdateRule(tag, rules_result.rules);
+                }
+
+                if (old_config && old_tag != tag) {
+                    if (transition.RetireOldAfterCommit()) {
+                        co_await removeInbound(old_tag);
+                    }
+                    co_await removeOutbound(old_tag);
+                    clearUsers(old_tag, old_protocol);
+                    UpdateRule(old_tag, {});
+                }
+
+                LOG_CONSOLE(
+                    "node config_committed panel={} node={} tag={} replaced={}",
+                    panel_name, node_id, tag, old_config.has_value());
+            }
+
+            if (ban_tracking_tags_.insert(tag).second) {
+                for (const auto& worker : workers_) {
+                    worker->EnableBanTrackingAsync(tag);
+                }
+                LOG_CONSOLE("node ban_tracking=enabled panel={} node={} tag={}",
+                            panel_name, node_id, tag);
             }
 
             co_await userInfoMonitor(panel, tag, protocol);
@@ -291,15 +410,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             }
         }
     }
-}
-
-bool Controller::Impl::ConfigChanged(const api::NodeInfo& a, const api::NodeInfo& b) const {
-    return a.Port != b.Port || a.NodeType != b.NodeType
-        || a.TransportProtocol != b.TransportProtocol || a.Path != b.Path
-        || a.Host != b.Host || a.EnableTLS != b.EnableTLS
-        || a.TLSServerName != b.TLSServerName || a.TLSCert != b.TLSCert
-        || a.TLSKey != b.TLSKey || a.CypherMethod != b.CypherMethod
-        || a.ShadowsocksServerKey != b.ShadowsocksServerKey;
 }
 
 }  // namespace acpp

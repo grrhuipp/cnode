@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace acpp {
 
@@ -37,7 +36,10 @@ net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
 
 net::awaitable<void> Controller::Impl::removeOutbound(const std::string& tag) {
     for (const auto& worker : workers_) {
-        worker->RemoveOutboundAsync(tag);
+        co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->RemoveOutboundTask(tag),
+            net::use_awaitable);
     }
     co_return;
 }
@@ -51,8 +53,17 @@ net::awaitable<bool> Controller::Impl::addOutbound(api::API* panel,
         : nullptr;
 
     auto prepared = controller::OutboundBuilder(tag, panel_cfg, node_config);
+    if (!prepared) {
+        co_return false;
+    }
     for (const auto& worker : workers_) {
-        worker->AddOutboundAsync(prepared);
+        const bool added = co_await net::co_spawn(
+            worker->GetExecutor(),
+            worker->AddOutboundTask(*prepared),
+            net::use_awaitable);
+        if (!added) {
+            co_return false;
+        }
     }
     co_return true;
 }
@@ -292,102 +303,6 @@ Controller::Impl::GetDetectResult(const std::string& tag) {
     co_return merged;
 }
 
-namespace {
-
-struct UserListDiff {
-    std::vector<api::UserInfo> deleted;
-    std::vector<api::UserInfo> added;
-};
-
-[[nodiscard]] bool SameUserInfo(const api::UserInfo& a, const api::UserInfo& b) {
-    return a.UID == b.UID
-        && a.Email == b.Email
-        && a.Passwd == b.Passwd
-        && a.Port == b.Port
-        && a.Method == b.Method
-        && a.SpeedLimit == b.SpeedLimit
-        && a.DeviceLimit == b.DeviceLimit
-        && a.Protocol == b.Protocol
-        && a.ProtocolParam == b.ProtocolParam
-        && a.Obfs == b.Obfs
-        && a.ObfsParam == b.ObfsParam
-        && a.UUID == b.UUID
-        && a.Flow == b.Flow
-        && a.AlterID == b.AlterID
-        && a.Enabled == b.Enabled;
-}
-
-template <typename T>
-void HashCombine(std::size_t& seed, const T& value) {
-    seed ^= std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL +
-            (seed << 6) + (seed >> 2);
-}
-
-struct UserInfoRef {
-    const api::UserInfo* user = nullptr;
-};
-
-struct UserInfoRefHash {
-    std::size_t operator()(const UserInfoRef& ref) const {
-        const auto& user = *ref.user;
-        std::size_t seed = 0;
-        HashCombine(seed, user.UID);
-        HashCombine(seed, user.Email);
-        HashCombine(seed, user.Passwd);
-        HashCombine(seed, user.Port);
-        HashCombine(seed, user.Method);
-        HashCombine(seed, user.SpeedLimit);
-        HashCombine(seed, user.DeviceLimit);
-        HashCombine(seed, user.Protocol);
-        HashCombine(seed, user.ProtocolParam);
-        HashCombine(seed, user.Obfs);
-        HashCombine(seed, user.ObfsParam);
-        HashCombine(seed, user.UUID);
-        HashCombine(seed, user.Flow);
-        HashCombine(seed, user.AlterID);
-        HashCombine(seed, user.Enabled);
-        return seed;
-    }
-};
-
-struct UserInfoRefEqual {
-    bool operator()(const UserInfoRef& a, const UserInfoRef& b) const {
-        return SameUserInfo(*a.user, *b.user);
-    }
-};
-
-using UserInfoSet = std::unordered_set<UserInfoRef, UserInfoRefHash, UserInfoRefEqual>;
-
-[[nodiscard]] UserInfoSet BuildUserInfoSet(const std::vector<api::UserInfo>& users) {
-    UserInfoSet result;
-    result.reserve(users.size());
-    for (const auto& user : users) {
-        result.insert(UserInfoRef{&user});
-    }
-    return result;
-}
-
-[[nodiscard]] UserListDiff CompareUserList(const std::vector<api::UserInfo>& old_users,
-                                           const std::vector<api::UserInfo>& new_users) {
-    UserListDiff diff;
-    const auto old_set = BuildUserInfoSet(old_users);
-    const auto new_set = BuildUserInfoSet(new_users);
-
-    for (const auto& old_user : old_users) {
-        if (!new_set.contains(UserInfoRef{&old_user})) {
-            diff.deleted.push_back(old_user);
-        }
-    }
-    for (const auto& new_user : new_users) {
-        if (!old_set.contains(UserInfoRef{&new_user})) {
-            diff.added.push_back(new_user);
-        }
-    }
-    return diff;
-}
-
-}  // namespace
-
 net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
                                                  const std::string& tag,
                                                  const std::string& protocol) {
@@ -472,68 +387,31 @@ void Controller::Impl::clearUsers(const std::string& tag, const std::string& pro
     proxyman::inbound::UserStore::ClearUsers(protocol, tag);
 }
 
-void Controller::Impl::removeUsers(const std::string& tag,
-                             const std::string& protocol,
-                             const api::NodeInfo& node_config,
-                             const std::vector<api::UserInfo>& api_users) {
-    if (api_users.empty()) {
-        return;
-    }
-
+bool Controller::Impl::applyUserList(
+    const std::string& tag,
+    const std::string& protocol,
+    const api::NodeInfo& node_config,
+    const std::vector<api::UserInfo>& api_users) {
     if (!proxyman::inbound::HasProxy(protocol)) {
-        LOG_WARN("removeUsers: unsupported protocol '{}'", protocol);
-        return;
+        LOG_WARN("applyUserList: unsupported protocol '{}'", protocol);
+        return false;
     }
 
     auto user_set = BuildUsersForInbound(protocol, tag, node_config, api_users);
     if (!user_set) {
-        LOG_WARN("removeUsers: build users failed for protocol '{}'", protocol);
-        return;
+        LOG_WARN("applyUserList: build users failed for protocol '{}'", protocol);
+        return false;
     }
-    proxyman::inbound::UserStore::RemoveUsers(protocol, tag, *user_set);
+    proxyman::inbound::UserStore::ApplyUsers(protocol, tag, *user_set);
+    return true;
 }
 
-void Controller::Impl::addNewUser(api::API* panel,
-                            const std::vector<api::UserInfo>& api_users) {
-    if (api_users.empty()) {
-        return;
-    }
-
-    const auto client_info = panel->Describe();
-    const auto panel_cfg_it = panel_configs_.find(panel);
-    const std::string panel_name =
-        (panel_cfg_it != panel_configs_.end() && !panel_cfg_it->second.Name.empty())
-            ? panel_cfg_it->second.Name
-            : client_info.APIHost;
-
-    auto it = node_configs_.find(panel);
-    if (it == node_configs_.end()) {
-        return;
-    }
-
-    const auto& node_config = it->second;
-    std::string protocol = naming::ResolveProtocolOrDefault(node_config.NodeType);
-    std::string tag = naming::BuildPanelNodeTag(panel_name, protocol, node_config.Port);
-
-    if (!proxyman::inbound::HasProxy(protocol)) {
-        LOG_WARN("addNewUser: unsupported protocol '{}'", protocol);
-        return;
-    }
-
-    auto user_set = BuildUsersForInbound(protocol, tag, node_config, api_users);
-    if (!user_set) {
-        LOG_WARN("addNewUser: build users failed for protocol '{}'", protocol);
-        return;
-    }
-    proxyman::inbound::UserStore::AddUsers(protocol, tag, *user_set);
-}
-
-void Controller::Impl::syncUserList(api::API* panel,
-                              const std::string& tag,
-                              const std::string& protocol,
-                              const api::NodeInfo& node_config,
-                              const std::vector<api::UserInfo>& api_users,
-                              bool replace_all) {
+bool Controller::Impl::syncUserList(
+    api::API* panel,
+    const std::string& tag,
+    const std::string& protocol,
+    const api::NodeInfo& node_config,
+    const std::vector<api::UserInfo>& api_users) {
     const auto client_info = panel->Describe();
     const int node_id = client_info.NodeID;
     const auto panel_cfg_it = panel_configs_.find(panel);
@@ -542,25 +420,13 @@ void Controller::Impl::syncUserList(api::API* panel,
             ? panel_cfg_it->second.Name
             : client_info.APIHost;
 
+    if (!applyUserList(tag, protocol, node_config, api_users)) {
+        return false;
+    }
+    user_lists_[panel] = api_users;
     std::string stats_key = naming::BuildPanelNodeStatsKey(panel_name, node_id);
     node_stats_[stats_key].user_count = api_users.size();
-
-    auto cached = user_lists_.find(panel);
-    if (replace_all || cached == user_lists_.end()) {
-        clearUsers(tag, protocol);
-        addNewUser(panel, api_users);
-        user_lists_[panel] = api_users;
-        return;
-    }
-
-    const auto diff = CompareUserList(cached->second, api_users);
-    if (!diff.deleted.empty()) {
-        removeUsers(tag, protocol, node_config, diff.deleted);
-    }
-    if (!diff.added.empty()) {
-        addNewUser(panel, diff.added);
-    }
-    cached->second = api_users;
+    return true;
 }
 
 }  // namespace acpp

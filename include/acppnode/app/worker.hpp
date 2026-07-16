@@ -106,8 +106,9 @@ public:
         bool ban_tracking_enabled);
 
     // 动态出站（线程安全）：XrayR Controller 面板节点 addOutbound/removeOutbound。
-    void AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config);
-    void RemoveOutboundAsync(std::string tag);
+    net::awaitable<bool> AddOutboundTask(
+        proxyman::outbound::PreparedOutboundConfig config);
+    net::awaitable<void> RemoveOutboundTask(std::string tag);
 
     // 注销监听上下文（线程安全）
     void UnregisterListenerAsync(std::string tag);
@@ -162,6 +163,10 @@ private:
         bool ban_tracking_enabled);
 
     void UnregisterListenerOnWorkerThread(std::string_view tag);
+
+    [[nodiscard]] bool AddOutboundOnWorkerThread(
+        proxyman::outbound::PreparedOutboundConfig config);
+    void RemoveOutboundOnWorkerThread(std::string_view tag);
 
     [[nodiscard]] MemoryStats GetMemoryStats() const;
 

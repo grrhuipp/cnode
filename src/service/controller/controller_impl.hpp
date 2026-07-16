@@ -51,18 +51,17 @@ struct Controller::Impl {
                                      const api::NodeInfo& node_config,
                                      const std::string& tag);
 
-    void syncUserList(api::API* panel,
-                      const std::string& tag,
-                      const std::string& protocol,
-                      const api::NodeInfo& node_config,
-                      const std::vector<api::UserInfo>& api_users,
-                      bool replace_all);
-    void addNewUser(api::API* panel,
-                    const std::vector<api::UserInfo>& api_users);
-    void removeUsers(const std::string& tag,
-                     const std::string& protocol,
-                     const api::NodeInfo& node_config,
-                     const std::vector<api::UserInfo>& api_users);
+    [[nodiscard]] bool syncUserList(
+        api::API* panel,
+        const std::string& tag,
+        const std::string& protocol,
+        const api::NodeInfo& node_config,
+        const std::vector<api::UserInfo>& api_users);
+    [[nodiscard]] bool applyUserList(
+        const std::string& tag,
+        const std::string& protocol,
+        const api::NodeInfo& node_config,
+        const std::vector<api::UserInfo>& api_users);
     void clearUsers(const std::string& tag, const std::string& protocol);
 
     [[nodiscard]] std::string BuildUserTag(std::string_view tag,
@@ -73,8 +72,6 @@ struct Controller::Impl {
         std::string_view tag,
         const api::NodeInfo& node_config,
         const std::vector<api::UserInfo>& api_users) const;
-
-    bool ConfigChanged(const api::NodeInfo& a, const api::NodeInfo& b) const;
 
     net::io_context&                       io_context_;
     std::vector<std::unique_ptr<Worker>>&  workers_;

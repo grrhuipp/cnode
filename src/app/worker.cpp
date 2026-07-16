@@ -880,71 +880,77 @@ void Worker::RegisterInboundAsync(
         });
 }
 
-void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config) {
-    net::post(runtime_->io_context,
-        [this, cfg = std::move(config)]() mutable {
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+bool Worker::AddOutboundOnWorkerThread(
+    proxyman::outbound::PreparedOutboundConfig config) {
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
-            auto current_snapshot = runtime_->Snapshot();
-            auto handler = proxyman::outbound::NewHandler(
-                cfg, runtime_->io_context,
-                *runtime_->dns_service, runtime_->udp_session_manager.get(),
-                current_snapshot->timeouts.DialTimeout());
+    auto current_snapshot = runtime_->Snapshot();
+    auto handler = proxyman::outbound::NewHandler(
+        config, runtime_->io_context,
+        *runtime_->dns_service, runtime_->udp_session_manager.get(),
+        current_snapshot->timeouts.DialTimeout());
 
-            if (!handler) {
-                LOG_WARN("Worker[{}]: failed to create dynamic {} outbound '{}'",
-                         id_, cfg.protocol, cfg.tag);
-                return;
-            }
+    if (!handler) {
+        LOG_WARN("Worker[{}]: failed to create dynamic {} outbound '{}'",
+                 id_, config.protocol, config.tag);
+        return false;
+    }
 
-            LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
-                      id_, cfg.protocol, cfg.tag);
-            if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
-                LOG_WARN("Worker[{}]: failed to replace dynamic outbound '{}'",
-                         id_, cfg.tag);
-                return;
-            }
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+    LOG_DEBUG("Worker[{}]: registered dynamic {} outbound '{}'",
+              id_, config.protocol, config.tag);
+    if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
+        LOG_WARN("Worker[{}]: failed to replace dynamic outbound '{}'",
+                 id_, config.tag);
+        return false;
+    }
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            std::erase_if(next_snapshot->outbounds,
-                          [&](const auto& outbound) { return outbound.tag == cfg.tag; });
-            next_snapshot->outbounds.push_back(std::move(cfg));
-            if (next_snapshot->default_outbound_tag.empty()) {
-                next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
-                    ? std::string(constants::protocol::kDirect)
-                    : next_snapshot->outbounds.front().tag;
-            }
-            runtime_->InitRouter(
-                *this,
-                next_snapshot->routing,
-                next_snapshot->default_outbound_tag,
-                runtime_->geo_manager);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-        });
+    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    std::erase_if(next_snapshot->outbounds,
+                  [&](const auto& outbound) { return outbound.tag == config.tag; });
+    next_snapshot->outbounds.push_back(std::move(config));
+    if (next_snapshot->default_outbound_tag.empty()) {
+        next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
+            ? std::string(constants::protocol::kDirect)
+            : next_snapshot->outbounds.front().tag;
+    }
+    runtime_->InitRouter(
+        *this,
+        next_snapshot->routing,
+        next_snapshot->default_outbound_tag,
+        runtime_->geo_manager);
+    runtime_->StoreSnapshot(std::move(next_snapshot));
+    return true;
 }
 
-void Worker::RemoveOutboundAsync(std::string tag) {
-    net::post(runtime_->io_context,
-        [this, t = std::move(tag)] {
-            auto current_snapshot = runtime_->Snapshot();
-            runtime_->outbound_manager->RemoveHandler(t);
-            auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
-            std::erase_if(next_snapshot->outbounds,
-                          [&](const auto& outbound) { return outbound.tag == t; });
-            if (next_snapshot->default_outbound_tag == t) {
-                next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
-                    ? std::string(constants::protocol::kDirect)
-                    : next_snapshot->outbounds.front().tag;
-            }
-            runtime_->InitRouter(
-                *this,
-                next_snapshot->routing,
-                next_snapshot->default_outbound_tag,
-                runtime_->geo_manager);
-            runtime_->StoreSnapshot(std::move(next_snapshot));
-            runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
-        });
+net::awaitable<bool> Worker::AddOutboundTask(
+    proxyman::outbound::PreparedOutboundConfig config) {
+    co_return AddOutboundOnWorkerThread(std::move(config));
+}
+
+void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
+    auto current_snapshot = runtime_->Snapshot();
+    runtime_->outbound_manager->RemoveHandler(tag);
+    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    std::erase_if(next_snapshot->outbounds,
+                  [&](const auto& outbound) { return outbound.tag == tag; });
+    if (next_snapshot->default_outbound_tag == tag) {
+        next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
+            ? std::string(constants::protocol::kDirect)
+            : next_snapshot->outbounds.front().tag;
+    }
+    runtime_->InitRouter(
+        *this,
+        next_snapshot->routing,
+        next_snapshot->default_outbound_tag,
+        runtime_->geo_manager);
+    runtime_->StoreSnapshot(std::move(next_snapshot));
+    runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
+}
+
+net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
+    RemoveOutboundOnWorkerThread(tag);
+    co_return;
 }
 
 void Worker::ListenerState::RetireInboundHandler(Worker& worker, const std::string& tag) {

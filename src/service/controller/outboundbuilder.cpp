@@ -7,7 +7,7 @@
 
 namespace acpp::controller {
 
-proxyman::outbound::PreparedOutboundConfig OutboundBuilder(
+std::optional<proxyman::outbound::PreparedOutboundConfig> OutboundBuilder(
     const std::string& tag,
     const PanelConfig* panel_config,
     const api::NodeInfo& /*node_config*/) {
@@ -33,15 +33,12 @@ proxyman::outbound::PreparedOutboundConfig OutboundBuilder(
 
     auto prepared = proxyman::outbound::PrepareOutboundConfig(source);
     if (prepared) {
-        return std::move(*prepared);
+        return prepared;
     }
 
     LOG_WARN("OutboundBuilder: outbound protocol '{}' is not registered",
              constants::protocol::kFreedom);
-    proxyman::outbound::PreparedOutboundConfig fallback;
-    fallback.tag = tag;
-    fallback.protocol = std::string(constants::protocol::kFreedom);
-    return fallback;
+    return std::nullopt;
 }
 
 }  // namespace acpp::controller
