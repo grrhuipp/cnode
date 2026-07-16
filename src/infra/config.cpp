@@ -814,7 +814,16 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     }
     cfg.server_names = jstr_array(j, {"serverNames", "server_names"});
     cfg.private_key = jstr(j, {"privateKey", "private_key"}, "");
-    cfg.short_ids = jstr_array(j, {"shortIds", "short_ids"});
+    const auto short_ids = jstr_array(j, {"shortIds", "short_ids"});
+    cfg.short_ids.reserve(short_ids.size());
+    for (const auto& short_id : short_ids) {
+        auto parsed = transport::internet::ParseRealityShortId(short_id);
+        if (!parsed) {
+            throw std::invalid_argument(
+                "REALITY shortIds contains an invalid value");
+        }
+        cfg.short_ids.push_back(*parsed);
+    }
     const auto min_client_version = transport::internet::ParseRealityClientVersion(
         jstr(j, {"minClientVer", "min_client_ver"}, ""));
     if (!min_client_version) {
@@ -855,7 +864,12 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     cfg.server_name = jstr(j, {"serverName", "server_name"}, "");
     cfg.public_key = jstr(
         j, {"publicKey", "public_key", "password"}, "");
-    cfg.short_id = jstr(j, {"shortId", "short_id"}, "");
+    auto short_id = transport::internet::ParseRealityShortId(
+        jstr(j, {"shortId", "short_id"}, ""));
+    if (!short_id) {
+        throw std::invalid_argument("REALITY shortId is invalid");
+    }
+    cfg.short_id = *short_id;
     if (j.contains("spiderX") || j.contains("spider_x")) {
         throw std::invalid_argument(
             "REALITY spiderX/spider_x is not supported; the REALITY crawler "

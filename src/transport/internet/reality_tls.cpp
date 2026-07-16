@@ -1,5 +1,6 @@
 #include "reality_tls.hpp"
 #include "acppnode/transport/internet/reality_client_version.hpp"
+#include "acppnode/transport/internet/reality_short_id.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
@@ -37,7 +38,7 @@ constexpr size_t kRealityX25519KeySize = 32;
 constexpr size_t kRealityRandomSize = 32;
 constexpr size_t kRealitySessionIdSize = 32;
 constexpr size_t kRealityPlainAuthSize = 16;
-constexpr size_t kRealityShortIdSize = 8;
+constexpr size_t kRealityShortIdSize = transport::internet::kRealityShortIdSize;
 constexpr size_t kRealityAesGcmNonceSize = 12;
 constexpr uint16_t kTlsGroupX25519 = 29;
 constexpr uint16_t kTlsGroupX25519MlKem768 = 0x11ec;
@@ -60,7 +61,7 @@ using UniqueX509 = std::unique_ptr<X509, X509Deleter>;
 struct RealityServerState {
     std::array<uint8_t, kRealityX25519KeySize> private_key{};
     std::vector<std::string> server_names;
-    std::vector<std::array<uint8_t, kRealityShortIdSize>> short_ids;
+    std::vector<transport::internet::RealityShortId> short_ids;
     std::optional<transport::internet::RealityClientVersion> min_client_version;
     std::optional<transport::internet::RealityClientVersion> max_client_version;
     uint64_t max_time_diff_ms = 0;
@@ -106,32 +107,6 @@ struct RealityServerState {
             bit_count -= 8;
             out.push_back(static_cast<uint8_t>((bits >> bit_count) & 0xff));
         }
-    }
-    return out;
-}
-
-[[nodiscard]] int HexValue(char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-[[nodiscard]] std::optional<std::array<uint8_t, kRealityShortIdSize>>
-DecodeRealityShortId(std::string_view value) noexcept {
-    if (value.size() % 2 != 0 ||
-        value.size() / 2 > kRealityShortIdSize) {
-        return std::nullopt;
-    }
-
-    std::array<uint8_t, kRealityShortIdSize> out{};
-    for (size_t i = 0; i < value.size(); i += 2) {
-        const int hi = HexValue(value[i]);
-        const int lo = HexValue(value[i + 1]);
-        if (hi < 0 || lo < 0) {
-            return std::nullopt;
-        }
-        out[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
     }
     return out;
 }
@@ -417,7 +392,7 @@ BuildRealityClientAuthPlain(
 
 struct RealityClientState {
     std::array<uint8_t, kRealityX25519KeySize> server_public{};
-    std::array<uint8_t, kRealityShortIdSize> short_id{};
+    transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
     bool auth_key_ready = false;
 };
@@ -429,15 +404,9 @@ struct RealityClientState {
         LOG_ERROR("REALITY client publicKey is invalid");
         return {};
     }
-    auto short_id = DecodeRealityShortId(config.short_id);
-    if (!short_id) {
-        LOG_ERROR("REALITY client shortId '{}' is invalid", config.short_id);
-        return {};
-    }
-
     auto state = std::make_shared<RealityClientState>();
     std::copy_n(key->data(), state->server_public.size(), state->server_public.begin());
-    state->short_id = *short_id;
+    state->short_id = config.short_id;
     return state;
 }
 
@@ -598,7 +567,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return false;
     }
 
-    std::array<uint8_t, kRealityShortIdSize> short_id{};
+    transport::internet::RealityShortId short_id{};
     std::copy_n(plain.data() + 8, short_id.size(), short_id.begin());
     return std::find(state.short_ids.begin(), state.short_ids.end(), short_id) !=
            state.short_ids.end();
@@ -739,14 +708,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     state->min_client_version = config.min_client_version;
     state->max_client_version = config.max_client_version;
 
-    for (const auto& short_id_text : config.short_ids) {
-        auto short_id = DecodeRealityShortId(short_id_text);
-        if (!short_id) {
-            LOG_ERROR("REALITY shortId '{}' is invalid", short_id_text);
-            return {};
-        }
-        state->short_ids.push_back(*short_id);
-    }
+    state->short_ids = config.short_ids;
 
     std::array<uint8_t, 32> seed{};
     if (RAND_bytes(seed.data(), static_cast<int>(seed.size())) != 1) {

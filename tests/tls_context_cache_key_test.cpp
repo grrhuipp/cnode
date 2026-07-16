@@ -86,9 +86,12 @@ int main() {
     }
 
     acpp::RealityConfig joined_short_ids;
-    joined_short_ids.short_ids = {"a,b"};
+    joined_short_ids.short_ids = {
+        acpp::transport::internet::RealityShortId{1, 2}};
     acpp::RealityConfig split_short_ids;
-    split_short_ids.short_ids = {"a", "b"};
+    split_short_ids.short_ids = {
+        acpp::transport::internet::RealityShortId{1},
+        acpp::transport::internet::RealityShortId{2}};
     if (!Require(MakeRealityServerContextCacheKey(joined_short_ids, tls) !=
                      MakeRealityServerContextCacheKey(split_short_ids, tls),
                  "different REALITY short-ID lists must not share a cache key")) {
