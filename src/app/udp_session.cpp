@@ -402,13 +402,6 @@ net::awaitable<ErrorCode> UDPSession::SendTo(
     }
 }
 
-net::awaitable<ErrorCode> UDPSession::SendTo(
-    const TargetAddress& target,
-    const uint8_t* data,
-    size_t len) {
-    co_return co_await SendTo(target, data, len, 0);
-}
-
 ErrorCode UDPSession::StartReceive() {
     if (!impl_->running || impl_->receive_started) {
         return ErrorCode::INTERNAL;
@@ -763,12 +756,20 @@ void UDPSession::Touch() {
     impl_->Touch();
 }
 
-bool UDPSession::IsExpired(std::chrono::seconds timeout) const {
-    return std::chrono::steady_clock::now() - impl_->last_active > timeout;
-}
-
 bool UDPSession::IsRunning() const noexcept {
     return impl_->running && impl_->receive_started;
+}
+
+bool UDPSession::HasConsumers() const noexcept {
+    return !impl_->registered_callbacks.empty();
+}
+
+bool UDPSession::CanRetire(std::chrono::seconds timeout) const {
+    if (HasConsumers()) {
+        return false;
+    }
+    return !IsRunning() ||
+        std::chrono::steady_clock::now() - impl_->last_active > timeout;
 }
 
 uint16_t UDPSession::LocalPort() const {
@@ -836,6 +837,11 @@ std::expected<UDPSession*, ErrorCode> UDPSessionManager::AcquireSession(
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {
         if (!it->second->IsRunning()) {
+            if (it->second->HasConsumers()) {
+                LOG_CONN_FAIL("UDP session {} stopped while consumers are still attached",
+                              session_id);
+                return std::unexpected(ErrorCode::NETWORK_IO_ERROR);
+            }
             LOG_CONN_FAIL("UDP session {} is no longer receiving; replacing it",
                           session_id);
             it->second->Stop();
@@ -914,8 +920,7 @@ void UDPSessionManager::CleanupExpiredSessions() {
     if (!impl_->running) return;
     bool removed_session = false;
     for (auto it = impl_->sessions.begin(); it != impl_->sessions.end(); ) {
-        if (!it->second->IsRunning() ||
-            it->second->IsExpired(impl_->session_timeout)) {
+        if (it->second->CanRetire(impl_->session_timeout)) {
             LOG_ACCESS_DEBUG("UDP session {} inactive or expired, removing", it->first);
             it->second->Stop();
             it = impl_->sessions.erase(it);

@@ -52,17 +52,12 @@ public:
         buf::MultiBuffer payload,
         uint64_t callback_id);
 
-    net::awaitable<ErrorCode> SendTo(
-        const TargetAddress& target,
-        const uint8_t* data,
-        size_t len);
-
-    // 注册 Full Cone 回调，返回 callback_id 用于后续取消；session 未运行、
-    // 回调为空或容量耗尽时返回 0。
+    // 注册 Full Cone 回调并取得 session 存活租约，返回 callback_id
+    // 用于后续释放；session 未运行、回调为空或容量耗尽时返回 0。
     // 注意：Per-Worker 模式，无需 executor 参数，回调在同一线程执行
     uint64_t RegisterCallback(PacketCallback callback);
 
-    // 取消注册
+    // 取消注册并释放 session 存活租约。释放后不得再使用该 session。
     void UnregisterCallback(uint64_t callback_id);
 
     // 获取本地端口
@@ -76,7 +71,8 @@ private:
     void Touch();
     void Stop();
     [[nodiscard]] bool IsRunning() const noexcept;
-    [[nodiscard]] bool IsExpired(std::chrono::seconds timeout) const;
+    [[nodiscard]] bool HasConsumers() const noexcept;
+    [[nodiscard]] bool CanRetire(std::chrono::seconds timeout) const;
     [[nodiscard]] bool UsesBindAddress(
         const net::ip::address& bind_address) const;
 

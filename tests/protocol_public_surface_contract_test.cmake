@@ -362,6 +362,22 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSession must reject duplicate receive loops and replace dead sessions")
 endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+        "if [(]HasConsumers[(][)][)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "if [(]it->second->HasConsumers[(][)][)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "it->second->CanRetire[(]impl_->session_timeout[)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "return std::unexpected[(]ErrorCode::NETWORK_IO_ERROR[)]")
+    message(FATAL_ERROR
+        "UDPSessionManager must not retire sessions while consumers hold callbacks")
+endif()
+if(UDP_SESSION_HEADER_SOURCE MATCHES
+        "const uint8_t[*] data,[\r\n ]+size_t len[\r\n ]*[)];")
+    message(FATAL_ERROR
+        "UDPSession sends must carry a registered callback lease")
+endif()
 string(FIND "${UDP_SESSION_HEADER_SOURCE}" "private:" UDP_SESSION_PRIVATE_OFFSET)
 string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode Start(" UDP_SESSION_START_OFFSET)
 string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode StartReceive(" UDP_SESSION_RECEIVE_OFFSET)
