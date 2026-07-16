@@ -129,12 +129,31 @@ std::string lower_ascii_copy(std::string value) {
 void parse_http_headers(const json::object& j,
                         transport::internet::HttpHeaders& headers,
                         std::string_view key = "headers") {
-    auto* p = j.if_contains(key);
-    if (p && p->is_object()) {
-        for (const auto& [k, v] : p->as_object()) {
-            if (v.is_string()) {
-                headers[std::string(k)] = std::string(v.as_string());
-            }
+    const auto* declaration = j.if_contains(key);
+    if (!declaration) return;
+    if (!declaration->is_object()) {
+        throw std::invalid_argument(std::format("{} must be an object", key));
+    }
+    for (const auto& [name, raw_value] : declaration->as_object()) {
+        if (!transport::internet::IsValidHttpHeaderName(name)) {
+            throw std::invalid_argument("HTTP header name is invalid");
+        }
+        if (!raw_value.is_string()) {
+            throw std::invalid_argument(std::format(
+                "HTTP header '{}' must be a string", name));
+        }
+        const std::string& value = raw_value.as_string();
+        const std::string normalized =
+            transport::internet::NormalizeHttpHeaderName(name);
+        if (!transport::internet::IsValidHttpHeaderValue(value)) {
+            throw std::invalid_argument(std::format(
+                "HTTP header '{}' contains invalid control characters",
+                normalized));
+        }
+        const auto [existing, inserted] = headers.emplace(normalized, value);
+        if (!inserted && existing->second != value) {
+            throw std::invalid_argument(std::format(
+                "HTTP header '{}' has conflicting values", normalized));
         }
     }
 }

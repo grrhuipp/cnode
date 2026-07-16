@@ -66,11 +66,32 @@ void TestInvalidPortsAreRejected() {
     Check(!result, "uint64 overflow node port was accepted");
 }
 
+void TestInvalidNetworkHostIsRejected() {
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"headers":{"Host":42}}})",
+        "Host must be a string");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"headers":{"Host":"edge.example\r\nInjected: yes"}}})",
+        "invalid control characters");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"headers":{"Host":"one.example","host":"two.example"}}})",
+        "aliases must match");
+    CheckInvalid(
+        R"({"server_port":443,"networkSettings":{"headers":[]}})",
+        "headers must be an object");
+
+    auto lowercase = ParseResponse(
+        R"({"server_port":443,"networkSettings":{"headers":{"host":"edge.example"}}})");
+    Check(lowercase.has_value() && lowercase->Host == "edge.example",
+          "lowercase panel Host header was not normalized");
+}
+
 }  // namespace
 
 int main() {
     TestValidResponseIsNormalized();
     TestInvalidPortsAreRejected();
+    TestInvalidNetworkHostIsRejected();
     std::cout << "v2board_node_info_json_test: ok\n";
     return 0;
 }

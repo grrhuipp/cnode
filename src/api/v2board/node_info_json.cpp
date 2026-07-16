@@ -2,7 +2,9 @@
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json_port.hpp"
+#include "acppnode/transport/internet/http_headers.hpp"
 
+#include <optional>
 #include <utility>
 
 namespace acpp::api::v2board {
@@ -52,12 +54,34 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
             path && path->is_string()) {
             config.Path = std::string(path->as_string());
         }
-        if (const auto* headers = settings.if_contains("headers");
-            headers && headers->is_object()) {
-            if (const auto* host = headers->as_object().if_contains("Host");
-                host && host->is_string()) {
-                config.Host = std::string(host->as_string());
+        if (const auto* headers = settings.if_contains("headers")) {
+            if (!headers->is_object()) {
+                return std::unexpected(
+                    "networkSettings headers must be an object");
             }
+            std::optional<std::string> host;
+            for (const auto& [name, raw_value] : headers->as_object()) {
+                if (transport::internet::NormalizeHttpHeaderName(name) != "host") {
+                    continue;
+                }
+                if (!raw_value.is_string()) {
+                    return std::unexpected(
+                        "networkSettings Host must be a string");
+                }
+                const std::string value(raw_value.as_string());
+                if (!transport::internet::IsValidHttpHeaderValue(value)) {
+                    return std::unexpected(
+                        "networkSettings Host contains invalid control characters");
+                }
+                if (host && *host != value) {
+                    return std::unexpected(
+                        "networkSettings Host aliases must match");
+                }
+                if (!host) {
+                    host = value;
+                }
+            }
+            config.Host = std::move(host).value_or("");
         }
     }
 

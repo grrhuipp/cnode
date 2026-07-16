@@ -116,6 +116,24 @@ expect_rejected(non_string_log_level
 expect_rejected(non_string_transport_network "{}" "outbounds.json"
     [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
     "network must be a string")
+expect_rejected(non_string_http_header "{}" "outbounds.json"
+    [=[[{"tag":"bad-header-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":42,"X-Valid":"yes"}}}}]]=]
+    "HTTP header 'Host' must be a string")
+expect_rejected(non_object_http_headers "{}" "outbounds.json"
+    [=[[{"tag":"bad-headers-shape","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":[]}}}]]=]
+    "headers must be an object")
+expect_rejected(invalid_http_header_name "{}" "outbounds.json"
+    [=[[{"tag":"bad-header-name","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Bad Header":"value"}}}}]]=]
+    "HTTP header name is invalid")
+expect_rejected(injected_http_header_value "{}" "outbounds.json"
+    [=[[{"tag":"bad-header-value","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"example.com\r\nInjected: yes"}}}}]]=]
+    "HTTP header 'host' contains invalid control characters")
+expect_rejected(conflicting_http_header_case_aliases "{}" "outbounds.json"
+    [=[[{"tag":"bad-header-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"one.example","host":"two.example"}}}}]]=]
+    "HTTP header 'host' has conflicting values")
+expect_started(equal_http_header_case_aliases
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-header-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"same.example","host":"same.example"}}}}]]=])
 expect_rejected(non_object_outbound_stream_settings "{}" "outbounds.json"
     [=[[{"tag":"bad-stream-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":[]}]]=]
     "streamSettings must be an object")
