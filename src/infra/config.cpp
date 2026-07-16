@@ -3,6 +3,7 @@
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
 #include "http2_initial_window.hpp"
+#include "json_bool.hpp"
 #include "json_unsigned.hpp"
 #include <algorithm>
 #include <cctype>
@@ -40,11 +41,15 @@ inline std::string jstr(const json::object& obj, std::string_view key,
 }
 
 // 从 object 中取 bool，不存在则返回默认值
-inline bool jbool(const json::object& obj, std::string_view key,
-                  bool def = false) {
-    auto* p = obj.if_contains(key);
-    if (!p || !p->is_bool()) return def;
-    return p->as_bool();
+inline bool jbool(
+    const json::object& obj,
+    std::initializer_list<std::string_view> aliases,
+    bool def = false) {
+    auto parsed = ParseAliasedJsonBool(obj, aliases);
+    if (!parsed) {
+        throw std::invalid_argument(std::move(parsed.error()));
+    }
+    return parsed->value_or(def);
 }
 
 uint32_t juint32(const json::object& obj,
@@ -255,9 +260,8 @@ LogConfig LogConfig::FromJson(const json::object& j) {
     }
     cfg.max_days = static_cast<uint16_t>(days->value_or(cfg.max_days));
 
-    cfg.rotate_daily = jbool(j, "rotateDaily", cfg.rotate_daily);
-    cfg.gzip = jbool(j, "gzip", cfg.gzip);
-    cfg.gzip = jbool(j, "compress", cfg.gzip);
+    cfg.rotate_daily = jbool(j, {"rotateDaily"}, cfg.rotate_daily);
+    cfg.gzip = jbool(j, {"gzip", "compress"}, cfg.gzip);
     return cfg;
 }
 
@@ -546,7 +550,7 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     if (cfg.real_ip_header.empty()) {
         cfg.real_ip_header = jstr(j, "real_ip_header", "");
     }
-    cfg.accept_proxy_protocol = jbool(j, "acceptProxyProtocol", false);
+    cfg.accept_proxy_protocol = jbool(j, {"acceptProxyProtocol"}, false);
     return cfg;
 }
 
@@ -560,10 +564,7 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
     if (cfg.real_ip_header.empty()) {
         cfg.real_ip_header = jstr(j, "real_ip_header", "");
     }
-    cfg.force_http2 = jbool(j, "forceHttp2", false);
-    if (!cfg.force_http2) {
-        cfg.force_http2 = jbool(j, "force_http2", false);
-    }
+    cfg.force_http2 = jbool(j, {"forceHttp2", "force_http2"}, false);
     auto initial_window = ParseHttp2InitialWindow(j);
     if (!initial_window) {
         throw std::invalid_argument(std::move(initial_window.error()));
@@ -586,8 +587,7 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     if (cfg.user_agent.empty()) {
         cfg.user_agent = jstr(j, "userAgent", "");
     }
-    cfg.multi_mode = jbool(j, "multiMode", false);
-    cfg.multi_mode = jbool(j, "multi_mode", cfg.multi_mode);
+    cfg.multi_mode = jbool(j, {"multiMode", "multi_mode"}, false);
     if (j.contains("initial_windows_size")) {
         throw std::invalid_argument(
             "initial_windows_size is not supported; use initial_window_size");
@@ -702,10 +702,8 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     cfg.host = jstr(j, "host", "");
     cfg.mode = lower_ascii_copy(jstr(j, "mode", ""));
     parse_http_headers(j, cfg.headers);
-    cfg.no_grpc_header = jbool(j, "noGRPCHeader", false);
-    cfg.no_grpc_header = jbool(j, "no_grpc_header", cfg.no_grpc_header);
-    cfg.no_sse_header = jbool(j, "noSSEHeader", false);
-    cfg.no_sse_header = jbool(j, "no_sse_header", cfg.no_sse_header);
+    cfg.no_grpc_header = jbool(j, {"noGRPCHeader", "no_grpc_header"}, false);
+    cfg.no_sse_header = jbool(j, {"noSSEHeader", "no_sse_header"}, false);
     auto parse_download_settings = [&](const json::object& source) {
         const json::value* declaration = nullptr;
         std::string_view declaration_key;
@@ -736,10 +734,10 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
         extra && extra->is_object()) {
         const auto& extra_obj = extra->as_object();
         parse_http_headers(extra_obj, cfg.headers);
-        cfg.no_grpc_header = jbool(extra_obj, "noGRPCHeader", cfg.no_grpc_header);
-        cfg.no_grpc_header = jbool(extra_obj, "no_grpc_header", cfg.no_grpc_header);
-        cfg.no_sse_header = jbool(extra_obj, "noSSEHeader", cfg.no_sse_header);
-        cfg.no_sse_header = jbool(extra_obj, "no_sse_header", cfg.no_sse_header);
+        cfg.no_grpc_header = jbool(
+            extra_obj, {"noGRPCHeader", "no_grpc_header"}, cfg.no_grpc_header);
+        cfg.no_sse_header = jbool(
+            extra_obj, {"noSSEHeader", "no_sse_header"}, cfg.no_sse_header);
         parse_download_settings(extra_obj);
     }
     if (cfg.download_settings) {
@@ -757,7 +755,7 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
 
 RealityConfig RealityConfig::FromJson(const json::object& j) {
     RealityConfig cfg;
-    cfg.show = jbool(j, "show", false);
+    cfg.show = jbool(j, {"show"}, false);
     cfg.type = lower_ascii_copy(jstr(j, "type", ""));
     if (j.contains("dest") || j.contains("target")) {
         throw std::invalid_argument(
@@ -911,7 +909,7 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
         if (!p || !p->is_object()) return;
         const auto& t = p->as_object();
         cfg.tls.server_name    = jstr(t, "serverName", "");
-        cfg.tls.allow_insecure = jbool(t, "allowInsecure", false);
+        cfg.tls.allow_insecure = jbool(t, {"allowInsecure"}, false);
         // ALPN
         if (auto* ap = t.if_contains("alpn"); ap && ap->is_array()) {
             cfg.tls.alpn = jstr_array(*ap);
@@ -1270,7 +1268,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         auto* p = j.if_contains(key);
         if (!p || !p->is_object()) return;
         const auto& s = p->as_object();
-        cfg.sniffing.enabled = jbool(s, "enabled", true);
+        cfg.sniffing.enabled = jbool(s, {"enabled"}, true);
         if (s.contains("destOverride")) {
             cfg.sniffing.dest_override = jstr_array(s.at("destOverride"));
         } else if (s.contains("dest_override")) {
@@ -1284,8 +1282,8 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     };
     parse_sniffing("sniffing");
 
-    cfg.routing_enabled = jbool(j, "routingEnabled", cfg.routing_enabled);
-    cfg.routing_enabled = jbool(j, "routing_enabled", cfg.routing_enabled);
+    cfg.routing_enabled = jbool(
+        j, {"routingEnabled", "routing_enabled"}, cfg.routing_enabled);
 
     return cfg;
 }

@@ -91,6 +91,17 @@ expect_rejected(overflow_log_retention
     "between 0 and 65535")
 expect_started(valid_zero_log_retention
     [=[{"workers":1,"log":{"maxDays":0}}]=] "" "")
+expect_rejected(non_boolean_log_compression
+    [=[{"log":{"gzip":"false"}}]=] "" ""
+    "gzip must be a boolean")
+expect_rejected(conflicting_log_compression
+    [=[{"log":{"gzip":true,"compress":false}}]=] "" ""
+    "gzip and compress must match")
+expect_started(equal_log_compression_aliases
+    [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
+expect_rejected(non_boolean_tls_allow_insecure "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-bool","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":"true"}}}]]=]
+    "allowInsecure must be a boolean")
 expect_rejected(negative_read_timeout
     [=[{"timeouts":{"read":-1}}]=] "" "")
 expect_rejected(negative_connection_limit
