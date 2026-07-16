@@ -23,6 +23,32 @@ bool Config::Validate() const {
         return false;
     }
 
+    const auto inbound_semantic = ValidateStaticInboundSemantics(static_inbounds_);
+    switch (inbound_semantic.error) {
+        case StaticInboundSemanticError::None:
+            break;
+        case StaticInboundSemanticError::InvalidPort:
+            LOG_ERROR("Static inbound at index {} has an invalid port", inbound_semantic.index);
+            return false;
+        case StaticInboundSemanticError::EmptyTag:
+            LOG_ERROR("Static inbound at index {} has an empty tag", inbound_semantic.index);
+            return false;
+        case StaticInboundSemanticError::DuplicateTag:
+            LOG_ERROR("Static inbound at index {} duplicates tag '{}' from index {}",
+                      inbound_semantic.index, inbound_semantic.detail,
+                      inbound_semantic.conflicting_index);
+            return false;
+        case StaticInboundSemanticError::InvalidListen:
+            LOG_ERROR("Static inbound at index {} has invalid listen address '{}'",
+                      inbound_semantic.index, inbound_semantic.detail);
+            return false;
+        case StaticInboundSemanticError::DuplicateEndpoint:
+            LOG_ERROR("Static inbound at index {} duplicates listen endpoint '{}' from index {}",
+                      inbound_semantic.index, inbound_semantic.detail,
+                      inbound_semantic.conflicting_index);
+            return false;
+    }
+
     const auto semantic = ValidateOutboundRoutingSemantics(
         prepared_outbounds_, routing_.rules);
     switch (semantic.error) {

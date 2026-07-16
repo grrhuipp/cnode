@@ -55,5 +55,21 @@ expect_rejected(partial_vmess_users "{}" "inbounds.json"
     [=[[{"tag":"partial-vmess","protocol":"vmess","port":12004,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"},{"id":"not-a-uuid"}]}}]]=])
 expect_rejected(empty_trojan_users "{}" "inbounds.json"
     [=[[{"tag":"empty-trojan","protocol":"trojan","port":12005,"settings":{"clients":[]}}]]=])
+expect_rejected(missing_inbound_port "{}" "inbounds.json"
+    [=[[{"tag":"missing-port","protocol":"vmess","settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(negative_inbound_port "{}" "inbounds.json"
+    [=[[{"tag":"negative-port","protocol":"vmess","port":-1,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(overflow_inbound_port "{}" "inbounds.json"
+    [=[[{"tag":"overflow-port","protocol":"vmess","port":65536,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(uint64_overflow_inbound_port "{}" "inbounds.json"
+    [=[[{"tag":"uint64-overflow-port","protocol":"vmess","port":18446744073709551615,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(string_inbound_port "{}" "inbounds.json"
+    [=[[{"tag":"string-port","protocol":"vmess","port":"12006","settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(invalid_inbound_listen "{}" "inbounds.json"
+    [=[[{"tag":"invalid-listen","protocol":"vmess","listen":"not-an-ip","port":12007,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=])
+expect_rejected(duplicate_inbound_tag "{}" "inbounds.json"
+    [=[[{"tag":"duplicate","protocol":"vmess","listen":"127.0.0.1","port":12008,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}},{"tag":"duplicate","protocol":"vmess","listen":"127.0.0.2","port":12008,"settings":{"clients":[{"id":"22f6ee21-7dd1-4e62-9cf3-96ca6c7e8b72"}]}}]]=])
+expect_rejected(duplicate_inbound_endpoint "{}" "inbounds.json"
+    [=[[{"tag":"first","protocol":"vmess","listen":"127.0.0.1","port":12009,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}},{"tag":"second","protocol":"vmess","listen":"127.0.0.1","port":12009,"settings":{"clients":[{"id":"22f6ee21-7dd1-4e62-9cf3-96ca6c7e8b72"}]}}]]=])
 
 file(REMOVE_RECURSE "${TEST_ROOT}")

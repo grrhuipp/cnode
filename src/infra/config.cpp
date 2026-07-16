@@ -42,6 +42,31 @@ inline int64_t jint(const json::object& obj, std::string_view key,
     return def;
 }
 
+uint16_t required_port(const json::object& obj, std::string_view key) {
+    const auto* value = obj.if_contains(key);
+    if (!value) {
+        throw std::invalid_argument(std::string(key) + " is required");
+    }
+
+    uint64_t port = 0;
+    if (value->is_int64()) {
+        const int64_t signed_port = value->as_int64();
+        if (signed_port <= 0) {
+            throw std::invalid_argument(std::string(key) + " must be between 1 and 65535");
+        }
+        port = static_cast<uint64_t>(signed_port);
+    } else if (value->is_uint64()) {
+        port = value->as_uint64();
+    } else {
+        throw std::invalid_argument(std::string(key) + " must be an integer");
+    }
+
+    if (port == 0 || port > std::numeric_limits<uint16_t>::max()) {
+        throw std::invalid_argument(std::string(key) + " must be between 1 and 65535");
+    }
+    return static_cast<uint16_t>(port);
+}
+
 inline std::string jstr_or_int(const json::object& obj, std::string_view key,
                                std::string_view def = "") {
     auto* p = obj.if_contains(key);
@@ -960,9 +985,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         cfg.listen = std::string(j.at("listen").as_string());
     }
 
-    if (j.contains("port")) {
-        cfg.port = static_cast<uint16_t>(j.at("port").as_int64());
-    }
+    cfg.port = required_port(j, "port");
 
     if (j.contains("settings") && j.at("settings").is_object()) {
         cfg.static_users = ParseStaticUserConfig(cfg.protocol, j.at("settings").as_object());
