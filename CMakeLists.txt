@@ -314,6 +314,7 @@ set(CNODE_SOURCES
     src/app/proxyman/outbound/manager.cpp
     src/app/worker.cpp
     src/service/controller/controller.cpp
+    src/service/controller/awaitable_batch.cpp
     src/service/controller/node_transition.cpp
     src/service/controller/config.cpp
     src/service/controller/inboundbuilder.cpp
@@ -845,6 +846,31 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_ban_tracking_contract_test
         COMMAND cnode_ban_tracking_contract_test)
+
+    add_executable(cnode_awaitable_batch_test
+        tests/awaitable_batch_test.cpp
+        src/service/controller/awaitable_batch.cpp
+    )
+    target_include_directories(cnode_awaitable_batch_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
+    )
+    target_link_libraries(cnode_awaitable_batch_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_awaitable_batch_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_awaitable_batch_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_awaitable_batch_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_awaitable_batch_test
+        COMMAND cnode_awaitable_batch_test)
 
     add_test(
         NAME cnode_invalid_config_sources_test

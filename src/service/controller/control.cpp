@@ -1,4 +1,5 @@
 #include "controller_impl.hpp"
+#include "awaitable_batch.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 
@@ -173,9 +174,8 @@ Controller::Impl::getTraffic(const std::string& tag) {
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    for (auto& task : tasks) {
-        co_await std::move(task);
-    }
+    co_await controller::RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
 
     size_t merged_hint = 0;
     for (const auto& traffic : per_worker) {
@@ -220,9 +220,8 @@ Controller::Impl::GetOnlineDevice(const std::string& tag,
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    for (auto& task : tasks) {
-        co_await std::move(task);
-    }
+    co_await controller::RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
 
     size_t total_online = 0;
     for (const auto& online : per_worker) {
@@ -271,9 +270,8 @@ Controller::Impl::GetDetectResult(const std::string& tag) {
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    for (auto& task : tasks) {
-        co_await std::move(task);
-    }
+    co_await controller::RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
 
     size_t total = 0;
     for (const auto& results : per_worker) {

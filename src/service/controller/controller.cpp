@@ -1,4 +1,5 @@
 #include "controller_impl.hpp"
+#include "awaitable_batch.hpp"
 #include "node_transition.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
@@ -129,8 +130,13 @@ net::awaitable<void> Controller::Impl::runNodeInfoMonitors() {
                 tasks.push_back(nodeInfoMonitor(panel_nodes_[i]));
             }
 
-            for (auto& task : tasks) {
-                co_await std::move(task);
+            try {
+                co_await controller::RunAwaitableBatch(
+                    io_context_.get_executor(), std::move(tasks));
+            } catch (const std::exception& e) {
+                LOG_ERROR("panel monitor batch failed: {}", e.what());
+            } catch (...) {
+                LOG_ERROR("panel monitor batch failed with unknown exception");
             }
         }
     };
