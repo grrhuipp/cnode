@@ -134,8 +134,6 @@ void EncodeEndTo(memory::ByteVector& out,
 // Mux 线上格式:         IPv4=1, Domain=2, IPv6=3
 // ============================================================================
 [[nodiscard]] uint8_t     ToMuxAddrType(AddressType t) noexcept;
-[[nodiscard]] AddressType FromMuxAddrType(uint8_t t) noexcept;
-
 // ============================================================================
 // GlobalID 辅助函数
 // ============================================================================

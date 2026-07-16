@@ -22,15 +22,6 @@ uint8_t ToMuxAddrType(AddressType t) noexcept {
     }
 }
 
-AddressType FromMuxAddrType(uint8_t t) noexcept {
-    switch (t) {
-        case 1: return AddressType::IPv4;
-        case 2: return AddressType::Domain;
-        case 3: return AddressType::IPv6;
-        default: return AddressType::Invalid;
-    }
-}
-
 // ============================================================================
 // 内部：解析 PortThenAddress（Mux 线上格式）
 // 返回解析是否成功；成功时填入 target
@@ -39,8 +30,6 @@ static bool ParsePortThenAddress(ByteReader& r, TargetAddress& target) {
     uint16_t port     = r.ReadU16BE();
     uint8_t  addr_raw = r.ReadU8();
     if (!r.Ok()) return false;
-
-    AddressType addr_type = FromMuxAddrType(addr_raw);
 
     if (addr_raw == 1) {
         // IPv4: 4 字节
@@ -71,8 +60,7 @@ static bool ParsePortThenAddress(ByteReader& r, TargetAddress& target) {
         return false;
     }
 
-    (void)addr_type;  // 已通过 addr_raw 分支处理
-    return true;
+    return target.IsValid();
 }
 
 class MultiBufferFrameReader {
@@ -187,7 +175,7 @@ static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& targe
         net::ip::address_v4::bytes_type bytes{};
         if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
         target = TargetAddress(net::ip::make_address_v4(bytes), port);
-        return true;
+        return target.IsValid();
     }
     if (addr_raw == 2) {
         uint8_t domain_len = r.ReadU8();
@@ -195,13 +183,13 @@ static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& targe
         std::string domain = r.ReadString(domain_len);
         if (!r.Ok()) return false;
         target = TargetAddress(std::string_view(domain), port);
-        return true;
+        return target.IsValid();
     }
     if (addr_raw == 3) {
         net::ip::address_v6::bytes_type bytes{};
         if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
         target = TargetAddress(net::ip::make_address_v6(bytes), port);
-        return true;
+        return target.IsValid();
     }
     return false;
 }
@@ -422,6 +410,11 @@ std::optional<FrameHeader> DecodeFrame(
 // ============================================================================
 template <class ByteContainer>
 static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
+    if (!addr.IsValid() ||
+        (addr.IsDomain() && addr.host.size() > std::numeric_limits<uint8_t>::max())) {
+        return false;
+    }
+
     // Port (2 BE)
     buf.push_back(static_cast<uint8_t>(addr.port >> 8));
     buf.push_back(static_cast<uint8_t>(addr.port & 0xFF));
@@ -440,8 +433,7 @@ static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
         break;
     }
     case AddressType::Domain: {
-        uint8_t dlen = static_cast<uint8_t>(
-            std::min(addr.host.size(), size_t{255}));
+        uint8_t dlen = static_cast<uint8_t>(addr.host.size());
         buf.push_back(dlen);
         buf.insert(buf.end(), addr.host.begin(), addr.host.begin() + dlen);
         break;
@@ -556,7 +548,8 @@ static bool EncodeNewToImpl(ByteContainer& out,
                             const TargetAddress& target,
                             const uint8_t* data,
                             size_t len) {
-    if (len > std::numeric_limits<uint16_t>::max()) {
+    if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
+        len > std::numeric_limits<uint16_t>::max()) {
         out.clear();
         return false;
     }

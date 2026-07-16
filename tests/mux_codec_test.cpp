@@ -76,6 +76,42 @@ int main() {
           "oversized Mux TCP header was truncated instead of rejected");
 
     const TargetAddress target("example.com", 53);
+    const TargetAddress zero_port_target("example.com", 0);
+    TargetAddress oversized_domain_target;
+    oversized_domain_target.type = AddressType::Domain;
+    oversized_domain_target.host.assign(256, 'a');
+    oversized_domain_target.port = 53;
+    Check(!mux::EncodeNewTo(
+              encoded,
+              7,
+              mux::NetworkType::TCP,
+              zero_port_target,
+              nullptr,
+              0) &&
+              encoded.empty(),
+          "Mux NEW encoded a zero-port target");
+    Check(!mux::EncodeKeepUDPTo(
+              encoded, 7, zero_port_target, nullptr, 0) && encoded.empty(),
+          "Mux UDP encoded a zero-port target");
+    Check(!mux::EncodeNewTo(
+              encoded,
+              7,
+              mux::NetworkType::TCP,
+              oversized_domain_target,
+              nullptr,
+              0) &&
+              encoded.empty(),
+          "Mux NEW truncated an oversized domain target");
+    Check(!mux::EncodeNewTo(
+              encoded,
+              7,
+              static_cast<mux::NetworkType>(0xff),
+              target,
+              nullptr,
+              0) &&
+              encoded.empty(),
+          "Mux NEW encoded an unknown network type");
+
     Check(!mux::EncodeNewTo(
               encoded,
               7,
@@ -109,6 +145,23 @@ int main() {
         static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00};
     CheckInvalidAcrossLayouts(
         missing_new_target, "Mux NEW without a target was accepted");
+
+    const std::vector<uint8_t> zero_port_new_target{
+        0x00, 0x13, 0x00, 0x07,
+        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00,
+        static_cast<uint8_t>(mux::NetworkType::TCP),
+        0x00, 0x00, 0x02, 0x0b,
+        'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'};
+    CheckInvalidAcrossLayouts(
+        zero_port_new_target, "Mux NEW accepted a zero-port target");
+
+    const std::vector<uint8_t> invalid_domain_new_target{
+        0x00, 0x0b, 0x00, 0x07,
+        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00,
+        static_cast<uint8_t>(mux::NetworkType::TCP),
+        0x00, 0x50, 0x02, 0x03, 'a', ' ', 'b'};
+    CheckInvalidAcrossLayouts(
+        invalid_domain_new_target, "Mux NEW accepted an invalid domain target");
 
     const std::vector<uint8_t> trailing_keepalive_metadata{
         0x00, 0x05, 0x00, 0x00,
