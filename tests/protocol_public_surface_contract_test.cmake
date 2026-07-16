@@ -136,3 +136,8 @@ if(NOT VLESS_OUTBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "VLESS Mux UDP responses must remain bound to their logical session")
 endif()
+if(VLESS_OUTBOUND_SOURCE MATCHES
+        "VLESS mux request encode failed[^\n]*\n[^\n]*continue")
+    message(FATAL_ERROR
+        "VLESS Mux request encoding failures must propagate to relay")
+endif()

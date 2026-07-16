@@ -16,6 +16,7 @@
 
 #include <unordered_map>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <new>
 #include <array>
@@ -437,23 +438,30 @@ public:
                 continue;
             }
 
-            buf::MultiBuffer payload;
-            if (!buf::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(data, buffer.size()),
-                    payload)) {
-                throw std::bad_alloc();
-            }
+            std::span<const uint8_t> remaining(data, buffer.size());
+            while (!remaining.empty()) {
+                const size_t chunk_size = std::min(
+                    remaining.size(),
+                    static_cast<size_t>(std::numeric_limits<uint16_t>::max()));
+                const auto chunk = remaining.first(chunk_size);
 
-            MuxReply reply;
-            reply.session_id = session_id_;
-            reply.is_end = false;
-            reply.is_udp = false;
-            reply.payload_size = buffer.size();
-            reply.payload = std::move(payload);
-            if (!reply_queue_.PushTcp(std::move(reply))) {
-                reply_queue_.tcp_overflowed = true;
-                Cancel();
-                break;
+                buf::MultiBuffer payload;
+                if (!buf::AppendSpanToMultiBuffer(chunk, payload)) {
+                    throw std::bad_alloc();
+                }
+
+                MuxReply reply;
+                reply.session_id = session_id_;
+                reply.is_end = false;
+                reply.is_udp = false;
+                reply.payload_size = chunk_size;
+                reply.payload = std::move(payload);
+                if (!reply_queue_.PushTcp(std::move(reply))) {
+                    reply_queue_.tcp_overflowed = true;
+                    Cancel();
+                    co_return;
+                }
+                remaining = remaining.subspan(chunk_size);
             }
         }
     }
@@ -1109,10 +1117,15 @@ net::awaitable<RelayResult> DoMuxRelay(
                 }
                 continue;
             } else {
-                mux::EncodeKeepDataHeaderTo(
-                    write_frame,
-                    reply.session_id,
-                    reply.PayloadSize());
+                if (!mux::EncodeKeepDataHeaderTo(
+                        write_frame,
+                        reply.session_id,
+                        reply.PayloadSize())) {
+                    reply.payload.clear();
+                    result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
+                    running = false;
+                    break;
+                }
                 if (!co_await write_payload_frame_to_client(write_frame, reply)) {
                     running = false;
                     break;

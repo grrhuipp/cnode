@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace acpp::mux {
@@ -566,31 +567,50 @@ static void InitFrameBase(
 }
 
 // 回填 MetaLen（= buf.size() - 2）并按需追加 DataLen。
-static void FinalizeFrameHeader(auto& buf, size_t payload_len)
+static bool FinalizeFrameHeader(
+    auto& buf,
+    size_t payload_len,
+    bool has_data)
 {
+    constexpr size_t kMaxWireLength = std::numeric_limits<uint16_t>::max();
+    if (buf.size() < 2 || buf.size() - 2 > kMaxWireLength ||
+        payload_len > kMaxWireLength) {
+        buf.clear();
+        return false;
+    }
     // 回填 MetaLen
     uint16_t meta_len = static_cast<uint16_t>(buf.size() - 2);
     buf[0] = static_cast<uint8_t>(meta_len >> 8);
     buf[1] = static_cast<uint8_t>(meta_len & 0xFF);
 
-    if (payload_len > 0) {
+    if (has_data) {
         // DataLen
         buf.push_back(static_cast<uint8_t>(payload_len >> 8));
         buf.push_back(static_cast<uint8_t>(payload_len & 0xFF));
     }
+    return true;
 }
 
 // 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
-static void FinalizeFrame(
+static bool FinalizeFrame(
     auto& buf,
-    const uint8_t* payload, size_t payload_len)
+    const uint8_t* payload,
+    size_t payload_len,
+    bool has_data)
 {
-    FinalizeFrameHeader(buf, payload && payload_len > 0 ? payload_len : 0);
+    if (has_data && payload_len > 0 && !payload) {
+        buf.clear();
+        return false;
+    }
+    if (!FinalizeFrameHeader(buf, payload_len, has_data)) {
+        return false;
+    }
 
-    if (payload && payload_len > 0) {
+    if (has_data && payload_len > 0) {
         // Payload
         buf.insert(buf.end(), payload, payload + payload_len);
     }
+    return true;
 }
 
 // ============================================================================
@@ -619,6 +639,10 @@ static bool EncodeNewToImpl(ByteContainer& out,
                             const TargetAddress& target,
                             const uint8_t* data,
                             size_t len) {
+    if (len > std::numeric_limits<uint16_t>::max()) {
+        out.clear();
+        return false;
+    }
     size_t addr_reserve = 1 + 2 + 1 + 16;
     if (target.IsDomain()) {
         addr_reserve = 1 + 2 + 1 + 1 + target.host.size();
@@ -634,8 +658,7 @@ static bool EncodeNewToImpl(ByteContainer& out,
         out.clear();
         return false;
     }
-    FinalizeFrame(out, data, len);
-    return true;
+    return FinalizeFrame(out, data, len, len > 0);
 }
 
 bool EncodeNewTo(memory::ByteVector& out,
@@ -654,7 +677,7 @@ template <class ByteContainer>
 static void EncodeEndToImpl(ByteContainer& out, uint16_t session_id, bool error) {
     uint8_t option = error ? kOptionError : 0x00;
     InitFrameBase(out, session_id, SessionStatus::END, option);
-    FinalizeFrame(out, nullptr, 0);
+    (void)FinalizeFrame(out, nullptr, 0, false);
 }
 
 void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
@@ -665,39 +688,47 @@ void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
 // EncodeKeepData（TCP 数据）
 // ============================================================================
 template <class ByteContainer>
-static void EncodeKeepDataToImpl(
+static bool EncodeKeepDataToImpl(
     ByteContainer& out,
     uint16_t session_id,
     const uint8_t* data, size_t len)
 {
+    if (len > std::numeric_limits<uint16_t>::max()) {
+        out.clear();
+        return false;
+    }
     InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, len);
-    FinalizeFrame(out, data, len);
+    return FinalizeFrame(out, data, len, true);
 }
 
-void EncodeKeepDataTo(
+bool EncodeKeepDataTo(
     memory::ByteVector& out,
     uint16_t session_id,
     const uint8_t* data, size_t len)
 {
-    EncodeKeepDataToImpl(out, session_id, data, len);
+    return EncodeKeepDataToImpl(out, session_id, data, len);
 }
 
 template <class ByteContainer>
-static void EncodeKeepDataHeaderToImpl(
+static bool EncodeKeepDataHeaderToImpl(
     ByteContainer& out,
     uint16_t session_id,
     size_t payload_len)
 {
+    if (payload_len > std::numeric_limits<uint16_t>::max()) {
+        out.clear();
+        return false;
+    }
     InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, payload_len);
-    FinalizeFrameHeader(out, payload_len);
+    return FinalizeFrameHeader(out, payload_len, true);
 }
 
-void EncodeKeepDataHeaderTo(
+bool EncodeKeepDataHeaderTo(
     memory::ByteVector& out,
     uint16_t session_id,
     size_t payload_len)
 {
-    EncodeKeepDataHeaderToImpl(out, session_id, payload_len);
+    return EncodeKeepDataHeaderToImpl(out, session_id, payload_len);
 }
 
 // ============================================================================
@@ -710,6 +741,10 @@ static bool EncodeKeepUDPToImpl(
     const TargetAddress& src,
     const uint8_t* data, size_t len)
 {
+    if (len > std::numeric_limits<uint16_t>::max()) {
+        out.clear();
+        return false;
+    }
     // 预估地址字节数
     size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
     InitFrameBase(out, session_id, SessionStatus::KEEP,
@@ -723,8 +758,7 @@ static bool EncodeKeepUDPToImpl(
         return false;
     }
 
-    FinalizeFrame(out, data, len);
-    return true;
+    return FinalizeFrame(out, data, len, true);
 }
 
 bool EncodeKeepUDPTo(
@@ -743,6 +777,10 @@ static bool EncodeKeepUDPHeaderToImpl(
     const TargetAddress& src,
     size_t payload_len)
 {
+    if (payload_len > std::numeric_limits<uint16_t>::max()) {
+        out.clear();
+        return false;
+    }
     // 预估地址字节数
     size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
     InitFrameBase(out, session_id, SessionStatus::KEEP,
@@ -756,8 +794,7 @@ static bool EncodeKeepUDPHeaderToImpl(
         return false;
     }
 
-    FinalizeFrameHeader(out, payload_len);
-    return true;
+    return FinalizeFrameHeader(out, payload_len, true);
 }
 
 bool EncodeKeepUDPHeaderTo(

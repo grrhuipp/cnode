@@ -112,12 +112,12 @@ void EncodeKeepAliveTo(memory::ByteVector& out);
                                size_t len);
 void EncodeEndTo(memory::ByteVector& out,
                  uint16_t session_id, bool error = false);
-void EncodeKeepDataTo(memory::ByteVector& out,
-                      uint16_t session_id,
-                      const uint8_t* data, size_t len);
-void EncodeKeepDataHeaderTo(memory::ByteVector& out,
-                            uint16_t session_id,
-                            size_t payload_len);
+[[nodiscard]] bool EncodeKeepDataTo(memory::ByteVector& out,
+                                    uint16_t session_id,
+                                    const uint8_t* data, size_t len);
+[[nodiscard]] bool EncodeKeepDataHeaderTo(memory::ByteVector& out,
+                                          uint16_t session_id,
+                                          size_t payload_len);
 [[nodiscard]] bool EncodeKeepUDPTo(memory::ByteVector& out,
                      uint16_t session_id,
                      const TargetAddress& src,

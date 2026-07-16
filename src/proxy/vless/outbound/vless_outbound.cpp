@@ -794,13 +794,11 @@ public:
             mb.FreeSlot(buffer);
 
             if (!encoded || write_frame_.empty()) {
-                continue;
+                throw IoSystemError(
+                    io_error::connection_reset,
+                    "VLESS mux request encode failed");
             }
-            try {
-                co_await WriteVlessBytes(writer_, write_frame_);
-            } catch (...) {
-                break;
-            }
+            co_await WriteVlessBytes(writer_, write_frame_);
         }
         mb.clear();
     }
@@ -832,23 +830,18 @@ public:
             }
 
             if (!encoded || write_frame_.empty()) {
-                continue;
+                throw IoSystemError(
+                    io_error::connection_reset,
+                    "VLESS mux request encode failed");
             }
-            try {
-                co_await WriteVlessBytes(writer_, write_frame_);
-            } catch (...) {
-                break;
-            }
+            co_await WriteVlessBytes(writer_, write_frame_);
         }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
         if (session_started_ && !end_sent_) {
             mux::EncodeEndTo(write_frame_, session_id_);
-            try {
-                co_await WriteVlessBytes(writer_, write_frame_);
-            } catch (...) {
-            }
+            co_await WriteVlessBytes(writer_, write_frame_);
             end_sent_ = true;
         }
         co_await writer_.AsyncShutdownWrite();

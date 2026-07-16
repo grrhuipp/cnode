@@ -863,6 +863,28 @@ if(CNODE_BUILD_TESTS)
     )
     add_test(NAME cnode_uot_ss2022_test COMMAND cnode_uot_ss2022_test)
 
+    add_executable(cnode_mux_codec_test
+        tests/mux_codec_test.cpp
+        src/common/mux/mux_codec.cpp
+    )
+    target_include_directories(cnode_mux_codec_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_mux_codec_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_mux_codec_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_mux_codec_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_mux_codec_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(NAME cnode_mux_codec_test COMMAND cnode_mux_codec_test)
+
     add_executable(cnode_shadowsocks_stream_crypto_test
         tests/shadowsocks_stream_crypto_test.cpp
         src/proxy/shadowsocks/shadowsocks_protocol.cpp
