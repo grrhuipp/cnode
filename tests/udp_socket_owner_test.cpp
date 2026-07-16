@@ -8,6 +8,23 @@
 
 namespace {
 
+class DummyUdpHandler final : public acpp::proxyman::inbound::UdpHandler {
+public:
+    std::optional<acpp::proxyman::inbound::UdpDecodeResult> DecodeUdp(
+        std::string_view,
+        std::string_view,
+        const uint8_t*,
+        size_t) const override {
+        return std::nullopt;
+    }
+
+    acpp::buf::MultiBuffer EncodeUdpResponse(
+        acpp::UDPPacketView,
+        const acpp::proxyman::inbound::UdpResponseContext&) const override {
+        return {};
+    }
+};
+
 static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().Close()));
 static_assert(noexcept(
@@ -56,6 +73,29 @@ int main() {
     if (ec) Fail("failed to open second UDP socket");
     second->bind(endpoint, ec);
     if (ec) Fail("owned UDP socket did not release its bound port");
+
+    acpp::proxyman::inbound::UdpWorker worker(
+        "test-inbound", std::make_unique<DummyUdpHandler>());
+    auto* attached = worker.AttachSocket("stable-socket", std::move(second));
+    if (!attached || worker.FindSocket("stable-socket") != attached ||
+        !attached->is_open()) {
+        Fail("failed to attach initial UDP socket");
+    }
+
+    auto duplicate = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
+    duplicate->open(acpp::udp::v4(), ec);
+    if (ec) Fail("failed to open duplicate UDP socket");
+    if (worker.AttachSocket("stable-socket", std::move(duplicate)) != nullptr) {
+        Fail("duplicate UDP socket attachment was accepted");
+    }
+    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+        Fail("duplicate attachment replaced the live UDP socket");
+    }
+
+    worker.CloseSocket("stable-socket");
+    if (worker.FindSocket("stable-socket") != nullptr) {
+        Fail("closed UDP socket remained registered");
+    }
 
     return 0;
 }

@@ -1250,13 +1250,18 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
+        src/app/proxyman/inbound/udp_worker.cpp
+        src/common/session.cpp
+        src/infra/log.cpp
     )
     target_include_directories(cnode_udp_socket_owner_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${concurrentqueue_SOURCE_DIR}
     )
     target_link_libraries(cnode_udp_socket_owner_test PRIVATE
         asio::asio
         Threads::Threads
+        cnode_zlib
     )
     if(WIN32)
         target_link_libraries(cnode_udp_socket_owner_test PRIVATE ws2_32)

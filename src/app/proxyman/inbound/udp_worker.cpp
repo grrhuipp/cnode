@@ -11,7 +11,11 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/async_stream.hpp"
 
+#include <asio/as_tuple.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <unordered_map>
 
@@ -636,9 +640,9 @@ udp::socket* UdpWorker::AttachSocket(
     if (!socket) {
         return nullptr;
     }
-    auto* raw = socket.get();
-    impl_->udp_sockets[socket_key] = std::move(socket);
-    return raw;
+    auto [it, inserted] = impl_->udp_sockets.try_emplace(
+        socket_key, std::move(socket));
+    return inserted ? it->second.get() : nullptr;
 }
 
 udp::socket* UdpWorker::FindSocket(const std::string& socket_key) noexcept {

@@ -126,6 +126,8 @@ public:
     [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
         return std::make_unique<udp::socket>(io_context);
     }
+    // A socket key belongs to one receive loop. Duplicate attachment is
+    // rejected instead of cancelling and replacing the live socket.
     [[nodiscard]] udp::socket* AttachSocket(
         const std::string& socket_key,
         SocketPtr socket);
