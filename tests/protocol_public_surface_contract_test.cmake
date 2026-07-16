@@ -363,16 +363,30 @@ if(NOT UDP_SESSION_SOURCE MATCHES
 endif()
 set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
+set(UDP_WORKER_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp")
 set(UDP_HANDLER_HEADER_PATH
     "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp")
 file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
+file(READ "${UDP_WORKER_HEADER_PATH}" UDP_WORKER_HEADER_SOURCE)
 file(READ "${UDP_HANDLER_HEADER_PATH}" UDP_HANDLER_HEADER_SOURCE)
 if(NOT UDP_WORKER_SOURCE MATCHES
-    "datagram[.]buffer_count == 1" OR
+        "datagram[.]buffer_count == 1" OR
    NOT UDP_WORKER_SOURCE MATCHES
     "coalesced[.]reserve[(]datagram[.]payload_size[)]")
     message(FATAL_ERROR
         "UDP ClientSession must preserve one datagram across Buffer chunks")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "kMaxQueuedUdpDatagrams = 256" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "kMaxQueuedUdpBytes = 512 [*] 1024" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "WouldOverflowUdpQueue[(]" OR
+   NOT UDP_WORKER_HEADER_SOURCE MATCHES
+        "bool[\r\n ]+Push[(]")
+    message(FATAL_ERROR
+        "UDP input and reply queues must expose bounded backpressure")
 endif()
 if(NOT UDP_WORKER_SOURCE MATCHES
         "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR

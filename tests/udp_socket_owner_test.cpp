@@ -214,6 +214,30 @@ int main() {
     }
     io_context.restart();
 
+    acpp::proxyman::inbound::UdpWorker::ClientSession bounded_input_session(
+        io_context,
+        acpp::RoutedPacketCallback{
+            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        reply_endpoint_a,
+        default_owner);
+    auto make_tiny_payload = [&]() {
+        acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+        if (!buffer) Fail("failed to allocate bounded UDP queue payload");
+        buffer->Tail()[0] = 0x7a;
+        buffer->Produce(1);
+        return acpp::buf::MultiBuffer{buffer.release()};
+    };
+    for (size_t i = 0; i < 256; ++i) {
+        if (!bounded_input_session.Push(
+                callback_source, make_tiny_payload())) {
+            Fail("UDP input queue rejected a datagram below its bound");
+        }
+    }
+    if (bounded_input_session.Push(callback_source, make_tiny_payload())) {
+        Fail("UDP input queue accepted more than its datagram bound");
+    }
+    bounded_input_session.Close();
+
     auto first = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
     first->open(acpp::udp::v4(), ec);
     if (ec) Fail("failed to open first UDP socket");
@@ -288,6 +312,22 @@ int main() {
 
     acpp::proxyman::inbound::UdpWorker worker(
         "test-inbound", std::make_unique<DummyUdpHandler>());
+
+    for (size_t i = 0; i < 512; ++i) {
+        (void)worker.EnqueueReply(
+            "bounded-replies", reply_endpoint_a, make_tiny_payload());
+    }
+    size_t drained_replies = 0;
+    while (auto reply = worker.BeginReplySend("bounded-replies")) {
+        ++drained_replies;
+        if (!worker.CompleteReplySend("bounded-replies")) {
+            break;
+        }
+    }
+    if (drained_replies != 256) {
+        Fail("UDP reply queue exceeded or undershot its datagram bound");
+    }
+    worker.ClearReplyQueue("bounded-replies");
 
     acpp::proxyman::inbound::UdpSessionOwner owner_a;
     acpp::proxyman::inbound::UdpSessionOwner owner_b;

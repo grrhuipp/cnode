@@ -72,6 +72,18 @@ public:
 
 namespace {
 
+constexpr size_t kMaxQueuedUdpDatagrams = 256;
+constexpr size_t kMaxQueuedUdpBytes = 512 * 1024;
+
+[[nodiscard]] bool WouldOverflowUdpQueue(
+    size_t queued_datagrams,
+    size_t queued_bytes,
+    size_t payload_size) noexcept {
+    return queued_datagrams >= kMaxQueuedUdpDatagrams ||
+        payload_size > kMaxQueuedUdpBytes ||
+        queued_bytes > kMaxQueuedUdpBytes - payload_size;
+}
+
 struct UdpReplyQueueState {
     memory::ThreadLocalDeque<UdpWorker::PendingUdpReply> pending;
     size_t queued_bytes = 0;
@@ -150,17 +162,18 @@ void UdpWorker::ClientSession::UpdateReplyEndpoint(
     impl_->reply_endpoint = std::move(endpoint);
 }
 
-void UdpWorker::ClientSession::Push(
+bool UdpWorker::ClientSession::Push(
     const TargetAddress& target,
     buf::MultiBuffer payload) {
     const size_t payload_size = buf::TotalLen(payload);
     if (impl_->closed || payload_size == 0) {
         payload.clear();
-        return;
+        return false;
     }
-    if (impl_->queued_bytes + payload_size > 512 * 1024) {
+    if (WouldOverflowUdpQueue(
+            impl_->input_queue.size(), impl_->queued_bytes, payload_size)) {
         payload.clear();
-        return;
+        return false;
     }
 
     for (buf::Buffer* buffer : payload) {
@@ -175,6 +188,7 @@ void UdpWorker::ClientSession::Push(
         impl_->shrink_queue_on_drain = true;
     }
     impl_->WakeReader();
+    return true;
 }
 
 void UdpWorker::ClientSession::Close() noexcept {
@@ -488,6 +502,10 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
     }
 
     auto& queue = impl_->reply_queues[socket_key];
+    if (WouldOverflowUdpQueue(
+            queue.pending.size(), queue.queued_bytes, payload_size)) {
+        return false;
+    }
     const bool should_start_send = !queue.write_in_progress;
     queue.queued_bytes += payload_size;
 
@@ -511,6 +529,10 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
 
     const size_t payload_size = payload->Len();
     auto& queue = impl_->reply_queues[socket_key];
+    if (WouldOverflowUdpQueue(
+            queue.pending.size(), queue.queued_bytes, payload_size)) {
+        return false;
+    }
     const bool should_start_send = !queue.write_in_progress;
     queue.queued_bytes += payload_size;
 
@@ -645,8 +667,7 @@ bool UdpWorker::PushClientPayload(
     auto& session = session_it->second;
     session.last_active = now;
     session.link->UpdateReplyEndpoint(std::move(reply_endpoint));
-    session.link->Push(target, std::move(payload));
-    return true;
+    return session.link->Push(target, std::move(payload));
 }
 
 void UdpWorker::CleanupIdleClientSessions(

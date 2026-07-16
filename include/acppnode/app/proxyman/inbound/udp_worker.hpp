@@ -164,7 +164,9 @@ public:
     [[nodiscard]] bool Owns(const UdpSessionOwner& owner) const noexcept;
 
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
-    void Push(const TargetAddress& target, buf::MultiBuffer payload);
+    [[nodiscard]] bool Push(
+        const TargetAddress& target,
+        buf::MultiBuffer payload);
     void Close() noexcept;
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
