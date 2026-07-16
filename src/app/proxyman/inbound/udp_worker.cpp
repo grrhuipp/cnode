@@ -231,7 +231,6 @@ struct UdpWorker::Impl {
     std::string tag;
     std::unique_ptr<UdpHandler> proxy;
     UdpSocketMap udp_sockets;
-    memory::ThreadLocalVector<UdpWorker::SocketPtr> retired_udp_sockets;
     memory::ThreadLocalUnorderedMap<std::string, UdpReplyQueueState> reply_queues;
     memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap> client_sessions;
 };
@@ -674,7 +673,6 @@ void UdpWorker::CloseSocket(const std::string& socket_key) noexcept {
     IoErrorCode ec;
     sock_it->second->cancel(ec);
     sock_it->second->close(ec);
-    impl_->retired_udp_sockets.push_back(std::move(sock_it->second));
     impl_->udp_sockets.erase(sock_it);
     MaybeShrinkHashContainer(impl_->udp_sockets, 8);
 }
@@ -683,7 +681,6 @@ void UdpWorker::CloseAllSockets() noexcept {
     while (!impl_->udp_sockets.empty()) {
         CloseSocket(impl_->udp_sockets.begin()->first);
     }
-    TryShrinkSequence(impl_->retired_udp_sockets);
 }
 
 }  // namespace acpp::proxyman::inbound
