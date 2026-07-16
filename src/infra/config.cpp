@@ -2,6 +2,7 @@
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
+#include "http2_initial_window.hpp"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -580,10 +581,11 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
     if (!cfg.force_http2) {
         cfg.force_http2 = jbool(j, "force_http2", false);
     }
-    cfg.initial_window_size = static_cast<int>(jint(j, "initialWindowSize", 0));
-    if (cfg.initial_window_size <= 0) {
-        cfg.initial_window_size = static_cast<int>(jint(j, "initial_window_size", 0));
+    auto initial_window = ParseHttp2InitialWindow(j);
+    if (!initial_window) {
+        throw std::invalid_argument(std::move(initial_window.error()));
     }
+    cfg.initial_window_size = *initial_window;
     return cfg;
 }
 
@@ -603,9 +605,15 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     }
     cfg.multi_mode = jbool(j, "multiMode", false);
     cfg.multi_mode = jbool(j, "multi_mode", cfg.multi_mode);
-    cfg.initial_window_size = static_cast<int>(
-        jint(j, "initial_windows_size",
-             jint(j, "initialWindowSize", cfg.initial_window_size)));
+    if (j.contains("initial_windows_size")) {
+        throw std::invalid_argument(
+            "initial_windows_size is not supported; use initial_window_size");
+    }
+    auto initial_window = ParseHttp2InitialWindow(j);
+    if (!initial_window) {
+        throw std::invalid_argument(std::move(initial_window.error()));
+    }
+    cfg.initial_window_size = *initial_window;
     return cfg;
 }
 

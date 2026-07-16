@@ -7,6 +7,7 @@
 #include "acppnode/transport/internet/tls_config.hpp"
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -94,7 +95,7 @@ struct HttpConfig {
     // TLS 默认 HTTP/2，显式 ALPN=http/1.1 时使用 HTTP/1.1，明文使用 HTTP/1.1。
     bool force_http2 = false;
 
-    int initial_window_size = 0;
+    std::optional<uint32_t> initial_window_size;
 
     static HttpConfig FromJson(const json::object& j);
 };
@@ -107,7 +108,7 @@ struct GrpcConfig {
     std::string service_name;
     std::string user_agent;
     bool multi_mode = false;
-    int initial_window_size = 0;
+    std::optional<uint32_t> initial_window_size;
 
     static GrpcConfig FromJson(const json::object& j);
     [[nodiscard]] std::string RequestPath() const;

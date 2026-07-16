@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "http2_settings.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
@@ -1903,17 +1904,6 @@ net::awaitable<bool> WriteGrpcHunkMessage(
         offset += chunk;
     }
     co_return true;
-}
-
-[[nodiscard]] memory::ByteVector EncodeSettingsPayload(uint32_t initial_window) {
-    memory::ByteVector payload;
-    if (initial_window > 0) {
-        payload.resize(6);
-        payload[0] = 0;
-        payload[1] = 4; // SETTINGS_INITIAL_WINDOW_SIZE
-        WriteU32(payload.data() + 2, initial_window);
-    }
-    return payload;
 }
 
 size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept {
@@ -4185,10 +4175,7 @@ const TcpStream* GrpcServerSubStream::BaseTcpStream() const {
 }
 
 [[nodiscard]] uint32_t GrpcInitialWindow(const GrpcConfig& cfg) noexcept {
-    if (cfg.initial_window_size > 0) {
-        return static_cast<uint32_t>(cfg.initial_window_size);
-    }
-    return kGrpcInitialWindow;
+    return cfg.initial_window_size.value_or(kGrpcInitialWindow);
 }
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
@@ -4205,7 +4192,8 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto settings = EncodeSettingsPayload(GrpcInitialWindow(cfg));
+    auto settings = transport::internet::EncodeInitialWindowSetting(
+        GrpcInitialWindow(cfg));
     if (!co_await WriteH2Frame(
             *stream,
             H2FrameType::SETTINGS,
@@ -4298,7 +4286,8 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    auto settings = EncodeSettingsPayload(GrpcInitialWindow(cfg));
+    auto settings = transport::internet::EncodeInitialWindowSetting(
+        GrpcInitialWindow(cfg));
     if (!co_await WriteH2Frame(
             *stream,
             H2FrameType::SETTINGS,
@@ -4339,10 +4328,7 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
 }
 
 [[nodiscard]] uint32_t HttpInitialWindow(const HttpConfig& cfg) noexcept {
-    if (cfg.initial_window_size > 0) {
-        return static_cast<uint32_t>(cfg.initial_window_size);
-    }
-    return kGrpcInitialWindow;
+    return cfg.initial_window_size.value_or(kGrpcInitialWindow);
 }
 
 [[nodiscard]] bool HttpPathMatches(std::string_view configured,
@@ -4803,7 +4789,8 @@ net::awaitable<TransportBuildResult> DoHttp2ServerHandshakeAfterPreface(
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
     const XHttpConfig* xhttp_config = nullptr) {
-    auto settings = EncodeSettingsPayload(HttpInitialWindow(cfg));
+    auto settings = transport::internet::EncodeInitialWindowSetting(
+        HttpInitialWindow(cfg));
     if (!co_await WriteH2Frame(
             *stream,
             H2FrameType::SETTINGS,
@@ -5272,7 +5259,8 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    auto settings = EncodeSettingsPayload(HttpInitialWindow(cfg));
+    auto settings = transport::internet::EncodeInitialWindowSetting(
+        HttpInitialWindow(cfg));
     if (!co_await WriteH2Frame(
             *stream,
             H2FrameType::SETTINGS,

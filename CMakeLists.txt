@@ -274,6 +274,7 @@ set(CNODE_SOURCES
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/routing_ip_network.cpp
+    src/infra/http2_initial_window.cpp
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
     src/infra/config_validation.cpp
@@ -298,6 +299,7 @@ set(CNODE_SOURCES
     src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
+    src/transport/internet/http2_settings.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/outbound_target_builder.cpp
@@ -835,6 +837,25 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_json_port_test
         COMMAND cnode_json_port_test)
+
+    add_executable(cnode_http2_initial_window_test
+        tests/http2_initial_window_test.cpp
+        src/infra/http2_initial_window.cpp
+        src/infra/json.cpp
+        src/transport/internet/http2_settings.cpp
+    )
+    target_include_directories(cnode_http2_initial_window_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_compile_options(cnode_http2_initial_window_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_http2_initial_window_test
+        COMMAND cnode_http2_initial_window_test)
 
     add_executable(cnode_routing_ip_network_test
         tests/routing_ip_network_test.cpp

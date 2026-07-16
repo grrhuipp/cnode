@@ -210,6 +210,21 @@ expect_rejected(nested_xhttp_download_settings "{}" "outbounds.json"
 expect_started(valid_xhttp_split_download
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-xhttp-split","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(non_integer_grpc_initial_window "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":"65535"}}}]]=])
+expect_rejected(negative_grpc_initial_window "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":-1}}}]]=])
+expect_rejected(overflow_grpc_initial_window "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":2147483648}}}]]=])
+expect_rejected(conflicting_grpc_initial_windows "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":65535,"initial_window_size":65536}}}]]=])
+expect_rejected(legacy_plural_grpc_initial_window "{}" "outbounds.json"
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_windows_size":65535}}}]]=])
+expect_rejected(non_integer_http2_initial_window "{}" "outbounds.json"
+    [=[[{"tag":"bad-h2-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","initialWindowSize":"65535"}}}]]=])
+expect_started(valid_zero_grpc_initial_window
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-grpc-zero-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_window_size":0}}}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"
