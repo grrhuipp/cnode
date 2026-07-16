@@ -21,11 +21,24 @@ auto Parse(std::string_view body) {
         parsed.as_object(), {"camelText", "snake_text"});
 }
 
+auto ParseArray(std::string_view body) {
+    const auto parsed = acpp::json::parse(body);
+    return acpp::ParseAliasedJsonStringArray(
+        parsed.as_object(), {"camelList", "snake_list"});
+}
+
 void CheckInvalid(std::string_view body, std::string_view cause) {
     auto result = Parse(body);
     Check(!result, "invalid JSON string was accepted");
     Check(result.error().find(cause) != std::string::npos,
           "JSON string error lost its cause");
+}
+
+void CheckInvalidArray(std::string_view body, std::string_view cause) {
+    auto result = ParseArray(body);
+    Check(!result, "invalid JSON string array was accepted");
+    Check(result.error().find(cause) != std::string::npos,
+          "JSON string array error lost its cause");
 }
 
 }  // namespace
@@ -51,6 +64,31 @@ int main() {
     CheckInvalid(R"({"camelText":false})", "must be a string");
     CheckInvalid(
         R"({"camelText":"one","snake_text":"two"})", "must match");
+
+    auto absent_array = ParseArray(R"({})");
+    Check(absent_array.has_value() && !*absent_array,
+          "absent string array became configured");
+
+    auto empty_array = ParseArray(R"({"camelList":[]})");
+    Check(empty_array.has_value() && empty_array->has_value() &&
+              (**empty_array).empty(),
+          "explicit empty string array was lost");
+
+    auto array = ParseArray(R"({"snake_list":["one","two"]})");
+    Check(array.has_value() && **array ==
+              std::vector<std::string>({"one", "two"}),
+          "string array value mismatch");
+
+    auto equal_array_aliases = ParseArray(
+        R"({"camelList":["same"],"snake_list":["same"]})");
+    Check(equal_array_aliases.has_value() &&
+              **equal_array_aliases == std::vector<std::string>({"same"}),
+          "equal string array aliases were rejected");
+
+    CheckInvalidArray(R"({"camelList":"one"})", "array of strings");
+    CheckInvalidArray(R"({"camelList":["one",2]})", "only strings");
+    CheckInvalidArray(
+        R"({"camelList":["one"],"snake_list":["two"]})", "must match");
 
     std::cout << "json_string_test: ok\n";
     return 0;

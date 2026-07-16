@@ -201,6 +201,18 @@ expect_rejected(trailing_route_ipv6_prefix "{}" "routing.json"
     [=[{"rules":[{"ip":["2001:db8::/32junk"],"outboundTag":"direct"}]}]=])
 expect_rejected(invalid_route_source_cidr "{}" "routing.json"
     [=[{"rules":[{"source":["not-an-ip"],"outboundTag":"direct"}]}]=])
+expect_rejected(non_string_route_domain_suffix "{}" "routing.json"
+    [=[{"rules":[{"domainSuffix":["example.com",42],"outboundTag":"direct"}]}]=]
+    "domainSuffix must contain only strings")
+expect_rejected(non_array_route_domain_suffix "{}" "routing.json"
+    [=[{"rules":[{"domainSuffix":"example.com","outboundTag":"direct"}]}]=]
+    "domainSuffix must be an array of strings")
+expect_rejected(conflicting_route_domain_suffix_aliases "{}" "routing.json"
+    [=[{"rules":[{"domainSuffix":["one.example"],"domain_suffix":["two.example"],"outboundTag":"direct"}]}]=]
+    "domainSuffix and domain_suffix must match")
+expect_started(equal_route_domain_suffix_aliases
+    [=[{"workers":1}]=] "routing.json"
+    [=[{"rules":[{"domainSuffix":["same.example"],"domain_suffix":["same.example"],"outboundTag":"direct"}]}]=])
 expect_rejected(unsupported_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"does-not-exist"}]]=])
 expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"

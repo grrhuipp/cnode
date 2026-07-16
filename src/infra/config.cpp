@@ -107,17 +107,17 @@ uint16_t required_port(const json::object& obj, std::string_view key) {
     throw std::invalid_argument(std::string(key) + " is invalid");
 }
 
-// 从 JSON array 中提取 string vector
-inline std::vector<std::string> jstr_array(const json::value& v) {
-    std::vector<std::string> result;
-    if (v.is_array()) {
-        for (const auto& item : v.as_array()) {
-            if (item.is_string()) {
-                result.push_back(std::string(item.as_string()));
-            }
-        }
+inline std::vector<std::string> jstr_array(
+    const json::object& obj,
+    std::initializer_list<std::string_view> aliases) {
+    auto parsed = ParseAliasedJsonStringArray(obj, aliases);
+    if (!parsed) {
+        throw std::invalid_argument(std::move(parsed.error()));
     }
-    return result;
+    if (!*parsed) {
+        return {};
+    }
+    return std::move(**parsed);
 }
 
 std::string lower_ascii_copy(std::string value) {
@@ -343,9 +343,8 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     RouteRuleConfig rule;
 
     // 域名匹配 - 处理 xray 格式 (domain 数组可能包含 geosite:xxx, full:xxx 等)
-    if (j.contains("domain") && j.at("domain").is_array()) {
-        for (const auto& item : j.at("domain").as_array()) {
-            std::string val = std::string(item.as_string());
+    if (j.contains("domain")) {
+        for (std::string val : jstr_array(j, {"domain"})) {
 
             // 解析前缀
             if (val.substr(0, 8) == "geosite:") {
@@ -366,55 +365,32 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
 
     // 独立的域名字段
-    if (j.contains("domainSuffix")) {
-        auto arr = jstr_array(j.at("domainSuffix"));
+    if (j.contains("domainSuffix") || j.contains("domain_suffix")) {
+        auto arr = jstr_array(j, {"domainSuffix", "domain_suffix"});
         rule.domain_suffix.insert(rule.domain_suffix.end(), arr.begin(), arr.end());
     }
-    if (j.contains("domain_suffix")) {
-        auto arr = jstr_array(j.at("domain_suffix"));
-        rule.domain_suffix.insert(rule.domain_suffix.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domainKeyword")) {
-        auto arr = jstr_array(j.at("domainKeyword"));
+    if (j.contains("domainKeyword") || j.contains("domain_keyword")) {
+        auto arr = jstr_array(j, {"domainKeyword", "domain_keyword"});
         rule.domain_keyword.insert(rule.domain_keyword.end(), arr.begin(), arr.end());
     }
-    if (j.contains("domain_keyword")) {
-        auto arr = jstr_array(j.at("domain_keyword"));
-        rule.domain_keyword.insert(rule.domain_keyword.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domainFull")) {
-        auto arr = jstr_array(j.at("domainFull"));
+    if (j.contains("domainFull") || j.contains("domain_full")) {
+        auto arr = jstr_array(j, {"domainFull", "domain_full"});
         rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
     }
-    if (j.contains("domain_full")) {
-        auto arr = jstr_array(j.at("domain_full"));
-        rule.domain_full.insert(rule.domain_full.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domainRegex")) {
-        auto arr = jstr_array(j.at("domainRegex"));
-        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domainRegexp")) {
-        auto arr = jstr_array(j.at("domainRegexp"));
-        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domain_regex")) {
-        auto arr = jstr_array(j.at("domain_regex"));
-        rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
-    }
-    if (j.contains("domain_regexp")) {
-        auto arr = jstr_array(j.at("domain_regexp"));
+    if (j.contains("domainRegex") || j.contains("domainRegexp") ||
+        j.contains("domain_regex") || j.contains("domain_regexp")) {
+        auto arr = jstr_array(j, {
+            "domainRegex", "domainRegexp", "domain_regex", "domain_regexp"});
         rule.domain_regex.insert(rule.domain_regex.end(), arr.begin(), arr.end());
     }
     if (j.contains("geosite")) {
-        auto arr = jstr_array(j.at("geosite"));
+        auto arr = jstr_array(j, {"geosite"});
         rule.geosite.insert(rule.geosite.end(), arr.begin(), arr.end());
     }
 
     // IP 匹配 - 处理 xray 格式 (ip 数组可能包含 geoip:xxx)
-    if (j.contains("ip") && j.at("ip").is_array()) {
-        for (const auto& item : j.at("ip").as_array()) {
-            std::string val = std::string(item.as_string());
+    if (j.contains("ip")) {
+        for (std::string val : jstr_array(j, {"ip"})) {
 
             if (val.substr(0, 6) == "geoip:") {
                 rule.geoip.push_back(val.substr(6));
@@ -424,7 +400,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         }
     }
     if (j.contains("geoip")) {
-        auto arr = jstr_array(j.at("geoip"));
+        auto arr = jstr_array(j, {"geoip"});
         rule.geoip.insert(rule.geoip.end(), arr.begin(), arr.end());
     }
 
@@ -451,11 +427,12 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     auto parse_str_or_array = [&](std::string_view key) -> std::vector<std::string> {
         auto* p = j.if_contains(key);
         if (!p) return {};
-        if (p->is_array()) return jstr_array(*p);
+        if (p->is_array()) return jstr_array(j, {key});
         if (p->is_string()) return split_comma(std::string(p->as_string()));
         if (p->is_int64()) return {std::to_string(p->as_int64())};
         if (p->is_uint64()) return {std::to_string(p->as_uint64())};
-        return {};
+        throw std::invalid_argument(std::format(
+            "routing {} must be a string, integer, or array of strings", key));
     };
 
     // 端口（支持 Xray 格式: "53,443,1000-2000"）
@@ -483,7 +460,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 来源 IP/CIDR（Xray source 字段）
     if (j.contains("source") && j.at("source").is_array()) {
-        for (const auto& value : jstr_array(j.at("source"))) {
+        for (const auto& value : jstr_array(j, {"source"})) {
             rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
         }
     } else {
@@ -758,23 +735,9 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "REALITY xver 1 and 2 are not supported; PROXY protocol forwarding "
             "to the REALITY target is not implemented");
     }
-    if (auto* p = j.if_contains("serverNames"); p && p->is_array()) {
-        cfg.server_names = jstr_array(*p);
-    }
-    if (cfg.server_names.empty()) {
-        if (auto* p = j.if_contains("server_names"); p && p->is_array()) {
-            cfg.server_names = jstr_array(*p);
-        }
-    }
+    cfg.server_names = jstr_array(j, {"serverNames", "server_names"});
     cfg.private_key = jstr(j, {"privateKey", "private_key"}, "");
-    if (auto* p = j.if_contains("shortIds"); p && p->is_array()) {
-        cfg.short_ids = jstr_array(*p);
-    }
-    if (cfg.short_ids.empty()) {
-        if (auto* p = j.if_contains("short_ids"); p && p->is_array()) {
-            cfg.short_ids = jstr_array(*p);
-        }
-    }
+    cfg.short_ids = jstr_array(j, {"shortIds", "short_ids"});
     cfg.min_client_ver = jstr(j, {"minClientVer", "min_client_ver"}, "");
     cfg.max_client_ver = jstr(j, {"maxClientVer", "max_client_ver"}, "");
     auto max_time_diff = ParseAliasedJsonUint64(
@@ -876,9 +839,7 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
         cfg.tls.server_name    = jstr(t, "serverName", "");
         cfg.tls.allow_insecure = jbool(t, {"allowInsecure"}, false);
         // ALPN
-        if (auto* ap = t.if_contains("alpn"); ap && ap->is_array()) {
-            cfg.tls.alpn = jstr_array(*ap);
-        }
+        cfg.tls.alpn = jstr_array(t, {"alpn"});
         // 证书（服务端）
         auto* certs = t.if_contains("certificates");
         if (certs && certs->is_array() && !certs->as_array().empty()) {
@@ -1234,16 +1195,10 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         if (!p || !p->is_object()) return;
         const auto& s = p->as_object();
         cfg.sniffing.enabled = jbool(s, {"enabled"}, true);
-        if (s.contains("destOverride")) {
-            cfg.sniffing.dest_override = jstr_array(s.at("destOverride"));
-        } else if (s.contains("dest_override")) {
-            cfg.sniffing.dest_override = jstr_array(s.at("dest_override"));
-        }
-        if (s.contains("domainsExcluded")) {
-            cfg.sniffing.domains_excluded = jstr_array(s.at("domainsExcluded"));
-        } else if (s.contains("domains_excluded")) {
-            cfg.sniffing.domains_excluded = jstr_array(s.at("domains_excluded"));
-        }
+        cfg.sniffing.dest_override =
+            jstr_array(s, {"destOverride", "dest_override"});
+        cfg.sniffing.domains_excluded =
+            jstr_array(s, {"domainsExcluded", "domains_excluded"});
     };
     parse_sniffing("sniffing");
 
