@@ -3,6 +3,7 @@
 
 #include "acppnode/infra/json.hpp"
 #include "../app/proxyman/outbound/source_config.hpp"
+#include "config_semantics.hpp"
 
 #include <fstream>
 #include <iterator>
@@ -275,6 +276,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         }
         cfg.prepared_outbounds_.push_back(std::move(*prepared));
         LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
+    }
+
+    for (const auto& ignored : IgnoreUnknownRoutingRules(
+             cfg.prepared_outbounds_, cfg.routing_.rules)) {
+        LOG_WARN("config.routing ignored rule={} unknown_outbound={}",
+                 ignored.index, ignored.tag);
     }
 
     auto geoip_path = config_dir / constants::paths::kGeoIpFile;

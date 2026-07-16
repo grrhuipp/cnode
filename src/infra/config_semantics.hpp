@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace acpp {
 
@@ -28,6 +29,11 @@ struct ConfigSemanticValidation {
     [[nodiscard]] bool Ok() const noexcept {
         return error == ConfigSemanticError::None;
     }
+};
+
+struct IgnoredRouteRule {
+    size_t index = 0;
+    std::string tag;
 };
 
 enum class StaticInboundSemanticError {
@@ -52,6 +58,13 @@ struct StaticInboundSemanticValidation {
 [[nodiscard]] ConfigSemanticValidation ValidateOutboundRoutingSemantics(
     std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
     std::span<const RouteRuleConfig> rules);
+
+// A routing sidecar may outlive one or more removed outbounds. Those stale
+// rules are unusable, but must not prevent the rest of the node from starting.
+// Remove them during cold-path normalization before publishing the runtime.
+[[nodiscard]] std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
+    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::vector<RouteRuleConfig>& rules);
 
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);

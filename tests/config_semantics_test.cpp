@@ -61,43 +61,50 @@ int main() {
     if (result.error != ConfigSemanticError::UnknownRouteOutboundTag ||
         result.index != 0 || result.tag != "m2") return 5;
 
-    rules[0] = Rule("direct");
+    rules.push_back(Rule("direct"));
+    rules.push_back(Rule("missing"));
+    const auto ignored = acpp::IgnoreUnknownRoutingRules(outbounds, rules);
+    if (ignored.size() != 2 || ignored[0].index != 0 ||
+        ignored[0].tag != "m2" || ignored[1].index != 2 ||
+        ignored[1].tag != "missing") return 6;
+    if (rules.size() != 1 || rules[0].outbound_tag != "direct") return 7;
+
     result = acpp::ValidateOutboundRoutingSemantics(outbounds, rules);
-    if (!result.Ok()) return 6;
+    if (!result.Ok()) return 8;
 
     std::vector<acpp::StaticInboundConfig> inbounds;
     inbounds.push_back(Inbound("first", "127.0.0.1", 0));
     auto inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::InvalidPort ||
-        inbound_result.index != 0) return 7;
+        inbound_result.index != 0) return 9;
 
     inbounds[0] = Inbound("", "127.0.0.1", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::EmptyTag ||
-        inbound_result.index != 0) return 8;
+        inbound_result.index != 0) return 10;
 
     inbounds[0] = Inbound("same", "127.0.0.1", 12001);
     inbounds.push_back(Inbound("same", "127.0.0.2", 12001));
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::DuplicateTag ||
         inbound_result.index != 1 || inbound_result.conflicting_index != 0 ||
-        inbound_result.detail != "same") return 9;
+        inbound_result.detail != "same") return 11;
 
     inbounds[1] = Inbound("second", "127.0.0.1", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::DuplicateEndpoint ||
-        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 10;
+        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 12;
 
     inbounds[0] = Inbound("first", "auto", 12001);
     inbounds[1] = Inbound("second", "0.0.0.0", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::DuplicateEndpoint ||
-        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 11;
+        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 13;
 
     inbounds[0] = Inbound("first", "127.0.0.1", 12001);
     inbounds[1] = Inbound("second", "127.0.0.2", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
-    if (!inbound_result.Ok()) return 12;
+    if (!inbound_result.Ok()) return 14;
 
     return 0;
 }

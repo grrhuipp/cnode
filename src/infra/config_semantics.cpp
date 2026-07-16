@@ -6,6 +6,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace acpp {
 
@@ -53,6 +54,33 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
     }
 
     return {};
+}
+
+std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
+    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::vector<RouteRuleConfig>& rules) {
+    std::unordered_set<std::string_view> tags;
+    tags.reserve(outbounds.size());
+    for (const auto& outbound : outbounds) {
+        tags.insert(outbound.tag);
+    }
+
+    std::vector<IgnoredRouteRule> ignored;
+    ignored.reserve(rules.size());
+    size_t index = 0;
+    std::erase_if(rules, [&](const RouteRuleConfig& rule) {
+        const bool unknown = !rule.outbound_tag.empty() &&
+                             !tags.contains(rule.outbound_tag);
+        if (unknown) {
+            ignored.push_back(IgnoredRouteRule{
+                .index = index,
+                .tag = rule.outbound_tag,
+            });
+        }
+        ++index;
+        return unknown;
+    });
+    return ignored;
 }
 
 StaticInboundSemanticValidation ValidateStaticInboundSemantics(
