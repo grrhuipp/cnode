@@ -1442,6 +1442,12 @@ if(CNODE_BUILD_TESTS)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_public_surface_contract_test.cmake)
 
+    add_test(
+        NAME cnode_worker_runtime_transaction_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_runtime_transaction_contract_test.cmake)
+
     add_executable(cnode_protocol_registration_test
         tests/protocol_registration_test.cpp
         src/app/proxyman/inbound/factory.cpp

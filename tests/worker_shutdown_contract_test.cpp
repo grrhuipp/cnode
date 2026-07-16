@@ -13,6 +13,10 @@ static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().AddOutboundTask(
         std::declval<acpp::proxyman::outbound::PreparedOutboundConfig>())),
     acpp::net::awaitable<void>>);
+static_assert(std::same_as<
+    decltype(std::declval<acpp::Worker&>().UnregisterListenerTask(
+        std::declval<std::string>())),
+    acpp::net::awaitable<void>>);
 static_assert(noexcept(std::declval<acpp::app::router::Router&>().SetDefaultOutbound(
     std::declval<std::string>())));
 

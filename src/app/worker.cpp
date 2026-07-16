@@ -56,6 +56,7 @@ struct Worker::ListenerSlot {
 struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     using ListenerSlotMap =
         memory::ThreadLocalUnorderedMap<std::string, ListenerSlot>;
+    using ListenerKeys = memory::ThreadLocalVector<std::string>;
 
     memory::ThreadLocalUnorderedMap<std::string, std::string> tcp_listener_tags;
     ListenerSlotMap listener_slots;
@@ -64,14 +65,17 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         udp_workers;
 
     [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
-    void StopListening(Worker& worker, const std::string& tag);
+    [[nodiscard]] ListenerKeys CollectTcpListenerKeys(const std::string& tag) const;
+    void StopListening(const std::string& tag,
+                       ListenerKeys listener_keys) noexcept;
     [[nodiscard]] bool StartUdpListening(
         Worker& worker,
         const PortBinding& binding,
         std::unique_ptr<proxyman::inbound::UdpHandler> handler);
-    void StopUdpListening(Worker& worker, const std::string& tag);
-    void Shutdown(Worker& worker);
-    void RetireInboundHandler(Worker& worker, const std::string& tag);
+    [[nodiscard]] ListenerKeys CollectUdpSocketKeys(const std::string& tag) const;
+    void StopUdpListening(const std::string& tag,
+                          ListenerKeys socket_keys) noexcept;
+    void Shutdown();
     void DrainRetiredHandlersIfIdle(Worker& worker);
 
     net::awaitable<void> AcceptLoop(
@@ -314,7 +318,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         [&](const auto& item) { return item.second == binding.tag; });
     if (replacing) {
         LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
-        StopListening(worker, binding.tag);
+        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
     }
 
     auto* inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
@@ -434,13 +438,20 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     return true;
 }
 
-void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag) {
-    memory::ThreadLocalVector<std::string> listener_keys;
+Worker::ListenerState::ListenerKeys
+Worker::ListenerState::CollectTcpListenerKeys(const std::string& tag) const {
+    ListenerKeys listener_keys;
     for (const auto& [listener_key, listener_tag] : tcp_listener_tags) {
         if (listener_tag == tag) {
             listener_keys.push_back(listener_key);
         }
     }
+    return listener_keys;
+}
+
+void Worker::ListenerState::StopListening(
+    const std::string& tag,
+    ListenerKeys listener_keys) noexcept {
     if (listener_keys.empty()) return;
 
     auto slot_it = listener_slots.find(tag);
@@ -451,8 +462,6 @@ void Worker::ListenerState::StopListening(Worker& worker, const std::string& tag
         tcp_listener_tags.erase(listener_key);
     }
     MaybeShrinkHashContainer(tcp_listener_tags, 8);
-    LOG_DEBUG("worker.listener stopped worker={} tag={} sockets={}",
-              worker.id_, tag, listener_keys.size());
 }
 
 proxyman::inbound::UdpWorker*
@@ -481,14 +490,20 @@ Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) c
     return worker_it->second.get();
 }
 
-void Worker::ListenerState::StopUdpListening(Worker& worker, const std::string& tag) {
-    memory::ThreadLocalVector<std::string> socket_keys;
+Worker::ListenerState::ListenerKeys
+Worker::ListenerState::CollectUdpSocketKeys(const std::string& tag) const {
+    ListenerKeys socket_keys;
     for (const auto& [socket_key, socket_tag] : udp_socket_tags) {
         if (socket_tag == tag) {
             socket_keys.push_back(socket_key);
         }
     }
+    return socket_keys;
+}
 
+void Worker::ListenerState::StopUdpListening(
+    const std::string& tag,
+    ListenerKeys socket_keys) noexcept {
     for (const auto& socket_key : socket_keys) {
         if (auto* udp_worker = FindUdpWorkerBySocketKey(socket_key)) {
             udp_worker->CloseSocket(socket_key);
@@ -502,18 +517,20 @@ void Worker::ListenerState::StopUdpListening(Worker& worker, const std::string& 
         it->second->Close();
         udp_workers.erase(it);
     }
-    (void)worker;
 }
 
-void Worker::ListenerState::Shutdown(Worker& worker) {
+void Worker::ListenerState::Shutdown() {
     while (!tcp_listener_tags.empty()) {
-        StopListening(worker, tcp_listener_tags.begin()->second);
+        const std::string tag = tcp_listener_tags.begin()->second;
+        StopListening(tag, CollectTcpListenerKeys(tag));
     }
     while (!udp_workers.empty()) {
-        StopUdpListening(worker, udp_workers.begin()->first);
+        const std::string tag = udp_workers.begin()->first;
+        StopUdpListening(tag, CollectUdpSocketKeys(tag));
     }
     while (!udp_socket_tags.empty()) {
-        StopUdpListening(worker, udp_socket_tags.begin()->second);
+        const std::string tag = udp_socket_tags.begin()->second;
+        StopUdpListening(tag, CollectUdpSocketKeys(tag));
     }
 }
 
@@ -792,7 +809,7 @@ net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
 }
 
 net::awaitable<void> Worker::ShutdownTask() {
-    runtime_->listener_state->Shutdown(*this);
+    runtime_->listener_state->Shutdown();
     runtime_->udp_session_manager->StopAll();
 
     // Yield once so listener/session cancellation handlers queued above can
@@ -932,16 +949,6 @@ net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
     co_return;
 }
 
-void Worker::ListenerState::RetireInboundHandler(Worker& worker, const std::string& tag) {
-    auto* retiring = worker.runtime_->inbound_manager->GetHandler(tag);
-    if (auto slot_it = listener_slots.find(tag);
-            slot_it != listener_slots.end() &&
-            slot_it->second.handler == retiring) {
-        slot_it->second.handler = nullptr;
-    }
-    worker.runtime_->inbound_manager->RemoveHandler(tag);
-}
-
 void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
     if (worker.runtime_->active_connections != 0) {
         return;
@@ -953,11 +960,25 @@ void Worker::ListenerState::DrainRetiredHandlersIfIdle(Worker& worker) {
 void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
     auto current_snapshot = runtime_->Snapshot();
     const std::string owned_tag(tag);
-    runtime_->listener_state->StopListening(*this, owned_tag);
-    runtime_->listener_state->StopUdpListening(*this, owned_tag);
-    runtime_->listener_state->RetireInboundHandler(*this, owned_tag);
     auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
     RemoveInboundRuntimeFromSnapshot(*next_snapshot, tag);
+
+    auto tcp_listener_keys =
+        runtime_->listener_state->CollectTcpListenerKeys(owned_tag);
+    auto udp_socket_keys =
+        runtime_->listener_state->CollectUdpSocketKeys(owned_tag);
+
+    auto* retiring = runtime_->inbound_manager->GetHandler(owned_tag);
+    runtime_->inbound_manager->RemoveHandler(owned_tag);
+    if (auto slot_it = runtime_->listener_state->listener_slots.find(owned_tag);
+            slot_it != runtime_->listener_state->listener_slots.end() &&
+            slot_it->second.handler == retiring) {
+        slot_it->second.handler = nullptr;
+    }
+    runtime_->listener_state->StopListening(
+        owned_tag, std::move(tcp_listener_keys));
+    runtime_->listener_state->StopUdpListening(
+        owned_tag, std::move(udp_socket_keys));
     runtime_->StoreSnapshot(std::move(next_snapshot));
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
 }
@@ -1079,7 +1100,7 @@ bool Worker::ListenerState::StartUdpListening(
         [&](const auto& item) { return item.second == binding.tag; });
     if (replacing) {
         LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
-        StopUdpListening(worker, binding.tag);
+        StopUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
     }
 
     auto udp_worker =
