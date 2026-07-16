@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -119,6 +120,32 @@ using UserSet = std::variant<
     PreparedTrojanUsers,
     PreparedShadowsocksUsers,
     PreparedAnyTlsUsers>;
+
+enum class UserProtocol : uint8_t {
+    Vmess,
+    Vless,
+    Trojan,
+    Shadowsocks,
+    AnyTls,
+};
+
+[[nodiscard]] inline UserProtocol UserProtocolOf(const UserSet& users) noexcept {
+    return std::visit([](const auto& value) noexcept {
+        using Users = std::remove_cvref_t<decltype(value)>;
+        if constexpr (std::is_same_v<Users, PreparedVmessUsers>) {
+            return UserProtocol::Vmess;
+        } else if constexpr (std::is_same_v<Users, PreparedVlessUsers>) {
+            return UserProtocol::Vless;
+        } else if constexpr (std::is_same_v<Users, PreparedTrojanUsers>) {
+            return UserProtocol::Trojan;
+        } else if constexpr (std::is_same_v<Users, PreparedShadowsocksUsers>) {
+            return UserProtocol::Shadowsocks;
+        } else {
+            static_assert(std::is_same_v<Users, PreparedAnyTlsUsers>);
+            return UserProtocol::AnyTls;
+        }
+    }, users);
+}
 
 [[nodiscard]] inline bool UserSetEmpty(const UserSet& users) noexcept {
     return std::visit([](const auto& value) { return value.empty(); }, users);

@@ -903,6 +903,7 @@ proxy::vless::inbound::Handler::Process(
 namespace {
 const bool kVlessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vless;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {

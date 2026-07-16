@@ -3,7 +3,6 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/core/constants.hpp"
 
 namespace acpp::trojan {
 
@@ -54,7 +53,7 @@ void Validator::RemoveUsers(std::string_view tag,
 }
 
 void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kTrojan, tag);
+    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::Trojan, tag);
 }
 
 bool Validator::Validate(std::string_view tag, std::string_view hash) const {
@@ -71,7 +70,8 @@ size_t Validator::Size() const {
 }
 
 size_t Validator::SizeForTag(std::string_view tag) const {
-    return proxyman::inbound::UserStore::SizeForProtocolTag(constants::protocol::kTrojan, tag);
+    return proxyman::inbound::UserStore::SizeForProtocolTag(
+        proxyman::inbound::UserProtocol::Trojan, tag);
 }
 
 void Validator::OnUserConnected(std::string_view tag,

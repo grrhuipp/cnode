@@ -152,9 +152,9 @@ public:
                          const UserSet& users);
     static void RemoveUsers(std::string_view tag,
                             const UserSet& users);
-    static void ClearUsers(std::string_view protocol,
+    static void ClearUsers(UserProtocol protocol,
                            std::string_view tag);
-    static void ClearProtocol(std::string_view protocol);
+    static void ClearProtocol(UserProtocol protocol);
     static void ClearAll();
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);
@@ -174,7 +174,7 @@ public:
                    const std::array<uint8_t, 32>& password_hash);
 
     [[nodiscard]] static Stats GetStats();
-    [[nodiscard]] static size_t SizeForProtocolTag(std::string_view protocol,
+    [[nodiscard]] static size_t SizeForProtocolTag(UserProtocol protocol,
                                                    std::string_view tag);
 };
 

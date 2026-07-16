@@ -1,7 +1,5 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/core/constants.hpp"
-
 #include <iostream>
 #include <type_traits>
 #include <variant>
@@ -36,25 +34,36 @@ bool TestTypedUpdatesStayProtocolLocal() {
     UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess-1", 1)}});
     UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}});
 
-    if (UserStore::SizeForProtocolTag(acpp::constants::protocol::kVmess, kTag) != 1 ||
-        UserStore::SizeForProtocolTag(acpp::constants::protocol::kTrojan, kTag) != 1) {
+    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 1 ||
+        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 1) {
         return false;
     }
 
     UserStore::AddUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess-2", 3)}});
-    if (UserStore::SizeForProtocolTag(acpp::constants::protocol::kVmess, kTag) != 2 ||
-        UserStore::SizeForProtocolTag(acpp::constants::protocol::kTrojan, kTag) != 1) {
+    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 2 ||
+        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 1) {
         return false;
     }
 
     UserStore::RemoveUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}});
-    if (UserStore::SizeForProtocolTag(acpp::constants::protocol::kVmess, kTag) != 2 ||
-        UserStore::SizeForProtocolTag(acpp::constants::protocol::kTrojan, kTag) != 0) {
+    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 2 ||
+        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 0) {
         return false;
     }
 
     UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{}});
-    return UserStore::SizeForProtocolTag(acpp::constants::protocol::kVmess, kTag) == 0;
+    return UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) == 0;
+}
+
+bool TestTypedClearStaysProtocolLocal() {
+    constexpr std::string_view kTag = "clear-tag";
+    UserStore::ClearAll();
+    UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess", 1)}});
+    UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}});
+
+    UserStore::ClearUsers(UserProtocol::Vmess, kTag);
+    return UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) == 0 &&
+           UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) == 1;
 }
 
 }  // namespace
@@ -63,6 +72,10 @@ int main() {
     if (!TestTypedUpdatesStayProtocolLocal()) {
         std::cerr << "typed user updates crossed protocol storage boundaries\n";
         return 1;
+    }
+    if (!TestTypedClearStaysProtocolLocal()) {
+        std::cerr << "typed user clear crossed protocol storage boundaries\n";
+        return 2;
     }
     return 0;
 }

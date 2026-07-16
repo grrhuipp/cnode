@@ -379,11 +379,13 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
 }
 
 void Controller::Impl::clearUsers(const std::string& tag, const std::string& protocol) {
-    if (!proxyman::inbound::HasProxy(protocol)) {
+    const auto user_protocol =
+        proxyman::inbound::RegisteredUserProtocol(protocol);
+    if (!user_protocol) {
         return;
     }
 
-    proxyman::inbound::UserStore::ClearUsers(protocol, tag);
+    proxyman::inbound::UserStore::ClearUsers(*user_protocol, tag);
 }
 
 bool Controller::Impl::applyUserList(

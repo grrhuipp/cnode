@@ -1079,6 +1079,7 @@ Handler::Process(
 namespace {
 const bool kInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::AnyTls;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {

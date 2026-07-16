@@ -268,6 +268,7 @@ proxy::vmess::inbound::Handler::Process(
 namespace {
 const bool kVmessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vmess;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {

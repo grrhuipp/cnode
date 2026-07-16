@@ -491,6 +491,7 @@ proxy::trojan::inbound::Handler::Process(
 namespace {
 const bool kTrojanInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
+    reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Trojan;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {

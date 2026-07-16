@@ -2,7 +2,6 @@
 
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/core/constants.hpp"
 
 #include <algorithm>
 
@@ -111,7 +110,8 @@ void Validator::RemoveUsers(std::string_view tag,
 }
 
 void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kShadowsocks, tag);
+    proxyman::inbound::UserStore::ClearUsers(
+        proxyman::inbound::UserProtocol::Shadowsocks, tag);
 }
 
 proxyman::inbound::UserStore::ShadowsocksUsersView
@@ -167,7 +167,7 @@ size_t Validator::Size() const {
 
 size_t Validator::SizeForTag(std::string_view tag) const {
     return proxyman::inbound::UserStore::SizeForProtocolTag(
-        constants::protocol::kShadowsocks, tag);
+        proxyman::inbound::UserProtocol::Shadowsocks, tag);
 }
 
 void Validator::OnUserConnected(std::string_view tag,

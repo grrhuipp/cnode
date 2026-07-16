@@ -1,8 +1,6 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/core/constants.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <utility>
@@ -359,35 +357,47 @@ void UserStore::RemoveUsers(std::string_view tag,
     });
 }
 
-void UserStore::ClearUsers(std::string_view protocol,
+void UserStore::ClearUsers(UserProtocol protocol,
                            std::string_view tag) {
     Publish([&](Snapshot& snapshot) {
-        if (protocol == constants::protocol::kVmess) {
-            snapshot.vmess.erase(std::string(tag));
-        } else if (protocol == constants::protocol::kVless) {
-            snapshot.vless.erase(std::string(tag));
-        } else if (protocol == constants::protocol::kTrojan) {
-            snapshot.trojan.erase(std::string(tag));
-        } else if (protocol == constants::protocol::kShadowsocks) {
-            snapshot.shadowsocks.erase(std::string(tag));
-        } else if (protocol == constants::protocol::kAnyTLS) {
-            snapshot.anytls.erase(std::string(tag));
+        switch (protocol) {
+            case UserProtocol::Vmess:
+                snapshot.vmess.erase(std::string(tag));
+                break;
+            case UserProtocol::Vless:
+                snapshot.vless.erase(std::string(tag));
+                break;
+            case UserProtocol::Trojan:
+                snapshot.trojan.erase(std::string(tag));
+                break;
+            case UserProtocol::Shadowsocks:
+                snapshot.shadowsocks.erase(std::string(tag));
+                break;
+            case UserProtocol::AnyTls:
+                snapshot.anytls.erase(std::string(tag));
+                break;
         }
     });
 }
 
-void UserStore::ClearProtocol(std::string_view protocol) {
+void UserStore::ClearProtocol(UserProtocol protocol) {
     Publish([&](Snapshot& snapshot) {
-        if (protocol == constants::protocol::kVmess) {
-            snapshot.vmess.clear();
-        } else if (protocol == constants::protocol::kVless) {
-            snapshot.vless.clear();
-        } else if (protocol == constants::protocol::kTrojan) {
-            snapshot.trojan.clear();
-        } else if (protocol == constants::protocol::kShadowsocks) {
-            snapshot.shadowsocks.clear();
-        } else if (protocol == constants::protocol::kAnyTLS) {
-            snapshot.anytls.clear();
+        switch (protocol) {
+            case UserProtocol::Vmess:
+                snapshot.vmess.clear();
+                break;
+            case UserProtocol::Vless:
+                snapshot.vless.clear();
+                break;
+            case UserProtocol::Trojan:
+                snapshot.trojan.clear();
+                break;
+            case UserProtocol::Shadowsocks:
+                snapshot.shadowsocks.clear();
+                break;
+            case UserProtocol::AnyTls:
+                snapshot.anytls.clear();
+                break;
         }
     });
 }
@@ -503,23 +513,20 @@ UserStore::Stats UserStore::GetStats() {
     return stats;
 }
 
-size_t UserStore::SizeForProtocolTag(std::string_view protocol,
+size_t UserStore::SizeForProtocolTag(UserProtocol protocol,
                                      std::string_view tag) {
     auto snapshot = LoadSnapshot();
-    if (protocol == constants::protocol::kVmess) {
-        return TagSize(snapshot->vmess, tag);
-    }
-    if (protocol == constants::protocol::kVless) {
-        return TagSize(snapshot->vless, tag);
-    }
-    if (protocol == constants::protocol::kTrojan) {
-        return TagSize(snapshot->trojan, tag);
-    }
-    if (protocol == constants::protocol::kShadowsocks) {
-        return TagSize(snapshot->shadowsocks, tag);
-    }
-    if (protocol == constants::protocol::kAnyTLS) {
-        return TagSize(snapshot->anytls, tag);
+    switch (protocol) {
+        case UserProtocol::Vmess:
+            return TagSize(snapshot->vmess, tag);
+        case UserProtocol::Vless:
+            return TagSize(snapshot->vless, tag);
+        case UserProtocol::Trojan:
+            return TagSize(snapshot->trojan, tag);
+        case UserProtocol::Shadowsocks:
+            return TagSize(snapshot->shadowsocks, tag);
+        case UserProtocol::AnyTls:
+            return TagSize(snapshot->anytls, tag);
     }
     return 0;
 }

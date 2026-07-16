@@ -3,7 +3,6 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/core/constants.hpp"
 
 #include <openssl/evp.h>
 
@@ -60,7 +59,7 @@ void Validator::RemoveUsers(std::string_view tag, const std::vector<UserInfo>& u
 }
 
 void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kAnyTLS, tag);
+    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::AnyTls, tag);
 }
 
 std::shared_ptr<const proxyman::inbound::UserStore::AnyTlsCredential> Validator::Validate(
@@ -74,7 +73,8 @@ size_t Validator::Size() const {
 }
 
 size_t Validator::SizeForTag(std::string_view tag) const {
-    return proxyman::inbound::UserStore::SizeForProtocolTag(constants::protocol::kAnyTLS, tag);
+    return proxyman::inbound::UserStore::SizeForProtocolTag(
+        proxyman::inbound::UserProtocol::AnyTls, tag);
 }
 
 void Validator::OnUserConnected(std::string_view tag,

@@ -4,7 +4,6 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/common/string_hash.hpp"
-#include "acppnode/core/constants.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
 
@@ -218,14 +217,14 @@ void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<Mem
 }
 
 void TimedUserValidator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(constants::protocol::kVmess, tag);
+    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::Vmess, tag);
     impl_->hot_cache.Clear();
     impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
 void TimedUserValidator::Clear() {
-    proxyman::inbound::UserStore::ClearProtocol(constants::protocol::kVmess);
+    proxyman::inbound::UserStore::ClearProtocol(proxyman::inbound::UserProtocol::Vmess);
     impl_->hot_cache.Clear();
     impl_->session_history.Clear();
     impl_->hot_users.reset();
@@ -236,7 +235,8 @@ size_t TimedUserValidator::Size() const {
 }
 
 size_t TimedUserValidator::SizeForTag(std::string_view tag) const {
-    return proxyman::inbound::UserStore::SizeForProtocolTag(constants::protocol::kVmess, tag);
+    return proxyman::inbound::UserStore::SizeForProtocolTag(
+        proxyman::inbound::UserProtocol::Vmess, tag);
 }
 
 std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>

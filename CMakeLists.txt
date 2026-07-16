@@ -1439,6 +1439,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_protocol_registration_test
         tests/protocol_registration_test.cpp
         src/app/proxyman/inbound/factory.cpp
+        src/app/proxyman/inbound/user_store.cpp
         src/app/proxyman/outbound/factory.cpp
     )
     target_include_directories(cnode_protocol_registration_test PRIVATE

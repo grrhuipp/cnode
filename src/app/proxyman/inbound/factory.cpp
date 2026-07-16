@@ -22,8 +22,11 @@ RegistrationMap& Registrations() noexcept {
 bool RegisterProxy(
     std::string_view protocol,
     ProxyRegistration registration) {
+    const bool has_user_builders = registration.build_static_users ||
+                                   registration.build_users;
     if (protocol.empty() || !registration.create_runtime ||
-        !registration.create_tcp_handler) {
+        !registration.create_tcp_handler ||
+        has_user_builders != registration.user_protocol.has_value()) {
         return false;
     }
     return Registrations().try_emplace(
@@ -42,6 +45,13 @@ std::vector<std::string> RegisteredProtocols() {
         result.push_back(name);
     }
     return result;
+}
+
+std::optional<UserProtocol> RegisteredUserProtocol(
+    std::string_view protocol) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    return it == registrations.end() ? std::nullopt : it->second.user_protocol;
 }
 
 std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
@@ -89,7 +99,11 @@ std::optional<UserSet> BuildStaticUsers(
     if (it == registrations.end() || !it->second.build_static_users) {
         return std::nullopt;
     }
-    return it->second.build_static_users(tag, config);
+    auto result = it->second.build_static_users(tag, config);
+    if (result && UserProtocolOf(*result) != *it->second.user_protocol) {
+        return std::nullopt;
+    }
+    return result;
 }
 
 std::optional<UserSet> BuildUsers(
@@ -101,7 +115,11 @@ std::optional<UserSet> BuildUsers(
     if (it == registrations.end() || !it->second.build_users) {
         return std::nullopt;
     }
-    return it->second.build_users(req, users);
+    auto result = it->second.build_users(req, users);
+    if (result && UserProtocolOf(*result) != *it->second.user_protocol) {
+        return std::nullopt;
+    }
+    return result;
 }
 
 }  // namespace acpp::proxyman::inbound
