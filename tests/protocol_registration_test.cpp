@@ -61,12 +61,6 @@ public:
         size_t) override {
         return std::nullopt;
     }
-
-    acpp::buf::MultiBuffer EncodeUdpResponse(
-        acpp::UDPPacketView,
-        const acpp::proxyman::inbound::UdpResponseContext&) const override {
-        return {};
-    }
 };
 
 class DummyOutbound final : public acpp::Outbound {

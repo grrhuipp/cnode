@@ -27,12 +27,19 @@ public:
         size_t) override {
         return std::nullopt;
     }
+};
 
-    acpp::buf::MultiBuffer EncodeUdpResponse(
-        acpp::UDPPacketView,
-        const acpp::proxyman::inbound::UdpResponseContext&) const override {
+class CountingUdpResponseContext final
+    : public acpp::proxyman::inbound::UdpResponseContext {
+public:
+    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView packet) override {
+        ++calls;
+        last_size = packet.data.size();
         return {};
     }
+
+    size_t calls = 0;
+    size_t last_size = 0;
 };
 
 static_assert(noexcept(
@@ -325,9 +332,40 @@ int main() {
         Fail("duplicate attachment replaced the live UDP socket");
     }
 
+    auto response_context = std::make_shared<CountingUdpResponseContext>();
+    acpp::proxyman::inbound::UdpWorker::ClientSession snapshot_reply_session(
+        io_context,
+        acpp::RoutedPacketCallback{
+            [response_context](
+                acpp::UDPPacketView packet,
+                const acpp::udp::endpoint&) {
+                auto encoded = response_context->Encode(packet);
+                encoded.clear();
+            }},
+        reply_endpoint_a,
+        default_owner);
     if (!worker.ReplaceHandler(std::make_unique<DummyUdpHandler>())) {
         Fail("valid UDP handler replacement was rejected");
     }
+    acpp::buf::BufferGuard snapshot_reply{acpp::buf::Buffer::New()};
+    if (!snapshot_reply) Fail("failed to allocate snapshot UDP reply");
+    snapshot_reply->Tail()[0] = 0x55;
+    snapshot_reply->Produce(1);
+    snapshot_reply->SetUDP(callback_source);
+    bool snapshot_reply_failed = false;
+    acpp::net::co_spawn(
+        io_context,
+        snapshot_reply_session.WriteMultiBuffer(
+            acpp::buf::MultiBuffer{snapshot_reply.release()}),
+        [&](std::exception_ptr error) {
+            snapshot_reply_failed = error != nullptr;
+        });
+    io_context.run();
+    if (snapshot_reply_failed || response_context->calls != 1 ||
+        response_context->last_size != 1) {
+        Fail("UDP handler replacement changed a live response context");
+    }
+    io_context.restart();
     if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
         Fail("UDP handler replacement disturbed the live socket");
     }

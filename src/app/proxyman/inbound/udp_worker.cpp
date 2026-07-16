@@ -379,22 +379,18 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->inbound.protocol = receiver->protocol;
         ctx->content.speed_limit = decoded->speed_limit;
 
-        auto response_context = decoded->response_context;
+        auto response_context = std::move(decoded->response_context);
         udp::socket* sock = datagram.sock;
         auto& reply_sink = datagram.reply_sink;
         const uint32_t worker_id = datagram.worker_id;
 
-        auto reply_cb = [this,
-                         socket_key,
+        auto reply_cb = [socket_key,
                          sock,
                          response_context = std::move(response_context),
                          &reply_sink,
                          worker_id](UDPPacketView pkt,
                                     const udp::endpoint& reply_endpoint) mutable {
-            if (!impl_->proxy) {
-                return;
-            }
-            auto payload = impl_->proxy->EncodeUdpResponse(pkt, *response_context);
+            auto payload = response_context->Encode(pkt);
             if (payload.empty()) {
                 return;
             }

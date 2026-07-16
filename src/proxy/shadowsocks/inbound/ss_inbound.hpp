@@ -42,10 +42,6 @@ public:
         const uint8_t* data,
         size_t len) override;
 
-    [[nodiscard]] ::acpp::buf::MultiBuffer EncodeUdpResponse(
-        ::acpp::UDPPacketView packet,
-        const ::acpp::proxyman::inbound::UdpResponseContext& response_context) const override;
-
 private:
     ::acpp::ss::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;

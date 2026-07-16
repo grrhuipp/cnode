@@ -298,6 +298,13 @@ if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "Shadowsocks UDP sessions must bind protocol session IDs to authenticated credentials")
 endif()
+if(SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "Handler::EncodeUdpResponse" OR
+   SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "dynamic_cast.*UdpResponseContext")
+    message(FATAL_ERROR
+        "Shadowsocks UDP response encoding must belong to its captured session context")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES
@@ -351,7 +358,10 @@ if(NOT UDP_SESSION_SOURCE MATCHES
 endif()
 set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
+set(UDP_HANDLER_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp")
 file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
+file(READ "${UDP_HANDLER_HEADER_PATH}" UDP_HANDLER_HEADER_SOURCE)
 if(NOT UDP_WORKER_SOURCE MATCHES
     "datagram[.]buffer_count == 1" OR
    NOT UDP_WORKER_SOURCE MATCHES
@@ -372,6 +382,12 @@ if(NOT UDP_WORKER_SOURCE MATCHES
         "[!]session_it->second[.]link->Owns[(]session_owner[)]")
     message(FATAL_ERROR
         "UDP session key collisions must not cross authenticated owners")
+endif()
+if(UDP_HANDLER_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
+   UDP_WORKER_SOURCE MATCHES "impl_->proxy->EncodeUdpResponse" OR
+   NOT UDP_WORKER_SOURCE MATCHES "response_context->Encode[(]pkt[)]")
+    message(FATAL_ERROR
+        "live UDP sessions must encode replies through their captured response context")
 endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)

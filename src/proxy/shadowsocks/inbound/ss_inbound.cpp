@@ -74,28 +74,13 @@ public:
     ShadowsocksUdpResponseContext(std::shared_ptr<ss::Ss2022UdpSessionState> session)
         : ss2022_session_(std::move(session)) {}
 
-    [[nodiscard]] const ss::KeyBytes& ReplyKey() const noexcept {
-        return reply_key_;
-    }
-
-    [[nodiscard]] const ss::SsCipherInfo& CipherInfo() const noexcept {
-        return cipher_info_;
-    }
-
-    [[nodiscard]] ss::Ss2022UdpSessionState* Ss2022Session() const noexcept {
-        return ss2022_session_.get();
-    }
+    [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
 
 private:
     ss::KeyBytes reply_key_;
     ss::SsCipherInfo cipher_info_;
     std::shared_ptr<ss::Ss2022UdpSessionState> ss2022_session_;
 };
-
-[[nodiscard]] const ShadowsocksUdpResponseContext* AsShadowsocksUdpContext(
-    const proxyman::inbound::UdpResponseContext& context) noexcept {
-    return dynamic_cast<const ShadowsocksUdpResponseContext*>(&context);
-}
 
 }  // namespace
 
@@ -358,19 +343,14 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     return result;
 }
 
-buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
-    UDPPacketView packet,
-    const proxyman::inbound::UdpResponseContext& response_context) const {
-    const auto* ss_context = AsShadowsocksUdpContext(response_context);
-    if (!ss_context) {
-        return {};
-    }
-    if (auto* session = ss_context->Ss2022Session()) {
+buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
+    if (ss2022_session_) {
+        auto& session = *ss2022_session_;
         const size_t encoded_len = ss::Encode2022UdpResponsePacketTo(
             packet.target,
             packet.data.data(),
             packet.data.size(),
-            *session,
+            session,
             nullptr,
             0);
         if (encoded_len == 0) {
@@ -386,7 +366,7 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
                 packet.target,
                 packet.data.data(),
                 packet.data.size(),
-                *session,
+                session,
                 payload->Tail().data(),
                 payload->Available());
             if (written != encoded_len) {
@@ -401,7 +381,7 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
             packet.target,
             packet.data.data(),
             packet.data.size(),
-            *session,
+            session,
             scratch.data(),
             scratch.size());
         if (written != encoded_len) {
@@ -418,16 +398,14 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
         return payload;
     }
 
-    const auto& reply_key = ss_context->ReplyKey();
-    const auto& cipher = ss_context->CipherInfo();
     const size_t encoded_len = ss::EncodeUdpPacketTo(
         packet.target,
         packet.data.data(),
         packet.data.size(),
-        reply_key.span(),
-        cipher.type,
-        cipher.key_size,
-        cipher.salt_size,
+        reply_key_.span(),
+        cipher_info_.type,
+        cipher_info_.key_size,
+        cipher_info_.salt_size,
         nullptr,
         0);
     if (encoded_len == 0) {
@@ -443,10 +421,10 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
             packet.target,
             packet.data.data(),
             packet.data.size(),
-            reply_key.span(),
-            cipher.type,
-            cipher.key_size,
-            cipher.salt_size,
+            reply_key_.span(),
+            cipher_info_.type,
+            cipher_info_.key_size,
+            cipher_info_.salt_size,
             payload->Tail().data(),
             payload->Available());
         if (written != encoded_len) {
@@ -461,10 +439,10 @@ buf::MultiBuffer proxy::shadowsocks::inbound::Handler::EncodeUdpResponse(
         packet.target,
         packet.data.data(),
         packet.data.size(),
-        reply_key.span(),
-        cipher.type,
-        cipher.key_size,
-        cipher.salt_size,
+        reply_key_.span(),
+        cipher_info_.type,
+        cipher_info_.key_size,
+        cipher_info_.salt_size,
         scratch.data(),
         scratch.size());
     if (written != encoded_len) {
