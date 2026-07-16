@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "http2_settings.hpp"
+#include "tls_context_cache_key.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
@@ -75,67 +76,6 @@ void InsertTlsContext(Cache& cache,
     return Base64Encode(sha1, sizeof(sha1));
 }
 
-std::string MakeTlsCacheKey(std::string_view role, const TlsConfig& config) {
-    std::string key;
-    key.reserve(256);
-    key.append(role);
-    key.push_back('|');
-    key.append(config.cert_file);
-    key.push_back('|');
-    key.append(config.key_file);
-    key.push_back('|');
-    key.append(config.ca_file);
-    key.push_back('|');
-    key.append(config.server_name);
-    key.push_back('|');
-    key.append(config.allow_insecure ? "1" : "0");
-    key.push_back('|');
-    key.push_back(static_cast<char>(config.min_version));
-    key.push_back('|');
-    key.push_back(static_cast<char>(config.max_version));
-    for (const auto& proto : config.alpn) {
-        key.push_back('|');
-        key.append(proto);
-    }
-
-    return key;
-}
-
-std::string MakeRealityCacheKey(const RealityConfig& reality,
-                                const TlsConfig& tls_config) {
-    std::string key = MakeTlsCacheKey("server-reality", tls_config);
-    key.push_back('|');
-    key.append(reality.private_key);
-    key.push_back('|');
-    key.append(reality.min_client_ver);
-    key.push_back('|');
-    key.append(reality.max_client_ver);
-    key.push_back('|');
-    key.append(std::to_string(reality.max_time_diff));
-    for (const auto& name : reality.server_names) {
-        key.push_back('|');
-        key.append(name);
-    }
-    key.push_back('|');
-    for (const auto& short_id : reality.short_ids) {
-        key.push_back(',');
-        key.append(short_id);
-    }
-    return key;
-}
-
-std::string MakeRealityClientCacheKey(const RealityConfig& reality,
-                                      const TlsConfig& tls_config) {
-    std::string key = MakeTlsCacheKey("client-reality", tls_config);
-    key.push_back('|');
-    key.append(reality.public_key);
-    key.push_back('|');
-    key.append(reality.server_name);
-    key.push_back('|');
-    key.append(reality.short_id);
-    return key;
-}
-
 SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     thread_local TlsContextCache cache;
     struct LastHit {
@@ -152,8 +92,8 @@ SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     }
 
     std::string key = has_certificate
-        ? MakeTlsCacheKey("server", config)
-        : MakeTlsCacheKey("server-auto-sign", config);
+        ? transport::internet::MakeTlsContextCacheKey("server", config)
+        : transport::internet::MakeTlsContextCacheKey("server-auto-sign", config);
 
     if (auto it = cache.find(key); it != cache.end()) {
         last = LastHit{&config, has_certificate, it->second.get()};
@@ -190,7 +130,8 @@ SslContext* AcquireServerRealityContext(const RealityConfig& reality,
         return last.ctx;
     }
 
-    std::string key = MakeRealityCacheKey(reality, tls_config);
+    std::string key = transport::internet::MakeRealityServerContextCacheKey(
+        reality, tls_config);
     if (auto it = cache.find(key); it != cache.end()) {
         last = LastHit{&reality, &tls_config, it->second.get()};
         return it->second.get();
@@ -216,7 +157,8 @@ SslContext* AcquireClientTlsContext(const TlsConfig& config) {
         return last_ctx;
     }
 
-    std::string key = MakeTlsCacheKey("client", config);
+    std::string key =
+        transport::internet::MakeTlsContextCacheKey("client", config);
 
     if (auto it = cache.find(key); it != cache.end()) {
         last_config = &config;
@@ -249,7 +191,8 @@ SslContext* AcquireClientRealityContext(const RealityConfig& reality,
         return last.ctx;
     }
 
-    std::string key = MakeRealityClientCacheKey(reality, tls_config);
+    std::string key = transport::internet::MakeRealityClientContextCacheKey(
+        reality, tls_config);
     if (auto it = cache.find(key); it != cache.end()) {
         last = LastHit{&reality, &tls_config, it->second.get()};
         return it->second.get();

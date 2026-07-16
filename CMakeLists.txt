@@ -305,6 +305,7 @@ set(CNODE_SOURCES
     src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http2_settings.cpp
+    src/transport/internet/tls_context_cache_key.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
     src/transport/internet/outbound_target_builder.cpp
@@ -603,6 +604,27 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_tls_client_certificate_test
         COMMAND cnode_tls_client_certificate_test)
+
+    add_executable(cnode_tls_context_cache_key_test
+        tests/tls_context_cache_key_test.cpp
+        src/transport/internet/tls_context_cache_key.cpp
+    )
+    target_include_directories(cnode_tls_context_cache_key_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_link_libraries(cnode_tls_context_cache_key_test PRIVATE asio::asio)
+    if(WIN32)
+        target_compile_definitions(
+            cnode_tls_context_cache_key_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_tls_context_cache_key_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_tls_context_cache_key_test
+        COMMAND cnode_tls_context_cache_key_test)
 
     add_executable(cnode_uot_ss2022_test
         tests/uot_ss2022_test.cpp
