@@ -84,8 +84,6 @@ public:
 
     void Close() noexcept;
 
-    void SetBanTrackingEnabled(bool enabled) noexcept;
-
     void ProcessDatagram(const UdpDatagramContext& datagram);
 
     [[nodiscard]] bool EnqueueReply(const std::string& socket_key,

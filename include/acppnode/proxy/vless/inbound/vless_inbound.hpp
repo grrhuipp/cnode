@@ -34,10 +34,6 @@ public:
         const ::acpp::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
-    void SetBanTrackingEnabled(bool enabled) noexcept override {
-        ban_tracking_enabled_ = enabled;
-    }
-
 private:
     ::acpp::vless::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
@@ -45,7 +41,6 @@ private:
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption_;
     std::unique_ptr<::acpp::vless::VlessEncryptionServerTicketStore>
         decryption_tickets_;
-    bool ban_tracking_enabled_ = false;
 };
 
 }  // namespace acpp::proxy::vless::inbound

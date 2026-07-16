@@ -39,15 +39,10 @@ public:
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
-    void SetBanTrackingEnabled(bool enabled) noexcept override {
-        ban_tracking_enabled_ = enabled;
-    }
-
 private:
     ::acpp::anytls::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
-    bool ban_tracking_enabled_ = false;
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
 };

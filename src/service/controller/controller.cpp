@@ -320,11 +320,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                             }
                             restored = restored && inbound_restored;
                             inbound_started_[panel] = restored;
-                            if (restored && ban_tracking_tags_.insert(old_tag).second) {
-                                for (const auto& worker : workers_) {
-                                    worker->EnableBanTrackingAsync(old_tag);
-                                }
-                            }
                         }
                         co_return restored;
                     } catch (const std::exception& e) {
@@ -386,14 +381,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 LOG_CONSOLE(
                     "node config_committed panel={} node={} tag={} replaced={}",
                     panel_name, node_id, tag, old_config.has_value());
-            }
-
-            if (ban_tracking_tags_.insert(tag).second) {
-                for (const auto& worker : workers_) {
-                    worker->EnableBanTrackingAsync(tag);
-                }
-                LOG_CONSOLE("node ban_tracking=enabled panel={} node={} tag={}",
-                            panel_name, node_id, tag);
             }
 
             co_await userInfoMonitor(panel, tag, protocol);

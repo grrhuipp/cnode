@@ -100,8 +100,7 @@ net::awaitable<bool> SetupWorkerInbounds(
                 inbound.protocol,
                 connection_limiter,
                 inbound.build_request,
-                std::move(receiver),
-                true)) {
+                std::move(receiver))) {
             co_await RemoveInstalledInbounds(worker, installed, inbound.tag);
             co_return false;
         }
@@ -120,8 +119,7 @@ net::awaitable<bool> SetupWorkerInbounds(
                 binding,
                 inbound.protocol,
                 connection_limiter,
-                inbound.build_request,
-                true)) {
+                inbound.build_request)) {
             co_await RemoveInstalledInbounds(worker, installed, inbound.tag);
             co_return false;
         }

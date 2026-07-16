@@ -30,7 +30,6 @@ net::awaitable<void> Controller::Impl::removeInbound(const std::string& tag) {
     registered_tags_.erase(
         std::remove(registered_tags_.begin(), registered_tags_.end(), tag),
         registered_tags_.end());
-    ban_tracking_tags_.erase(tag);
     co_return;
 }
 
@@ -89,8 +88,6 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
         co_return false;
     }
 
-    const bool ban_tracking_enabled = ban_tracking_tags_.contains(inbound.tag);
-
     for (const auto& worker : workers_) {
         auto* limiter = limiters_[worker->Id()].get();
 
@@ -110,8 +107,7 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                 inbound.protocol,
                 limiter,
                 inbound.handler_request,
-                std::move(receiver),
-                ban_tracking_enabled),
+                std::move(receiver)),
             net::use_awaitable);
 
         if (!registered) {
@@ -141,8 +137,7 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                 inbound.binding,
                 inbound.protocol,
                 limiter,
-                inbound.handler_request,
-                ban_tracking_enabled),
+                inbound.handler_request),
             net::use_awaitable);
         if (!udp_bound) {
             LOG_WARN("Node {}/{}: UDP bind failed, tag={}",

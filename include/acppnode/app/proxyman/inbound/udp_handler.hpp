@@ -41,8 +41,6 @@ public:
     [[nodiscard]] virtual buf::MultiBuffer EncodeUdpResponse(
         ::acpp::UDPPacketView packet,
         const UdpResponseContext& response_context) const = 0;
-
-    virtual void SetBanTrackingEnabled(bool enabled) noexcept = 0;
 };
 
 }  // namespace acpp::proxyman::inbound

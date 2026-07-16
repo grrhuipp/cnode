@@ -820,16 +820,13 @@ bool Worker::RegisterInboundOnWorkerThread(
     std::string_view protocol,
     ConnectionLimiterPtr limiter,
     const proxyman::inbound::BuildRequest& req,
-    proxyman::inbound::ReceiverSettings receiver,
-    bool ban_tracking_enabled) {
+    proxyman::inbound::ReceiverSettings receiver) {
     auto handler = runtime_->inbound_manager->NewHandler(protocol, limiter, req);
     if (!handler) {
         LOG_WARN("Worker[{}]: failed to create inbound handler tag={} protocol={}",
                  id_, receiver.inbound_tag, protocol);
         return false;
     }
-    handler->SetBanTrackingEnabled(ban_tracking_enabled);
-
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
     runtime_->listener_state->RetireInboundHandler(*this, receiver.inbound_tag);
     runtime_->listener_state->DrainRetiredHandlersIfIdle(*this);
@@ -855,10 +852,9 @@ net::awaitable<bool> Worker::RegisterInboundTask(
     std::string protocol,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req,
-    proxyman::inbound::ReceiverSettings receiver,
-    bool ban_tracking_enabled) {
+    proxyman::inbound::ReceiverSettings receiver) {
     co_return RegisterInboundOnWorkerThread(
-        protocol, limiter, req, std::move(receiver), ban_tracking_enabled);
+        protocol, limiter, req, std::move(receiver));
 }
 
 bool Worker::AddOutboundOnWorkerThread(
@@ -969,19 +965,6 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     co_return;
 }
 
-void Worker::EnableBanTrackingAsync(std::string tag) {
-    net::post(runtime_->io_context,
-        [this, t = std::move(tag)] {
-            if (auto* h = runtime_->inbound_manager->GetHandler(t)) {
-                h->SetBanTrackingEnabled(true);
-            }
-            if (auto h = runtime_->listener_state->udp_workers.find(t);
-                    h != runtime_->listener_state->udp_workers.end() && h->second) {
-                h->second->SetBanTrackingEnabled(true);
-            }
-        });
-}
-
 void Worker::UpdateRuleAsync(std::string tag, std::vector<rule::DetectRule> rules) {
     net::post(runtime_->io_context,
         [this, t = std::move(tag), r = std::move(rules)] {
@@ -1060,13 +1043,11 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
     PortBinding binding,
     std::string protocol,
     ConnectionLimiterPtr limiter,
-    proxyman::inbound::BuildRequest req,
-    bool ban_tracking_enabled) {
+    proxyman::inbound::BuildRequest req) {
     auto handler = runtime_->inbound_manager->NewUdpHandler(protocol, limiter, req);
     if (!handler) {
         co_return true;
     }
-    handler->SetBanTrackingEnabled(ban_tracking_enabled);
     co_return runtime_->listener_state->StartUdpListening(
         *this, binding, std::move(handler));
 }

@@ -30,15 +30,10 @@ public:
         const ::acpp::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
-    void SetBanTrackingEnabled(bool enabled) noexcept override {
-        ban_tracking_enabled_ = enabled;
-    }
-
 private:
     ::acpp::vmess::TimedUserValidator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
-    bool ban_tracking_enabled_ = false;
 };
 
 }  // namespace acpp::proxy::vmess::inbound

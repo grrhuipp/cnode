@@ -174,7 +174,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
             LOG_CONN_FAIL("[{}] SS auth failed from {}", tag, client_ip);
-            if (limiter_ && ban_tracking_enabled_) {
+            if (limiter_) {
                 limiter_->OnAuthFailTracked(tag, client_ip);
             }
             stats_->OnError();
@@ -188,7 +188,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     const auto* matched = session_result->user;
     if (!matched) {
         LOG_CONN_FAIL("[{}] SS auth failed from {}", tag, client_ip);
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         stats_->OnError();
@@ -330,7 +330,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
         data, len, users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
     if (!decoded) {
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         return std::nullopt;

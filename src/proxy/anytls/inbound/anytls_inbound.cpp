@@ -1017,7 +1017,7 @@ Handler::Process(
     }
     auto user = validator_.Validate(ctx.inbound.tag, auth_hash);
     if (!user) {
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
         }
         stats_->OnError();

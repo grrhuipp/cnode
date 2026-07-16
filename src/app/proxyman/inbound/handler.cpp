@@ -149,12 +149,6 @@ Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> pr
     : receiver_(std::move(receiver))
     , proxy_(std::move(proxy)) {}
 
-void Handler::SetBanTrackingEnabled(bool enabled) noexcept {
-    if (proxy_) {
-        proxy_->SetBanTrackingEnabled(enabled);
-    }
-}
-
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,

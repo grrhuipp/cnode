@@ -76,8 +76,7 @@ public:
         std::string protocol,
         ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req,
-        proxyman::inbound::ReceiverSettings receiver,
-        bool ban_tracking_enabled);
+        proxyman::inbound::ReceiverSettings receiver);
 
     // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）。协议 handler 在
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
@@ -85,8 +84,7 @@ public:
         PortBinding binding,
         std::string protocol,
         ConnectionLimiterPtr limiter,
-        proxyman::inbound::BuildRequest req,
-        bool ban_tracking_enabled);
+        proxyman::inbound::BuildRequest req);
 
     // 动态出站（线程安全）：XrayR Controller 面板节点 addOutbound/removeOutbound。
     net::awaitable<bool> AddOutboundTask(
@@ -95,9 +93,6 @@ public:
 
     // 动态控制面使用：必须在 Worker executor 上执行，完成后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);
-
-    // 面板/静态用户同步完成后启用指定 tag 的认证失败 ban 计数。
-    void EnableBanTrackingAsync(std::string tag);
 
     void UpdateRuleAsync(std::string tag, std::vector<rule::DetectRule> rules);
 
@@ -139,8 +134,7 @@ private:
         std::string_view protocol,
         ConnectionLimiterPtr limiter,
         const proxyman::inbound::BuildRequest& req,
-        proxyman::inbound::ReceiverSettings receiver,
-        bool ban_tracking_enabled);
+        proxyman::inbound::ReceiverSettings receiver);
 
     void UnregisterListenerOnWorkerThread(std::string_view tag);
 

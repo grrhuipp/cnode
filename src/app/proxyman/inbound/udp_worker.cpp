@@ -259,12 +259,6 @@ void UdpWorker::Close() noexcept {
     MaybeShrinkHashContainer(impl_->reply_queues, 8);
 }
 
-void UdpWorker::SetBanTrackingEnabled(bool enabled) noexcept {
-    if (impl_->proxy) {
-        impl_->proxy->SetBanTrackingEnabled(enabled);
-    }
-}
-
 void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     if (!impl_->proxy || !datagram.sock || datagram.payload.empty()) {
         return;

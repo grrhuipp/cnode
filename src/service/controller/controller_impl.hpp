@@ -9,7 +9,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
 
 namespace acpp {
@@ -92,8 +91,6 @@ struct Controller::Impl {
     };
     std::map<std::string, NodeStats> node_stats_;
     std::vector<std::string>         registered_tags_;
-    std::unordered_set<std::string>  ban_tracking_tags_;
-
     bool running_ = false;
 };
 

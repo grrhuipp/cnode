@@ -53,9 +53,6 @@ public:
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) = 0;
-
-    // 冷路径控制：面板/静态用户同步完成后启用认证失败 ban 计数。
-    virtual void SetBanTrackingEnabled(bool enabled) noexcept = 0;
 };
 
 }  // namespace acpp

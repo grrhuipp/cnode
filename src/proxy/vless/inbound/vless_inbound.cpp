@@ -733,7 +733,7 @@ proxy::vless::inbound::Handler::Process(
     if (!user_info) {
         LOG_CONN_FAIL("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
                       tag, client_ip, validator_.Size(), validator_.SizeForTag(tag));
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);

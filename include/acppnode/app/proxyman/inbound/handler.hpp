@@ -40,8 +40,6 @@ public:
         return receiver_;
     }
 
-    void SetBanTrackingEnabled(bool enabled) noexcept;
-
     net::awaitable<void> ProcessAcceptedTCP(
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,

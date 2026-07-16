@@ -175,7 +175,7 @@ proxy::vmess::inbound::Handler::Process(
                        total_read,
                        FormatHexPrefix(handshake_buf, total_read));
         LOG_CONN_FAIL("[{}] VMess auth failed from {}", tag, client_ip);
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);

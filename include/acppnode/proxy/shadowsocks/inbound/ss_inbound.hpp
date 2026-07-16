@@ -46,15 +46,10 @@ public:
         ::acpp::UDPPacketView packet,
         const ::acpp::proxyman::inbound::UdpResponseContext& response_context) const override;
 
-    void SetBanTrackingEnabled(bool enabled) noexcept override {
-        ban_tracking_enabled_ = enabled;
-    }
-
 private:
     ::acpp::ss::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
-    bool ban_tracking_enabled_ = false;
     std::string         cipher_method_;
     ::acpp::ss::SsCipherInfo cipher_info_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）

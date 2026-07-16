@@ -402,7 +402,7 @@ proxy::trojan::inbound::Handler::Process(
                       request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0),
                       validator_.Size(),
                       validator_.SizeForTag(tag));
-        if (limiter_ && ban_tracking_enabled_) {
+        if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);

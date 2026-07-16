@@ -820,6 +820,32 @@ if(CNODE_BUILD_TESTS)
             ${CMAKE_CURRENT_BINARY_DIR}/static_inbound_startup_test)
     set_tests_properties(cnode_static_inbound_startup_test PROPERTIES TIMEOUT 15)
 
+    add_executable(cnode_ban_tracking_contract_test
+        tests/ban_tracking_contract_test.cpp
+        src/infra/log.cpp
+    )
+    target_include_directories(cnode_ban_tracking_contract_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${concurrentqueue_SOURCE_DIR}
+    )
+    target_link_libraries(cnode_ban_tracking_contract_test PRIVATE
+        asio::asio
+        Threads::Threads
+        cnode_zlib
+    )
+    if(WIN32)
+        target_link_libraries(cnode_ban_tracking_contract_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_ban_tracking_contract_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_ban_tracking_contract_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4324 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_ban_tracking_contract_test
+        COMMAND cnode_ban_tracking_contract_test)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}
