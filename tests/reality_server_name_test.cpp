@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/reality_server_name.hpp"
+#include "acppnode/transport/internet/tls_server_name.hpp"
 
 #include <array>
 #include <cstdio>
@@ -16,44 +17,44 @@ bool Require(bool condition, const char* message) {
 
 int main() {
     using acpp::transport::internet::IsRealityServerNameAllowed;
-    using acpp::transport::internet::ParseRealityServerNameExtension;
+    using acpp::transport::internet::ParseTlsServerNameExtension;
 
     constexpr std::array<uint8_t, 16> valid_extension{
         0x00, 0x0e, 0x00, 0x00, 0x0b,
         'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'};
-    const auto parsed = ParseRealityServerNameExtension(valid_extension);
+    const auto parsed = ParseTlsServerNameExtension(valid_extension);
     if (!Require(parsed && *parsed == "example.com",
                  "a canonical host_name entry must parse")) return 1;
 
     constexpr std::array<uint8_t, 17> trailing_byte{
         0x00, 0x0f, 0x00, 0x00, 0x0b,
         'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0xff};
-    if (!Require(!ParseRealityServerNameExtension(trailing_byte),
+    if (!Require(!ParseTlsServerNameExtension(trailing_byte),
                  "bytes after host_name must not be ignored")) return 2;
 
     constexpr std::array<uint8_t, 10> duplicate_host_name{
         0x00, 0x08, 0x00, 0x00, 0x01, 'a',
         0x00, 0x00, 0x01, 'b'};
-    if (!Require(!ParseRealityServerNameExtension(duplicate_host_name),
+    if (!Require(!ParseTlsServerNameExtension(duplicate_host_name),
                  "duplicate host_name entries must be rejected")) return 3;
 
     constexpr std::array<uint8_t, 5> empty_host_name{
         0x00, 0x03, 0x00, 0x00, 0x00};
-    if (!Require(!ParseRealityServerNameExtension(empty_host_name),
+    if (!Require(!ParseTlsServerNameExtension(empty_host_name),
                  "an empty host_name entry must be rejected")) return 4;
 
     constexpr std::array<uint8_t, 10> unknown_then_host{
         0x00, 0x08, 0x01, 0x00, 0x01, 'x',
         0x00, 0x00, 0x01, 'a'};
     const auto parsed_after_unknown =
-        ParseRealityServerNameExtension(unknown_then_host);
+        ParseTlsServerNameExtension(unknown_then_host);
     if (!Require(parsed_after_unknown && *parsed_after_unknown == "a",
                  "well-formed unknown name types must be skipped")) return 5;
 
     constexpr std::array<uint8_t, 14> duplicate_unknown_type{
         0x00, 0x0c, 0x01, 0x00, 0x01, 'x',
         0x01, 0x00, 0x01, 'y', 0x00, 0x00, 0x01, 'a'};
-    if (!Require(!ParseRealityServerNameExtension(duplicate_unknown_type),
+    if (!Require(!ParseTlsServerNameExtension(duplicate_unknown_type),
                  "duplicate server name types must be rejected")) return 6;
 
     const std::vector<std::string> names{"Example.COM", ""};

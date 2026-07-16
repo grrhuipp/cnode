@@ -4,6 +4,7 @@
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_server_name.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
+#include "acppnode/transport/internet/tls_server_name.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
@@ -97,7 +98,7 @@ enum class RealitySniParseResult {
     if (!ext) {
         return RealitySniParseResult::Invalid;
     }
-    auto parsed = transport::internet::ParseRealityServerNameExtension(
+    auto parsed = transport::internet::ParseTlsServerNameExtension(
         std::span<const uint8_t>(ext, ext_len));
     if (!parsed) {
         return RealitySniParseResult::Invalid;

@@ -300,6 +300,7 @@ set(CNODE_SOURCES
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_client_context.cpp
+    src/transport/internet/tls_server_name.cpp
     src/transport/internet/tls_stream.cpp
     src/transport/internet/autosign_cert.cpp
     src/transport/internet/reality_client_version.cpp
@@ -631,6 +632,22 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_tls_context_cache_key_test
         COMMAND cnode_tls_context_cache_key_test)
 
+    add_executable(cnode_tls_sniffer_test
+        tests/tls_sniffer_test.cpp
+        src/sniff/tls_sniffer.cpp
+        src/transport/internet/tls_server_name.cpp
+    )
+    target_include_directories(cnode_tls_sniffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(cnode_tls_sniffer_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_tls_sniffer_test
+        COMMAND cnode_tls_sniffer_test)
+
     add_executable(cnode_reality_client_version_test
         tests/reality_client_version_test.cpp
         src/transport/internet/reality_client_version.cpp
@@ -680,6 +697,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_reality_server_name_test
         tests/reality_server_name_test.cpp
         src/transport/internet/reality_server_name.cpp
+        src/transport/internet/tls_server_name.cpp
     )
     target_include_directories(cnode_reality_server_name_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
