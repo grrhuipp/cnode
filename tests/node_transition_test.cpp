@@ -23,7 +23,7 @@ bool HasMode(const NodeInfo* current,
     return plan.mode == mode
         && plan.Transitioning() == (mode != NodeTransitionMode::Refresh)
         && plan.DestructiveSwap() == (mode == NodeTransitionMode::SwapSameEndpoint)
-        && plan.RetireOldAfterCommit()
+        && plan.RetireOldInboundBeforeCommit()
             == (mode == NodeTransitionMode::StageNewEndpoint)
         && plan.RestoreOldInboundOnRollback()
             == (mode == NodeTransitionMode::ReplaceInPlace

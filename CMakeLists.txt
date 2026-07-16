@@ -1366,6 +1366,12 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_node_transition_test
         COMMAND cnode_node_transition_test)
 
+    add_test(
+        NAME cnode_controller_transition_commit_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_transition_commit_contract_test.cmake)
+
     add_executable(cnode_static_inbound_startup_test
         tests/static_inbound_startup_test.cpp
     )

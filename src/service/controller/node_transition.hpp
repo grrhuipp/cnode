@@ -24,7 +24,7 @@ struct NodeTransitionPlan {
         return mode == NodeTransitionMode::SwapSameEndpoint;
     }
 
-    [[nodiscard]] bool RetireOldAfterCommit() const noexcept {
+    [[nodiscard]] bool RetireOldInboundBeforeCommit() const noexcept {
         return mode == NodeTransitionMode::StageNewEndpoint;
     }
 

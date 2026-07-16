@@ -364,23 +364,23 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     std::rethrow_exception(candidate_failure);
                 }
 
-                node_configs_[panel] = fetched_config;
-                user_lists_[panel] = *next_users;
-                inbound_started_[panel] = true;
-                node_stats_[stats_key].user_count = next_users->size();
-
-                if (rules_result.Ok() && !rules_result.not_modified) {
-                    co_await UpdateRule(tag, rules_result.rules);
-                }
-
                 if (old_config && old_tag != tag) {
-                    if (transition.RetireOldAfterCommit()) {
+                    if (transition.RetireOldInboundBeforeCommit()) {
                         co_await removeInbound(old_tag);
                     }
                     co_await removeOutbound(old_tag);
                     clearUsers(old_tag, old_protocol);
                     co_await UpdateRule(old_tag, {});
                 }
+
+                if (rules_result.Ok() && !rules_result.not_modified) {
+                    co_await UpdateRule(tag, rules_result.rules);
+                }
+
+                node_configs_[panel] = fetched_config;
+                user_lists_[panel] = *next_users;
+                inbound_started_[panel] = true;
+                node_stats_[stats_key].user_count = next_users->size();
 
                 LOG_CONSOLE(
                     "node config_committed panel={} node={} tag={} replaced={}",
