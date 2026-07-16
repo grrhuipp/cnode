@@ -80,6 +80,17 @@ expect_rejected(excessive_workers
     [=[{"workers":4294967295}]=] "" "")
 expect_rejected(string_workers
     [=[{"workers":"4"}]=] "" "")
+expect_rejected(negative_log_retention
+    [=[{"log":{"maxDays":-1}}]=] "" ""
+    "between 0 and 65535")
+expect_rejected(non_integer_log_retention
+    [=[{"log":{"maxDays":"15"}}]=] "" ""
+    "must be an integer between 0 and 65535")
+expect_rejected(overflow_log_retention
+    [=[{"log":{"maxDays":18446744073709551615}}]=] "" ""
+    "between 0 and 65535")
+expect_started(valid_zero_log_retention
+    [=[{"workers":1,"log":{"maxDays":0}}]=] "" "")
 expect_rejected(negative_read_timeout
     [=[{"timeouts":{"read":-1}}]=] "" "")
 expect_rejected(negative_connection_limit

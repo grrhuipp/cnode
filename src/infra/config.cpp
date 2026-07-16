@@ -47,16 +47,6 @@ inline bool jbool(const json::object& obj, std::string_view key,
     return p->as_bool();
 }
 
-// 从 object 中取 int64，不存在则返回默认值
-inline int64_t jint(const json::object& obj, std::string_view key,
-                    int64_t def = 0) {
-    auto* p = obj.if_contains(key);
-    if (!p) return def;
-    if (p->is_int64()) return p->as_int64();
-    if (p->is_uint64()) return static_cast<int64_t>(p->as_uint64());
-    return def;
-}
-
 uint32_t juint32(const json::object& obj,
                  std::string_view key,
                  uint32_t def) {
@@ -258,10 +248,12 @@ LogConfig LogConfig::FromJson(const json::object& j) {
     auto error_path = jstr(j, "error");
     if (!error_path.empty()) cfg.error_path = error_path;
 
-    auto days = jint(j, "maxDays", cfg.max_days);
-    days = std::clamp<int64_t>(
-        days, 0, std::numeric_limits<uint16_t>::max());
-    cfg.max_days = static_cast<uint16_t>(days);
+    auto days = ParseAliasedJsonUint64(
+        j, {"maxDays"}, std::numeric_limits<uint16_t>::max());
+    if (!days) {
+        throw std::invalid_argument(std::move(days.error()));
+    }
+    cfg.max_days = static_cast<uint16_t>(days->value_or(cfg.max_days));
 
     cfg.rotate_daily = jbool(j, "rotateDaily", cfg.rotate_daily);
     cfg.gzip = jbool(j, "gzip", cfg.gzip);
