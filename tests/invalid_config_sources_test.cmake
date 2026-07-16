@@ -164,6 +164,27 @@ expect_rejected(non_object_outbound_stream_settings "{}" "outbounds.json"
 expect_rejected(non_object_tls_settings "{}" "outbounds.json"
     [=[[{"tag":"bad-tls-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":[]}}]]=]
     "tlsSettings must be an object")
+expect_rejected(non_object_tls_certificate "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[42]}}}]]=]
+    "tls certificates entries must be objects")
+expect_rejected(non_array_tls_certificates "{}" "outbounds.json"
+    [=[[{"tag":"bad-tls-certificates","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":{}}}}]]=]
+    "tls certificates must be an array")
+expect_rejected(multiple_tls_certificates "{}" "outbounds.json"
+    [=[[{"tag":"bad-multiple-certificates","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"one.pem","keyFile":"one.key"},{"certificateFile":"two.pem","keyFile":"two.key"}]}}}]]=]
+    "multiple TLS certificates are not supported")
+expect_rejected(incomplete_tls_certificate_entry "{}" "outbounds.json"
+    [=[[{"tag":"bad-incomplete-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"cert.pem"}]}}}]]=]
+    "must provide certificateFile and keyFile")
+expect_rejected(orphan_tls_cert_file "{}" "outbounds.json"
+    [=[[{"tag":"bad-orphan-cert","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certFile":"cert.pem"}}}]]=]
+    "tls certFile and keyFile must be configured together")
+expect_rejected(conflicting_tls_certificate_sources "{}" "outbounds.json"
+    [=[[{"tag":"bad-certificate-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"array.pem","keyFile":"array.key"}],"certFile":"direct.pem","keyFile":"direct.key"}}}]]=]
+    "tls certificates and certFile/keyFile must match")
+expect_started(equal_tls_certificate_sources
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-certificate-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"same.pem","keyFile":"same.key"}],"certFile":"same.pem","keyFile":"same.key"}}}]]=])
 expect_rejected(conflicting_outbound_stream_settings_aliases "{}" "outbounds.json"
     [=[[{"tag":"bad-stream-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"none"},"stream_settings":{"network":"grpc","security":"none"}}]]=]
     "streamSettings and stream_settings must match")

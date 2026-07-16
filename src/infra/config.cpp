@@ -15,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace acpp {
 
@@ -904,19 +905,55 @@ StreamSettings StreamSettings::FromJson(const json::object& j) {
         cfg.tls.allow_insecure = jbool(*tls, {"allowInsecure"}, false);
         // ALPN
         cfg.tls.alpn = jstr_array(*tls, {"alpn"});
-        // 证书（服务端）
-        auto* certs = tls->if_contains("certificates");
-        if (certs && certs->is_array() && !certs->as_array().empty()) {
-            const auto& c = certs->as_array()[0];
-            if (c.is_object()) {
-                cfg.tls.cert_file = jstr(c.as_object(), "certificateFile", "");
-                cfg.tls.key_file  = jstr(c.as_object(), "keyFile", "");
+        std::optional<std::pair<std::string, std::string>> certificate_entry;
+        if (const auto* certificates = tls->if_contains("certificates")) {
+            if (!certificates->is_array()) {
+                throw std::invalid_argument(
+                    "tls certificates must be an array");
+            }
+            if (certificates->as_array().size() > 1) {
+                throw std::invalid_argument(
+                    "multiple TLS certificates are not supported");
+            }
+            if (!certificates->as_array().empty()) {
+                const auto& entry = certificates->as_array()[0];
+                if (!entry.is_object()) {
+                    throw std::invalid_argument(
+                        "tls certificates entries must be objects");
+                }
+                std::string cert_file = jstr(
+                    entry.as_object(), "certificateFile", "");
+                std::string key_file = jstr(
+                    entry.as_object(), "keyFile", "");
+                if (cert_file.empty() || key_file.empty()) {
+                    throw std::invalid_argument(
+                        "tls certificates entry must provide certificateFile "
+                        "and keyFile");
+                }
+                certificate_entry.emplace(
+                    std::move(cert_file), std::move(key_file));
             }
         }
-        if (cfg.tls.cert_file.empty())
-            cfg.tls.cert_file = jstr(*tls, "certFile", "");
-        if (cfg.tls.key_file.empty())
-            cfg.tls.key_file = jstr(*tls, "keyFile", "");
+
+        std::string direct_cert_file = jstr(*tls, "certFile", "");
+        std::string direct_key_file = jstr(*tls, "keyFile", "");
+        if (direct_cert_file.empty() != direct_key_file.empty()) {
+            throw std::invalid_argument(
+                "tls certFile and keyFile must be configured together");
+        }
+        if (certificate_entry && !direct_cert_file.empty() &&
+            (certificate_entry->first != direct_cert_file ||
+             certificate_entry->second != direct_key_file)) {
+            throw std::invalid_argument(
+                "tls certificates and certFile/keyFile must match");
+        }
+        if (certificate_entry) {
+            cfg.tls.cert_file = std::move(certificate_entry->first);
+            cfg.tls.key_file = std::move(certificate_entry->second);
+        } else {
+            cfg.tls.cert_file = std::move(direct_cert_file);
+            cfg.tls.key_file = std::move(direct_key_file);
+        }
     }
 
     if (const auto* reality = optional_object(
