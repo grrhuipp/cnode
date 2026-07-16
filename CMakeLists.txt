@@ -1378,6 +1378,26 @@ if(CNODE_BUILD_TESTS)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_worker_mutation_contract_test.cmake)
 
+    add_executable(cnode_panel_schedule_test
+        tests/panel_schedule_test.cpp
+    )
+    target_include_directories(cnode_panel_schedule_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
+    )
+    target_compile_options(cnode_panel_schedule_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_panel_schedule_test
+        COMMAND cnode_panel_schedule_test)
+
+    add_test(
+        NAME cnode_controller_panel_schedule_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_panel_schedule_contract_test.cmake)
+
     add_executable(cnode_static_inbound_startup_test
         tests/static_inbound_startup_test.cpp
     )

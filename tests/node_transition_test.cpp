@@ -84,5 +84,10 @@ int main() {
     changed.DestOverride = {"http"};
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 10;
 
+    changed = current;
+    changed.PullInterval = current.PullInterval + 1;
+    changed.PushInterval = current.PushInterval + 2;
+    if (acpp::controller::NodeConfigChanged(current, changed)) return 11;
+
     return 0;
 }

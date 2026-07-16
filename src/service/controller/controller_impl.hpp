@@ -25,7 +25,8 @@ struct Controller::Impl {
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
 
-    net::awaitable<void> runNodeInfoMonitors();
+    net::awaitable<void> runPanelMonitors(uint64_t generation);
+    net::awaitable<void> panelMonitor(api::API* panel, uint64_t generation);
     net::awaitable<void> nodeInfoMonitor(api::API* panel);
     net::awaitable<void> userInfoMonitor(api::API* panel,
                                          const std::string& tag,
@@ -79,6 +80,7 @@ struct Controller::Impl {
     };
     std::map<std::string, NodeStats> node_stats_;
     bool running_ = false;
+    uint64_t monitor_generation_ = 0;
 };
 
 }  // namespace acpp

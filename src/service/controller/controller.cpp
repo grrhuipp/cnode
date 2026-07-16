@@ -1,6 +1,7 @@
 #include "controller_impl.hpp"
 #include "awaitable_batch.hpp"
 #include "node_transition.hpp"
+#include "panel_schedule.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/worker.hpp"
@@ -70,12 +71,20 @@ void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
 }
 
 void Controller::Impl::Start() {
+    if (running_) {
+        return;
+    }
     running_ = true;
-    net::co_spawn(io_context_.get_executor(), runNodeInfoMonitors(), net::detached);
+    const uint64_t generation = ++monitor_generation_;
+    net::co_spawn(
+        io_context_.get_executor(),
+        runPanelMonitors(generation),
+        net::detached);
 }
 
 void Controller::Impl::Stop() {
     running_ = false;
+    ++monitor_generation_;
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
@@ -108,45 +117,110 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
     return result;
 }
 
-net::awaitable<void> Controller::Impl::runNodeInfoMonitors() {
+net::awaitable<void> Controller::Impl::runPanelMonitors(uint64_t generation) {
     if (panel_nodes_.empty()) {
         co_return;
     }
 
-    const auto run_once = [this]() -> net::awaitable<void> {
-        const size_t batch_size = std::min(
-            panel_nodes_.size(),
-            std::max<size_t>(workers_.size() * 2, 1));
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(panel_nodes_.size());
+    for (api::API* panel : panel_nodes_) {
+        tasks.push_back(panelMonitor(panel, generation));
+    }
+    try {
+        co_await controller::RunAwaitableBatch(
+            io_context_.get_executor(), std::move(tasks));
+    } catch (const std::exception& e) {
+        LOG_ERROR("panel monitors failed: {}", e.what());
+    } catch (...) {
+        LOG_ERROR("panel monitors failed with unknown exception");
+    }
+    co_return;
+}
 
-        for (size_t offset = 0; offset < panel_nodes_.size(); offset += batch_size) {
-            std::vector<net::awaitable<void>> tasks;
-            tasks.reserve(std::min(batch_size, panel_nodes_.size() - offset));
+net::awaitable<void> Controller::Impl::panelMonitor(
+    api::API* panel,
+    uint64_t generation) {
+    using Clock = std::chrono::steady_clock;
+    const auto client_info = panel->Describe();
+    const std::string panel_name = ResolvePanelName(panel, panel_configs_);
+    auto next_pull = Clock::now();
+    auto next_push = next_pull;
 
-            const size_t end = std::min(panel_nodes_.size(), offset + batch_size);
-            for (size_t i = offset; i < end; ++i) {
-                tasks.push_back(nodeInfoMonitor(panel_nodes_[i]));
-            }
-
-            try {
-                co_await controller::RunAwaitableBatch(
-                    io_context_.get_executor(), std::move(tasks));
-            } catch (const std::exception& e) {
-                LOG_ERROR("panel monitor batch failed: {}", e.what());
-            } catch (...) {
-                LOG_ERROR("panel monitor batch failed with unknown exception");
-            }
+    const auto interval = [&](bool pull) {
+        if (const auto state = committed_nodes_.find(panel);
+            state != committed_nodes_.end()) {
+            return pull
+                ? controller::PanelInterval(
+                      state->second.config.PullInterval,
+                      defaults::kPanelPullInterval)
+                : controller::PanelInterval(
+                      state->second.config.PushInterval,
+                      defaults::kPanelPushInterval);
         }
+        return std::chrono::seconds(
+            pull ? defaults::kPanelPullInterval
+                 : defaults::kPanelPushInterval);
     };
 
-    co_await run_once();
+    while (running_ && generation == monitor_generation_) {
+        auto now = Clock::now();
+        if (now >= next_pull) {
+            try {
+                co_await nodeInfoMonitor(panel);
+            } catch (const std::exception& e) {
+                LOG_WARN("Panel {}/{}: config pull failed: {}",
+                         panel_name,
+                         client_info.NodeID,
+                         e.what());
+            } catch (...) {
+                LOG_WARN("Panel {}/{}: config pull failed with unknown exception",
+                         panel_name,
+                         client_info.NodeID);
+            }
+            if (!running_ || generation != monitor_generation_) {
+                break;
+            }
+            now = Clock::now();
+            next_pull = now + interval(true);
+            next_push = std::min(next_push, now + interval(false));
+        }
 
-    while (running_) {
+        now = Clock::now();
+        if (running_ && generation == monitor_generation_ && now >= next_push) {
+            if (const auto state = committed_nodes_.find(panel);
+                state != committed_nodes_.end()) {
+                const auto& config = state->second.config;
+                const std::string protocol =
+                    naming::ResolveProtocolOrDefault(config.NodeType);
+                const std::string tag = naming::BuildPanelNodeTag(
+                    panel_name,
+                    protocol,
+                    config.Port);
+                try {
+                    co_await userInfoMonitor(panel, tag, protocol);
+                } catch (const std::exception& e) {
+                    LOG_WARN("Panel {}/{}: status push failed: {}",
+                             panel_name,
+                             client_info.NodeID,
+                             e.what());
+                } catch (...) {
+                    LOG_WARN("Panel {}/{}: status push failed with unknown exception",
+                             panel_name,
+                             client_info.NodeID);
+                }
+            }
+            next_push = Clock::now() + interval(false);
+        }
+
+        if (!running_ || generation != monitor_generation_) {
+            break;
+        }
         net::steady_timer timer(io_context_);
-        timer.expires_after(std::chrono::seconds(defaults::kPanelPullInterval));
+        timer.expires_at(std::min(next_pull, next_push));
         (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-        if (!running_) break;
-        co_await run_once();
     }
+    co_return;
 }
 
 net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
@@ -505,8 +579,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     "node config_committed panel={} node={} tag={} replaced={}",
                     panel_name, node_id, tag, old_config != nullptr);
             }
-
-            co_await userInfoMonitor(panel, tag, protocol);
 
             co_return;
 
