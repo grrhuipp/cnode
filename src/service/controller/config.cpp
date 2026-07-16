@@ -113,7 +113,18 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
     if (cfg.Name.empty() && !cfg.NodeIDs.empty()) {
         cfg.Name = std::format("{}-{}", cfg.NodeType, cfg.NodeIDs.front());
     }
-    cfg.ListenIP = jstr(j, "ListenIP", cfg.ListenIP);
+    if (const auto* listen_ip = j.if_contains("ListenIP")) {
+        if (!listen_ip->is_string()) {
+            throw std::invalid_argument("Panel ListenIP must be a string");
+        }
+        auto parsed = InboundListen::Parse(listen_ip->as_string());
+        if (!parsed) {
+            throw std::invalid_argument(std::format(
+                "Panel ListenIP '{}' must be auto or an IP address",
+                listen_ip->as_string()));
+        }
+        cfg.ListenIP = std::move(*parsed);
+    }
     if (const auto* send_ip = j.if_contains("SendIP")) {
         if (!send_ip->is_string()) {
             throw std::invalid_argument("Panel SendIP must be a string");

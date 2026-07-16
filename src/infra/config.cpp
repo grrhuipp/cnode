@@ -1152,7 +1152,16 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     }
 
     if (j.contains("listen")) {
-        cfg.listen = std::string(j.at("listen").as_string());
+        if (!j.at("listen").is_string()) {
+            throw std::invalid_argument("static inbound listen must be a string");
+        }
+        auto listen = InboundListen::Parse(j.at("listen").as_string());
+        if (!listen) {
+            throw std::invalid_argument(std::format(
+                "static inbound listen '{}' must be auto or an IP address",
+                j.at("listen").as_string()));
+        }
+        cfg.listen = std::move(*listen);
     }
 
     cfg.port = required_port(j, "port");

@@ -35,7 +35,6 @@ enum class StaticInboundSemanticError {
     InvalidPort,
     EmptyTag,
     DuplicateTag,
-    InvalidListen,
     DuplicateEndpoint,
 };
 

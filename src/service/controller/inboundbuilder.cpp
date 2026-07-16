@@ -84,7 +84,7 @@ InboundBuild InboundBuilder(const std::string& panel_name,
         build.protocol,
         build.tag,
         panel_config ? panel_config->ListenIP
-                     : std::string(constants::network::kDualStackAuto));
+                     : InboundListen{});
 
     return build;
 }

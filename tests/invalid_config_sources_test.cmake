@@ -75,6 +75,9 @@ expect_rejected(empty_panel_api_port
 expect_rejected(invalid_panel_send_ip
     [=[{"panels":[{"Name":"bad-bind","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess","SendIP":"not-an-ip"}]}]=]
     "" "")
+expect_rejected(invalid_panel_listen_ip
+    [=[{"panels":[{"Name":"bad-listen","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1],"NodeType":"vmess","ListenIP":"not-an-ip"}]}]=]
+    "" "")
 expect_rejected(negative_route_port "{}" "routing.json"
     [=[{"rules":[{"port":"-1","outboundTag":"direct"}]}]=])
 expect_rejected(overflow_route_port "{}" "routing.json"

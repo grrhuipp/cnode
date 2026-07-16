@@ -1,10 +1,7 @@
 #include "config_semantics.hpp"
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 
-#include <array>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -92,27 +89,8 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             };
         }
 
-        std::array<net::ip::address, 2> addresses;
-        size_t address_count = 0;
-        if (inbound.listen.empty() ||
-            inbound.listen == constants::network::kDualStackAuto) {
-            addresses[address_count++] = net::ip::address_v4::any();
-            addresses[address_count++] = net::ip::address_v6::any();
-        } else {
-            IoErrorCode ec;
-            auto address = net::ip::make_address(inbound.listen, ec);
-            if (ec) {
-                return {
-                    .error = StaticInboundSemanticError::InvalidListen,
-                    .index = i,
-                    .detail = inbound.listen,
-                };
-            }
-            addresses[address_count++] = address;
-        }
-
-        for (size_t address_index = 0; address_index < address_count; ++address_index) {
-            std::string endpoint = addresses[address_index].to_string();
+        for (const auto& address : inbound.listen.Candidates()) {
+            std::string endpoint = address.to_string();
             endpoint.push_back('|');
             endpoint.append(std::to_string(inbound.port));
             if (const auto [it, inserted] = endpoints.emplace(endpoint, i); !inserted) {

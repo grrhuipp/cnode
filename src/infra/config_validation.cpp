@@ -43,10 +43,6 @@ bool Config::Validate() const {
                       inbound_semantic.index, inbound_semantic.detail,
                       inbound_semantic.conflicting_index);
             return false;
-        case StaticInboundSemanticError::InvalidListen:
-            LOG_ERROR("Static inbound at index {} has invalid listen address '{}'",
-                      inbound_semantic.index, inbound_semantic.detail);
-            return false;
         case StaticInboundSemanticError::DuplicateEndpoint:
             LOG_ERROR("Static inbound at index {} duplicates listen endpoint '{}' from index {}",
                       inbound_semantic.index, inbound_semantic.detail,

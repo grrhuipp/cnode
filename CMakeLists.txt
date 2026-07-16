@@ -288,6 +288,7 @@ set(CNODE_SOURCES
 
     # Transport - common stream interface
     src/transport/async_stream.cpp
+    src/transport/internet/inbound_listen.cpp
     src/transport/internet/outbound_bind.cpp
 
     # Transport - Internet
@@ -715,6 +716,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_config_semantics_test
         tests/config_semantics_test.cpp
         src/infra/config_semantics.cpp
+        src/transport/internet/inbound_listen.cpp
     )
     target_include_directories(cnode_config_semantics_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -799,6 +801,30 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_outbound_bind_test
         COMMAND cnode_outbound_bind_test)
+
+    add_executable(cnode_inbound_listen_test
+        tests/inbound_listen_test.cpp
+        src/transport/internet/inbound_listen.cpp
+    )
+    target_include_directories(cnode_inbound_listen_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_inbound_listen_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_inbound_listen_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_inbound_listen_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_inbound_listen_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_inbound_listen_test
+        COMMAND cnode_inbound_listen_test)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp

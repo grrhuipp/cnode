@@ -23,7 +23,7 @@ acpp::StaticInboundConfig Inbound(
     acpp::StaticInboundConfig inbound;
     inbound.tags.push_back(tag);
     inbound.protocol = "vmess";
-    inbound.listen = listen;
+    inbound.listen = *acpp::InboundListen::Parse(listen);
     inbound.port = port;
     return inbound;
 }
@@ -83,26 +83,21 @@ int main() {
         inbound_result.index != 1 || inbound_result.conflicting_index != 0 ||
         inbound_result.detail != "same") return 9;
 
-    inbounds[1] = Inbound("second", "not-an-ip", 12001);
-    inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
-    if (inbound_result.error != StaticInboundSemanticError::InvalidListen ||
-        inbound_result.index != 1 || inbound_result.detail != "not-an-ip") return 10;
-
     inbounds[1] = Inbound("second", "127.0.0.1", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::DuplicateEndpoint ||
-        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 11;
+        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 10;
 
     inbounds[0] = Inbound("first", "auto", 12001);
     inbounds[1] = Inbound("second", "0.0.0.0", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (inbound_result.error != StaticInboundSemanticError::DuplicateEndpoint ||
-        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 12;
+        inbound_result.index != 1 || inbound_result.conflicting_index != 0) return 11;
 
     inbounds[0] = Inbound("first", "127.0.0.1", 12001);
     inbounds[1] = Inbound("second", "127.0.0.2", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
-    if (!inbound_result.Ok()) return 13;
+    if (!inbound_result.Ok()) return 12;
 
     return 0;
 }

@@ -177,16 +177,6 @@ namespace {
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 
-std::vector<std::string> BuildListenCandidates(std::string_view listen) {
-    if (listen.empty() || listen == constants::network::kDualStackAuto) {
-        return {
-            std::string(constants::network::kAnyIpv4),
-            std::string(constants::network::kAnyIpv6),
-        };
-    }
-    return {std::string(listen)};
-}
-
 std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
     std::string key;
     key.reserve(tag.size() + listen.size() + 12);
@@ -344,19 +334,12 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         return false;
     };
 
-    const auto listen_candidates = BuildListenCandidates(binding.listen);
+    const auto listen_candidates = binding.listen.Candidates();
     size_t bound_count = 0;
 
-    for (size_t i = 0; i < listen_candidates.size(); ++i) {
-        const auto& listen_addr = listen_candidates[i];
+    for (const auto& addr : listen_candidates) {
+        const std::string listen_addr = addr.to_string();
         IoErrorCode ec;
-        auto addr = net::ip::make_address(listen_addr, ec);
-        if (ec) {
-            LOG_ERROR("Worker[{}]: invalid listen address '{}': {}",
-                      worker.id_, listen_addr, ec.message());
-            if (listen_candidates.size() == 1) return fail_listener();
-            continue;
-        }
 
         tcp::endpoint ep(addr, binding.port);
         const std::string listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
@@ -1078,19 +1061,12 @@ bool Worker::ListenerState::StartUdpListening(
     udp_workers[binding.tag] = std::move(udp_worker);
     auto& listener_slot = listener_slots[binding.tag];
 
-    const auto listen_candidates = BuildListenCandidates(binding.listen);
+    const auto listen_candidates = binding.listen.Candidates();
     size_t bound_count = 0;
 
-    for (size_t i = 0; i < listen_candidates.size(); ++i) {
-        const auto& listen_addr = listen_candidates[i];
+    for (const auto& addr : listen_candidates) {
+        const std::string listen_addr = addr.to_string();
         IoErrorCode ec;
-        auto addr = net::ip::make_address(listen_addr, ec);
-        if (ec) {
-            LOG_ERROR("Worker[{}]: SS UDP invalid listen address '{}': {}",
-                      worker.id_, listen_addr, ec.message());
-            if (listen_candidates.size() == 1) break;
-            continue;
-        }
         udp::endpoint ep(addr, binding.port);
         auto* current_udp_worker = udp_workers[binding.tag].get();
         auto candidate_sock =

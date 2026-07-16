@@ -7,6 +7,7 @@
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/proxy/sniff_config.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/inbound_listen.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -66,7 +67,7 @@ struct StaticUserConfig {
 struct StaticInboundConfig {
     std::vector<std::string> tags;
     std::string protocol;
-    std::string listen = std::string(constants::network::kDualStackAuto);
+    InboundListen listen;
     uint16_t port = 0;
     StaticUserConfig static_users;
     StreamSettings stream_settings;

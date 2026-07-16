@@ -3,6 +3,7 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/proxy/sniff_config.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/inbound_listen.hpp"
 
 #include <cstdint>
 #include <string>
@@ -15,7 +16,7 @@ struct StaticInboundRuntimeEntry {
     std::string tag;
     std::vector<std::string> all_tags;
     uint16_t port = 0;
-    std::string listen;
+    InboundListen listen;
     StreamSettings stream_settings;
     SniffConfig sniffing;
     bool routing_enabled = false;
