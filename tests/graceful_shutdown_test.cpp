@@ -30,7 +30,7 @@ bool WriteConfig(const fs::path& root, unsigned short port) {
 
     std::ofstream main_config(root / "config.json", std::ios::binary);
     main_config
-        << R"({"workers":2,"dns":{"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5}})"
+        << R"({"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5}})"
         << '\n';
     if (!main_config) return false;
 

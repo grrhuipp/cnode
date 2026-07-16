@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
@@ -33,7 +34,9 @@ struct LogConfig {
 // DNS 配置
 // ============================================================================
 struct DnsConfig {
-    std::vector<std::string> servers = {"8.8.8.8", "1.1.1.1"};
+    DnsConfig();
+
+    std::vector<net::ip::address> servers;
     uint32_t timeout = defaults::kDnsTimeout;
     uint32_t cache_size = defaults::kDnsCacheSize;
     uint32_t min_ttl = defaults::kDnsMinTTL;

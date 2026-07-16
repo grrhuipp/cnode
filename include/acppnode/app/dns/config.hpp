@@ -1,14 +1,15 @@
 #pragma once
 
+#include "acppnode/common/asio_types.hpp"
+
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace acpp::app::dns {
 
 struct Config {
-    std::vector<std::string> servers = {"8.8.8.8", "1.1.1.1"};
+    std::vector<net::ip::address> servers;
     uint32_t timeout_sec = 5;
     size_t cache_size = 1024;
     size_t global_cache_size = 10000;

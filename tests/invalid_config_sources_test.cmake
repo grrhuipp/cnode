@@ -53,6 +53,16 @@ expect_rejected(negative_connection_limit
     [=[{"limits":{"maxConnections":-1}}]=] "" "")
 expect_rejected(negative_dns_cache_size
     [=[{"dns":{"cacheSize":-1}}]=] "" "")
+expect_rejected(invalid_dns_server
+    [=[{"dns":{"servers":["not-an-ip"]}}]=] "" "")
+expect_rejected(mixed_invalid_dns_server
+    [=[{"dns":{"servers":["127.0.0.1","not-an-ip"]}}]=] "" "")
+expect_rejected(non_string_dns_server
+    [=[{"dns":{"servers":[123]}}]=] "" "")
+expect_rejected(scalar_dns_servers
+    [=[{"dns":{"servers":"8.8.8.8"}}]=] "" "")
+expect_rejected(empty_dns_servers
+    [=[{"dns":{"servers":[]}}]=] "" "")
 expect_rejected(overflow_panel_api_port
     [=[{"panels":[{"Name":"bad-port","Type":"V2board","APIHost":"http://127.0.0.1:70000","Key":"secret","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     "" "")

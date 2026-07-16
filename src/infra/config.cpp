@@ -279,11 +279,33 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 // ============================================================================
 // DnsConfig
 // ============================================================================
+DnsConfig::DnsConfig()
+    : servers{
+        net::ip::make_address("8.8.8.8"),
+        net::ip::make_address("1.1.1.1"),
+    } {}
+
 DnsConfig DnsConfig::FromJson(const json::object& j) {
     DnsConfig cfg;
-    if (auto* servers = j.if_contains("servers"); servers && servers->is_array()) {
-        auto parsed = jstr_array(*servers);
-        if (!parsed.empty()) cfg.servers = std::move(parsed);
+    if (const auto* servers = j.if_contains("servers")) {
+        if (!servers->is_array()) {
+            throw std::invalid_argument("dns servers must be an array of IP addresses");
+        }
+        cfg.servers.clear();
+        cfg.servers.reserve(servers->as_array().size());
+        for (const auto& server : servers->as_array()) {
+            if (!server.is_string()) {
+                throw std::invalid_argument("dns server must be an IP address string");
+            }
+            const auto text = server.as_string();
+            IoErrorCode error;
+            auto address = net::ip::make_address(text, error);
+            if (error) {
+                throw std::invalid_argument(std::format(
+                    "dns server '{}' is not a valid IP address", text));
+            }
+            cfg.servers.push_back(std::move(address));
+        }
     }
     cfg.timeout    = juint32(j, "timeout", cfg.timeout);
     cfg.cache_size = juint32(j, "cacheSize", cfg.cache_size);

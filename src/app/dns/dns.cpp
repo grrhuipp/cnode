@@ -11,6 +11,7 @@
 #include <cstring>
 #include <format>
 #include <random>
+#include <stdexcept>
 #include <span>
 
 namespace acpp::app::dns {
@@ -177,20 +178,12 @@ DNS::Impl::Impl(net::io_context& io_context, const Config& config)
         config.max_ttl);
 
     constexpr net::ip::port_type kDnsPort = 53;
+    if (config.servers.empty()) {
+        throw std::invalid_argument("DNS requires at least one server address");
+    }
     servers.reserve(config.servers.size());
     for (const auto& server : config.servers) {
-        IoErrorCode ec;
-        auto addr = net::ip::make_address(server, ec);
-        if (!ec) {
-            servers.emplace_back(addr, kDnsPort);
-        } else {
-            LOG_WARN("Invalid DNS server address: {}", server);
-        }
-    }
-
-    if (servers.empty()) {
-        servers.emplace_back(net::ip::make_address("8.8.8.8"), kDnsPort);
-        servers.emplace_back(net::ip::make_address("1.1.1.1"), kDnsPort);
+        servers.emplace_back(server, kDnsPort);
     }
 
     std::random_device rd;
