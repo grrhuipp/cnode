@@ -79,6 +79,18 @@ uint32_t juint32(
     return static_cast<uint32_t>(parsed->value_or(def));
 }
 
+const json::object* optional_object(
+    const json::object& obj, std::string_view key) {
+    const auto* value = obj.if_contains(key);
+    if (!value) {
+        return nullptr;
+    }
+    if (!value->is_object()) {
+        throw std::invalid_argument(std::format("{} must be an object", key));
+    }
+    return &value->as_object();
+}
+
 uint16_t required_port(const json::object& obj, std::string_view key) {
     const auto result = ReadJsonPort(obj, {key});
     switch (result.error) {
@@ -1249,8 +1261,8 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
     Config cfg;
 
     try {
-        if (j.contains("log") && j.at("log").is_object()) {
-            cfg.log_ = LogConfig::FromJson(j.at("log").as_object());
+        if (const auto* log = optional_object(j, "log")) {
+            cfg.log_ = LogConfig::FromJson(*log);
         }
 
         cfg.workers_ = juint32(j, {"workers"}, cfg.workers_);
@@ -1259,22 +1271,25 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
                 "workers must be between 0 and {}", defaults::kMaxWorkers));
         }
 
-        if (j.contains("dns") && j.at("dns").is_object()) {
-            cfg.dns_ = DnsConfig::FromJson(j.at("dns").as_object());
+        if (const auto* dns = optional_object(j, "dns")) {
+            cfg.dns_ = DnsConfig::FromJson(*dns);
         }
 
-        if (j.contains("limits") && j.at("limits").is_object()) {
-            cfg.limits_ = LimitsConfig::FromJson(j.at("limits").as_object());
+        if (const auto* limits = optional_object(j, "limits")) {
+            cfg.limits_ = LimitsConfig::FromJson(*limits);
         }
 
-        if (j.contains("timeouts") && j.at("timeouts").is_object()) {
-            cfg.timeouts_ = TimeoutsConfig::FromJson(j.at("timeouts").as_object());
+        if (const auto* timeouts = optional_object(j, "timeouts")) {
+            cfg.timeouts_ = TimeoutsConfig::FromJson(*timeouts);
         }
 
         auto parse_panels = [&](std::string_view key) {
             if (!j.contains(key)) return;
             const auto& arr = j.at(key);
-            if (!arr.is_array()) return;
+            if (!arr.is_array()) {
+                throw std::invalid_argument(
+                    std::format("{} must be an array", key));
+            }
             for (const auto& panel : arr.as_array()) {
                 if (!panel.is_object()) {
                     throw std::runtime_error("panel entry must be an object");

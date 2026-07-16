@@ -74,6 +74,17 @@ expect_rejected(wrong_shape_routing "{}" "routing.json" [=[{"routing":[]}]=])
 expect_rejected(scalar_inbounds "{}" "inbounds.json" "42")
 expect_rejected(scalar_outbounds "{}" "outbounds.json" "42")
 expect_rejected(scalar_routing "{}" "routing.json" "42")
+expect_rejected(non_object_timeouts
+    [=[{"workers":1,"timeouts":[]}]=] "" ""
+    "timeouts must be an object")
+expect_rejected(non_object_log
+    [=[{"log":false}]=] "" "" "log must be an object")
+expect_rejected(non_object_dns
+    [=[{"dns":[]}]=] "" "" "dns must be an object")
+expect_rejected(non_object_limits
+    [=[{"limits":"none"}]=] "" "" "limits must be an object")
+expect_rejected(non_array_panels
+    [=[{"panels":{}}]=] "" "" "panels must be an array")
 expect_rejected(overflow_workers
     [=[{"workers":4294967296}]=] "" "")
 expect_rejected(excessive_workers
