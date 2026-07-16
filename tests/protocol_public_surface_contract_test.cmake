@@ -118,6 +118,29 @@ if(NOT UDP_RELAY_SOURCE MATCHES
     message(FATAL_ERROR
         "UDP relay must preserve one ReadMultiBuffer as one datagram")
 endif()
+set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
+file(READ "${UDP_SESSION}" UDP_SESSION_SOURCE)
+if(UDP_SESSION_SOURCE MATCHES
+        "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*buf::Buffer::kSize")
+    message(FATAL_ERROR
+        "UDPSession receive capacity must not be limited to one Buffer")
+endif()
+if(NOT UDP_SESSION_SOURCE MATCHES "socket[.]available")
+    message(FATAL_ERROR
+        "UDPSession must size large datagrams before receiving them")
+endif()
+set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
+file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
+if(WORKER_SOURCE MATCHES
+        "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*kRecvBufSize")
+    message(FATAL_ERROR
+        "native UDP inbound receive must not be limited to one Buffer")
+endif()
+if(NOT WORKER_SOURCE MATCHES
+        "detail::UdpReceiveBuffer receive_buffer")
+    message(FATAL_ERROR
+        "native UDP inbound must share the full-datagram receive path")
+endif()
 if(NOT UDP_RELAY_SOURCE MATCHES
         "session[.]SendTo[\r\n ()*,a-zA-Z0-9_.]*datagram[.]data[(][)]")
     message(FATAL_ERROR

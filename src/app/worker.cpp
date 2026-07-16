@@ -1,4 +1,5 @@
 #include "acppnode/app/worker.hpp"
+#include "udp_receive_buffer.hpp"
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/traffic_types.hpp"
@@ -1249,7 +1250,6 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     std::string socket_key,
     std::string tag,
     ListenerSlot* listener_slot) {
-    constexpr size_t kRecvBufSize = buf::Buffer::kSize;
     const auto runtime_snapshot = worker.runtime_->Snapshot();
     const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
 
@@ -1264,19 +1264,35 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
 
     while (true) {
         udp::endpoint client_ep;
-        buf::BufferGuard recv_buf{buf::Buffer::New()};
-        if (!recv_buf) {
+        auto [wait_ec] = co_await sock->async_wait(
+            udp::socket::wait_read,
+            net::as_tuple(net::use_awaitable));
+        if (wait_ec == io_error::operation_aborted) co_return;
+        if (wait_ec) {
+            continue;
+        }
+
+        IoErrorCode available_ec;
+        const size_t available_bytes = sock->available(available_ec);
+        if (available_ec) {
+            continue;
+        }
+
+        detail::UdpReceiveBuffer receive_buffer;
+        const auto storage = receive_buffer.Prepare(available_bytes);
+        if (storage.size() == 0) {
             LOG_ERROR("Worker[{}]: UDP receive buffer allocation failed tag={}", worker.id_, tag);
             co_return;
         }
         auto [ec, n] = co_await sock->async_receive_from(
-            net::buffer(recv_buf->Tail().data(), kRecvBufSize), client_ep,
+            storage, client_ep,
             net::as_tuple(net::use_awaitable));
 
         if (ec == io_error::operation_aborted) co_return;
         if (ec || n == 0) {
             continue;
         }
+        const auto received = receive_buffer.Data(n);
 
         // ── 懒清理空闲会话 ────────────────────────────────────────────────
         const auto now = std::chrono::steady_clock::now();
@@ -1291,7 +1307,7 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .socket_key = socket_key,
             .sock = sock,
             .client_endpoint = client_ep,
-            .payload = std::span<const uint8_t>(recv_buf->Tail().data(), n),
+            .payload = received,
             .receiver = listener,
             .io_context = worker.runtime_->io_context,
             .dispatcher = *worker.runtime_->dispatcher,

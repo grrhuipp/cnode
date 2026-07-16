@@ -9,6 +9,7 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "udp_receive_buffer.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -401,13 +402,35 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
 
 net::awaitable<void> UDPSession::Impl::DoReceive() {
     while (running) {
-        buf::BufferGuard recv_guard{buf::Buffer::New()};
-        if (!recv_guard) {
+        auto [wait_ec] = co_await socket.async_wait(
+            udp::socket::wait_read,
+            net::as_tuple(net::use_awaitable));
+        if (wait_ec == io_error::operation_aborted) {
+            co_return;
+        }
+        if (wait_ec) {
+            LOG_ACCESS_DEBUG("UDP session {} wait error: {} ({})",
+                             session_id, wait_ec.message(), wait_ec.value());
+            continue;
+        }
+
+        IoErrorCode available_ec;
+        const size_t available_bytes = socket.available(available_ec);
+        if (available_ec) {
+            LOG_ACCESS_DEBUG("UDP session {} available error: {} ({})",
+                             session_id,
+                             available_ec.message(), available_ec.value());
+            continue;
+        }
+
+        detail::UdpReceiveBuffer receive_buffer;
+        const auto storage = receive_buffer.Prepare(available_bytes);
+        if (storage.size() == 0) {
             co_return;
         }
 
         auto [ec, bytes] = co_await socket.async_receive_from(
-            net::buffer(recv_guard->data, buf::Buffer::kSize),
+            storage,
             sender_endpoint,
             net::as_tuple(net::use_awaitable));
         if (ec == io_error::operation_aborted) {
@@ -441,9 +464,10 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
         source.resolved_addr = sender_endpoint.address();
         source.port = sender_endpoint.port();
 
+        const auto received = receive_buffer.Data(bytes);
         UDPPacketView packet_view{
             source,
-            std::span<const uint8_t>(recv_guard->data, bytes)};
+            received};
 
         bool delivered = false;
 

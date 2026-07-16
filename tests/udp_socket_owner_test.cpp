@@ -1,11 +1,19 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "udp_receive_buffer.hpp"
 
+#include <asio/as_tuple.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
+#include <asio/use_awaitable.hpp>
+
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -71,6 +79,48 @@ int main() {
     io_context.run();
     if (!receive_cancelled) {
         Fail("destroyed UDP socket did not cancel its pending receive");
+    }
+    io_context.restart();
+
+    acpp::udp::socket large_receiver(io_context, acpp::udp::v4());
+    large_receiver.bind(
+        acpp::udp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
+    if (ec) Fail("failed to bind large UDP receiver");
+    acpp::udp::socket large_sender(io_context, acpp::udp::v4());
+    const auto large_endpoint = large_receiver.local_endpoint(ec);
+    if (ec) Fail("failed to query large UDP receiver endpoint");
+
+    std::vector<uint8_t> large_payload(acpp::buf::Buffer::kSize + 257, 0x6d);
+    bool large_received = false;
+    acpp::net::co_spawn(
+        io_context,
+        [&]() -> acpp::net::awaitable<void> {
+            auto [wait_ec] = co_await large_receiver.async_wait(
+                acpp::udp::socket::wait_read,
+                acpp::net::as_tuple(acpp::net::use_awaitable));
+            if (wait_ec) co_return;
+
+            acpp::IoErrorCode available_ec;
+            const size_t available = large_receiver.available(available_ec);
+            if (available_ec) co_return;
+            acpp::detail::UdpReceiveBuffer receive_buffer;
+            const auto storage = receive_buffer.Prepare(available);
+            acpp::udp::endpoint sender_endpoint;
+            auto [receive_ec, bytes] = co_await large_receiver.async_receive_from(
+                storage,
+                sender_endpoint,
+                acpp::net::as_tuple(acpp::net::use_awaitable));
+            if (receive_ec) co_return;
+            const auto received = receive_buffer.Data(bytes);
+            large_received = received.size() == large_payload.size() &&
+                std::equal(received.begin(), received.end(), large_payload.begin());
+        },
+        acpp::net::detached);
+    large_sender.send_to(acpp::net::buffer(large_payload), large_endpoint, 0, ec);
+    if (ec) Fail("failed to send large UDP datagram");
+    io_context.run();
+    if (!large_received) {
+        Fail("UDP receive path truncated a datagram larger than one Buffer");
     }
     io_context.restart();
 

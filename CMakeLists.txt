@@ -1344,6 +1344,7 @@ if(CNODE_BUILD_TESTS)
     )
     target_include_directories(cnode_udp_socket_owner_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
         ${concurrentqueue_SOURCE_DIR}
     )
     target_link_libraries(cnode_udp_socket_owner_test PRIVATE
