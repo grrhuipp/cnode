@@ -1479,6 +1479,30 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_udp_socket_owner_test
         COMMAND cnode_udp_socket_owner_test)
 
+    add_executable(cnode_timeout_scheduler_test
+        tests/timeout_scheduler_test.cpp
+        src/transport/internet/timeout_scheduler.cpp
+    )
+    target_include_directories(cnode_timeout_scheduler_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_timeout_scheduler_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_timeout_scheduler_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_timeout_scheduler_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_timeout_scheduler_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_timeout_scheduler_test
+        COMMAND cnode_timeout_scheduler_test)
+
     add_executable(cnode_node_transition_test
         tests/node_transition_test.cpp
         src/service/controller/node_transition.cpp

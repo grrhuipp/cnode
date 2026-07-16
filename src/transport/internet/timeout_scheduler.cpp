@@ -2,8 +2,10 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <algorithm>
+#include <asio/as_tuple.hpp>
 #include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
 
 namespace acpp {
 
@@ -12,7 +14,7 @@ struct TimeoutScheduler::Impl {
         : timer(io_context) {
         events.reserve(kInitialEventReserve);
         deadline_heap.reserve(kInitialEventReserve);
-        ready_callbacks.reserve(kInitialReadyReserve);
+        ready_event_ids.reserve(kInitialReadyReserve);
     }
 
     static constexpr size_t kInitialEventReserve = 1024;
@@ -42,7 +44,7 @@ struct TimeoutScheduler::Impl {
 
     TimeoutEventMap events;
     memory::ThreadLocalVector<HeapEntry> deadline_heap;
-    memory::ThreadLocalVector<Callback> ready_callbacks;
+    memory::ThreadLocalVector<uint64_t> ready_event_ids;
     uint64_t next_id = 1;
     uint64_t timer_generation = 0;
     bool timer_armed = false;
@@ -101,7 +103,7 @@ struct TimeoutScheduler::Impl {
         if (released) return;
         if (ec) return;  // cancelled / stopped
 
-        auto& ready = ready_callbacks;
+        auto& ready = ready_event_ids;
         ready.clear();
 
         const auto now = std::chrono::steady_clock::now();
@@ -116,16 +118,30 @@ struct TimeoutScheduler::Impl {
             if (it == events.end() || it->second.deadline != entry.deadline) {
                 continue;
             }
-            ready.push_back(std::move(it->second.cb));
-            events.erase(it);
+            ready.push_back(entry.id);
         }
 
-        for (auto& cb : ready) {
+        // Keep due callbacks in events until the instant they execute. A prior
+        // callback in this same ready batch may cancel and destroy a later
+        // callback owner; Cancel must still be able to erase that event.
+        for (size_t i = 0; i < ready.size(); ++i) {
+            const uint64_t id = ready[i];
+            auto it = events.find(id);
+            if (it == events.end()) {
+                continue;
+            }
+            Callback cb = std::move(it->second.cb);
+            events.erase(it);
             if (cb) cb();
+            if (released) {
+                break;
+            }
         }
         ready.clear();
 
-        ArmTimer();
+        if (!released) {
+            ArmTimer();
+        }
     }
 
     void Release() noexcept {
@@ -136,7 +152,7 @@ struct TimeoutScheduler::Impl {
         timer_armed = false;
         events.clear();
         deadline_heap.clear();
-        ready_callbacks.clear();
+        ready_event_ids.clear();
     }
 };
 
