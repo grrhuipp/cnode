@@ -50,11 +50,26 @@ int main() {
             "GET / HTTP/1.1\r\nHost: bad host\r\n\r\n").success,
         "an invalid HTTP authority must be rejected")) return 8;
 
+    if (!Require(!SniffHttp(
+            "GET / HTTP/1.1\r\nHost: [not:ipv6]:443\r\n\r\n").success,
+        "a bracketed non-IPv6 host must be rejected")) return 9;
+    if (!Require(!SniffHttp(
+            "GET / HTTP/1.1\r\nHost: bad..example\r\n\r\n").success,
+        "an empty DNS label must be rejected")) return 10;
+    if (!Require(!SniffHttp(
+            "GET / HTTP/1.1\r\nHost: -bad.example\r\n\r\n").success,
+        "a DNS label must not start with a hyphen")) return 11;
+
     const auto ipv6 = SniffHttp(
         "CONNECT [2001:db8::1]:8443 HTTP/1.1\r\n"
         "hOsT:\t[2001:db8::1]:8443\t\r\n\r\n");
     if (!Require(ipv6.success && ipv6.domain == "2001:db8::1" &&
                      ipv6.port == 8443,
-                 "a bracketed IPv6 authority must be parsed")) return 9;
+                 "a bracketed IPv6 authority must be parsed")) return 12;
+
+    const auto absolute_dns = SniffHttp(
+        "GET / HTTP/1.1\r\nHost: example.com.\r\n\r\n");
+    if (!Require(absolute_dns.success && absolute_dns.domain == "example.com.",
+                 "an absolute DNS hostname must remain valid for HTTP")) return 13;
     return 0;
 }

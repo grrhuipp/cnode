@@ -33,8 +33,9 @@ struct ClientHelloFixture {
     std::size_t extensions_length_offset = 0;
 };
 
-ClientHelloFixture BuildClientHello(bool malformed_sni_tail = false) {
-    const std::string_view host = "example.com";
+ClientHelloFixture BuildClientHello(
+    bool malformed_sni_tail = false,
+    std::string_view host = "example.com") {
     std::vector<uint8_t> server_name_list;
     server_name_list.push_back(0);
     AppendU16(server_name_list, host.size());
@@ -118,5 +119,21 @@ int main() {
            long_extensions.bytes.size());
     if (!Require(!sniffer.Sniff(long_extensions.bytes).success,
                  "truncated ClientHello extensions must be rejected")) return 6;
+
+    const auto ipv4_sni = BuildClientHello(false, "192.0.2.1");
+    if (!Require(!sniffer.Sniff(ipv4_sni.bytes).success,
+                 "an IPv4 literal must not be accepted as TLS host_name")) return 7;
+
+    const auto trailing_dot_sni = BuildClientHello(false, "example.com.");
+    if (!Require(!sniffer.Sniff(trailing_dot_sni.bytes).success,
+                 "TLS host_name must not contain a trailing dot")) return 8;
+
+    const auto empty_label_sni = BuildClientHello(false, "bad..example");
+    if (!Require(!sniffer.Sniff(empty_label_sni.bytes).success,
+                 "TLS host_name must not contain an empty DNS label")) return 9;
+
+    const auto invalid_label_sni = BuildClientHello(false, "bad_name.example");
+    if (!Require(!sniffer.Sniff(invalid_label_sni.bytes).success,
+                 "TLS host_name must use DNS hostname labels")) return 10;
     return 0;
 }

@@ -1,5 +1,7 @@
 #include "acppnode/sniff/sniffer.hpp"
 
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/unsafe.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
@@ -143,6 +145,9 @@ std::optional<HttpSniffer::HostPortView> HttpSniffer::ParseHttpHost(
                     return std::nullopt;
                 }
                 parsed.host = value.substr(1, close - 1);
+                IoErrorCode ip_error;
+                (void)net::ip::make_address_v6(parsed.host, ip_error);
+                if (ip_error) return std::nullopt;
                 const std::string_view suffix = value.substr(close + 1);
                 if (!suffix.empty() &&
                     (suffix.front() != ':' ||
@@ -167,7 +172,12 @@ std::optional<HttpSniffer::HostPortView> HttpSniffer::ParseHttpHost(
                     parsed.host = value.substr(0, colon_position);
                 }
             }
-            if (parsed.host.empty()) return std::nullopt;
+            if (parsed.host.empty() ||
+                (value.front() != '[' &&
+                 !domain::IsValidDnsHostname(
+                     parsed.host, domain::TrailingDotPolicy::Allow))) {
+                return std::nullopt;
+            }
             host = parsed;
         }
         position = line_end + 2;

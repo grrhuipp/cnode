@@ -1,5 +1,6 @@
 #include "acppnode/sniff/sniffer.hpp"
 
+#include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/transport/internet/tls_server_name.hpp"
 
@@ -111,7 +112,12 @@ std::optional<std::string_view> TlsSniffer::ExtractSNI(
             if (server_name) return std::nullopt;
             auto parsed = transport::internet::ParseTlsServerNameExtension(
                 extensions.subspan(position, extension_size));
-            if (!parsed) return std::nullopt;
+            if (!parsed ||
+                !domain::IsValidDnsHostname(
+                    *parsed, domain::TrailingDotPolicy::Forbid) ||
+                domain::IsIpv4AddressLiteral(*parsed)) {
+                return std::nullopt;
+            }
             server_name = *parsed;
         }
         position += extension_size;
