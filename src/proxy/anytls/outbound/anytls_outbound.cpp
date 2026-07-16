@@ -12,7 +12,7 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
-#include "../../../app/proxyman/outbound/settings_json.hpp"
+#include "acppnode/infra/json_port.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -54,12 +54,12 @@ std::optional<acpp::proxy::anytls::outbound::Settings> ParseSettings(
     if (result.address.empty()) {
         result.address = read_string("server");
     }
-    const auto port = acpp::proxyman::outbound::ParsePort(
+    const auto port = acpp::ReadJsonPort(
         settings, {"server_port", "port"});
-    if (!port.valid) {
+    if (port.Invalid()) {
         return std::nullopt;
     }
-    if (port.present) {
+    if (port.Valid()) {
         result.port = port.value;
     }
     if (const auto value = read_string("password"); !value.empty()) {

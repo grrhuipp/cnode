@@ -1,5 +1,6 @@
 #include "acppnode/infra/config.hpp"
 #include "acppnode/core/naming.hpp"
+#include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
 #include <algorithm>
 #include <cctype>
@@ -43,28 +44,19 @@ inline int64_t jint(const json::object& obj, std::string_view key,
 }
 
 uint16_t required_port(const json::object& obj, std::string_view key) {
-    const auto* value = obj.if_contains(key);
-    if (!value) {
-        throw std::invalid_argument(std::string(key) + " is required");
+    const auto result = ReadJsonPort(obj, {key});
+    switch (result.error) {
+        case JsonPortError::None:
+            return result.value;
+        case JsonPortError::Missing:
+            throw std::invalid_argument(std::string(key) + " is required");
+        case JsonPortError::InvalidType:
+            throw std::invalid_argument(std::string(key) + " must be an integer");
+        case JsonPortError::OutOfRange:
+            throw std::invalid_argument(
+                std::string(key) + " must be between 1 and 65535");
     }
-
-    uint64_t port = 0;
-    if (value->is_int64()) {
-        const int64_t signed_port = value->as_int64();
-        if (signed_port <= 0) {
-            throw std::invalid_argument(std::string(key) + " must be between 1 and 65535");
-        }
-        port = static_cast<uint64_t>(signed_port);
-    } else if (value->is_uint64()) {
-        port = value->as_uint64();
-    } else {
-        throw std::invalid_argument(std::string(key) + " must be an integer");
-    }
-
-    if (port == 0 || port > std::numeric_limits<uint16_t>::max()) {
-        throw std::invalid_argument(std::string(key) + " must be between 1 and 65535");
-    }
-    return static_cast<uint16_t>(port);
+    throw std::invalid_argument(std::string(key) + " is invalid");
 }
 
 inline std::string jstr_or_int(const json::object& obj, std::string_view key,

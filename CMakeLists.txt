@@ -406,6 +406,7 @@ set(CNODE_SOURCES
     src/app/router/router.cpp
 
     # API / panel clients
+    src/api/v2board/node_info_json.cpp
     src/api/v2board/v2board.cpp
 
     # Main
@@ -633,6 +634,32 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_v2board_http_response_test
         COMMAND cnode_v2board_http_response_test)
 
+    add_executable(cnode_v2board_node_info_json_test
+        tests/v2board_node_info_json_test.cpp
+        src/api/v2board/node_info_json.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_v2board_node_info_json_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
+    )
+    target_link_libraries(cnode_v2board_node_info_json_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_v2board_node_info_json_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_v2board_node_info_json_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_v2board_node_info_json_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_v2board_node_info_json_test
+        COMMAND cnode_v2board_node_info_json_test)
+
     add_executable(cnode_inbound_tls_policy_test
         tests/inbound_tls_policy_test.cpp
     )
@@ -706,21 +733,20 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_config_semantics_test
         COMMAND cnode_config_semantics_test)
 
-    add_executable(cnode_outbound_settings_json_test
-        tests/outbound_settings_json_test.cpp
+    add_executable(cnode_json_port_test
+        tests/json_port_test.cpp
         src/infra/json.cpp
     )
-    target_include_directories(cnode_outbound_settings_json_test PRIVATE
+    target_include_directories(cnode_json_port_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/proxyman/outbound
     )
-    target_compile_options(cnode_outbound_settings_json_test PRIVATE
+    target_compile_options(cnode_json_port_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(
-        NAME cnode_outbound_settings_json_test
-        COMMAND cnode_outbound_settings_json_test)
+        NAME cnode_json_port_test
+        COMMAND cnode_json_port_test)
 
     add_test(
         NAME cnode_invalid_config_sources_test

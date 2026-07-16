@@ -4,7 +4,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
-#include "../../../app/proxyman/outbound/settings_json.hpp"
+#include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/common/error.hpp"
@@ -380,11 +380,11 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 if (vmess_config.address.empty()) {
                     vmess_config.address = json_string(server, "server");
                 }
-                const auto port = acpp::proxyman::outbound::ParsePort(server, {"port"});
-                if (!port.valid) {
+                const auto port = acpp::ReadJsonPort(server, {"port"});
+                if (port.Invalid()) {
                     return std::nullopt;
                 }
-                if (port.present) {
+                if (port.Valid()) {
                     vmess_config.port = port.value;
                 }
                 vmess_config.uuid = json_string(user, "id");
@@ -407,12 +407,12 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (vmess_config.address.empty()) {
                 vmess_config.address = json_string(s, "address");
             }
-            const auto port = acpp::proxyman::outbound::ParsePort(
+            const auto port = acpp::ReadJsonPort(
                 s, {"server_port", "port"});
-            if (!port.valid) {
+            if (port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.present) {
+            if (port.Valid()) {
                 vmess_config.port = port.value;
             }
             vmess_config.uuid = json_string(s, "uuid");

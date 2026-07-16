@@ -7,19 +7,34 @@
 #include <limits>
 #include <string_view>
 
-namespace acpp::proxyman::outbound {
+namespace acpp {
 
-struct ParsedPort {
-    bool present = false;
-    bool valid = true;
-    uint16_t value = 0;
+enum class JsonPortError {
+    None,
+    Missing,
+    InvalidType,
+    OutOfRange,
 };
 
-[[nodiscard]] inline ParsedPort ParsePort(
-    const json::object& settings,
+struct JsonPortResult {
+    JsonPortError error = JsonPortError::Missing;
+    uint16_t value = 0;
+
+    [[nodiscard]] bool Valid() const noexcept {
+        return error == JsonPortError::None;
+    }
+
+    [[nodiscard]] bool Invalid() const noexcept {
+        return error == JsonPortError::InvalidType ||
+               error == JsonPortError::OutOfRange;
+    }
+};
+
+[[nodiscard]] inline JsonPortResult ReadJsonPort(
+    const json::object& source,
     std::initializer_list<std::string_view> keys) noexcept {
     for (const std::string_view key : keys) {
-        const auto* raw = settings.if_contains(key);
+        const auto* raw = source.if_contains(key);
         if (!raw) {
             continue;
         }
@@ -28,25 +43,24 @@ struct ParsedPort {
         if (raw->is_int64()) {
             const int64_t signed_value = raw->as_int64();
             if (signed_value <= 0) {
-                return {.present = true, .valid = false};
+                return {.error = JsonPortError::OutOfRange};
             }
             value = static_cast<uint64_t>(signed_value);
         } else if (raw->is_uint64()) {
             value = raw->as_uint64();
         } else {
-            return {.present = true, .valid = false};
+            return {.error = JsonPortError::InvalidType};
         }
 
         if (value == 0 || value > std::numeric_limits<uint16_t>::max()) {
-            return {.present = true, .valid = false};
+            return {.error = JsonPortError::OutOfRange};
         }
         return {
-            .present = true,
-            .valid = true,
+            .error = JsonPortError::None,
             .value = static_cast<uint16_t>(value),
         };
     }
     return {};
 }
 
-}  // namespace acpp::proxyman::outbound
+}  // namespace acpp

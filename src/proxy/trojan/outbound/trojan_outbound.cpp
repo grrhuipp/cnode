@@ -3,7 +3,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
-#include "../../../app/proxyman/outbound/settings_json.hpp"
+#include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
@@ -619,12 +619,12 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (config.address.empty()) {
                 config.address = json_string(obj, "server");
             }
-            const auto port = acpp::proxyman::outbound::ParsePort(
+            const auto port = acpp::ReadJsonPort(
                 obj, {"server_port", "port"});
-            if (!port.valid) {
+            if (port.Invalid()) {
                 return false;
             }
-            if (port.present) {
+            if (port.Valid()) {
                 config.port = port.value;
             }
             config.password = json_string(obj, "password");

@@ -9,7 +9,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
-#include "../../../app/proxyman/outbound/settings_json.hpp"
+#include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
@@ -1269,11 +1269,11 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 vnext_p->as_array()[0].is_object()) {
             const auto& server = vnext_p->as_array()[0].as_object();
             vless_config.address = json_string(server, "address");
-            const auto port = acpp::proxyman::outbound::ParsePort(server, {"port"});
-            if (!port.valid) {
+            const auto port = acpp::ReadJsonPort(server, {"port"});
+            if (port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.present) {
+            if (port.Valid()) {
                 vless_config.port = port.value;
             }
 
@@ -1300,12 +1300,12 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (vless_config.address.empty()) {
                 vless_config.address = json_string(s, "address");
             }
-            const auto port = acpp::proxyman::outbound::ParsePort(
+            const auto port = acpp::ReadJsonPort(
                 s, {"server_port", "port"});
-            if (!port.valid) {
+            if (port.Invalid()) {
                 return std::nullopt;
             }
-            if (port.present) {
+            if (port.Valid()) {
                 vless_config.port = port.value;
             }
             vless_config.uuid = json_string(s, "uuid");

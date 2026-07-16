@@ -6,6 +6,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "http_response.hpp"
+#include "node_info_json.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
@@ -638,61 +639,15 @@ APIClient::Impl::GetNodeInfo() {
         auto jv = json::parse(resp.body);
         auto& j = jv.as_object();
 
-        ::acpp::api::NodeInfo config;
-        config.NodeID = node_id;
-        config.NodeType = config_.NodeType;  // 使用面板配置中的节点类型
-
-        auto* sp = j.if_contains("server_port");
-        config.Port = (sp && sp->is_int64()) ? static_cast<uint16_t>(sp->as_int64()) : 0;
-        auto* np = j.if_contains("network");
-        config.TransportProtocol = (np && np->is_string())
-            ? std::string(np->as_string())
-            : std::string(constants::protocol::kTcp);
-
-        // networkSettings 可能是 null
-        auto* nsp = j.if_contains("networkSettings");
-        if (nsp && nsp->is_object()) {
-            auto& ns = nsp->as_object();
-            auto* pp = ns.if_contains("path");
-            config.Path = (pp && pp->is_string()) ? std::string(pp->as_string()) : "";
-            auto* hp = ns.if_contains("headers");
-            if (hp && hp->is_object()) {
-                auto* hostp = hp->as_object().if_contains("Host");
-                config.Host = (hostp && hostp->is_string()) ? std::string(hostp->as_string()) : "";
-            }
+        auto parsed_config = ParseNodeInfo(j, node_id, config_.NodeType);
+        if (!parsed_config) {
+            LOG_ERROR("V2Board[{}]: invalid node config: {}",
+                      config_.Name, parsed_config.error());
+            co_return NodeInfoFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                std::move(parsed_config.error()));
         }
-
-        // tls 可能是 null 或 0/1
-        auto* tlsp = j.if_contains(constants::protocol::kTls);
-        if (tlsp && !tlsp->is_null()) {
-            if (tlsp->is_int64()) config.EnableTLS = tlsp->as_int64() != 0;
-            else if (tlsp->is_bool()) config.EnableTLS = tlsp->as_bool();
-        }
-
-        // server_name / sni
-        auto* snip = j.if_contains("server_name");
-        if (snip && snip->is_string()) {
-            config.TLSServerName = std::string(snip->as_string());
-        }
-
-        // cipher（Shadowsocks 加密方法）
-        auto* ciphp = j.if_contains("cipher");
-        if (ciphp && ciphp->is_string()) {
-            config.CypherMethod = std::string(ciphp->as_string());
-        }
-        auto* ss_server_key = j.if_contains("server_key");
-        if (ss_server_key && ss_server_key->is_string()) {
-            config.ShadowsocksServerKey = std::string(ss_server_key->as_string());
-        }
-
-        auto* bcp = j.if_contains("base_config");
-        if (bcp && bcp->is_object()) {
-            auto& bc = bcp->as_object();
-            auto* pi = bc.if_contains("pull_interval");
-            config.PullInterval = (pi && pi->is_int64()) ? static_cast<int>(pi->as_int64()) : 60;
-            auto* pu = bc.if_contains("push_interval");
-            config.PushInterval = (pu && pu->is_int64()) ? static_cast<int>(pu->as_int64()) : 60;
-        }
+        auto config = std::move(*parsed_config);
 
         cached_route_rules_ = ExtractBlockDetectRules(j, config_.Name);
 
