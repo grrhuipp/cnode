@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/proxy/vmess/account.hpp"
+#include "../account.hpp"
 #include "../vmess_cipher.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"

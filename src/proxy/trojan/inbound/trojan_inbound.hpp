@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/trojan/validator.hpp"
+#include "../validator.hpp"
 
 namespace acpp {
 struct StatsShard;

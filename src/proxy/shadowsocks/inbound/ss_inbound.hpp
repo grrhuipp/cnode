@@ -4,7 +4,7 @@
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/app/udp_types.hpp"
-#include "acppnode/proxy/shadowsocks/validator.hpp"
+#include "../validator.hpp"
 
 #include <array>
 #include <memory>

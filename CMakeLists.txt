@@ -806,6 +806,7 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_uot_ss2022_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/uot
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/shadowsocks
         ${blake3_SOURCE_DIR}/c
     )
     target_link_libraries(cnode_uot_ss2022_test PRIVATE
@@ -981,6 +982,8 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_inbound_tls_policy_test
         tests/inbound_tls_policy_test.cpp
+        src/transport/internet/inbound_listen.cpp
+        src/transport/internet/outbound_bind.cpp
     )
     target_include_directories(cnode_inbound_tls_policy_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1428,10 +1431,10 @@ if(CNODE_BUILD_TESTS)
     set_tests_properties(cnode_graceful_shutdown_test PROPERTIES TIMEOUT 15)
 
     add_test(
-        NAME cnode_protocol_handler_header_contract_test
+        NAME cnode_protocol_public_surface_contract_test
         COMMAND ${CMAKE_COMMAND}
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_handler_header_contract_test.cmake)
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_public_surface_contract_test.cmake)
 
     add_test(
         NAME cnode_invalid_config_sources_test

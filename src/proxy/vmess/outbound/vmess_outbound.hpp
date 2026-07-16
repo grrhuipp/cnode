@@ -2,8 +2,8 @@
 
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/proxy/outbound.hpp"
-#include "acppnode/proxy/vmess/account.hpp"
-#include "acppnode/proxy/vmess/types.hpp"
+#include "../account.hpp"
+#include "../types.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 

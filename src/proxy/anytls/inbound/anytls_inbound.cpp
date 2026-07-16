@@ -13,7 +13,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/transport/async_stream.hpp"
-#include "acppnode/proxy/anytls/validator.hpp"
+#include "../validator.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -1079,6 +1079,12 @@ Handler::Process(
 namespace {
 const bool kInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
+
+    reg.create_runtime = []() -> std::unique_ptr<
+        acpp::proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
+            acpp::anytls::Validator>>();
+    };
 
     reg.create_tcp_handler =
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,

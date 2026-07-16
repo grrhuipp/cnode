@@ -1,4 +1,4 @@
-#include "acppnode/proxy/shadowsocks/validator.hpp"
+#include "validator.hpp"
 
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"

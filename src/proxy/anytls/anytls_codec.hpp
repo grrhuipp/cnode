@@ -5,7 +5,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/anytls/user_info.hpp"
+#include "user_info.hpp"
 
 #include <array>
 #include <cstdint>

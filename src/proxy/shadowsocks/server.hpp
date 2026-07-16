@@ -2,8 +2,8 @@
 
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
-#include "acppnode/proxy/shadowsocks/validator.hpp"
+#include "shadowsocks_protocol.hpp"
+#include "validator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 

@@ -492,6 +492,12 @@ namespace {
 const bool kTrojanInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
 
+    reg.create_runtime = []() -> std::unique_ptr<
+        acpp::proxyman::inbound::ProtocolRuntime> {
+        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
+            acpp::trojan::Validator>>();
+    };
+
     reg.create_tcp_handler =
         [](const acpp::proxyman::inbound::ProtocolDeps& deps,
            acpp::ConnectionLimiterPtr limiter,

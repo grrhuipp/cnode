@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/proxy/anytls/user_info.hpp"
+#include "user_info.hpp"
 
 #include <array>
 #include <cstddef>

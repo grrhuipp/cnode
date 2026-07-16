@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "shadowsocks_protocol.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 

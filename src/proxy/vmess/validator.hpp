@@ -1,64 +1,71 @@
 #pragma once
 
 // ============================================================================
-// validator.hpp — Trojan 用户管理
+// validator.hpp — VMess TimedUserValidator
 //
 // 职责（协议特有）：
-//   - 认证：password_hash → 全局 UserStore credential
-//   - 验证：SHA224 哈希比对
-//   - 按 tag 独立管理（面板多入站场景）
+//   - 全局 RCU 账户快照
+//   - 热点账户缓存
 //
-// 通用能力（委托给在线追踪实现）：
-//   - 在线追踪：OnUserConnected / OnUserDisconnected / GetOnlineDevices 等
+// 通用能力：
+//   - 在线用户追踪
 // ============================================================================
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/proxy/trojan/user_info.hpp"
+#include "account.hpp"
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace acpp {
 struct OnlineDevice;
-}  // namespace acpp
 
-namespace acpp::trojan {
-
-[[nodiscard]] std::string HashPassword(const std::string& password);
+namespace vmess {
 
 // ============================================================================
-// Trojan 用户管理器
+// TimedUserValidator — 用户验证器
+//
+// 线程模型：
+//   - 认证用户表为进程级单份 RCU 快照，认证路径只做 atomic load
+//   - 面板/静态更新在冷路径构建新快照后无锁发布
+//   - 在线追踪为 Worker 私有状态
 // ============================================================================
-class Validator {
+class TimedUserValidator {
 public:
-    Validator();
-    ~Validator();
+    TimedUserValidator();
+    ~TimedUserValidator();
 
-    Validator(const Validator&) = delete;
-    Validator& operator=(const Validator&) = delete;
-    Validator(Validator&&) noexcept;
-    Validator& operator=(Validator&&) noexcept;
+    TimedUserValidator(const TimedUserValidator&) = delete;
+    TimedUserValidator& operator=(const TimedUserValidator&) = delete;
+    TimedUserValidator(TimedUserValidator&&) noexcept;
+    TimedUserValidator& operator=(TimedUserValidator&&) noexcept;
 
     // ── 用户存储 ─────────────────────────────────────────────────────────────
 
-    void ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
-    void AddUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
-    void RemoveUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
+    void ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
+    void AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
+    void RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
     void ClearUsers(std::string_view tag);
-
-    // ── 认证与查找 ───────────────────────────────────────────────────────────
-
-    bool Validate(std::string_view tag, std::string_view hash) const;
-
-    std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential>
-    FindUser(std::string_view tag, std::string_view hash) const;
+    void Clear();
 
     size_t Size() const;
     size_t SizeForTag(std::string_view tag) const;
+
+    // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
+    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
+    FindByAuthIDForTag(std::string_view tag,
+                       const uint8_t* auth_id,
+                       int64_t& out_timestamp) const;
+
+    // Records AEAD request body key/IV for replay protection.
+    // Returns false if the same user/key/IV tuple is still inside the replay window.
+    [[nodiscard]] bool RegisterSessionIfNew(
+        const proxyman::inbound::UserStore::VmessCredential& user,
+        const std::array<uint8_t, 16>& body_key,
+        const std::array<uint8_t, 16>& body_iv) const;
 
     // ── 在线追踪 ─────────────────────────────────────────────────────────────
 
@@ -86,4 +93,5 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace acpp::trojan
+}  // namespace vmess
+}  // namespace acpp

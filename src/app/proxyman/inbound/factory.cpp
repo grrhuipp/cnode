@@ -40,6 +40,16 @@ std::vector<std::string> RegisteredProtocols() {
     return result;
 }
 
+std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
+    std::string_view protocol) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    if (it == registrations.end() || !it->second.create_runtime) {
+        return nullptr;
+    }
+    return it->second.create_runtime();
+}
+
 std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
     const ProtocolDeps& deps,

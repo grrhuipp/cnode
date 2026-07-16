@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/proxy/vmess/validator.hpp"
+#include "../validator.hpp"
 #include "../vmess_request.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"

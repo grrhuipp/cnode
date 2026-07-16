@@ -1,4 +1,4 @@
-#include "acppnode/proxy/vmess/validator.hpp"
+#include "validator.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"

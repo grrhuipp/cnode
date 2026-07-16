@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/common/user_profile.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "shadowsocks_protocol.hpp"
 
 #include <cstddef>
 #include <string>

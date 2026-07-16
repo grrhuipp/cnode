@@ -12,7 +12,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/proxy/vmess/types.hpp"
+#include "types.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>

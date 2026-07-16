@@ -1,6 +1,6 @@
 #include "uot.hpp"
 
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "shadowsocks_protocol.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>

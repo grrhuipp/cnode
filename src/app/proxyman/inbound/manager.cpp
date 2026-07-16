@@ -8,12 +8,6 @@
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/string_hash.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/proxy/shadowsocks/validator.hpp"
-#include "acppnode/proxy/anytls/validator.hpp"
-#include "acppnode/proxy/trojan/validator.hpp"
-#include "acppnode/proxy/vless/validator.hpp"
-#include "acppnode/proxy/vmess/validator.hpp"
 
 namespace acpp::proxyman::inbound {
 
@@ -23,35 +17,35 @@ struct Manager::Impl {
         std::unique_ptr<Handler>,
         TransparentStringHash,
         TransparentStringEq>;
+    using RuntimeMap = memory::ThreadLocalUnorderedMap<
+        std::string,
+        std::unique_ptr<ProtocolRuntime>,
+        TransparentStringHash,
+        TransparentStringEq>;
 
     explicit Impl(StatsShard& stats) noexcept
         : stats(stats) {}
 
-    [[nodiscard]] ProtocolDeps Deps(std::string_view protocol) noexcept {
-        void* validator = nullptr;
-        if (protocol == constants::protocol::kVmess) {
-            validator = &vmess_validator;
-        } else if (protocol == constants::protocol::kVless) {
-            validator = &vless_validator;
-        } else if (protocol == constants::protocol::kTrojan) {
-            validator = &trojan_validator;
-        } else if (protocol == constants::protocol::kShadowsocks) {
-            validator = &ss_validator;
-        } else if (protocol == constants::protocol::kAnyTLS) {
-            validator = &anytls_validator;
+    [[nodiscard]] ProtocolRuntime* EnsureRuntime(std::string_view protocol) {
+        if (auto it = runtimes.find(protocol); it != runtimes.end()) {
+            return it->second.get();
         }
+        auto runtime = NewProtocolRuntime(protocol);
+        if (!runtime) return nullptr;
+        auto result = runtimes.emplace(
+            std::string(protocol), std::move(runtime));
+        return result.first->second.get();
+    }
+
+    [[nodiscard]] ProtocolDeps Deps(std::string_view protocol) {
         return ProtocolDeps{
-            .validator = validator,
+            .runtime = EnsureRuntime(protocol),
             .stats = &stats,
         };
     }
 
     StatsShard& stats;
-    ::acpp::vmess::TimedUserValidator vmess_validator;
-    ::acpp::vless::Validator vless_validator;
-    ::acpp::trojan::Validator trojan_validator;
-    ::acpp::ss::Validator ss_validator;
-    ::acpp::anytls::Validator anytls_validator;
+    RuntimeMap runtimes;
     HandlerMap handlers;
     memory::ThreadLocalVector<std::unique_ptr<Handler>> retired_handlers;
 };
@@ -135,20 +129,8 @@ void Manager::ClearUsers(std::string_view protocol, std::string_view tag) {
 
 std::vector<::acpp::OnlineDevice>
 Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
-    if (protocol == constants::protocol::kVmess) {
-        return impl_->vmess_validator.GetOnlineDevices(tag);
-    }
-    if (protocol == constants::protocol::kVless) {
-        return impl_->vless_validator.GetOnlineDevices(tag);
-    }
-    if (protocol == constants::protocol::kTrojan) {
-        return impl_->trojan_validator.GetOnlineDevices(tag);
-    }
-    if (protocol == constants::protocol::kShadowsocks) {
-        return impl_->ss_validator.GetOnlineDevices(tag);
-    }
-    if (protocol == constants::protocol::kAnyTLS) {
-        return impl_->anytls_validator.GetOnlineDevices(tag);
+    if (auto it = impl_->runtimes.find(protocol); it != impl_->runtimes.end()) {
+        return it->second->GetOnlineDevices(tag);
     }
     return {};
 }

@@ -2,8 +2,8 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
-#include "acppnode/proxy/shadowsocks/validator.hpp"
+#include "shadowsocks_protocol.hpp"
+#include "validator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <array>

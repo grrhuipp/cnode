@@ -21,7 +21,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
-#include "acppnode/proxy/vless/validator.hpp"
+#include "../validator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"

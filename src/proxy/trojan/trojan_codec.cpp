@@ -1,5 +1,5 @@
 #include "trojan_codec.hpp"
-#include "acppnode/proxy/trojan/validator.hpp"
+#include "validator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/unsafe.hpp"

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/vless/validator.hpp"
+#include "../validator.hpp"
 
 #include <memory>
 #include <string>

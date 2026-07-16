@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "shadowsocks_protocol.hpp"
 
 #include <openssl/evp.h>
 

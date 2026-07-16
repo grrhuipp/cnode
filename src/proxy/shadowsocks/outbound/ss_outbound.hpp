@@ -3,7 +3,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
-#include "acppnode/proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "../shadowsocks_protocol.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
