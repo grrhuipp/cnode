@@ -5,6 +5,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/link.hpp"

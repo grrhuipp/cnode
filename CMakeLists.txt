@@ -310,7 +310,6 @@ set(CNODE_SOURCES
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
     src/app/proxyman/outbound/source_config.cpp
-    src/app/proxyman/outbound/handler.cpp
     src/app/proxyman/outbound/manager.cpp
     src/app/worker.cpp
     src/service/controller/controller.cpp

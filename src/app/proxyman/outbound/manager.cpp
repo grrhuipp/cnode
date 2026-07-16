@@ -1,22 +1,22 @@
 #include "acppnode/app/proxyman/outbound/manager.hpp"
 
-#include "acppnode/app/proxyman/outbound/handler.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/string_hash.hpp"
+#include "acppnode/proxy/outbound.hpp"
 
 namespace acpp::proxyman::outbound {
 
 struct Manager::Impl {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
         std::string,
-        std::unique_ptr<Handler>,
+        std::unique_ptr<Outbound>,
         TransparentStringHash,
         TransparentStringEq>;
 
     HandlerMap handlers;
-    memory::ThreadLocalVector<std::unique_ptr<Handler>> retired_handlers;
-    Handler* default_handler = nullptr;
+    memory::ThreadLocalVector<std::unique_ptr<Outbound>> retired_handlers;
+    Outbound* default_handler = nullptr;
 };
 
 Manager::Manager()
@@ -26,16 +26,16 @@ Manager::~Manager() noexcept {
     Clear();
 }
 
-features::outbound::Handler* Manager::GetHandler(std::string_view tag) noexcept {
+Outbound* Manager::GetHandler(std::string_view tag) noexcept {
     auto it = impl_->handlers.find(tag);
     return it == impl_->handlers.end() ? nullptr : it->second.get();
 }
 
-features::outbound::Handler* Manager::GetDefaultHandler() noexcept {
+Outbound* Manager::GetDefaultHandler() noexcept {
     return impl_->default_handler;
 }
 
-Handler* Manager::AddHandler(std::unique_ptr<Handler> handler) noexcept {
+Outbound* Manager::AddHandler(std::unique_ptr<Outbound> handler) noexcept {
     if (!handler) {
         return nullptr;
     }
@@ -45,7 +45,7 @@ Handler* Manager::AddHandler(std::unique_ptr<Handler> handler) noexcept {
         return nullptr;
     }
 
-    Handler* raw = handler.get();
+    Outbound* raw = handler.get();
     if (!impl_->default_handler) {
         impl_->default_handler = raw;
     }

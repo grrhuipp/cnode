@@ -19,6 +19,7 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/proxy/vless/validator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"

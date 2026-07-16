@@ -53,12 +53,11 @@ std::vector<PreparedOutboundConfig> PrepareOutboundConfigs(
     return prepared;
 }
 
-std::unique_ptr<Handler> NewHandler(
+std::unique_ptr<::acpp::Outbound> NewHandler(
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,
     ::acpp::app::dns::DNS& dns,
     ::acpp::UDPSessionManager* udp_mgr,
-    ::acpp::StatsShard& stats,
     std::chrono::seconds dial_timeout) {
 
     if (!config.create) {
@@ -68,7 +67,7 @@ std::unique_ptr<Handler> NewHandler(
     if (!proxy) {
         return nullptr;
     }
-    return std::make_unique<Handler>(std::string(proxy->Tag()), std::move(proxy), stats);
+    return proxy;
 }
 
 bool HasProxy(std::string_view protocol) {

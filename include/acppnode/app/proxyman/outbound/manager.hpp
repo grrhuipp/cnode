@@ -5,9 +5,11 @@
 #include <memory>
 #include <string_view>
 
-namespace acpp::proxyman::outbound {
+namespace acpp {
+class Outbound;
+}
 
-class Handler;
+namespace acpp::proxyman::outbound {
 
 // ============================================================================
 // Manager - per-Worker outbound handler manager
@@ -23,10 +25,10 @@ public:
     Manager(const Manager&) = delete;
     Manager& operator=(const Manager&) = delete;
 
-    [[nodiscard]] features::outbound::Handler* GetHandler(std::string_view tag) noexcept override;
-    [[nodiscard]] features::outbound::Handler* GetDefaultHandler() noexcept override;
+    [[nodiscard]] Outbound* GetHandler(std::string_view tag) noexcept override;
+    [[nodiscard]] Outbound* GetDefaultHandler() noexcept override;
 
-    [[nodiscard]] Handler* AddHandler(std::unique_ptr<Handler> handler) noexcept;
+    [[nodiscard]] Outbound* AddHandler(std::unique_ptr<Outbound> handler) noexcept;
     void RemoveHandler(std::string_view tag) noexcept;
     void Clear() noexcept;
     void DrainRetiredHandlers() noexcept;

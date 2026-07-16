@@ -19,7 +19,6 @@ class Router;
 
 namespace features::outbound {
 class Manager;
-class Handler;
 }  // namespace features::outbound
 
 namespace rule {
@@ -88,7 +87,7 @@ private:
         StatsShard& stats,
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout);
-    [[nodiscard]] features::outbound::Handler* ResolveOutboundHandler(
+    [[nodiscard]] Outbound* ResolveOutboundHandler(
         std::string_view tag) const noexcept;
     [[nodiscard]] RouteSelection SelectRoute(
         session::Context& ctx,

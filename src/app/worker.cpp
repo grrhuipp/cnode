@@ -21,7 +21,6 @@
 #include "acppnode/app/proxyman/outbound/manager.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/outbound/handler.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -284,7 +283,6 @@ void Worker::RuntimeState::InitOutbounds(
         auto handler = proxyman::outbound::NewHandler(
             prepared_outbound, worker.runtime_->io_context,
             *dns_service, udp_session_manager.get(),
-            stats,
             dial_timeout);
 
         if (handler) {
@@ -888,7 +886,6 @@ void Worker::AddOutboundAsync(proxyman::outbound::PreparedOutboundConfig config)
             auto handler = proxyman::outbound::NewHandler(
                 cfg, runtime_->io_context,
                 *runtime_->dns_service, runtime_->udp_session_manager.get(),
-                runtime_->stats,
                 current_snapshot->timeouts.DialTimeout());
 
             if (!handler) {

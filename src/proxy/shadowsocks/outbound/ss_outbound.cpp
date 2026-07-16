@@ -9,6 +9,7 @@
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"

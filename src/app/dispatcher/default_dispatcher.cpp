@@ -8,6 +8,7 @@
 #include "acppnode/common/rule.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/outbound/outbound.hpp"
+#include "acppnode/proxy/outbound.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/proxy/inbound.hpp"
@@ -127,7 +128,7 @@ void DefaultDispatcher::BindMuxSessionHandler(
     mux_session_handler_ = &mux_session_handler;
 }
 
-features::outbound::Handler* DefaultDispatcher::ResolveOutboundHandler(
+Outbound* DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
         return nullptr;
@@ -350,7 +351,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
 
     // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> outbound.Process -> relay。
     // UDP 数据面（Full Cone + framer）下沉到 UDP-capable 出站的 Process，由下方
-    // 通用路径设置入站 idle/write timeout 并调用 outbound_handler->Dispatch。
+    // 通用路径设置入站 idle/write timeout 并调用 outbound.Process。
 
     std::optional<tcp::endpoint> inbound_local_addr =
         inbound_endpoint ? inbound_endpoint->LocalEndpoint() : std::nullopt;
@@ -394,12 +395,13 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                    relay_payload_size);
 
     ActiveSessionScope relay_scope{ctx, session_tracking_};
-    auto outbound_process = co_await outbound_handler->Dispatch(
+    auto outbound_process = co_await outbound_handler->Process(
         io_context,
         inbound_local_addr ? &*inbound_local_addr : nullptr,
         ctx,
         timeouts,
         transport::Link{inbound_reader, inbound_writer, inbound_control},
+        stats,
         relay_cfg,
         use_owned_first_payload
             ? std::span<const uint8_t>{}
@@ -408,8 +410,15 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         relay_idle_timeout,
         relay_write_timeout);
     if (!outbound_process) {
+        ErrorCode process_error = outbound_process.error();
+        if (process_error == ErrorCode::OK) {
+            process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
+        }
+        LOG_CONN_FAIL_CTX(ctx, "OUTBOUND_PROCESS_FAILED {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, ErrorCodeToString(process_error));
         stats.OnError();
-        co_return MakeRelayError(ErrorCode::OUTBOUND_CONNECTION_FAILED);
+        co_return MakeRelayError(process_error);
     }
     RelayResult relay_result = std::move(*outbound_process);
 

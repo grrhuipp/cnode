@@ -9,6 +9,7 @@
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../../app/proxyman/outbound/source_config.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"

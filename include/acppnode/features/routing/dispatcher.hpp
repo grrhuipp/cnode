@@ -12,6 +12,7 @@
 namespace acpp {
 
 class AsyncStream;
+class Outbound;
 
 namespace proxyman::inbound {
 struct ReceiverSettings;
@@ -24,14 +25,10 @@ struct Context;
 struct StatsShard;
 struct TimeoutsConfig;
 
-namespace features::outbound {
-class Handler;
-}
-
 namespace routing {
 
 struct DispatchResult {
-    features::outbound::Handler* handler = nullptr;
+    Outbound* handler = nullptr;
     ErrorCode error = ErrorCode::OK;
 };
 
