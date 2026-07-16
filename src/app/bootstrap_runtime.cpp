@@ -99,10 +99,10 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
         ctx.controller.Start();
     }
 
-    RuntimeState runtime_state;
-    [[maybe_unused]] auto shutdown_signals = InstallShutdownHandler(ctx, runtime_state);
-
-    StartRuntimeMonitoring(ctx, runtime_state);
+    RuntimeMonitor runtime_monitor(ctx);
+    [[maybe_unused]] auto shutdown_signals =
+        InstallShutdownHandler(ctx, runtime_monitor);
+    runtime_monitor.Start();
 
     ctx.main_ctx.run();
     shutdown_signals.reset();
@@ -110,8 +110,6 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
     for (auto& t : worker_threads) {
         if (t.joinable()) t.join();
     }
-    ctx.main_ctx.restart();
-    ctx.main_ctx.run_for(std::chrono::milliseconds(100));
     TimeoutScheduler::ReleaseForIoContext(ctx.main_ctx);
 
     accesslog::Reporter::Instance().Shutdown();

@@ -8,7 +8,7 @@
 #include <exception>
 #include <memory>
 
-namespace acpp::controller {
+namespace acpp {
 
 namespace {
 
@@ -81,4 +81,4 @@ net::awaitable<void> RunAwaitableBatch(
     }
 }
 
-}  // namespace acpp::controller
+}  // namespace acpp

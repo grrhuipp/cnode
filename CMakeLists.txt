@@ -369,7 +369,7 @@ set(CNODE_SOURCES
     src/app/proxyman/outbound/manager.cpp
     src/app/worker.cpp
     src/service/controller/controller.cpp
-    src/service/controller/awaitable_batch.cpp
+    src/common/awaitable_batch.cpp
     src/service/controller/node_transition.cpp
     src/service/controller/config.cpp
     src/service/controller/panel_node_ids.cpp
@@ -1404,6 +1404,12 @@ if(CNODE_BUILD_TESTS)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_shutdown_contract_test.cmake)
 
+    add_test(
+        NAME cnode_runtime_monitor_shutdown_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_monitor_shutdown_contract_test.cmake)
+
     add_executable(cnode_static_inbound_startup_test
         tests/static_inbound_startup_test.cpp
     )
@@ -1455,11 +1461,11 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_awaitable_batch_test
         tests/awaitable_batch_test.cpp
-        src/service/controller/awaitable_batch.cpp
+        src/common/awaitable_batch.cpp
     )
     target_include_directories(cnode_awaitable_batch_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     )
     target_link_libraries(cnode_awaitable_batch_test PRIVATE
         asio::asio

@@ -6,7 +6,7 @@ file(READ
     "${SOURCE_DIR}/src/service/controller/control.cpp"
     CONTROL_SOURCE)
 file(READ
-    "${SOURCE_DIR}/src/service/controller/awaitable_batch.cpp"
+    "${SOURCE_DIR}/src/common/awaitable_batch.cpp"
     BATCH_SOURCE)
 
 string(FIND "${CONTROL_SOURCE}"

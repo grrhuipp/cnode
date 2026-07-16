@@ -1,5 +1,5 @@
 #include "controller_impl.hpp"
-#include "awaitable_batch.hpp"
+#include "../../common/awaitable_batch.hpp"
 #include "node_transition.hpp"
 #include "panel_schedule.hpp"
 
@@ -12,7 +12,6 @@
 #include <chrono>
 #include <exception>
 #include <stdexcept>
-#include <vector>
 
 namespace acpp {
 
@@ -27,31 +26,6 @@ std::string ResolvePanelName(api::API* panel,
     }
     return client_info.APIHost;
 }
-
-class MonitorTimerRegistration {
-public:
-    MonitorTimerRegistration(
-        std::vector<net::steady_timer*>& timers,
-        net::steady_timer& timer)
-        : timers_(timers)
-        , timer_(&timer) {
-        timers_.push_back(timer_);
-    }
-
-    ~MonitorTimerRegistration() {
-        const auto entry = std::ranges::find(timers_, timer_);
-        if (entry != timers_.end()) {
-            timers_.erase(entry);
-        }
-    }
-
-    MonitorTimerRegistration(const MonitorTimerRegistration&) = delete;
-    MonitorTimerRegistration& operator=(const MonitorTimerRegistration&) = delete;
-
-private:
-    std::vector<net::steady_timer*>& timers_;
-    net::steady_timer* timer_;
-};
 
 }  // namespace
 
@@ -115,10 +89,7 @@ net::awaitable<void> Controller::Impl::Stop() {
     for (const auto& panel : panels_) {
         panel->CancelPending();
     }
-    for (net::steady_timer* timer : monitor_timers_) {
-        IoErrorCode ignored;
-        timer->cancel(ignored);
-    }
+    monitor_timers_.CancelAll();
     if (monitors_active_) {
         (void)co_await monitor_completion_.async_wait(
             net::as_tuple(net::use_awaitable));
@@ -167,7 +138,7 @@ net::awaitable<void> Controller::Impl::runPanelMonitors(uint64_t generation) {
         tasks.push_back(panelMonitor(panel, generation));
     }
     try {
-        co_await controller::RunAwaitableBatch(
+        co_await RunAwaitableBatch(
             io_context_.get_executor(), std::move(tasks));
     } catch (const std::exception& e) {
         LOG_ERROR("panel monitors failed: {}", e.what());
@@ -201,7 +172,8 @@ net::awaitable<void> Controller::Impl::panelMonitor(
     auto next_pull = Clock::now();
     auto next_push = next_pull;
     net::steady_timer timer(io_context_);
-    MonitorTimerRegistration timer_registration(monitor_timers_, timer);
+    CancelableTimerRegistry::Registration timer_registration(
+        monitor_timers_, timer);
 
     const auto interval = [&](bool pull) {
         if (const auto state = committed_nodes_.find(panel);
@@ -292,7 +264,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             LOG_WARN("Panel {}/{}: retry {}/{} in {}s",
                      panel_name, node_id, attempt, kMaxAttempts - 1, delay);
             net::steady_timer timer(io_context_);
-            MonitorTimerRegistration timer_registration(monitor_timers_, timer);
+            CancelableTimerRegistry::Registration timer_registration(
+                monitor_timers_, timer);
             timer.expires_after(std::chrono::seconds(delay));
             (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
             if (!running_) co_return;

@@ -47,7 +47,7 @@ int main() {
 
     auto result = acpp::net::co_spawn(
         io_context,
-        acpp::controller::RunAwaitableBatch(
+        acpp::RunAwaitableBatch(
             io_context.get_executor(), std::move(tasks)),
         acpp::net::use_future);
     io_context.run();

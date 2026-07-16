@@ -1,5 +1,8 @@
 #include "acppnode/app/bootstrap_monitor.hpp"
 
+#include "../common/awaitable_batch.hpp"
+#include "../common/cancelable_timer_registry.hpp"
+
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/memory_stats.hpp"
@@ -15,7 +18,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <fstream>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -25,6 +30,18 @@
 namespace acpp {
 
 namespace {
+
+struct RuntimeMonitorState {
+    bool running = false;
+    CancelableTimerRegistry timers;
+};
+
+struct MonitorContext {
+    net::io_context& main_ctx;
+    ShardedStats& stats;
+    std::vector<std::unique_ptr<Worker>>& workers;
+    Controller& controller;
+};
 
 struct ProcessMemory {
     size_t vm_size = 0;
@@ -67,7 +84,7 @@ net::awaitable<double> GetMemoryMBAsync() {
 }
 
 net::awaitable<std::vector<Worker::RuntimeStatsSnapshot>>
-CollectWorkerRuntimeStats(const RuntimeContext& ctx) {
+CollectWorkerRuntimeStats(const MonitorContext& ctx) {
     std::vector<Worker::RuntimeStatsSnapshot> snapshots(ctx.workers.size());
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
@@ -82,13 +99,12 @@ CollectWorkerRuntimeStats(const RuntimeContext& ctx) {
             }(ctx.workers[i].get(), snapshots[i])
         );
     }
-    for (auto& task : tasks) {
-        co_await std::move(task);
-    }
+    co_await RunAwaitableBatch(
+        ctx.main_ctx.get_executor(), std::move(tasks));
     co_return snapshots;
 }
 
-net::awaitable<void> CollectWorkerHeaps(const RuntimeContext& ctx, bool force) {
+net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx, bool force) {
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
     for (const auto& worker : ctx.workers) {
@@ -105,9 +121,8 @@ net::awaitable<void> CollectWorkerHeaps(const RuntimeContext& ctx, bool force) {
             }(worker.get(), force)
         );
     }
-    for (auto& task : tasks) {
-        co_await std::move(task);
-    }
+    co_await RunAwaitableBatch(
+        ctx.main_ctx.get_executor(), std::move(tasks));
 
     if (force) {
         memory::CollectBurst();
@@ -130,8 +145,12 @@ StatsSnapshot AggregateWorkerStats(
     return snapshot;
 }
 
-net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState& state) {
+net::awaitable<void> RuntimeSamplingLoop(
+    const MonitorContext& ctx,
+    RuntimeMonitorState& state) {
     net::steady_timer timer(ctx.main_ctx);
+    CancelableTimerRegistry::Registration timer_registration(
+        state.timers, timer);
     [[maybe_unused]] uint32_t last_sample_total_conns = 0;
     [[maybe_unused]] uint64_t last_force_collect_total_connections = 0;
     [[maybe_unused]] bool churn_collect_baseline_set = false;
@@ -139,6 +158,9 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
     [[maybe_unused]] auto last_steady_collect_at = steady_clock::time_point{};
     while (state.running) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
+        if (!state.running) {
+            co_return;
+        }
         auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
         ctx.stats.SampleNow(aggregate_stats);
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
@@ -220,10 +242,17 @@ net::awaitable<void> RuntimeSamplingLoop(const RuntimeContext& ctx, RuntimeState
     }
 }
 
-net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeState& state) {
+net::awaitable<void> RuntimeStatsOutputLoop(
+    const MonitorContext& ctx,
+    RuntimeMonitorState& state) {
     net::steady_timer timer(ctx.main_ctx);
+    CancelableTimerRegistry::Registration timer_registration(
+        state.timers, timer);
     while (state.running) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
+        if (!state.running) {
+            co_return;
+        }
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
 
         ::acpp::app::dns::DnsCacheStats dns_l1_stats;
@@ -367,9 +396,76 @@ net::awaitable<void> RuntimeStatsOutputLoop(const RuntimeContext& ctx, RuntimeSt
 
 }  // namespace
 
-void StartRuntimeMonitoring(const RuntimeContext& ctx, RuntimeState& state) {
-    net::co_spawn(ctx.main_ctx.get_executor(), RuntimeSamplingLoop(ctx, state), net::detached);
-    net::co_spawn(ctx.main_ctx.get_executor(), RuntimeStatsOutputLoop(ctx, state), net::detached);
+struct RuntimeMonitor::Impl : std::enable_shared_from_this<RuntimeMonitor::Impl> {
+    explicit Impl(const RuntimeContext& runtime_context)
+        : ctx{
+              runtime_context.main_ctx,
+              runtime_context.stats,
+              runtime_context.workers,
+              runtime_context.controller}
+        , completion(ctx.main_ctx) {}
+
+    net::awaitable<void> Run() {
+        std::vector<net::awaitable<void>> tasks;
+        tasks.reserve(2);
+        tasks.push_back(RuntimeSamplingLoop(ctx, state));
+        tasks.push_back(RuntimeStatsOutputLoop(ctx, state));
+        co_await RunAwaitableBatch(
+            ctx.main_ctx.get_executor(), std::move(tasks));
+    }
+
+    static net::awaitable<void> RunOwned(std::shared_ptr<Impl> self) {
+        try {
+            co_await self->Run();
+        } catch (const std::exception& e) {
+            LOG_ERROR("runtime monitor failed: {}", e.what());
+        } catch (...) {
+            LOG_ERROR("runtime monitor failed with unknown exception");
+        }
+        self->active = false;
+        IoErrorCode ignored;
+        self->completion.cancel(ignored);
+    }
+
+    void Start() {
+        if (state.running || active) {
+            return;
+        }
+        state.running = true;
+        active = true;
+        completion.expires_at(net::steady_timer::time_point::max());
+        net::co_spawn(
+            ctx.main_ctx.get_executor(),
+            RunOwned(shared_from_this()),
+            net::detached);
+    }
+
+    net::awaitable<void> Stop() {
+        state.running = false;
+        state.timers.CancelAll();
+        if (active) {
+            (void)co_await completion.async_wait(
+                net::as_tuple(net::use_awaitable));
+        }
+    }
+
+    MonitorContext ctx;
+    RuntimeMonitorState state;
+    net::steady_timer completion;
+    bool active = false;
+};
+
+RuntimeMonitor::RuntimeMonitor(const RuntimeContext& ctx)
+    : impl_(std::make_shared<Impl>(ctx)) {}
+
+RuntimeMonitor::~RuntimeMonitor() = default;
+
+void RuntimeMonitor::Start() {
+    impl_->Start();
+}
+
+net::awaitable<void> RuntimeMonitor::Stop() {
+    co_await impl_->Stop();
 }
 
 }  // namespace acpp

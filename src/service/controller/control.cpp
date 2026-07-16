@@ -1,5 +1,5 @@
 #include "controller_impl.hpp"
-#include "awaitable_batch.hpp"
+#include "../../common/awaitable_batch.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 
@@ -37,7 +37,7 @@ net::awaitable<void> RunWorkerMutationBatch(
     for (size_t i = 0; i < workers.size(); ++i) {
         tasks.push_back(task_factory(*workers[i], i));
     }
-    co_await controller::RunAwaitableBatch(executor, std::move(tasks));
+    co_await RunAwaitableBatch(executor, std::move(tasks));
 }
 
 struct WorkerBindResult {
@@ -265,7 +265,7 @@ Controller::Impl::getTraffic(const std::string& tag) {
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    co_await controller::RunAwaitableBatch(
+    co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
 
     size_t merged_hint = 0;
@@ -311,7 +311,7 @@ Controller::Impl::GetOnlineDevice(const std::string& tag,
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    co_await controller::RunAwaitableBatch(
+    co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
 
     size_t total_online = 0;
@@ -355,7 +355,7 @@ net::awaitable<void> Controller::Impl::UpdateRule(
                     net::use_awaitable);
             }(worker.get(), tag, new_rule_list));
     }
-    co_await controller::RunAwaitableBatch(
+    co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
 }
 
@@ -375,7 +375,7 @@ Controller::Impl::GetDetectResult(const std::string& tag) {
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
-    co_await controller::RunAwaitableBatch(
+    co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
 
     size_t total = 0;

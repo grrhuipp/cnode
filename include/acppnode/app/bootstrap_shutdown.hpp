@@ -8,8 +8,10 @@
 
 namespace acpp {
 
+class RuntimeMonitor;
+
 [[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
     const RuntimeContext& ctx,
-    RuntimeState& state);
+    RuntimeMonitor& monitor);
 
 }  // namespace acpp

@@ -5,6 +5,7 @@
 #include "acppnode/api/api.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/service/controller/config.hpp"
+#include "../../common/cancelable_timer_registry.hpp"
 
 #include <map>
 #include <optional>
@@ -83,7 +84,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         uint64_t bytes_down   = 0;
     };
     std::map<std::string, NodeStats> node_stats_;
-    std::vector<net::steady_timer*> monitor_timers_;
+    CancelableTimerRegistry monitor_timers_;
     bool running_ = false;
     bool monitors_active_ = false;
     uint64_t monitor_generation_ = 0;

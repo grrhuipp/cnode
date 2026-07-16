@@ -17,6 +17,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/api/v2board/v2board.cpp"
     V2BOARD_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/common/cancelable_timer_registry.hpp"
+    TIMER_REGISTRY_HEADER)
 
 foreach(REQUIRED_HEADER
         "net::awaitable<void> Stop();"
@@ -32,7 +35,7 @@ endforeach()
 foreach(REQUIRED_SOURCE
         "runPanelMonitorsOwned(shared_from_this(), generation)"
         "panel->CancelPending()"
-        "timer->cancel(ignored)"
+        "monitor_timers_.CancelAll()"
         "co_await monitor_completion_.async_wait")
     string(FIND "${CONTROLLER_SOURCE}" "${REQUIRED_SOURCE}" REQUIRED_POSITION)
     if(REQUIRED_POSITION EQUAL -1)
@@ -40,6 +43,12 @@ foreach(REQUIRED_SOURCE
             "Controller monitor cancellation is missing '${REQUIRED_SOURCE}'")
     endif()
 endforeach()
+
+if(NOT TIMER_REGISTRY_HEADER MATCHES "class CancelableTimerRegistry" OR
+   NOT TIMER_REGISTRY_HEADER MATCHES "timer->cancel\\(ignored\\)")
+    message(FATAL_ERROR
+        "Controller and runtime monitors must share the timer cancellation primitive")
+endif()
 
 if(NOT API_HEADER MATCHES "virtual void CancelPending\\(\\) noexcept = 0")
     message(FATAL_ERROR

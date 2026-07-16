@@ -1,4 +1,5 @@
 #include "acppnode/app/bootstrap_shutdown.hpp"
+#include "acppnode/app/bootstrap_monitor.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/infra/log.hpp"
@@ -39,7 +40,10 @@ net::awaitable<void> ShutdownWorkers(const RuntimeContext& ctx) {
     });
 }
 
-net::awaitable<void> ShutdownRuntime(const RuntimeContext& ctx) {
+net::awaitable<void> ShutdownRuntime(
+    const RuntimeContext& ctx,
+    RuntimeMonitor& monitor) {
+    co_await monitor.Stop();
     co_await ctx.controller.Stop();
     co_await ShutdownWorkers(ctx);
 }
@@ -48,7 +52,7 @@ net::awaitable<void> ShutdownRuntime(const RuntimeContext& ctx) {
 
 std::unique_ptr<net::signal_set> InstallShutdownHandler(
     const RuntimeContext& ctx,
-    RuntimeState& state) {
+    RuntimeMonitor& monitor) {
     auto signals = std::make_unique<net::signal_set>(ctx.main_ctx);
     signals->add(SIGINT);
     signals->add(SIGTERM);
@@ -56,17 +60,16 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
     signals->add(SIGBREAK);
 #endif
 
-    signals->async_wait([&state, &ctx](
+    signals->async_wait([&monitor, &ctx](
                             const IoErrorCode& ec, int signo) {
         if (ec) {
             return;
         }
         LOG_CONSOLE("shutdown signal={} status=stopping", signo);
-        state.running = false;
 
         net::co_spawn(
             ctx.main_ctx.get_executor(),
-            ShutdownRuntime(ctx),
+            ShutdownRuntime(ctx, monitor),
             net::detached);
     });
 

@@ -28,10 +28,6 @@ struct RuntimeContext {
     bool                                                  enable_controller = false;
 };
 
-struct RuntimeState {
-    bool running = true;
-};
-
 void RunApplicationRuntime(const RuntimeContext& ctx);
 
 }  // namespace acpp
