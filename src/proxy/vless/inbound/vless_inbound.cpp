@@ -5,6 +5,7 @@
 #include "../vless_encryption_io.hpp"
 #include "../vless_encryption_runtime.hpp"
 #include "../vless_io_util.hpp"
+#include "../udp_framing.hpp"
 #include "../vless_vision.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -13,7 +14,6 @@
 #include "acppnode/app/udp_types.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/session.hpp"
@@ -24,9 +24,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
-#include <algorithm>
 #include <array>
-#include <cstring>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -39,108 +37,6 @@ namespace acpp {
 namespace {
 
 using ::acpp::vless::VlessBufferedReader;
-
-constexpr size_t kUdpFrameQueueShrinkItems = 64;
-
-constexpr std::string_view kPacketAddrMagicAddress =
-    "sp.packet-addr.v2fly.arpa";
-bool IsPacketAddrMagic(const TargetAddress& target) {
-    return target.IsDomain() && target.host == kPacketAddrMagicAddress;
-}
-
-size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
-                                uint8_t* out,
-                                size_t cap) {
-    if (!target.resolved_addr) {
-        return 0;
-    }
-    if (target.resolved_addr->is_v4()) {
-        if (cap < 7) return 0;
-        out[0] = 0x01;
-        const auto bytes = target.resolved_addr->to_v4().to_bytes();
-        std::memcpy(out + 1, bytes.data(), bytes.size());
-        out[5] = static_cast<uint8_t>((target.port >> 8) & 0xff);
-        out[6] = static_cast<uint8_t>(target.port & 0xff);
-        return 7;
-    }
-    if (target.resolved_addr->is_v6()) {
-        if (cap < 19) return 0;
-        out[0] = 0x02;
-        const auto bytes = target.resolved_addr->to_v6().to_bytes();
-        std::memcpy(out + 1, bytes.data(), bytes.size());
-        out[17] = static_cast<uint8_t>((target.port >> 8) & 0xff);
-        out[18] = static_cast<uint8_t>(target.port & 0xff);
-        return 19;
-    }
-    return 0;
-}
-
-struct PacketAddrHeader {
-    TargetAddress target;
-    size_t consumed = 0;
-};
-
-std::optional<PacketAddrHeader> DecodePacketAddrHeader(std::span<const uint8_t> data) {
-    if (data.empty()) {
-        return std::nullopt;
-    }
-    if (data[0] == 0x01) {
-        if (data.size() < 7) return std::nullopt;
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port =
-            (static_cast<uint16_t>(data[5]) << 8) |
-            static_cast<uint16_t>(data[6]);
-        return PacketAddrHeader{
-            TargetAddress(net::ip::make_address_v4(bytes), port),
-            7,
-        };
-    }
-    if (data[0] == 0x02) {
-        if (data.size() < 19) return std::nullopt;
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port =
-            (static_cast<uint16_t>(data[17]) << 8) |
-            static_cast<uint16_t>(data[18]);
-        return PacketAddrHeader{
-            TargetAddress(net::ip::make_address_v6(bytes), port),
-            19,
-        };
-    }
-    return std::nullopt;
-}
-
-bool EncodeVlessUdpLengthHeaderTo(size_t payload_len, buf::Buffer& out) {
-    if (payload_len == 0 || payload_len > 0xffff || out.Available() < 2) {
-        return false;
-    }
-    auto tail = out.Tail();
-    tail[0] = static_cast<uint8_t>((payload_len >> 8) & 0xff);
-    tail[1] = static_cast<uint8_t>(payload_len & 0xff);
-    out.Produce(2);
-    return true;
-}
-
-bool EncodePacketAddrUdpHeaderTo(const TargetAddress& target,
-                                 size_t payload_len,
-                                 buf::Buffer& out) {
-    std::array<uint8_t, 19> addr{};
-    const size_t addr_len = EncodePacketAddrHeaderTo(target, addr.data(), addr.size());
-    if (addr_len == 0) {
-        return false;
-    }
-    const size_t packet_len = addr_len + payload_len;
-    if (packet_len == 0 || packet_len > 0xffff || out.Available() < addr_len + 2) {
-        return false;
-    }
-    auto tail = out.Tail();
-    tail[0] = static_cast<uint8_t>((packet_len >> 8) & 0xff);
-    tail[1] = static_cast<uint8_t>(packet_len & 0xff);
-    std::memcpy(tail.data() + 2, addr.data(), addr_len);
-    out.Produce(static_cast<uint32_t>(addr_len + 2));
-    return true;
-}
 
 class VlessOnlineSession {
 public:
@@ -196,128 +92,6 @@ private:
     buf::MultiBuffer pending_;
 };
 
-class VlessUdpFramer {
-public:
-    void Feed(const uint8_t* data, size_t len) {
-        while (len > 0) {
-            if (!pending_) {
-                pending_ = buf::BufferGuard{buf::Buffer::New()};
-                if (!pending_) {
-                    return;
-                }
-            }
-            if (pending_->Available() == 0 && pending_->start > 0) {
-                Compact();
-            }
-            if (pending_->Available() == 0) {
-                ClearBuffer();
-                return;
-            }
-
-            const size_t n = std::min<size_t>(len, pending_->Available());
-            std::memcpy(pending_->Tail().data(), data, n);
-            pending_->Produce(static_cast<uint32_t>(n));
-            data += n;
-            len -= n;
-            Parse();
-        }
-    }
-
-    bool Next(buf::BufferGuard& out) {
-        if (queue_.empty()) {
-            return false;
-        }
-        out = std::move(queue_.front());
-        queue_.pop_front();
-        if (queue_.empty() && shrink_queue_on_drain_) {
-            TryShrinkSequence(queue_);
-            shrink_queue_on_drain_ = false;
-        }
-        return true;
-    }
-
-private:
-    buf::BufferGuard pending_;
-    memory::ThreadLocalDeque<buf::BufferGuard> queue_;
-    bool shrink_queue_on_drain_ = false;
-
-    void Compact() {
-        if (!pending_ || pending_->start == 0) {
-            return;
-        }
-        const uint32_t remaining = pending_->Len();
-        if (remaining == 0) {
-            ClearBuffer();
-            return;
-        }
-        std::memmove(pending_->data, pending_->Bytes().data(), remaining);
-        pending_->start = 0;
-        pending_->end = remaining;
-    }
-
-    const uint8_t* Data() const {
-        return pending_ ? pending_->Bytes().data() : nullptr;
-    }
-
-    size_t Size() const {
-        return pending_ ? pending_->Len() : 0;
-    }
-
-    void ClearBuffer() {
-        pending_ = buf::BufferGuard{};
-    }
-
-    [[nodiscard]] bool TryTakePayload(std::span<const uint8_t> payload) {
-        buf::BufferGuard taken;
-        if (!buf::TakeBufferSuffix(pending_, payload, taken)) {
-            return false;
-        }
-        queue_.push_back(std::move(taken));
-        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-            shrink_queue_on_drain_ = true;
-        }
-        return true;
-    }
-
-    void Parse() {
-        while (Size() > 0) {
-            auto parsed = vless::Codec::ParseUdpPacket(Data(), Size());
-            if (parsed.result == vless::Codec::UdpParseResult::SUCCESS) {
-                if (parsed.packet && TryTakePayload(parsed.packet->payload)) {
-                    continue;
-                }
-                buf::BufferGuard payload{buf::Buffer::New()};
-                if (payload && parsed.packet) {
-                    const auto bytes = parsed.packet->payload;
-                    const size_t n = std::min<size_t>(
-                        bytes.size(),
-                        static_cast<size_t>(payload->Available()));
-                    std::memcpy(payload->Tail().data(), bytes.data(), n);
-                    payload->Produce(static_cast<uint32_t>(n));
-                    queue_.push_back(std::move(payload));
-                    if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-                        shrink_queue_on_drain_ = true;
-                    }
-                }
-                pending_->Advance(static_cast<uint32_t>(parsed.consumed));
-                continue;
-            }
-            if (parsed.result == vless::Codec::UdpParseResult::INCOMPLETE) {
-                break;
-            }
-            pending_->Advance(1);
-            if (Size() < 2) {
-                ClearBuffer();
-                break;
-            }
-        }
-
-        if (pending_ && pending_->IsEmpty()) {
-            ClearBuffer();
-        }
-    }
-};
-
 class VlessUdpReader final : public transport::MultiBufferReader {
 public:
     VlessUdpReader(transport::MultiBufferReader& src,
@@ -326,7 +100,7 @@ public:
                    bool packet_addr = false)
         : src_(src)
         , target_(std::move(target))
-        , packet_addr_(packet_addr) {
+        , framer_(packet_addr) {
         if (!first_packet.empty()) {
             framer_.Feed(first_packet.data(), first_packet.size());
         }
@@ -334,26 +108,17 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
-            buf::MultiBuffer out;
-            buf::BufferGuard pkt;
-            while (framer_.Next(pkt)) {
-                if (!pkt || pkt->IsEmpty()) {
-                    continue;
-                }
-                if (packet_addr_) {
-                    auto header = DecodePacketAddrHeader(pkt->Bytes());
-                    if (!header || header->consumed >= pkt->Len()) {
-                        continue;
+            ::acpp::vless::FramedUdpPacket packet;
+            if (framer_.Next(packet)) {
+                const TargetAddress& target = packet.target
+                    ? *packet.target
+                    : target_;
+                for (buf::Buffer* buffer : packet.payload) {
+                    if (buffer && !buffer->IsEmpty()) {
+                        buffer->SetUDP(target);
                     }
-                    pkt->Advance(static_cast<uint32_t>(header->consumed));
-                    pkt->SetUDP(std::move(header->target));
-                } else {
-                    pkt->SetUDP(target_);
                 }
-                out.push_back(pkt.release());
-            }
-            if (buf::HasData(out)) {
-                co_return out;
+                co_return std::move(packet.payload);
             }
 
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
@@ -372,8 +137,7 @@ public:
 private:
     transport::MultiBufferReader& src_;
     TargetAddress target_;
-    bool packet_addr_ = false;
-    VlessUdpFramer framer_;
+    ::acpp::vless::UdpFramer framer_;
 };
 
 class VlessUdpWriter final : public transport::MultiBufferWriter {
@@ -384,71 +148,18 @@ public:
         , packet_addr_(packet_addr) {}
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        buf::MultiBuffer out;
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            if (packet_addr_ && !buffer->HasUDP()) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            buf::BufferGuard header{buf::Buffer::New()};
-            if (!header) {
-                break;
-            }
-            bool ok = false;
-            if (packet_addr_) {
-                ok = EncodePacketAddrUdpHeaderTo(buffer->UDP(), buffer->Len(), *header);
-            } else {
-                ok = EncodeVlessUdpLengthHeaderTo(buffer->Len(), *header);
-            }
-            if (!ok) {
-                mb.FreeSlot(buffer);
-                continue;
-            }
-            out.push_back(header.release());
-            buffer->ClearUDP();
-            out.push_back(mb.ReleaseSlot(buffer));
-        }
-        mb.clear();
-        if (buf::HasData(out)) {
-            co_await dst_.WriteMultiBuffer(std::move(out));
-        }
+        co_await ::acpp::vless::WriteUdpDatagram(
+            dst_, std::move(mb), packet_addr_);
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (packet_addr_) {
-            co_return;
+            throw IoSystemError(
+                io_error::invalid_argument,
+                "packet-address VLESS UDP write requires a target");
         }
-
-        buf::MultiBuffer header_owner;
-        memory::ThreadLocalVector<net::const_buffer> out;
-        header_owner.reserve(buffers.size());
-        out.reserve(buffers.size() * 2);
-
-        for (const net::const_buffer& buffer : buffers) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!data || buffer.size() == 0) {
-                continue;
-            }
-            buf::BufferGuard header{buf::Buffer::New()};
-            if (!header) {
-                throw std::bad_alloc();
-            }
-            if (!EncodeVlessUdpLengthHeaderTo(buffer.size(), *header)) {
-                throw IoSystemError(io_error::fault, "VLESS UDP header allocation failed");
-            }
-            const auto header_bytes = header->Bytes();
-            out.emplace_back(header_bytes.data(), header_bytes.size());
-            header_owner.push_back(header.release());
-            out.emplace_back(data, buffer.size());
-        }
-
-        if (!out.empty()) {
-            co_await dst_.WriteBuffers(out);
-        }
+        co_await ::acpp::vless::WriteUdpDatagram(
+            dst_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -802,7 +513,7 @@ proxy::vless::inbound::Handler::Process(
     }
     const bool packet_addr_udp =
         request->command == ::acpp::vless::Command::UDP &&
-        IsPacketAddrMagic(request->target);
+        ::acpp::vless::IsPacketAddrMagic(request->target);
     ctx.outbound.original_target = request->target;
     ctx.outbound.target = std::move(request->target);
     ctx.content.network = net;

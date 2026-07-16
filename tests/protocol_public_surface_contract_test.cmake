@@ -164,6 +164,39 @@ if(NOT TROJAN_UDP_FRAMING_SOURCE MATCHES
     message(FATAL_ERROR
         "Trojan UDP framing must preserve complete MultiBuffer datagrams")
 endif()
+set(VLESS_UDP_FRAMING
+    "${SOURCE_DIR}/src/proxy/vless/udp_framing.cpp")
+set(VLESS_INBOUND
+    "${SOURCE_DIR}/src/proxy/vless/inbound/vless_inbound.cpp")
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_UDP_FRAMING}" VLESS_UDP_FRAMING_SOURCE)
+file(READ "${VLESS_INBOUND}" VLESS_INBOUND_SOURCE)
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+foreach(VLESS_ENDPOINT_SOURCE IN ITEMS
+        VLESS_INBOUND_SOURCE VLESS_OUTBOUND_SOURCE)
+    if(${VLESS_ENDPOINT_SOURCE} MATCHES "class VlessUdpFramer")
+        message(FATAL_ERROR
+            "VLESS endpoints must not duplicate UDP stream framing")
+    endif()
+    if(NOT ${VLESS_ENDPOINT_SOURCE} MATCHES
+            "vless::WriteUdpDatagram")
+        message(FATAL_ERROR
+            "VLESS endpoints must use the shared datagram writer")
+    endif()
+    if(NOT ${VLESS_ENDPOINT_SOURCE} MATCHES
+            "co_return std::move[(]packet[.]payload[)]")
+        message(FATAL_ERROR
+            "VLESS UDP readers must return exactly one logical datagram")
+    endif()
+endforeach()
+if(NOT VLESS_UDP_FRAMING_SOURCE MATCHES
+        "buf::InspectUdpDatagram[(]payload[)]" OR
+   NOT VLESS_UDP_FRAMING_SOURCE MATCHES
+        "buf::AppendSpanToMultiBuffer")
+    message(FATAL_ERROR
+        "VLESS UDP framing must preserve complete MultiBuffer datagrams")
+endif()
 set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES

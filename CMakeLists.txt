@@ -426,6 +426,7 @@ set(CNODE_SOURCES
     src/proxy/vless/vless_encryption_record.cpp
     src/proxy/vless/vless_encryption_runtime.cpp
     src/proxy/vless/vless_encryption_xor.cpp
+    src/proxy/vless/udp_framing.cpp
     src/proxy/vless/vless_vision.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
     src/proxy/vless/outbound/vless_outbound.cpp
@@ -867,6 +868,35 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_trojan_udp_framing_test
         COMMAND cnode_trojan_udp_framing_test)
+
+    add_executable(cnode_vless_udp_framing_test
+        tests/vless_udp_framing_test.cpp
+        src/infra/log.cpp
+        src/proxy/vless/vless_codec.cpp
+        src/proxy/vless/udp_framing.cpp
+    )
+    target_include_directories(cnode_vless_udp_framing_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vless
+        ${concurrentqueue_SOURCE_DIR}
+    )
+    target_link_libraries(cnode_vless_udp_framing_test PRIVATE
+        asio::asio
+        Threads::Threads
+        cnode_zlib
+    )
+    if(WIN32)
+        target_link_libraries(cnode_vless_udp_framing_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_vless_udp_framing_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_vless_udp_framing_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_vless_udp_framing_test
+        COMMAND cnode_vless_udp_framing_test)
 
     add_executable(cnode_uot_ss2022_test
         tests/uot_ss2022_test.cpp
