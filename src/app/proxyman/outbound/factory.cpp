@@ -26,8 +26,11 @@ bool RegisterProxy(
     std::string_view protocol,
     std::optional<PreparedOutboundConfig> (*creator)(
         const OutboundSourceConfig& config)) {
-    Proxies().insert_or_assign(std::string(protocol), std::move(creator));
-    return true;
+    if (protocol.empty() || !creator) {
+        return false;
+    }
+    return Proxies().try_emplace(
+        std::string(protocol), creator).second;
 }
 
 std::optional<PreparedOutboundConfig> PrepareOutboundConfig(

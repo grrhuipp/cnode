@@ -22,8 +22,12 @@ RegistrationMap& Registrations() noexcept {
 bool RegisterProxy(
     std::string_view protocol,
     ProxyRegistration registration) {
-    Registrations().insert_or_assign(std::string(protocol), std::move(registration));
-    return true;
+    if (protocol.empty() || !registration.create_runtime ||
+        !registration.create_tcp_handler) {
+        return false;
+    }
+    return Registrations().try_emplace(
+        std::string(protocol), std::move(registration)).second;
 }
 
 bool HasProxy(std::string_view protocol) {

@@ -1436,6 +1436,32 @@ if(CNODE_BUILD_TESTS)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_public_surface_contract_test.cmake)
 
+    add_executable(cnode_protocol_registration_test
+        tests/protocol_registration_test.cpp
+        src/app/proxyman/inbound/factory.cpp
+        src/app/proxyman/outbound/factory.cpp
+    )
+    target_include_directories(cnode_protocol_registration_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/proxyman/outbound
+    )
+    target_link_libraries(cnode_protocol_registration_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_protocol_registration_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_protocol_registration_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_protocol_registration_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_protocol_registration_test
+        COMMAND cnode_protocol_registration_test)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}
