@@ -957,9 +957,7 @@ const bool kVlessInboundRegistered = [] {
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
-            acpp::proxyman::inbound::UserSet result;
-            result.vless_users = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     reg.build_users =
@@ -985,9 +983,7 @@ const bool kVlessInboundRegistered = [] {
                 info.profile.device_limit = runtime_user.device_limit;
                 users.push_back(std::move(info));
             }
-            acpp::proxyman::inbound::UserSet result;
-            result.vless_users = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     acpp::proxyman::inbound::RegisterProxy(

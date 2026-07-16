@@ -17,14 +17,6 @@ struct PreparedStaticInbound {
     proxyman::inbound::UserSet users;
 };
 
-[[nodiscard]] bool UserSetEmpty(const proxyman::inbound::UserSet& users) noexcept {
-    return users.vmess_accounts.empty() &&
-           users.vless_users.empty() &&
-           users.trojan_users.empty() &&
-           users.ss_users.empty() &&
-           users.anytls_users.empty();
-}
-
 PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
     const StaticInboundConfig& source) {
     StaticInboundRuntimeEntry entry;
@@ -62,7 +54,7 @@ PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
         throw std::invalid_argument(
             "static inbound '" + entry.tag + "' has invalid users or settings");
     }
-    if (UserSetEmpty(*users)) {
+    if (proxyman::inbound::UserSetEmpty(*users)) {
         throw std::invalid_argument(
             "static inbound '" + entry.tag + "' has no valid users");
     }
@@ -86,10 +78,7 @@ std::vector<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntries(
     std::vector<StaticInboundRuntimeEntry> entries;
     entries.reserve(prepared.size());
     for (auto& inbound : prepared) {
-        proxyman::inbound::UserStore::ApplyUsers(
-            inbound.entry.protocol,
-            inbound.entry.tag,
-            inbound.users);
+        proxyman::inbound::UserStore::ApplyUsers(inbound.entry.tag, inbound.users);
         entries.push_back(std::move(inbound.entry));
     }
     return entries;

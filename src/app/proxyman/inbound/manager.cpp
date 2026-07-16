@@ -111,22 +111,6 @@ void Manager::DrainRetiredHandlers() {
     TryShrinkSequence(impl_->retired_handlers);
 }
 
-void Manager::ApplyUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    UserStore::ApplyUsers(protocol, tag, users);
-}
-
-void Manager::AddUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    UserStore::AddUsers(protocol, tag, users);
-}
-
-void Manager::RemoveUsers(std::string_view protocol, std::string_view tag, const UserSet& users) {
-    UserStore::RemoveUsers(protocol, tag, users);
-}
-
-void Manager::ClearUsers(std::string_view protocol, std::string_view tag) {
-    UserStore::ClearUsers(protocol, tag);
-}
-
 std::vector<::acpp::OnlineDevice>
 Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
     if (auto it = impl_->runtimes.find(protocol); it != impl_->runtimes.end()) {

@@ -47,7 +47,7 @@ StaticInboundRuntimeEntry BuildTestModeInbound() {
     if (!users) {
         throw std::runtime_error("test mode VMess user preparation failed");
     }
-    proxyman::inbound::UserStore::ApplyUsers(protocol, kTestTag, *users);
+    proxyman::inbound::UserStore::ApplyUsers(kTestTag, *users);
 
     StaticInboundRuntimeEntry entry;
     entry.protocol = protocol;

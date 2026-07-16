@@ -223,66 +223,64 @@ size_t UserStore::Array32Hash::operator()(const std::array<uint8_t, 32>& value) 
     return out;
 }
 
-void UserStore::ApplyUsers(std::string_view protocol,
-                           std::string_view tag,
+void UserStore::ApplyUsers(std::string_view tag,
                            const UserSet& users) {
     Publish([&](Snapshot& snapshot) {
-        if (protocol == constants::protocol::kVmess) {
-            SetOrErase(snapshot.vmess, tag, BuildVmessUsers(users.vmess_accounts));
-        } else if (protocol == constants::protocol::kVless) {
-            SetOrErase(snapshot.vless, tag, BuildVlessUsers(users.vless_users));
-        } else if (protocol == constants::protocol::kTrojan) {
-            SetOrErase(snapshot.trojan, tag, BuildTrojanUsers(users.trojan_users));
-        } else if (protocol == constants::protocol::kShadowsocks) {
-            SetOrErase(snapshot.shadowsocks, tag, BuildShadowsocksUsers(users.ss_users));
-        } else if (protocol == constants::protocol::kAnyTLS) {
-            SetOrErase(snapshot.anytls, tag, BuildAnyTlsUsers(users.anytls_users));
+        if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
+            SetOrErase(snapshot.vmess, tag, BuildVmessUsers(*vmess));
+        } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
+            SetOrErase(snapshot.vless, tag, BuildVlessUsers(*vless));
+        } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
+            SetOrErase(snapshot.trojan, tag, BuildTrojanUsers(*trojan));
+        } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
+            SetOrErase(snapshot.shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
+        } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
+            SetOrErase(snapshot.anytls, tag, BuildAnyTlsUsers(*anytls));
         }
     });
 }
 
-void UserStore::AddUsers(std::string_view protocol,
-                         std::string_view tag,
+void UserStore::AddUsers(std::string_view tag,
                          const UserSet& users) {
     Publish([&](Snapshot& snapshot) {
-        if (protocol == constants::protocol::kVmess) {
+        if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
             auto next = std::make_shared<VmessUserMap>();
             if (auto it = snapshot.vmess.find(tag); it != snapshot.vmess.end() && it->second) {
                 *next = *it->second;
             }
-            next->reserve(next->size() + users.vmess_accounts.size());
-            for (const auto& user : users.vmess_accounts) {
+            next->reserve(next->size() + vmess->size());
+            for (const auto& user : *vmess) {
                 (*next)[user.uuid] = BuildVmessCredential(user);
             }
             SetOrErase(snapshot.vmess, tag, std::move(next));
-        } else if (protocol == constants::protocol::kVless) {
+        } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
             auto next = std::make_shared<VlessUserMap>();
             if (auto it = snapshot.vless.find(tag); it != snapshot.vless.end() && it->second) {
                 *next = *it->second;
             }
-            next->reserve(next->size() + users.vless_users.size());
-            for (const auto& user : users.vless_users) {
+            next->reserve(next->size() + vless->size());
+            for (const auto& user : *vless) {
                 (*next)[user.uuid_bytes] = BuildVlessCredential(user);
             }
             SetOrErase(snapshot.vless, tag, std::move(next));
-        } else if (protocol == constants::protocol::kTrojan) {
+        } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
             auto next = std::make_shared<TrojanUserMap>();
             if (auto it = snapshot.trojan.find(tag); it != snapshot.trojan.end() && it->second) {
                 *next = *it->second;
             }
-            next->reserve(next->size() + users.trojan_users.size());
-            for (const auto& user : users.trojan_users) {
+            next->reserve(next->size() + trojan->size());
+            for (const auto& user : *trojan) {
                 (*next)[user.password_hash] = BuildTrojanCredential(user);
             }
             SetOrErase(snapshot.trojan, tag, std::move(next));
-        } else if (protocol == constants::protocol::kShadowsocks) {
+        } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
             auto next = std::make_shared<ShadowsocksUserList>();
             if (auto it = snapshot.shadowsocks.find(tag);
                     it != snapshot.shadowsocks.end() && it->second) {
                 *next = *it->second;
             }
-            next->reserve(next->size() + users.ss_users.size());
-            for (const auto& user : users.ss_users) {
+            next->reserve(next->size() + shadowsocks->size());
+            for (const auto& user : *shadowsocks) {
                 auto it = std::find_if(
                     next->begin(), next->end(),
                     [&](const auto& existing) {
@@ -295,13 +293,13 @@ void UserStore::AddUsers(std::string_view protocol,
                 }
             }
             SetOrErase(snapshot.shadowsocks, tag, std::move(next));
-        } else if (protocol == constants::protocol::kAnyTLS) {
+        } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
             auto next = std::make_shared<AnyTlsUserMap>();
             if (auto it = snapshot.anytls.find(tag); it != snapshot.anytls.end() && it->second) {
                 *next = *it->second;
             }
-            next->reserve(next->size() + users.anytls_users.size());
-            for (const auto& user : users.anytls_users) {
+            next->reserve(next->size() + anytls->size());
+            for (const auto& user : *anytls) {
                 (*next)[user.password_hash] = BuildAnyTlsCredential(user);
             }
             SetOrErase(snapshot.anytls, tag, std::move(next));
@@ -309,52 +307,51 @@ void UserStore::AddUsers(std::string_view protocol,
     });
 }
 
-void UserStore::RemoveUsers(std::string_view protocol,
-                            std::string_view tag,
+void UserStore::RemoveUsers(std::string_view tag,
                             const UserSet& users) {
     Publish([&](Snapshot& snapshot) {
-        if (protocol == constants::protocol::kVmess) {
+        if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
             auto it = snapshot.vmess.find(tag);
             if (it == snapshot.vmess.end() || !it->second) return;
             auto next = std::make_shared<VmessUserMap>(*it->second);
-            for (const auto& user : users.vmess_accounts) {
+            for (const auto& user : *vmess) {
                 next->erase(user.uuid);
             }
             SetOrErase(snapshot.vmess, tag, std::move(next));
-        } else if (protocol == constants::protocol::kVless) {
+        } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
             auto it = snapshot.vless.find(tag);
             if (it == snapshot.vless.end() || !it->second) return;
             auto next = std::make_shared<VlessUserMap>(*it->second);
-            for (const auto& user : users.vless_users) {
+            for (const auto& user : *vless) {
                 next->erase(user.uuid_bytes);
             }
             SetOrErase(snapshot.vless, tag, std::move(next));
-        } else if (protocol == constants::protocol::kTrojan) {
+        } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
             auto it = snapshot.trojan.find(tag);
             if (it == snapshot.trojan.end() || !it->second) return;
             auto next = std::make_shared<TrojanUserMap>(*it->second);
-            for (const auto& user : users.trojan_users) {
+            for (const auto& user : *trojan) {
                 next->erase(user.password_hash);
             }
             SetOrErase(snapshot.trojan, tag, std::move(next));
-        } else if (protocol == constants::protocol::kShadowsocks) {
+        } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
             auto it = snapshot.shadowsocks.find(tag);
             if (it == snapshot.shadowsocks.end() || !it->second) return;
             auto next = std::make_shared<ShadowsocksUserList>(*it->second);
             auto should_remove = [&](const auto& existing) {
                 return std::any_of(
-                    users.ss_users.begin(), users.ss_users.end(),
+                    shadowsocks->begin(), shadowsocks->end(),
                     [&](const auto& user) {
                         return SameShadowsocksIdentity(existing, user);
                     });
             };
             next->erase(std::remove_if(next->begin(), next->end(), should_remove), next->end());
             SetOrErase(snapshot.shadowsocks, tag, std::move(next));
-        } else if (protocol == constants::protocol::kAnyTLS) {
+        } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
             auto it = snapshot.anytls.find(tag);
             if (it == snapshot.anytls.end() || !it->second) return;
             auto next = std::make_shared<AnyTlsUserMap>(*it->second);
-            for (const auto& user : users.anytls_users) {
+            for (const auto& user : *anytls) {
                 next->erase(user.password_hash);
             }
             SetOrErase(snapshot.anytls, tag, std::move(next));

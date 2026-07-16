@@ -55,11 +55,6 @@ public:
 
     void DrainRetiredHandlers();
 
-    void ApplyUsers(std::string_view protocol, std::string_view tag, const UserSet& users);
-    void AddUsers(std::string_view protocol, std::string_view tag, const UserSet& users);
-    void RemoveUsers(std::string_view protocol, std::string_view tag, const UserSet& users);
-    void ClearUsers(std::string_view protocol, std::string_view tag);
-
     [[nodiscard]] std::vector<::acpp::OnlineDevice>
     GetOnlineDevices(std::string_view protocol, std::string_view tag) const;
 

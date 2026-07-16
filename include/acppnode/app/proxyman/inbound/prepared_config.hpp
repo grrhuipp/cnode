@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace acpp::proxyman::inbound {
@@ -103,12 +104,24 @@ struct PreparedAnyTlsUser {
     ::acpp::UserProfile profile;
 };
 
-struct UserSet {
-    std::vector<PreparedVmessUser> vmess_accounts;
-    std::vector<PreparedVlessUser> vless_users;
-    std::vector<PreparedTrojanUser> trojan_users;
-    std::vector<PreparedShadowsocksUser> ss_users;
-    std::vector<PreparedAnyTlsUser> anytls_users;
-};
+using PreparedVmessUsers = std::vector<PreparedVmessUser>;
+using PreparedVlessUsers = std::vector<PreparedVlessUser>;
+using PreparedTrojanUsers = std::vector<PreparedTrojanUser>;
+using PreparedShadowsocksUsers = std::vector<PreparedShadowsocksUser>;
+using PreparedAnyTlsUsers = std::vector<PreparedAnyTlsUser>;
+
+// A prepared user payload belongs to exactly one protocol. Keeping the protocol
+// implicit in the variant makes contradictory protocol + payload pairs
+// unrepresentable at the UserStore boundary.
+using UserSet = std::variant<
+    PreparedVmessUsers,
+    PreparedVlessUsers,
+    PreparedTrojanUsers,
+    PreparedShadowsocksUsers,
+    PreparedAnyTlsUsers>;
+
+[[nodiscard]] inline bool UserSetEmpty(const UserSet& users) noexcept {
+    return std::visit([](const auto& value) { return value.empty(); }, users);
+}
 
 }  // namespace acpp::proxyman::inbound

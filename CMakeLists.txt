@@ -1462,6 +1462,24 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_protocol_registration_test
         COMMAND cnode_protocol_registration_test)
 
+    add_executable(cnode_user_store_typed_payload_test
+        tests/user_store_typed_payload_test.cpp
+        src/app/proxyman/inbound/user_store.cpp
+    )
+    target_include_directories(cnode_user_store_typed_payload_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_user_store_typed_payload_test PRIVATE
+        Threads::Threads
+    )
+    target_compile_options(cnode_user_store_typed_payload_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_user_store_typed_payload_test
+        COMMAND cnode_user_store_typed_payload_test)
+
     add_test(
         NAME cnode_invalid_config_sources_test
         COMMAND ${CMAKE_COMMAND}

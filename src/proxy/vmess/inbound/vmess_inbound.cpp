@@ -315,9 +315,7 @@ const bool kVmessInboundRegistered = [] {
                 });
             }
 
-            acpp::proxyman::inbound::UserSet result;
-            result.vmess_accounts = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     reg.build_users =
@@ -345,9 +343,7 @@ const bool kVmessInboundRegistered = [] {
                 }
             }
 
-            acpp::proxyman::inbound::UserSet result;
-            result.vmess_accounts = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     acpp::proxyman::inbound::RegisterProxy(

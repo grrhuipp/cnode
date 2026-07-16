@@ -3,6 +3,7 @@
 #include "acppnode/service/controller/controller.hpp"
 
 #include "acppnode/api/api.hpp"
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/service/controller/config.hpp"
 
 #include <map>
@@ -12,10 +13,6 @@
 #include <vector>
 
 namespace acpp {
-
-namespace proxyman::inbound {
-struct UserSet;
-}  // namespace proxyman::inbound
 
 struct Controller::Impl {
     Impl(net::io_context& io_context,

@@ -16,8 +16,6 @@
 
 namespace acpp::proxyman::inbound {
 
-struct UserSet;
-
 // ============================================================================
 // UserStore - process-wide inbound user RCU store
 //
@@ -148,14 +146,11 @@ public:
         }
     };
 
-    static void ApplyUsers(std::string_view protocol,
-                           std::string_view tag,
+    static void ApplyUsers(std::string_view tag,
                            const UserSet& users);
-    static void AddUsers(std::string_view protocol,
-                         std::string_view tag,
+    static void AddUsers(std::string_view tag,
                          const UserSet& users);
-    static void RemoveUsers(std::string_view protocol,
-                            std::string_view tag,
+    static void RemoveUsers(std::string_view tag,
                             const UserSet& users);
     static void ClearUsers(std::string_view protocol,
                            std::string_view tag);

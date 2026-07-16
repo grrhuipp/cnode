@@ -310,7 +310,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                         } else {
                             if (rollback_user_set) {
                                 proxyman::inbound::UserStore::ApplyUsers(
-                                    old_protocol, old_tag, *rollback_user_set);
+                                    old_tag, *rollback_user_set);
                             }
                             restored = co_await addOutbound(
                                 panel, *old_config, old_tag);
@@ -339,8 +339,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     co_await removeInbound(old_tag);
                 }
 
-                proxyman::inbound::UserStore::ApplyUsers(
-                    protocol, tag, *candidate_user_set);
+                proxyman::inbound::UserStore::ApplyUsers(tag, *candidate_user_set);
 
                 std::exception_ptr candidate_failure;
                 try {

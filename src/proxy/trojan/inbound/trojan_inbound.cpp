@@ -528,9 +528,7 @@ const bool kTrojanInboundRegistered = [] {
                 users.push_back(std::move(info));
             }
 
-            acpp::proxyman::inbound::UserSet result;
-            result.trojan_users = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     reg.build_users =
@@ -553,9 +551,7 @@ const bool kTrojanInboundRegistered = [] {
                 users.push_back(std::move(info));
             }
 
-            acpp::proxyman::inbound::UserSet result;
-            result.trojan_users = std::move(users);
-            return result;
+            return acpp::proxyman::inbound::UserSet{std::move(users)};
         };
 
     acpp::proxyman::inbound::RegisterProxy(

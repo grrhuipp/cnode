@@ -194,27 +194,24 @@ TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
 TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
 
 void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set;
-    set.vmess_accounts = ToPreparedUsers(users);
-    proxyman::inbound::UserStore::ApplyUsers(constants::protocol::kVmess, tag, set);
+    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
+    proxyman::inbound::UserStore::ApplyUsers(tag, set);
     impl_->hot_cache.Clear();
     impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
 void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set;
-    set.vmess_accounts = ToPreparedUsers(users);
-    proxyman::inbound::UserStore::AddUsers(constants::protocol::kVmess, tag, set);
+    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
+    proxyman::inbound::UserStore::AddUsers(tag, set);
     impl_->hot_cache.Clear();
     impl_->session_history.Clear();
     impl_->hot_users.reset();
 }
 
 void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set;
-    set.vmess_accounts = ToPreparedUsers(users);
-    proxyman::inbound::UserStore::RemoveUsers(constants::protocol::kVmess, tag, set);
+    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
+    proxyman::inbound::UserStore::RemoveUsers(tag, set);
     impl_->hot_cache.Clear();
     impl_->session_history.Clear();
     impl_->hot_users.reset();

@@ -401,7 +401,7 @@ bool Controller::Impl::applyUserList(
         LOG_WARN("applyUserList: build users failed for protocol '{}'", protocol);
         return false;
     }
-    proxyman::inbound::UserStore::ApplyUsers(protocol, tag, *user_set);
+    proxyman::inbound::UserStore::ApplyUsers(tag, *user_set);
     return true;
 }
 
