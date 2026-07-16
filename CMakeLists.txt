@@ -274,6 +274,7 @@ set(CNODE_SOURCES
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/config_loader.cpp
+    src/infra/config_semantics.cpp
     src/infra/config_validation.cpp
 
     # App - DNS
@@ -679,6 +680,31 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_outbound_manager_test
         COMMAND cnode_outbound_manager_test)
+
+    add_executable(cnode_config_semantics_test
+        tests/config_semantics_test.cpp
+        src/infra/config_semantics.cpp
+    )
+    target_include_directories(cnode_config_semantics_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
+    )
+    target_link_libraries(cnode_config_semantics_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_config_semantics_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_config_semantics_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_config_semantics_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_config_semantics_test
+        COMMAND cnode_config_semantics_test)
 
 endif()
 

@@ -1,6 +1,8 @@
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include "config_semantics.hpp"
+
 #include <algorithm>
 
 namespace acpp {
@@ -19,6 +21,31 @@ bool Config::Validate() const {
     if (dns_.min_ttl > dns_.max_ttl) {
         LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
+    }
+
+    const auto semantic = ValidateOutboundRoutingSemantics(
+        prepared_outbounds_, routing_.rules);
+    switch (semantic.error) {
+        case ConfigSemanticError::None:
+            break;
+        case ConfigSemanticError::NoOutbounds:
+            LOG_ERROR("At least one outbound is required");
+            return false;
+        case ConfigSemanticError::EmptyOutboundTag:
+            LOG_ERROR("Outbound at index {} has an empty tag", semantic.index);
+            return false;
+        case ConfigSemanticError::DuplicateOutboundTag:
+            LOG_ERROR("Duplicate outbound tag '{}' at index {}",
+                      semantic.tag, semantic.index);
+            return false;
+        case ConfigSemanticError::EmptyRouteOutboundTag:
+            LOG_ERROR("Routing rule at index {} has an empty outbound tag",
+                      semantic.index);
+            return false;
+        case ConfigSemanticError::UnknownRouteOutboundTag:
+            LOG_ERROR("Routing rule at index {} references unknown outbound '{}'",
+                      semantic.index, semantic.tag);
+            return false;
     }
 
     return true;
