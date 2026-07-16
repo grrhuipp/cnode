@@ -31,6 +31,32 @@ function(expect_rejected case_name main_content sidecar_name sidecar_content)
     endif()
 endfunction()
 
+function(expect_started case_name main_content sidecar_name sidecar_content)
+    set(case_dir "${TEST_ROOT}/${case_name}")
+    file(REMOVE_RECURSE "${case_dir}")
+    file(MAKE_DIRECTORY "${case_dir}")
+    file(WRITE "${case_dir}/config.json" "${main_content}")
+    if(NOT "${sidecar_name}" STREQUAL "")
+        file(WRITE "${case_dir}/${sidecar_name}" "${sidecar_content}")
+    endif()
+
+    execute_process(
+        COMMAND "${CNODE_EXE}" --config-dir "${case_dir}"
+        RESULT_VARIABLE result
+        OUTPUT_VARIABLE stdout
+        ERROR_VARIABLE stderr
+        TIMEOUT 1)
+
+    if("${result}" MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "${case_name}: valid config exited before startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
+    endif()
+    if(NOT "${stdout}" MATCHES "server started")
+        message(FATAL_ERROR
+            "${case_name}: valid config did not reach startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
+    endif()
+endfunction()
+
 expect_rejected(malformed_main "{" "" "")
 expect_rejected(malformed_inbounds "{}" "inbounds.json" "{")
 expect_rejected(malformed_outbounds "{}" "outbounds.json" "{")
@@ -126,6 +152,64 @@ expect_rejected(non_string_outbound_send_through "{}" "outbounds.json"
     [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":123}]]=])
 expect_rejected(invalid_xhttp_download_send_through "{}" "outbounds.json"
     [=[[{"tag":"bad-xhttp-bind","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"sendThrough":"not-an-ip","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(non_integer_xhttp_download_port "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":"443","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(missing_xhttp_download_port "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(conflicting_xhttp_download_ports "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"server_port":8443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(missing_xhttp_download_address "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-address","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(conflicting_xhttp_download_addresses "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-address","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","server":"other.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(non_xhttp_download_network "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-network","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"tcp"}}}}}]]=])
+expect_rejected(stream_one_xhttp_download "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"stream-one"}}}}}}]]=])
+expect_rejected(stream_one_xhttp_upload_with_download "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"stream-one","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(non_object_xhttp_download_settings "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-shape","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":443}}}]]=])
+expect_rejected(duplicate_xhttp_download_settings "{}" "outbounds.json"
+    [=[[{"tag":"bad-xhttp-duplicate","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":{"address":"one.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}},"extra":{"downloadSettings":{"address":"two.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+expect_rejected(nested_xhttp_download_settings "{}" "outbounds.json"
+    [=[[
+      {
+        "tag":"bad-xhttp-nested",
+        "protocol":"vless",
+        "settings":{
+          "server":"upload.example.com",
+          "server_port":443,
+          "uuid":"b831381d-6324-4d53-ad4f-8cda48b30811",
+          "encryption":"none"
+        },
+        "streamSettings":{
+          "network":"xhttp",
+          "security":"none",
+          "xhttpSettings":{
+            "extra":{
+              "downloadSettings":{
+                "address":"download.example.com",
+                "port":443,
+                "network":"xhttp",
+                "xhttpSettings":{
+                  "mode":"auto",
+                  "downloadSettings":{
+                    "address":"nested.example.com",
+                    "port":443,
+                    "network":"xhttp",
+                    "xhttpSettings":{"mode":"auto"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]]=])
+expect_started(valid_xhttp_split_download
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-xhttp-split","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"

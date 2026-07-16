@@ -7,6 +7,7 @@
 #include <charconv>
 #include <format>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -612,37 +613,95 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     const json::object& j) {
     auto settings = std::make_shared<XHttpDownloadSettings>();
 
-    settings->address = jstr(j, "address", "");
-    if (settings->address.empty()) {
-        settings->address = jstr(j, "server", "");
-    }
-
-    const int64_t port = jint(j, "port", jint(j, "server_port", 0));
-    if (port > 0 && port <= std::numeric_limits<uint16_t>::max()) {
-        settings->port = static_cast<uint16_t>(port);
-    }
-
-    const json::value* bind_value = j.if_contains("sendThrough");
-    if (!bind_value) {
-        bind_value = j.if_contains("send_through");
-    }
-    std::string send_through;
-    if (bind_value) {
-        if (!bind_value->is_string()) {
-            throw std::invalid_argument("xhttp download sendThrough must be a string");
+    std::optional<std::string> address;
+    std::string_view address_key;
+    for (const std::string_view key : {"address", "server"}) {
+        const auto* value = j.if_contains(key);
+        if (!value) continue;
+        if (!value->is_string() || value->as_string().empty()) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} must be a non-empty string", key));
         }
-        send_through = std::string(bind_value->as_string());
+        const std::string parsed(value->as_string());
+        if (address && *address != parsed) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} and {} must match", address_key, key));
+        }
+        if (!address) {
+            address = parsed;
+            address_key = key;
+        }
     }
-    auto parsed_bind = OutboundBind::Parse(send_through);
+    if (!address) {
+        throw std::invalid_argument("xhttp download address is required");
+    }
+    settings->address = std::move(*address);
+
+    std::optional<uint16_t> port;
+    std::string_view port_key;
+    for (const std::string_view key : {"port", "server_port"}) {
+        if (!j.contains(key)) continue;
+        const auto parsed = ReadJsonPort(j, {key});
+        if (!parsed.Valid()) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} must be an integer between 1 and 65535", key));
+        }
+        if (port && *port != parsed.value) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} and {} must match", port_key, key));
+        }
+        if (!port) {
+            port = parsed.value;
+            port_key = key;
+        }
+    }
+    if (!port) throw std::invalid_argument("xhttp download port is required");
+    settings->port = *port;
+
+    std::optional<std::string> send_through;
+    std::string_view bind_key;
+    for (const std::string_view key : {"sendThrough", "send_through"}) {
+        const auto* value = j.if_contains(key);
+        if (!value) continue;
+        if (!value->is_string()) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} must be a string", key));
+        }
+        const std::string parsed(value->as_string());
+        if (send_through && *send_through != parsed) {
+            throw std::invalid_argument(std::format(
+                "xhttp download {} and {} must match", bind_key, key));
+        }
+        if (!send_through) {
+            send_through = parsed;
+            bind_key = key;
+        }
+    }
+    auto parsed_bind = OutboundBind::Parse(send_through.value_or(""));
     if (!parsed_bind) {
         throw std::invalid_argument(std::format(
             "xhttp download sendThrough '{}' must be auto, wildcard, or an IP address",
-            send_through));
+            send_through.value_or("")));
     }
     settings->send_through = std::move(*parsed_bind);
 
     settings->stream_settings = StreamSettings::FromJson(j);
-    settings->stream_settings.xhttp.download_settings.reset();
+    if (settings->stream_settings.xhttp.download_settings) {
+        throw std::invalid_argument("nested xhttp downloadSettings is not supported");
+    }
+    if (!settings->stream_settings.IsXHttp()) {
+        throw std::invalid_argument("xhttp download network must be xhttp");
+    }
+    if (settings->stream_settings.xhttp.IsStreamOne()) {
+        throw std::invalid_argument(
+            "xhttp download mode stream-one is not supported");
+    }
+    if (!settings->stream_settings.xhttp.AcceptsPacketUp() &&
+        !settings->stream_settings.xhttp.AcceptsStreamUp()) {
+        throw std::invalid_argument(std::format(
+            "xhttp download mode '{}' is not supported",
+            settings->stream_settings.xhttp.mode));
+    }
     return settings;
 }
 
@@ -657,15 +716,29 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     cfg.no_sse_header = jbool(j, "noSSEHeader", false);
     cfg.no_sse_header = jbool(j, "no_sse_header", cfg.no_sse_header);
     auto parse_download_settings = [&](const json::object& source) {
-        if (const auto* camel_download = source.if_contains("downloadSettings");
-            camel_download && camel_download->is_object()) {
-            cfg.download_settings =
-                ParseXHttpDownloadSettings(camel_download->as_object());
-        } else if (const auto* snake_download = source.if_contains("download_settings");
-                   snake_download && snake_download->is_object()) {
-            cfg.download_settings =
-                ParseXHttpDownloadSettings(snake_download->as_object());
+        const json::value* declaration = nullptr;
+        std::string_view declaration_key;
+        for (const std::string_view key : {"downloadSettings", "download_settings"}) {
+            const auto* value = source.if_contains(key);
+            if (!value) continue;
+            if (declaration) {
+                throw std::invalid_argument(
+                    "xhttp downloadSettings must be declared only once");
+            }
+            declaration = value;
+            declaration_key = key;
         }
+        if (!declaration) return;
+        if (!declaration->is_object()) {
+            throw std::invalid_argument(std::format(
+                "xhttp {} must be an object", declaration_key));
+        }
+        if (cfg.download_settings) {
+            throw std::invalid_argument(
+                "xhttp downloadSettings must be declared only once");
+        }
+        cfg.download_settings =
+            ParseXHttpDownloadSettings(declaration->as_object());
     };
     parse_download_settings(j);
     if (const auto* extra = j.if_contains("extra");
@@ -677,6 +750,16 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
         cfg.no_sse_header = jbool(extra_obj, "noSSEHeader", cfg.no_sse_header);
         cfg.no_sse_header = jbool(extra_obj, "no_sse_header", cfg.no_sse_header);
         parse_download_settings(extra_obj);
+    }
+    if (cfg.download_settings) {
+        if (cfg.IsStreamOne()) {
+            throw std::invalid_argument(
+                "xhttp upload mode stream-one cannot use downloadSettings");
+        }
+        if (!cfg.AcceptsPacketUp() && !cfg.AcceptsStreamUp()) {
+            throw std::invalid_argument(std::format(
+                "xhttp upload mode '{}' cannot use downloadSettings", cfg.mode));
+        }
     }
     return cfg;
 }
