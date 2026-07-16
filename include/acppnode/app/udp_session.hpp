@@ -34,6 +34,11 @@ public:
                ::acpp::app::dns::DNS& dns_service);
     ~UDPSession();
 
+    UDPSession(const UDPSession&) = delete;
+    UDPSession& operator=(const UDPSession&) = delete;
+    UDPSession(UDPSession&&) = delete;
+    UDPSession& operator=(UDPSession&&) = delete;
+
     // 启动会话（绑定本地端口）
     ErrorCode Start(const net::ip::address& bind_address);
 
@@ -86,7 +91,7 @@ public:
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 // ============================================================================

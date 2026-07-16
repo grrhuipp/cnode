@@ -143,6 +143,20 @@ if(UDP_SEND_CALL_COUNT LESS 3)
     message(FATAL_ERROR
         "UDPSession must centralize socket send, accounting and payload limits")
 endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+    "RunReceive[(]std::shared_ptr<Impl> self[)]")
+    message(FATAL_ERROR
+        "UDPSession receive loop must own Impl until cancellation completes")
+endif()
+if(UDP_SESSION_SOURCE MATCHES "retired_sessions")
+    message(FATAL_ERROR
+        "UDPSessionManager must not retain every removed session until shutdown")
+endif()
+if(NOT UDP_SESSION_SOURCE MATCHES
+    "UDPSessionManager::~UDPSessionManager[(][)] \\{[\r\n ]+StopAll[(][)];")
+    message(FATAL_ERROR
+        "UDPSessionManager destruction must cancel cleanup and live sessions")
+endif()
 set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
 file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
 if(WORKER_SOURCE MATCHES

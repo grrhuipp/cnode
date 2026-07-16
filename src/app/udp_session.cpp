@@ -116,6 +116,7 @@ struct UDPSession::Impl {
         , next_target_prune_at(steady_clock::now() + kTargetPruneInterval) {}
 
     void Touch() { last_active = std::chrono::steady_clock::now(); }
+    static net::awaitable<void> RunReceive(std::shared_ptr<Impl> self);
     net::awaitable<void> DoReceive();
     net::awaitable<std::pair<ErrorCode, udp::endpoint>> ResolveEndpoint(
         const TargetAddress& target);
@@ -198,16 +199,13 @@ struct UDPSession::Impl {
 UDPSession::UDPSession(net::io_context& io_context,
                        const std::string& session_id,
                        ::acpp::app::dns::DNS& dns_service)
-    : impl_(std::make_unique<Impl>(io_context, session_id, dns_service)) {
+    : impl_(std::make_shared<Impl>(io_context, session_id, dns_service)) {
 }
 
 UDPSession::~UDPSession() {
     if (impl_->running) {
-        IoErrorCode ec;
-        impl_->socket.cancel(ec);
-        impl_->socket.close(ec);
-        impl_->running = false;
         LOG_ACCESS_DEBUG("UDP session {} destroyed without Stop(), forced close", impl_->session_id);
+        Stop();
     }
 }
 
@@ -384,7 +382,7 @@ void UDPSession::StartReceive() {
     if (!impl_->running) return;
     net::co_spawn(
         impl_->io_context.get_executor(),
-        impl_->DoReceive(),
+        Impl::RunReceive(impl_),
         [](std::exception_ptr) {});
 }
 
@@ -423,6 +421,10 @@ void UDPSession::UnregisterCallback(uint64_t callback_id) {
             MaybeShrinkHashContainer(impl_->target_to_callbacks, 16);
         }
     }
+}
+
+net::awaitable<void> UDPSession::Impl::RunReceive(std::shared_ptr<Impl> self) {
+    co_await self->DoReceive();
 }
 
 net::awaitable<void> UDPSession::Impl::DoReceive() {
@@ -676,7 +678,6 @@ struct UDPSessionManager::Impl {
     ::acpp::app::dns::DNS& dns_service;
     std::chrono::seconds session_timeout;
     memory::ThreadLocalUnorderedMap<std::string, SessionPtr> sessions;
-    memory::ThreadLocalVector<SessionPtr> retired_sessions;
     TimeoutToken cleanup_token;
     bool running = false;
     uint64_t total_packets_sent = 0;
@@ -697,7 +698,9 @@ UDPSessionManager::UDPSessionManager(net::io_context& io_context,
     : impl_(std::make_unique<Impl>(io_context, dns_service, session_timeout)) {
 }
 
-UDPSessionManager::~UDPSessionManager() = default;
+UDPSessionManager::~UDPSessionManager() {
+    StopAll();
+}
 
 UDPSession* UDPSessionManager::GetOrCreateSession(
     const std::string& session_id,
@@ -748,7 +751,6 @@ void UDPSessionManager::RemoveSession(const std::string& session_id) {
     auto it = impl_->sessions.find(session_id);
     if (it != impl_->sessions.end()) {
         it->second->Stop();
-        impl_->retired_sessions.push_back(std::move(it->second));
         impl_->sessions.erase(it);
         MaybeShrinkHashContainer(impl_->sessions, 64);
         LOG_ACCESS_DEBUG("Removed UDP session {}, remaining: {}", session_id, impl_->sessions.size());
@@ -769,7 +771,6 @@ void UDPSessionManager::CleanupExpiredSessions() {
             impl_->total_packets_sent += it->second->PacketsSent();
             impl_->total_packets_received += it->second->PacketsReceived();
             it->second->Stop();
-            impl_->retired_sessions.push_back(std::move(it->second));
             it = impl_->sessions.erase(it);
             removed_session = true;
         } else {
@@ -792,18 +793,15 @@ void UDPSessionManager::CleanupExpiredSessions() {
 
 void UDPSessionManager::StopAll() {
     impl_->running = false;
-    TimeoutScheduler::ForIoContext(impl_->io_context).Cancel(impl_->cleanup_token);
+    if (impl_->cleanup_token.Valid()) {
+        TimeoutScheduler::ForIoContext(impl_->io_context).Cancel(impl_->cleanup_token);
+    }
 
     for (const auto& [id, session] : impl_->sessions) {
         session->Stop();
     }
-    for (const auto& session : impl_->retired_sessions) {
-        session->Stop();
-    }
     impl_->sessions.clear();
-    impl_->retired_sessions.clear();
     MaybeShrinkHashContainer(impl_->sessions, 64);
-    TryShrinkSequence(impl_->retired_sessions);
 }
 
 size_t UDPSessionManager::ActiveSessionCount() const {
