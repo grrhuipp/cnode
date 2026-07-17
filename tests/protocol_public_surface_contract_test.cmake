@@ -75,6 +75,20 @@ endif()
 set(TRANSPORT_STACK
     "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
 file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/xhttp_packet_queue.hpp"
+    XHTTP_PACKET_QUEUE_SOURCE)
+if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
+       "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
+   NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
+       "kMaxQueuedPackets = 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketQueue packet_queue_" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "ThreadLocalMap<uint64_t, buf::MultiBuffer> pending_")
+    message(FATAL_ERROR
+        "XHTTP packet-up reordering must use the bounded Worker-local queue")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES
        "XHttpPacketSessionKeyRef lookup_key\{&io_context, session_id\}" OR
    NOT TRANSPORT_STACK_SOURCE MATCHES

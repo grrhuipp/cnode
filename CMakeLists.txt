@@ -1529,6 +1529,30 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_xhttp_packet_session_key_test
         COMMAND cnode_xhttp_packet_session_key_test)
 
+    add_executable(cnode_xhttp_packet_queue_test
+        tests/xhttp_packet_queue_test.cpp
+    )
+    target_include_directories(cnode_xhttp_packet_queue_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_link_libraries(cnode_xhttp_packet_queue_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_xhttp_packet_queue_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_xhttp_packet_queue_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_xhttp_packet_queue_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_xhttp_packet_queue_test
+        COMMAND cnode_xhttp_packet_queue_test)
+
     add_executable(cnode_timeout_scheduler_test
         tests/timeout_scheduler_test.cpp
         src/transport/internet/timeout_scheduler.cpp

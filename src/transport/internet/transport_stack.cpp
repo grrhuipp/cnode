@@ -3,6 +3,7 @@
 #include "http2_settings.hpp"
 #include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
+#include "xhttp_packet_queue.hpp"
 #include "xhttp_packet_session_key.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
@@ -866,27 +867,17 @@ public:
         Wake();
     }
 
-    void Push(uint64_t seq, buf::MultiBuffer payload) {
+    [[nodiscard]] bool Push(uint64_t seq, buf::MultiBuffer payload) {
         if (closed_ || input_closed_) {
             payload.clear();
-            return;
+            return false;
         }
-        if (seq == next_seq_) {
-            ready_.push_back(std::move(payload));
-            ++next_seq_;
-            while (true) {
-                auto it = pending_.find(next_seq_);
-                if (it == pending_.end()) {
-                    break;
-                }
-                ready_.push_back(std::move(it->second));
-                pending_.erase(it);
-                ++next_seq_;
-            }
-        } else if (seq > next_seq_) {
-            pending_.emplace(seq, std::move(payload));
+        if (!packet_queue_.Push(seq, std::move(payload))) {
+            Close();
+            return false;
         }
         Wake();
+        return true;
     }
 
     void CloseInput() noexcept {
@@ -903,8 +894,7 @@ public:
         }
         closed_ = true;
         input_closed_ = true;
-        ready_.clear();
-        pending_.clear();
+        packet_queue_.Clear();
         if (stream_input_) {
             stream_input_->Close();
             stream_input_.reset();
@@ -920,16 +910,9 @@ public:
         }
 
         while (true) {
-            while (!ready_.empty() && !buf::HasData(ready_.front())) {
-                ready_.pop_front();
-            }
-            if (!ready_.empty()) {
-                auto& front = ready_.front();
-                const size_t n = front.ConsumePrefixTo(
+            if (packet_queue_.HasReady()) {
+                const size_t n = packet_queue_.ConsumePrefixTo(
                     std::span<uint8_t>(out, capacity));
-                if (!buf::HasData(front)) {
-                    ready_.pop_front();
-                }
                 co_return n;
             }
             if (stream_input_) {
@@ -954,13 +937,8 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
         while (true) {
-            while (!ready_.empty() && !buf::HasData(ready_.front())) {
-                ready_.pop_front();
-            }
-            if (!ready_.empty()) {
-                buf::MultiBuffer mb = std::move(ready_.front());
-                ready_.pop_front();
-                co_return mb;
+            if (packet_queue_.HasReady()) {
+                co_return packet_queue_.Pop();
             }
             if (stream_input_) {
                 buf::MultiBuffer mb = co_await stream_input_->ReadMultiBuffer();
@@ -992,10 +970,8 @@ private:
 
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
-    memory::ThreadLocalDeque<buf::MultiBuffer> ready_;
-    memory::ThreadLocalMap<uint64_t, buf::MultiBuffer> pending_;
+    detail::XHttpPacketQueue packet_queue_;
     std::unique_ptr<AsyncStream> stream_input_;
-    uint64_t next_seq_ = 0;
     bool input_closed_ = false;
     bool closed_ = false;
 };
@@ -3366,8 +3342,19 @@ private:
                                 if (n == 0) {
                                     break;
                                 }
+                                if (buf::TotalLen(payload) >
+                                    detail::XHttpPacketQueue::kMaxQueuedBytes) {
+                                    throw IoSystemError(
+                                        io_error::message_size,
+                                        "xhttp packet-up payload exceeds queue limit");
+                                }
                             }
-                            xsession->Push(seq, std::move(payload));
+                            if (!xsession->Push(seq, std::move(payload))) {
+                                LOG_ACCESS_DEBUG(
+                                    "[XHTTP:{}] server: H2 packet-up queue exhausted seq={}",
+                                    conn_id,
+                                    seq);
+                            }
                         } catch (const std::exception& e) {
                             LOG_ACCESS_DEBUG(
                                 "[XHTTP:{}] server: H2 packet-up read failed seq={} error={}",
@@ -4164,6 +4151,9 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     buf::MultiBuffer payload;
 
     if (content_length) {
+        if (*content_length > detail::XHttpPacketQueue::kMaxQueuedBytes) {
+            co_return std::nullopt;
+        }
         size_t remaining = *content_length;
         while (remaining > 0) {
             const size_t n = co_await ReadToMultiBufferTail(
@@ -4186,6 +4176,11 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
                 buf::Buffer::kSize);
             if (n == 0) {
                 break;
+            }
+            if (buf::TotalLen(payload) >
+                detail::XHttpPacketQueue::kMaxQueuedBytes) {
+                payload.clear();
+                co_return std::nullopt;
             }
         }
     }
@@ -4780,7 +4775,9 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (!payload) {
             co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        session->Push(meta.seq, std::move(*payload));
+        if (!session->Push(meta.seq, std::move(*payload))) {
+            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
 
         const std::string response = BuildXHttpResponseHeaders(cfg, false);
         if (!co_await WriteFullToStream(
