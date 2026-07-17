@@ -12,6 +12,9 @@ file(READ
     "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp"
     ANYTLS_OUTBOUND_SOURCE)
 file(READ
+    "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp"
+    ANYTLS_INBOUND_SOURCE)
+file(READ
     "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp"
     VMESS_OUTBOUND_SOURCE)
 file(READ
@@ -41,6 +44,13 @@ if(ACCESS_LOG_EVENT_SOURCE MATCHES
        "event[.]remote_ip = AddressString[(][*]target[.]resolved_addr[)]")
     message(FATAL_ERROR
         "DNS candidates must not be reported as an established remote IP")
+endif()
+
+if(ANYTLS_INBOUND_SOURCE MATCHES "access_event_submitted" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "ctx[.]content[.]network = Network::MUX")
+    message(FATAL_ERROR
+        "AnyTLS must describe its control transport as MUX instead of controlling access logging")
 endif()
 
 if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
