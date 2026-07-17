@@ -16,6 +16,22 @@ int main() {
     acpp::net::io_context io_context;
     auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io_context);
 
+    bool abandoned_ran = false;
+    {
+        auto abandoned = scheduler.ScheduleAfter(1ms, [&]() {
+            abandoned_ran = true;
+        });
+        if (!abandoned.Valid()) {
+            return 101;
+        }
+    }
+    std::this_thread::sleep_for(10ms);
+    io_context.run();
+    if (abandoned_ran) {
+        return 102;
+    }
+    io_context.restart();
+
     bool first_ran = false;
     bool cancelled_ran = false;
     acpp::TimeoutToken cancelled;

@@ -21,6 +21,7 @@ class TimeoutScheduler;
 class TimeoutToken {
 public:
     TimeoutToken() noexcept = default;
+    ~TimeoutToken() noexcept;
     TimeoutToken(const TimeoutToken&) = delete;
     TimeoutToken& operator=(const TimeoutToken&) = delete;
 

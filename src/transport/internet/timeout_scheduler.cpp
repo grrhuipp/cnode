@@ -257,6 +257,20 @@ asio::execution_context::id TimeoutSchedulerService::id;
 TimeoutScheduler::TimeoutScheduler(net::io_context& io_context)
     : impl_(std::make_unique<Impl>(io_context)) {}
 
+TimeoutToken::~TimeoutToken() noexcept {
+    if (!Valid()) {
+        return;
+    }
+    try {
+        owner_->Cancel(*this);
+    } catch (...) {
+        // Cancel erases this token's event before timer reconciliation can
+        // allocate. Destruction must not leak an exception if re-arming a
+        // different event fails under allocation pressure.
+        Reset();
+    }
+}
+
 TimeoutToken& TimeoutToken::operator=(TimeoutToken&& other) {
     if (this != &other) {
         if (Valid()) {

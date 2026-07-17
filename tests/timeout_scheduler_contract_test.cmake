@@ -11,11 +11,14 @@ file(READ
 
 if(NOT SCHEDULER_HEADER MATCHES "TimeoutScheduler[*] owner_" OR
    SCHEDULER_HEADER MATCHES "const void[*] owner_" OR
+   NOT SCHEDULER_HEADER MATCHES "~TimeoutToken[(][)] noexcept" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "TimeoutToken::~TimeoutToken[(][)] noexcept" OR
    NOT SCHEDULER_SOURCE MATCHES
        "TimeoutToken::operator=[(]TimeoutToken&& other[)]" OR
    NOT SCHEDULER_SOURCE MATCHES "owner_->Cancel[(][*]this[)]")
     message(FATAL_ERROR
-        "timeout token move assignment must cancel a displaced owned event")
+        "timeout token destruction and move assignment must cancel owned events")
 endif()
 
 if(NOT SCHEDULER_SOURCE MATCHES
