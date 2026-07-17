@@ -156,3 +156,27 @@ if(UDP_BIND_FAILURE_POS EQUAL -1 OR UDP_REPLACE_COMMIT_POS EQUAL -1 OR
     message(FATAL_ERROR
         "UDP listener replacement must bind before retiring the live worker and start receive loops only after commit")
 endif()
+
+string(FIND "${WORKER_SOURCE}"
+    "bool Worker::ListenerState::StartListening" TCP_START_BEGIN)
+string(FIND "${WORKER_SOURCE}"
+    "Worker::ListenerState::CollectTcpListenerKeys" TCP_START_END)
+math(EXPR TCP_START_LENGTH "${TCP_START_END} - ${TCP_START_BEGIN}")
+string(SUBSTRING "${WORKER_SOURCE}"
+    ${TCP_START_BEGIN} ${TCP_START_LENGTH} TCP_START_SOURCE)
+string(FIND "${TCP_START_SOURCE}"
+    "if (bound_count == 0)" TCP_BIND_FAILURE_POS)
+string(FIND "${TCP_START_SOURCE}"
+    "StopListening" TCP_REPLACE_COMMIT_POS)
+string(FIND "${TCP_START_SOURCE}"
+    "listener_slot.tcp_worker = std::move(replacement_worker)" TCP_WORKER_COMMIT_POS)
+string(FIND "${TCP_START_SOURCE}"
+    "net::co_spawn" TCP_ACCEPT_START_POS)
+if(TCP_BIND_FAILURE_POS EQUAL -1 OR TCP_REPLACE_COMMIT_POS EQUAL -1 OR
+   TCP_WORKER_COMMIT_POS EQUAL -1 OR TCP_ACCEPT_START_POS EQUAL -1 OR
+   NOT TCP_BIND_FAILURE_POS LESS TCP_REPLACE_COMMIT_POS OR
+   NOT TCP_REPLACE_COMMIT_POS LESS TCP_WORKER_COMMIT_POS OR
+   NOT TCP_WORKER_COMMIT_POS LESS TCP_ACCEPT_START_POS)
+    message(FATAL_ERROR
+        "TCP listener replacement must listen before retiring the live worker and start accept loops only after commit")
+endif()

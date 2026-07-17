@@ -358,24 +358,14 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 
     PortBinding committed_binding = binding;
-    if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
-        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
-    }
-
-    auto& listener_slot = listener_slots[binding.tag];
-    if (!listener_slot.tcp_worker) {
-        listener_slot.tcp_worker = std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
-    }
-    auto& tcp_worker = *listener_slot.tcp_worker;
-    const auto fail_listener = [&]() -> bool {
-        tcp_worker.Close();
-        listener_slot.tcp_worker.reset();
-        listener_slot.tcp_binding.reset();
-        return false;
-    };
+    auto replacement_worker =
+        std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
+    ListenerKeys prepared_listener_keys;
+    decltype(tcp_listener_tags) prepared_listener_tags;
 
     const auto listen_candidates = binding.listen.Candidates();
+    prepared_listener_keys.reserve(listen_candidates.size());
+    prepared_listener_tags.reserve(listen_candidates.size());
     size_t bound_count = 0;
 
     for (const auto& addr : listen_candidates) {
@@ -385,7 +375,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         tcp::endpoint ep(addr, binding.port);
         const std::string listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
         tcp::acceptor* candidate_acceptor =
-            tcp_worker.CreateAcceptor(listener_key, worker.runtime_->io_context);
+            replacement_worker->CreateAcceptor(listener_key, worker.runtime_->io_context);
         if (!candidate_acceptor) {
             LOG_ERROR("Worker[{}]: failed to create TCP acceptor tag={} key={}",
                       worker.id_, binding.tag, listener_key);
@@ -393,7 +383,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         }
 
         auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
-            tcp_worker.CloseAcceptor(listener_key);
+            replacement_worker->CloseAcceptor(listener_key);
             if (listen_candidates.size() > 1) {
                 LOG_WARN("Worker[{}]: TCP {} {} failed: {}, continuing dual-stack bind",
                          worker.id_,
@@ -412,14 +402,14 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         candidate_acceptor->open(ep.protocol(), ec);
         if (ec) {
             if (fail_candidate("open", ec.message())) continue;
-            return fail_listener();
+            break;
         }
 
         if (addr.is_v6()) {
             candidate_acceptor->set_option(net::ip::v6_only(true), ec);
             if (ec) {
                 if (fail_candidate("set IPV6_V6ONLY", ec.message())) continue;
-                return fail_listener();
+                break;
             }
         }
 
@@ -431,48 +421,62 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
                          &optval, sizeof(optval)) < 0) {
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
-            return fail_listener();
+            break;
         }
 #endif
 
         candidate_acceptor->bind(ep, ec);
         if (ec) {
             if (fail_candidate("bind", ec.message())) continue;
-            return fail_listener();
+            break;
         }
 
         candidate_acceptor->listen(net::socket_base::max_listen_connections, ec);
         if (ec) {
             if (fail_candidate("listen", ec.message())) continue;
-            return fail_listener();
+            break;
         }
 
-        tcp::acceptor* acceptor = candidate_acceptor;
-        if (!acceptor) {
-            LOG_ERROR("Worker[{}]: failed to attach TCP acceptor tag={} key={}",
-                      worker.id_, binding.tag, listener_key);
-            continue;
-        }
-        tcp_listener_tags.emplace(listener_key, binding.tag);
-
-        net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      AcceptLoop(worker, listener_key, binding.tag, acceptor, &listener_slot),
-                      [](std::exception_ptr) {});
+        prepared_listener_keys.push_back(listener_key);
+        prepared_listener_tags.emplace(listener_key, binding.tag);
 
         ++bound_count;
-        LOG_DEBUG("worker.listener ready worker={} endpoint={} tag={} protocol={} accept=SO_REUSEPORT",
-                  worker.id_,
-                  iputil::FormatEndpointForLog(listen_addr, binding.port),
-                  binding.tag,
-                  binding.protocol);
     }
 
     if (bound_count == 0) {
         LOG_ERROR("Worker[{}]: no TCP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
-        return fail_listener();
+        return false;
     }
+
+    auto slot_it = listener_slots.try_emplace(binding.tag).first;
+    tcp_listener_tags.reserve(
+        tcp_listener_tags.size() + prepared_listener_tags.size());
+    auto& listener_slot = slot_it->second;
+
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
+        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
+    } else if (listener_slot.tcp_worker) {
+        listener_slot.tcp_worker->Close();
+    }
+
+    listener_slot.tcp_worker = std::move(replacement_worker);
+    tcp_listener_tags.merge(prepared_listener_tags);
     listener_slot.tcp_binding = std::move(committed_binding);
+
+    for (const auto& listener_key : prepared_listener_keys) {
+        auto* acceptor = listener_slot.tcp_worker->FindAcceptor(listener_key);
+        if (!acceptor) {
+            continue;
+        }
+        net::co_spawn(worker.runtime_->io_context.get_executor(),
+                      AcceptLoop(worker, listener_key, binding.tag, acceptor, &listener_slot),
+                      [](std::exception_ptr) {});
+
+        LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
+                  worker.id_, listener_key, binding.tag, binding.protocol);
+    }
     return true;
 }
 
