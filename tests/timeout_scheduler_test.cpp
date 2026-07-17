@@ -161,6 +161,38 @@ int main() {
     }
     acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
 
+    acpp::net::io_context cancellation_io_context;
+    auto& cancellation_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(cancellation_io_context);
+    auto keeper = cancellation_scheduler.ScheduleAfter(1h, []() {});
+    constexpr size_t kCancellationStormSize = 4096;
+    for (size_t i = 0; i < kCancellationStormSize; ++i) {
+        auto token = cancellation_scheduler.ScheduleAfter(2h, []() {});
+        cancellation_scheduler.Cancel(token);
+        if (token.Valid()) {
+            acpp::TimeoutScheduler::ReleaseForIoContext(
+                cancellation_io_context);
+            acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+            return 11;
+        }
+    }
+
+    bool after_cancellation_storm_ran = false;
+    auto after_cancellation_storm =
+        cancellation_scheduler.ScheduleAfter(1ms, [&]() {
+            after_cancellation_storm_ran = true;
+        });
+    std::this_thread::sleep_for(10ms);
+    cancellation_io_context.run_for(100ms);
+    if (!after_cancellation_storm_ran) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(cancellation_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 12;
+    }
+    cancellation_scheduler.Cancel(after_cancellation_storm);
+    cancellation_scheduler.Cancel(keeper);
+    acpp::TimeoutScheduler::ReleaseForIoContext(cancellation_io_context);
+
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;
 }

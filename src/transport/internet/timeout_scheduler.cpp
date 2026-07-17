@@ -19,6 +19,7 @@ struct TimeoutScheduler::Impl {
 
     static constexpr size_t kInitialEventReserve = 1024;
     static constexpr size_t kMaxReadyBatch = 64;
+    static constexpr size_t kHeapCompactStaleFloor = 1024;
 
     struct Event {
         std::chrono::steady_clock::time_point deadline;
@@ -49,6 +50,7 @@ struct TimeoutScheduler::Impl {
     uint64_t timer_generation = 0;
     bool timer_armed = false;
     bool released = false;
+    bool dispatching_ready_batch = false;
     std::chrono::steady_clock::time_point armed_deadline{};
 
     void PushHeap(HeapEntry entry) {
@@ -71,6 +73,37 @@ struct TimeoutScheduler::Impl {
                 return;
             }
             (void)PopHeap();
+        }
+    }
+
+    void MaybeCompactHeap() noexcept {
+        if (released || dispatching_ready_batch ||
+            deadline_heap.size() <= events.size()) {
+            return;
+        }
+
+        const size_t stale = deadline_heap.size() - events.size();
+        if (stale < kHeapCompactStaleFloor ||
+            stale < deadline_heap.size() / 2) {
+            return;
+        }
+
+        // Cancellation only erases the authoritative event. Rebuild the
+        // derived deadline index once tombstones dominate so a long-lived
+        // earlier timer cannot retain an unbounded cancelled tail. Build the
+        // replacement transactionally because Cancel is used by noexcept
+        // owner destructors and compaction is only a best-effort cold path.
+        try {
+            memory::ThreadLocalVector<HeapEntry> compacted;
+            compacted.reserve(std::max(kInitialEventReserve, events.size()));
+            for (const auto& [id, event] : events) {
+                compacted.push_back(HeapEntry{event.deadline, id});
+            }
+            std::make_heap(compacted.begin(), compacted.end(), HeapCompare{});
+            deadline_heap.swap(compacted);
+        } catch (...) {
+            // The original heap remains intact until swap, so allocation
+            // failure can safely defer compaction to a later cancellation.
         }
     }
 
@@ -143,6 +176,7 @@ struct TimeoutScheduler::Impl {
         // Keep due callbacks in events until the instant they execute. A prior
         // callback in this same ready batch may cancel and destroy a later
         // callback owner; Cancel must still be able to erase that event.
+        dispatching_ready_batch = true;
         for (size_t i = 0; i < ready.size(); ++i) {
             const uint64_t id = ready[i];
             auto it = events.find(id);
@@ -163,9 +197,11 @@ struct TimeoutScheduler::Impl {
                 break;
             }
         }
+        dispatching_ready_batch = false;
         ready.clear();
 
         if (!released) {
+            MaybeCompactHeap();
             ArmTimer();
         }
     }
@@ -176,6 +212,7 @@ struct TimeoutScheduler::Impl {
         IoErrorCode ec;
         timer.cancel(ec);
         timer_armed = false;
+        dispatching_ready_batch = false;
         events.clear();
         deadline_heap.clear();
         ready_event_ids.clear();
@@ -280,6 +317,7 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) {
         const bool removed = impl_->events.erase(token.id_) != 0;
         if (removed) {
             impl_->ReconcileTimerAfterCancellation();
+            impl_->MaybeCompactHeap();
         }
     }
     token.Reset();

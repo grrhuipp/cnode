@@ -1502,6 +1502,11 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_timeout_scheduler_test
         COMMAND cnode_timeout_scheduler_test)
+    add_test(
+        NAME cnode_timeout_scheduler_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_contract_test.cmake)
 
     add_executable(cnode_node_transition_test
         tests/node_transition_test.cpp
