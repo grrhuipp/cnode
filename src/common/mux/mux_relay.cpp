@@ -344,7 +344,7 @@ public:
         if (QueueBytesWouldExceed(
                 queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
             mb.clear();
-            Cancel();
+            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
             return false;
         }
         input_queue_.emplace_back(std::move(mb), bytes);
@@ -398,9 +398,13 @@ public:
 
             auto [ec] = co_await input_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
+            if (ec) {
+                throw IoSystemError(
+                    io_error::operation_aborted,
+                    "Mux TCP input cancelled");
+            }
         }
-        co_return buf::MultiBuffer{};
+        ThrowInputError("Mux TCP input cancelled");
     }
 
     [[nodiscard]] bool ForwardHalfCloseToPeerOnEof() const noexcept {
@@ -533,11 +537,12 @@ public:
         co_return;
     }
 
-    void Cancel() noexcept {
+    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (cancelled_) {
             return;
         }
         cancelled_ = true;
+        terminal_error_ = error;
         input_done_ = true;
         output_sleep_.Cancel();
         WakeInputReader();
@@ -553,6 +558,13 @@ public:
     session::Context ctx;
 
 private:
+    [[noreturn]] void ThrowInputError(const char* what) const {
+        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
+            throw IoSystemError(io_error::no_buffer_space, what);
+        }
+        throw IoSystemError(io_error::operation_aborted, what);
+    }
+
     void WakeInputReader() noexcept {
         if (io_context_.stopped()) {
             return;
@@ -601,6 +613,7 @@ private:
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
+    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
     bool end_sent_ = false;
     bool dispatch_done_ = false;
     bool dispatch_done_notified_ = false;
@@ -647,7 +660,7 @@ public:
         if (QueueBytesWouldExceed(
                 queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
             mb.clear();
-            Cancel();
+            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
             return;
         }
         if (xudp_packet_mode_) {
@@ -705,9 +718,13 @@ public:
 
             auto [ec] = co_await input_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
-            (void)ec;
+            if (ec) {
+                throw IoSystemError(
+                    io_error::operation_aborted,
+                    "Mux UDP input cancelled");
+            }
         }
-        co_return buf::MultiBuffer{};
+        ThrowInputError("Mux UDP input cancelled");
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -760,11 +777,12 @@ public:
         co_return;
     }
 
-    void Cancel() noexcept {
+    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
         if (cancelled_) {
             return;
         }
         cancelled_ = true;
+        terminal_error_ = error;
         input_done_ = true;
         WakeInputReader();
         input_queue_.clear();
@@ -780,6 +798,13 @@ public:
     session::Context ctx;
 
 private:
+    [[noreturn]] void ThrowInputError(const char* what) const {
+        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
+            throw IoSystemError(io_error::no_buffer_space, what);
+        }
+        throw IoSystemError(io_error::operation_aborted, what);
+    }
+
     void WakeInputReader() noexcept {
         if (io_context_.stopped()) {
             return;
@@ -831,6 +856,7 @@ private:
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
+    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
     bool end_sent_ = false;
     bool dispatch_done_ = false;
     bool dispatch_done_notified_ = false;
@@ -851,7 +877,7 @@ private:
         if (QueueBytesWouldExceed(
                 queued_bytes_, bytes, kMuxQueueEmergencyBytes)) {
             payload.clear();
-            Cancel();
+            Cancel(ErrorCode::RESOURCE_EXHAUSTED);
             return;
         }
         StampDefaultTarget(payload);

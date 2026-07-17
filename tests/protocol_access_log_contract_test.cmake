@@ -74,6 +74,18 @@ if(NOT MUX_RELAY_SOURCE MATCHES
         "Mux child access traffic must fail instead of counting dropped replies")
 endif()
 
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "Cancel[(]ErrorCode error = ErrorCode::CANCELLED[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "Cancel[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "Mux TCP input cancelled" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "Mux UDP input cancelled")
+    message(FATAL_ERROR
+        "Mux child input failures must remain visible to access logging")
+endif()
+
 string(FIND "${UDP_RELAY_SOURCE}"
        "auto send_result = co_await session.SendTo"
        UDP_SEND_POSITION)
