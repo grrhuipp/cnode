@@ -8,6 +8,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/access_log_session.cpp"
     SESSION_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp"
+    INBOUND_HANDLER_SOURCE)
 
 string(FIND "${REPORTER_SOURCE}" "auto spool = std::make_unique<Spool>(spool_path_)"
        SPOOL_INITIALIZE_POSITION)
@@ -17,6 +20,16 @@ if(SPOOL_INITIALIZE_POSITION EQUAL -1 OR THREAD_START_POSITION EQUAL -1 OR
    NOT SPOOL_INITIALIZE_POSITION LESS THREAD_START_POSITION)
     message(FATAL_ERROR
         "access-log durable spool must initialize before the reporter thread starts")
+endif()
+
+if(NOT SESSION_SOURCE MATCHES
+       "AccessLogSession::Fail[(]ErrorCode error_code[)]" OR
+   NOT INBOUND_HANDLER_SOURCE MATCHES
+       "access_log[.]Fail[(]build_result[.]error[(][)][)]" OR
+   NOT INBOUND_HANDLER_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::INTERNAL[)]")
+    message(FATAL_ERROR
+        "pre-dispatch transport and protocol failures must reach the access-log terminal path")
 endif()
 if(NOT REPORTER_SOURCE MATCHES
        "if [(][!]spool->Initialize[(][)][)]" OR

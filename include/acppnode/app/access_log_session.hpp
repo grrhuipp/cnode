@@ -20,6 +20,7 @@ public:
     AccessLogSession& operator=(AccessLogSession&&) = delete;
 
     void Complete(const RelayResult& result) noexcept;
+    void Fail(ErrorCode error_code) noexcept;
     // Mux/control transports are containers rather than logical requests.
     void Suppress() noexcept;
 

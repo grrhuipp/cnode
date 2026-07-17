@@ -43,6 +43,18 @@ void AccessLogSession::Complete(const RelayResult& result) noexcept {
     terminal_ = true;
 }
 
+void AccessLogSession::Fail(ErrorCode error_code) noexcept {
+    RelayResult result;
+    result.error = error_code == ErrorCode::OK
+        ? ErrorCode::INTERNAL
+        : error_code;
+    if (ctx_) {
+        result.bytes_up = ctx_->traffic.bytes_up;
+        result.bytes_down = ctx_->traffic.bytes_down;
+    }
+    Complete(result);
+}
+
 void AccessLogSession::Suppress() noexcept {
     suppressed_ = true;
     if (ctx_) {

@@ -163,6 +163,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     if (!stream) {
         stats.OnError();
+        access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
@@ -171,6 +172,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (logical) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
+        access_log.Fail(ErrorCode::BLOCKED);
         co_return;
     }
 
@@ -182,6 +184,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
+            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -191,6 +194,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
+            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
             co_return;
         }
         connection_limit->MarkIPAccepted();
@@ -206,6 +210,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     if (!proxy_) {
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
         co_return;
     }
     try {
@@ -220,9 +225,11 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: {}", e.what());
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: unknown");
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
     }
 }
 
@@ -245,6 +252,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
+        access_log.Fail(ErrorCode::BLOCKED);
         co_return;
     }
 
@@ -256,6 +264,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
+            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -295,6 +304,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                        listener.stream_settings.security,
                        listener.stream_settings.network);
         stats.OnError();
+        access_log.Fail(build_result.error());
         co_return;
     }
     auto stream = std::move(*build_result);
@@ -327,6 +337,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
+            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
             co_return;
         }
         connection_limit->MarkIPAccepted();
@@ -338,6 +349,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     if (!proxy_) {
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
         co_return;
     }
     try {
@@ -352,9 +364,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     } catch (const std::exception& e) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: {}", e.what());
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
         LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: unknown");
         stats.OnError();
+        access_log.Fail(ErrorCode::INTERNAL);
     }
 }
 
