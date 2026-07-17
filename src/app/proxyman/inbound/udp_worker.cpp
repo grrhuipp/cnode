@@ -131,6 +131,7 @@ struct UdpWorker::ClientSession::Impl {
     size_t queued_bytes = 0;
     bool shrink_queue_on_drain = false;
     bool closed = false;
+    ErrorCode terminal_error = ErrorCode::OK;
     UdpSessionOwner session_owner;
 };
 
@@ -174,6 +175,7 @@ bool UdpWorker::ClientSession::Push(
     if (WouldOverflowUdpQueue(
             impl_->input_queue.size(), impl_->queued_bytes, payload_size)) {
         payload.clear();
+        CloseWithError(ErrorCode::RESOURCE_EXHAUSTED);
         return false;
     }
 
@@ -193,10 +195,15 @@ bool UdpWorker::ClientSession::Push(
 }
 
 void UdpWorker::ClientSession::Close() noexcept {
+    CloseWithError(ErrorCode::OK);
+}
+
+void UdpWorker::ClientSession::CloseWithError(ErrorCode error) noexcept {
     if (impl_->closed) {
         return;
     }
     impl_->closed = true;
+    impl_->terminal_error = error;
     impl_->input_queue.clear();
     impl_->queued_bytes = 0;
     impl_->WakeReader();
@@ -217,12 +224,21 @@ UdpWorker::ClientSession::ReadMultiBuffer() {
         }
 
         if (impl_->closed) {
+            if (impl_->terminal_error == ErrorCode::RESOURCE_EXHAUSTED) {
+                throw IoSystemError(
+                    io_error::no_buffer_space,
+                    "UDP client input queue full");
+            }
             co_return buf::MultiBuffer{};
         }
 
         auto [ec] = co_await impl_->reader_signal.async_receive(
             net::as_tuple(net::use_awaitable));
-        (void)ec;
+        if (ec) {
+            throw IoSystemError(
+                io_error::operation_aborted,
+                "UDP client input cancelled");
+        }
     }
 }
 
@@ -230,7 +246,9 @@ net::awaitable<void>
 UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (impl_->closed || !impl_->reply_callback) {
         mb.clear();
-        co_return;
+        throw IoSystemError(
+            io_error::operation_aborted,
+            "UDP client reply path closed");
     }
 
     const auto datagram = buf::InspectUdpDatagram(mb);

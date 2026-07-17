@@ -111,6 +111,16 @@ if(NOT UDP_WORKER_SOURCE MATCHES
         "native UDP reply rejection must fail relay accounting and access logging")
 endif()
 
+if(NOT UDP_WORKER_SOURCE MATCHES
+       "CloseWithError[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+       "UDP client input queue full" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+       "UDP client reply path closed")
+    message(FATAL_ERROR
+        "native UDP session termination must remain visible to access logging")
+endif()
+
 if(NOT MUX_RELAY_SOURCE MATCHES
        "Cancel[(]ErrorCode error = ErrorCode::CANCELLED[)]" OR
    NOT MUX_RELAY_SOURCE MATCHES

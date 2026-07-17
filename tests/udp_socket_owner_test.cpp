@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -475,6 +476,45 @@ int main() {
             std::chrono::steady_clock::now())) {
         Fail("UDP session ID collision blocked a different authenticated owner");
     }
+
+    acpp::proxyman::inbound::UdpWorker::ClientSession overflow_session(
+        io_context,
+        acpp::RoutedPacketCallback{
+            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        reply_endpoint_a,
+        owner_a);
+    acpp::buf::MultiBuffer oversized_input;
+    size_t oversized_bytes = 0;
+    while (oversized_bytes <= 512 * 1024) {
+        acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+        if (!buffer) Fail("failed to allocate oversized UDP input");
+        const size_t n = buffer->Available();
+        std::memset(buffer->Tail().data(), 0x5a, n);
+        buffer->Produce(static_cast<uint32_t>(n));
+        oversized_bytes += n;
+        oversized_input.push_back(buffer.release());
+    }
+    if (overflow_session.Push(callback_source, std::move(oversized_input)) ||
+        !overflow_session.Closed()) {
+        Fail("oversized UDP input did not terminate its session");
+    }
+    bool overflow_reported = false;
+    acpp::net::co_spawn(
+        io_context,
+        overflow_session.ReadMultiBuffer(),
+        [&](std::exception_ptr error, acpp::buf::MultiBuffer) {
+            try {
+                if (error) std::rethrow_exception(error);
+            } catch (const acpp::IoSystemError& e) {
+                overflow_reported = e.code() == acpp::io_error::no_buffer_space;
+            }
+        });
+    io_context.run();
+    if (!overflow_reported) {
+        Fail("UDP input overflow was exposed as a clean EOF");
+    }
+    io_context.restart();
+
     auto attached = worker.AttachSocket("stable-socket", std::move(second));
     if (!attached || worker.FindSocket("stable-socket") != attached ||
         !worker.OwnsSocket("stable-socket", attached.get()) ||

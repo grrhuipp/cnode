@@ -190,6 +190,8 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
 
 private:
+    void CloseWithError(ErrorCode error) noexcept;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
