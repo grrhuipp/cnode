@@ -6,9 +6,18 @@ AccessLogSession::AccessLogSession(session::Context& ctx) noexcept
     : ctx_(&ctx) {}
 
 AccessLogSession::~AccessLogSession() noexcept {
-    if (!ctx_ || !terminal_ || error_code_ != ErrorCode::OK || suppressed_ ||
+    if (!ctx_ || !terminal_ || suppressed_ ||
         ctx_->access_event_submitted ||
         ctx_->inbound.access_source_ref == 0) {
+        return;
+    }
+
+    const bool known_failed_request =
+        error_code_ != ErrorCode::OK &&
+        ctx_->inbound.user_id != 0 &&
+        !ctx_->content.multiple_targets &&
+        ctx_->outbound.target.IsValid();
+    if (error_code_ != ErrorCode::OK && !known_failed_request) {
         return;
     }
 

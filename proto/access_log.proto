@@ -71,4 +71,6 @@ message AccessBatch {
   uint64 last_sequence = 6;
   repeated SourceDescriptor sources = 7;
   repeated AccessEvent events = 8;
+  // Set by the log service from HTTP forwarding headers or the TCP peer.
+  string node_ip = 9;
 }

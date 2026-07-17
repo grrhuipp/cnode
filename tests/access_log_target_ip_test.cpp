@@ -33,8 +33,10 @@ int main() {
 
     ctx.outbound.target = TargetAddress(
         net::ip::make_address("198.51.100.7"), 8443);
+    ctx.inbound.user_id = 1001;
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::DIAL_REFUSED);
+    assert(event.user_id == 1001);
     assert(event.target_host == "198.51.100.7");
     assert(event.target_port == 8443);
     assert(event.remote_ip.empty());

@@ -7,9 +7,10 @@
 namespace acpp::app {
 
 // One guard may exist at the inbound boundary and another at Dispatcher. Each
-// successful authenticated logical proxy request submits one terminal result.
-// Failed/rejected requests are never sent to the centralized access-log
-// collector. The Context flag makes successful submission idempotent.
+// successful logical proxy request submits one terminal result. A failed,
+// rejected or cancelled request is also submitted once both the authenticated
+// user and its single target are known. The Context flag makes submission
+// idempotent.
 class AccessLogSession final {
 public:
     explicit AccessLogSession(session::Context& ctx) noexcept;

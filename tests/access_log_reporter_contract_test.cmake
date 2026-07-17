@@ -103,11 +103,15 @@ if(SESSION_SOURCE MATCHES
    SESSION_SOURCE MATCHES
        "AccessLogSession::Cancel" OR
    NOT SESSION_SOURCE MATCHES
+       "ctx_->inbound[.]user_id != 0" OR
+   NOT SESSION_SOURCE MATCHES
+       "ctx_->outbound[.]target[.]IsValid[(][)]" OR
+   NOT SESSION_SOURCE MATCHES
        "error_code_ = result[.]error" OR
    NOT SESSION_SOURCE MATCHES
        "AccessLogSession::Suppress")
     message(FATAL_ERROR
-        "logical request failures must be reported; only container sessions may be suppressed")
+        "known-user, known-target logical failures must be reported; container and unidentified failures may be suppressed")
 endif()
 
 string(FIND "${SESSION_SOURCE}"
