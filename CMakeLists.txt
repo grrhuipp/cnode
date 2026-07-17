@@ -306,6 +306,7 @@ set(CNODE_SOURCES
     # Infra (logging, config)
     src/infra/log.cpp
     src/infra/access_log_identity.cpp
+    src/infra/access_log_ack.cpp
     src/infra/access_log_encoding.cpp
     src/infra/access_log_reporter.cpp
     src/infra/json.cpp
@@ -1471,6 +1472,23 @@ if(CNODE_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/access_log_reporter_contract_test.cmake)
+
+    add_executable(cnode_access_log_ack_test
+        tests/access_log_ack_test.cpp
+        src/infra/access_log_ack.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_access_log_ack_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/infra
+    )
+    target_compile_options(cnode_access_log_ack_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_access_log_ack_test
+        COMMAND cnode_access_log_ack_test)
 
     add_executable(cnode_access_log_target_ip_test
         tests/access_log_target_ip_test.cpp

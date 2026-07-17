@@ -1,5 +1,6 @@
 #include "acppnode/infra/access_log_reporter.hpp"
 
+#include "access_log_ack.hpp"
 #include "access_log_encoding.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/clock.hpp"
@@ -560,21 +561,8 @@ private:
             SendResult result;
             result.status = response->status;
             result.detail = response->body.substr(0, 512);
-            if (response->status == 200 || response->status == 409) {
-                std::string compact;
-                compact.reserve(response->body.size());
-                for (unsigned char ch : response->body) {
-                    if (!std::isspace(ch)) {
-                        compact.push_back(static_cast<char>(std::tolower(ch)));
-                    }
-                }
-                const bool accepted =
-                    compact.find("\"accepted\":true") != std::string::npos ||
-                    response->status == 409;
-                const bool matching_batch =
-                    compact.find(LowerCopy(batch_id)) != std::string::npos;
-                result.acknowledged = accepted && matching_batch;
-            }
+            result.acknowledged = detail::IsBatchAcknowledged(
+                response->status, response->body, batch_id);
             co_return result;
         }
         co_return SendResult{.detail = "connect/write/read failed"};
