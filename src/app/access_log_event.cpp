@@ -94,6 +94,9 @@ accesslog::Event BuildAccessLogEvent(
     if (ctx.outbound.connected_target_addr) {
         event.remote_ip = AddressString(*ctx.outbound.connected_target_addr);
     }
+    if (ctx.outbound.dial_target_addr) {
+        event.dial_ip = AddressString(*ctx.outbound.dial_target_addr);
+    }
     if (ctx.outbound.connected_local_addr) {
         event.local_ip = AddressString(*ctx.outbound.connected_local_addr);
     }

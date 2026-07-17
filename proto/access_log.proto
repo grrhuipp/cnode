@@ -60,6 +60,9 @@ message AccessEvent {
   uint32 dns_state = 26;
   string sniff_protocol = 27;
   string sniff_domain = 28;
+  // Final-destination IP used by the most recent direct dial attempt. This is
+  // populated even when the connection or transport handshake fails.
+  string dial_ip = 29;
 }
 
 message AccessBatch {

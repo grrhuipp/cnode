@@ -274,7 +274,8 @@ Worker 只允许：
 | `source_port` | `uint32` | 客户端端口 |
 | `target_host` | `string` | 请求目标域名或 IP |
 | `target_port` | `uint32` | 目标端口 |
-| `remote_ip` | `string` | 实际远端 IP |
+| `remote_ip` | `string` | 连接成功后确认的最终目标对端 IP |
+| `dial_ip` | `string` | 直连出站最近一次实际尝试拨号的最终目标 IP，失败时仍可用 |
 | `local_ip` | `string` | 本地出站 IP，可选 |
 | `uplink_bytes` | `uint64` | 上行字节数 |
 | `downlink_bytes` | `uint64` | 下行字节数 |

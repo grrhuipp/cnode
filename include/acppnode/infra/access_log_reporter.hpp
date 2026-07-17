@@ -70,6 +70,7 @@ struct Event {
     std::string target_host;
     uint16_t target_port = 0;
     std::string remote_ip;
+    std::string dial_ip;
     std::string local_ip;
 
     uint64_t uplink_bytes = 0;

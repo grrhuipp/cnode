@@ -12,11 +12,13 @@ int main() {
     ctx.outbound.target.resolved_addr = net::ip::make_address("192.0.2.10");
 
     ctx.outbound.connected_target_addr = net::ip::make_address("192.0.2.20");
+    ctx.outbound.dial_target_addr = net::ip::make_address("192.0.2.10");
     ctx.outbound.connected_local_addr = net::ip::make_address("2001:db8::10");
     auto event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::OK);
     assert(event.target_host == "www.example.com");
     assert(event.remote_ip == "192.0.2.20");
+    assert(event.dial_ip == "192.0.2.10");
     assert(event.local_ip == "2001:db8::10");
 
     ctx.outbound.connected_target_addr = net::ip::address{};
@@ -25,10 +27,12 @@ int main() {
     assert(event.remote_ip.empty());
 
     ctx.outbound.connected_target_addr.reset();
+    ctx.outbound.dial_target_addr = net::ip::make_address("198.51.100.8");
     ctx.outbound.target.resolved_addr.reset();
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::OK);
     assert(event.remote_ip.empty());
+    assert(event.dial_ip == "198.51.100.8");
     assert(event.target_host == "www.example.com");
 
     ctx.outbound.target = TargetAddress(
@@ -40,6 +44,7 @@ int main() {
     assert(event.target_host == "198.51.100.7");
     assert(event.target_port == 8443);
     assert(event.remote_ip.empty());
+    assert(event.dial_ip == "198.51.100.8");
 
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Unknown, 3, 4, ErrorCode::BLOCKED);
@@ -58,11 +63,13 @@ int main() {
 
     ctx.content.multiple_targets = true;
     ctx.outbound.connected_target_addr = net::ip::make_address("203.0.113.9");
+    ctx.outbound.dial_target_addr = net::ip::address{};
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Client, 9, 10, ErrorCode::OK);
     assert(event.target_host.empty());
     assert(event.target_port == 0);
     assert(event.remote_ip == "203.0.113.9");
+    assert(event.dial_ip.empty());
 
     return 0;
 }

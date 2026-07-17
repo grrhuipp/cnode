@@ -139,6 +139,8 @@ std::vector<uint8_t> EncodeEvent(
     WriteUInt(out, 26, event.dns_state);
     WriteString(out, 27, event.sniff_protocol, 64);
     WriteString(out, 28, event.sniff_domain, 1024);
+    // Additive schema-v1 field. Older collectors skip unknown protobuf fields.
+    WriteString(out, 29, event.dial_ip, 64);
     return out;
 }
 

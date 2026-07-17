@@ -66,6 +66,7 @@ int main() {
     event.source_port = 50000;
     event.target_host = "example.com";
     event.target_port = 443;
+    event.dial_ip = "198.51.100.42";
     event.uplink_bytes = 123;
     event.downlink_bytes = 456;
     event.result = Result::Completed;
@@ -85,6 +86,7 @@ int main() {
     assert(!batch.protobuf.empty());
     assert(Contains(batch.protobuf, "https://panel.example.com"));
     assert(Contains(batch.protobuf, "example.com"));
+    assert(Contains(batch.protobuf, "198.51.100.42"));
     assert(Contains(batch.protobuf, "cnode-test"));
 
     const auto compressed = CompressZstd(batch.protobuf);

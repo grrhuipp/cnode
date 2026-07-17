@@ -56,6 +56,11 @@ struct Outbound {
     // The final destination address confirmed by a direct outbound after a
     // successful dial. Proxy next-hop addresses must never be stored here.
     std::optional<net::ip::address> connected_target_addr;
+    // The final destination address most recently attempted by a direct
+    // outbound. Unlike connected_target_addr, this remains available when
+    // the transport dial or handshake fails. Proxy next hops must not be
+    // stored here.
+    std::optional<net::ip::address> dial_target_addr;
     // Local egress address of the established outbound socket. Unlike the
     // remote field this is meaningful for direct and proxy next-hop sockets.
     std::optional<net::ip::address> connected_local_addr;

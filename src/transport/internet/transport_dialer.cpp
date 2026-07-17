@@ -574,6 +574,7 @@ net::awaitable<DialResult> DialSingleCandidate(
             io_context, candidate.endpoint, target.timeout);
     }
 
+    tcp_result.attempted_remote_addr = candidate.endpoint.address();
     co_return tcp_result;
 }
 
@@ -605,24 +606,30 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
         ctx.conn_id);
     if (!build_result) {
         const ErrorCode code = build_result.error();
-        co_return DialResult::Fail(
+        auto result = DialResult::Fail(
             code,
             std::string("xhttp client request failed: ") +
                 std::string(ErrorCodeToString(code)));
+        result.attempted_remote_addr = candidate.endpoint.address();
+        co_return result;
     }
 
     auto stream = std::move(*build_result);
     if (kind != XHttpClientRequestKind::PacketUp && !stream) {
-        co_return DialResult::Fail(
+        auto result = DialResult::Fail(
             ErrorCode::SOCKET_EOF,
             "xhttp client request returned no stream");
+        result.attempted_remote_addr = candidate.endpoint.address();
+        co_return result;
     }
     if (stream) {
         stream->ClearPhaseDeadline();
         stream->SetIdleTimeout(std::chrono::seconds(0));
     }
 
-    co_return DialResult::Success(std::move(stream));
+    auto result = DialResult::Success(std::move(stream));
+    result.attempted_remote_addr = candidate.endpoint.address();
+    co_return result;
 }
 
 net::awaitable<DialResult> DialAndBuildSingleCandidate(
@@ -647,10 +654,12 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
         ctx.conn_id);
     if (!build_result) {
         const ErrorCode code = build_result.error();
-        co_return DialResult::Fail(
+        auto result = DialResult::Fail(
             code,
             std::string("outbound transport build failed: ") +
                 std::string(ErrorCodeToString(code)));
+        result.attempted_remote_addr = candidate.endpoint.address();
+        co_return result;
     }
 
     auto stream = std::move(*build_result);
@@ -658,7 +667,9 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     // 后续 outbound handler / relay 阶段会重新设置 idle/read/write timeout。
     stream->SetIdleTimeout(std::chrono::seconds(0));
 
-    co_return DialResult::Success(std::move(stream));
+    auto result = DialResult::Success(std::move(stream));
+    result.attempted_remote_addr = candidate.endpoint.address();
+    co_return result;
 }
 
 net::awaitable<DialResult> DialAndBuildCandidatesSequential(
@@ -773,7 +784,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     }
 
     if (mode == XHttpOutboundMode::PacketUp) {
-        co_return DialResult::Success(
+        auto result = DialResult::Success(
             std::make_unique<XHttpPacketUpClientStream>(
                 io_context,
                 std::move(downlink),
@@ -781,9 +792,11 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
                 *upload_candidate,
                 session_id,
                 ctx.conn_id));
+        result.attempted_remote_addr = selected->endpoint.address();
+        co_return result;
     }
 
-    co_return DialResult::Success(
+    auto result = DialResult::Success(
         std::make_unique<XHttpSplitClientStream>(
             io_context,
             std::move(downlink),
@@ -791,6 +804,8 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             *upload_candidate,
             upload_path,
             ctx.conn_id));
+    result.attempted_remote_addr = selected->endpoint.address();
+    co_return result;
 }
 
 }  // namespace

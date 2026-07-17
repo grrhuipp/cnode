@@ -274,6 +274,10 @@ inline bool ConsumeWriteSideTimeout(AsyncStream& stream) {
 // ============================================================================
 struct DialResult : ResultStatus {
     std::unique_ptr<AsyncStream> stream;  // 成功时有效
+    // The endpoint address used by the most recent transport dial attempt.
+    // This is transport metadata only; an outbound decides whether the
+    // endpoint represents the final destination or a proxy next hop.
+    std::optional<net::ip::address> attempted_remote_addr;
 
     [[nodiscard]] bool Ok() const noexcept {
         return ResultStatus::Ok() && stream != nullptr;
