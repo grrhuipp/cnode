@@ -41,6 +41,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/relay_udp.cpp"
     UDP_RELAY_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/common/mux/mux_relay.cpp"
+    MUX_RELAY_SOURCE)
 
 foreach(SOURCE IN ITEMS
         VLESS_OUTBOUND_SOURCE
@@ -59,6 +62,16 @@ if(ACCESS_LOG_EVENT_SOURCE MATCHES
        "event[.]remote_ip = AddressString[(][*]target[.]resolved_addr[)]")
     message(FATAL_ERROR
         "DNS candidates must not be reported as an established remote IP")
+endif()
+
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "bool CanPushTcp[(]size_t payload_bytes, size_t reply_count[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "Mux TCP reply queue full" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "Mux UDP reply queue full")
+    message(FATAL_ERROR
+        "Mux child access traffic must fail instead of counting dropped replies")
 endif()
 
 string(FIND "${UDP_RELAY_SOURCE}"

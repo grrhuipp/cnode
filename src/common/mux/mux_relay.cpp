@@ -95,6 +95,20 @@ struct ReplyQueueState {
             kMuxQueueHighWaterBytes);
     }
 
+    bool CanPushTcp(size_t payload_bytes, size_t reply_count) const noexcept {
+        if (reply_count > kMuxQueueEmergencyBytes / kMuxReplyOverhead) {
+            return false;
+        }
+        const size_t overhead = reply_count * kMuxReplyOverhead;
+        if (payload_bytes > kMuxQueueEmergencyBytes - overhead) {
+            return false;
+        }
+        return !QueueBytesWouldExceed(
+            tcp_queued_bytes,
+            payload_bytes + overhead,
+            kMuxQueueEmergencyBytes);
+    }
+
     bool PushTcp(MuxReply&& reply) {
         if (reply.PayloadSize() > kMuxQueueEmergencyBytes - kMuxReplyOverhead) {
             return false;
@@ -401,7 +415,26 @@ public:
 
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
-            co_return;
+            throw IoSystemError(
+                io_error::operation_aborted,
+                "Mux TCP reply path closed");
+        }
+
+        size_t payload_bytes = 0;
+        size_t reply_count = 0;
+        for (const buf::Buffer* buffer : mb) {
+            if (buffer && !buffer->IsEmpty()) {
+                payload_bytes += buffer->Len();
+                ++reply_count;
+            }
+        }
+        if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
+            reply_queue_.tcp_overflowed = true;
+            mb.clear();
+            Cancel();
+            throw IoSystemError(
+                io_error::no_buffer_space,
+                "Mux TCP reply queue full");
         }
 
         for (buf::Buffer*& buffer : mb) {
@@ -419,7 +452,10 @@ public:
             if (!reply_queue_.PushTcp(std::move(reply))) {
                 reply_queue_.tcp_overflowed = true;
                 Cancel();
-                break;
+                mb.clear();
+                throw IoSystemError(
+                    io_error::no_buffer_space,
+                    "Mux TCP reply queue admission changed");
             }
         }
         mb.clear();
@@ -432,7 +468,28 @@ public:
         }
 
         if (cancelled_ || !reply_queue_.running) {
-            co_return;
+            throw IoSystemError(
+                io_error::operation_aborted,
+                "Mux TCP reply path closed");
+        }
+
+        size_t payload_bytes = 0;
+        size_t reply_count = 0;
+        for (const net::const_buffer& buffer : buffers) {
+            if (buffer.size() == 0) {
+                continue;
+            }
+            payload_bytes += buffer.size();
+            reply_count +=
+                (buffer.size() + std::numeric_limits<uint16_t>::max() - 1) /
+                std::numeric_limits<uint16_t>::max();
+        }
+        if (!reply_queue_.CanPushTcp(payload_bytes, reply_count)) {
+            reply_queue_.tcp_overflowed = true;
+            Cancel();
+            throw IoSystemError(
+                io_error::no_buffer_space,
+                "Mux TCP reply queue full");
         }
 
         for (const net::const_buffer& buffer : buffers) {
@@ -462,7 +519,9 @@ public:
                 if (!reply_queue_.PushTcp(std::move(reply))) {
                     reply_queue_.tcp_overflowed = true;
                     Cancel();
-                    co_return;
+                    throw IoSystemError(
+                        io_error::no_buffer_space,
+                        "Mux TCP reply queue admission changed");
                 }
                 remaining = remaining.subspan(chunk_size);
             }
@@ -654,7 +713,9 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
-            co_return;
+            throw IoSystemError(
+                io_error::operation_aborted,
+                "Mux UDP reply path closed");
         }
 
         const auto datagram = buf::InspectUdpDatagram(mb);
@@ -676,7 +737,10 @@ public:
                     parent_conn_id_, dropped);
             }
             mb.clear();
-            co_return;
+            Cancel();
+            throw IoSystemError(
+                io_error::no_buffer_space,
+                "Mux UDP reply queue full");
         }
 
         MuxReply reply;

@@ -14,6 +14,9 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
     if (ec == io_error::operation_aborted) {
         return ErrorCode::CANCELLED;
     }
+    if (ec == io_error::no_buffer_space) {
+        return ErrorCode::RESOURCE_EXHAUSTED;
+    }
     if (ec == io_error::timed_out) {
         return ErrorCode::TIMEOUT;
     }
