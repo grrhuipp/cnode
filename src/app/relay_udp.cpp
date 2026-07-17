@@ -77,9 +77,18 @@ net::awaitable<RelayResult> DoUDPRelayLink(
         size_t queued_bytes = 0;
         uint64_t total_replies = 0;
         bool shrink_queue_on_drain = false;
+        ErrorCode terminal_error = ErrorCode::OK;
 
         void WakeReplyReader() {
             (void)reply_signal.try_send(IoErrorCode{});
+        }
+
+        void Fail(ErrorCode error) {
+            if (terminal_error == ErrorCode::OK) {
+                terminal_error = error;
+            }
+            running = false;
+            WakeReplyReader();
         }
 
         [[nodiscard]] bool push(UdpRelayReply&& pkt) {
@@ -131,7 +140,14 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             LOG_ACCESS_DEBUG("[conn={}] UDP Full Cone received {} bytes from {}",
                       conn_id, pkt.data.size(), pkt.target);
             ++state.total_replies;
-            return state.push(pkt);
+            if (state.push(pkt)) {
+                return true;
+            }
+            LOG_ACCESS_DEBUG(
+                "[conn={}] UDP Full Cone reply queue exhausted at {} packets/{} bytes",
+                conn_id, state.reply_queue.size(), state.queued_bytes);
+            state.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            return false;
         });
     if (callback_id == 0) {
         result.error = ErrorCode::RESOURCE_EXHAUSTED;
@@ -272,6 +288,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     // ── 回包：remote -> framer -> client ──────────────────────────────────────
     auto download = [&]() -> net::awaitable<void> {
         while (true) {
+            if (state.terminal_error != ErrorCode::OK) {
+                if (result.error == ErrorCode::OK) {
+                    result.error = state.terminal_error;
+                }
+                throw IoSystemError(io_error::no_buffer_space);
+            }
+
             SharedState::UdpRelayReply pkt;
             size_t sent_batch = 0;
             while (sent_batch < 32 && state.pop(pkt)) {
@@ -288,6 +311,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             }
             if (sent_batch > 0) {
                 LOG_CONN_DEBUG(ctx, "Sent {} reply packets (batched)", sent_batch);
+            }
+
+            if (state.terminal_error != ErrorCode::OK) {
+                if (result.error == ErrorCode::OK) {
+                    result.error = state.terminal_error;
+                }
+                throw IoSystemError(io_error::no_buffer_space);
             }
 
             if (!state.running && state.empty()) {

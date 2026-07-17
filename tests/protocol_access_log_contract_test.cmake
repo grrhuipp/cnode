@@ -150,6 +150,16 @@ if(UDP_SEND_POSITION EQUAL -1 OR UDP_ACCOUNT_POSITION EQUAL -1 OR
         "UDP access traffic must be accounted only after a successful datagram send")
 endif()
 
+if(NOT UDP_RELAY_SOURCE MATCHES
+       "state[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "result[.]error = state[.]terminal_error" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "UDP Full Cone reply queue exhausted")
+    message(FATAL_ERROR
+        "Full Cone UDP reply rejection must terminate the relay and reach access logging")
+endif()
+
 if(NOT RELAY_SOURCE MATCHES
        "struct RelayCloseState" OR
    NOT RELAY_SOURCE MATCHES
