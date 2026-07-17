@@ -44,6 +44,8 @@ accesslog::Result ToAccessResult(ErrorCode error_code) noexcept {
         case ErrorCode::VMESS_INVALID_USER:
         case ErrorCode::PANEL_USER_DISABLED:
         case ErrorCode::PANEL_TRAFFIC_EXCEEDED:
+        case ErrorCode::PANEL_RATE_LIMITED:
+        case ErrorCode::CONNECTION_LIMITED:
             return accesslog::Result::Rejected;
         default:
             return accesslog::Result::Failed;

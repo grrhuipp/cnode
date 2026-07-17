@@ -184,7 +184,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -194,7 +194,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit->MarkIPAccepted();
@@ -264,7 +264,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -337,7 +337,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit->MarkIPAccepted();

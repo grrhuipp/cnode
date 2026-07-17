@@ -41,6 +41,7 @@ enum class ErrorCode : int {
     RESOURCE_EXHAUSTED = 8,
     NOT_SUPPORTED = 9,
     CONNECTION_CLOSED = 10,
+    CONNECTION_LIMITED = 11,
 
     // Socket/Network 错误 (100-199)
     SOCKET_CREATE_FAILED = 100,
@@ -140,6 +141,7 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
         case ErrorCode::RESOURCE_EXHAUSTED: return "RESOURCE_EXHAUSTED";
         case ErrorCode::NOT_SUPPORTED: return "NOT_SUPPORTED";
         case ErrorCode::CONNECTION_CLOSED: return "CONNECTION_CLOSED";
+        case ErrorCode::CONNECTION_LIMITED: return "CONNECTION_LIMITED";
 
         case ErrorCode::SOCKET_CREATE_FAILED: return "SOCKET_CREATE_FAILED";
         case ErrorCode::SOCKET_BIND_FAILED: return "SOCKET_BIND_FAILED";
@@ -257,6 +259,7 @@ constexpr ErrorDomain ErrorCodeDomain(ErrorCode code) {
         case ErrorCode::RESOURCE_EXHAUSTED:
         case ErrorCode::NOT_SUPPORTED:
         case ErrorCode::CONNECTION_CLOSED:
+        case ErrorCode::CONNECTION_LIMITED:
             return ErrorDomain::General;
 
         case ErrorCode::SOCKET_CREATE_FAILED:

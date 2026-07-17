@@ -14,6 +14,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp"
     DISPATCHER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/access_log_event.cpp"
+    EVENT_SOURCE)
 
 string(FIND "${REPORTER_SOURCE}" "auto spool = std::make_unique<Spool>(spool_path_)"
        SPOOL_INITIALIZE_POSITION)
@@ -23,6 +26,16 @@ if(SPOOL_INITIALIZE_POSITION EQUAL -1 OR THREAD_START_POSITION EQUAL -1 OR
    NOT SPOOL_INITIALIZE_POSITION LESS THREAD_START_POSITION)
     message(FATAL_ERROR
         "access-log durable spool must initialize before the reporter thread starts")
+endif()
+
+if(INBOUND_HANDLER_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT INBOUND_HANDLER_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::CONNECTION_LIMITED[)]" OR
+   NOT EVENT_SOURCE MATCHES
+       "case ErrorCode::CONNECTION_LIMITED:")
+    message(FATAL_ERROR
+        "connection admission limits must be reported as rejected, not failed")
 endif()
 
 if(NOT DISPATCHER_SOURCE MATCHES
