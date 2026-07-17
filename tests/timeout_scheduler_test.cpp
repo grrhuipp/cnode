@@ -6,12 +6,32 @@
 
 #include <chrono>
 #include <future>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 int main() {
     using namespace std::chrono_literals;
+
+    std::optional<acpp::net::io_context> recycled_io_context;
+    for (size_t iteration = 0; iteration < 4; ++iteration) {
+        recycled_io_context.emplace();
+        bool recycled_callback_ran = false;
+        {
+            auto& recycled_scheduler =
+                acpp::TimeoutScheduler::ForIoContext(*recycled_io_context);
+            auto recycled_token = recycled_scheduler.ScheduleAfter(
+                1ms, [&]() { recycled_callback_ran = true; });
+            std::this_thread::sleep_for(10ms);
+            recycled_io_context->run();
+            recycled_scheduler.Cancel(recycled_token);
+        }
+        if (!recycled_callback_ran) {
+            return 100;
+        }
+        recycled_io_context.reset();
+    }
 
     acpp::net::io_context io_context;
     auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io_context);

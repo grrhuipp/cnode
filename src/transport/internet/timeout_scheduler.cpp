@@ -241,11 +241,20 @@ public:
     }
 
     void ShutdownNow() noexcept {
+        ClearThreadCache();
         scheduler_.Release();
     }
 
 private:
+    void ClearThreadCache() noexcept {
+        if (tl_cached_scheduler == &scheduler_) {
+            tl_cached_context = nullptr;
+            tl_cached_scheduler = nullptr;
+        }
+    }
+
     void shutdown() override {
+        ClearThreadCache();
         scheduler_.Release();
     }
 

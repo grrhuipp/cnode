@@ -32,6 +32,16 @@ if(NOT SCHEDULER_SOURCE MATCHES
 endif()
 
 if(NOT SCHEDULER_SOURCE MATCHES
+       "void ClearThreadCache[(][)] noexcept" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "tl_cached_scheduler == &scheduler_" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "void shutdown[(][)] override")
+    message(FATAL_ERROR
+        "io_context service destruction must invalidate the thread-local scheduler cache")
+endif()
+
+if(NOT SCHEDULER_SOURCE MATCHES
        "kHeapCompactStaleFloor = 1024" OR
    NOT SCHEDULER_SOURCE MATCHES
        "stale < deadline_heap.size[(][)] / 2" OR
