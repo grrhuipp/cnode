@@ -193,6 +193,18 @@ if(ANYTLS_INBOUND_SOURCE MATCHES "access_event_submitted" OR
 endif()
 
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "report_predispatch_failure" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "access_log[.]Fail[(]error[)]" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "report_predispatch_failure[(]request[.]error[(][)][)]" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "report_predispatch_failure[(]ErrorCode::PROTOCOL_INVALID_ADDRESS[)]")
+    message(FATAL_ERROR
+        "AnyTLS UoT child failures before dispatcher entry must reach access logging")
+endif()
+
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
        "AnyTLS substream cancelled" OR
    ANYTLS_INBOUND_SOURCE MATCHES
        "if [(]ec[)] [{][\r\n ]*co_return buf::MultiBuffer[{][}]" OR

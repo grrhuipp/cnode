@@ -3,6 +3,7 @@
 #include "../anytls_codec.hpp"
 #include "../../uot/uot.hpp"
 #include "../../../transport/internet/async_write_gate.hpp"
+#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -597,28 +598,45 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
         co_return;
     }
 
+    session::Context ctx;
+    CopySessionContext(base_ctx_, ctx);
+    ctx.outbound.original_target = target;
+    ctx.outbound.target = target;
+    ctx.outbound.route_target = target;
+    ctx.content.network = uot_version ? Network::UDP : Network::TCP;
+
+    auto report_predispatch_failure = [&](ErrorCode error) {
+        app::AccessLogSession access_log(ctx);
+        access_log.Fail(error);
+        RemoveStream(sub->Sid());
+    };
+
     bool is_connect = false;
     std::optional<proxy::uot::PacketReader> uot_reader;
     std::optional<proxy::uot::PacketWriter> uot_writer;
-    if (uot_version) {
-        if (*uot_version == proxy::uot::Version::V2) {
-            auto request = co_await proxy::uot::ReadRequest(
-                *sub, initial_uot_payload);
-            if (!request || !request->destination.IsValid()) {
-                RemoveStream(sub->Sid());
-                co_return;
+    try {
+        if (uot_version) {
+            if (*uot_version == proxy::uot::Version::V2) {
+                auto request = co_await proxy::uot::ReadRequest(
+                    *sub, initial_uot_payload);
+                if (!request) {
+                    report_predispatch_failure(request.error());
+                    co_return;
+                }
+                if (!request->destination.IsValid()) {
+                    report_predispatch_failure(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+                    co_return;
+                }
+                is_connect = request->is_connect;
+                target = std::move(request->destination);
             }
-            is_connect = request->is_connect;
-            target = std::move(request->destination);
-        }
 
-        uot_reader.emplace(
-            *sub, is_connect, target, std::move(initial_uot_payload));
-        if (*uot_version == proxy::uot::Version::V1) {
-            try {
+            uot_reader.emplace(
+                *sub, is_connect, target, std::move(initial_uot_payload));
+            if (*uot_version == proxy::uot::Version::V1) {
                 auto first_packet = co_await uot_reader->ReadMultiBuffer();
                 if (!buf::HasData(first_packet)) {
-                    RemoveStream(sub->Sid());
+                    report_predispatch_failure(ErrorCode::CONNECTION_CLOSED);
                     co_return;
                 }
                 for (const buf::Buffer* buffer : first_packet) {
@@ -628,20 +646,24 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
                     }
                 }
                 if (!target.IsValid()) {
-                    RemoveStream(sub->Sid());
+                    report_predispatch_failure(ErrorCode::PROTOCOL_INVALID_ADDRESS);
                     co_return;
                 }
                 uot_reader->SetInitialDecoded(std::move(first_packet));
-            } catch (...) {
-                RemoveStream(sub->Sid());
-                co_return;
             }
+            uot_writer.emplace(*sub, is_connect, target);
         }
-        uot_writer.emplace(*sub, is_connect, target);
+    } catch (const IoSystemError& e) {
+        report_predispatch_failure(MapAsioError(e.code()));
+        co_return;
+    } catch (const std::bad_alloc&) {
+        report_predispatch_failure(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return;
+    } catch (...) {
+        report_predispatch_failure(ErrorCode::INTERNAL);
+        co_return;
     }
 
-    session::Context ctx;
-    CopySessionContext(base_ctx_, ctx);
     ctx.outbound.original_target = target;
     ctx.outbound.target = target;
     ctx.outbound.route_target = target;
