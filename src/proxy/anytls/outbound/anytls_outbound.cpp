@@ -843,6 +843,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     const size_t first_payload_size = buf::TotalLen(first_payload);
+    uint64_t prewritten_bytes = 0;
+    bool prewrote_initial_payload = false;
     memory::ByteVector open_packet;
     open_packet.reserve(
         (kFrameHeaderSize * 3) + target->size() + first_payload_size +
@@ -890,6 +892,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             }
         }
         first_payload.clear();
+        prewritten_bytes += first_payload_size;
     }
     if (!is_udp && !initial_payload.empty()) {
         auto frame = AppendFrameBytesTo(open_packet, kCmdPSH, sid, initial_payload);
@@ -897,11 +900,17 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             stream.Cancel();
             co_return std::unexpected(frame.error());
         }
+        prewritten_bytes += initial_payload.size();
+        prewrote_initial_payload = true;
     }
     if (auto ok = co_await session->WriteOpenPacket(sid, std::move(open_packet)); !ok) {
         stream.Cancel();
         logical->Close(ok.error());
         co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
+    }
+    if (prewritten_bytes > 0) {
+        stats.AddBytesOut(prewritten_bytes);
+        ctx.traffic.bytes_up = prewritten_bytes;
     }
     if (sid >= 2 && session->peer_version >= 2) {
         if (auto ok = co_await logical->WaitSynAck(std::chrono::seconds(3)); !ok) {
@@ -1022,7 +1031,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 io_context, *inbound.reader, *inbound.writer,
                 endpoint, ctx, stats, first_payload, relay_config);
         }
-        if (!initial_payload.empty()) {
+        if (!prewrote_initial_payload && !initial_payload.empty()) {
             if (inbound_control) {
                 co_return co_await DoRelayLinkWithFirstPacket(
                     io_context, *inbound.reader, *inbound.writer,
@@ -1054,6 +1063,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!inbound_control) {
         try { co_await inbound.writer->AsyncShutdownWrite(); } catch (...) {}
     }
+    result.bytes_up += prewritten_bytes;
+    ctx.traffic.bytes_up = result.bytes_up;
     logical_lease.Finish(result.error);
     co_return result;
 }
