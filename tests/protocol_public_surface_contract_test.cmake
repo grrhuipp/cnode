@@ -151,6 +151,21 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "XHTTP packet stream cancellation must abort pending reads without closing the session")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "ReadClientResponseHeaders[(]H2Frame frame[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "field[.]name == \":status\"" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 peer closed before response headers" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 DATA arrived before response headers" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 stream reset by peer" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 connection closed by peer")
+    message(FATAL_ERROR
+        "HTTP/2 client streams must validate a successful response before accepting data or EOF")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")

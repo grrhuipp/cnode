@@ -1325,6 +1325,7 @@ constexpr std::string_view kHttp2ClientPreface =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr size_t kHttp2FrameHeaderSize = 9;
 constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
+constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
 constexpr uint32_t kGrpcInitialWindow = 4 * 1024 * 1024;
 
 enum class H2FrameType : uint8_t {
@@ -2596,6 +2597,50 @@ private:
         co_return co_await WriteGrpcHunkMessage(*inner_, stream_id_, data);
     }
 
+    net::awaitable<bool> ReadClientResponseHeaders(H2Frame frame) {
+        const bool end_stream = (frame.flags & 0x1) != 0;
+        auto first_fragment = H2HeaderBlockPayload(frame);
+        if (!first_fragment || first_fragment->size() > kHttp2MaxHeaderBlockSize) {
+            ThrowGrpcStreamError("invalid HTTP/2 response header block");
+        }
+
+        memory::ByteVector header_block(
+            first_fragment->begin(),
+            first_fragment->end());
+        while ((frame.flags & 0x4) == 0) {
+            auto continuation = co_await ReadH2Frame(*inner_);
+            if (!continuation ||
+                continuation->type != H2FrameType::CONTINUATION ||
+                continuation->stream_id != stream_id_ ||
+                continuation->payload.size() >
+                    kHttp2MaxHeaderBlockSize - header_block.size()) {
+                ThrowGrpcStreamError("invalid HTTP/2 response continuation");
+            }
+            header_block.insert(
+                header_block.end(),
+                continuation->payload.begin(),
+                continuation->payload.end());
+            frame = std::move(*continuation);
+        }
+
+        auto fields = response_decoder_.Decode(header_block);
+        if (!fields) {
+            ThrowGrpcStreamError("failed to decode HTTP/2 response headers");
+        }
+        std::string_view status;
+        for (const auto& field : *fields) {
+            if (field.name == ":status") {
+                status = field.value;
+                break;
+            }
+        }
+        if (status.size() != 3 || status.front() != '2') {
+            ThrowGrpcStreamError("HTTP/2 server rejected request");
+        }
+        response_headers_received_ = true;
+        co_return end_stream;
+    }
+
     net::awaitable<bool> ReadNextGrpcMessage() {
         if (read_closed_) {
             co_return false;
@@ -2655,6 +2700,9 @@ private:
         while (!read_closed_) {
             auto frame = co_await ReadH2Frame(*inner_);
             if (!frame) {
+                if (role_ == Role::Client && !response_headers_received_) {
+                    ThrowGrpcStreamError("HTTP/2 peer closed before response headers");
+                }
                 co_return false;
             }
 
@@ -2672,15 +2720,24 @@ private:
             case H2FrameType::CONTINUATION:
                 break;
             case H2FrameType::HEADERS:
-                if (frame->stream_id == stream_id_ &&
-                    (frame->flags & 0x1) != 0) {
-                    read_closed_ = true;
-                    co_return false;
+                if (frame->stream_id == stream_id_) {
+                    if (role_ == Role::Client && !response_headers_received_) {
+                        if (co_await ReadClientResponseHeaders(std::move(*frame))) {
+                            read_closed_ = true;
+                            co_return false;
+                        }
+                    } else if ((frame->flags & 0x1) != 0) {
+                        read_closed_ = true;
+                        co_return false;
+                    }
                 }
                 break;
             case H2FrameType::DATA: {
                 if (frame->stream_id != stream_id_) {
                     break;
+                }
+                if (role_ == Role::Client && !response_headers_received_) {
+                    ThrowGrpcStreamError("HTTP/2 DATA arrived before response headers");
                 }
                 const auto data = H2DataPayload(*frame);
                 const size_t data_len = data.size();
@@ -2707,13 +2764,11 @@ private:
             }
             case H2FrameType::RST_STREAM:
                 if (frame->stream_id == stream_id_) {
-                    read_closed_ = true;
-                    co_return false;
+                    ThrowGrpcStreamError("HTTP/2 stream reset by peer");
                 }
                 break;
             case H2FrameType::GOAWAY:
-                read_closed_ = true;
-                co_return false;
+                ThrowGrpcStreamError("HTTP/2 connection closed by peer");
             default:
                 break;
             }
@@ -2726,6 +2781,7 @@ private:
     Role role_ = Role::Client;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     uint64_t conn_id_ = 0;
+    HpackDecoder response_decoder_;
     memory::ByteVector h2_data_;
     size_t h2_data_offset_ = 0;
     size_t h2_data_end_ = 0;
@@ -2735,6 +2791,7 @@ private:
     bool read_closed_ = false;
     bool write_closed_ = false;
     bool closed_ = false;
+    bool response_headers_received_ = false;
 };
 
 class GrpcServerSession;
