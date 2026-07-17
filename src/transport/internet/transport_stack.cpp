@@ -1115,7 +1115,10 @@ struct XHttpRequestMeta {
         return nullptr;
     }
     auto session = std::make_shared<XHttpPacketUpSession>(io_context);
-    detail::XHttpPacketSessionKey stored_key{.owner = &io_context};
+    detail::XHttpPacketSessionKey stored_key{
+        .owner = &io_context,
+        .session_id = {},
+    };
     stored_key.session_id.assign(session_id.data(), session_id.size());
     sessions.emplace(std::move(stored_key), session);
     return session;

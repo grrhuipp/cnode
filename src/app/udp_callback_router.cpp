@@ -223,7 +223,11 @@ uint64_t UdpCallbackRouter::Register(PacketCallback callback) {
     const uint64_t callback_id = impl_->NextCallbackId();
     impl_->registered_callbacks.emplace(
         callback_id,
-        CallbackEntry{.callback = std::move(callback)});
+        CallbackEntry{
+            .callback = std::move(callback),
+            .sent_targets = {},
+            .pending_removal = false,
+        });
     return callback_id;
 }
 
@@ -254,7 +258,7 @@ UdpCallbackRouter::BeginTargetSend(
     auto callback_it = impl_->registered_callbacks.find(callback_id);
     if (callback_it == impl_->registered_callbacks.end() ||
         callback_it->second.pending_removal || impl_->clear_pending) {
-        return {ErrorCode::INVALID_ARGUMENT, {}};
+        return {ErrorCode::INVALID_ARGUMENT, MappingLease{}};
     }
 
     auto& sent_targets = callback_it->second.sent_targets;
@@ -271,7 +275,7 @@ UdpCallbackRouter::BeginTargetSend(
     }
     if (sent_targets.size() >= kMaxTargetsPerCallback ||
         impl_->target_mapping_count >= kMaxTargetMappings) {
-        return {ErrorCode::RESOURCE_EXHAUSTED, {}};
+        return {ErrorCode::RESOURCE_EXHAUSTED, MappingLease{}};
     }
 
     const uint64_t generation = impl_->NextGeneration();

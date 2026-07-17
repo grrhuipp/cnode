@@ -455,7 +455,10 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
     if (selection.error != ErrorCode::OK) {
         LOG_CONN_FAIL_CTX(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
                           ctx.inbound.source_ip, ctx.outbound.target);
-        return routing::DispatchResult{.error = selection.error};
+        return routing::DispatchResult{
+            .handler = {},
+            .error = selection.error,
+        };
     }
 
     ctx.outbound.tag = selection.outbound_tag;
@@ -477,7 +480,10 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
                 rule_dest,
                 std::string_view(ctx.inbound.user_email.data(),
                                  ctx.inbound.user_email.size()))) {
-            return routing::DispatchResult{.error = ErrorCode::BLOCKED};
+            return routing::DispatchResult{
+                .handler = {},
+                .error = ErrorCode::BLOCKED,
+            };
         }
     }
 
@@ -487,7 +493,10 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
         ctx.outbound.tag = handler_tag;
     }
     if (!handler) {
-        return routing::DispatchResult{.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND};
+        return routing::DispatchResult{
+            .handler = {},
+            .error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND,
+        };
     }
 
     return routing::DispatchResult{
