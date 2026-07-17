@@ -3,6 +3,7 @@
 #include "http2_settings.hpp"
 #include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
+#include "xhttp_packet_session_key.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
@@ -1110,10 +1111,11 @@ struct XHttpRequestMeta {
     std::string_view session_id,
     bool create) {
     using SessionMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
-        std::weak_ptr<XHttpPacketUpSession>>;
+        detail::XHttpPacketSessionKey,
+        std::weak_ptr<XHttpPacketUpSession>,
+        detail::XHttpPacketSessionKeyHash,
+        detail::XHttpPacketSessionKeyEq>;
     thread_local SessionMap sessions;
-    thread_local memory::ThreadLocalString lookup_key;
 
     if (sessions.size() >= kXHttpPacketSessionPruneThreshold) {
         for (auto it = sessions.begin(); it != sessions.end();) {
@@ -1125,7 +1127,7 @@ struct XHttpRequestMeta {
         }
     }
 
-    lookup_key.assign(session_id.data(), session_id.size());
+    const detail::XHttpPacketSessionKeyRef lookup_key{&io_context, session_id};
     auto it = sessions.find(lookup_key);
     if (it != sessions.end()) {
         if (auto session = it->second.lock()) {
@@ -1137,7 +1139,9 @@ struct XHttpRequestMeta {
         return nullptr;
     }
     auto session = std::make_shared<XHttpPacketUpSession>(io_context);
-    sessions.emplace(lookup_key, session);
+    detail::XHttpPacketSessionKey stored_key{.owner = &io_context};
+    stored_key.session_id.assign(session_id.data(), session_id.size());
+    sessions.emplace(std::move(stored_key), session);
     return session;
 }
 

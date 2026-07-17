@@ -75,6 +75,13 @@ endif()
 set(TRANSPORT_STACK
     "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
 file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketSessionKeyRef lookup_key\{&io_context, session_id\}" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketSessionKey stored_key\{[.]owner = &io_context\}")
+    message(FATAL_ERROR
+        "XHTTP packet session registry keys must include the owning io_context")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")
