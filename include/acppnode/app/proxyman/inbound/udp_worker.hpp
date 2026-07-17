@@ -59,7 +59,9 @@ struct UdpDatagramContext {
 // ============================================================================
 class UdpWorker final {
 public:
-    using SocketPtr = std::unique_ptr<udp::socket>;
+    // Handles remain Worker-local; receive/send operations retain them only
+    // across their own asynchronous cancellation boundary.
+    using SocketPtr = std::shared_ptr<udp::socket>;
 
     class PendingUdpReply;
     class ClientSession;
@@ -131,15 +133,19 @@ public:
     void CleanupAllClientSessions() noexcept;
 
     [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
-        return std::make_unique<udp::socket>(io_context);
+        return std::make_shared<udp::socket>(io_context);
     }
     // A socket key belongs to one receive loop. Duplicate attachment is
     // rejected instead of cancelling and replacing the live socket.
-    [[nodiscard]] udp::socket* AttachSocket(
+    [[nodiscard]] SocketPtr AttachSocket(
         const std::string& socket_key,
         SocketPtr socket);
-    [[nodiscard]] udp::socket* FindSocket(const std::string& socket_key) noexcept;
-    [[nodiscard]] const udp::socket* FindSocket(const std::string& socket_key) const noexcept;
+    [[nodiscard]] SocketPtr FindSocket(const std::string& socket_key) noexcept;
+    [[nodiscard]] std::shared_ptr<const udp::socket> FindSocket(
+        const std::string& socket_key) const noexcept;
+    [[nodiscard]] bool OwnsSocket(
+        const std::string& socket_key,
+        const udp::socket* socket) const noexcept;
     [[nodiscard]] std::vector<std::string> SocketKeys() const;
     void CloseSocket(const std::string& socket_key) noexcept;
     void CloseAllSockets() noexcept;

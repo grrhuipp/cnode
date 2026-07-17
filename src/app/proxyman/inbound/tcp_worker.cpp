@@ -10,7 +10,7 @@ struct TcpWorker::Impl {
         : tag(std::move(tag)) {}
 
     std::string tag;
-    memory::ThreadLocalUnorderedMap<std::string, tcp::acceptor> acceptors;
+    memory::ThreadLocalUnorderedMap<std::string, TcpWorker::AcceptorPtr> acceptors;
 };
 
 TcpWorker::TcpWorker(std::string tag)
@@ -30,21 +30,33 @@ void TcpWorker::Close() noexcept {
     }
 }
 
-tcp::acceptor* TcpWorker::CreateAcceptor(std::string listener_key,
-                                         net::io_context& io_context) {
+TcpWorker::AcceptorPtr TcpWorker::CreateAcceptor(
+    std::string listener_key,
+    net::io_context& io_context) {
+    auto acceptor = std::make_shared<tcp::acceptor>(io_context);
     auto [it, inserted] = impl_->acceptors.try_emplace(
-        std::move(listener_key), io_context);
-    return inserted ? &it->second : nullptr;
+        std::move(listener_key), acceptor);
+    return inserted ? std::move(acceptor) : nullptr;
 }
 
-tcp::acceptor* TcpWorker::FindAcceptor(const std::string& listener_key) noexcept {
+TcpWorker::AcceptorPtr TcpWorker::FindAcceptor(
+    const std::string& listener_key) noexcept {
     auto it = impl_->acceptors.find(listener_key);
-    return it == impl_->acceptors.end() ? nullptr : &it->second;
+    return it == impl_->acceptors.end() ? nullptr : it->second;
 }
 
-const tcp::acceptor* TcpWorker::FindAcceptor(const std::string& listener_key) const noexcept {
+std::shared_ptr<const tcp::acceptor> TcpWorker::FindAcceptor(
+    const std::string& listener_key) const noexcept {
     auto it = impl_->acceptors.find(listener_key);
-    return it == impl_->acceptors.end() ? nullptr : &it->second;
+    return it == impl_->acceptors.end() ? nullptr : it->second;
+}
+
+bool TcpWorker::OwnsAcceptor(
+    const std::string& listener_key,
+    const tcp::acceptor* acceptor) const noexcept {
+    auto it = impl_->acceptors.find(listener_key);
+    return acceptor && it != impl_->acceptors.end() &&
+        it->second.get() == acceptor;
 }
 
 std::vector<std::string> TcpWorker::ListenerKeys() const {
@@ -63,10 +75,12 @@ void TcpWorker::CloseAcceptor(const std::string& listener_key) noexcept {
         return;
     }
 
-    IoErrorCode ec;
-    it->second.close(ec);
+    auto acceptor = std::move(it->second);
     impl_->acceptors.erase(it);
     MaybeShrinkHashContainer(impl_->acceptors, 8);
+
+    IoErrorCode ec;
+    acceptor->close(ec);
 }
 
 }  // namespace acpp::proxyman::inbound

@@ -19,6 +19,10 @@ namespace acpp::proxyman::inbound {
 // ============================================================================
 class TcpWorker final {
 public:
+    // Handles remain Worker-local; accept loops retain them only until a
+    // close/cancel completion has resumed and observed owner-map retirement.
+    using AcceptorPtr = std::shared_ptr<tcp::acceptor>;
+
     explicit TcpWorker(std::string tag);
     ~TcpWorker() noexcept;
 
@@ -33,10 +37,15 @@ public:
 
     // listener_key is unique for the lifetime of its AcceptLoop. Duplicate
     // creation is rejected instead of replacing the object at a stable address.
-    [[nodiscard]] tcp::acceptor* CreateAcceptor(std::string listener_key,
-                                                net::io_context& io_context);
-    [[nodiscard]] tcp::acceptor* FindAcceptor(const std::string& listener_key) noexcept;
-    [[nodiscard]] const tcp::acceptor* FindAcceptor(const std::string& listener_key) const noexcept;
+    [[nodiscard]] AcceptorPtr CreateAcceptor(std::string listener_key,
+                                             net::io_context& io_context);
+    [[nodiscard]] AcceptorPtr FindAcceptor(
+        const std::string& listener_key) noexcept;
+    [[nodiscard]] std::shared_ptr<const tcp::acceptor> FindAcceptor(
+        const std::string& listener_key) const noexcept;
+    [[nodiscard]] bool OwnsAcceptor(
+        const std::string& listener_key,
+        const tcp::acceptor* acceptor) const noexcept;
     [[nodiscard]] std::vector<std::string> ListenerKeys() const;
     void CloseAcceptor(const std::string& listener_key) noexcept;
 

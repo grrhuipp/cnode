@@ -469,8 +469,9 @@ int main() {
             std::chrono::steady_clock::now())) {
         Fail("UDP session ID collision blocked a different authenticated owner");
     }
-    auto* attached = worker.AttachSocket("stable-socket", std::move(second));
+    auto attached = worker.AttachSocket("stable-socket", std::move(second));
     if (!attached || worker.FindSocket("stable-socket") != attached ||
+        !worker.OwnsSocket("stable-socket", attached.get()) ||
         !attached->is_open()) {
         Fail("failed to attach initial UDP socket");
     }
@@ -539,9 +540,24 @@ int main() {
 
     owner_session->Close();
 
+    bool attached_wait_cancelled = false;
+    attached->async_wait(
+        acpp::udp::socket::wait_read,
+        [&](acpp::IoErrorCode wait_ec) {
+            attached_wait_cancelled =
+                wait_ec == acpp::io_error::operation_aborted;
+        });
     worker.CloseSocket("stable-socket");
     if (worker.FindSocket("stable-socket") != nullptr) {
         Fail("closed UDP socket remained registered");
+    }
+    if (!attached || attached->is_open() ||
+        worker.OwnsSocket("stable-socket", attached.get())) {
+        Fail("retired UDP socket lifetime handle did not observe closure");
+    }
+    io_context.run();
+    if (!attached_wait_cancelled) {
+        Fail("retired UDP socket did not deliver cancellation to its lifetime handle");
     }
 
     return 0;

@@ -88,7 +88,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         Worker& worker,
         std::string listener_key,
         std::string tag,
-        tcp::acceptor* acceptor,
+        proxyman::inbound::TcpWorker::AcceptorPtr acceptor,
         ListenerSlot* slot);
 
     net::awaitable<void> ProcessReceivedConnection(
@@ -101,6 +101,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         Worker& worker,
         std::string socket_key,
         std::string tag,
+        proxyman::inbound::UdpWorker::SocketPtr sock,
         ListenerSlot* listener_slot);
 
     [[nodiscard]] proxyman::inbound::UdpWorker*
@@ -124,7 +125,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
                          buf::BufferGuard payload,
                          uint32_t worker_id);
     void StartUdpReplySend(const std::string& tag,
-                           udp::socket* sock,
+                           proxyman::inbound::UdpWorker::SocketPtr sock,
                            uint32_t worker_id);
 };
 
@@ -374,7 +375,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
 
         tcp::endpoint ep(addr, binding.port);
         const std::string listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
-        tcp::acceptor* candidate_acceptor =
+        auto candidate_acceptor =
             replacement_worker->CreateAcceptor(listener_key, worker.runtime_->io_context);
         if (!candidate_acceptor) {
             LOG_ERROR("Worker[{}]: failed to create TCP acceptor tag={} key={}",
@@ -466,7 +467,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     listener_slot.tcp_binding = std::move(committed_binding);
 
     for (const auto& listener_key : prepared_listener_keys) {
-        auto* acceptor = listener_slot.tcp_worker->FindAcceptor(listener_key);
+        auto acceptor = listener_slot.tcp_worker->FindAcceptor(listener_key);
         if (!acceptor) {
             continue;
         }
@@ -625,13 +626,13 @@ void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
                                             buf::MultiBuffer payload,
                                             uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
-    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
-    if (current_sock != sock || !sock || !sock->is_open() || payload.empty()) {
+    if (!udp_worker || !udp_worker->OwnsSocket(tag, sock) ||
+        !sock->is_open() || payload.empty()) {
         return;
     }
 
     if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
-        StartUdpReplySend(tag, sock, worker_id);
+        StartUdpReplySend(tag, udp_worker->FindSocket(tag), worker_id);
     }
 }
 
@@ -641,23 +642,22 @@ void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
                                             buf::BufferGuard payload,
                                             uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
-    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
-    if (current_sock != sock || !sock || !sock->is_open() || !payload || payload->IsEmpty()) {
+    if (!udp_worker || !udp_worker->OwnsSocket(tag, sock) ||
+        !sock->is_open() || !payload || payload->IsEmpty()) {
         return;
     }
 
     if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
-        StartUdpReplySend(tag, sock, worker_id);
+        StartUdpReplySend(tag, udp_worker->FindSocket(tag), worker_id);
     }
 }
 
 void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
-                                              udp::socket* sock,
+                                              proxyman::inbound::UdpWorker::SocketPtr sock,
                                               uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
-    auto* current_sock = udp_worker ? udp_worker->FindSocket(tag) : nullptr;
-    if (current_sock != sock ||
-        !sock || !sock->is_open()) {
+    if (!udp_worker || !sock ||
+        !udp_worker->OwnsSocket(tag, sock.get()) || !sock->is_open()) {
         return;
     }
 
@@ -686,7 +686,7 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
             }
 
             const bool current_sock =
-                udp_worker->FindSocket(tag) == sock;
+                udp_worker->OwnsSocket(tag, sock.get());
 
             const bool has_pending =
                 udp_worker->CompleteReplySend(tag, *packet);
@@ -704,20 +704,21 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
     Worker& worker,
     std::string listener_key,
     std::string tag,
-    tcp::acceptor* acceptor,
+    proxyman::inbound::TcpWorker::AcceptorPtr acceptor,
     ListenerSlot* slot) {
-    while (true) {
-        if (!acceptor) co_return;
+    const auto owns_acceptor = [&]() {
+        return acceptor && slot && slot->tcp_worker &&
+            slot->tcp_worker->OwnsAcceptor(listener_key, acceptor.get());
+    };
+    while (owns_acceptor()) {
 
         auto [ec, socket] = co_await acceptor->async_accept(
             net::as_tuple(net::use_awaitable));
 
+        if (!owns_acceptor()) co_return;
+
         if (ec == io_error::operation_aborted) co_return;
         if (ec) {
-            if (!slot || !slot->tcp_worker ||
-                slot->tcp_worker->FindAcceptor(listener_key) != acceptor) {
-                co_return;
-            }
             LOG_WARN("Worker[{}]: accept error tag={}: {}", worker.id_, tag, ec.message());
             const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
                 ? kAcceptResourceBackoff
@@ -1212,7 +1213,7 @@ bool Worker::ListenerState::StartUdpListening(
         }
 
         const std::string socket_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
-        udp::socket* bound_sock =
+        auto bound_sock =
             replacement_worker->AttachSocket(socket_key, std::move(candidate_sock));
         if (!bound_sock) {
             LOG_ERROR("Worker[{}]: failed to attach UDP socket tag={} key={}",
@@ -1249,12 +1250,14 @@ bool Worker::ListenerState::StartUdpListening(
     listener_slot.udp_binding = std::move(committed_binding);
 
     for (const auto& socket_key : prepared_socket_keys) {
-        auto* bound_sock = worker_it->second->FindSocket(socket_key);
+        auto bound_sock = worker_it->second->FindSocket(socket_key);
         if (!bound_sock) {
             continue;
         }
         net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      UdpReceiveLoop(worker, socket_key, binding.tag, &listener_slot),
+                      UdpReceiveLoop(
+                          worker, socket_key, binding.tag,
+                          std::move(bound_sock), &listener_slot),
                       [](std::exception_ptr) {});
 
         LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
@@ -1277,24 +1280,28 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
     std::string socket_key,
     std::string tag,
+    proxyman::inbound::UdpWorker::SocketPtr sock,
     ListenerSlot* listener_slot) {
     const auto runtime_snapshot = worker.runtime_->Snapshot();
     const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
 
-    auto* udp_worker = FindUdpWorkerBySocketKey(socket_key);
-    if (!udp_worker) {
-        co_return;
-    }
-    udp::socket* sock = udp_worker->FindSocket(socket_key);
-    if (!sock) {
-        co_return;
-    }
+    const auto find_current_worker = [&]() -> proxyman::inbound::UdpWorker* {
+        auto* current = FindUdpWorkerBySocketKey(socket_key);
+        return current && current->OwnsSocket(socket_key, sock.get())
+            ? current
+            : nullptr;
+    };
 
     while (true) {
+        auto* udp_worker = find_current_worker();
+        if (!udp_worker || !sock) co_return;
+
         udp::endpoint client_ep;
         auto [wait_ec] = co_await sock->async_wait(
             udp::socket::wait_read,
             net::as_tuple(net::use_awaitable));
+        udp_worker = find_current_worker();
+        if (!udp_worker) co_return;
         if (wait_ec == io_error::operation_aborted) co_return;
         if (wait_ec) {
             continue;
@@ -1316,6 +1323,8 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             storage, client_ep,
             net::as_tuple(net::use_awaitable));
 
+        udp_worker = find_current_worker();
+        if (!udp_worker) co_return;
         if (ec == io_error::operation_aborted) co_return;
         if (ec || n == 0) {
             continue;
@@ -1333,7 +1342,7 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
 
         udp_worker->ProcessDatagram(proxyman::inbound::UdpDatagramContext{
             .socket_key = socket_key,
-            .sock = sock,
+            .sock = sock.get(),
             .client_endpoint = client_ep,
             .payload = received,
             .receiver = listener,

@@ -3,6 +3,10 @@ if(NOT DEFINED SOURCE_DIR)
 endif()
 
 file(READ "${SOURCE_DIR}/src/app/worker.cpp" WORKER_SOURCE)
+file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/tcp_worker.hpp"
+    TCP_WORKER_HEADER_SOURCE)
+file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp"
+    UDP_WORKER_HEADER_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp" BOOTSTRAP_RUNTIME_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp" BOOTSTRAP_INBOUNDS_SOURCE)
 
@@ -179,4 +183,22 @@ if(TCP_BIND_FAILURE_POS EQUAL -1 OR TCP_REPLACE_COMMIT_POS EQUAL -1 OR
    NOT TCP_WORKER_COMMIT_POS LESS TCP_ACCEPT_START_POS)
     message(FATAL_ERROR
         "TCP listener replacement must listen before retiring the live worker and start accept loops only after commit")
+endif()
+
+if(NOT TCP_WORKER_HEADER_SOURCE MATCHES
+       "using AcceptorPtr = std::shared_ptr<tcp::acceptor>" OR
+   NOT UDP_WORKER_HEADER_SOURCE MATCHES
+       "using SocketPtr = std::shared_ptr<udp::socket>" OR
+   NOT WORKER_SOURCE MATCHES
+       "AcceptLoop[^(]*[(][\r\n a-zA-Z0-9_&:<>*,]*AcceptorPtr acceptor" OR
+   NOT WORKER_SOURCE MATCHES
+       "UdpReceiveLoop[^(]*[(][\r\n a-zA-Z0-9_&:<>*,]*SocketPtr sock" OR
+   NOT WORKER_SOURCE MATCHES
+       "while [(]owns_acceptor[(][)][)]" OR
+   NOT WORKER_SOURCE MATCHES
+       "if [(][!]owns_acceptor[(][)][)] co_return" OR
+   NOT WORKER_SOURCE MATCHES
+       "udp_worker = find_current_worker[(][)][;][\r\n ]+if [(][!]udp_worker[)] co_return")
+    message(FATAL_ERROR
+        "listener loops must retain Worker-local socket ownership across asynchronous suspension")
 endif()

@@ -57,19 +57,36 @@ int main() {
 
     acpp::net::io_context io_context;
     acpp::proxyman::inbound::TcpWorker worker("test-inbound");
-    auto* acceptor = worker.CreateAcceptor("stable-listener", io_context);
-    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor) return 7;
+    auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
+    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor ||
+        !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
 
     acpp::IoErrorCode ec;
     acceptor->open(acpp::tcp::v4(), ec);
     if (ec || !acceptor->is_open()) return 8;
+    acceptor->bind(
+        acpp::tcp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
+    if (ec) return 9;
+    acceptor->listen(acpp::net::socket_base::max_listen_connections, ec);
+    if (ec) return 10;
 
-    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 9;
+    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 11;
     if (worker.FindAcceptor("stable-listener") != acceptor ||
-        !acceptor->is_open()) return 10;
+        !acceptor->is_open()) return 12;
+
+    bool accept_cancelled = false;
+    acceptor->async_accept(
+        [&](acpp::IoErrorCode accept_ec, acpp::tcp::socket) {
+            accept_cancelled =
+                accept_ec == acpp::io_error::operation_aborted;
+        });
 
     worker.CloseAcceptor("stable-listener");
-    if (worker.FindAcceptor("stable-listener") != nullptr) return 11;
+    if (worker.FindAcceptor("stable-listener") != nullptr) return 13;
+    if (!acceptor || acceptor->is_open() ||
+        worker.OwnsAcceptor("stable-listener", acceptor.get())) return 14;
+    io_context.run();
+    if (!accept_cancelled) return 15;
 
     return 0;
 }

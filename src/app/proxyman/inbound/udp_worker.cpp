@@ -723,25 +723,35 @@ void UdpWorker::CleanupAllClientSessions() noexcept {
     }
 }
 
-udp::socket* UdpWorker::AttachSocket(
+UdpWorker::SocketPtr UdpWorker::AttachSocket(
     const std::string& socket_key,
     SocketPtr socket) {
     if (!socket) {
         return nullptr;
     }
     auto [it, inserted] = impl_->udp_sockets.try_emplace(
-        socket_key, std::move(socket));
-    return inserted ? it->second.get() : nullptr;
+        socket_key, socket);
+    return inserted ? std::move(socket) : nullptr;
 }
 
-udp::socket* UdpWorker::FindSocket(const std::string& socket_key) noexcept {
+UdpWorker::SocketPtr UdpWorker::FindSocket(
+    const std::string& socket_key) noexcept {
     auto it = impl_->udp_sockets.find(socket_key);
-    return it == impl_->udp_sockets.end() ? nullptr : it->second.get();
+    return it == impl_->udp_sockets.end() ? nullptr : it->second;
 }
 
-const udp::socket* UdpWorker::FindSocket(const std::string& socket_key) const noexcept {
+std::shared_ptr<const udp::socket> UdpWorker::FindSocket(
+    const std::string& socket_key) const noexcept {
     auto it = impl_->udp_sockets.find(socket_key);
-    return it == impl_->udp_sockets.end() ? nullptr : it->second.get();
+    return it == impl_->udp_sockets.end() ? nullptr : it->second;
+}
+
+bool UdpWorker::OwnsSocket(
+    const std::string& socket_key,
+    const udp::socket* socket) const noexcept {
+    auto it = impl_->udp_sockets.find(socket_key);
+    return socket && it != impl_->udp_sockets.end() &&
+        it->second.get() == socket;
 }
 
 std::vector<std::string> UdpWorker::SocketKeys() const {
@@ -763,11 +773,13 @@ void UdpWorker::CloseSocket(const std::string& socket_key) noexcept {
         return;
     }
 
-    IoErrorCode ec;
-    sock_it->second->cancel(ec);
-    sock_it->second->close(ec);
+    auto socket = std::move(sock_it->second);
     impl_->udp_sockets.erase(sock_it);
     MaybeShrinkHashContainer(impl_->udp_sockets, 8);
+
+    IoErrorCode ec;
+    socket->cancel(ec);
+    socket->close(ec);
 }
 
 void UdpWorker::CloseAllSockets() noexcept {
