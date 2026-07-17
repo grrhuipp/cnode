@@ -88,3 +88,17 @@ if(SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "logical request failures must be reported; only container sessions may be suppressed")
 endif()
+
+string(FIND "${SESSION_SOURCE}"
+       "Reporter::Instance().Submit(BuildAccessLogEvent"
+       SESSION_SUBMIT_POSITION)
+string(FIND "${SESSION_SOURCE}"
+       "ctx_->access_event_submitted = true"
+       SESSION_SUBMITTED_POSITION)
+if(SESSION_SUBMIT_POSITION EQUAL -1 OR SESSION_SUBMITTED_POSITION EQUAL -1 OR
+   NOT SESSION_SUBMIT_POSITION LESS SESSION_SUBMITTED_POSITION OR
+   NOT SESSION_SOURCE MATCHES
+       "if [(]accesslog::Reporter::Instance[(][)][.]Submit")
+    message(FATAL_ERROR
+        "an access event may become idempotent only after reporter admission")
+endif()

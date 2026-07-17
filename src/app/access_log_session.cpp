@@ -11,10 +11,11 @@ AccessLogSession::~AccessLogSession() noexcept {
         return;
     }
 
-    ctx_->access_event_submitted = true;
     try {
-        (void)accesslog::Reporter::Instance().Submit(BuildAccessLogEvent(
-            *ctx_, close_side_, bytes_up_, bytes_down_, error_code_));
+        if (accesslog::Reporter::Instance().Submit(BuildAccessLogEvent(
+                *ctx_, close_side_, bytes_up_, bytes_down_, error_code_))) {
+            ctx_->access_event_submitted = true;
+        }
     } catch (...) {
         // Reporting is fail-open and must never unwind into the proxy path.
     }
