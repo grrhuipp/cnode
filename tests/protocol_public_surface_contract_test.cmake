@@ -112,6 +112,15 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "XHTTP packet session registry keys must include the owning io_context")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kXHttpMaxPacketSessions = 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]session->AcceptingInput[(][)][)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]sessions[.]size[(][)] >= kXHttpMaxPacketSessions[)]")
+    message(FATAL_ERROR
+        "XHTTP packet session registry must reject retired sessions and enforce a hard cap")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")

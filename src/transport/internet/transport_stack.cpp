@@ -38,7 +38,7 @@ namespace acpp {
 namespace {
 
 constexpr size_t kTlsContextCacheMaxEntries = 16;
-constexpr size_t kXHttpPacketSessionPruneThreshold = 1024;
+constexpr size_t kXHttpMaxPacketSessions = 1024;
 constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
 
 using TlsContextMap =
@@ -905,6 +905,10 @@ public:
         Wake();
     }
 
+    [[nodiscard]] bool AcceptingInput() const noexcept {
+        return !closed_ && !input_closed_;
+    }
+
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) {
         auto* out = static_cast<uint8_t*>(buffer.data());
         const size_t capacity = buffer.size();
@@ -1096,7 +1100,7 @@ struct XHttpRequestMeta {
         detail::XHttpPacketSessionKeyEq>;
     thread_local SessionMap sessions;
 
-    if (sessions.size() >= kXHttpPacketSessionPruneThreshold) {
+    if (sessions.size() >= kXHttpMaxPacketSessions) {
         for (auto it = sessions.begin(); it != sessions.end();) {
             if (it->second.expired()) {
                 it = sessions.erase(it);
@@ -1110,11 +1114,16 @@ struct XHttpRequestMeta {
     auto it = sessions.find(lookup_key);
     if (it != sessions.end()) {
         if (auto session = it->second.lock()) {
-            return session;
+            if (session->AcceptingInput()) {
+                return session;
+            }
         }
         sessions.erase(it);
     }
     if (!create) {
+        return nullptr;
+    }
+    if (sessions.size() >= kXHttpMaxPacketSessions) {
         return nullptr;
     }
     auto session = std::make_shared<XHttpPacketUpSession>(io_context);
