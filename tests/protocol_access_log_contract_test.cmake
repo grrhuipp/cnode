@@ -95,6 +95,18 @@ if(MUX_RELAY_SOURCE MATCHES
         "new Mux UDP requests without a target must enter dispatcher validation and access logging")
 endif()
 
+string(REGEX MATCHALL
+       "ReportDispatchAdmissionFailure[(]sub_ptr->ctx[)]"
+       MUX_ADMISSION_FAILURE_REPORTS
+       "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_ADMISSION_FAILURE_REPORTS MUX_ADMISSION_FAILURE_REPORT_COUNT)
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT MUX_ADMISSION_FAILURE_REPORT_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "Mux TCP and UDP dispatch admission failures must reach access logging")
+endif()
+
 if(UDP_HANDLER_SOURCE MATCHES
        "optional<UdpDecodeResult>" OR
    NOT UDP_HANDLER_SOURCE MATCHES
