@@ -123,6 +123,19 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "H1 XHTTP packet-up must require one unambiguous valid body framing")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"incomplete HTTP/1 chunk-size line\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"invalid HTTP/1 chunk-size line\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"incomplete HTTP/1 chunk trailers\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"truncated HTTP/1 chunk payload\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"invalid HTTP/1 chunk terminator\"[)]")
+    message(FATAL_ERROR
+        "malformed HTTP/1 chunks must fail the request instead of becoming normal EOF")
+endif()
 if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
        "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
    NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES

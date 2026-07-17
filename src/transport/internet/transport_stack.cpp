@@ -701,10 +701,7 @@ private:
                 break;
             }
             if (ch == ' ' || ch == '\t') {
-                if (any) {
-                    continue;
-                }
-                continue;
+                return std::nullopt;
             }
             const int hex = HexValue(static_cast<uint8_t>(ch));
             if (hex < 0) {
@@ -786,6 +783,11 @@ private:
         co_return false;
     }
 
+    [[noreturn]] void FailChunkedRead(const char* what) {
+        read_closed_ = true;
+        throw IoSystemError(io_error::invalid_argument, what);
+    }
+
     net::awaitable<size_t> ReadChunked(net::mutable_buffer buffer) {
         if (read_closed_) {
             co_return 0;
@@ -804,16 +806,16 @@ private:
                 }
                 std::string line;
                 if (!co_await ReadLine(line)) {
-                    read_closed_ = true;
-                    co_return copied;
+                    FailChunkedRead("incomplete HTTP/1 chunk-size line");
                 }
                 auto chunk_size = ParseChunkSize(line);
                 if (!chunk_size) {
-                    read_closed_ = true;
-                    co_return copied;
+                    FailChunkedRead("invalid HTTP/1 chunk-size line");
                 }
                 if (*chunk_size == 0) {
-                    (void)co_await ConsumeTrailers();
+                    if (!co_await ConsumeTrailers()) {
+                        FailChunkedRead("incomplete HTTP/1 chunk trailers");
+                    }
                     read_closed_ = true;
                     co_return copied;
                 }
@@ -823,8 +825,7 @@ private:
             const size_t want = std::min(capacity - copied, chunk_remaining_);
             const size_t n = co_await ReadRaw(net::buffer(out + copied, want));
             if (n == 0) {
-                read_closed_ = true;
-                co_return copied;
+                FailChunkedRead("truncated HTTP/1 chunk payload");
             }
             copied += n;
             chunk_remaining_ -= n;
@@ -833,8 +834,7 @@ private:
                 std::array<uint8_t, 2> crlf{};
                 if (!co_await ReadExact(crlf.data(), crlf.size()) ||
                     crlf[0] != '\r' || crlf[1] != '\n') {
-                    read_closed_ = true;
-                    co_return copied;
+                    FailChunkedRead("invalid HTTP/1 chunk terminator");
                 }
                 if (copied > 0) {
                     co_return copied;
