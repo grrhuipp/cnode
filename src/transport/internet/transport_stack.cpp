@@ -1,6 +1,7 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "async_write_gate.hpp"
 #include "http2_settings.hpp"
+#include "http_path_match.hpp"
 #include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
 #include "xhttp_packet_queue.hpp"
@@ -1090,7 +1091,7 @@ struct XHttpRequestMeta {
         }
         return meta;
     }
-    if (!actual.starts_with(expected)) {
+    if (!transport::internet::detail::PathPrefixMatchesSegment(expected, actual)) {
         return meta;
     }
 
@@ -4269,12 +4270,9 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
 
 [[nodiscard]] bool HttpPathMatches(std::string_view configured,
                                    std::string_view actual) {
-    const std::string_view expected = EffectivePath(configured);
-    actual = PathWithoutQuery(actual);
-    if (expected == "/") {
-        return actual.starts_with("/");
-    }
-    return actual.starts_with(expected);
+    return transport::internet::detail::PathPrefixMatchesSegment(
+        EffectivePath(configured),
+        actual);
 }
 
 [[nodiscard]] std::string BuildXHttpResponseHeaders(const HttpConfig& cfg,

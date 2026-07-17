@@ -1269,6 +1269,20 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_http2_initial_window_test
         COMMAND cnode_http2_initial_window_test)
 
+    add_executable(cnode_http_path_match_test
+        tests/http_path_match_test.cpp
+    )
+    target_include_directories(cnode_http_path_match_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_compile_options(cnode_http_path_match_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_http_path_match_test
+        COMMAND cnode_http_path_match_test)
+
     add_executable(cnode_json_unsigned_test
         tests/json_unsigned_test.cpp
         src/infra/json_unsigned.cpp

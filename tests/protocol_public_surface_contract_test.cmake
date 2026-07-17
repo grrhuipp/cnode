@@ -100,6 +100,18 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/transport/internet/xhttp_upload_stream_slot.hpp"
     XHTTP_UPLOAD_SLOT_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/http_path_match.hpp"
+    HTTP_PATH_MATCH_SOURCE)
+if(NOT HTTP_PATH_MATCH_SOURCE MATCHES
+       "actual[[]expected[.]size[(][)][]] == '/'" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "detail::PathPrefixMatchesSegment[(]expected, actual[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "detail::PathPrefixMatchesSegment[(][\r\n\t ]*EffectivePath[(]configured[)]")
+    message(FATAL_ERROR
+        "HTTP and XHTTP path prefixes must share segment-boundary matching")
+endif()
 if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
        "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
    NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
