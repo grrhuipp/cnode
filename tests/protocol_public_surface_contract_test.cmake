@@ -190,6 +190,15 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "HTTP/2 server streams must be unique, ordered, client-owned, and capacity bounded")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxDynamicTableSize = 4096" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]size > kHpackMaxDynamicTableSize[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(][!]size [|][|] [!]ResizeDynamic[(][*]size[)][)]")
+    message(FATAL_ERROR
+        "HPACK peer table size updates must not exceed the local decoder limit")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")

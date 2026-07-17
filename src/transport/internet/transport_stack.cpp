@@ -1327,6 +1327,7 @@ constexpr std::string_view kHttp2ClientPreface =
 constexpr size_t kHttp2FrameHeaderSize = 9;
 constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
 constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
+constexpr uint32_t kHpackMaxDynamicTableSize = 4096;
 constexpr uint32_t kGrpcInitialWindow = 4 * 1024 * 1024;
 
 enum class H2FrameType : uint8_t {
@@ -1990,10 +1991,9 @@ public:
             }
             if ((first & 0x20) != 0) {
                 auto size = ReadInteger(block, offset, 5);
-                if (!size) {
+                if (!size || !ResizeDynamic(*size)) {
                     return std::nullopt;
                 }
-                ResizeDynamic(*size);
                 continue;
             }
             auto field = ReadLiteral(block, offset, 4);
@@ -2294,9 +2294,13 @@ private:
         EvictDynamic();
     }
 
-    void ResizeDynamic(uint32_t size) {
+    [[nodiscard]] bool ResizeDynamic(uint32_t size) {
+        if (size > kHpackMaxDynamicTableSize) {
+            return false;
+        }
         dynamic_max_size_ = size;
         EvictDynamic();
+        return true;
     }
 
     void EvictDynamic() {
@@ -2309,7 +2313,7 @@ private:
 
     DynamicTable dynamic_table_;
     size_t dynamic_size_ = 0;
-    size_t dynamic_max_size_ = 4096;
+    size_t dynamic_max_size_ = kHpackMaxDynamicTableSize;
 };
 
 struct H2RequestHeaders {
