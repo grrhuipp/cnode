@@ -44,6 +44,12 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES "active_dispatches_")
     message(FATAL_ERROR
         "AnyTLS demux must own explicit child dispatch lifetime state")
 endif()
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate_" OR
+   ANYTLS_INBOUND_SOURCE MATCHES "write_busy_|write_signal_")
+    message(FATAL_ERROR
+        "AnyTLS inbound writes must use the shared cancellation-broadcast gate")
+endif()
 
 set(ANYTLS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp")
@@ -55,6 +61,15 @@ endif()
 if(ANYTLS_OUTBOUND_SOURCE MATCHES "cleanup_logical_stream")
     message(FATAL_ERROR
         "AnyTLS outbound must not restore manual logical stream cleanup")
+endif()
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "CloseAll[(]ok[.]error[(][)][)]" OR
+   ANYTLS_OUTBOUND_SOURCE MATCHES
+       "write_busy|write_signal|atomic_bool|closed[.](load|store)")
+    message(FATAL_ERROR
+        "AnyTLS outbound writes must broadcast terminal failures through the shared gate")
 endif()
 
 set(TRANSPORT_STACK

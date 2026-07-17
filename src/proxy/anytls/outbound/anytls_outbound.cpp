@@ -3,6 +3,7 @@
 
 #include "../anytls_codec.hpp"
 #include "../../uot/uot.hpp"
+#include "../../../transport/internet/async_write_gate.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
@@ -23,7 +24,6 @@
 #include <asio/experimental/awaitable_operators.hpp>
 #include <array>
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -244,7 +244,7 @@ struct Handler::ClientSession {
     ClientSession(net::io_context& io_context, std::unique_ptr<AsyncStream> s)
         : io_context_(io_context)
         , stream(std::move(s))
-        , write_signal(io_context, 1) {}
+        , write_gate(io_context) {}
 
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream;
@@ -255,7 +255,7 @@ struct Handler::ClientSession {
     bool settings_sent = false;
     uint8_t peer_version = 0;
     std::chrono::steady_clock::time_point idle_since{};
-    net::experimental::channel<void(IoErrorCode)> write_signal;
+    transport::internet::AsyncWriteGate write_gate;
     acpp::memory::ThreadLocalUnorderedMap<
         uint32_t,
         std::weak_ptr<LogicalStream>>
@@ -263,11 +263,10 @@ struct Handler::ClientSession {
     size_t active_streams = 0;
     bool in_idle_pool = false;
     bool read_loop_started = false;
-    bool write_busy = false;
-    std::atomic_bool closed = false;
+    bool closed = false;
 
     [[nodiscard]] bool Available() const noexcept {
-        return !closed.load() && stream && active_streams == 0;
+        return !closed && stream && active_streams == 0;
     }
 
     std::shared_ptr<LogicalStream> RegisterLogicalStream(
@@ -283,8 +282,9 @@ struct Handler::ClientSession {
     }
 
     void CloseAll(ErrorCode error) {
-        closed.store(true);
-        WakeWriter();
+        if (closed) return;
+        closed = true;
+        write_gate.Cancel();
         for (auto& [sid, weak] : logical_streams) {
             (void)sid;
             if (auto logical = weak.lock()) {
@@ -297,42 +297,12 @@ struct Handler::ClientSession {
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>> WaitWriteTurn() {
-        while (write_busy && !closed.load()) {
-            auto [ec] = co_await write_signal.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return std::unexpected(ErrorCode::CANCELLED);
-            }
-        }
-        if (closed.load() || !stream) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
-        }
-        write_busy = true;
-        co_return std::expected<void, ErrorCode>{};
-    }
-
-    void ReleaseWriteTurn() {
-        write_busy = false;
-        WakeWriter();
-    }
-
-    void WakeWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)write_signal.try_send(IoErrorCode{});
-    }
-
     net::awaitable<std::expected<void, ErrorCode>>
     WriteOpenPacket(uint32_t sid, memory::ByteVector packet) {
-        auto turn = co_await WaitWriteTurn();
-        if (!turn) {
-            co_return std::unexpected(turn.error());
+        auto write_lease = co_await write_gate.Acquire();
+        if (!write_lease || closed || !stream) {
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
         if (!settings_sent) {
             const auto settings = DefaultClientSettings();
@@ -357,7 +327,7 @@ struct Handler::ClientSession {
         auto ok = co_await WritePacketWithPadding(
             *stream, *scheme_snapshot, this_packet, std::move(packet));
         if (!ok) {
-            closed.store(true);
+            CloseAll(ok.error());
             co_return std::unexpected(ok.error());
         }
         settings_sent = true;
@@ -366,14 +336,11 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>>
     WritePayloadFrames(uint32_t sid, buf::MultiBuffer mb) {
-        auto turn = co_await WaitWriteTurn();
-        if (!turn) {
+        auto write_lease = co_await write_gate.Acquire();
+        if (!write_lease || closed || !stream) {
             mb.clear();
-            co_return std::unexpected(turn.error());
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
         auto scheme_snapshot = padding_scheme;
         const uint32_t this_packet =
@@ -381,7 +348,7 @@ struct Handler::ClientSession {
         auto ok = co_await WriteMultiBufferAsFramesWithPadding(
             *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
         if (!ok) {
-            closed.store(true);
+            CloseAll(ok.error());
             co_return std::unexpected(ok.error());
         }
         co_return std::expected<void, ErrorCode>{};
@@ -400,13 +367,10 @@ struct Handler::ClientSession {
             co_return std::expected<void, ErrorCode>{};
         }
 
-        auto turn = co_await WaitWriteTurn();
-        if (!turn) {
-            co_return std::unexpected(turn.error());
+        auto write_lease = co_await write_gate.Acquire();
+        if (!write_lease || closed || !stream) {
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
         auto scheme_snapshot = padding_scheme;
         const uint32_t this_packet =
@@ -414,7 +378,7 @@ struct Handler::ClientSession {
         auto ok = co_await WriteBuffersAsFramesWithPadding(
             *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
         if (!ok) {
-            closed.store(true);
+            CloseAll(ok.error());
             co_return std::unexpected(ok.error());
         }
         co_return std::expected<void, ErrorCode>{};
@@ -422,24 +386,21 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-        auto turn = co_await WaitWriteTurn();
-        if (!turn) {
-            co_return std::unexpected(turn.error());
+        auto write_lease = co_await write_gate.Acquire();
+        if (!write_lease || closed || !stream) {
+            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) { static_cast<ClientSession*>(p)->ReleaseWriteTurn(); }};
 
         auto ok = co_await WriteFrame(*stream, cmd, sid, payload);
         if (!ok) {
-            closed.store(true);
+            CloseAll(ok.error());
             co_return std::unexpected(ok.error());
         }
         co_return std::expected<void, ErrorCode>{};
     }
 
     net::awaitable<void> ReadLoop() {
-        while (!closed.load() && stream) {
+        while (!closed && stream) {
             auto header = co_await ReadFrameHeader(*stream);
             if (!header) {
                 CloseAll(header.error());
@@ -621,7 +582,7 @@ struct Handler::LogicalStreamLease {
         if (error == ErrorCode::OK &&
             session->active_streams == 0 &&
             session->stream &&
-            !session->closed.load()) {
+            !session->closed) {
             session->idle_since = std::chrono::steady_clock::now();
             if (!session->in_idle_pool) {
                 try {
@@ -674,7 +635,7 @@ void Handler::PruneSessions() {
             CloseSession(session);
             continue;
         }
-        if (session->closed.load()) {
+        if (session->closed) {
             CloseSession(session);
             continue;
         }
@@ -691,7 +652,7 @@ void Handler::PruneSessions() {
     acpp::memory::ThreadLocalVector<std::shared_ptr<ClientSession>> idle;
     idle.reserve(idle_sessions_.size());
     for (auto& session : idle_sessions_) {
-        if (!session || session->closed.load() || !session->in_idle_pool || session->active_streams != 0) {
+        if (!session || session->closed || !session->in_idle_pool || session->active_streams != 0) {
             continue;
         }
         idle.push_back(session);

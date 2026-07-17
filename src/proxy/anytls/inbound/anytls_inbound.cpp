@@ -2,6 +2,7 @@
 
 #include "../anytls_codec.hpp"
 #include "../../uot/uot.hpp"
+#include "../../../transport/internet/async_write_gate.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -409,7 +410,7 @@ public:
         , timeouts_(timeouts)
         , padding_scheme_raw_(std::move(padding_scheme_raw))
         , padding_scheme_md5_(std::move(padding_scheme_md5))
-        , write_signal_(io_context, 1)
+        , write_gate_(io_context)
         , dispatch_completion_(io_context) {
         CopySessionContext(base_ctx, base_ctx_);
     }
@@ -425,54 +426,21 @@ public:
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return std::unexpected(ErrorCode::CANCELLED);
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) {
-                auto* self = static_cast<AnyTLSDemuxSession*>(p);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
     }
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                mb.clear();
-                co_return std::unexpected(ErrorCode::CANCELLED);
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             mb.clear();
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) {
-                auto* self = static_cast<AnyTLSDemuxSession*>(p);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await anytls::WriteMultiBufferAsFrameBatch(
             *stream_, cmd, sid, std::move(mb));
@@ -493,26 +461,10 @@ public:
             co_return std::expected<void, ErrorCode>{};
         }
 
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return std::unexpected(ErrorCode::CANCELLED);
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* p) {
-                auto* self = static_cast<AnyTLSDemuxSession*>(p);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         const PaddingScheme no_padding;
         co_return co_await anytls::WriteBuffersAsFramesWithPadding(
@@ -551,7 +503,7 @@ private:
             return;
         }
         cancelled_ = true;
-        WakeWriter();
+        write_gate_.Cancel();
         for (auto& [sid, sub] : streams_) {
             (void)sid;
             if (sub) {
@@ -562,13 +514,6 @@ private:
         if (stream_) {
             stream_->CloseAbortive();
         }
-    }
-
-    void WakeWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)write_signal_.try_send(IoErrorCode{});
     }
 
     net::awaitable<void> StartDispatch(
@@ -594,12 +539,11 @@ private:
     TimeoutsConfig timeouts_;
     std::string padding_scheme_raw_;
     std::string padding_scheme_md5_;
-    net::experimental::channel<void(IoErrorCode)> write_signal_;
+    transport::internet::AsyncWriteGate write_gate_;
     net::steady_timer dispatch_completion_;
     memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>
         streams_;
     memory::ThreadLocalUnorderedMap<uint32_t, StreamState> stream_states_;
-    bool write_busy_ = false;
     bool cancelled_ = false;
     bool handshake_done_ = false;
     size_t active_dispatches_ = 0;
