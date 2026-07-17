@@ -1358,7 +1358,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                         hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
 
                     uint16_t sid = hdr.session_id;
-                    if (!hdr.has_target || sub_sessions.contains(sid)) {
+                    if (sub_sessions.contains(sid)) {
                         mux::EncodeEndTo(write_frame, hdr.session_id, true);
                         (void)co_await write_frame_to_client(write_frame);
                         break;

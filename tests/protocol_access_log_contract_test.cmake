@@ -89,6 +89,12 @@ if(NOT MUX_RELAY_SOURCE MATCHES
         "Mux child access traffic must fail instead of counting dropped replies")
 endif()
 
+if(MUX_RELAY_SOURCE MATCHES
+       "if [(][!]hdr[.]has_target [|][|] sub_sessions[.]contains[(]sid[)][)]")
+    message(FATAL_ERROR
+        "new Mux UDP requests without a target must enter dispatcher validation and access logging")
+endif()
+
 if(UDP_HANDLER_SOURCE MATCHES
        "optional<UdpDecodeResult>" OR
    NOT UDP_HANDLER_SOURCE MATCHES
