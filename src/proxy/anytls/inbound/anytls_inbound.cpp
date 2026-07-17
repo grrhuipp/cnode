@@ -266,6 +266,8 @@ public:
         return sid_;
     }
 
+    session::Context ctx;
+
     net::awaitable<bool> PushInput(buf::MultiBuffer mb) {
         const size_t bytes = buf::TotalLen(mb);
         co_return co_await PushInput(std::move(mb), bytes);
@@ -503,6 +505,15 @@ private:
         return sub;
     }
 
+    void ReportStreamFailure(uint32_t sid, ErrorCode error) noexcept {
+        auto it = streams_.find(sid);
+        if (it == streams_.end() || !it->second) {
+            return;
+        }
+        app::AccessLogSession access_log(it->second->ctx);
+        access_log.Fail(error);
+    }
+
     void CancelAll() noexcept {
         if (cancelled_) {
             return;
@@ -598,8 +609,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
         co_return;
     }
 
-    session::Context ctx;
-    CopySessionContext(base_ctx_, ctx);
+    session::Context& ctx = sub->ctx;
     ctx.outbound.original_target = target;
     ctx.outbound.target = target;
     ctx.outbound.route_target = target;
@@ -705,8 +715,17 @@ void AnyTLSDemuxSession::SpawnDispatch(
     }
 
     const uint32_t sid = sub->Sid();
+    sub->ctx.conn_id = session::NewID(base_ctx_.worker_id);
+    sub->ctx.worker_id = base_ctx_.worker_id;
+    sub->ctx.inbound.access_source_ref =
+        base_ctx_.inbound.access_source_ref;
     ++active_dispatches_;
     try {
+        CopySessionContext(base_ctx_, sub->ctx);
+        sub->ctx.outbound.original_target = target;
+        sub->ctx.outbound.target = target;
+        sub->ctx.outbound.route_target = target;
+        sub->ctx.content.network = uot_version ? Network::UDP : Network::TCP;
         auto self = shared_from_this();
         net::co_spawn(
             io_context_.get_executor(),
@@ -733,16 +752,19 @@ void AnyTLSDemuxSession::SpawnDispatch(
                         "[AnyTLS] child dispatch failed sid={} error={}",
                         sid,
                         e.what());
+                    self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
                     self->RemoveStream(sid);
                 } catch (...) {
                     LOG_ACCESS_DEBUG(
                         "[AnyTLS] child dispatch failed sid={} error=unknown",
                         sid);
+                    self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
                     self->RemoveStream(sid);
                 }
             },
             net::detached);
     } catch (...) {
+        ReportStreamFailure(sid, ErrorCode::RESOURCE_EXHAUSTED);
         RemoveStream(sid);
         CompleteDispatch();
     }

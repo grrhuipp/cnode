@@ -235,6 +235,16 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES
 endif()
 
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "session::Context& ctx = sub->ctx" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "ReportStreamFailure[(]sid, ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "ReportStreamFailure[(]sid, ErrorCode::INTERNAL[)]")
+    message(FATAL_ERROR
+        "AnyTLS child context must exist before dispatch admission and report failures")
+endif()
+
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
        "AnyTLS substream cancelled" OR
    ANYTLS_INBOUND_SOURCE MATCHES
        "if [(]ec[)] [{][\r\n ]*co_return buf::MultiBuffer[{][}]" OR
