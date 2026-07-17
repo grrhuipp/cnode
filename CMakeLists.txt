@@ -1490,6 +1490,12 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_access_log_ack_test
         COMMAND cnode_access_log_ack_test)
 
+    add_test(
+        NAME cnode_protocol_access_log_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_access_log_contract_test.cmake)
+
     add_executable(cnode_access_log_target_ip_test
         tests/access_log_target_ip_test.cpp
         src/app/access_log_event.cpp

@@ -809,6 +809,7 @@ proxy::vless::outbound::Handler::Process(
     }
 
     bool prewrote_tcp_payload = false;
+    uint64_t prewritten_bytes = 0;
     const size_t first_payload_size = buf::TotalLen(first_payload);
     const size_t initial_payload_size = initial_payload.size();
     const bool can_batch_tcp_initial =
@@ -829,7 +830,7 @@ proxy::vless::outbound::Handler::Process(
         }
         first_payload.clear();
         prewrote_tcp_payload = true;
-        const uint64_t prewritten_bytes = first_payload_size + initial_payload_size;
+        prewritten_bytes = first_payload_size + initial_payload_size;
         if (prewritten_bytes > 0) {
             stats.AddBytesOut(prewritten_bytes);
             ctx.traffic.bytes_up = prewritten_bytes;
@@ -916,14 +917,19 @@ proxy::vless::outbound::Handler::Process(
             io_context, *inbound.reader, *inbound.writer, target_endpoint,
             ctx, stats, initial_payload, relay_config);
     }
+    RelayResult result;
     if (inbound.control) {
-        co_return co_await DoRelayLink(
+        result = co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer, *inbound.control,
             target_endpoint, ctx, stats, relay_config);
+    } else {
+        result = co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer,
+            target_endpoint, ctx, stats, relay_config);
     }
-    co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
-        target_endpoint, ctx, stats, relay_config);
+    result.bytes_up += prewritten_bytes;
+    ctx.traffic.bytes_up = result.bytes_up;
+    co_return result;
 }
 
 }  // namespace acpp
