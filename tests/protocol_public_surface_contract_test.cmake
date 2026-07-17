@@ -166,6 +166,17 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "HTTP/2 client streams must validate a successful response before accepting data or EOF")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]frame[.]length > kHttp2MaxFramePayload[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "first_fragment->size[(][)] > kHttp2MaxHeaderBlockSize" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHttp2MaxHeaderBlockSize - header_block[.]size[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "frame[.]length > 16 [*] 1024 [*] 1024")
+    message(FATAL_ERROR
+        "HTTP/2 frame and accumulated header blocks must remain protocol bounded")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")

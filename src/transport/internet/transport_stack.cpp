@@ -1396,7 +1396,7 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
     frame.flags = header[4];
     frame.stream_id = ReadU32(header.data() + 5) & 0x7fff'ffffu;
 
-    if (frame.length > 16 * 1024 * 1024) {
+    if (frame.length > kHttp2MaxFramePayload) {
         co_return std::nullopt;
     }
     frame.payload.resize(frame.length);
@@ -3227,7 +3227,8 @@ private:
         const uint8_t initial_flags = frame.flags;
         const uint32_t stream_id = frame.stream_id;
         auto first_fragment = H2HeaderBlockPayload(frame);
-        if (!first_fragment) {
+        if (!first_fragment ||
+            first_fragment->size() > kHttp2MaxHeaderBlockSize) {
             co_return false;
         }
         memory::ByteVector header_block(
@@ -3237,7 +3238,9 @@ private:
             auto cont = co_await ReadH2Frame(*stream_);
             if (!cont ||
                 cont->type != H2FrameType::CONTINUATION ||
-                cont->stream_id != stream_id) {
+                cont->stream_id != stream_id ||
+                cont->payload.size() >
+                    kHttp2MaxHeaderBlockSize - header_block.size()) {
                 co_return false;
             }
             header_block.insert(
