@@ -5,6 +5,18 @@ endif()
 file(READ
     "${SOURCE_DIR}/src/transport/internet/timeout_scheduler.cpp"
     SCHEDULER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/transport/internet/timeout_scheduler.hpp"
+    SCHEDULER_HEADER)
+
+if(NOT SCHEDULER_HEADER MATCHES "TimeoutScheduler[*] owner_" OR
+   SCHEDULER_HEADER MATCHES "const void[*] owner_" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "TimeoutToken::operator=[(]TimeoutToken&& other[)]" OR
+   NOT SCHEDULER_SOURCE MATCHES "owner_->Cancel[(][*]this[)]")
+    message(FATAL_ERROR
+        "timeout token move assignment must cancel a displaced owned event")
+endif()
 
 if(NOT SCHEDULER_SOURCE MATCHES
        "kHeapCompactStaleFloor = 1024" OR

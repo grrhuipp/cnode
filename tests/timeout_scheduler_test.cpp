@@ -237,6 +237,32 @@ int main() {
     sleep_scheduler.Cancel(sleep_probe);
     acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
 
+    acpp::net::io_context assignment_io_context;
+    auto& assignment_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(assignment_io_context);
+    bool displaced_token_ran = false;
+    bool replacement_token_ran = false;
+    auto assigned_token = assignment_scheduler.ScheduleAfter(1ms, [&]() {
+        displaced_token_ran = true;
+    });
+    assigned_token = assignment_scheduler.ScheduleAfter(1ms, [&]() {
+        replacement_token_ran = true;
+    });
+    std::this_thread::sleep_for(10ms);
+    assignment_io_context.run();
+    if (displaced_token_ran) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 15;
+    }
+    if (!replacement_token_ran) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 16;
+    }
+    assignment_scheduler.Cancel(assigned_token);
+    acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
+
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;
 }

@@ -13,6 +13,7 @@
 namespace acpp {
 
 class TimeoutSchedulerService;
+class TimeoutScheduler;
 
 // ============================================================================
 // TimeoutToken - 共享定时调度器句柄
@@ -27,13 +28,9 @@ public:
         : id_(std::exchange(other.id_, 0))
         , owner_(std::exchange(other.owner_, nullptr)) {}
 
-    TimeoutToken& operator=(TimeoutToken&& other) noexcept {
-        if (this != &other) {
-            id_ = std::exchange(other.id_, 0);
-            owner_ = std::exchange(other.owner_, nullptr);
-        }
-        return *this;
-    }
+    // Assignment replaces ownership: a still-live destination event is
+    // cancelled before the source handle is adopted.
+    TimeoutToken& operator=(TimeoutToken&& other);
 
     [[nodiscard]] bool Valid() const noexcept {
         return id_ != 0 && owner_ != nullptr;
@@ -47,7 +44,7 @@ private:
     friend class TimeoutScheduler;
 
     uint64_t id_ = 0;
-    const void* owner_ = nullptr;
+    TimeoutScheduler* owner_ = nullptr;
 };
 
 // ============================================================================

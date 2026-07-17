@@ -255,6 +255,17 @@ asio::execution_context::id TimeoutSchedulerService::id;
 TimeoutScheduler::TimeoutScheduler(net::io_context& io_context)
     : impl_(std::make_unique<Impl>(io_context)) {}
 
+TimeoutToken& TimeoutToken::operator=(TimeoutToken&& other) {
+    if (this != &other) {
+        if (Valid()) {
+            owner_->Cancel(*this);
+        }
+        id_ = std::exchange(other.id_, 0);
+        owner_ = std::exchange(other.owner_, nullptr);
+    }
+    return *this;
+}
+
 TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& io_context) {
     if (tl_cached_context == &io_context && tl_cached_scheduler) {
         return *tl_cached_scheduler;
@@ -297,7 +308,7 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
 
     TimeoutToken token;
     token.id_ = impl_->next_id++;
-    token.owner_ = impl_.get();
+    token.owner_ = this;
     const auto deadline = std::chrono::steady_clock::now() + delay;
 
     impl_->events.emplace(token.id_, Impl::Event{deadline, std::move(cb)});
@@ -309,18 +320,19 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
 
 void TimeoutScheduler::Cancel(TimeoutToken& token) {
     if (!token.Valid()) return;
-    if (token.owner_ != impl_.get()) {
+    if (token.owner_ != this) {
         return;
     }
 
+    const uint64_t id = token.id_;
+    token.Reset();
     if (!impl_->released) {
-        const bool removed = impl_->events.erase(token.id_) != 0;
+        const bool removed = impl_->events.erase(id) != 0;
         if (removed) {
             impl_->ReconcileTimerAfterCancellation();
             impl_->MaybeCompactHeap();
         }
     }
-    token.Reset();
 }
 
 ScheduledSleep::ScheduledSleep(net::io_context& io_context)
