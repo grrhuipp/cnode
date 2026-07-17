@@ -903,6 +903,17 @@ public:
         Wake();
     }
 
+    void CancelPendingOperations() noexcept {
+        if (closed_) {
+            return;
+        }
+        read_cancelled_ = true;
+        if (auto stream = stream_input_.Snapshot()) {
+            stream->Cancel();
+        }
+        Wake();
+    }
+
     [[nodiscard]] bool AcceptingInput() const noexcept {
         return !closed_ && !input_closed_;
     }
@@ -915,13 +926,21 @@ public:
         }
 
         while (true) {
+            ThrowIfReadCancelled();
             if (packet_queue_.HasReady()) {
                 const size_t n = packet_queue_.ConsumePrefixTo(
                     std::span<uint8_t>(out, capacity));
                 co_return n;
             }
             if (auto stream = stream_input_.Snapshot()) {
-                const size_t n = co_await stream->AsyncRead(buffer);
+                size_t n = 0;
+                try {
+                    n = co_await stream->AsyncRead(buffer);
+                } catch (...) {
+                    ThrowIfReadCancelled();
+                    throw;
+                }
+                ThrowIfReadCancelled();
                 if (n > 0) {
                     co_return n;
                 }
@@ -942,11 +961,19 @@ public:
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
         while (true) {
+            ThrowIfReadCancelled();
             if (packet_queue_.HasReady()) {
                 co_return packet_queue_.Pop();
             }
             if (auto stream = stream_input_.Snapshot()) {
-                buf::MultiBuffer mb = co_await stream->ReadMultiBuffer();
+                buf::MultiBuffer mb;
+                try {
+                    mb = co_await stream->ReadMultiBuffer();
+                } catch (...) {
+                    ThrowIfReadCancelled();
+                    throw;
+                }
+                ThrowIfReadCancelled();
                 if (buf::HasData(mb)) {
                     co_return mb;
                 }
@@ -966,6 +993,16 @@ public:
     }
 
 private:
+    void ThrowIfReadCancelled() {
+        if (!read_cancelled_) {
+            return;
+        }
+        read_cancelled_ = false;
+        throw IoSystemError(
+            io_error::operation_aborted,
+            "xhttp packet-up read cancelled");
+    }
+
     void Wake() noexcept {
         if (io_context_.stopped()) {
             return;
@@ -979,6 +1016,7 @@ private:
     detail::XHttpUploadStreamSlot stream_input_;
     bool input_closed_ = false;
     bool closed_ = false;
+    bool read_cancelled_ = false;
 };
 
 [[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
@@ -1202,7 +1240,7 @@ public:
 
     void Cancel() noexcept override {
         if (session_) {
-            session_->Close();
+            session_->CancelPendingOperations();
         }
         if (downlink_) {
             downlink_->Cancel();

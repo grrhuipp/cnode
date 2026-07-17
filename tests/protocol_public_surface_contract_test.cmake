@@ -131,6 +131,17 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "XHTTP packet session registry must reject retired sessions and enforce a hard cap")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "void CancelPendingOperations[(][)] noexcept" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "ThrowIfReadCancelled[(][)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "session_->CancelPendingOperations[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "void Cancel[(][)] noexcept override \\{[\r\n\t ]*if [(]session_[)] \\{[\r\n\t ]*session_->Close[(][)]")
+    message(FATAL_ERROR
+        "XHTTP packet stream cancellation must abort pending reads without closing the session")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")
