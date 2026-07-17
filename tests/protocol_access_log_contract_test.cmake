@@ -108,6 +108,18 @@ if(ANYTLS_INBOUND_SOURCE MATCHES "access_event_submitted" OR
         "AnyTLS must describe its control transport as MUX instead of controlling access logging")
 endif()
 
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "AnyTLS substream cancelled" OR
+   ANYTLS_INBOUND_SOURCE MATCHES
+       "if [(]ec[)] [{][\r\n ]*co_return buf::MultiBuffer[{][}]" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "payload[.]error[(][)] == ErrorCode::RESOURCE_EXHAUSTED" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "io_error::no_buffer_space")
+    message(FATAL_ERROR
+        "AnyTLS child termination must remain visible to access logging")
+endif()
+
 if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
        "if [(][!]prewrote_initial_payload && [!]initial_payload[.]empty[(][)][)]" OR
    NOT ANYTLS_OUTBOUND_SOURCE MATCHES

@@ -343,10 +343,14 @@ public:
             auto [ec] = co_await input_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
             if (ec) {
-                co_return buf::MultiBuffer{};
+                throw IoSystemError(
+                    io_error::operation_aborted,
+                    "AnyTLS substream input cancelled");
             }
         }
-        co_return buf::MultiBuffer{};
+        throw IoSystemError(
+            io_error::operation_aborted,
+            "AnyTLS substream cancelled");
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
@@ -553,7 +557,9 @@ net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     auto session = session_;
     if (!session) {
         mb.clear();
-        co_return;
+        throw IoSystemError(
+            io_error::operation_aborted,
+            "AnyTLS substream session unavailable");
     }
     auto ok = co_await session->WriteMultiBufferSerialized(anytls::kCmdPSH, sid_, std::move(mb));
     if (!ok) {
@@ -565,7 +571,9 @@ net::awaitable<void> AnyTLSSubStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     auto session = session_;
     if (!session) {
-        co_return;
+        throw IoSystemError(
+            io_error::operation_aborted,
+            "AnyTLS substream session unavailable");
     }
     auto ok = co_await session->WriteBuffersSerialized(anytls::kCmdPSH, sid_, buffers);
     if (!ok) {

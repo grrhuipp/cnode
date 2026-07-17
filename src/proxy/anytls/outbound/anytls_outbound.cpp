@@ -954,6 +954,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                 if (payload.error() == ErrorCode::OK) {
                     co_return buf::MultiBuffer{};
                 }
+                if (payload.error() == ErrorCode::RESOURCE_EXHAUSTED) {
+                    throw IoSystemError(
+                        io_error::no_buffer_space,
+                        "AnyTLS logical receive queue full");
+                }
+                if (payload.error() == ErrorCode::CANCELLED) {
+                    throw IoSystemError(
+                        io_error::operation_aborted,
+                        "AnyTLS logical stream cancelled");
+                }
                 throw IoSystemError(io_error::connection_reset, "AnyTLS logical stream closed");
             }
             if (is_udp) {
