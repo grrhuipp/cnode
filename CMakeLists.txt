@@ -1508,6 +1508,30 @@ if(CNODE_BUILD_TESTS)
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeout_scheduler_contract_test.cmake)
 
+    add_executable(cnode_async_write_gate_test
+        tests/async_write_gate_test.cpp
+    )
+    target_include_directories(cnode_async_write_gate_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/internet
+    )
+    target_link_libraries(cnode_async_write_gate_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_async_write_gate_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_async_write_gate_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_async_write_gate_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_async_write_gate_test
+        COMMAND cnode_async_write_gate_test)
+
     add_executable(cnode_node_transition_test
         tests/node_transition_test.cpp
         src/service/controller/node_transition.cpp

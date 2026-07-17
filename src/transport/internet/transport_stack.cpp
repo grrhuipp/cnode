@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "async_write_gate.hpp"
 #include "http2_settings.hpp"
 #include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
@@ -2892,7 +2893,7 @@ public:
         : io_context_(io_context)
         , stream_(std::move(stream))
         , stream_handler_(std::move(stream_handler))
-        , write_signal_(io_context, 1)
+        , write_gate_(io_context)
         , payload_codec_(payload_codec)
         , response_headers_(std::move(response_headers))
         , http_config_(std::move(http_config))
@@ -2946,7 +2947,7 @@ public:
             return;
         }
         cancelled_ = true;
-        WakeWriter();
+        write_gate_.Cancel();
         for (auto& [stream_id, sub] : streams_) {
             (void)stream_id;
             if (sub) {
@@ -2964,26 +2965,10 @@ public:
         uint8_t flags,
         uint32_t stream_id,
         std::span<const uint8_t> payload = {}) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return false;
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return false;
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* ptr) {
-                auto* self = static_cast<GrpcServerSession*>(ptr);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await WriteH2Frame(
             *stream_,
@@ -2996,26 +2981,10 @@ public:
     net::awaitable<bool> WriteGrpcMessageSerialized(
         uint32_t stream_id,
         std::span<const uint8_t> data) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return false;
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return false;
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* ptr) {
-                auto* self = static_cast<GrpcServerSession*>(ptr);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await WriteGrpcHunkMessage(*stream_, stream_id, data);
     }
@@ -3024,26 +2993,10 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> data,
         bool end_stream = false) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return false;
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return false;
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* ptr) {
-                auto* self = static_cast<GrpcServerSession*>(ptr);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await WriteH2DataPayload(
             *stream_,
@@ -3056,26 +3009,10 @@ public:
         uint32_t stream_id,
         std::span<const net::const_buffer> buffers,
         bool end_stream = false) {
-        while (write_busy_ && !cancelled_) {
-            auto [ec] = co_await write_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                co_return false;
-            }
-        }
-        if (cancelled_ || !stream_) {
+        auto write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
             co_return false;
         }
-
-        write_busy_ = true;
-        auto guard = std::unique_ptr<void, void(*)(void*)>{
-            this,
-            [](void* ptr) {
-                auto* self = static_cast<GrpcServerSession*>(ptr);
-                self->write_busy_ = false;
-                self->WakeWriter();
-            }};
-        (void)guard;
 
         co_return co_await WriteH2DataPayloadBuffers(
             *stream_,
@@ -3195,13 +3132,6 @@ public:
     }
 
 private:
-    void WakeWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)write_signal_.try_send(IoErrorCode{});
-    }
-
     net::awaitable<bool> HandleHeadersFrame(H2Frame frame) {
         if (frame.stream_id == 0) {
             co_return false;
@@ -3503,7 +3433,7 @@ private:
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
-    net::experimental::channel<void(IoErrorCode)> write_signal_;
+    transport::internet::AsyncWriteGate write_gate_;
     memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<GrpcServerSubStreamState>>
         streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
@@ -3512,7 +3442,6 @@ private:
     std::optional<XHttpConfig> xhttp_config_;
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
-    bool write_busy_ = false;
     bool cancelled_ = false;
 };
 

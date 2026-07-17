@@ -64,6 +64,15 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate_" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "write_gate_[.]Cancel[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES "write_busy_" OR
+   TRANSPORT_STACK_SOURCE MATCHES "write_signal_")
+    message(FATAL_ERROR
+        "gRPC server writes must use the shared cancellation-broadcast gate")
+endif()
 string(FIND "${TRANSPORT_STACK_SOURCE}"
     "~StreamRemovalGuard() noexcept" STREAM_REMOVAL_GUARD_DESTRUCTOR)
 if(STREAM_REMOVAL_GUARD_DESTRUCTOR EQUAL -1)
