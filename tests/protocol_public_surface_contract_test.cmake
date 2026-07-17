@@ -199,6 +199,17 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "HPACK peer table size updates must not exceed the local decoder limit")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxHeaderFields = 256" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxHeaderListSize = 64 [*] 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "fields[.]size[(][)] >= kHpackMaxHeaderFields" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "field_size > kHpackMaxHeaderListSize - header_list_size")
+    message(FATAL_ERROR
+        "HPACK decoded header lists must bound both field count and expanded size")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")

@@ -1328,6 +1328,8 @@ constexpr size_t kHttp2FrameHeaderSize = 9;
 constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
 constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
 constexpr uint32_t kHpackMaxDynamicTableSize = 4096;
+constexpr size_t kHpackMaxHeaderFields = 256;
+constexpr size_t kHpackMaxHeaderListSize = 64 * 1024;
 constexpr uint32_t kGrpcInitialWindow = 4 * 1024 * 1024;
 
 enum class H2FrameType : uint8_t {
@@ -1965,6 +1967,18 @@ public:
     std::optional<HeaderFields> Decode(
         std::span<const uint8_t> block) {
         HeaderFields fields;
+        size_t header_list_size = 0;
+        const auto append_field = [&](HpackHeaderField field) {
+            const size_t field_size =
+                field.name.size() + field.value.size() + 32;
+            if (fields.size() >= kHpackMaxHeaderFields ||
+                field_size > kHpackMaxHeaderListSize - header_list_size) {
+                return false;
+            }
+            header_list_size += field_size;
+            fields.push_back(std::move(field));
+            return true;
+        };
         size_t offset = 0;
         while (offset < block.size()) {
             const uint8_t first = block[offset];
@@ -1977,7 +1991,9 @@ public:
                 if (!field) {
                     return std::nullopt;
                 }
-                fields.push_back(std::move(*field));
+                if (!append_field(std::move(*field))) {
+                    return std::nullopt;
+                }
                 continue;
             }
             if ((first & 0x40) != 0) {
@@ -1986,7 +2002,9 @@ public:
                     return std::nullopt;
                 }
                 AddDynamic(*field);
-                fields.push_back(std::move(*field));
+                if (!append_field(std::move(*field))) {
+                    return std::nullopt;
+                }
                 continue;
             }
             if ((first & 0x20) != 0) {
@@ -2000,7 +2018,9 @@ public:
             if (!field) {
                 return std::nullopt;
             }
-            fields.push_back(std::move(*field));
+            if (!append_field(std::move(*field))) {
+                return std::nullopt;
+            }
         }
         return fields;
     }
