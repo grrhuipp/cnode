@@ -76,6 +76,15 @@ set(TRANSPORT_STACK
     "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
 file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
 file(READ
+    "${SOURCE_DIR}/src/transport/internet/transport_dialer.cpp"
+    TRANSPORT_DIALER_SOURCE)
+if(TRANSPORT_DIALER_SOURCE MATCHES "next_seq_[+][+]" OR
+   NOT TRANSPORT_DIALER_SOURCE MATCHES
+       "if [(][!]build_result[)] \\{[^}]*ThrowXHttpPacketError[^}]*\\}[\r\n\t ]*[+][+]next_seq_;")
+    message(FATAL_ERROR
+        "XHTTP packet-up sequence must commit only after the server accepts the request")
+endif()
+file(READ
     "${SOURCE_DIR}/include/acppnode/transport/internet/ws_stream.hpp"
     WS_STREAM_SOURCE)
 if(TRANSPORT_STACK_SOURCE MATCHES

@@ -522,7 +522,7 @@ private:
         std::string path = BuildXHttpSplitPath(
             target_.stream_settings->xhttp,
             session_id_,
-            next_seq_++);
+            next_seq_);
 
         auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
@@ -543,6 +543,7 @@ private:
         if (!build_result) {
             ThrowXHttpPacketError("xhttp packet-up request failed");
         }
+        ++next_seq_;
     }
 
     net::io_context& io_context_;
