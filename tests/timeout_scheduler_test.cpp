@@ -1,6 +1,8 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
+#include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
+#include <asio/use_future.hpp>
 
 #include <chrono>
 #include <future>
@@ -192,6 +194,48 @@ int main() {
     cancellation_scheduler.Cancel(after_cancellation_storm);
     cancellation_scheduler.Cancel(keeper);
     acpp::TimeoutScheduler::ReleaseForIoContext(cancellation_io_context);
+
+    acpp::net::io_context sleep_io_context;
+    auto& sleep_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(sleep_io_context);
+    acpp::ScheduledSleep repeated_cancel_sleep(sleep_io_context);
+    bool second_wait_started = false;
+    bool second_wait_completed = false;
+    bool second_wait_completed_before_probe = false;
+    auto sleep_future = acpp::net::co_spawn(
+        sleep_io_context,
+        [&]() -> acpp::net::awaitable<void> {
+            co_await repeated_cancel_sleep.WaitFor(1h);
+            second_wait_started = true;
+            co_await repeated_cancel_sleep.WaitFor(1h);
+            second_wait_completed = true;
+        },
+        acpp::net::use_future);
+    acpp::net::post(sleep_io_context, [&]() {
+        repeated_cancel_sleep.Cancel();
+        repeated_cancel_sleep.Cancel();
+    });
+    auto sleep_probe = sleep_scheduler.ScheduleAfter(50ms, [&]() {
+        second_wait_completed_before_probe = second_wait_completed;
+        repeated_cancel_sleep.Cancel();
+    });
+
+    sleep_io_context.run();
+    try {
+        sleep_future.get();
+    } catch (...) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 13;
+    }
+    if (!second_wait_started || !second_wait_completed ||
+        second_wait_completed_before_probe) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 14;
+    }
+    sleep_scheduler.Cancel(sleep_probe);
+    acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
 
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;

@@ -324,8 +324,7 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) {
 }
 
 ScheduledSleep::ScheduledSleep(net::io_context& io_context)
-    : io_context_(io_context)
-    , scheduler_(TimeoutScheduler::ForIoContext(io_context))
+    : scheduler_(TimeoutScheduler::ForIoContext(io_context))
     , signal_(io_context, 1) {}
 
 ScheduledSleep::~ScheduledSleep() noexcept {
@@ -352,9 +351,9 @@ net::awaitable<void> ScheduledSleep::WaitFor(std::chrono::milliseconds delay) {
 }
 
 void ScheduledSleep::Cancel() noexcept {
-    if (token_.Valid()) {
-        scheduler_.Cancel(token_);
-    }
+    if (!token_.Valid()) return;
+
+    scheduler_.Cancel(token_);
     if (waiting_) {
         (void)signal_.try_send(io_error::operation_aborted);
     }

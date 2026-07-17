@@ -101,7 +101,6 @@ public:
     void Cancel() noexcept;
 
 private:
-    net::io_context& io_context_;
     TimeoutScheduler& scheduler_;
     TimeoutToken token_;
     net::experimental::channel<void(IoErrorCode)> signal_;
