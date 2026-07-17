@@ -4835,11 +4835,12 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
     const std::string_view transfer_encoding =
         ExtractHeaderValueCI(request, "Transfer-Encoding");
+    const std::string_view content_length_header =
+        TrimAscii(ExtractHeaderValueCI(request, "Content-Length"));
     const std::string_view expect_header =
         ExtractHeaderValueCI(request, "Expect");
     const bool request_chunked = HeaderContainsTokenCI(transfer_encoding, "chunked");
-    const auto content_length =
-        ParseContentLength(ExtractHeaderValueCI(request, "Content-Length"));
+    const auto content_length = ParseContentLength(content_length_header);
     const auto meta = ParseXHttpRequestMeta(cfg.path, request_path, method);
 
     LOG_ACCESS_TRACE(
@@ -4916,6 +4917,18 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
         if (!xhttp_cfg.AcceptsPacketUp()) {
             co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        const bool valid_content_length =
+            transfer_encoding.empty() && !content_length_header.empty() &&
+            content_length.has_value();
+        const bool valid_chunked =
+            content_length_header.empty() &&
+            EqualsAsciiCI(TrimAscii(transfer_encoding), "chunked");
+        if (!valid_content_length && !valid_chunked) {
+            LOG_ACCESS_DEBUG(
+                "[XHTTP:{}] server: packet-up requires exactly one valid body framing",
+                conn_id);
+            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         auto session = GetXHttpPacketSession(io_context, meta.session_id, false);
         if (!session) {
