@@ -188,6 +188,16 @@ if(NOT UDP_RELAY_SOURCE MATCHES
         "Full Cone UDP reply rejection must terminate the relay and reach access logging")
 endif()
 
+if(NOT UDP_RELAY_SOURCE MATCHES
+       "auto mark_close_side" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "catch [(]const IoSystemError& e[)] [{][\r\n ]*mark_close_side[(]true[)]" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "UDP reply write failed")
+    message(FATAL_ERROR
+        "UDP client read and reply-write failures must publish client close-side evidence")
+endif()
+
 if(NOT RELAY_SOURCE MATCHES
        "struct RelayCloseState" OR
    NOT RELAY_SOURCE MATCHES

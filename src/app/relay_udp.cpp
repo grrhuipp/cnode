@@ -56,6 +56,12 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     RelayResult result;
     ctx.traffic.bytes_up = 0;
     ctx.traffic.bytes_down = 0;
+    auto mark_close_side = [&](bool client_side) noexcept {
+        if (!result.close_side_known) {
+            result.client_closed_first = client_side;
+            result.close_side_known = true;
+        }
+    };
 
     // 回包队列：单线程，无锁。UDP 接收回调在同一 Worker io_context 上 push，
     // download 协程 pop。wake 计时器用于在新回包到达时唤醒等待中的 download。
@@ -194,6 +200,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             co_return true;
 
         } catch (const std::exception& e) {
+            mark_close_side(true);
             LOG_CONN_DEBUG(ctx, "UDP reply write failed: {}", e.what());
             co_return false;
         }
@@ -208,11 +215,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             try {
                 read_mb = co_await client_reader.ReadMultiBuffer();
             } catch (const IoSystemError& e) {
+                mark_close_side(true);
                 if (result.error == ErrorCode::OK) {
                     result.error = MapAsioError(e.code());
                 }
                 break;
             } catch (...) {
+                mark_close_side(true);
                 if (result.error == ErrorCode::OK) {
                     result.error = ErrorCode::INTERNAL;
                 }
@@ -226,8 +235,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 // 入站读到 EOF：client 关闭隧道，结束上行并触发回包收尾。
                 LOG_CONN_DEBUG(ctx, "UDP relay: client EOF, up={}B down={}B",
                                result.bytes_up, result.bytes_down);
-                result.client_closed_first = true;
-                result.close_side_known = true;
+                mark_close_side(true);
                 break;
             }
             if (!datagram_info.Valid()) {
