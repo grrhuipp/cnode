@@ -392,6 +392,7 @@ set(CNODE_SOURCES
     src/common/session.cpp
     src/common/sharded_user_stats.cpp
     src/app/stats.cpp
+    src/app/udp_callback_router.cpp
     src/app/udp_session.cpp
     src/app/bootstrap.cpp
 
@@ -1478,6 +1479,31 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_udp_socket_owner_test
         COMMAND cnode_udp_socket_owner_test)
+
+    add_executable(cnode_udp_callback_router_test
+        tests/udp_callback_router_test.cpp
+        src/app/udp_callback_router.cpp
+    )
+    target_include_directories(cnode_udp_callback_router_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+    )
+    target_link_libraries(cnode_udp_callback_router_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_udp_callback_router_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_udp_callback_router_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_udp_callback_router_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_udp_callback_router_test
+        COMMAND cnode_udp_callback_router_test)
 
     add_executable(cnode_timeout_scheduler_test
         tests/timeout_scheduler_test.cpp

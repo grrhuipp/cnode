@@ -342,9 +342,13 @@ if(NOT UDP_RELAY_SOURCE MATCHES
         "UDP relay must preserve one ReadMultiBuffer as one datagram")
 endif()
 set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
+set(UDP_CALLBACK_ROUTER "${SOURCE_DIR}/src/app/udp_callback_router.cpp")
+set(UDP_CALLBACK_ROUTER_HEADER "${SOURCE_DIR}/src/app/udp_callback_router.hpp")
 set(UDP_SESSION_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp")
 set(UDP_TYPES_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_types.hpp")
 file(READ "${UDP_SESSION}" UDP_SESSION_SOURCE)
+file(READ "${UDP_CALLBACK_ROUTER}" UDP_CALLBACK_ROUTER_SOURCE)
+file(READ "${UDP_CALLBACK_ROUTER_HEADER}" UDP_CALLBACK_ROUTER_HEADER_SOURCE)
 file(READ "${UDP_SESSION_HEADER}" UDP_SESSION_HEADER_SOURCE)
 file(READ "${UDP_TYPES_HEADER}" UDP_TYPES_HEADER_SOURCE)
 if(UDP_SESSION_SOURCE MATCHES
@@ -447,16 +451,28 @@ if(NOT UDP_SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "UDPSession cleanup must be idempotent and dead aggregate stats must stay removed")
 endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-        "registered_callbacks[.]size[(][)] >= Impl::kMaxCallbacks" OR
+if(UDP_SESSION_SOURCE MATCHES
+       "registered_callbacks|target_to_callbacks" OR
    NOT UDP_SESSION_SOURCE MATCHES
+        "callbacks[.]RegisteredCount[(][)]" OR
+   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
         "kMaxTargetsPerCallback = 256" OR
-   NOT UDP_SESSION_SOURCE MATCHES
+   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
         "kMaxTargetMappings = 4096" OR
    NOT UDP_SESSION_SOURCE MATCHES
-        "RemoveTargetMapping[(][*]new_target_mapping, callback_id[)]")
+        "callbacks[.]RollbackTarget[(]mapping_token[)]" OR
+   NOT UDP_SESSION_SOURCE MATCHES
+        "callbacks[.]CommitTarget[(]mapping_token[)]" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "pending_removal" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "DispatchScope" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "target_it->second[.]generation != token[.]generation" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "pending_sends")
     message(FATAL_ERROR
-        "UDPSession callbacks and target mappings must be bounded and transactional")
+        "UDPSession callback routing must be bounded, reentrant-safe and generation-transactional")
 endif()
 if(NOT UDP_SESSION_SOURCE MATCHES
         "kMaxSessions = 4096" OR
