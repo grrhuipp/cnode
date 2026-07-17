@@ -7,6 +7,8 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <stdexcept>
+
 namespace acpp {
 
 struct TimeoutScheduler::Impl {
@@ -347,19 +349,30 @@ net::awaitable<void> ScheduledSleep::WaitFor(std::chrono::milliseconds delay) {
     if (delay <= std::chrono::milliseconds::zero()) {
         co_return;
     }
+    if (waiting_) {
+        throw std::logic_error(
+            "ScheduledSleep does not support concurrent WaitFor calls");
+    }
 
     Cancel();
     waiting_ = true;
-    token_ = scheduler_.ScheduleAfter(delay, [this]() {
-        token_.Reset();
-        if (waiting_) {
-            (void)signal_.try_send(IoErrorCode{});
-        }
-    });
+    try {
+        token_ = scheduler_.ScheduleAfter(delay, [this]() {
+            token_.Reset();
+            if (waiting_) {
+                (void)signal_.try_send(IoErrorCode{});
+            }
+        });
 
-    auto [ec] = co_await signal_.async_receive(net::as_tuple(net::use_awaitable));
-    (void)ec;
-    waiting_ = false;
+        auto [ec] = co_await signal_.async_receive(
+            net::as_tuple(net::use_awaitable));
+        (void)ec;
+        waiting_ = false;
+    } catch (...) {
+        waiting_ = false;
+        scheduler_.Cancel(token_);
+        throw;
+    }
 }
 
 void ScheduledSleep::Cancel() noexcept {

@@ -94,6 +94,8 @@ public:
     ScheduledSleep(const ScheduledSleep&) = delete;
     ScheduledSleep& operator=(const ScheduledSleep&) = delete;
 
+    // One instance represents one outstanding sleep. Concurrent waits are a
+    // logic error because the cancellation token and wake channel are shared.
     [[nodiscard]] net::awaitable<void> WaitFor(std::chrono::milliseconds delay);
     void Cancel() noexcept;
 

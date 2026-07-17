@@ -263,6 +263,57 @@ int main() {
     assignment_scheduler.Cancel(assigned_token);
     acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
 
+    acpp::net::io_context concurrent_sleep_io_context;
+    auto& concurrent_sleep_scheduler =
+        acpp::TimeoutScheduler::ForIoContext(concurrent_sleep_io_context);
+    bool concurrent_wait_rejected = false;
+    {
+        acpp::ScheduledSleep single_wait_sleep(concurrent_sleep_io_context);
+        auto first_wait = acpp::net::co_spawn(
+            concurrent_sleep_io_context,
+            [&]() -> acpp::net::awaitable<void> {
+                co_await single_wait_sleep.WaitFor(1h);
+            },
+            acpp::net::use_future);
+        auto second_wait = acpp::net::co_spawn(
+            concurrent_sleep_io_context,
+            [&]() -> acpp::net::awaitable<void> {
+                co_await single_wait_sleep.WaitFor(1h);
+            },
+            acpp::net::use_future);
+        auto concurrent_sleep_probe =
+            concurrent_sleep_scheduler.ScheduleAfter(20ms, [&]() {
+                single_wait_sleep.Cancel();
+            });
+
+        concurrent_sleep_io_context.run_for(100ms);
+        if (first_wait.wait_for(0ms) == std::future_status::ready) {
+            try {
+                first_wait.get();
+            } catch (...) {
+                acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+                return 17;
+            }
+        }
+        if (second_wait.wait_for(0ms) == std::future_status::ready) {
+            try {
+                second_wait.get();
+            } catch (const std::logic_error&) {
+                concurrent_wait_rejected = true;
+            } catch (...) {
+                acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+                return 18;
+            }
+        }
+        concurrent_sleep_scheduler.Cancel(concurrent_sleep_probe);
+        concurrent_sleep_io_context.stop();
+    }
+    acpp::TimeoutScheduler::ReleaseForIoContext(concurrent_sleep_io_context);
+    if (!concurrent_wait_rejected) {
+        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
+        return 19;
+    }
+
     acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
     return 0;
 }

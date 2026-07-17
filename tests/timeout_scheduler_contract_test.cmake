@@ -19,6 +19,16 @@ if(NOT SCHEDULER_HEADER MATCHES "TimeoutScheduler[*] owner_" OR
 endif()
 
 if(NOT SCHEDULER_SOURCE MATCHES
+       "if [(]waiting_[)]" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "ScheduledSleep does not support concurrent WaitFor calls" OR
+   NOT SCHEDULER_SOURCE MATCHES
+       "catch [(]...[)][\r\n ]*[{][\r\n ]*waiting_ = false;[\r\n ]*scheduler_[.]Cancel[(]token_[)]")
+    message(FATAL_ERROR
+        "ScheduledSleep must reject concurrent waiters and roll back failed waits")
+endif()
+
+if(NOT SCHEDULER_SOURCE MATCHES
        "kHeapCompactStaleFloor = 1024" OR
    NOT SCHEDULER_SOURCE MATCHES
        "stale < deadline_heap.size[(][)] / 2" OR
