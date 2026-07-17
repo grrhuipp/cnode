@@ -1,12 +1,14 @@
 #pragma once
 
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/app/udp_types.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
@@ -90,7 +92,7 @@ public:
 
     // Called only by the owning Worker. Protocol decoders may update
     // Worker-local session state such as replay windows after authentication.
-    [[nodiscard]] virtual std::optional<UdpDecodeResult> DecodeUdp(
+    [[nodiscard]] virtual std::expected<UdpDecodeResult, ErrorCode> DecodeUdp(
         std::string_view tag,
         std::string_view client_ip,
         const uint8_t* data,

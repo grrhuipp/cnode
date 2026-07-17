@@ -1,6 +1,7 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/session.hpp"
@@ -335,6 +336,33 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     auto decoded = impl_->proxy->DecodeUdp(
         impl_->tag, client_ip, datagram.payload.data(), datagram.payload.size());
     if (!decoded) {
+        if (datagram.receiver && datagram.receiver->access_source_ref != 0) {
+            session::Context rejected_ctx;
+            rejected_ctx.conn_id = session::NewID(datagram.worker_id);
+            rejected_ctx.worker_id = datagram.worker_id;
+            rejected_ctx.inbound.tag = datagram.receiver->inbound_tag.empty()
+                ? std::string_view(impl_->tag)
+                : std::string_view(datagram.receiver->inbound_tag);
+            rejected_ctx.inbound.tags = datagram.receiver->RouteInboundTags();
+            rejected_ctx.inbound.source_ip = client_ip;
+            rejected_ctx.inbound.source_addr = normalized_client_addr;
+            rejected_ctx.inbound.source_port = datagram.client_endpoint.port();
+            rejected_ctx.inbound.access_source_ref =
+                datagram.receiver->access_source_ref;
+            rejected_ctx.inbound.protocol = datagram.receiver->protocol;
+            rejected_ctx.content.network = Network::UDP;
+
+            IoErrorCode local_ec;
+            const auto local_ep = datagram.sock->local_endpoint(local_ec);
+            if (!local_ec && !local_ep.address().is_unspecified()) {
+                rejected_ctx.inbound.local_endpoint = tcp::endpoint(
+                    iputil::NormalizeAddress(local_ep.address()),
+                    local_ep.port());
+            }
+
+            app::AccessLogSession access_log(rejected_ctx);
+            access_log.Fail(decoded.error());
+        }
         return;
     }
 

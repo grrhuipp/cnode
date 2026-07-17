@@ -299,7 +299,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         timeouts);
 }
 
-std::optional<acpp::proxyman::inbound::UdpDecodeResult>
+std::expected<acpp::proxyman::inbound::UdpDecodeResult, acpp::ErrorCode>
 proxy::shadowsocks::inbound::Handler::DecodeUdp(
     std::string_view tag,
     std::string_view client_ip,
@@ -309,12 +309,12 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     if (limiter_ && limiter_->GetLimiter().IsBanned(tag, client_ip)) {
         LOG_ACCESS_DEBUG("{} from {} rejected ip_banned [{}] (udp)",
                        LogLocalNow(), client_ip, tag);
-        return std::nullopt;
+        return std::unexpected(ErrorCode::BLOCKED);
     }
 
     auto users = validator_.FindUsersForTag(tag);
     if (users.empty()) {
-        return std::nullopt;
+        return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     auto decoded = ss::DecodeUdpPacket(
@@ -325,7 +325,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
         if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
-        return std::nullopt;
+        return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     const auto& user = users[decoded->user_index];
@@ -333,7 +333,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
 
     proxyman::inbound::UdpDecodeResult result;
     if (!result.session_owner.Assign(user.derived_key.span())) {
-        return std::nullopt;
+        return std::unexpected(ErrorCode::INTERNAL);
     }
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);

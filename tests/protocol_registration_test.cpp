@@ -54,12 +54,14 @@ public:
 
 class DummyUdpHandler final : public acpp::proxyman::inbound::UdpHandler {
 public:
-    std::optional<acpp::proxyman::inbound::UdpDecodeResult> DecodeUdp(
+    std::expected<
+        acpp::proxyman::inbound::UdpDecodeResult,
+        acpp::ErrorCode> DecodeUdp(
         std::string_view,
         std::string_view,
         const uint8_t*,
         size_t) override {
-        return std::nullopt;
+        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 

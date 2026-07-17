@@ -9,7 +9,7 @@
 
 #include <array>
 #include <memory>
-#include <optional>
+#include <expected>
 #include <utility>
 
 namespace acpp {
@@ -39,7 +39,9 @@ public:
         const ::acpp::TimeoutsConfig& timeouts) override;
 
     // 对应 xray-core proxy/shadowsocks/server.go 的 handleUDPPayload 解码路径。
-    [[nodiscard]] std::optional<::acpp::proxyman::inbound::UdpDecodeResult> DecodeUdp(
+    [[nodiscard]] std::expected<
+        ::acpp::proxyman::inbound::UdpDecodeResult,
+        ::acpp::ErrorCode> DecodeUdp(
         std::string_view tag,
         std::string_view client_ip,
         const uint8_t* data,

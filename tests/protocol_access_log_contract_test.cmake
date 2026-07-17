@@ -44,6 +44,12 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/common/mux/mux_relay.cpp"
     MUX_RELAY_SOURCE)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp"
+    UDP_HANDLER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp"
+    UDP_WORKER_SOURCE)
 
 foreach(SOURCE IN ITEMS
         VLESS_OUTBOUND_SOURCE
@@ -72,6 +78,16 @@ if(NOT MUX_RELAY_SOURCE MATCHES
        "Mux UDP reply queue full")
     message(FATAL_ERROR
         "Mux child access traffic must fail instead of counting dropped replies")
+endif()
+
+if(UDP_HANDLER_SOURCE MATCHES
+       "optional<UdpDecodeResult>" OR
+   NOT UDP_HANDLER_SOURCE MATCHES
+       "expected<UdpDecodeResult, ErrorCode>" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+       "access_log[.]Fail[(]decoded[.]error[(][)][)]")
+    message(FATAL_ERROR
+        "native UDP decode failures must retain their error and reach access logging")
 endif()
 
 if(NOT MUX_RELAY_SOURCE MATCHES

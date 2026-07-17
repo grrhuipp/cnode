@@ -1,4 +1,5 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "acppnode/app/access_log_session.hpp"
 #include "udp_receive_buffer.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -36,12 +37,14 @@ public:
         }
     }
 
-    std::optional<acpp::proxyman::inbound::UdpDecodeResult> DecodeUdp(
+    std::expected<
+        acpp::proxyman::inbound::UdpDecodeResult,
+        acpp::ErrorCode> DecodeUdp(
         std::string_view,
         std::string_view,
         const uint8_t*,
         size_t) override {
-        return std::nullopt;
+        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
 private:
@@ -562,3 +565,16 @@ int main() {
 
     return 0;
 }
+// This ownership-focused target compiles UdpWorker without the production
+// reporter graph. Keep the access-log boundary inert here; its admission and
+// UDP failure contracts are covered by their dedicated tests.
+namespace acpp::app {
+
+AccessLogSession::AccessLogSession(session::Context& ctx) noexcept
+    : ctx_(&ctx) {}
+
+AccessLogSession::~AccessLogSession() noexcept = default;
+
+void AccessLogSession::Fail(ErrorCode) noexcept {}
+
+}  // namespace acpp::app
