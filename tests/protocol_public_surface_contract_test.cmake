@@ -76,6 +76,16 @@ set(TRANSPORT_STACK
     "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
 file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
 file(READ
+    "${SOURCE_DIR}/include/acppnode/transport/internet/ws_stream.hpp"
+    WS_STREAM_SOURCE)
+if(TRANSPORT_STACK_SOURCE MATCHES
+       "void Cancel\\(\\) noexcept override \\{[\r\n\t ]*closed_ = true;" OR
+   WS_STREAM_SOURCE MATCHES
+       "void Cancel\\(\\) noexcept override \\{[\r\n\t ]*closed_ = true;")
+    message(FATAL_ERROR
+        "transport wrapper Cancel must not suppress the following Close operation")
+endif()
+file(READ
     "${SOURCE_DIR}/src/transport/internet/xhttp_packet_queue.hpp"
     XHTTP_PACKET_QUEUE_SOURCE)
 file(READ

@@ -367,7 +367,6 @@ public:
     }
 
     void Cancel() noexcept override {
-        closed_ = true;
         inner_->Cancel();
     }
 
