@@ -142,6 +142,16 @@ if(NOT UDP_WORKER_SOURCE MATCHES
         "native UDP session termination must remain visible to access logging")
 endif()
 
+if(NOT UDP_WORKER_SOURCE MATCHES
+       "catch [(]const std::bad_alloc&[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+       "access_log[.]Fail[(]ErrorCode::INTERNAL[)]")
+    message(FATAL_ERROR
+        "native UDP dispatch admission and coroutine failures must reach access logging")
+endif()
+
 if(NOT MUX_RELAY_SOURCE MATCHES
        "Cancel[(]ErrorCode error = ErrorCode::CANCELLED[)]" OR
    NOT MUX_RELAY_SOURCE MATCHES

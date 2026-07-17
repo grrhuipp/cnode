@@ -481,44 +481,60 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         auto* io_context = &datagram.io_context;
         auto* stats = &datagram.stats;
         auto timeouts = datagram.timeouts;
-        net::co_spawn(
-            io_context->get_executor(),
-            [dispatcher,
-             io_context,
-             stats,
-             receiver,
-             ctx,
-             client_session,
-             timeouts,
-             worker_id]() -> net::awaitable<void> {
-                try {
-                    RelayResult relay_result = co_await dispatcher->Dispatch(
-                        *io_context,
-                        *receiver,
-                        nullptr,
-                        transport::Link{client_session.get(), client_session.get()},
-                        InitialPayload{},
-                        *ctx,
-                        *stats,
-                        timeouts);
-                    if (relay_result.error != ErrorCode::OK) {
-                        auto& log_ctx = *ctx;
-                        LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",
-                                       ErrorCodeToString(relay_result.error),
-                                       relay_result.bytes_up,
-                                       relay_result.bytes_down);
+        try {
+            net::co_spawn(
+                io_context->get_executor(),
+                [dispatcher,
+                 io_context,
+                 stats,
+                 receiver,
+                 ctx,
+                 client_session,
+                 timeouts,
+                 worker_id]() -> net::awaitable<void> {
+                    try {
+                        RelayResult relay_result = co_await dispatcher->Dispatch(
+                            *io_context,
+                            *receiver,
+                            nullptr,
+                            transport::Link{client_session.get(), client_session.get()},
+                            InitialPayload{},
+                            *ctx,
+                            *stats,
+                            timeouts);
+                        if (relay_result.error != ErrorCode::OK) {
+                            auto& log_ctx = *ctx;
+                            LOG_CONN_DEBUG(log_ctx, "[UDP] dispatcher session end: {} up={}B down={}B",
+                                           ErrorCodeToString(relay_result.error),
+                                           relay_result.bytes_up,
+                                           relay_result.bytes_down);
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
+                                  worker_id, e.what());
+                        app::AccessLogSession access_log(*ctx);
+                        access_log.Fail(ErrorCode::INTERNAL);
+                    } catch (...) {
+                        LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
+                                  worker_id);
+                        app::AccessLogSession access_log(*ctx);
+                        access_log.Fail(ErrorCode::INTERNAL);
                     }
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
-                              worker_id, e.what());
-                } catch (...) {
-                    LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
-                              worker_id);
-                }
-                client_session->Close();
-                co_return;
-            },
-            net::detached);
+                    client_session->Close();
+                    co_return;
+                },
+                net::detached);
+        } catch (const std::bad_alloc&) {
+            app::AccessLogSession access_log(*ctx);
+            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+            client_session->Close();
+            return;
+        } catch (...) {
+            app::AccessLogSession access_log(*ctx);
+            access_log.Fail(ErrorCode::INTERNAL);
+            client_session->Close();
+            return;
+        }
     }
 
     if (!PushClientPayload(
