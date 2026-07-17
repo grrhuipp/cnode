@@ -30,11 +30,12 @@ class UdpReplySink {
 public:
     virtual ~UdpReplySink() noexcept = default;
 
-    virtual void EnqueueUdpReply(const std::string& socket_key,
-                                 udp::socket* sock,
-                                 udp::endpoint endpoint,
-                                 buf::MultiBuffer payload,
-                                 uint32_t worker_id) = 0;
+    [[nodiscard]] virtual bool EnqueueUdpReply(
+        const std::string& socket_key,
+        udp::socket* sock,
+        udp::endpoint endpoint,
+        buf::MultiBuffer payload,
+        uint32_t worker_id) = 0;
 };
 
 struct UdpDatagramContext {
@@ -68,6 +69,12 @@ public:
     using ClientSessionPtr = std::shared_ptr<ClientSession>;
     using ReplyCallback = ::acpp::RoutedPacketCallback;
 
+    enum class ReplyEnqueueResult : uint8_t {
+        Rejected,
+        Queued,
+        StartSend,
+    };
+
     struct PendingUdpReplyDeleter {
         void operator()(PendingUdpReply* reply) const noexcept;
     };
@@ -90,12 +97,14 @@ public:
 
     void ProcessDatagram(const UdpDatagramContext& datagram);
 
-    [[nodiscard]] bool EnqueueReply(const std::string& socket_key,
-                                    udp::endpoint endpoint,
-                                    buf::MultiBuffer payload);
-    [[nodiscard]] bool EnqueueReply(const std::string& socket_key,
-                                    udp::endpoint endpoint,
-                                    buf::BufferGuard payload);
+    [[nodiscard]] ReplyEnqueueResult EnqueueReply(
+        const std::string& socket_key,
+        udp::endpoint endpoint,
+        buf::MultiBuffer payload);
+    [[nodiscard]] ReplyEnqueueResult EnqueueReply(
+        const std::string& socket_key,
+        udp::endpoint endpoint,
+        buf::BufferGuard payload);
     [[nodiscard]] PendingUdpReplyPtr BeginReplySend(const std::string& socket_key);
     [[nodiscard]] static std::span<const net::const_buffer>
     ReplySendBuffers(const PendingUdpReply& reply) noexcept;

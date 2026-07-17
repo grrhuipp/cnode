@@ -50,6 +50,12 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp"
     UDP_WORKER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp"
+    UDP_WORKER_HEADER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/worker.cpp"
+    WORKER_SOURCE)
 
 foreach(SOURCE IN ITEMS
         VLESS_OUTBOUND_SOURCE
@@ -88,6 +94,21 @@ if(UDP_HANDLER_SOURCE MATCHES
        "access_log[.]Fail[(]decoded[.]error[(][)][)]")
     message(FATAL_ERROR
         "native UDP decode failures must retain their error and reach access logging")
+endif()
+
+if(NOT UDP_WORKER_HEADER_SOURCE MATCHES
+       "enum class ReplyEnqueueResult")
+    message(FATAL_ERROR
+        "native UDP reply admission must distinguish rejection from queued work")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+       "return reply_sink[.]EnqueueUdpReply" OR
+   NOT WORKER_SOURCE MATCHES
+       "ReplyEnqueueResult::Rejected" OR
+   NOT WORKER_SOURCE MATCHES
+       "return false;")
+    message(FATAL_ERROR
+        "native UDP reply rejection must fail relay accounting and access logging")
 endif()
 
 if(NOT MUX_RELAY_SOURCE MATCHES

@@ -109,21 +109,12 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     [[nodiscard]] const proxyman::inbound::UdpWorker*
     FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept;
 
-    void EnqueueUdpReply(const std::string& tag,
-                         udp::socket* sock,
-                         udp::endpoint endpoint,
-                         std::span<const uint8_t> payload,
-                         uint32_t worker_id);
-    void EnqueueUdpReply(const std::string& tag,
-                         udp::socket* sock,
-                         udp::endpoint endpoint,
-                         buf::MultiBuffer payload,
-                         uint32_t worker_id) override;
-    void EnqueueUdpReply(const std::string& tag,
-                         udp::socket* sock,
-                         udp::endpoint endpoint,
-                         buf::BufferGuard payload,
-                         uint32_t worker_id);
+    [[nodiscard]] bool EnqueueUdpReply(
+        const std::string& tag,
+        udp::socket* sock,
+        udp::endpoint endpoint,
+        buf::MultiBuffer payload,
+        uint32_t worker_id) override;
     void StartUdpReplySend(const std::string& tag,
                            proxyman::inbound::UdpWorker::SocketPtr sock,
                            uint32_t worker_id);
@@ -593,63 +584,27 @@ void Worker::ListenerState::Shutdown() {
     }
 }
 
-void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
-                                            udp::socket* sock,
-                                            udp::endpoint endpoint,
-                                            std::span<const uint8_t> payload,
-                                            uint32_t worker_id) {
-    if (payload.empty()) {
-        return;
-    }
-
-    buf::MultiBuffer mb;
-    mb.reserve((payload.size() + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    size_t offset = 0;
-    while (offset < payload.size()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) {
-            return;
-        }
-        const size_t n = std::min(payload.size() - offset,
-                                  static_cast<size_t>(buffer->Available()));
-        std::memcpy(buffer->Tail().data(), payload.data() + offset, n);
-        buffer->Produce(static_cast<uint32_t>(n));
-        mb.push_back(buffer.release());
-        offset += n;
-    }
-    EnqueueUdpReply(tag, sock, std::move(endpoint), std::move(mb), worker_id);
-}
-
-void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
-                                            udp::socket* sock,
-                                            udp::endpoint endpoint,
-                                            buf::MultiBuffer payload,
-                                            uint32_t worker_id) {
+bool Worker::ListenerState::EnqueueUdpReply(
+    const std::string& tag,
+    udp::socket* sock,
+    udp::endpoint endpoint,
+    buf::MultiBuffer payload,
+    uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
     if (!udp_worker || !udp_worker->OwnsSocket(tag, sock) ||
         !sock->is_open() || payload.empty()) {
-        return;
+        return false;
     }
 
-    if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
+    const auto admitted = udp_worker->EnqueueReply(
+        tag, std::move(endpoint), std::move(payload));
+    if (admitted == proxyman::inbound::UdpWorker::ReplyEnqueueResult::Rejected) {
+        return false;
+    }
+    if (admitted == proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
         StartUdpReplySend(tag, udp_worker->FindSocket(tag), worker_id);
     }
-}
-
-void Worker::ListenerState::EnqueueUdpReply(const std::string& tag,
-                                            udp::socket* sock,
-                                            udp::endpoint endpoint,
-                                            buf::BufferGuard payload,
-                                            uint32_t worker_id) {
-    auto* udp_worker = FindUdpWorkerBySocketKey(tag);
-    if (!udp_worker || !udp_worker->OwnsSocket(tag, sock) ||
-        !sock->is_open() || !payload || payload->IsEmpty()) {
-        return;
-    }
-
-    if (udp_worker->EnqueueReply(tag, std::move(endpoint), std::move(payload))) {
-        StartUdpReplySend(tag, udp_worker->FindSocket(tag), worker_id);
-    }
+    return true;
 }
 
 void Worker::ListenerState::StartUdpReplySend(const std::string& tag,

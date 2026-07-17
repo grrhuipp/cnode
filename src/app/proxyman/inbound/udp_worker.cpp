@@ -437,12 +437,12 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
                          response_context = std::move(response_context),
                          &reply_sink,
                          worker_id](UDPPacketView pkt,
-                                    const udp::endpoint& reply_endpoint) mutable {
+                                    const udp::endpoint& reply_endpoint) mutable -> bool {
             auto payload = response_context->Encode(pkt);
             if (payload.empty()) {
-                return;
+                return false;
             }
-            reply_sink.EnqueueUdpReply(
+            return reply_sink.EnqueueUdpReply(
                 socket_key,
                 sock,
                 reply_endpoint,
@@ -516,18 +516,19 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     }
 }
 
-bool UdpWorker::EnqueueReply(const std::string& socket_key,
-                             udp::endpoint endpoint,
-                             buf::MultiBuffer payload) {
+UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
+    const std::string& socket_key,
+    udp::endpoint endpoint,
+    buf::MultiBuffer payload) {
     const size_t payload_size = buf::TotalLen(payload);
     if (payload_size == 0) {
-        return false;
+        return ReplyEnqueueResult::Rejected;
     }
 
     auto& queue = impl_->reply_queues[socket_key];
     if (WouldOverflowUdpQueue(
             queue.pending.size(), queue.queued_bytes, payload_size)) {
-        return false;
+        return ReplyEnqueueResult::Rejected;
     }
     const bool should_start_send = queue.active_reply == nullptr;
     queue.queued_bytes += payload_size;
@@ -540,21 +541,24 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
     if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
         queue.shrink_pending_on_drain = true;
     }
-    return should_start_send;
+    return should_start_send
+        ? ReplyEnqueueResult::StartSend
+        : ReplyEnqueueResult::Queued;
 }
 
-bool UdpWorker::EnqueueReply(const std::string& socket_key,
-                             udp::endpoint endpoint,
-                             buf::BufferGuard payload) {
+UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
+    const std::string& socket_key,
+    udp::endpoint endpoint,
+    buf::BufferGuard payload) {
     if (!payload || payload->IsEmpty()) {
-        return false;
+        return ReplyEnqueueResult::Rejected;
     }
 
     const size_t payload_size = payload->Len();
     auto& queue = impl_->reply_queues[socket_key];
     if (WouldOverflowUdpQueue(
             queue.pending.size(), queue.queued_bytes, payload_size)) {
-        return false;
+        return ReplyEnqueueResult::Rejected;
     }
     const bool should_start_send = queue.active_reply == nullptr;
     queue.queued_bytes += payload_size;
@@ -567,7 +571,9 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
     if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
         queue.shrink_pending_on_drain = true;
     }
-    return should_start_send;
+    return should_start_send
+        ? ReplyEnqueueResult::StartSend
+        : ReplyEnqueueResult::Queued;
 }
 
 UdpWorker::PendingUdpReplyPtr

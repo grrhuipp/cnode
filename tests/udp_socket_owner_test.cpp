@@ -362,8 +362,9 @@ int main() {
     }
     worker.ClearReplyQueue("bounded-replies");
 
-    if (!worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+    if (worker.EnqueueReply(
+            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the first UDP reply generation");
     }
     auto stale_reply = worker.BeginReplySend("reply-generation");
@@ -372,8 +373,9 @@ int main() {
     }
     worker.ClearReplyQueue("reply-generation");
 
-    if (!worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+    if (worker.EnqueueReply(
+            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the replacement UDP reply generation");
     }
     auto active_reply = worker.BeginReplySend("reply-generation");
@@ -384,7 +386,8 @@ int main() {
         Fail("stale UDP reply completion matched a replacement queue");
     }
     if (worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::Queued) {
         Fail("stale UDP reply completion released a replacement queue");
     }
     if (!worker.CompleteReplySend("reply-generation", *active_reply)) {
