@@ -40,6 +40,7 @@ namespace {
 constexpr size_t kTlsContextCacheMaxEntries = 16;
 constexpr size_t kXHttpMaxPacketSessions = 1024;
 constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
+constexpr size_t kHttp2MaxConcurrentStreams = 256;
 
 using TlsContextMap =
     memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<SslContext>>;
@@ -3003,9 +3004,11 @@ public:
     }
 
     std::shared_ptr<GrpcServerSubStreamState> CreateStream(uint32_t stream_id) {
-        auto it = streams_.find(stream_id);
-        if (it != streams_.end()) {
-            return it->second;
+        if (stream_id == 0 ||
+            (stream_id & 1u) == 0 ||
+            stream_id <= last_remote_stream_id_ ||
+            streams_.size() >= kHttp2MaxConcurrentStreams) {
+            return nullptr;
         }
         auto sub = std::make_shared<GrpcServerSubStreamState>(
             io_context_,
@@ -3014,6 +3017,7 @@ public:
             payload_codec_,
             conn_id_);
         streams_.emplace(stream_id, sub);
+        last_remote_stream_id_ = stream_id;
         return sub;
     }
 
@@ -3261,6 +3265,9 @@ private:
         }
 
         auto sub = CreateStream(stream_id);
+        if (!sub) {
+            co_return false;
+        }
         if (payload_codec_ == H2PayloadCodec::RawData) {
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
@@ -3334,6 +3341,9 @@ private:
                 co_return false;
             }
             auto sub = CreateStream(stream_id);
+            if (!sub) {
+                co_return false;
+            }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
             }
@@ -3366,6 +3376,9 @@ private:
                 co_return false;
             }
             auto sub = CreateStream(stream_id);
+            if (!sub) {
+                co_return false;
+            }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
             }
@@ -3401,6 +3414,9 @@ private:
                 co_return false;
             }
             auto sub = CreateStream(stream_id);
+            if (!sub) {
+                co_return false;
+            }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
             }
@@ -3433,6 +3449,9 @@ private:
                 co_return false;
             }
             auto sub = CreateStream(stream_id);
+            if (!sub) {
+                co_return false;
+            }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
             }
@@ -3548,6 +3567,7 @@ private:
     std::optional<XHttpConfig> xhttp_config_;
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
+    uint32_t last_remote_stream_id_ = 0;
     bool cancelled_ = false;
 };
 
@@ -4130,6 +4150,9 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
                 transport::internet::HttpHeaders{},
                 conn_id);
             auto sub = session->CreateStream(stream_id);
+            if (!sub) {
+                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
             auto response_headers = EncodeGrpcResponseHeaders();
             if (!co_await session->WriteFrameSerialized(
                     H2FrameType::HEADERS,

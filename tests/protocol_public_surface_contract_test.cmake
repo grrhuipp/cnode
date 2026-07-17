@@ -177,6 +177,19 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
     message(FATAL_ERROR
         "HTTP/2 frame and accumulated header blocks must remain protocol bounded")
 endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHttp2MaxConcurrentStreams = 256" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "[(]stream_id & 1u[)] == 0" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "stream_id <= last_remote_stream_id_" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "streams_[.]size[(][)] >= kHttp2MaxConcurrentStreams" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]it != streams_[.]end[(][)][)] \\{[\r\n\t ]*return it->second;")
+    message(FATAL_ERROR
+        "HTTP/2 server streams must be unique, ordered, client-owned, and capacity bounded")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
     message(FATAL_ERROR
         "detached HTTP/2 server stream close must own exception-safe removal")
