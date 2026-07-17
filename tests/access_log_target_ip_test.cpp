@@ -22,7 +22,7 @@ int main() {
     ctx.outbound.connected_target_addr = net::ip::address{};
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::OK);
-    assert(event.remote_ip == "192.0.2.10");
+    assert(event.remote_ip.empty());
 
     ctx.outbound.connected_target_addr.reset();
     ctx.outbound.target.resolved_addr.reset();
