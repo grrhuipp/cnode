@@ -1146,29 +1146,20 @@ bool Worker::ListenerState::StartUdpListening(
     auto replacement_worker =
         std::make_unique<proxyman::inbound::UdpWorker>(
             binding.tag, std::move(handler));
-    auto slot_it = listener_slots.try_emplace(binding.tag).first;
-    auto worker_it = udp_workers.try_emplace(binding.tag).first;
-
-    if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
-        ResetUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
-    } else if (worker_it->second) {
-        worker_it->second->Close();
-    }
-
-    worker_it->second = std::move(replacement_worker);
-    auto& listener_slot = slot_it->second;
+    ListenerKeys prepared_socket_keys;
+    decltype(udp_socket_tags) prepared_socket_tags;
 
     const auto listen_candidates = binding.listen.Candidates();
+    prepared_socket_keys.reserve(listen_candidates.size());
+    prepared_socket_tags.reserve(listen_candidates.size());
     size_t bound_count = 0;
 
     for (const auto& addr : listen_candidates) {
         const std::string listen_addr = addr.to_string();
         IoErrorCode ec;
         udp::endpoint ep(addr, binding.port);
-        auto* current_udp_worker = worker_it->second.get();
         auto candidate_sock =
-            current_udp_worker->MakeSocket(worker.runtime_->io_context);
+            replacement_worker->MakeSocket(worker.runtime_->io_context);
 
         auto fail_candidate = [&](std::string_view op, std::string_view msg) -> bool {
             if (listen_candidates.size() > 1) {
@@ -1218,35 +1209,53 @@ bool Worker::ListenerState::StartUdpListening(
 
         const std::string socket_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
         udp::socket* bound_sock =
-            current_udp_worker->AttachSocket(socket_key, std::move(candidate_sock));
+            replacement_worker->AttachSocket(socket_key, std::move(candidate_sock));
         if (!bound_sock) {
             LOG_ERROR("Worker[{}]: failed to attach UDP socket tag={} key={}",
                       worker.id_, binding.tag, socket_key);
             continue;
         }
-        udp_socket_tags[socket_key] = binding.tag;
-
-        net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      UdpReceiveLoop(worker, socket_key, binding.tag, &listener_slot),
-                      [](std::exception_ptr) {});
+        prepared_socket_keys.push_back(socket_key);
+        prepared_socket_tags.emplace(socket_key, binding.tag);
 
         ++bound_count;
-        LOG_DEBUG("worker.udp_listener ready worker={} endpoint={} tag={} protocol={} accept=SO_REUSEPORT",
-                  worker.id_,
-                  iputil::FormatEndpointForLog(listen_addr, binding.port),
-                  binding.tag,
-                  binding.protocol);
     }
 
     if (bound_count == 0) {
-        worker_it->second->Close();
-        udp_workers.erase(worker_it);
-        listener_slot.udp_binding.reset();
         LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
         return false;
     }
+
+    auto slot_it = listener_slots.try_emplace(binding.tag).first;
+    auto worker_it = udp_workers.try_emplace(binding.tag).first;
+    udp_socket_tags.reserve(
+        udp_socket_tags.size() + prepared_socket_tags.size());
+
+    if (replacing) {
+        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
+        ResetUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
+    } else if (worker_it->second) {
+        worker_it->second->Close();
+    }
+
+    worker_it->second = std::move(replacement_worker);
+    udp_socket_tags.merge(prepared_socket_tags);
+    auto& listener_slot = slot_it->second;
     listener_slot.udp_binding = std::move(committed_binding);
+
+    for (const auto& socket_key : prepared_socket_keys) {
+        auto* bound_sock = worker_it->second->FindSocket(socket_key);
+        if (!bound_sock) {
+            continue;
+        }
+        net::co_spawn(worker.runtime_->io_context.get_executor(),
+                      UdpReceiveLoop(worker, socket_key, binding.tag, &listener_slot),
+                      [](std::exception_ptr) {});
+
+        LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
+                  worker.id_, socket_key, binding.tag, binding.protocol);
+    }
     return true;
 }
 

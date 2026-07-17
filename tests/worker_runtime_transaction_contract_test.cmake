@@ -132,3 +132,27 @@ require_reuse_before_restart(
     "ReplaceHandler"
     "ResetUdpListening"
     "UDP")
+
+string(FIND "${WORKER_SOURCE}"
+    "bool Worker::ListenerState::StartUdpListening" UDP_START_BEGIN)
+string(FIND "${WORKER_SOURCE}"
+    "net::awaitable<void> Worker::ListenerState::UdpReceiveLoop" UDP_START_END)
+math(EXPR UDP_START_LENGTH "${UDP_START_END} - ${UDP_START_BEGIN}")
+string(SUBSTRING "${WORKER_SOURCE}"
+    ${UDP_START_BEGIN} ${UDP_START_LENGTH} UDP_START_SOURCE)
+string(FIND "${UDP_START_SOURCE}"
+    "if (bound_count == 0)" UDP_BIND_FAILURE_POS)
+string(FIND "${UDP_START_SOURCE}"
+    "ResetUdpListening" UDP_REPLACE_COMMIT_POS)
+string(FIND "${UDP_START_SOURCE}"
+    "worker_it->second = std::move(replacement_worker)" UDP_WORKER_COMMIT_POS)
+string(FIND "${UDP_START_SOURCE}"
+    "net::co_spawn" UDP_RECEIVE_START_POS)
+if(UDP_BIND_FAILURE_POS EQUAL -1 OR UDP_REPLACE_COMMIT_POS EQUAL -1 OR
+   UDP_WORKER_COMMIT_POS EQUAL -1 OR UDP_RECEIVE_START_POS EQUAL -1 OR
+   NOT UDP_BIND_FAILURE_POS LESS UDP_REPLACE_COMMIT_POS OR
+   NOT UDP_REPLACE_COMMIT_POS LESS UDP_WORKER_COMMIT_POS OR
+   NOT UDP_WORKER_COMMIT_POS LESS UDP_RECEIVE_START_POS)
+    message(FATAL_ERROR
+        "UDP listener replacement must bind before retiring the live worker and start receive loops only after commit")
+endif()
