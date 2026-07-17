@@ -309,6 +309,15 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacket(
             ? ErrorCode::RELAY_TIMEOUT
             : MapAsioError(e.code());
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
+        co_return result;
+    } catch (const std::bad_alloc&) {
+        MarkAbortiveCloseIfSupported(client);
+        MarkAbortiveCloseIfSupported(target);
+        RelayResult result;
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        result.error_msg = "first packet allocation failed";
         co_return result;
     } catch (const std::exception& e) {
         MarkAbortiveCloseIfSupported(client);
@@ -316,6 +325,8 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacket(
         RelayResult result;
         result.error = ErrorCode::RELAY_WRITE_FAILED;
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
         co_return result;
     }
 }
@@ -351,6 +362,15 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketBuffer(
             ? ErrorCode::RELAY_TIMEOUT
             : MapAsioError(e.code());
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
+        co_return result;
+    } catch (const std::bad_alloc&) {
+        MarkAbortiveCloseIfSupported(client);
+        MarkAbortiveCloseIfSupported(target);
+        RelayResult result;
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        result.error_msg = "first packet allocation failed";
         co_return result;
     } catch (const std::exception& e) {
         MarkAbortiveCloseIfSupported(client);
@@ -358,6 +378,8 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketBuffer(
         RelayResult result;
         result.error = ErrorCode::RELAY_WRITE_FAILED;
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
         co_return result;
     }
 }
@@ -392,6 +414,15 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketMultiBuffer(
             ? ErrorCode::RELAY_TIMEOUT
             : MapAsioError(e.code());
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
+        co_return result;
+    } catch (const std::bad_alloc&) {
+        MarkAbortiveCloseIfSupported(client);
+        MarkAbortiveCloseIfSupported(target);
+        RelayResult result;
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        result.error_msg = "first packet allocation failed";
         co_return result;
     } catch (const std::exception& e) {
         MarkAbortiveCloseIfSupported(client);
@@ -399,6 +430,8 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketMultiBuffer(
         RelayResult result;
         result.error = ErrorCode::RELAY_WRITE_FAILED;
         result.error_msg = std::string("first packet error: ") + e.what();
+        result.client_closed_first = false;
+        result.close_side_known = true;
         co_return result;
     }
 }

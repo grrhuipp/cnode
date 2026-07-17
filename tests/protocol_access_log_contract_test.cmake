@@ -210,6 +210,24 @@ if(NOT RELAY_SOURCE MATCHES
         "relay must capture the first terminal endpoint and publish its close-side evidence")
 endif()
 
+string(REGEX MATCHALL
+       "result[.]client_closed_first = false"
+       FIRST_PACKET_REMOTE_FAILURES
+       "${RELAY_SOURCE}")
+list(LENGTH FIRST_PACKET_REMOTE_FAILURES FIRST_PACKET_REMOTE_FAILURE_COUNT)
+string(REGEX MATCHALL
+       "result[.]close_side_known = true"
+       FIRST_PACKET_KNOWN_FAILURES
+       "${RELAY_SOURCE}")
+list(LENGTH FIRST_PACKET_KNOWN_FAILURES FIRST_PACKET_KNOWN_FAILURE_COUNT)
+if(NOT FIRST_PACKET_REMOTE_FAILURE_COUNT EQUAL 6 OR
+   NOT FIRST_PACKET_KNOWN_FAILURE_COUNT EQUAL 6 OR
+   NOT RELAY_SOURCE MATCHES
+       "result[.]error = ErrorCode::RESOURCE_EXHAUSTED;[\r\n ]*result[.]error_msg = .first packet allocation failed.")
+    message(FATAL_ERROR
+        "first-packet target failures must report Remote while allocation failures stay local")
+endif()
+
 foreach(SOURCE IN ITEMS
         VMESS_INBOUND_SOURCE
         VLESS_INBOUND_SOURCE
