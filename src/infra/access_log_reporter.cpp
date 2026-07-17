@@ -859,7 +859,30 @@ public:
             return false;
         }
         spool_path_ = ResolveSpoolPath(log_dir);
-        thread_ = std::thread([this] { Run(); });
+        auto spool = std::make_unique<Spool>(spool_path_);
+        if (!spool->Initialize()) {
+            LOG_ERROR("access-log reporter initialization failed spool={}",
+                      spool_path_.string());
+            return false;
+        }
+        LOG_INFO(
+            "access-log reporter ready endpoint={} target={} spool={} pending_bytes={}",
+            kServiceBaseUrl,
+            kBatchTarget,
+            spool_path_.string(),
+            spool->Bytes());
+        spool_ = std::move(spool);
+        try {
+            thread_ = std::thread([this] { Run(); });
+        } catch (const std::exception& e) {
+            LOG_ERROR("access-log reporter thread start failed: {}", e.what());
+            spool_.reset();
+            return false;
+        } catch (...) {
+            LOG_ERROR("access-log reporter thread start failed: unknown");
+            spool_.reset();
+            return false;
+        }
         initialized_.store(true, std::memory_order_release);
         return true;
     }
@@ -1018,19 +1041,7 @@ private:
     }
 
     void Run() noexcept {
-        Spool spool(spool_path_);
-        const bool spool_ready = spool.Initialize();
-        if (!spool_ready) {
-            LOG_ERROR("access-log reporter disabled persistence path={}",
-                      spool_path_.string());
-        } else {
-            LOG_INFO(
-                "access-log reporter ready endpoint={} target={} spool={} pending_bytes={}",
-                kServiceBaseUrl,
-                kBatchTarget,
-                spool_path_.string(),
-                spool.Bytes());
-        }
+        Spool& spool = *spool_;
 
         std::vector<Event> dequeue_buffer(kMaxBatchEvents);
         auto retry_delay = kInitialRetry;
@@ -1046,7 +1057,7 @@ private:
                 if (queued > 0 && !first_queued_at) {
                     first_queued_at = now;
                 }
-                if (spool_ready && queued > 0 &&
+                if (queued > 0 &&
                     (queued >= kMaxBatchEvents ||
                      now - *first_queued_at >= kFlushInterval)) {
                     DrainOneBatch(spool, dequeue_buffer);
@@ -1055,7 +1066,7 @@ private:
                         : std::nullopt;
                 }
 
-                if (spool_ready && !spool.Empty() && now >= next_send) {
+                if (!spool.Empty() && now >= next_send) {
                     const Spool::Entry* entry = spool.Front();
                     auto payload = spool.ReadFront();
                     if (!entry || !payload) {
@@ -1106,7 +1117,7 @@ private:
                 if (first_queued_at) {
                     wake_at = std::min(wake_at, *first_queued_at + kFlushInterval);
                 }
-                if (spool_ready && !spool.Empty()) {
+                if (!spool.Empty()) {
                     wake_at = std::min(wake_at, next_send);
                 }
                 std::unique_lock lock(wake_mutex_);
@@ -1116,16 +1127,8 @@ private:
                 });
             }
 
-            if (spool_ready) {
-                while (queued_.load(std::memory_order_acquire) > 0) {
-                    DrainOneBatch(spool, dequeue_buffer);
-                }
-            } else {
-                Event dropped;
-                while (queue_.try_dequeue(dropped)) {
-                    queued_.fetch_sub(1, std::memory_order_release);
-                    dropped_events_.fetch_add(1, std::memory_order_relaxed);
-                }
+            while (queued_.load(std::memory_order_acquire) > 0) {
+                DrainOneBatch(spool, dequeue_buffer);
             }
             ReportDropsIfNeeded();
         } catch (const std::exception& e) {
@@ -1154,6 +1157,7 @@ private:
     std::atomic_bool initialized_{false};
     std::mutex lifecycle_mutex_;
     std::filesystem::path spool_path_;
+    std::unique_ptr<Spool> spool_;
     HttpsBatchClient client_;
     std::mutex wake_mutex_;
     std::condition_variable wake_;
