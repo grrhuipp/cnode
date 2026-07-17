@@ -161,7 +161,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     if (ctx.content.network == Network::MUX) {
         // The Mux control connection contains framing bytes and would double
         // count traffic. Its logical TCP/UDP sub-sessions are reported instead.
-        access_log.Cancel();
+        access_log.Suppress();
     }
 
     RelayResult result = co_await DispatchPreparedLink(

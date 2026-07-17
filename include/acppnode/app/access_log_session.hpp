@@ -6,9 +6,9 @@
 
 namespace acpp::app {
 
-// One guard may exist at the inbound boundary and another at Dispatcher. Only
-// successfully completed logical proxy requests are submitted. The Context
-// flag makes successful terminal submission idempotent.
+// One guard may exist at the inbound boundary and another at Dispatcher. Each
+// authenticated logical proxy request submits one terminal result. The Context
+// flag makes terminal submission idempotent.
 class AccessLogSession final {
 public:
     explicit AccessLogSession(session::Context& ctx) noexcept;
@@ -20,21 +20,24 @@ public:
     AccessLogSession& operator=(AccessLogSession&&) = delete;
 
     void Complete(const RelayResult& result) noexcept;
-    void Cancel() noexcept;
+    // Mux/control transports are containers rather than logical requests.
+    void Suppress() noexcept;
 
 private:
     session::Context* ctx_ = nullptr;
     accesslog::CloseSide close_side_ = accesslog::CloseSide::Unknown;
     uint64_t bytes_up_ = 0;
     uint64_t bytes_down_ = 0;
-    bool completed_ = false;
-    bool cancelled_ = false;
+    ErrorCode error_code_ = ErrorCode::INTERNAL;
+    bool terminal_ = false;
+    bool suppressed_ = false;
 };
 
 [[nodiscard]] accesslog::Event BuildAccessLogEvent(
     const session::Context& ctx,
     accesslog::CloseSide close_side,
     uint64_t bytes_up,
-    uint64_t bytes_down);
+    uint64_t bytes_down,
+    ErrorCode error_code);
 
 }  // namespace acpp::app

@@ -5,6 +5,9 @@ endif()
 file(READ
     "${SOURCE_DIR}/src/infra/access_log_reporter.cpp"
     REPORTER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/access_log_session.cpp"
+    SESSION_SOURCE)
 
 string(FIND "${REPORTER_SOURCE}" "auto spool = std::make_unique<Spool>(spool_path_)"
        SPOOL_INITIALIZE_POSITION)
@@ -38,4 +41,16 @@ if(NOT REPORTER_SOURCE MATCHES
        "if [(]spool[.]DiscardFront[(][)][)]")
     message(FATAL_ERROR
         "unreadable batches must remain owned until their file is removed")
+endif()
+
+if(SESSION_SOURCE MATCHES
+       "if [(]result[.]error != ErrorCode::OK[)]" OR
+   SESSION_SOURCE MATCHES
+       "AccessLogSession::Cancel" OR
+   NOT SESSION_SOURCE MATCHES
+       "error_code_ = result[.]error" OR
+   NOT SESSION_SOURCE MATCHES
+       "AccessLogSession::Suppress")
+    message(FATAL_ERROR
+        "logical request failures must be reported; only container sessions may be suppressed")
 endif()

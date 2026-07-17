@@ -302,7 +302,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_DEBUG(ctx, "[Session] Transport consumed connection ({}/{})",
                        listener.stream_settings.security,
                        listener.stream_settings.network);
-        access_log.Cancel();
+        access_log.Suppress();
         co_return;
     }
 
