@@ -32,7 +32,7 @@ void AccessLogSession::Complete(const RelayResult& result) noexcept {
     bytes_up_ = result.bytes_up;
     bytes_down_ = result.bytes_down;
     error_code_ = result.error;
-    if (result.error == ErrorCode::OK) {
+    if (result.close_side_known || result.error == ErrorCode::OK) {
         close_side_ = result.client_closed_first
             ? accesslog::CloseSide::Client
             : accesslog::CloseSide::Remote;

@@ -669,6 +669,7 @@ net::awaitable<RelayResult> DoRelayLink(
     result.error = relay_detail::SelectRelayError(error_up, error_down);
     result.client_closed_first =
         relay_detail::ClientSideErrorFirst(error_up, error_down);
+    result.close_side_known = true;
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -814,6 +815,7 @@ net::awaitable<RelayResult> DoRelayLink(
     result.error = relay_detail::SelectRelayError(error_up, error_down);
     result.client_closed_first =
         relay_detail::ClientSideErrorFirst(error_up, error_down);
+    result.close_side_known = true;
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -987,6 +989,7 @@ net::awaitable<RelayResult> DoRelayLink(
     result.client_closed_first = first_error != ErrorCode::OK
         ? first_error_from_client
         : relay_detail::ClientSideErrorFirst(up_result.second, down_result.second);
+    result.close_side_known = true;
     if (first_error != ErrorCode::OK) {
         result.error = first_error;
     } else if (up_result.second != ErrorCode::OK) {

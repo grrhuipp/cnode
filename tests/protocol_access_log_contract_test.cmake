@@ -42,6 +42,9 @@ file(READ
     "${SOURCE_DIR}/src/app/relay_udp.cpp"
     UDP_RELAY_SOURCE)
 file(READ
+    "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
+    RELAY_SOURCE)
+file(READ
     "${SOURCE_DIR}/src/common/mux/mux_relay.cpp"
     MUX_RELAY_SOURCE)
 file(READ
@@ -145,6 +148,14 @@ if(UDP_SEND_POSITION EQUAL -1 OR UDP_ACCOUNT_POSITION EQUAL -1 OR
        "result[.]error = send_result")
     message(FATAL_ERROR
         "UDP access traffic must be accounted only after a successful datagram send")
+endif()
+
+if(NOT RELAY_SOURCE MATCHES
+       "result[.]close_side_known = true" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "result[.]close_side_known = true")
+    message(FATAL_ERROR
+        "relay close-side evidence must reach access logging")
 endif()
 
 foreach(SOURCE IN ITEMS

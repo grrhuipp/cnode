@@ -57,6 +57,14 @@ if(NOT SESSION_SOURCE MATCHES
     message(FATAL_ERROR
         "pre-dispatch transport and protocol failures must reach the access-log terminal path")
 endif()
+
+if(NOT SESSION_SOURCE MATCHES
+       "result[.]close_side_known" OR
+   NOT SESSION_SOURCE MATCHES
+       "result[.]client_closed_first")
+    message(FATAL_ERROR
+        "relay failures with a known closer must retain their access-log close side")
+endif()
 if(NOT REPORTER_SOURCE MATCHES
        "if [(][!]spool->Initialize[(][)][)]" OR
    NOT REPORTER_SOURCE MATCHES

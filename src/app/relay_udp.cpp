@@ -211,6 +211,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 LOG_CONN_DEBUG(ctx, "UDP relay: client EOF, up={}B down={}B",
                                result.bytes_up, result.bytes_down);
                 result.client_closed_first = true;
+                result.close_side_known = true;
                 break;
             }
             if (!datagram_info.Valid()) {

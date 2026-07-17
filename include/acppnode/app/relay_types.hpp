@@ -29,6 +29,7 @@ struct RelayResult : ResultStatus {
     uint64_t bytes_up = 0;
     uint64_t bytes_down = 0;
     bool client_closed_first = false;
+    bool close_side_known = false;
 };
 
 }  // namespace acpp
