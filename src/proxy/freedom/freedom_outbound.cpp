@@ -322,6 +322,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                        transport_target.candidates.size());
     }
 
+    ctx.outbound.connected_target_addr.reset();
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_FAIL_CTX(ctx, "DIAL_FAILED {} -> {} via {}: {}",
@@ -338,6 +339,9 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     net::ip::address local_ip{};
     if (auto remote_ep = stream->RemoteEndpoint()) {
         remote_ip = iputil::NormalizeAddress(remote_ep->address());
+        if (!remote_ip.is_unspecified()) {
+            ctx.outbound.connected_target_addr = remote_ip;
+        }
     }
     if (auto local_ep = stream->LocalEndpoint()) {
         local_ip = iputil::NormalizeAddress(local_ep->address());

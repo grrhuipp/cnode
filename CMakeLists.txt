@@ -355,6 +355,7 @@ set(CNODE_SOURCES
     src/transport/internet/proxy_protocol.cpp
 
     # App (Application layer)
+    src/app/access_log_event.cpp
     src/app/access_log_session.cpp
     src/app/dispatcher/default_dispatcher.cpp
     src/app/mux_session_handler.cpp
@@ -1450,6 +1451,29 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_access_log_wire_test
         COMMAND cnode_access_log_wire_test)
+
+    add_executable(cnode_access_log_target_ip_test
+        tests/access_log_target_ip_test.cpp
+        src/app/access_log_event.cpp
+    )
+    target_include_directories(cnode_access_log_target_ip_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_access_log_target_ip_test PRIVATE
+        asio::asio
+    )
+    if(WIN32)
+        target_link_libraries(cnode_access_log_target_ip_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_access_log_target_ip_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_access_log_target_ip_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_access_log_target_ip_test
+        COMMAND cnode_access_log_target_ip_test)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp

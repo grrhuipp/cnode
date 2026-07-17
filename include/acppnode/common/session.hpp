@@ -53,6 +53,9 @@ struct Outbound {
     TargetAddress original_target;
     TargetAddress target;
     TargetAddress route_target;
+    // The final destination address confirmed by a direct outbound after a
+    // successful dial. Proxy next-hop addresses must never be stored here.
+    std::optional<net::ip::address> connected_target_addr;
     std::string_view tag;
 };
 
