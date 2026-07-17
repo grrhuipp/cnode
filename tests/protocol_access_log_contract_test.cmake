@@ -205,6 +205,18 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES
 endif()
 
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "report_child_creation_failure" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "report_child_creation_failure[(][\r\n ]*sid,[\r\n ]*TargetAddress[{][}]" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "ErrorCode::PROTOCOL_INVALID_ADDRESS" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "uot_version [?] Network::UDP : Network::TCP")
+    message(FATAL_ERROR
+        "AnyTLS logical child creation failures must reach access logging")
+endif()
+
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
        "AnyTLS substream cancelled" OR
    ANYTLS_INBOUND_SOURCE MATCHES
        "if [(]ec[)] [{][\r\n ]*co_return buf::MultiBuffer[{][}]" OR

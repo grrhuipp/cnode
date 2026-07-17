@@ -779,6 +779,22 @@ AnyTLSDemuxSession::FinishRun(RelayResult result) {
 
 net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
     RelayResult result;
+    auto report_child_creation_failure = [this](
+            uint32_t sid,
+            const TargetAddress& target,
+            Network network,
+            ErrorCode error) {
+        session::Context ctx;
+        CopySessionContext(base_ctx_, ctx);
+        ctx.outbound.original_target = target;
+        ctx.outbound.target = target;
+        ctx.outbound.route_target = target;
+        ctx.content.network = network;
+        app::AccessLogSession access_log(ctx);
+        access_log.Fail(error);
+        RemoveStream(sid);
+    };
+
     while (!cancelled_) {
         auto header = co_await anytls::ReadFrameHeader(*stream_);
         if (!header) {
@@ -917,15 +933,26 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
                 auto target = ParseSocksAddress(*payload, header->length);
                 payload->clear();
                 if (!target) {
+                    report_child_creation_failure(
+                        sid,
+                        TargetAddress{},
+                        Network::TCP,
+                        ErrorCode::PROTOCOL_INVALID_ADDRESS);
                     result.error = ErrorCode::PROTOCOL_INVALID_ADDRESS;
                     co_return co_await FinishRun(std::move(result));
                 }
+                const auto uot_version =
+                    proxy::uot::VersionFromMagicAddress(*target);
                 if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid, {}); !ok) {
+                    report_child_creation_failure(
+                        sid,
+                        uot_version ? TargetAddress{} : *target,
+                        uot_version ? Network::UDP : Network::TCP,
+                        ok.error());
                     result.error = ok.error();
                     co_return co_await FinishRun(std::move(result));
                 }
-                if (const auto uot_version =
-                        proxy::uot::VersionFromMagicAddress(*target)) {
+                if (uot_version) {
                     if (*uot_version == proxy::uot::Version::V2) {
                         state_it->second = StreamState::PendingUotRequest;
                         break;
