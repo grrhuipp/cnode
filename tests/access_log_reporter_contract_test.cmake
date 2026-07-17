@@ -24,3 +24,18 @@ if(NOT REPORTER_SOURCE MATCHES
     message(FATAL_ERROR
         "access-log Initialize must fail closed and hand one prepared spool to Run")
 endif()
+
+if(REPORTER_SOURCE MATCHES "QuarantineFront" OR
+   REPORTER_SOURCE MATCHES "replace_extension[(]\"[.]bad\"[)]" OR
+   REPORTER_SOURCE MATCHES "ignoring malformed spool file" OR
+   REPORTER_SOURCE MATCHES "ignoring invalid spool file")
+    message(FATAL_ERROR
+        "access-log spool must not abandon invalid files outside its capacity accounting")
+endif()
+if(NOT REPORTER_SOURCE MATCHES
+       "bool DiscardFront[(][)]" OR
+   NOT REPORTER_SOURCE MATCHES
+       "if [(]spool[.]DiscardFront[(][)][)]")
+    message(FATAL_ERROR
+        "unreadable batches must remain owned until their file is removed")
+endif()

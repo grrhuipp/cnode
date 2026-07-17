@@ -638,9 +638,13 @@ public:
                 continue;
             }
             const auto path = it->path();
-            if (path.extension() == ".tmp") {
+            if (path.extension() == ".tmp" || path.extension() == ".bad") {
                 std::filesystem::remove(path, ec);
-                ec.clear();
+                if (ec) {
+                    LOG_ERROR("access-log reporter: cannot remove stale spool file {}: {}",
+                              path.string(), ec.message());
+                    return false;
+                }
                 continue;
             }
             if (path.extension() != ".batch") {
@@ -650,8 +654,14 @@ public:
             const size_t underscore = stem.rfind('_');
             if (underscore == std::string::npos ||
                 !IsHexId(std::string_view(stem).substr(underscore + 1))) {
-                LOG_WARN("access-log reporter: ignoring malformed spool file {}",
+                LOG_WARN("access-log reporter: removing malformed spool file {}",
                          path.string());
+                std::filesystem::remove(path, ec);
+                if (ec) {
+                    LOG_ERROR("access-log reporter: cannot remove malformed spool file {}: {}",
+                              path.string(), ec.message());
+                    return false;
+                }
                 continue;
             }
             uint64_t event_count = 0;
@@ -671,9 +681,20 @@ public:
             }
             const uint64_t size = std::filesystem::file_size(path, ec);
             if (ec || size > kMaxSpoolFileBytes) {
-                LOG_WARN("access-log reporter: ignoring invalid spool file {}",
-                         path.string());
+                const auto size_error = ec;
                 ec.clear();
+                LOG_WARN("access-log reporter: removing invalid spool file {}",
+                         path.string());
+                std::filesystem::remove(path, ec);
+                if (ec) {
+                    LOG_ERROR("access-log reporter: cannot remove invalid spool file {}: {}",
+                              path.string(), ec.message());
+                    return false;
+                }
+                if (size_error) {
+                    LOG_WARN("access-log reporter: invalid spool size for {}: {}",
+                             path.string(), size_error.message());
+                }
                 continue;
             }
             loaded.push_back({
@@ -817,16 +838,18 @@ public:
         return true;
     }
 
-    void QuarantineFront() {
+    bool DiscardFront() {
         if (entries_.empty()) {
-            return;
+            return false;
         }
-        auto bad_path = entries_.front().path;
-        bad_path.replace_extension(".bad");
         std::error_code ec;
-        std::filesystem::rename(entries_.front().path, bad_path, ec);
+        std::filesystem::remove(entries_.front().path, ec);
+        if (ec) {
+            return false;
+        }
         bytes_ -= entries_.front().bytes;
         entries_.pop_front();
+        return true;
     }
 
 private:
@@ -1071,11 +1094,15 @@ private:
                     auto payload = spool.ReadFront();
                     if (!entry || !payload) {
                         if (entry) {
-                            LOG_ERROR("access-log reporter: quarantining unreadable batch {}",
+                            LOG_ERROR("access-log reporter: discarding unreadable batch {}",
                                       entry->path.string());
                         }
-                        spool.QuarantineFront();
-                        next_send = now;
+                        if (spool.DiscardFront()) {
+                            next_send = now;
+                        } else {
+                            LOG_ERROR("access-log reporter: cannot discard unreadable batch");
+                            next_send = now + retry_delay;
+                        }
                         continue;
                     }
 
