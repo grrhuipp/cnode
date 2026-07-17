@@ -175,6 +175,27 @@ SslContext* AcquireClientRealityContext(const RealityConfig& reality,
     return {};
 }
 
+[[nodiscard]] size_t CountHeadersCI(
+    std::string_view request,
+    std::string_view name) {
+    size_t count = 0;
+    size_t line_start = 0;
+    while (line_start < request.size()) {
+        const size_t line_end = request.find("\r\n", line_start);
+        if (line_end == std::string_view::npos || line_end == line_start) {
+            break;
+        }
+        const std::string_view line = request.substr(line_start, line_end - line_start);
+        if (const size_t colon = line.find(':');
+            colon != std::string_view::npos &&
+            EqualsAsciiCI(line.substr(0, colon), name)) {
+            ++count;
+        }
+        line_start = line_end + 2;
+    }
+    return count;
+}
+
 [[nodiscard]] std::string_view ExtractRequestLine(std::string_view request) {
     const size_t end = request.find("\r\n");
     if (end == std::string_view::npos) {
@@ -4837,6 +4858,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         ExtractHeaderValueCI(request, "Transfer-Encoding");
     const std::string_view content_length_header =
         TrimAscii(ExtractHeaderValueCI(request, "Content-Length"));
+    const size_t transfer_encoding_count =
+        CountHeadersCI(request, "Transfer-Encoding");
+    const size_t content_length_count =
+        CountHeadersCI(request, "Content-Length");
     const std::string_view expect_header =
         ExtractHeaderValueCI(request, "Expect");
     const bool request_chunked = HeaderContainsTokenCI(transfer_encoding, "chunked");
@@ -4919,10 +4944,11 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         const bool valid_content_length =
-            transfer_encoding.empty() && !content_length_header.empty() &&
+            transfer_encoding_count == 0 && content_length_count == 1 &&
+            !content_length_header.empty() &&
             content_length.has_value();
         const bool valid_chunked =
-            content_length_header.empty() &&
+            content_length_count == 0 && transfer_encoding_count == 1 &&
             EqualsAsciiCI(TrimAscii(transfer_encoding), "chunked");
         if (!valid_content_length && !valid_chunked) {
             LOG_ACCESS_DEBUG(

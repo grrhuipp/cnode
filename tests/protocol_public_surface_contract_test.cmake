@@ -115,8 +115,6 @@ endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES
        "const bool valid_content_length" OR
    NOT TRANSPORT_STACK_SOURCE MATCHES
-       "transfer_encoding[.]empty[(][)] && [!]content_length_header[.]empty[(][)]" OR
-   NOT TRANSPORT_STACK_SOURCE MATCHES
        "EqualsAsciiCI[(]TrimAscii[(]transfer_encoding[)], \"chunked\"[)]" OR
    NOT TRANSPORT_STACK_SOURCE MATCHES
        "if [(][!]valid_content_length && [!]valid_chunked[)]")
@@ -135,6 +133,17 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
        "FailChunkedRead[(]\"invalid HTTP/1 chunk terminator\"[)]")
     message(FATAL_ERROR
         "malformed HTTP/1 chunks must fail the request instead of becoming normal EOF")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "CountHeadersCI[(]request, \"Transfer-Encoding\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "CountHeadersCI[(]request, \"Content-Length\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "transfer_encoding_count == 0 && content_length_count == 1" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "content_length_count == 0 && transfer_encoding_count == 1")
+    message(FATAL_ERROR
+        "H1 XHTTP packet framing must reject duplicate CL and TE headers")
 endif()
 if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
        "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
