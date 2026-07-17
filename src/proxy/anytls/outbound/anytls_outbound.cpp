@@ -815,6 +815,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     auto& stream = *session->stream;
+    if (auto local_ep = stream.LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
     stream.SetIdleTimeout(timeouts.HandshakeTimeout());
     auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
 

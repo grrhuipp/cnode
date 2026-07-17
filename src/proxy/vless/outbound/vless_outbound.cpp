@@ -712,6 +712,10 @@ proxy::vless::outbound::Handler::Process(
 
     auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
+    if (auto local_ep = stream->LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
     LOG_ACCESS(FormatAccessLog(ctx));
 
     auto fail_abortive = [&](ErrorCode error) {

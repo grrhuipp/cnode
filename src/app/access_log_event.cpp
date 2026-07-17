@@ -91,6 +91,9 @@ accesslog::Event BuildAccessLogEvent(
     if (event.remote_ip.empty() && target.resolved_addr) {
         event.remote_ip = AddressString(*target.resolved_addr);
     }
+    if (ctx.outbound.connected_local_addr) {
+        event.local_ip = AddressString(*ctx.outbound.connected_local_addr);
+    }
     if (event.target_host.empty()) {
         event.target_host = event.remote_ip;
     }

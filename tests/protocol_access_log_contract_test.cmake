@@ -11,6 +11,15 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp"
     ANYTLS_OUTBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp"
+    VMESS_OUTBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/ss_outbound.cpp"
+    SHADOWSOCKS_OUTBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/freedom/freedom_outbound.cpp"
+    FREEDOM_OUTBOUND_SOURCE)
 
 foreach(SOURCE IN ITEMS
         VLESS_OUTBOUND_SOURCE
@@ -32,3 +41,16 @@ if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "AnyTLS open-packet payload must be sent once and counted as access traffic")
 endif()
+
+foreach(SOURCE IN ITEMS
+        VMESS_OUTBOUND_SOURCE
+        VLESS_OUTBOUND_SOURCE
+        TROJAN_OUTBOUND_SOURCE
+        SHADOWSOCKS_OUTBOUND_SOURCE
+        ANYTLS_OUTBOUND_SOURCE
+        FREEDOM_OUTBOUND_SOURCE)
+    if(NOT "${${SOURCE}}" MATCHES "connected_local_addr")
+        message(FATAL_ERROR
+            "${SOURCE}: established outbound local IP must reach access-log metadata")
+    endif()
+endforeach()

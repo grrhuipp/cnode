@@ -12,10 +12,12 @@ int main() {
     ctx.outbound.target.resolved_addr = net::ip::make_address("192.0.2.10");
 
     ctx.outbound.connected_target_addr = net::ip::make_address("192.0.2.20");
+    ctx.outbound.connected_local_addr = net::ip::make_address("2001:db8::10");
     auto event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::OK);
     assert(event.target_host == "www.example.com");
     assert(event.remote_ip == "192.0.2.20");
+    assert(event.local_ip == "2001:db8::10");
 
     ctx.outbound.connected_target_addr = net::ip::address{};
     event = app::BuildAccessLogEvent(
