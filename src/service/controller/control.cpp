@@ -132,6 +132,7 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
     if (access_source_ref == 0) {
         LOG_ERROR("Node {}/{}: centralized access-log source registration failed api={}",
                   panel_name, node_id, client_info.APIHost);
+        co_return false;
     }
 
     std::exception_ptr publish_failure;
