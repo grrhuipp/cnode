@@ -15,6 +15,18 @@ file(READ
     "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp"
     ANYTLS_INBOUND_SOURCE)
 file(READ
+    "${SOURCE_DIR}/src/proxy/vmess/inbound/vmess_inbound.cpp"
+    VMESS_INBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/vless/inbound/vless_inbound.cpp"
+    VLESS_INBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp"
+    TROJAN_INBOUND_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/proxy/shadowsocks/inbound/ss_inbound.cpp"
+    SHADOWSOCKS_INBOUND_SOURCE)
+file(READ
     "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp"
     VMESS_OUTBOUND_SOURCE)
 file(READ
@@ -45,6 +57,19 @@ if(ACCESS_LOG_EVENT_SOURCE MATCHES
     message(FATAL_ERROR
         "DNS candidates must not be reported as an established remote IP")
 endif()
+
+foreach(SOURCE IN ITEMS
+        VMESS_INBOUND_SOURCE
+        VLESS_INBOUND_SOURCE
+        TROJAN_INBOUND_SOURCE
+        SHADOWSOCKS_INBOUND_SOURCE
+        ANYTLS_INBOUND_SOURCE)
+    if(NOT "${${SOURCE}}" MATCHES "device_limit" OR
+       NOT "${${SOURCE}}" MATCHES "ErrorCode::PERMISSION_DENIED")
+        message(FATAL_ERROR
+            "${SOURCE}: device-limit policy must be reported as a rejection")
+    endif()
+endforeach()
 
 if(ANYTLS_INBOUND_SOURCE MATCHES "access_event_submitted" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES

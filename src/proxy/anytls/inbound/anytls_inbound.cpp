@@ -1017,7 +1017,7 @@ Handler::Process(
                     validator_.OnlineDeviceCount(ctx.inbound.tag, uid));
                 stats_->OnError();
                 RelayResult result;
-                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                result.error = ErrorCode::PERMISSION_DENIED;
                 co_return result;
             }
             validator_.OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);

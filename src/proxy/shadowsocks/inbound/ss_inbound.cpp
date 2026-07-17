@@ -202,7 +202,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
             profile.device_limit,
             validator_.OnlineDeviceCount(tag, uid));
-        co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return fail(ErrorCode::PERMISSION_DENIED);
     }
 
     validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);

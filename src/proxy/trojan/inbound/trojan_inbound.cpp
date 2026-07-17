@@ -240,7 +240,7 @@ proxy::trojan::inbound::Handler::Process(
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,
                 validator_.OnlineDeviceCount(tag, tracked_uid));
-            co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
     }
 
