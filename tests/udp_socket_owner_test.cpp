@@ -350,7 +350,7 @@ int main() {
     size_t drained_replies = 0;
     while (auto reply = worker.BeginReplySend("bounded-replies")) {
         ++drained_replies;
-        if (!worker.CompleteReplySend("bounded-replies")) {
+        if (!worker.CompleteReplySend("bounded-replies", *reply)) {
             break;
         }
     }
@@ -358,6 +358,43 @@ int main() {
         Fail("UDP reply queue exceeded or undershot its datagram bound");
     }
     worker.ClearReplyQueue("bounded-replies");
+
+    if (!worker.EnqueueReply(
+            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+        Fail("failed to start the first UDP reply generation");
+    }
+    auto stale_reply = worker.BeginReplySend("reply-generation");
+    if (!stale_reply) {
+        Fail("failed to acquire the first UDP reply generation");
+    }
+    worker.ClearReplyQueue("reply-generation");
+
+    if (!worker.EnqueueReply(
+            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+        Fail("failed to start the replacement UDP reply generation");
+    }
+    auto active_reply = worker.BeginReplySend("reply-generation");
+    if (!active_reply) {
+        Fail("failed to acquire the replacement UDP reply generation");
+    }
+    if (worker.CompleteReplySend("reply-generation", *stale_reply)) {
+        Fail("stale UDP reply completion matched a replacement queue");
+    }
+    if (worker.EnqueueReply(
+            "reply-generation", reply_endpoint_a, make_tiny_payload())) {
+        Fail("stale UDP reply completion released a replacement queue");
+    }
+    if (!worker.CompleteReplySend("reply-generation", *active_reply)) {
+        Fail("active UDP reply completion did not release its queue");
+    }
+    auto queued_reply = worker.BeginReplySend("reply-generation");
+    if (!queued_reply) {
+        Fail("replacement UDP reply queue lost its pending datagram");
+    }
+    if (worker.CompleteReplySend("reply-generation", *queued_reply)) {
+        Fail("drained UDP reply queue still reported pending datagrams");
+    }
+    worker.ClearReplyQueue("reply-generation");
 
     acpp::proxyman::inbound::UdpSessionOwner owner_a;
     acpp::proxyman::inbound::UdpSessionOwner owner_b;

@@ -684,7 +684,8 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
             const bool current_sock =
                 udp_worker->FindSocket(tag) == sock;
 
-            const bool has_pending = udp_worker->CompleteReplySend(tag);
+            const bool has_pending =
+                udp_worker->CompleteReplySend(tag, *packet);
             if (has_pending && current_sock && sock && sock->is_open()) {
                 StartUdpReplySend(tag, sock, worker_id);
             }

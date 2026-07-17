@@ -99,7 +99,9 @@ public:
     ReplySendBuffers(const PendingUdpReply& reply) noexcept;
     [[nodiscard]] static const udp::endpoint&
     ReplyEndpoint(const PendingUdpReply& reply) noexcept;
-    [[nodiscard]] bool CompleteReplySend(const std::string& socket_key);
+    [[nodiscard]] bool CompleteReplySend(
+        const std::string& socket_key,
+        const PendingUdpReply& completed_reply);
     void ClearReplyQueue(const std::string& socket_key);
 
     [[nodiscard]] bool HasClientSession(const std::string& socket_key,

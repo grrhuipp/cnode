@@ -87,7 +87,7 @@ constexpr size_t kMaxQueuedUdpBytes = 512 * 1024;
 struct UdpReplyQueueState {
     memory::ThreadLocalDeque<UdpWorker::PendingUdpReply> pending;
     size_t queued_bytes = 0;
-    bool write_in_progress = false;
+    UdpWorker::PendingUdpReply* active_reply = nullptr;
     bool shrink_pending_on_drain = false;
 };
 
@@ -501,7 +501,7 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
             queue.pending.size(), queue.queued_bytes, payload_size)) {
         return false;
     }
-    const bool should_start_send = !queue.write_in_progress;
+    const bool should_start_send = queue.active_reply == nullptr;
     queue.queued_bytes += payload_size;
 
     PendingUdpReply reply;
@@ -528,7 +528,7 @@ bool UdpWorker::EnqueueReply(const std::string& socket_key,
             queue.pending.size(), queue.queued_bytes, payload_size)) {
         return false;
     }
-    const bool should_start_send = !queue.write_in_progress;
+    const bool should_start_send = queue.active_reply == nullptr;
     queue.queued_bytes += payload_size;
 
     PendingUdpReply reply;
@@ -550,7 +550,7 @@ UdpWorker::BeginReplySend(const std::string& socket_key) {
     }
 
     auto& queue = it->second;
-    if (queue.write_in_progress || queue.pending.empty()) {
+    if (queue.active_reply != nullptr || queue.pending.empty()) {
         return nullptr;
     }
 
@@ -558,8 +558,8 @@ UdpWorker::BeginReplySend(const std::string& socket_key) {
         new PendingUdpReply(std::move(queue.pending.front()))};
     queue.queued_bytes -= packet->PayloadSize();
     queue.pending.pop_front();
-    queue.write_in_progress = true;
     packet->PrepareSendBuffers();
+    queue.active_reply = packet.get();
     return packet;
 }
 
@@ -573,14 +573,19 @@ UdpWorker::ReplyEndpoint(const PendingUdpReply& reply) noexcept {
     return reply.endpoint;
 }
 
-bool UdpWorker::CompleteReplySend(const std::string& socket_key) {
+bool UdpWorker::CompleteReplySend(
+    const std::string& socket_key,
+    const PendingUdpReply& completed_reply) {
     auto it = impl_->reply_queues.find(socket_key);
     if (it == impl_->reply_queues.end()) {
         return false;
     }
 
     auto& queue = it->second;
-    queue.write_in_progress = false;
+    if (queue.active_reply != &completed_reply) {
+        return false;
+    }
+    queue.active_reply = nullptr;
     if (queue.pending.empty()) {
         if (queue.shrink_pending_on_drain) {
             TryShrinkSequence(queue.pending);
