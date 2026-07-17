@@ -38,6 +38,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/access_log_event.cpp"
     ACCESS_LOG_EVENT_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/relay_udp.cpp"
+    UDP_RELAY_SOURCE)
 
 foreach(SOURCE IN ITEMS
         VLESS_OUTBOUND_SOURCE
@@ -56,6 +59,20 @@ if(ACCESS_LOG_EVENT_SOURCE MATCHES
        "event[.]remote_ip = AddressString[(][*]target[.]resolved_addr[)]")
     message(FATAL_ERROR
         "DNS candidates must not be reported as an established remote IP")
+endif()
+
+string(FIND "${UDP_RELAY_SOURCE}"
+       "auto send_result = co_await session.SendTo"
+       UDP_SEND_POSITION)
+string(FIND "${UDP_RELAY_SOURCE}"
+       "ctx.traffic.bytes_up += datagram_info.payload_size"
+       UDP_ACCOUNT_POSITION)
+if(UDP_SEND_POSITION EQUAL -1 OR UDP_ACCOUNT_POSITION EQUAL -1 OR
+   NOT UDP_SEND_POSITION LESS UDP_ACCOUNT_POSITION OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "result[.]error = send_result")
+    message(FATAL_ERROR
+        "UDP access traffic must be accounted only after a successful datagram send")
 endif()
 
 foreach(SOURCE IN ITEMS

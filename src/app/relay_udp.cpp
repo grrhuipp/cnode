@@ -220,13 +220,6 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 continue;
             }
 
-            ctx.traffic.bytes_up += datagram_info.payload_size;
-            result.bytes_up += datagram_info.payload_size;
-            stats_acc.AddBytesOut(datagram_info.payload_size);
-            if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
-                FlushUdpRelayStats(stats, stats_acc);
-            }
-
             auto wait_time = upload_limiter.Consume(datagram_info.payload_size);
             if (wait_time.count() > 0) {
                 co_await upload_rate_sleep.WaitFor(wait_time);
@@ -255,6 +248,17 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             if (send_result != ErrorCode::OK) {
                 LOG_CONN_DEBUG(ctx, "UDP send failed: {}",
                                ErrorCodeToString(send_result));
+                if (result.error == ErrorCode::OK) {
+                    result.error = send_result;
+                }
+                continue;
+            }
+
+            ctx.traffic.bytes_up += datagram_info.payload_size;
+            result.bytes_up += datagram_info.payload_size;
+            stats_acc.AddBytesOut(datagram_info.payload_size);
+            if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
+                FlushUdpRelayStats(stats, stats_acc);
             }
         }
 
