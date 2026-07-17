@@ -11,6 +11,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp"
     INBOUND_HANDLER_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp"
+    DISPATCHER_SOURCE)
 
 string(FIND "${REPORTER_SOURCE}" "auto spool = std::make_unique<Spool>(spool_path_)"
        SPOOL_INITIALIZE_POSITION)
@@ -20,6 +23,16 @@ if(SPOOL_INITIALIZE_POSITION EQUAL -1 OR THREAD_START_POSITION EQUAL -1 OR
    NOT SPOOL_INITIALIZE_POSITION LESS THREAD_START_POSITION)
     message(FATAL_ERROR
         "access-log durable spool must initialize before the reporter thread starts")
+endif()
+
+if(NOT DISPATCHER_SOURCE MATCHES
+       "result = co_await DispatchPreparedLink" OR
+   NOT DISPATCHER_SOURCE MATCHES
+       "dispatcher request exception" OR
+   NOT DISPATCHER_SOURCE MATCHES
+       "access_log[.]Complete[(]result[)]")
+    message(FATAL_ERROR
+        "Dispatcher must normalize exceptions before the shared access-log terminal boundary")
 endif()
 
 if(NOT SESSION_SOURCE MATCHES

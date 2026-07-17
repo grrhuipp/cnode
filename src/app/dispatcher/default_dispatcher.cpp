@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace acpp::app::dispatcher {
@@ -164,16 +165,35 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         access_log.Suppress();
     }
 
-    RelayResult result = co_await DispatchPreparedLink(
-        io_context,
-        receiver,
-        std::move(inbound),
-        inbound_link,
-        std::move(first_packet),
-        ctx,
-        stats,
-        timeouts,
-        pressure_idle_timeout);
+    RelayResult result;
+    try {
+        result = co_await DispatchPreparedLink(
+            io_context,
+            receiver,
+            std::move(inbound),
+            inbound_link,
+            std::move(first_packet),
+            ctx,
+            stats,
+            timeouts,
+            pressure_idle_timeout);
+    } catch (const std::bad_alloc&) {
+        stats.OnError();
+        result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
+        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exhausted memory");
+    } catch (const IoSystemError& e) {
+        stats.OnError();
+        result = MakeRelayError(MapAsioError(e.code()));
+        LOG_CONN_FAIL_CTX(ctx, "dispatcher request I/O exception: {}", e.what());
+    } catch (const std::exception& e) {
+        stats.OnError();
+        result = MakeRelayError(ErrorCode::INTERNAL);
+        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exception: {}", e.what());
+    } catch (...) {
+        stats.OnError();
+        result = MakeRelayError(ErrorCode::INTERNAL);
+        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exception: unknown");
+    }
     access_log.Complete(result);
     co_return result;
 }
