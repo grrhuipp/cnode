@@ -91,36 +91,33 @@ struct UDPSession::Impl {
             co_return ErrorCode::INVALID_ARGUMENT;
         }
 
-        detail::UdpCallbackRouter::MappingToken mapping_token;
+        detail::UdpCallbackRouter::MappingLease mapping_lease;
         try {
             if (callback_id > 0) {
                 const UdpEndpointKey target_key = MakeEndpointKey(
                     remote_ep.address(), remote_ep.port());
-                auto [mapping_error, token] = callbacks.TrackTarget(
+                auto [mapping_error, lease] = callbacks.BeginTargetSend(
                     target_key, callback_id, steady_clock::now());
                 if (mapping_error != ErrorCode::OK) {
                     co_return mapping_error;
                 }
-                mapping_token = token;
+                mapping_lease = std::move(lease);
             }
 
             const size_t sent = co_await socket.async_send_to(
                 buffers, remote_ep, net::use_awaitable);
             if (sent != payload_size) {
-                callbacks.RollbackTarget(mapping_token);
                 co_return ErrorCode::NETWORK_IO_ERROR;
             }
-            callbacks.CommitTarget(mapping_token);
+            mapping_lease.Commit();
             ++packets_sent;
             bytes_sent += sent;
             Touch();
             co_return ErrorCode::SUCCESS;
         } catch (const IoSystemError& e) {
-            callbacks.RollbackTarget(mapping_token);
             LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
             co_return ErrorCode::NETWORK_IO_ERROR;
         } catch (const std::bad_alloc&) {
-            callbacks.RollbackTarget(mapping_token);
             co_return ErrorCode::RESOURCE_EXHAUSTED;
         }
     }

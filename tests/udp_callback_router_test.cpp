@@ -53,9 +53,9 @@ int main() {
     if (first_id == 0 || second_id == 0) Fail();
 
     auto [first_error, first_mapping] =
-        router.TrackTarget(target, first_id, now);
+        router.BeginTargetSend(target, first_id, now);
     auto [second_error, second_mapping] =
-        router.TrackTarget(target, second_id, now);
+        router.BeginTargetSend(target, second_id, now);
     if (first_error != acpp::ErrorCode::OK ||
         second_error != acpp::ErrorCode::OK ||
         !first_mapping || !second_mapping) {
@@ -82,10 +82,12 @@ int main() {
             return true;
         }});
     if (clear_first == 0 || clear_second == 0) Fail();
-    if (router.TrackTarget(target, clear_first, now).first !=
-            acpp::ErrorCode::OK ||
-        router.TrackTarget(target, clear_second, now).first !=
-            acpp::ErrorCode::OK) {
+    auto [clear_first_error, clear_first_mapping] =
+        router.BeginTargetSend(target, clear_first, now);
+    auto [clear_second_error, clear_second_mapping] =
+        router.BeginTargetSend(target, clear_second, now);
+    if (clear_first_error != acpp::ErrorCode::OK ||
+        clear_second_error != acpp::ErrorCode::OK) {
         Fail();
     }
     if (!router.Dispatch(target, packet, now + 2ms) ||
@@ -103,16 +105,16 @@ int main() {
         }});
     if (generation_id == 0) Fail();
     auto [initial_error, initial_mapping] =
-        router.TrackTarget(target, generation_id, now);
+        router.BeginTargetSend(target, generation_id, now);
     auto [refresh_error, refreshed_mapping] =
-        router.TrackTarget(target, generation_id, now + 1ms);
+        router.BeginTargetSend(target, generation_id, now + 1ms);
     if (initial_error != acpp::ErrorCode::OK ||
         refresh_error != acpp::ErrorCode::OK ||
-        !initial_mapping.inserted || refreshed_mapping.inserted) {
+        !initial_mapping.Inserted() || refreshed_mapping.Inserted()) {
         Fail();
     }
-    router.RollbackTarget(initial_mapping);
-    router.CommitTarget(refreshed_mapping);
+    initial_mapping = {};
+    refreshed_mapping.Commit();
     if (!router.Dispatch(target, packet, now + 2ms) ||
         generation_calls != 1 || router.TargetMappingCount() != 1) {
         Fail();
@@ -121,12 +123,14 @@ int main() {
     router.Clear();
     const uint64_t rollback_id = router.Register(acpp::PacketCallback{
         [](acpp::UDPPacketView) { return true; }});
-    auto [rollback_error, rollback_mapping] =
-        router.TrackTarget(target, rollback_id, now);
-    if (rollback_error != acpp::ErrorCode::OK || !rollback_mapping.inserted) {
-        Fail();
+    {
+        auto [rollback_error, rollback_mapping] =
+            router.BeginTargetSend(target, rollback_id, now);
+        if (rollback_error != acpp::ErrorCode::OK ||
+            !rollback_mapping.Inserted()) {
+            Fail();
+        }
     }
-    router.RollbackTarget(rollback_mapping);
     const uint64_t fallback_blocker = router.Register(acpp::PacketCallback{
         [](acpp::UDPPacketView) { return true; }});
     if (fallback_blocker == 0) Fail();
@@ -138,16 +142,17 @@ int main() {
     router.Clear();
     const uint64_t concurrent_failure_id = router.Register(acpp::PacketCallback{
         [](acpp::UDPPacketView) { return true; }});
-    auto [failure_a_error, failure_a] =
-        router.TrackTarget(target, concurrent_failure_id, now);
-    auto [failure_b_error, failure_b] =
-        router.TrackTarget(target, concurrent_failure_id, now + 1ms);
-    if (failure_a_error != acpp::ErrorCode::OK ||
-        failure_b_error != acpp::ErrorCode::OK) {
-        Fail();
+    {
+        auto [failure_a_error, failure_a] =
+            router.BeginTargetSend(target, concurrent_failure_id, now);
+        auto [failure_b_error, failure_b] =
+            router.BeginTargetSend(target, concurrent_failure_id, now + 1ms);
+        if (failure_a_error != acpp::ErrorCode::OK ||
+            failure_b_error != acpp::ErrorCode::OK) {
+            Fail();
+        }
+        failure_a = std::move(failure_b);
     }
-    router.RollbackTarget(failure_b);
-    router.RollbackTarget(failure_a);
     if (router.TargetMappingCount() != 0) {
         Fail();
     }

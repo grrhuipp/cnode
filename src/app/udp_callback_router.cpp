@@ -178,6 +178,42 @@ UdpCallbackRouter::UdpCallbackRouter()
 
 UdpCallbackRouter::~UdpCallbackRouter() noexcept = default;
 
+UdpCallbackRouter::MappingLease::~MappingLease() noexcept {
+    Reset();
+}
+
+UdpCallbackRouter::MappingLease::MappingLease(MappingLease&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      token_(std::exchange(other.token_, {})) {}
+
+UdpCallbackRouter::MappingLease&
+UdpCallbackRouter::MappingLease::operator=(MappingLease&& other) noexcept {
+    if (this != &other) {
+        Reset();
+        owner_ = std::exchange(other.owner_, nullptr);
+        token_ = std::exchange(other.token_, {});
+    }
+    return *this;
+}
+
+void UdpCallbackRouter::MappingLease::Commit() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    owner_->CommitTarget(token_);
+    owner_ = nullptr;
+    token_ = {};
+}
+
+void UdpCallbackRouter::MappingLease::Reset() noexcept {
+    if (owner_ == nullptr) {
+        return;
+    }
+    owner_->RollbackTarget(token_);
+    owner_ = nullptr;
+    token_ = {};
+}
+
 uint64_t UdpCallbackRouter::Register(PacketCallback callback) {
     if (!callback || impl_->clear_pending ||
         impl_->registered_callbacks.size() >= kMaxCallbacks) {
@@ -208,8 +244,8 @@ bool UdpCallbackRouter::Unregister(uint64_t callback_id) {
     return true;
 }
 
-std::pair<ErrorCode, UdpCallbackRouter::MappingToken>
-UdpCallbackRouter::TrackTarget(
+std::pair<ErrorCode, UdpCallbackRouter::MappingLease>
+UdpCallbackRouter::BeginTargetSend(
     const UdpEndpointKey& target,
     uint64_t callback_id,
     steady_clock::time_point now) {
@@ -226,12 +262,12 @@ UdpCallbackRouter::TrackTarget(
     if (existing != sent_targets.end()) {
         existing->second.last_active = now;
         ++existing->second.pending_sends;
-        return {ErrorCode::OK, MappingToken{
+        return {ErrorCode::OK, MappingLease{*this, MappingToken{
             .target = target,
             .callback_id = callback_id,
             .generation = existing->second.generation,
             .inserted = false,
-        }};
+        }}};
     }
     if (sent_targets.size() >= kMaxTargetsPerCallback ||
         impl_->target_mapping_count >= kMaxTargetMappings) {
@@ -257,12 +293,12 @@ UdpCallbackRouter::TrackTarget(
         throw;
     }
     ++impl_->target_mapping_count;
-    return {ErrorCode::OK, MappingToken{
+    return {ErrorCode::OK, MappingLease{*this, MappingToken{
         .target = target,
         .callback_id = callback_id,
         .generation = generation,
         .inserted = true,
-    }};
+    }}};
 }
 
 void UdpCallbackRouter::CommitTarget(const MappingToken& token) noexcept {

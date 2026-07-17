@@ -460,9 +460,17 @@ if(UDP_SESSION_SOURCE MATCHES
    NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
         "kMaxTargetMappings = 4096" OR
    NOT UDP_SESSION_SOURCE MATCHES
-        "callbacks[.]RollbackTarget[(]mapping_token[)]" OR
+        "callbacks[.]BeginTargetSend[(]" OR
    NOT UDP_SESSION_SOURCE MATCHES
-        "callbacks[.]CommitTarget[(]mapping_token[)]" OR
+        "mapping_lease[.]Commit[(][)]" OR
+   UDP_SESSION_SOURCE MATCHES
+        "RollbackTarget|CommitTarget" OR
+   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
+        "~MappingLease[(][)] noexcept" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "MappingLease::Reset[(][)] noexcept" OR
+   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
+        "owner_->RollbackTarget[(]token_[)]" OR
    NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
         "pending_removal" OR
    NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
