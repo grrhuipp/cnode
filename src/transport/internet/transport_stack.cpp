@@ -5,6 +5,7 @@
 #include "tls_context_cache_key.hpp"
 #include "xhttp_packet_queue.hpp"
 #include "xhttp_packet_session_key.hpp"
+#include "xhttp_upload_stream_slot.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
@@ -859,12 +860,15 @@ public:
         : io_context_(io_context)
         , input_signal_(io_context) {}
 
-    void AttachStream(std::unique_ptr<AsyncStream> stream) {
+    [[nodiscard]] bool AttachStream(std::unique_ptr<AsyncStream> stream) {
         if (closed_ || input_closed_ || !stream) {
-            return;
+            return false;
         }
-        stream_input_ = std::move(stream);
+        if (!stream_input_.Attach(std::move(stream))) {
+            return false;
+        }
         Wake();
+        return true;
     }
 
     [[nodiscard]] bool Push(uint64_t seq, buf::MultiBuffer payload) {
@@ -895,9 +899,8 @@ public:
         closed_ = true;
         input_closed_ = true;
         packet_queue_.Clear();
-        if (stream_input_) {
-            stream_input_->Close();
-            stream_input_.reset();
+        if (auto stream = stream_input_.Take()) {
+            stream->Close();
         }
         Wake();
     }
@@ -915,12 +918,12 @@ public:
                     std::span<uint8_t>(out, capacity));
                 co_return n;
             }
-            if (stream_input_) {
-                const size_t n = co_await stream_input_->AsyncRead(buffer);
+            if (auto stream = stream_input_.Snapshot()) {
+                const size_t n = co_await stream->AsyncRead(buffer);
                 if (n > 0) {
                     co_return n;
                 }
-                stream_input_.reset();
+                (void)stream_input_.ReleaseIfCurrent(stream);
                 CloseInput();
                 co_return 0;
             }
@@ -940,12 +943,12 @@ public:
             if (packet_queue_.HasReady()) {
                 co_return packet_queue_.Pop();
             }
-            if (stream_input_) {
-                buf::MultiBuffer mb = co_await stream_input_->ReadMultiBuffer();
+            if (auto stream = stream_input_.Snapshot()) {
+                buf::MultiBuffer mb = co_await stream->ReadMultiBuffer();
                 if (buf::HasData(mb)) {
                     co_return mb;
                 }
-                stream_input_.reset();
+                (void)stream_input_.ReleaseIfCurrent(stream);
                 CloseInput();
                 co_return buf::MultiBuffer{};
             }
@@ -971,7 +974,7 @@ private:
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     detail::XHttpPacketQueue packet_queue_;
-    std::unique_ptr<AsyncStream> stream_input_;
+    detail::XHttpUploadStreamSlot stream_input_;
     bool input_closed_ = false;
     bool closed_ = false;
 };
@@ -3304,8 +3307,13 @@ private:
                              conn_id_,
                              meta.session_id,
                              stream_id);
-            xsession->AttachStream(
-                std::make_unique<GrpcServerSubStream>(std::move(sub)));
+            if (!xsession->AttachStream(
+                    std::make_unique<GrpcServerSubStream>(std::move(sub)))) {
+                LOG_ACCESS_DEBUG(
+                    "[XHTTP:{}] server: rejected concurrent H2 stream-up session={}",
+                    conn_id_,
+                    meta.session_id);
+            }
             co_return true;
         }
 
@@ -4835,7 +4843,9 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         LOG_ACCESS_DEBUG("[XHTTP:{}] server: stream-up upload ready session={}",
                          conn_id,
                          meta.session_id);
-        session->AttachStream(std::move(body));
+        if (!session->AttachStream(std::move(body))) {
+            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
         co_return std::unique_ptr<AsyncStream>{};
     }
 

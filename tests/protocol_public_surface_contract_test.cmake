@@ -78,6 +78,9 @@ file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
 file(READ
     "${SOURCE_DIR}/src/transport/internet/xhttp_packet_queue.hpp"
     XHTTP_PACKET_QUEUE_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/xhttp_upload_stream_slot.hpp"
+    XHTTP_UPLOAD_SLOT_SOURCE)
 if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
        "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
    NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
@@ -89,10 +92,23 @@ if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
     message(FATAL_ERROR
         "XHTTP packet-up reordering must use the bounded Worker-local queue")
 endif()
+if(NOT XHTTP_UPLOAD_SLOT_SOURCE MATCHES
+       "std::shared_ptr<Stream> Snapshot[(][)]" OR
+   NOT XHTTP_UPLOAD_SLOT_SOURCE MATCHES
+       "if [(][!]stream [|][|] current_[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "stream_input_[.]Snapshot[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "std::unique_ptr<AsyncStream> stream_input_")
+    message(FATAL_ERROR
+        "XHTTP stream-up reads must retain one non-replaceable owner across await")
+endif()
 if(NOT TRANSPORT_STACK_SOURCE MATCHES
        "XHttpPacketSessionKeyRef lookup_key\{&io_context, session_id\}" OR
    NOT TRANSPORT_STACK_SOURCE MATCHES
-       "XHttpPacketSessionKey stored_key\{[.]owner = &io_context\}")
+       "XHttpPacketSessionKey stored_key" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "[.]owner = &io_context")
     message(FATAL_ERROR
         "XHTTP packet session registry keys must include the owning io_context")
 endif()
