@@ -153,15 +153,6 @@ inline ErrorCode SelectRelayError(ErrorCode up, ErrorCode down) noexcept {
     return up;
 }
 
-inline bool ClientSideErrorFirst(ErrorCode up, ErrorCode down) noexcept {
-    if (up == ErrorCode::OK) {
-        return false;
-    }
-    return !(up == ErrorCode::CANCELLED &&
-             down != ErrorCode::OK &&
-             down != ErrorCode::CANCELLED);
-}
-
 inline int64_t ToSteadyNs(SteadyClock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         tp.time_since_epoch()).count();
@@ -170,6 +161,18 @@ inline int64_t ToSteadyNs(SteadyClock::time_point tp) {
 struct RelayDirectionState {
     bool eof = false;
     int64_t half_close_deadline_ns = 0;
+};
+
+struct RelayCloseState {
+    void Mark(bool client_side) noexcept {
+        if (!known) {
+            known = true;
+            client = client_side;
+        }
+    }
+
+    bool known = false;
+    bool client = false;
 };
 
 class RateTimerGuard {
@@ -413,6 +416,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
     ToControl& to_control,
     RelayDirectionState& my_state,
     RelayDirectionState& peer_state,
+    RelayCloseState& close_state,
     std::chrono::seconds half_close_timeout,
     StatsShard* stats,
     bool is_upload,
@@ -431,11 +435,13 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
     [[maybe_unused]] RateLimiter rate_limiter(speed_limit);
     [[maybe_unused]] RateTimer rate_timer(io_context);
     LocalStatsAccumulator stats_acc;
+    bool operation_side_is_client = is_upload;
 
     while (true) {
         if (auto remaining = RemainingHalfCloseBudget(my_state.half_close_deadline_ns)) {
             if (remaining->count() == 0) {
                 error = ErrorCode::RELAY_TIMEOUT;
+                close_state.Mark(is_upload);
                 LOG_CONN_DEBUG(ctx, "[relay] {} absolute half-close timeout, transferred={}B",
                                is_upload ? "up" : "down", total_bytes);
                 CancelRelayControls(from_control, to_control);
@@ -452,6 +458,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
 
         try {
             buf::MultiBuffer mb;
+            operation_side_is_client = is_upload;
             if constexpr (requires { from_reader.ReadMultiBuffer(); }) {
                 mb = co_await from_reader.ReadMultiBuffer();
             } else if constexpr (std::is_same_v<
@@ -464,6 +471,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
 
             if (!buf::HasData(mb)) {
                 if (ConsumeRelayTimeoutSignals(from_control, to_control)) {
+                    close_state.Mark(operation_side_is_client);
                     error = ErrorCode::RELAY_TIMEOUT;
                     LOG_CONN_DEBUG(ctx, "[relay] {} relay timeout, transferred={}B",
                                    is_upload ? "up" : "down", total_bytes);
@@ -481,6 +489,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
 
                 LOG_CONN_DEBUG(ctx, "[relay] {} EOF after {}B", is_upload ? "up" : "down", total_bytes);
                 my_state.eof = true;
+                close_state.Mark(is_upload);
 
                 // 对齐 Xray：普通 TCP 半关闭只切换 idle timer，不主动发送
                 // 传输/协议级写关闭。例外是 mux/AnyTLS 这类虚拟流：EOF 不会
@@ -536,6 +545,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                 }
             }
 
+            operation_side_is_client = !is_upload;
             if constexpr (requires { to_writer.WriteMultiBuffer(std::move(mb)); }) {
                 co_await to_writer.WriteMultiBuffer(std::move(mb));
             } else if constexpr (std::is_same_v<
@@ -560,6 +570,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             }
 
         } catch (const IoSystemError& e) {
+            close_state.Mark(operation_side_is_client);
             error = MapAsioError(e.code());
             if (error == ErrorCode::CANCELLED &&
                 ConsumeRelayTimeoutSignals(from_control, to_control)) {
@@ -574,12 +585,14 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             CancelRelayControls(from_control, to_control);
             break;
         } catch (const std::exception& e) {
+            close_state.Mark(operation_side_is_client);
             error = ErrorCode::RELAY_WRITE_FAILED;
             LOG_CONN_DEBUG(ctx, "[relay] {} exception: {}, transferred={}B",
                            is_upload ? "up" : "down", e.what(), total_bytes);
             CancelRelayControls(from_control, to_control);
             break;
         } catch (...) {
+            close_state.Mark(operation_side_is_client);
             error = ErrorCode::RELAY_WRITE_FAILED;
             LOG_CONN_DEBUG(ctx, "[relay] {} exception: unknown, transferred={}B",
                            is_upload ? "up" : "down", total_bytes);
@@ -615,6 +628,7 @@ net::awaitable<RelayResult> DoRelayLink(
     RelayResult result;
     relay_detail::RelayDirectionState client_state;
     relay_detail::RelayDirectionState target_state;
+    relay_detail::RelayCloseState close_state;
 
     LOG_CONN_DEBUG(ctx, "Relay started, speed_limit={}, uplink_only={}s, downlink_only={}s",
                    config.speed_limit > 0 ?
@@ -628,10 +642,12 @@ net::awaitable<RelayResult> DoRelayLink(
         auto [up, down] = co_await (
             relay_detail::RelayOneDirectionImpl<false>(
                 io_context, client, client, target, target, client_state, target_state,
+                close_state,
                 config.downlink_only,
                 &stats, true, config.speed_limit, &ctx.traffic.bytes_up, ctx) &&
             relay_detail::RelayOneDirectionImpl<false>(
                 io_context, target, target, client, client, target_state, client_state,
+                close_state,
                 config.uplink_only,
                 &stats, false, config.speed_limit, &ctx.traffic.bytes_down, ctx)
         );
@@ -641,10 +657,12 @@ net::awaitable<RelayResult> DoRelayLink(
         auto [up, down] = co_await (
             relay_detail::RelayOneDirectionImpl<true>(
                 io_context, client, client, target, target, client_state, target_state,
+                close_state,
                 config.downlink_only,
                 &stats, true, config.speed_limit, &ctx.traffic.bytes_up, ctx) &&
             relay_detail::RelayOneDirectionImpl<true>(
                 io_context, target, target, client, client, target_state, client_state,
+                close_state,
                 config.uplink_only,
                 &stats, false, config.speed_limit, &ctx.traffic.bytes_down, ctx)
         );
@@ -667,9 +685,8 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_down = bytes_down;
 
     result.error = relay_detail::SelectRelayError(error_up, error_down);
-    result.client_closed_first =
-        relay_detail::ClientSideErrorFirst(error_up, error_down);
-    result.close_side_known = true;
+    result.client_closed_first = close_state.client;
+    result.close_side_known = close_state.known;
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -723,6 +740,7 @@ net::awaitable<RelayResult> DoRelayLink(
     RelayResult result;
     relay_detail::RelayDirectionState client_state;
     relay_detail::RelayDirectionState target_state;
+    relay_detail::RelayCloseState close_state;
 
     LOG_CONN_DEBUG(ctx, "Relay started, speed_limit={}, uplink_only={}s, downlink_only={}s",
                    config.speed_limit > 0 ?
@@ -742,6 +760,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 target,
                 client_state,
                 target_state,
+                close_state,
                 config.downlink_only,
                 &stats,
                 true,
@@ -756,6 +775,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 client_control,
                 target_state,
                 client_state,
+                close_state,
                 config.uplink_only,
                 &stats,
                 false,
@@ -775,6 +795,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 target,
                 client_state,
                 target_state,
+                close_state,
                 config.downlink_only,
                 &stats,
                 true,
@@ -789,6 +810,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 client_control,
                 target_state,
                 client_state,
+                close_state,
                 config.uplink_only,
                 &stats,
                 false,
@@ -813,9 +835,8 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_down = bytes_down;
 
     result.error = relay_detail::SelectRelayError(error_up, error_down);
-    result.client_closed_first =
-        relay_detail::ClientSideErrorFirst(error_up, error_down);
-    result.close_side_known = true;
+    result.client_closed_first = close_state.client;
+    result.close_side_known = close_state.known;
 
     LOG_CONN_DEBUG(ctx, "Relay CLOSING: up_err={} down_err={} up={}B down={}B closer={}",
                    ErrorCodeToString(error_up), ErrorCodeToString(error_down),
@@ -867,15 +888,14 @@ net::awaitable<RelayResult> DoRelayLink(
     std::pair<uint64_t, ErrorCode> up_result{0, ErrorCode::OK};
     std::pair<uint64_t, ErrorCode> down_result{0, ErrorCode::OK};
     ErrorCode first_error = ErrorCode::OK;
-    bool first_error_from_client = false;
+    relay_detail::RelayCloseState close_state;
     bool downlink_only_timeout_fired = false;
     auto& timeout_scheduler = TimeoutScheduler::ForIoContext(io_context);
     TimeoutToken downlink_only_token;
 
-    auto remember_error = [&](ErrorCode error, bool from_client) {
+    auto remember_error = [&](ErrorCode error) {
         if (error != ErrorCode::OK && first_error == ErrorCode::OK) {
             first_error = error;
-            first_error_from_client = from_client;
         }
     };
 
@@ -898,17 +918,21 @@ net::awaitable<RelayResult> DoRelayLink(
 
     auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
         uint64_t bytes = 0;
+        bool operation_side_is_client = true;
         LocalStatsAccumulator stats_acc;
         while (true) {
             try {
+                operation_side_is_client = true;
                 buf::MultiBuffer mb = co_await client_reader.ReadMultiBuffer();
                 if (!buf::HasData(mb)) {
+                    close_state.Mark(true);
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                     co_await relay_detail::ShutdownWriteForClose(target);
                     arm_downlink_only_timeout();
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
                 const size_t n = buf::TotalLen(mb);
+                operation_side_is_client = false;
                 co_await target.WriteMultiBuffer(std::move(mb));
                 bytes += n;
                 ctx.traffic.bytes_up = bytes;
@@ -917,16 +941,18 @@ net::awaitable<RelayResult> DoRelayLink(
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                 }
             } catch (const IoSystemError& e) {
+                close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 const ErrorCode error = MapAsioError(e.code());
                 up_result = std::make_pair(bytes, error);
-                remember_error(error, true);
+                remember_error(error);
                 relay_detail::CancelIfSupported(target);
                 throw;
             } catch (...) {
+                close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 up_result = std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-                remember_error(ErrorCode::RELAY_WRITE_FAILED, true);
+                remember_error(ErrorCode::RELAY_WRITE_FAILED);
                 relay_detail::CancelIfSupported(target);
                 throw;
             }
@@ -935,16 +961,20 @@ net::awaitable<RelayResult> DoRelayLink(
 
     auto download = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
         uint64_t bytes = 0;
+        bool operation_side_is_client = false;
         LocalStatsAccumulator stats_acc;
         while (true) {
             try {
+                operation_side_is_client = false;
                 buf::MultiBuffer mb = co_await target.ReadMultiBuffer();
                 if (!buf::HasData(mb)) {
+                    close_state.Mark(false);
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                     co_await relay_detail::ShutdownWriteForClose(client_writer);
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
                 const size_t n = buf::TotalLen(mb);
+                operation_side_is_client = true;
                 co_await client_writer.WriteMultiBuffer(std::move(mb));
                 bytes += n;
                 ctx.traffic.bytes_down = bytes;
@@ -953,19 +983,21 @@ net::awaitable<RelayResult> DoRelayLink(
                     relay_detail::FlushRelayStats(&stats, stats_acc);
                 }
             } catch (const IoSystemError& e) {
+                close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 ErrorCode error = MapAsioError(e.code());
                 if (error == ErrorCode::CANCELLED && downlink_only_timeout_fired) {
                     error = ErrorCode::RELAY_TIMEOUT;
                 }
                 down_result = std::make_pair(bytes, error);
-                remember_error(error, false);
+                remember_error(error);
                 relay_detail::CancelIfSupported(target);
                 throw;
             } catch (...) {
+                close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 down_result = std::make_pair(bytes, ErrorCode::RELAY_WRITE_FAILED);
-                remember_error(ErrorCode::RELAY_WRITE_FAILED, false);
+                remember_error(ErrorCode::RELAY_WRITE_FAILED);
                 relay_detail::CancelIfSupported(target);
                 throw;
             }
@@ -986,10 +1018,8 @@ net::awaitable<RelayResult> DoRelayLink(
     RelayResult result;
     result.bytes_up = first_error == ErrorCode::OK ? up_result.first : ctx.traffic.bytes_up;
     result.bytes_down = first_error == ErrorCode::OK ? down_result.first : ctx.traffic.bytes_down;
-    result.client_closed_first = first_error != ErrorCode::OK
-        ? first_error_from_client
-        : relay_detail::ClientSideErrorFirst(up_result.second, down_result.second);
-    result.close_side_known = true;
+    result.client_closed_first = close_state.client;
+    result.close_side_known = close_state.known;
     if (first_error != ErrorCode::OK) {
         result.error = first_error;
     } else if (up_result.second != ErrorCode::OK) {

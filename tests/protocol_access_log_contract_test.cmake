@@ -151,11 +151,15 @@ if(UDP_SEND_POSITION EQUAL -1 OR UDP_ACCOUNT_POSITION EQUAL -1 OR
 endif()
 
 if(NOT RELAY_SOURCE MATCHES
-       "result[.]close_side_known = true" OR
+       "struct RelayCloseState" OR
+   NOT RELAY_SOURCE MATCHES
+       "close_state[.]Mark[(]is_upload[)]" OR
+   NOT RELAY_SOURCE MATCHES
+       "result[.]close_side_known = close_state[.]known" OR
    NOT UDP_RELAY_SOURCE MATCHES
        "result[.]close_side_known = true")
     message(FATAL_ERROR
-        "relay close-side evidence must reach access logging")
+        "relay must capture the first terminal endpoint and publish its close-side evidence")
 endif()
 
 foreach(SOURCE IN ITEMS
