@@ -6,7 +6,8 @@ AccessLogSession::AccessLogSession(session::Context& ctx) noexcept
     : ctx_(&ctx) {}
 
 AccessLogSession::~AccessLogSession() noexcept {
-    if (!ctx_ || !terminal_ || suppressed_ || ctx_->access_event_submitted ||
+    if (!ctx_ || !terminal_ || error_code_ != ErrorCode::OK || suppressed_ ||
+        ctx_->access_event_submitted ||
         ctx_->inbound.access_source_ref == 0) {
         return;
     }

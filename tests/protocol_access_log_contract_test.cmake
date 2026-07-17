@@ -39,6 +39,9 @@ file(READ
     "${SOURCE_DIR}/src/app/access_log_event.cpp"
     ACCESS_LOG_EVENT_SOURCE)
 file(READ
+    "${SOURCE_DIR}/src/app/access_log_session.cpp"
+    ACCESS_LOG_SESSION_SOURCE)
+file(READ
     "${SOURCE_DIR}/src/app/relay_udp.cpp"
     UDP_RELAY_SOURCE)
 file(READ
@@ -72,6 +75,12 @@ foreach(SOURCE IN ITEMS
             "${SOURCE}: prewritten proxy payload must remain visible to access logging")
     endif()
 endforeach()
+
+if(NOT ACCESS_LOG_SESSION_SOURCE MATCHES
+       "error_code_ != ErrorCode::OK")
+    message(FATAL_ERROR
+        "centralized access logging must submit successful requests only")
+endif()
 
 if(ACCESS_LOG_EVENT_SOURCE MATCHES
        "event[.]remote_ip = AddressString[(][*]target[.]resolved_addr[)]")

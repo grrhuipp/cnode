@@ -31,6 +31,14 @@ int main() {
     assert(event.remote_ip.empty());
     assert(event.target_host == "www.example.com");
 
+    ctx.outbound.target = TargetAddress(
+        net::ip::make_address("198.51.100.7"), 8443);
+    event = app::BuildAccessLogEvent(
+        ctx, accesslog::CloseSide::Remote, 1, 2, ErrorCode::DIAL_REFUSED);
+    assert(event.target_host == "198.51.100.7");
+    assert(event.target_port == 8443);
+    assert(event.remote_ip.empty());
+
     event = app::BuildAccessLogEvent(
         ctx, accesslog::CloseSide::Unknown, 3, 4, ErrorCode::BLOCKED);
     assert(event.result == accesslog::Result::Rejected);

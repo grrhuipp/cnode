@@ -8,6 +8,9 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/common/awaitable_batch.cpp"
     BATCH_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp"
+    BOOTSTRAP_INBOUNDS_SOURCE)
 
 string(FIND "${CONTROL_SOURCE}"
     "net::awaitable<void> Controller::Impl::removeInbound" MUTATIONS_BEGIN)
@@ -55,6 +58,12 @@ string(SUBSTRING "${MUTATIONS_SOURCE}"
 if(NOT SOURCE_REGISTRATION_FAILURE_HANDLER MATCHES "co_return false;")
     message(FATAL_ERROR
         "panel inbounds must not publish without a centralized access-log source")
+endif()
+
+if(NOT BOOTSTRAP_INBOUNDS_SOURCE MATCHES
+       "std::move[(]route_policy[)],\r?\n[ \t]*0[)]")
+    message(FATAL_ERROR
+        "custom/static inbounds must explicitly disable centralized access logging")
 endif()
 
 string(FIND "${MUTATIONS_SOURCE}" "catch (...)" FAILURE_CATCH)

@@ -85,7 +85,9 @@ accesslog::Event BuildAccessLogEvent(
 
     if (!ctx.content.multiple_targets) {
         const TargetAddress& target = ctx.outbound.target;
-        event.target_host = target.host;
+        event.target_host = target.host.empty() && target.resolved_addr
+            ? AddressString(*target.resolved_addr)
+            : target.host;
         event.target_port = target.port;
     }
 
