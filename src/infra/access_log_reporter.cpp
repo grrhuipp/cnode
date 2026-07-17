@@ -1095,6 +1095,7 @@ private:
                     }
 
                     const std::string batch_id = entry->batch_id;
+                    const uint64_t event_count = entry->event_count;
                     const SendResult sent = client_.Send(*payload, batch_id);
                     if (sent.acknowledged) {
                         if (!spool.AcknowledgeFront()) {
@@ -1105,6 +1106,25 @@ private:
                             retry_delay = kInitialRetry;
                             next_send = now;
                             next_send_warning = std::chrono::steady_clock::time_point::min();
+                        }
+                    } else if (sent.status == 400) {
+                        LOG_ERROR(
+                            "access-log reporter: service rejected invalid batch={} events={} detail={}",
+                            batch_id,
+                            event_count,
+                            sent.detail);
+                        if (spool.DiscardFront()) {
+                            dropped_events_.fetch_add(
+                                event_count, std::memory_order_relaxed);
+                            retry_delay = kInitialRetry;
+                            next_send = now;
+                            next_send_warning =
+                                std::chrono::steady_clock::time_point::min();
+                        } else {
+                            LOG_ERROR(
+                                "access-log reporter: cannot remove rejected batch={}",
+                                batch_id);
+                            next_send = now + retry_delay;
                         }
                     } else {
                         if (now >= next_send_warning) {

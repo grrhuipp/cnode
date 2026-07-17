@@ -56,6 +56,14 @@ if(NOT REPORTER_SOURCE MATCHES
         "unreadable batches must remain owned until their file is removed")
 endif()
 
+if(NOT REPORTER_SOURCE MATCHES
+       "else if [(]sent[.]status == 400[)]" OR
+   NOT REPORTER_SOURCE MATCHES
+       "if [(]spool[.]DiscardFront[(][)][)]")
+    message(FATAL_ERROR
+        "permanently invalid service batches must not block later protocol logs")
+endif()
+
 if(SESSION_SOURCE MATCHES
        "if [(]result[.]error != ErrorCode::OK[)]" OR
    SESSION_SOURCE MATCHES
