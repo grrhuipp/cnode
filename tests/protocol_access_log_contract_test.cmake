@@ -199,6 +199,18 @@ if(NOT UDP_RELAY_SOURCE MATCHES
 endif()
 
 if(NOT RELAY_SOURCE MATCHES
+       "ObserveUdpRelayTarget" OR
+   NOT RELAY_SOURCE MATCHES
+       "ctx[.]content[.]multiple_targets = true" OR
+   NOT UDP_RELAY_SOURCE MATCHES
+       "ObserveUdpRelayTarget[(]ctx, read_mb[)]" OR
+   NOT ACCESS_LOG_EVENT_SOURCE MATCHES
+       "if [(][!]ctx[.]content[.]multiple_targets[)]")
+    message(FATAL_ERROR
+        "multi-target UDP sessions must not attribute aggregate traffic to the first target")
+endif()
+
+if(NOT RELAY_SOURCE MATCHES
        "struct RelayCloseState" OR
    NOT RELAY_SOURCE MATCHES
        "close_state[.]Mark[(]is_upload[)]" OR

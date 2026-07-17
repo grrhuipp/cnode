@@ -46,5 +46,13 @@ int main() {
     assert(event.result == accesslog::Result::Failed);
     assert(event.error_code == ErrorCode::DIAL_REFUSED);
 
+    ctx.content.multiple_targets = true;
+    ctx.outbound.connected_target_addr = net::ip::make_address("203.0.113.9");
+    event = app::BuildAccessLogEvent(
+        ctx, accesslog::CloseSide::Client, 9, 10, ErrorCode::OK);
+    assert(event.target_host.empty());
+    assert(event.target_port == 0);
+    assert(event.remote_ip == "203.0.113.9");
+
     return 0;
 }

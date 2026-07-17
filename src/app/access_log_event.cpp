@@ -83,9 +83,11 @@ accesslog::Event BuildAccessLogEvent(
         : ctx.inbound.source_ip;
     event.source_port = ctx.inbound.source_port;
 
-    const TargetAddress& target = ctx.outbound.target;
-    event.target_host = target.host;
-    event.target_port = target.port;
+    if (!ctx.content.multiple_targets) {
+        const TargetAddress& target = ctx.outbound.target;
+        event.target_host = target.host;
+        event.target_port = target.port;
+    }
 
     if (ctx.outbound.connected_target_addr) {
         event.remote_ip = AddressString(*ctx.outbound.connected_target_addr);
@@ -93,7 +95,7 @@ accesslog::Event BuildAccessLogEvent(
     if (ctx.outbound.connected_local_addr) {
         event.local_ip = AddressString(*ctx.outbound.connected_local_addr);
     }
-    if (event.target_host.empty()) {
+    if (event.target_host.empty() && !ctx.content.multiple_targets) {
         event.target_host = event.remote_ip;
     }
 

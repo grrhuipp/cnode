@@ -175,6 +175,21 @@ struct RelayCloseState {
     bool client = false;
 };
 
+inline void ObserveUdpRelayTarget(
+    session::Context& ctx,
+    const buf::MultiBuffer& payload) noexcept {
+    if (ctx.content.network != Network::UDP ||
+        ctx.content.multiple_targets) {
+        return;
+    }
+    const auto datagram = buf::InspectUdpDatagram(payload);
+    if (datagram.Valid() &&
+        ctx.outbound.target.IsValid() &&
+        !ctx.outbound.target.SameEndpoint(*datagram.target)) {
+        ctx.content.multiple_targets = true;
+    }
+}
+
 class RateTimerGuard {
 public:
     explicit RateTimerGuard(net::io_context& io_context) noexcept
@@ -455,7 +470,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
     bool is_upload,
     uint64_t speed_limit,
     uint64_t* live_bytes_counter,
-    const session::Context& ctx) {
+    session::Context& ctx) {
 
     uint64_t total_bytes = 0;
     ErrorCode error = ErrorCode::OK;
@@ -568,6 +583,10 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                                    is_upload ? "up" : "down");
                 }
                 break;
+            }
+
+            if (is_upload) {
+                ObserveUdpRelayTarget(ctx, mb);
             }
 
             size_t n = buf::TotalLen(mb);
@@ -964,6 +983,7 @@ net::awaitable<RelayResult> DoRelayLink(
                     arm_downlink_only_timeout();
                     co_return std::make_pair(bytes, ErrorCode::OK);
                 }
+                relay_detail::ObserveUdpRelayTarget(ctx, mb);
                 const size_t n = buf::TotalLen(mb);
                 operation_side_is_client = false;
                 co_await target.WriteMultiBuffer(std::move(mb));

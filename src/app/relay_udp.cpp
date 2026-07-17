@@ -279,6 +279,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 continue;
             }
 
+            relay_detail::ObserveUdpRelayTarget(ctx, read_mb);
             ctx.traffic.bytes_up += datagram_info.payload_size;
             result.bytes_up += datagram_info.payload_size;
             stats_acc.AddBytesOut(datagram_info.payload_size);

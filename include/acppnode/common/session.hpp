@@ -69,6 +69,7 @@ struct Content {
     std::string sniff_domain;
     uint64_t speed_limit = 0;
     session::DnsResultState dns_result = session::DnsResultState::None;
+    bool multiple_targets = false;
 };
 
 struct Traffic {
