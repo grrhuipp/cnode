@@ -834,6 +834,33 @@ if(NOT DEFAULT_DISPATCHER_SOURCE MATCHES
     message(FATAL_ERROR
         "Dispatcher must reject Mux links without a cancellable control stream")
 endif()
+string(REGEX MATCHALL "ActiveSessionScope relay_scope"
+    DISPATCHER_ACTIVE_SESSION_SCOPES "${DEFAULT_DISPATCHER_SOURCE}")
+list(LENGTH DISPATCHER_ACTIVE_SESSION_SCOPES
+    DISPATCHER_ACTIVE_SESSION_SCOPE_COUNT)
+if(NOT DISPATCHER_ACTIVE_SESSION_SCOPE_COUNT EQUAL 1)
+    message(FATAL_ERROR
+        "only logical routed requests may enter traffic tracking; Mux control frames must not be counted beside child sessions")
+endif()
+string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
+    "auto outbound_process = co_await outbound_handler->Process("
+    DISPATCHER_OUTBOUND_PROCESS_OFFSET)
+string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
+    "ActiveSessionScope relay_scope"
+    DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET)
+string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
+    "mux_session_handler_->Process("
+    DISPATCHER_MUX_PROCESS_OFFSET)
+if(DISPATCHER_MUX_PROCESS_OFFSET LESS 0 OR
+   DISPATCHER_OUTBOUND_PROCESS_OFFSET LESS 0 OR
+   DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS 0 OR
+   NOT DISPATCHER_MUX_PROCESS_OFFSET LESS
+       DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET OR
+   NOT DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS
+       DISPATCHER_OUTBOUND_PROCESS_OFFSET)
+    message(FATAL_ERROR
+        "traffic tracking must wrap the logical outbound Process call")
+endif()
 
 set(VLESS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")

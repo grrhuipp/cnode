@@ -247,7 +247,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
         LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
-        ActiveSessionScope relay_scope{ctx, session_tracking_};
+        // The Mux container carries framing bytes, not user payload. Each
+        // logical child re-enters Dispatch and owns the only traffic scope.
         auto relay_result = co_await mux_session_handler_->Process(
             io_context,
             transport::Link{inbound_reader, inbound_writer, inbound_control},
