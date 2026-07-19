@@ -260,10 +260,28 @@ private:
                 case 'n': out.push_back('\n'); break;
                 case 'r': out.push_back('\r'); break;
                 case 't': out.push_back('\t'); break;
-                case 'u': AppendUtf8(ReadHex4(), out); break;
+                case 'u': AppendUnicodeEscape(out); break;
                 default: Fail("invalid string escape");
             }
         }
+    }
+
+    void AppendUnicodeEscape(std::string& out) {
+        uint32_t code_point = ReadHex4();
+        if (code_point >= 0xD800 && code_point <= 0xDBFF) {
+            if (!Consume('\\') || !Consume('u')) {
+                Fail("high surrogate without low surrogate");
+            }
+            const uint32_t low_surrogate = ReadHex4();
+            if (low_surrogate < 0xDC00 || low_surrogate > 0xDFFF) {
+                Fail("high surrogate without low surrogate");
+            }
+            code_point = 0x10000 + ((code_point - 0xD800) << 10) +
+                         (low_surrogate - 0xDC00);
+        } else if (code_point >= 0xDC00 && code_point <= 0xDFFF) {
+            Fail("low surrogate without high surrogate");
+        }
+        AppendUtf8(code_point, out);
     }
 
     uint32_t ReadHex4() {
@@ -285,8 +303,13 @@ private:
         } else if (cp <= 0x7FF) {
             out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
+        } else if (cp <= 0xFFFF) {
             out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
             out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
         }

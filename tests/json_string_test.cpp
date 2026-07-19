@@ -41,6 +41,15 @@ void CheckInvalidArray(std::string_view body, std::string_view cause) {
           "JSON string array error lost its cause");
 }
 
+void CheckParseError(std::string_view body) {
+    try {
+        (void)acpp::json::parse(body);
+    } catch (const acpp::json::parse_error&) {
+        return;
+    }
+    Fail("invalid JSON unicode escape was accepted");
+}
+
 }  // namespace
 
 int main() {
@@ -89,6 +98,12 @@ int main() {
     CheckInvalidArray(R"({"camelList":["one",2]})", "only strings");
     CheckInvalidArray(
         R"({"camelList":["one"],"snake_list":["two"]})", "must match");
+
+    const auto supplementary = acpp::json::parse(R"("\uD83D\uDE00")");
+    Check(supplementary.as_string() == "\xF0\x9F\x98\x80",
+          "unicode surrogate pair was not decoded as one code point");
+    CheckParseError(R"("\uD83D")");
+    CheckParseError(R"("\uDE00")");
 
     std::cout << "json_string_test: ok\n";
     return 0;
