@@ -112,7 +112,7 @@ proxy::vmess::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[VMess][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_DEBUG("{} from {}:{} rejected ip_banned [{}]",
+        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
@@ -131,21 +131,21 @@ proxy::vmess::inbound::Handler::Process(
             n = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
         } catch (const IoSystemError&) {
             if (stream->ConsumePhaseDeadline()) {
-                LOG_CONN_FAIL_CTX(ctx, "[VMess][{}] handshake phase deadline from {}",
+                LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
                                   ctx.inbound.tag, ctx.inbound.source_ip);
                 co_return std::unexpected(ErrorCode::TIMEOUT);
             }
-            LOG_CONN_FAIL_CTX(ctx, "[VMess][{}] handshake read failed from {}",
+            LOG_CONN_WARN(ctx, "[VMess][{}] handshake read failed from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
             co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
         if (n == 0 && stream->ConsumePhaseDeadline()) {
-            LOG_CONN_FAIL_CTX(ctx, "[VMess][{}] handshake phase deadline from {}",
+            LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
             co_return std::unexpected(ErrorCode::TIMEOUT);
         }
         if (n == 0 && stream->ConsumeIdleTimeout()) {
-            LOG_CONN_FAIL_CTX(ctx, "[VMess][{}] handshake idle timeout from {}",
+            LOG_CONN_WARN(ctx, "[VMess][{}] handshake idle timeout from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
             co_return std::unexpected(ErrorCode::TIMEOUT);
         }
@@ -173,7 +173,7 @@ proxy::vmess::inbound::Handler::Process(
                        tag,
                        total_read,
                        FormatHexPrefix(handshake_buf, total_read));
-        LOG_CONN_FAIL("[{}] VMess auth failed from {}", tag, client_ip);
+        LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
         if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
@@ -210,7 +210,7 @@ proxy::vmess::inbound::Handler::Process(
         uint64_t uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(
                 tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,

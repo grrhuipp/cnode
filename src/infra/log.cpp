@@ -1,5 +1,7 @@
 #include "acppnode/infra/log.hpp"
 
+#include "acppnode/common/clock.hpp"
+
 #include <concurrentqueue.h>
 #include <zlib.h>
 
@@ -27,15 +29,15 @@ namespace {
 
 using namespace std::chrono_literals;
 
-enum class LogChannel {
-    App,
-    Access
-};
-
 struct LogRecord {
-    LogChannel channel{LogChannel::App};
+    LogChannel channel{LogChannel::System};
     LogLevel level{LogLevel::INFO};
+    int64_t timestamp_us{0};
+    std::string event;
     std::string message;
+    std::string source_file;
+    uint32_t source_line{0};
+    std::optional<ConnectionLogContext> connection;
 };
 
 struct LogTarget {
@@ -66,6 +68,110 @@ std::string_view LevelName(LogLevel level) noexcept {
         case LogLevel::NONE:  return "none";
     }
     return "?";
+}
+
+std::string_view ChannelName(LogChannel channel) noexcept {
+    switch (channel) {
+        case LogChannel::System: return "system";
+        case LogChannel::Connection: return "connection";
+    }
+    return "unknown";
+}
+
+std::tm UtcTime(std::time_t timestamp) noexcept {
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &timestamp);
+#else
+    gmtime_r(&timestamp, &tm);
+#endif
+    return tm;
+}
+
+std::string FormatLogTimestamp(int64_t timestamp_us) {
+    const auto seconds = timestamp_us / 1'000'000;
+    const auto micros = timestamp_us % 1'000'000;
+    const auto timestamp = static_cast<std::time_t>(seconds);
+    const auto tm = UtcTime(timestamp);
+    char buffer[32]{};
+    const auto written = std::strftime(
+        buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm);
+    if (written == 0) return {};
+    return std::format("{}.{:06d}Z", std::string_view(buffer, written), micros);
+}
+
+void AppendJsonString(std::string& output, std::string_view value) {
+    output.push_back('"');
+    for (const unsigned char ch : value) {
+        switch (ch) {
+            case '"': output.append("\\\""); break;
+            case '\\': output.append("\\\\"); break;
+            case '\b': output.append("\\b"); break;
+            case '\f': output.append("\\f"); break;
+            case '\n': output.append("\\n"); break;
+            case '\r': output.append("\\r"); break;
+            case '\t': output.append("\\t"); break;
+            default:
+                if (ch < 0x20) {
+                    output.append(std::format("\\u{:04x}", ch));
+                } else {
+                    output.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
+    }
+    output.push_back('"');
+}
+
+std::string ComponentName(std::string_view file) {
+    const auto src = file.rfind("src");
+    const auto include = file.rfind("include");
+    const auto begin = src != std::string_view::npos
+        ? src + 4
+        : include != std::string_view::npos ? include + 8 : 0;
+    auto component = file.substr(begin);
+    while (!component.empty() &&
+           (component.front() == '/' || component.front() == '\\')) {
+        component.remove_prefix(1);
+    }
+    const auto extension = component.rfind('.');
+    if (extension != std::string_view::npos) {
+        component = component.substr(0, extension);
+    }
+
+    std::string normalized;
+    normalized.reserve(component.size());
+    for (const char ch : component) {
+        normalized.push_back(ch == '/' || ch == '\\' ? '.' : ch);
+    }
+    return normalized.empty() ? "cnode" : normalized;
+}
+
+std::string FormatRecord(const LogRecord& record) {
+    std::string output;
+    output.reserve(record.message.size() + record.source_file.size() + 256);
+    output.append("{\"timestamp\":");
+    AppendJsonString(output, FormatLogTimestamp(record.timestamp_us));
+    output.append(",\"level\":");
+    AppendJsonString(output, LevelName(record.level));
+    output.append(",\"channel\":");
+    AppendJsonString(output, ChannelName(record.channel));
+    output.append(",\"component\":");
+    AppendJsonString(output, ComponentName(record.source_file));
+    output.append(",\"event\":");
+    AppendJsonString(output, record.event);
+    if (record.connection) {
+        output.append(std::format(
+            ",\"conn_id\":{},\"worker_id\":{}",
+            record.connection->conn_id,
+            record.connection->worker_id));
+        output.append(",\"inbound\":");
+        AppendJsonString(output, record.connection->inbound);
+    }
+    output.append(",\"message\":");
+    AppendJsonString(output, record.message);
+    output.append(std::format(",\"source_line\":{}}}", record.source_line));
+    return output;
 }
 
 std::string DateString(std::chrono::system_clock::time_point now) {
@@ -327,8 +433,15 @@ void CleanupManagedFiles(const std::vector<DailyLogSpec>& specs,
 
 void WriteStderrFallback(LogLevel level, const std::string& msg) {
     std::lock_guard lock(g_console_mutex);
-    std::cerr << '[' << LogLocalNow() << "] [" << LevelName(level) << "] "
-              << msg << std::endl;
+    LogRecord record{
+        .channel = LogChannel::System,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .event = "logging.fallback",
+        .message = msg,
+        .source_file = "src/infra/log.cpp",
+    };
+    std::cerr << FormatRecord(record) << std::endl;
 }
 
 LogLevel ParseLevel(std::string_view level) {
@@ -409,11 +522,10 @@ public:
         CloseFiles();
     }
 
-    void Enqueue(LogChannel channel, LogLevel level, std::string message) {
+    void Enqueue(LogRecord record) {
         if (!accepting_.load(std::memory_order_acquire)) return;
 
         thread_local moodycamel::ProducerToken producer_token(queue_);
-        LogRecord record{channel, level, std::move(message)};
         if (!queue_.try_enqueue(producer_token, std::move(record))) {
             dropped_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -564,18 +676,17 @@ private:
 
     void WriteRecord(const LogRecord& record) {
         switch (record.channel) {
-            case LogChannel::App:
+            case LogChannel::System:
                 if (error_file_) {
-                    error_file_ << '[' << LogLocalNow() << "] [" << record.level << "] "
-                                << record.message << '\n';
+                    error_file_ << FormatRecord(record) << '\n';
                     if (record.level >= LogLevel::WARN) {
                         error_file_.flush();
                     }
                 }
                 break;
-            case LogChannel::Access:
+            case LogChannel::Connection:
                 if (access_file_) {
-                    access_file_ << record.message << '\n';
+                    access_file_ << FormatRecord(record) << '\n';
                 }
                 break;
         }
@@ -583,8 +694,15 @@ private:
 
     void WriteBackendLine(LogLevel level, std::string msg) {
         if (error_file_) {
-            error_file_ << '[' << LogLocalNow() << "] [" << level << "] "
-                        << msg << '\n';
+            LogRecord record{
+                .channel = LogChannel::System,
+                .level = level,
+                .timestamp_us = NowMicros(),
+                .event = "logging.backend",
+                .message = std::move(msg),
+                .source_file = "src/infra/log.cpp",
+            };
+            error_file_ << FormatRecord(record) << '\n';
             if (level >= LogLevel::WARN) {
                 error_file_.flush();
             }
@@ -597,8 +715,15 @@ private:
         const auto dropped = dropped_.exchange(0, std::memory_order_acq_rel);
         if (dropped == 0 || !error_file_) return;
 
-        error_file_ << '[' << LogLocalNow() << "] [warn] log queue dropped "
-                    << dropped << " records\n";
+        LogRecord record{
+            .channel = LogChannel::System,
+            .level = LogLevel::WARN,
+            .timestamp_us = NowMicros(),
+            .event = "logging.queue_dropped",
+            .message = std::format("records={}", dropped),
+            .source_file = "src/infra/log.cpp",
+        };
+        error_file_ << FormatRecord(record) << '\n';
         error_file_.flush();
     }
 
@@ -669,7 +794,7 @@ bool Log::Init(const std::string& level,
             const auto compression = (rotate_daily && gzip) ? "gzip" : "none";
 
             initialized_.store(true, std::memory_order_release);
-            WriteConsole(std::format(
+            WriteConsole(LogLevel::INFO, std::format(
                 "logging level={} access={} error={} rotation={} compression={} retention={}d",
                 level,
                 resolved_access_path.string(),
@@ -677,7 +802,7 @@ bool Log::Init(const std::string& level,
                 rotation,
                 compression,
                 max_days));
-            WriteApp(LogLevel::INFO, std::format(
+            WriteSystem(LogLevel::INFO, std::format(
                 "logging initialized level={} access={} error={} dir={} rotation={} compression={} retention_days={}",
                 level,
                 resolved_access_path.string(),
@@ -715,37 +840,86 @@ void Log::Flush() {
     }
 }
 
-void Log::WriteApp(LogLevel level, std::string msg) {
+void Log::WriteSystem(LogLevel level,
+                      std::string message,
+                      std::string_view event,
+                      std::source_location location) {
     if (!ShouldLog(level)) return;
     if (!initialized_.load(std::memory_order_acquire)) {
         if (level >= LogLevel::WARN) {
-            WriteStderrFallback(level, msg);
+            WriteStderrFallback(level, message);
         }
         return;
     }
 
-    g_async_log_backend.Enqueue(LogChannel::App, level, std::move(msg));
+    g_async_log_backend.Enqueue(LogRecord{
+        .channel = LogChannel::System,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .event = std::string(event),
+        .message = std::move(message),
+        .source_file = location.file_name(),
+        .source_line = location.line(),
+    });
 }
 
-void Log::WriteAccess(std::string msg) {
-    if (min_level_.load(std::memory_order_relaxed) == LogLevel::NONE) return;
+void Log::WriteConnection(LogLevel level,
+                          std::string message,
+                          std::string_view event,
+                          std::source_location location) {
+    if (!ShouldLog(level)) return;
     if (!initialized_.load(std::memory_order_acquire)) return;
 
-    g_async_log_backend.Enqueue(LogChannel::Access, LogLevel::INFO, std::move(msg));
+    g_async_log_backend.Enqueue(LogRecord{
+        .channel = LogChannel::Connection,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .event = std::string(event),
+        .message = std::move(message),
+        .source_file = location.file_name(),
+        .source_line = location.line(),
+    });
 }
 
-void Log::WriteConsole(std::string msg) {
-    WriteConsole(LogLevel::INFO, std::move(msg));
+void Log::WriteConnection(LogLevel level,
+                          ConnectionLogContext context,
+                          std::string message,
+                          std::string_view event,
+                          std::source_location location) {
+    if (!ShouldLog(level)) return;
+    if (!initialized_.load(std::memory_order_acquire)) return;
+
+    g_async_log_backend.Enqueue(LogRecord{
+        .channel = LogChannel::Connection,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .event = std::string(event),
+        .message = std::move(message),
+        .source_file = location.file_name(),
+        .source_line = location.line(),
+        .connection = std::move(context),
+    });
 }
 
-void Log::WriteConsole(LogLevel level, std::string msg) {
+void Log::WriteConsole(LogLevel level,
+                       std::string message,
+                       std::string_view event,
+                       std::source_location location) {
     std::lock_guard lock(g_console_mutex);
-    if (msg.empty()) {
+    if (message.empty()) {
         std::cout << std::endl;
         return;
     }
-    std::cout << '[' << LogLocalNow() << "] [" << LevelName(level) << "] "
-              << msg << std::endl;
+    LogRecord record{
+        .channel = LogChannel::System,
+        .level = level,
+        .timestamp_us = NowMicros(),
+        .event = std::string(event),
+        .message = std::move(message),
+        .source_file = location.file_name(),
+        .source_line = location.line(),
+    };
+    std::cout << FormatRecord(record) << std::endl;
 }
 
 bool Log::ShouldLog(LogLevel level) noexcept {

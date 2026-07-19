@@ -750,7 +750,7 @@ public:
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
             const uint64_t dropped = ++reply_queue_.udp_dropped;
             if (dropped % 100 == 1) {
-                LOG_ACCESS_DEBUG(
+                LOG_NET_DEBUG(
                     "[conn={}] [MuxRelay] UDP reply queue full, dropped {} packets",
                     parent_conn_id_, dropped);
             }

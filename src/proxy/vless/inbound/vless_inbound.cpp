@@ -338,7 +338,7 @@ proxy::vless::inbound::Handler::Process(
     };
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS_DEBUG("{} from {}:{} rejected ip_banned [{}]",
+        LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail_abortive(ErrorCode::BLOCKED);
@@ -366,7 +366,7 @@ proxy::vless::inbound::Handler::Process(
                     *decryption_,
                     decryption_tickets_.get());
             if (!runtime) {
-                LOG_CONN_FAIL("[VLESS][{}] encryption handshake failed from {}",
+                LOG_NET_WARN("[VLESS][{}] encryption handshake failed from {}",
                               tag, client_ip);
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
@@ -410,7 +410,7 @@ proxy::vless::inbound::Handler::Process(
                 1);
         } catch (const IoSystemError&) {
             if (stream->ConsumePhaseDeadline()) {
-                LOG_CONN_FAIL_CTX(ctx, "[VLESS][{}] handshake phase deadline from {}",
+                LOG_CONN_WARN(ctx, "[VLESS][{}] handshake phase deadline from {}",
                                   tag, client_ip);
                 co_return fail_abortive(ErrorCode::TIMEOUT);
             }
@@ -436,12 +436,12 @@ proxy::vless::inbound::Handler::Process(
     }
 
     if (!request) {
-        LOG_CONN_FAIL("[VLESS][{}] parse failed from {}", tag, client_ip);
+        LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
         co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     auto user_info = validator_.FindUser(tag, request->uuid);
     if (!user_info) {
-        LOG_CONN_FAIL("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
+        LOG_NET_WARN("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
                       tag, client_ip, validator_.Size(), validator_.SizeForTag(tag));
         if (limiter_) {
             limiter_->OnAuthFailTracked(tag, client_ip);
@@ -449,37 +449,37 @@ proxy::vless::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     if (request->addons_len != 0 && request->flow.empty()) {
-        LOG_CONN_FAIL("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
+        LOG_NET_WARN("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     const bool use_vision = ::acpp::vless::IsVisionFlow(request->flow);
     if (!request->flow.empty()) {
         if (request->flow != user_info->flow) {
-            LOG_CONN_FAIL("[VLESS][{}] request flow '{}' not allowed for user",
+            LOG_NET_WARN("[VLESS][{}] request flow '{}' not allowed for user",
                           tag, request->flow);
             co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         if (!use_vision) {
-            LOG_CONN_FAIL("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
+            LOG_NET_WARN("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
             co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
     }
     if (!user_info->flow.empty() && !::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_CONN_FAIL("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
+        LOG_NET_WARN("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (request->flow.empty() && ::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_CONN_FAIL("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
+        LOG_NET_WARN("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision && request->command != ::acpp::vless::Command::TCP) {
-        LOG_CONN_FAIL("[VLESS][{}] flow '{}' only supports TCP", tag, request->flow);
+        LOG_NET_WARN("[VLESS][{}] flow '{}' only supports TCP", tag, request->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision &&
         (!receiver.stream_settings.IsTlsLike() ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        LOG_CONN_FAIL("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
+        LOG_NET_WARN("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
                       tag, request->flow);
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
@@ -493,7 +493,7 @@ proxy::vless::inbound::Handler::Process(
         tracked_uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(
                 tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,

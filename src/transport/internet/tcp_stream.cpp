@@ -260,7 +260,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         }
         if (ec == io_error::connection_reset ||
             ec == io_error::broken_pipe) {
-            LOG_ACCESS_DEBUG("AsyncRead: {} (fd={})", ec.message(), NativeHandle());
+            LOG_NET_DEBUG("AsyncRead: {} (fd={})", ec.message(), NativeHandle());
             co_return 0;
         }
         if (ec == io_error::operation_aborted) {
@@ -315,7 +315,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
                 co_return buf::MultiBuffer{};
             if (ec == io_error::connection_reset ||
                 ec == io_error::broken_pipe) {
-                LOG_ACCESS_DEBUG("ReadMultiBuffer: {} (fd={})", ec.message(), NativeHandle());
+                LOG_NET_DEBUG("ReadMultiBuffer: {} (fd={})", ec.message(), NativeHandle());
                 co_return buf::MultiBuffer{};
             }
             throw IoSystemError(ec);
@@ -371,7 +371,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
             co_return buf::MultiBuffer{};
         if (ec == io_error::connection_reset ||
             ec == io_error::broken_pipe) {
-            LOG_ACCESS_DEBUG("ReadMultiBuffer(scatter): {} (fd={})", ec.message(), NativeHandle());
+            LOG_NET_DEBUG("ReadMultiBuffer(scatter): {} (fd={})", ec.message(), NativeHandle());
             co_return buf::MultiBuffer{};
         }
         throw IoSystemError(ec);
@@ -1002,12 +1002,12 @@ void TcpStream::ScheduleIdleCheck() {
                 auto remote = self->impl_->socket.remote_endpoint(ep_ec);
                 const std::string_view label = self->StreamLabel();
                 if (!ep_ec) {
-                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] remote={}:{} limit={}s",
+                    LOG_NET_DEBUG("idle timeout fired: [{}] remote={}:{} limit={}s",
                                     label.empty() ? "?" : label,
                                     remote.address().to_string(), remote.port(),
                                     self->impl_->idle_timeout_sec);
                 } else {
-                    LOG_ACCESS_DEBUG("idle timeout fired: [{}] limit={}s",
+                    LOG_NET_DEBUG("idle timeout fired: [{}] limit={}s",
                                     label.empty() ? "?" : label,
                                     self->impl_->idle_timeout_sec);
                 }

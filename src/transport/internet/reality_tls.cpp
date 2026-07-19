@@ -386,13 +386,13 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
 
     UniqueX509 cert(SSL_get_peer_certificate(ssl));
     if (!cert) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: missing peer certificate");
+        LOG_NET_DEBUG("REALITY client verification failed: missing peer certificate");
         return false;
     }
 
     EVP_PKEY* pubkey = X509_get0_pubkey(cert.get());
     if (!pubkey || EVP_PKEY_id(pubkey) != EVP_PKEY_ED25519) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: peer key is not Ed25519");
+        LOG_NET_DEBUG("REALITY client verification failed: peer key is not Ed25519");
         return false;
     }
 
@@ -403,7 +403,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
             peer_public.data(),
             &peer_public_len) != 1 ||
         peer_public_len != peer_public.size()) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: peer public key export failed");
+        LOG_NET_DEBUG("REALITY client verification failed: peer public key export failed");
         return false;
     }
 
@@ -414,7 +414,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     if (!sig ||
         ASN1_STRING_length(sig) != 64 ||
         !ASN1_STRING_get0_data(sig)) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: certificate signature invalid");
+        LOG_NET_DEBUG("REALITY client verification failed: certificate signature invalid");
         return false;
     }
 
@@ -428,17 +428,17 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
               expected.data(),
               &expected_len) ||
         expected_len != expected.size()) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: signature hmac failed");
+        LOG_NET_DEBUG("REALITY client verification failed: signature hmac failed");
         return false;
     }
 
     const uint8_t* signature = ASN1_STRING_get0_data(sig);
     if (!std::equal(expected.begin(), expected.end(), signature)) {
-        LOG_ACCESS_DEBUG("REALITY client verification failed: signature mismatch");
+        LOG_NET_DEBUG("REALITY client verification failed: signature mismatch");
         return false;
     }
 
-    LOG_ACCESS_DEBUG("REALITY client verification ok");
+    LOG_NET_DEBUG("REALITY client verification ok");
     return true;
 }
 
@@ -531,7 +531,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
 [[nodiscard]] ssl_select_cert_result_t RealitySelectCertificateCallback(
     const SSL_CLIENT_HELLO* hello) {
     auto fail = [](std::string_view reason) {
-        LOG_ACCESS_DEBUG("REALITY server handshake reject: {}", reason);
+        LOG_NET_DEBUG("REALITY server handshake reject: {}", reason);
         return ssl_select_cert_error;
     };
 
@@ -601,7 +601,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return fail("certificate install failed");
     }
 
-    LOG_ACCESS_DEBUG("REALITY server handshake authenticated");
+    LOG_NET_DEBUG("REALITY server handshake authenticated");
     return ssl_select_cert_success;
 }
 

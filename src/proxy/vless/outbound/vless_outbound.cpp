@@ -697,14 +697,14 @@ proxy::vless::outbound::Handler::Process(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_FAIL_CTX(ctx, "[VLESS] DNS resolve failed for {}", config_.address);
+            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_.address);
         }
         co_return std::unexpected(transport_target.error());
     }
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_FAIL_CTX(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);
@@ -716,7 +716,7 @@ proxy::vless::outbound::Handler::Process(
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
     auto fail_abortive = [&](ErrorCode error) {
         if (stream) {

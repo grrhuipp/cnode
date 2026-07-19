@@ -137,7 +137,7 @@ bool BuildResponseHeader(
     }
     state.sent = true;
 
-    LOG_ACCESS_DEBUG("VMess encoding: EncodeResponseHeader start");
+    LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader start");
 
     uint8_t resp_data[4] = {
         state.response_header,
@@ -161,7 +161,7 @@ bool BuildResponseHeader(
 
     if (!AES128GCMEncrypt(len_key.data(), len_iv.data(), nullptr, 0,
                           len_plain, 2, resp_buf.data(), resp_buf.data() + 2)) {
-        LOG_ACCESS_DEBUG("VMess encoding: EncodeResponseHeader GCM encrypt len failed");
+        LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader GCM encrypt len failed");
         return false;
     }
 
@@ -178,7 +178,7 @@ bool BuildResponseHeader(
 
     if (!AES128GCMEncrypt(header_key.data(), header_iv.data(), nullptr, 0,
                           resp_data, 4, resp_buf.data() + 18, resp_buf.data() + 22)) {
-        LOG_ACCESS_DEBUG("VMess encoding: EncodeResponseHeader GCM encrypt header failed");
+        LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader GCM encrypt header failed");
         return false;
     }
 
@@ -194,11 +194,11 @@ net::awaitable<bool> EncodeResponseHeader(
     }
 
     if (!co_await WriteFull(stream, resp_buf.data(), resp_buf.size())) {
-        LOG_ACCESS_DEBUG("VMess encoding: EncodeResponseHeader WriteFull failed");
+        LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader WriteFull failed");
         co_return false;
     }
 
-    LOG_ACCESS_DEBUG("VMess encoding: EncodeResponseHeader OK (security={}, option={:#04x})",
+    LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader OK (security={}, option={:#04x})",
                      static_cast<int>(state.security), static_cast<int>(state.option));
     co_return true;
 }
@@ -497,7 +497,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
     uint8_t len_buf[18];
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     if (!co_await DecodeRequestBodyReadFull(state, stream, len_buf, length_header_size)) {
-        LOG_ACCESS_DEBUG("VMess encoding: DecodeRequestBody TCP-level close (failed to read chunk header) after {} chunks",
+        LOG_NET_DEBUG("VMess encoding: DecodeRequestBody TCP-level close (failed to read chunk header) after {} chunks",
                          state.chunk_count);
         state.eof = true;
         co_return buf::MultiBuffer{};
@@ -509,7 +509,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
         const ssize_t dec_len = state.length_cipher->Decrypt(
             len_buf, length_header_size, len_plain);
         if (dec_len != 2) {
-            LOG_ACCESS_DEBUG("VMess encoding: DecodeRequestBody authenticated length decrypt failed");
+            LOG_NET_DEBUG("VMess encoding: DecodeRequestBody authenticated length decrypt failed");
             state.eof = true;
             throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
         }
@@ -548,14 +548,14 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
                 co_return buf::MultiBuffer{};
             }
         }
-        LOG_ACCESS_DEBUG("VMess encoding: DecodeRequestBody EOF marker received after {} chunks",
+        LOG_NET_DEBUG("VMess encoding: DecodeRequestBody EOF marker received after {} chunks",
                          state.chunk_count);
         state.eof = true;
         co_return buf::MultiBuffer{};
     }
 
     if (chunk_len < overhead + padding_len || chunk_len > MAX_CHUNK_SIZE + overhead + 64) {
-        LOG_ACCESS_DEBUG("VMess encoding: DecodeRequestBody INVALID length chunk#{} raw_len={} chunk_len={} "
+        LOG_NET_DEBUG("VMess encoding: DecodeRequestBody INVALID length chunk#{} raw_len={} chunk_len={} "
                          "overhead={} padding={} MAX={} (可能 mask 计数器不同步)",
                          state.chunk_count, raw_len, chunk_len, overhead, padding_len, MAX_CHUNK_SIZE);
         state.eof = true;
@@ -594,7 +594,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
 
     if (!co_await DecodeRequestBodyReadFull(state, stream, read_crypto, chunk_len)) {
         ReleaseIdleBuffer(read_crypto_buf, 0);
-        LOG_ACCESS_DEBUG("VMess encoding: DecodeRequestBody ReadFull failed chunk#{} chunk_len={} "
+        LOG_NET_DEBUG("VMess encoding: DecodeRequestBody ReadFull failed chunk#{} chunk_len={} "
                          "(TCP 连接在 chunk body 传输中断开)",
                          state.chunk_count, chunk_len);
         state.eof = true;
@@ -801,15 +801,15 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     // VMess AEAD 请求格式：
     // AuthID (16) + LengthEncrypted (2+16) + ConnectionNonce (8) + HeaderEncrypted (N+16)
 
-    LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequest start len={} tag={} prefix={}",
+    LOG_NET_TRACE("[conn={}] VMess: ParseRequest start len={} tag={} prefix={}",
                      trace_conn_id,
                      len,
                      tag,
                      FormatHexPrefix(data, len, 24));
 
     if (len < 16 + 18 + 8) {
-        LOG_ACCESS_DEBUG("VMess: data too short, len={}", len);
-        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequest short packet len={} min={} prefix={}",
+        LOG_NET_DEBUG("VMess: data too short, len={}", len);
+        LOG_NET_TRACE("[conn={}] VMess: ParseRequest short packet len={} min={} prefix={}",
                          trace_conn_id,
                          len,
                          16 + 18 + 8,
@@ -823,9 +823,9 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     auto user = validator.FindByAuthIDForTag(tag, auth_id, timestamp);
 
     if (!user) {
-        LOG_ACCESS_DEBUG("VMess: user not found by auth_id (tag={}, users={})",
+        LOG_NET_DEBUG("VMess: user not found by auth_id (tag={}, users={})",
                          tag, validator.SizeForTag(tag));
-        LOG_ACCESS_TRACE("[conn={}] VMess: auth_id miss tag={} users={} auth_id={}",
+        LOG_NET_TRACE("[conn={}] VMess: auth_id miss tag={} users={} auth_id={}",
                          trace_conn_id,
                          tag,
                          validator.SizeForTag(tag),
@@ -838,8 +838,8 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     const int64_t skew = now - timestamp;
 
     const auto& profile = *user->profile;
-    LOG_ACCESS_DEBUG("VMess: found user {} by auth_id", profile.email);
-    LOG_ACCESS_TRACE("[conn={}] VMess: auth ok user={} tag={} ts={} skew={}s auth_id={}",
+    LOG_NET_DEBUG("VMess: found user {} by auth_id", profile.email);
+    LOG_NET_TRACE("[conn={}] VMess: auth ok user={} tag={} ts={} skew={}s auth_id={}",
                      trace_conn_id,
                      profile.email,
                      tag,
@@ -854,8 +854,8 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
 
     if (!ParseRequestHeader(data + 16, len - 16, user.get(), auth_id, connection_nonce,
                         trace_conn_id, request, consumed)) {
-        LOG_ACCESS_DEBUG("VMess: failed to parse request header");
-        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequestHeader failed user={} nonce={}",
+        LOG_NET_DEBUG("VMess: failed to parse request header");
+        LOG_NET_TRACE("[conn={}] VMess: ParseRequestHeader failed user={} nonce={}",
                          trace_conn_id,
                          profile.email,
                          FormatHexPrefix(connection_nonce, 8, 8));
@@ -863,15 +863,15 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     }
 
     if (!validator.RegisterSessionIfNew(*user, request.body_key, request.body_iv)) {
-        LOG_ACCESS_DEBUG("VMess: duplicated AEAD session id");
-        LOG_ACCESS_TRACE("[conn={}] VMess: duplicated AEAD session user={} tag={}",
+        LOG_NET_DEBUG("VMess: duplicated AEAD session id");
+        LOG_NET_TRACE("[conn={}] VMess: duplicated AEAD session user={} tag={}",
                          trace_conn_id,
                          profile.email,
                          tag);
         return {std::nullopt, 0};
     }
 
-    LOG_ACCESS_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
+    LOG_NET_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
                      trace_conn_id,
                      profile.email,
                      16 + consumed,
@@ -891,7 +891,7 @@ bool ParseRequestHeader(const uint8_t* data,
                         VMessRequest& request,
                         size_t& consumed) {
     if (len < 18 + 8) {
-        LOG_ACCESS_TRACE("[conn={}] VMess: ParseRequestHeader short len={} min={}",
+        LOG_NET_TRACE("[conn={}] VMess: ParseRequestHeader short len={} min={}",
                          trace_conn_id,
                          len,
                          18 + 8);
@@ -927,8 +927,8 @@ bool ParseRequestHeader(const uint8_t* data,
         len_dec.data(), len_dec.size(), len_dec_size);
 
     if (!len_ok || len_dec_size != len_dec.size()) {
-        LOG_ACCESS_DEBUG("VMess: header length decrypt failed");
-        LOG_ACCESS_TRACE("[conn={}] VMess: header length decrypt failed user={} auth_id={} nonce={}",
+        LOG_NET_DEBUG("VMess: header length decrypt failed");
+        LOG_NET_TRACE("[conn={}] VMess: header length decrypt failed user={} auth_id={} nonce={}",
                          trace_conn_id,
                          user && user->profile ? user->profile->email : "",
                          FormatHexPrefix(auth_id, 16, 8),
@@ -937,8 +937,8 @@ bool ParseRequestHeader(const uint8_t* data,
     }
 
     uint16_t header_len = (static_cast<uint16_t>(len_dec[0]) << 8) | len_dec[1];
-    LOG_ACCESS_DEBUG("VMess: header length = {}", header_len);
-    LOG_ACCESS_TRACE("[conn={}] VMess: header_len={} user={} nonce={}",
+    LOG_NET_DEBUG("VMess: header length = {}", header_len);
+    LOG_NET_TRACE("[conn={}] VMess: header_len={} user={} nonce={}",
                      trace_conn_id,
                      header_len,
                      user && user->profile ? user->profile->email : "",
@@ -946,8 +946,8 @@ bool ParseRequestHeader(const uint8_t* data,
 
     size_t needed = 18 + 8 + static_cast<size_t>(header_len) + 16;
     if (len < needed) {
-        LOG_ACCESS_DEBUG("VMess: not enough data for header, need {}, have {}", needed, len);
-        LOG_ACCESS_TRACE("[conn={}] VMess: incomplete header need={} have={} header_len={}",
+        LOG_NET_DEBUG("VMess: not enough data for header, need {}, have {}", needed, len);
+        LOG_NET_TRACE("[conn={}] VMess: incomplete header need={} have={} header_len={}",
                          trace_conn_id,
                          needed,
                          len,
@@ -980,8 +980,8 @@ bool ParseRequestHeader(const uint8_t* data,
         header_dec.data(), header_dec.size(), header_dec_len);
 
     if (!header_ok) {
-        LOG_ACCESS_DEBUG("VMess: header decrypt failed");
-        LOG_ACCESS_TRACE("[conn={}] VMess: header decrypt failed user={} header_len={} nonce={} enc_prefix={}",
+        LOG_NET_DEBUG("VMess: header decrypt failed");
+        LOG_NET_TRACE("[conn={}] VMess: header decrypt failed user={} header_len={} nonce={} enc_prefix={}",
                          trace_conn_id,
                          user && user->profile ? user->profile->email : "",
                          header_len,
@@ -992,8 +992,8 @@ bool ParseRequestHeader(const uint8_t* data,
     header_dec.resize(header_dec_len);
 
     if (!ParseDecryptedHeader(header_dec.data(), header_dec.size(), trace_conn_id, request)) {
-        LOG_ACCESS_DEBUG("VMess: parse decrypted header failed");
-        LOG_ACCESS_TRACE("[conn={}] VMess: ParseDecryptedHeader failed plain_len={} prefix={}",
+        LOG_NET_DEBUG("VMess: parse decrypted header failed");
+        LOG_NET_TRACE("[conn={}] VMess: ParseDecryptedHeader failed plain_len={} prefix={}",
                          trace_conn_id,
                          header_dec.size(),
                          FormatHexPrefix(header_dec.data(), header_dec.size(), 24));
@@ -1009,7 +1009,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
                                          VMessRequest& request) {
     static constexpr size_t kFixedHeaderSize = 38;
     if (len < kFixedHeaderSize + 4) {
-        LOG_ACCESS_TRACE("[conn={}] VMess: decrypted header too short len={} min={}",
+        LOG_NET_TRACE("[conn={}] VMess: decrypted header too short len={} min={}",
                          trace_conn_id,
                          len,
                          kFixedHeaderSize + 4);
@@ -1020,8 +1020,8 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
     request.version = reader.ReadU8();
     if (!reader.Ok() || request.version != VERSION) {
-        LOG_ACCESS_DEBUG("VMess: unsupported version {}", request.version);
-        LOG_ACCESS_TRACE("[conn={}] VMess: unsupported version={} prefix={}",
+        LOG_NET_DEBUG("VMess: unsupported version {}", request.version);
+        LOG_NET_TRACE("[conn={}] VMess: unsupported version={} prefix={}",
                          trace_conn_id,
                          request.version,
                          FormatHexPrefix(data, len, 24));
@@ -1083,16 +1083,16 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
                 break;
             }
             default:
-                LOG_ACCESS_DEBUG("VMess: unsupported address type {}", addr_type);
-                LOG_ACCESS_TRACE("[conn={}] VMess: unsupported address type={} prefix={}",
+                LOG_NET_DEBUG("VMess: unsupported address type {}", addr_type);
+                LOG_NET_TRACE("[conn={}] VMess: unsupported address type={} prefix={}",
                                  trace_conn_id,
                                  addr_type,
                                  FormatHexPrefix(data, len, 24));
                 return false;
         }
     } else {
-        LOG_ACCESS_DEBUG("VMess: unsupported command {}", static_cast<int>(request.command));
-        LOG_ACCESS_TRACE("[conn={}] VMess: unsupported command={} prefix={}",
+        LOG_NET_DEBUG("VMess: unsupported command {}", static_cast<int>(request.command));
+        LOG_NET_TRACE("[conn={}] VMess: unsupported command={} prefix={}",
                          trace_conn_id,
                          static_cast<int>(request.command),
                          FormatHexPrefix(data, len, 24));
@@ -1111,8 +1111,8 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     uint32_t actual_fnv = reader.ReadU32BE();
 
     if (!reader.Ok() || expected_fnv != actual_fnv) {
-        LOG_ACCESS_DEBUG("VMess: FNV1a checksum mismatch");
-        LOG_ACCESS_TRACE("[conn={}] VMess: checksum mismatch expected={:#010x} actual={:#010x} target={} padding={} options={:#04x} security={} command={}",
+        LOG_NET_DEBUG("VMess: FNV1a checksum mismatch");
+        LOG_NET_TRACE("[conn={}] VMess: checksum mismatch expected={:#010x} actual={:#010x} target={} padding={} options={:#04x} security={} command={}",
                          trace_conn_id,
                          expected_fnv,
                          actual_fnv,
@@ -1124,7 +1124,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         return false;
     }
 
-    LOG_ACCESS_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={} response_header={:#04x}",
+    LOG_NET_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={} response_header={:#04x}",
                      trace_conn_id,
                      request.target,
                      static_cast<int>(request.command),

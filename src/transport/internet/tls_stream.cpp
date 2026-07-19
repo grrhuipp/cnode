@@ -433,9 +433,9 @@ net::awaitable<bool> TlsStream::Handshake() {
     if (ec) {
         const unsigned long err_code = ERR_get_error();
         if (is_server_ && IsBenignServerHandshakeError(err_code)) {
-            LOG_ACCESS_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", ec.message());
+            LOG_NET_DEBUG("TLS handshake ignored (non-TLS traffic on TLS port): {}", ec.message());
         } else {
-            LOG_CONN_FAIL("TLS handshake error: {}", ec.message());
+            LOG_NET_WARN("TLS handshake error: {}", ec.message());
         }
         co_return false;
     }
@@ -583,12 +583,12 @@ void TlsStream::ShutdownWrite() {
 net::awaitable<void> TlsStream::AsyncShutdownWrite() {
     if (impl_ && handshake_done_ && !shutdown_initiated_) {
         shutdown_initiated_ = true;
-        LOG_ACCESS_DEBUG("TLS: sending close_notify");
+        LOG_NET_DEBUG("TLS: sending close_notify");
         auto [ec] = co_await impl_->stream.async_shutdown(
             net::as_tuple(net::use_awaitable));
         if (ec && ec != net::ssl::error::stream_truncated &&
             ec != io_error::eof && ec != io_error::operation_aborted) {
-            LOG_ACCESS_DEBUG("TLS: close_notify failed: {}", ec.message());
+            LOG_NET_DEBUG("TLS: close_notify failed: {}", ec.message());
         }
     }
     if (impl_) {

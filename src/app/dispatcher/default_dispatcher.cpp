@@ -180,19 +180,19 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (const std::bad_alloc&) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
-        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exhausted memory");
+        LOG_CONN_WARN(ctx, "dispatcher request exhausted memory");
     } catch (const IoSystemError& e) {
         stats.OnError();
         result = MakeRelayError(MapAsioError(e.code()));
-        LOG_CONN_FAIL_CTX(ctx, "dispatcher request I/O exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "dispatcher request I/O exception: {}", e.what());
     } catch (const std::exception& e) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "dispatcher request exception: {}", e.what());
     } catch (...) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_FAIL_CTX(ctx, "dispatcher request exception: unknown");
+        LOG_CONN_WARN(ctx, "dispatcher request exception: unknown");
     }
     access_log.Complete(result);
     co_return result;
@@ -245,7 +245,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             stats.OnError();
             co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        LOG_ACCESS(FormatAccessLog(ctx));
+        LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
         ActiveSessionScope relay_scope{ctx, session_tracking_};
         auto relay_result = co_await mux_session_handler_->Process(
@@ -371,12 +371,12 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
-            LOG_CONN_FAIL_CTX(ctx, "RULE_REJECT user={} target={}",
+            LOG_CONN_WARN(ctx, "RULE_REJECT user={} target={}",
                               ctx.inbound.user_email, ctx.outbound.target);
             stats.OnError();
             co_return MakeRelayError(ErrorCode::BLOCKED);
         }
-        LOG_CONN_FAIL_CTX(ctx, "OUTBOUND_HANDLER_NOT_FOUND {} -> {} via {}",
+        LOG_CONN_WARN(ctx, "OUTBOUND_HANDLER_NOT_FOUND {} -> {} via {}",
                           ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag);
         stats.OnError();
         co_return MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
@@ -447,7 +447,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         if (process_error == ErrorCode::OK) {
             process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        LOG_CONN_FAIL_CTX(ctx, "OUTBOUND_PROCESS_FAILED {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "OUTBOUND_PROCESS_FAILED {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, ErrorCodeToString(process_error));
         stats.OnError();
@@ -473,7 +473,7 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
     session::Context& ctx,
     const RouteSelection& selection) const noexcept {
     if (selection.error != ErrorCode::OK) {
-        LOG_CONN_FAIL_CTX(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
+        LOG_CONN_WARN(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
                           ctx.inbound.source_ip, ctx.outbound.target);
         return routing::DispatchResult{
             .handler = {},

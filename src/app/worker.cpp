@@ -636,7 +636,7 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
             }
 
             if (ec && ec != io_error::operation_aborted) {
-                LOG_ACCESS_DEBUG("Worker[{}]: UDP reply send failed tag={}: {}",
+                LOG_NET_DEBUG("Worker[{}]: UDP reply send failed tag={}: {}",
                                  worker_id, tag, ec.message());
             }
 
@@ -773,18 +773,18 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         if (!proxy_read.ok()) {
             switch (proxy_read.status) {
                 case ProxyProtocolReadStatus::TimedOut:
-                    LOG_CONN_FAIL_CTX(ctx,
+                    LOG_CONN_WARN(ctx,
                                       "PROXY_PROTOCOL_TIMEOUT client={}",
                                       ctx.inbound.source_ip);
                     break;
                 case ProxyProtocolReadStatus::Truncated:
-                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_TRUNCATED");
+                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TRUNCATED");
                     break;
                 case ProxyProtocolReadStatus::TooLarge:
-                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_TOO_LARGE limit={}B", 2048);
+                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TOO_LARGE limit={}B", 2048);
                     break;
                 case ProxyProtocolReadStatus::Invalid:
-                    LOG_CONN_FAIL_CTX(ctx, "PROXY_PROTOCOL_INVALID");
+                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_INVALID");
                     break;
                 case ProxyProtocolReadStatus::Ok:
                     break;
@@ -795,7 +795,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 
         if (listener.proxy_protocol == ProxyProtocolMode::On &&
             proxy_read.result.status != ProxyProtocolParseStatus::Success) {
-            LOG_CONN_FAIL_CTX(ctx,
+            LOG_CONN_WARN(ctx,
                               "PROXY_PROTOCOL_REQUIRED_MISSING client={}",
                               ctx.inbound.source_ip);
             tcp_stream->Close();

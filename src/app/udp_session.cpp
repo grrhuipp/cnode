@@ -115,7 +115,7 @@ struct UDPSession::Impl {
             Touch();
             co_return ErrorCode::SUCCESS;
         } catch (const IoSystemError& e) {
-            LOG_ACCESS_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
+            LOG_NET_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
             co_return ErrorCode::NETWORK_IO_ERROR;
         } catch (const std::bad_alloc&) {
             co_return ErrorCode::RESOURCE_EXHAUSTED;
@@ -155,7 +155,7 @@ UDPSession::UDPSession(net::io_context& io_context,
 
 UDPSession::~UDPSession() {
     if (impl_->running || impl_->receive_started || impl_->socket.is_open()) {
-        LOG_ACCESS_DEBUG("UDP session {} destroyed without Stop(), forced close", impl_->session_id);
+        LOG_NET_DEBUG("UDP session {} destroyed without Stop(), forced close", impl_->session_id);
     }
     Stop();
 }
@@ -175,7 +175,7 @@ ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
         impl_->local_port = impl_->socket.local_endpoint().port();
         impl_->running = true;
 
-        LOG_ACCESS_DEBUG("UDP session {} started on {}",
+        LOG_NET_DEBUG("UDP session {} started on {}",
                          impl_->session_id,
                          iputil::FormatEndpointForLog(
                              bind_address.to_string(), impl_->local_port));
@@ -184,7 +184,7 @@ ErrorCode UDPSession::Start(const net::ip::address& bind_address) {
         last_error = e.what();
     }
 
-    LOG_CONN_FAIL("UDP session {} start failed: {}", impl_->session_id, last_error);
+    LOG_NET_WARN("UDP session {} start failed: {}", impl_->session_id, last_error);
     return ErrorCode::NETWORK_BIND_FAILED;
 }
 
@@ -211,7 +211,7 @@ UDPSession::Impl::ResolveEndpoint(const TargetAddress& target) {
     try {
         auto dns_result = co_await dns_service.Resolve(target.host);
         if (!dns_result.Ok()) {
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "UDP session {} DNS resolve failed for {}", session_id, target.host);
             co_return std::make_pair(
                 ErrorCode::DNS_RESOLVE_FAILED, udp::endpoint{});
@@ -225,7 +225,7 @@ UDPSession::Impl::ResolveEndpoint(const TargetAddress& target) {
         co_return std::make_pair(
             ErrorCode::SUCCESS, udp::endpoint(*selected_addr, target.port));
     } catch (const IoSystemError& e) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "UDP session {} endpoint resolve error: {}", session_id, e.what());
         co_return std::make_pair(
             ErrorCode::NETWORK_IO_ERROR, udp::endpoint{});
@@ -349,7 +349,7 @@ uint64_t UDPSession::RegisterCallback(PacketCallback callback) {
     if (!impl_->running || !callback ||
         impl_->callbacks.RegisteredCount() >=
             detail::UdpCallbackRouter::kMaxCallbacks) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "UDP session {} rejected Full Cone callback running={} registered={}",
             impl_->session_id,
             impl_->running,
@@ -362,13 +362,13 @@ uint64_t UDPSession::RegisterCallback(PacketCallback callback) {
         return 0;
     }
 
-    LOG_ACCESS_DEBUG("UDP session {} registered Full Cone callback {}", impl_->session_id, id);
+    LOG_NET_DEBUG("UDP session {} registered Full Cone callback {}", impl_->session_id, id);
     return id;
 }
 
 void UDPSession::UnregisterCallback(uint64_t callback_id) {
     if (impl_->callbacks.Unregister(callback_id)) {
-        LOG_ACCESS_DEBUG("UDP session {} unregistered Full Cone callback {}", impl_->session_id, callback_id);
+        LOG_NET_DEBUG("UDP session {} unregistered Full Cone callback {}", impl_->session_id, callback_id);
     }
 }
 
@@ -376,16 +376,16 @@ net::awaitable<void> UDPSession::Impl::RunReceive(std::shared_ptr<Impl> self) {
     try {
         co_await self->DoReceive();
     } catch (const std::exception& e) {
-        LOG_CONN_FAIL("UDP session {} receive loop failed: {}",
+        LOG_NET_WARN("UDP session {} receive loop failed: {}",
                       self->session_id, e.what());
     } catch (...) {
-        LOG_CONN_FAIL("UDP session {} receive loop failed with unknown error",
+        LOG_NET_WARN("UDP session {} receive loop failed with unknown error",
                       self->session_id);
     }
 
     self->receive_started = false;
     if (self->running) {
-        LOG_CONN_FAIL("UDP session {} receive loop stopped unexpectedly",
+        LOG_NET_WARN("UDP session {} receive loop stopped unexpectedly",
                       self->session_id);
         self->running = false;
         IoErrorCode ec;
@@ -403,7 +403,7 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
             co_return;
         }
         if (wait_ec) {
-            LOG_ACCESS_DEBUG("UDP session {} wait error: {} ({})",
+            LOG_NET_DEBUG("UDP session {} wait error: {} ({})",
                              session_id, wait_ec.message(), wait_ec.value());
             continue;
         }
@@ -411,7 +411,7 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
         IoErrorCode available_ec;
         const size_t available_bytes = socket.available(available_ec);
         if (available_ec) {
-            LOG_ACCESS_DEBUG("UDP session {} available error: {} ({})",
+            LOG_NET_DEBUG("UDP session {} available error: {} ({})",
                              session_id,
                              available_ec.message(), available_ec.value());
             continue;
@@ -431,7 +431,7 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
             co_return;
         }
         if (ec) {
-            LOG_ACCESS_DEBUG("UDP session {} receive error: {} ({})",
+            LOG_NET_DEBUG("UDP session {} receive error: {} ({})",
                              session_id, ec.message(), ec.value());
             continue;
         }
@@ -444,7 +444,7 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
         const auto now = steady_clock::now();
         callbacks.Prune(now);
 
-        LOG_ACCESS_DEBUG("UDP session {} received {} bytes from {}",
+        LOG_NET_DEBUG("UDP session {} received {} bytes from {}",
                          session_id, bytes, EndpointKeyToString(sender_key));
 
         packets_received++;
@@ -467,7 +467,7 @@ net::awaitable<void> UDPSession::Impl::DoReceive() {
             sender_key, packet_view, now);
 
         if (!delivered) {
-            LOG_ACCESS_DEBUG("UDP session {} no callback for {}",
+            LOG_NET_DEBUG("UDP session {} no callback for {}",
                              session_id, EndpointKeyToString(sender_key));
         }
     }
@@ -487,7 +487,7 @@ void UDPSession::Stop() {
     impl_->callbacks.Clear();
 
     if (was_active) {
-        LOG_ACCESS_DEBUG("UDP session {} stopped, sent: {} pkts/{} bytes, recv: {} pkts/{} bytes",
+        LOG_NET_DEBUG("UDP session {} stopped, sent: {} pkts/{} bytes, recv: {} pkts/{} bytes",
                   impl_->session_id, impl_->packets_sent, impl_->bytes_sent,
                   impl_->packets_received, impl_->bytes_received);
     }
@@ -562,17 +562,17 @@ UDPSessionManager::AcquireSession(
     if (it != impl_->sessions.end()) {
         if (!it->second->IsRunning()) {
             if (it->second.use_count() != 1) {
-                LOG_CONN_FAIL("UDP session {} stopped while owning handles are still attached",
+                LOG_NET_WARN("UDP session {} stopped while owning handles are still attached",
                               session_id);
                 return std::unexpected(ErrorCode::NETWORK_IO_ERROR);
             }
-            LOG_CONN_FAIL("UDP session {} is no longer receiving; replacing it",
+            LOG_NET_WARN("UDP session {} is no longer receiving; replacing it",
                           session_id);
             it->second->Stop();
             impl_->sessions.erase(it);
         } else {
             if (!it->second->UsesBindAddress(bind_address)) {
-                LOG_CONN_FAIL("UDP session {} bind address conflict", session_id);
+                LOG_NET_WARN("UDP session {} bind address conflict", session_id);
                 return std::unexpected(ErrorCode::INVALID_ARGUMENT);
             }
             it->second->Touch();
@@ -580,7 +580,7 @@ UDPSessionManager::AcquireSession(
         }
     }
     if (impl_->sessions.size() >= Impl::kMaxSessions) {
-        LOG_CONN_FAIL("UDP session capacity exhausted: {}", Impl::kMaxSessions);
+        LOG_NET_WARN("UDP session capacity exhausted: {}", Impl::kMaxSessions);
         return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
@@ -598,7 +598,7 @@ UDPSessionManager::AcquireSession(
     auto err = session->Start(bind_address);
 
     if (err != ErrorCode::SUCCESS) {
-        LOG_CONN_FAIL("Failed to create UDP session {}: {}", session_id, ErrorCodeToString(err));
+        LOG_NET_WARN("Failed to create UDP session {}: {}", session_id, ErrorCodeToString(err));
         return std::unexpected(err);
     }
 
@@ -619,7 +619,7 @@ UDPSessionManager::AcquireSession(
         return std::unexpected(receive_error);
     }
 
-    LOG_ACCESS_DEBUG("Created UDP session {} on port {}, total sessions: {}",
+    LOG_NET_DEBUG("Created UDP session {} on port {}, total sessions: {}",
              session_id, session_handle->LocalPort(), impl_->sessions.size());
 
     return session_handle;
@@ -639,7 +639,7 @@ void UDPSessionManager::CleanupExpiredSessions() {
     for (auto it = impl_->sessions.begin(); it != impl_->sessions.end(); ) {
         if (it->second.use_count() == 1 &&
             it->second->CanRetire(impl_->session_timeout)) {
-            LOG_ACCESS_DEBUG("UDP session {} inactive or expired, removing", it->first);
+            LOG_NET_DEBUG("UDP session {} inactive or expired, removing", it->first);
             it->second->Stop();
             it = impl_->sessions.erase(it);
             removed_session = true;

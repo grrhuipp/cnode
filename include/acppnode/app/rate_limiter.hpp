@@ -263,7 +263,7 @@ public:
         // 达到阈值则屏蔽
         if (cnt >= cfg_.auth_fail_limit) {
             s->ban_until = now + cfg_.auth_ban_seconds;
-            LOG_CONN_FAIL("[{}] IP {} banned for {}s (auth failures: {})",
+            LOG_NET_WARN("[{}] IP {} banned for {}s (auth failures: {})",
                          tag, ip, cfg_.auth_ban_seconds, cnt);
             // 重置失败计数，ban 解除后重新开始计数
             s->auth_fails = 0;

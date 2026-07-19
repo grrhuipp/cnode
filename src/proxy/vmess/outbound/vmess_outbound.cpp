@@ -200,7 +200,7 @@ proxy::vmess::outbound::Handler::Process(
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_FAIL_CTX(ctx, "[VMess] DNS resolve failed for {}", config_.address);
+            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", config_.address);
         }
         co_return std::unexpected(transport_target.error());
     }
@@ -212,7 +212,7 @@ proxy::vmess::outbound::Handler::Process(
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_FAIL_CTX(ctx, "[VMess] dial failed {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);
@@ -224,7 +224,7 @@ proxy::vmess::outbound::Handler::Process(
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
     PhaseDeadlineHandle outbound_protocol_deadline =
@@ -243,7 +243,7 @@ proxy::vmess::outbound::Handler::Process(
         if (code == ErrorCode::OK) {
             code = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        LOG_CONN_FAIL("[conn={}] VMessOutbound: protocol handshake failed: {}",
+        LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
                       ctx.conn_id, ErrorCodeToString(code));
         stream->Cancel();
         co_return std::unexpected(outbound_protocol_deadline.Expired()

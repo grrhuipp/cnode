@@ -744,7 +744,7 @@ RouteDecision Router::RouteDetailed(
     // 顺序检查复合规则（AND 语义）
     for (const auto& rule : impl_->compound_rules) {
         if (rule.Match(ctx, impl_->geo_manager)) {
-            LOG_ACCESS_DEBUG("Router: {} matched compound rule -> {}",
+            LOG_NET_DEBUG("Router: {} matched compound rule -> {}",
                       target, rule.outbound_tag);
             return RouteDecision{
                 .outbound_tag = rule.outbound_tag,
@@ -754,7 +754,7 @@ RouteDecision Router::RouteDetailed(
     }
 
     // 无匹配，返回默认出站
-    LOG_ACCESS_DEBUG("Router: {} -> {} (default)",
+    LOG_NET_DEBUG("Router: {} -> {} (default)",
               target, default_outbound_tag);
     return RouteDecision{
         .outbound_tag = default_outbound_tag,

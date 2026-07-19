@@ -46,7 +46,7 @@ std::optional<TargetAddress> ReadSocksAddress(ByteReader& reader, uint8_t atype)
         uint8_t domain_len = reader.ReadU8();
         if (!reader.Ok()) return std::nullopt;
         if (domain_len == 0 || domain_len > 253) {
-            LOG_ACCESS_DEBUG("Invalid domain length: {}", domain_len);
+            LOG_NET_DEBUG("Invalid domain length: {}", domain_len);
             return std::nullopt;
         }
 

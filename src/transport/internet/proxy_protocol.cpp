@@ -81,30 +81,30 @@ ProxyProtocolResult ProxyProtocolParser::Parse(const uint8_t* data, size_t len) 
 
     // v2：以固定 12 字节签名开头
     if (len >= 12 && std::memcmp(data, kSignatureV2, 12) == 0) {
-        LOG_ACCESS_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
+        LOG_NET_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
         auto r = ParseV2(data, len);
         if (r.success()) {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v2 parsed: src={}:{} consumed={}",
+            LOG_NET_DEBUG("[ProxyProtocol] v2 parsed: src={}:{} consumed={}",
                       ProxySourceForLog(r), r.src_port, r.consumed);
         } else if (r.incomplete()) {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v2 parse incomplete");
+            LOG_NET_DEBUG("[ProxyProtocol] v2 parse incomplete");
         } else {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v2 parse failed (incomplete or invalid)");
+            LOG_NET_DEBUG("[ProxyProtocol] v2 parse failed (incomplete or invalid)");
         }
         return r;
     }
 
     // v1：以 "PROXY " 开头
     if (len >= 6 && std::memcmp(data, "PROXY ", 6) == 0) {
-        LOG_ACCESS_DEBUG("[ProxyProtocol] detected v1 text header");
+        LOG_NET_DEBUG("[ProxyProtocol] detected v1 text header");
         auto r = ParseV1(data, len);
         if (r.success()) {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v1 parsed: src={}:{} consumed={}",
+            LOG_NET_DEBUG("[ProxyProtocol] v1 parsed: src={}:{} consumed={}",
                       ProxySourceForLog(r), r.src_port, r.consumed);
         } else if (r.incomplete()) {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v1 parse incomplete");
+            LOG_NET_DEBUG("[ProxyProtocol] v1 parse incomplete");
         } else {
-            LOG_ACCESS_DEBUG("[ProxyProtocol] v1 parse failed (malformed or incomplete)");
+            LOG_NET_DEBUG("[ProxyProtocol] v1 parse failed (malformed or incomplete)");
         }
         return r;
     }

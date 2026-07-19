@@ -249,7 +249,7 @@ proxy::trojan::outbound::Handler::Process(
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_FAIL_CTX(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);
@@ -261,7 +261,7 @@ proxy::trojan::outbound::Handler::Process(
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
     auto fail_abortive = [&](ErrorCode error) {
         if (stream) {
             stream->CloseAbortive();
@@ -283,7 +283,7 @@ proxy::trojan::outbound::Handler::Process(
         target,
         header.data(), header.size());
     if (header_len == 0) {
-        LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: Handshake encode failed");
+        LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
         co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
@@ -299,7 +299,7 @@ proxy::trojan::outbound::Handler::Process(
                 first_payload,
                 initial_payload);
         if (!handshake_ok) {
-            LOG_CONN_FAIL_CTX(ctx, "TrojanOutbound: Handshake write failed");
+            LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake write failed");
             co_return fail_abortive(outbound_protocol_deadline.Expired()
                 ? ErrorCode::TIMEOUT
                 : ErrorCode::SOCKET_WRITE_FAILED);

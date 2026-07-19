@@ -441,7 +441,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     uint8_t len_buf[18];
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     if (!co_await ReadFull(stream, len_buf, length_header_size)) {
-        LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody TCP-level close "
+        LOG_NET_DEBUG("VMess client: DecodeResponseBody TCP-level close "
                          "(failed to read chunk header)");
         state.eof = true;
         throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
@@ -453,7 +453,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
         const ssize_t dec_len = state.length_cipher->Decrypt(
             len_buf, length_header_size, len_plain);
         if (dec_len != 2) {
-            LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody authenticated length decrypt failed");
+            LOG_NET_DEBUG("VMess client: DecodeResponseBody authenticated length decrypt failed");
             state.eof = true;
             throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
         }
@@ -498,7 +498,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
 
     if (chunk_len < overhead + padding_len ||
         chunk_len > ::acpp::vmess::MAX_CHUNK_SIZE + overhead + 64) {
-        LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody INVALID length raw_len={} chunk_len={} "
+        LOG_NET_DEBUG("VMess client: DecodeResponseBody INVALID length raw_len={} chunk_len={} "
                          "overhead={} padding={}", raw_len, chunk_len, overhead, padding_len);
         state.eof = true;
         throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
@@ -519,7 +519,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
 
     if (!co_await ReadFull(stream, crypto_scratch, chunk_len)) {
         ReleaseIdleBuffer(crypto_buf, 0);
-        LOG_ACCESS_DEBUG("VMess client: DecodeResponseBody ReadFull failed chunk_len={} "
+        LOG_NET_DEBUG("VMess client: DecodeResponseBody ReadFull failed chunk_len={} "
                          "(TCP 连接在 chunk body 传输中断开)", chunk_len);
         state.eof = true;
         throw IoSystemError(io_error::connection_reset, "VMess client stream read error");

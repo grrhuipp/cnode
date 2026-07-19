@@ -36,12 +36,10 @@ ID NewID(uint32_t worker_id) noexcept {
 
 }  // namespace session
 
-std::string FormatAccessLog(
+std::string FormatConnectionAccepted(
     const session::Context& ctx,
     const net::ip::address* resolved_ip,
     const net::ip::address* local_ip) {
-    std::string timestamp = FormatTimestamp(ctx.accept_time_us);
-
     std::string src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
     if (src_host.empty()) {
@@ -104,19 +102,12 @@ std::string FormatAccessLog(
         sniff_str = sniff_storage;
     }
 
-    const std::string_view in_tag = ctx.inbound.tag.empty()
-        ? std::string_view("-")
-        : ctx.inbound.tag;
     const std::string_view out_tag = ctx.outbound.tag.empty()
         ? std::string_view("-")
         : ctx.outbound.tag;
 
     return std::format(
-        "{} level=info event=accepted conn={} worker={} inbound={} outbound={} network={} src={} target={} remote={} local={} user={} dns={} sniff={}",
-        timestamp,
-        ctx.conn_id,
-        ctx.worker_id,
-        in_tag,
+        "outbound={} network={} source={} target={} remote_ip={} local_ip={} user={} dns={} sniff={}",
         out_tag,
         net_str,
         src,

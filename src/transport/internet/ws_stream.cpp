@@ -115,7 +115,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     // RFC 6455 §4.1: 密钥必须是随机生成的 16 字节 base64 编码
     uint8_t raw_key[16];
     if (RAND_bytes(raw_key, sizeof(raw_key)) != 1) [[unlikely]] {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: RAND_bytes failed", conn_id_);
+        LOG_NET_DEBUG("[conn={}] WS client: RAND_bytes failed", conn_id_);
         co_return std::unexpected(ErrorCode::INTERNAL);
     }
     std::string ws_key = Base64Encode(raw_key, sizeof(raw_key));
@@ -165,7 +165,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
 
     if (!co_await WriteFull(unsafe::ptr_cast<const uint8_t>(request.data()),
                             request.size())) {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: failed to send upgrade request", conn_id_);
+        LOG_NET_DEBUG("[conn={}] WS client: failed to send upgrade request", conn_id_);
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -183,7 +183,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         size_t n = co_await inner_->AsyncRead(
             net::buffer(response_data + response_len, response_capacity - response_len));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[conn={}] WS client: peer closed during upgrade response read", conn_id_);
+            LOG_NET_DEBUG("[conn={}] WS client: peer closed during upgrade response read", conn_id_);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
 
@@ -197,14 +197,14 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
     }
 
     if (!found_end) {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: incomplete upgrade response", conn_id_);
+        LOG_NET_DEBUG("[conn={}] WS client: incomplete upgrade response", conn_id_);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const std::string_view response(response_data, response_len);
     const std::string_view first_line = ExtractStatusLine(response);
     if (!IsSwitchingProtocolsStatus(first_line)) {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: server rejected upgrade: {}",
+        LOG_NET_DEBUG("[conn={}] WS client: server rejected upgrade: {}",
                   conn_id_,
                   first_line);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -212,13 +212,13 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
 
     const std::string_view accept = ExtractHttpHeaderCI(response, "Sec-WebSocket-Accept");
     if (accept.empty()) {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: missing Sec-WebSocket-Accept", conn_id_);
+        LOG_NET_DEBUG("[conn={}] WS client: missing Sec-WebSocket-Accept", conn_id_);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const std::string expected_accept = ComputeWsAccept(ws_key);
     if (accept != expected_accept) {
-        LOG_ACCESS_DEBUG("[conn={}] WS client: invalid Sec-WebSocket-Accept", conn_id_);
+        LOG_NET_DEBUG("[conn={}] WS client: invalid Sec-WebSocket-Accept", conn_id_);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -227,7 +227,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
                        response_len - header_end);
     }
 
-    LOG_ACCESS_DEBUG("[conn={}] WS client: handshake ok (host={} path={})", conn_id_, host, path);
+    LOG_NET_DEBUG("[conn={}] WS client: handshake ok (host={} path={})", conn_id_, host, path);
     co_return WsHandshakeResult{};
 }
 

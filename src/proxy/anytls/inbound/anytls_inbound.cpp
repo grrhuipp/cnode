@@ -748,14 +748,14 @@ void AnyTLSDemuxSession::SpawnDispatch(
                         std::move(initial),
                         uot_version);
                 } catch (const std::exception& e) {
-                    LOG_ACCESS_DEBUG(
+                    LOG_NET_DEBUG(
                         "[AnyTLS] child dispatch failed sid={} error={}",
                         sid,
                         e.what());
                     self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
                     self->RemoveStream(sid);
                 } catch (...) {
-                    LOG_ACCESS_DEBUG(
+                    LOG_NET_DEBUG(
                         "[AnyTLS] child dispatch failed sid={} error=unknown",
                         sid);
                     self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
@@ -1086,7 +1086,7 @@ Handler::Process(
         if (uid != 0) {
             if (!validator_.CanAcceptDevice(
                     ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-                LOG_ACCESS_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+                LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                     FormatTimestamp(ctx.accept_time_us),
                     ctx.inbound.source_ip,
                     ctx.inbound.source_port,

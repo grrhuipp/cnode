@@ -543,7 +543,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     if (ctx.content.network == Network::UDP && !use_uot) {
         if (!udp_session_manager_) {
-            LOG_CONN_FAIL_CTX(ctx, "[SsOutbound] UDP session manager not available");
+            LOG_CONN_WARN(ctx, "[SsOutbound] UDP session manager not available");
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
         }
         if (master_key_.empty()) {
@@ -573,7 +573,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         auto udp_session_result = udp_session_manager_->AcquireSession(
             session_id, bind_addr);
         if (!udp_session_result) {
-            LOG_CONN_FAIL_CTX(
+            LOG_CONN_WARN(
                 ctx,
                 "[SsOutbound] UDP session create failed via {}: {}",
                 ctx.outbound.tag,
@@ -642,7 +642,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
-        LOG_CONN_FAIL_CTX(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);
@@ -654,7 +654,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
     PhaseDeadlineHandle outbound_protocol_deadline =

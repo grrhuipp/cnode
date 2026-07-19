@@ -143,13 +143,13 @@ net::awaitable<RelayResult> DoUDPRelayLink(
     uint64_t callback_id = session.RegisterCallback(
         [&state, conn_id](UDPPacketView pkt) {
             if (!state.running) return false;
-            LOG_ACCESS_DEBUG("[conn={}] UDP Full Cone received {} bytes from {}",
+            LOG_NET_DEBUG("[conn={}] UDP Full Cone received {} bytes from {}",
                       conn_id, pkt.data.size(), pkt.target);
             ++state.total_replies;
             if (state.push(pkt)) {
                 return true;
             }
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[conn={}] UDP Full Cone reply queue exhausted at {} packets/{} bytes",
                 conn_id, state.reply_queue.size(), state.queued_bytes);
             state.Fail(ErrorCode::RESOURCE_EXHAUSTED);

@@ -2698,7 +2698,7 @@ private:
             co_return false;
         }
         if (prefix[0] != 0) {
-            LOG_ACCESS_DEBUG("[gRPC:{}] compressed messages are not supported", conn_id_);
+            LOG_NET_DEBUG("[gRPC:{}] compressed messages are not supported", conn_id_);
             co_return false;
         }
         const uint32_t len = ReadU32(prefix.data() + 1);
@@ -2711,7 +2711,7 @@ private:
 
         auto hunk = DecodeGrpcHunkData(message);
         if (!hunk) {
-            LOG_ACCESS_DEBUG("[gRPC:{}] invalid Hunk protobuf message", conn_id_);
+            LOG_NET_DEBUG("[gRPC:{}] invalid Hunk protobuf message", conn_id_);
             co_return false;
         }
         read_payload_ = std::move(message);
@@ -3256,12 +3256,12 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[gRPC:{}] server: read loop exception: {}",
                 conn_id_,
                 e.what());
         } catch (...) {
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[gRPC:{}] server: read loop exception: unknown",
                 conn_id_);
         }
@@ -3333,7 +3333,7 @@ private:
             sub->CloseInput();
         }
 
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[{}:{}] server: accepted logical stream_id={}",
             payload_codec_ == H2PayloadCodec::RawData ? "HTTP/2" : "gRPC",
             conn_id_,
@@ -3354,7 +3354,7 @@ private:
                                                  std::span<const uint8_t> header_block) {
         auto request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
         if (!request) {
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: failed to decode H2 request headers stream_id={}",
+            LOG_NET_DEBUG("[XHTTP:{}] server: failed to decode H2 request headers stream_id={}",
                              conn_id_,
                              stream_id);
             co_return false;
@@ -3362,7 +3362,7 @@ private:
         if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
             !expected_host.empty() &&
             !EqualsAsciiCI(TrimAscii(request->authority), expected_host)) {
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[XHTTP:{}] server: H2 host mismatch expected='{}' actual='{}'",
                 conn_id_,
                 SanitizeForLog(expected_host),
@@ -3375,7 +3375,7 @@ private:
             request->path,
             request->method);
         if (meta.kind == XHttpRequestMeta::Kind::Unknown) {
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: unknown H2 request method='{}' path='{}'",
+            LOG_NET_DEBUG("[XHTTP:{}] server: unknown H2 request method='{}' path='{}'",
                              conn_id_,
                              SanitizeForLog(request->method),
                              SanitizeForLog(request->path));
@@ -3396,7 +3396,7 @@ private:
             if ((initial_flags & 0x1) != 0 && sub) {
                 sub->CloseInput();
             }
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 stream-one ready stream_id={}",
+            LOG_NET_DEBUG("[XHTTP:{}] server: H2 stream-one ready stream_id={}",
                              conn_id_,
                              stream_id);
             auto handler = stream_handler_;
@@ -3431,7 +3431,7 @@ private:
             if ((initial_flags & 0x1) != 0 && sub) {
                 sub->CloseInput();
             }
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 split downlink ready session={} stream_id={} mode={}",
+            LOG_NET_DEBUG("[XHTTP:{}] server: H2 split downlink ready session={} stream_id={} mode={}",
                              conn_id_,
                              meta.session_id,
                              stream_id,
@@ -3469,13 +3469,13 @@ private:
             if ((initial_flags & 0x1) != 0 && sub) {
                 sub->CloseInput();
             }
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: H2 stream-up upload ready session={} stream_id={}",
+            LOG_NET_DEBUG("[XHTTP:{}] server: H2 stream-up upload ready session={} stream_id={}",
                              conn_id_,
                              meta.session_id,
                              stream_id);
             if (!xsession->AttachStream(
                     std::make_unique<GrpcServerSubStream>(std::move(sub)))) {
-                LOG_ACCESS_DEBUG(
+                LOG_NET_DEBUG(
                     "[XHTTP:{}] server: rejected concurrent H2 stream-up session={}",
                     conn_id_,
                     meta.session_id);
@@ -3530,19 +3530,19 @@ private:
                                 }
                             }
                             if (!xsession->Push(seq, std::move(payload))) {
-                                LOG_ACCESS_DEBUG(
+                                LOG_NET_DEBUG(
                                     "[XHTTP:{}] server: H2 packet-up queue exhausted seq={}",
                                     conn_id,
                                     seq);
                             }
                         } catch (const std::exception& e) {
-                            LOG_ACCESS_DEBUG(
+                            LOG_NET_DEBUG(
                                 "[XHTTP:{}] server: H2 packet-up read failed seq={} error={}",
                                 conn_id,
                                 seq,
                                 e.what());
                         } catch (...) {
-                            LOG_ACCESS_DEBUG(
+                            LOG_NET_DEBUG(
                                 "[XHTTP:{}] server: H2 packet-up read failed seq={} error=unknown",
                                 conn_id,
                                 seq);
@@ -4015,7 +4015,7 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
         co_return false;
     }
     if (prefix[0] != 0) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[gRPC:{}] server: compressed messages are not supported",
             conn_id_);
         co_return false;
@@ -4030,7 +4030,7 @@ net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
 
     auto hunk = DecodeGrpcHunkData(message);
     if (!hunk) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[gRPC:{}] server: invalid Hunk protobuf message",
             conn_id_);
         co_return false;
@@ -4143,7 +4143,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     if (!co_await ReadFullFromStream(*stream, preface.data(), preface.size()) ||
         std::string_view(unsafe::ptr_cast<const char>(preface.data()), preface.size()) !=
             kHttp2ClientPreface) {
-        LOG_ACCESS_DEBUG("[gRPC:{}] server: invalid HTTP/2 client preface", conn_id);
+        LOG_NET_DEBUG("[gRPC:{}] server: invalid HTTP/2 client preface", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -4211,7 +4211,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
                 sub->CloseInput();
             }
 
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[gRPC:{}] server: handshake ok stream_id={} path={}",
                 conn_id,
                 stream_id,
@@ -4271,7 +4271,7 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    LOG_ACCESS_DEBUG(
+    LOG_NET_DEBUG(
         "[gRPC:{}] client: handshake sent authority={} path={}",
         conn_id,
         authority.empty() ? "-" : std::string(authority),
@@ -4610,7 +4610,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
             std::move(stream),
             false,
             true);
-        LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={} initial={}B",
+        LOG_NET_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={} initial={}B",
                          conn_id,
                          EffectivePath(cfg.path),
                          payload_len);
@@ -4627,7 +4627,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
             std::move(stream),
             false,
             true);
-        LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={}",
+        LOG_NET_DEBUG("[XHTTP:{}] client: H1 stream-up ready path={}",
                          conn_id,
                          EffectivePath(cfg.path));
         co_return std::unique_ptr<AsyncStream>(std::move(body));
@@ -4689,7 +4689,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
             unsafe::ptr_cast<const uint8_t>(response_data + header_end),
             response_len - header_end);
     }
-    LOG_ACCESS_DEBUG("[XHTTP:{}] client: H1 {} ready path={}",
+    LOG_NET_DEBUG("[XHTTP:{}] client: H1 {} ready path={}",
                      conn_id,
                      kind == XHttpClientRequestKind::Downlink ? "downlink" : "stream-up",
                      EffectivePath(cfg.path));
@@ -4835,7 +4835,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         size_t n = co_await stream->AsyncRead(
             net::buffer(data + total, capacity - total));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[XHTTP:{}] server: peer closed during H1 request read", conn_id);
+            LOG_NET_DEBUG("[XHTTP:{}] server: peer closed during H1 request read", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         total += n;
@@ -4845,7 +4845,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         }
     }
     if (!found) {
-        LOG_ACCESS_DEBUG("[XHTTP:{}] server: H1 request too large or incomplete", conn_id);
+        LOG_NET_DEBUG("[XHTTP:{}] server: H1 request too large or incomplete", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -4868,7 +4868,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const auto content_length = ParseContentLength(content_length_header);
     const auto meta = ParseXHttpRequestMeta(cfg.path, request_path, method);
 
-    LOG_ACCESS_TRACE(
+    LOG_NET_TRACE(
         "[XHTTP:{}] server: H1 request line='{}' method='{}' path='{}' host='{}' bytes={}",
         conn_id,
         SanitizeForLog(request_line),
@@ -4882,7 +4882,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     }
     if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[XHTTP:{}] server: host mismatch expected='{}' actual='{}'",
             conn_id,
             SanitizeForLog(expected_host),
@@ -4929,7 +4929,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (header_end < total) {
             downlink->SetPendingData(data + header_end, total - header_end);
         }
-        LOG_ACCESS_DEBUG("[XHTTP:{}] server: split downlink ready session={} mode={}",
+        LOG_NET_DEBUG("[XHTTP:{}] server: split downlink ready session={} mode={}",
                          conn_id,
                          meta.session_id,
                          xhttp_cfg.AcceptsStreamUp() ? "stream-up" : "packet-up");
@@ -4951,7 +4951,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             content_length_count == 0 && transfer_encoding_count == 1 &&
             EqualsAsciiCI(TrimAscii(transfer_encoding), "chunked");
         if (!valid_content_length && !valid_chunked) {
-            LOG_ACCESS_DEBUG(
+            LOG_NET_DEBUG(
                 "[XHTTP:{}] server: packet-up requires exactly one valid body framing",
                 conn_id);
             co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -4985,7 +4985,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
                 response.size())) {
             co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
-        LOG_ACCESS_TRACE("[XHTTP:{}] server: packet-up payload accepted session={} seq={}",
+        LOG_NET_TRACE("[XHTTP:{}] server: packet-up payload accepted session={} seq={}",
                          conn_id,
                          meta.session_id,
                          meta.seq);
@@ -5028,7 +5028,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (header_end < total) {
             body->SetPendingData(data + header_end, total - header_end);
         }
-        LOG_ACCESS_DEBUG("[XHTTP:{}] server: stream-up upload ready session={}",
+        LOG_NET_DEBUG("[XHTTP:{}] server: stream-up upload ready session={}",
                          conn_id,
                          meta.session_id);
         if (!session->AttachStream(std::move(body))) {
@@ -5065,7 +5065,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         size_t n = co_await stream->AsyncRead(
             net::buffer(data + total, capacity - total));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[HTTP:{}] server: peer closed during request read", conn_id);
+            LOG_NET_DEBUG("[HTTP:{}] server: peer closed during request read", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         total += n;
@@ -5075,7 +5075,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         }
     }
     if (!found) {
-        LOG_ACCESS_DEBUG("[HTTP:{}] server: request too large or incomplete", conn_id);
+        LOG_NET_DEBUG("[HTTP:{}] server: request too large or incomplete", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -5086,7 +5086,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
     const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
 
-    LOG_ACCESS_TRACE(
+    LOG_NET_TRACE(
         "[HTTP:{}] server: request line='{}' method='{}' path='{}' host='{}' ua='{}' bytes={}",
         conn_id,
         SanitizeForLog(request_line),
@@ -5097,7 +5097,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         total);
 
     if (method.empty() || !HttpPathMatches(cfg.path, request_path)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[HTTP:{}] server: path mismatch expected='{}' actual='{}'",
             conn_id,
             EffectivePath(cfg.path),
@@ -5105,7 +5105,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!cfg.method.empty() && !EqualsAsciiCI(method, cfg.method)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[HTTP:{}] server: method mismatch expected='{}' actual='{}'",
             conn_id,
             cfg.method,
@@ -5114,7 +5114,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     }
     if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(cfg));
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[HTTP:{}] server: host mismatch expected='{}' actual='{}'",
             conn_id,
             SanitizeForLog(expected_host),
@@ -5155,7 +5155,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
             *stream,
             unsafe::ptr_cast<const uint8_t>(response.data()),
             response.size())) {
-        LOG_ACCESS_DEBUG("[HTTP:{}] server: failed to send 200 response", conn_id);
+        LOG_NET_DEBUG("[HTTP:{}] server: failed to send 200 response", conn_id);
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -5164,7 +5164,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     if (header_end < total) {
         http->SetPendingData(data + header_end, total - header_end);
     }
-    LOG_ACCESS_DEBUG("[HTTP:{}] server: handshake ok (path={})",
+    LOG_NET_DEBUG("[HTTP:{}] server: handshake ok (path={})",
                      conn_id,
                      EffectivePath(cfg.path));
     co_return std::unique_ptr<AsyncStream>(std::move(http));
@@ -5271,7 +5271,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    LOG_ACCESS_DEBUG(
+    LOG_NET_DEBUG(
         "[HTTP/2:{}] client: handshake sent authority={} path={}",
         conn_id,
         authority.empty() ? "-" : std::string(authority),
@@ -5323,7 +5323,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
             *stream,
             unsafe::ptr_cast<const uint8_t>(request.data()),
             request.size())) {
-        LOG_ACCESS_DEBUG("[HTTP:{}] client: failed to send request", conn_id);
+        LOG_NET_DEBUG("[HTTP:{}] client: failed to send request", conn_id);
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -5342,7 +5342,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
             net::buffer(response_data + response_len,
                         response_capacity - response_len));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[HTTP:{}] client: peer closed during response read", conn_id);
+            LOG_NET_DEBUG("[HTTP:{}] client: peer closed during response read", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         response_len += n;
@@ -5355,14 +5355,14 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     }
 
     if (!found_end) {
-        LOG_ACCESS_DEBUG("[HTTP:{}] client: incomplete response", conn_id);
+        LOG_NET_DEBUG("[HTTP:{}] client: incomplete response", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const std::string_view response(response_data, response_len);
     const std::string_view status_line = ExtractStatusLine(response);
     if (!IsHttpOkStatus(status_line)) {
-        LOG_ACCESS_DEBUG("[HTTP:{}] client: server rejected request: {}",
+        LOG_NET_DEBUG("[HTTP:{}] client: server rejected request: {}",
                          conn_id,
                          SanitizeForLog(status_line));
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -5374,7 +5374,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
             unsafe::ptr_cast<const uint8_t>(response_data + header_end),
             response_len - header_end);
     }
-    LOG_ACCESS_DEBUG("[HTTP:{}] client: handshake ok (host={} path={})",
+    LOG_NET_DEBUG("[HTTP:{}] client: handshake ok (host={} path={})",
                      conn_id,
                      host,
                      req_path);
@@ -5399,7 +5399,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
         size_t n = co_await stream->AsyncRead(
             net::buffer(data + total, capacity - total));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] server: peer closed during request read", conn_id);
+            LOG_NET_DEBUG("[HTTPUpgrade:{}] server: peer closed during request read", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         total += n;
@@ -5410,7 +5410,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     }
 
     if (!found) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] server: request too large or incomplete", conn_id);
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] server: request too large or incomplete", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
@@ -5422,7 +5422,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     const std::string_view connection = ExtractHeaderValueCI(request, "Connection");
     const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
 
-    LOG_ACCESS_TRACE(
+    LOG_NET_TRACE(
         "[HTTPUpgrade:{}] server: request line='{}' path='{}' host='{}' upgrade='{}' connection='{}' ua='{}' bytes={}",
         conn_id,
         SanitizeForLog(request_line),
@@ -5435,7 +5435,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
 
     if (!request_line.starts_with("GET ") ||
         !RequestPathMatches(cfg.path, request_path)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[HTTPUpgrade:{}] server: path mismatch expected='{}' actual='{}'",
             conn_id,
             EffectivePath(cfg.path),
@@ -5445,13 +5445,13 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
 
     if (!EqualsAsciiCI(upgrade, "websocket") ||
         !HeaderContainsTokenCI(connection, "upgrade")) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] server: invalid upgrade headers", conn_id);
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] server: invalid upgrade headers", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     if (const std::string_view expected_host = TrimAscii(ExpectedHttpUpgradeHost(cfg));
         !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "[HTTPUpgrade:{}] server: host mismatch expected='{}' actual='{}'",
             conn_id,
             SanitizeForLog(expected_host),
@@ -5482,7 +5482,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
             *stream,
             unsafe::ptr_cast<const uint8_t>(kResponse.data()),
             kResponse.size())) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] server: failed to send 101 response", conn_id);
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] server: failed to send 101 response", conn_id);
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -5491,7 +5491,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     if (header_end < total) {
         upgraded->SetPendingData(data + header_end, total - header_end);
     }
-    LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] server: handshake ok (path={})",
+    LOG_NET_DEBUG("[HTTPUpgrade:{}] server: handshake ok (path={})",
                      conn_id,
                      EffectivePath(cfg.path));
     co_return std::unique_ptr<AsyncStream>(std::move(upgraded));
@@ -5558,7 +5558,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
             *stream,
             unsafe::ptr_cast<const uint8_t>(request.data()),
             request.size())) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] client: failed to send request", conn_id);
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] client: failed to send request", conn_id);
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
@@ -5577,7 +5577,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
             net::buffer(response_data + response_len,
                         response_capacity - response_len));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] client: peer closed during response read", conn_id);
+            LOG_NET_DEBUG("[HTTPUpgrade:{}] client: peer closed during response read", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_EOF);
         }
         response_len += n;
@@ -5590,14 +5590,14 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     }
 
     if (!found_end) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] client: incomplete response", conn_id);
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] client: incomplete response", conn_id);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const std::string_view response(response_data, response_len);
     const std::string_view status_line = ExtractStatusLine(response);
     if (!IsSwitchingProtocolsStatus(status_line)) {
-        LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] client: server rejected upgrade: {}",
+        LOG_NET_DEBUG("[HTTPUpgrade:{}] client: server rejected upgrade: {}",
                          conn_id,
                          SanitizeForLog(status_line));
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -5609,7 +5609,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
             unsafe::ptr_cast<const uint8_t>(response_data + header_end),
             response_len - header_end);
     }
-    LOG_ACCESS_DEBUG("[HTTPUpgrade:{}] client: handshake ok (host={} path={})",
+    LOG_NET_DEBUG("[HTTPUpgrade:{}] client: handshake ok (host={} path={})",
                      conn_id,
                      host,
                      req_path);
@@ -5637,9 +5637,9 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         size_t n = co_await stream->AsyncRead(
             net::buffer(data + total, capacity - total));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[WS:{}] server: peer closed during HTTP upgrade read", conn_id);
+            LOG_NET_DEBUG("[WS:{}] server: peer closed during HTTP upgrade read", conn_id);
             std::string_view partial(unsafe::ptr_cast<char>(data), total);
-            LOG_ACCESS_TRACE("[WS:{}] server: peer closed during upgrade read bytes={} first_line='{}' prefix_hex={}",
+            LOG_NET_TRACE("[WS:{}] server: peer closed during upgrade read bytes={} first_line='{}' prefix_hex={}",
                              conn_id,
                              total,
                              SanitizeForLog(ExtractRequestLine(partial)),
@@ -5652,8 +5652,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
     if (!found) {
         std::string_view partial(unsafe::ptr_cast<char>(data), total);
-        LOG_ACCESS_DEBUG("[WS:{}] server: HTTP upgrade request too large or incomplete", conn_id);
-        LOG_ACCESS_TRACE("[WS:{}] server: incomplete upgrade bytes={} first_line='{}'",
+        LOG_NET_DEBUG("[WS:{}] server: HTTP upgrade request too large or incomplete", conn_id);
+        LOG_NET_TRACE("[WS:{}] server: incomplete upgrade bytes={} first_line='{}'",
                          conn_id,
                          total,
                          SanitizeForLog(ExtractRequestLine(partial)));
@@ -5671,7 +5671,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     const std::string_view origin = ExtractHeaderValueCI(request, "Origin");
     const std::string_view subprotocol = ExtractHeaderValueCI(request, "Sec-WebSocket-Protocol");
 
-    LOG_ACCESS_TRACE(
+    LOG_NET_TRACE(
         "[WS:{}] server: upgrade request line='{}' path='{}' host='{}' upgrade='{}' connection='{}' version='{}' ua='{}' origin='{}' proto='{}' bytes={}",
         conn_id,
         SanitizeForLog(request_line),
@@ -5687,8 +5687,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
 
     // 验证 Upgrade 头
     if (!EqualsAsciiCI(TrimAscii(upgrade), "websocket")) {
-        LOG_ACCESS_DEBUG("[WS:{}] server: missing 'Upgrade: websocket' header", conn_id);
-        LOG_ACCESS_TRACE("[WS:{}] server: reject missing upgrade line='{}' host='{}' upgrade='{}' connection='{}'",
+        LOG_NET_DEBUG("[WS:{}] server: missing 'Upgrade: websocket' header", conn_id);
+        LOG_NET_TRACE("[WS:{}] server: reject missing upgrade line='{}' host='{}' upgrade='{}' connection='{}'",
                          conn_id,
                          SanitizeForLog(request_line),
                          SanitizeForLog(host),
@@ -5700,8 +5700,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     // 验证路径（如果配置了非根路径）
     if (ws_cfg.path != "/" && !ws_cfg.path.empty()) {
         if (request_path != ws_cfg.path) {
-            LOG_ACCESS_DEBUG("[WS:{}] server: path mismatch, expected '{}'", conn_id, ws_cfg.path);
-            LOG_ACCESS_TRACE("[WS:{}] server: reject path mismatch expected='{}' actual='{}' line='{}'",
+            LOG_NET_DEBUG("[WS:{}] server: path mismatch, expected '{}'", conn_id, ws_cfg.path);
+            LOG_NET_TRACE("[WS:{}] server: reject path mismatch expected='{}' actual='{}' line='{}'",
                              conn_id,
                              ws_cfg.path,
                              SanitizeForLog(request_path),
@@ -5714,8 +5714,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     // 提取 Sec-WebSocket-Key
     std::string_view ws_key = ExtractHeaderValueCI(request, "Sec-WebSocket-Key");
     if (ws_key.empty()) {
-        LOG_ACCESS_DEBUG("[WS:{}] server: missing Sec-WebSocket-Key header", conn_id);
-        LOG_ACCESS_TRACE("[WS:{}] server: reject missing key line='{}' host='{}' version='{}'",
+        LOG_NET_DEBUG("[WS:{}] server: missing Sec-WebSocket-Key header", conn_id);
+        LOG_NET_TRACE("[WS:{}] server: reject missing key line='{}' host='{}' version='{}'",
                          conn_id,
                          SanitizeForLog(request_line),
                          SanitizeForLog(host),
@@ -5751,7 +5751,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         size_t n = co_await stream->AsyncWrite(
             net::buffer(resp.data() + sent, resp.size() - sent));
         if (n == 0) {
-            LOG_ACCESS_DEBUG("[WS:{}] server: failed to send 101 response", conn_id);
+            LOG_NET_DEBUG("[WS:{}] server: failed to send 101 response", conn_id);
             co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         sent += n;
@@ -5763,7 +5763,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     if (header_end < total) {
         ws->SetPendingData(data + header_end, total - header_end);
     }
-    LOG_ACCESS_TRACE(
+    LOG_NET_TRACE(
         "[WS:{}] server: handshake accepted path='{}' host='{}' key_len={} pending={} real_ip_header='{}' real_ip='{}'",
         conn_id,
         ws_cfg.path.empty() ? "/" : ws_cfg.path,
@@ -5772,7 +5772,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         header_end < total ? (total - header_end) : 0,
         ws_cfg.real_ip_header.empty() ? "-" : ws_cfg.real_ip_header,
         (out_real_ip && !out_real_ip->empty()) ? *out_real_ip : std::string("-"));
-    LOG_ACCESS_DEBUG("[WS:{}] server: handshake ok (path={})", conn_id, ws_cfg.path);
+    LOG_NET_DEBUG("[WS:{}] server: handshake ok (path={})", conn_id, ws_cfg.path);
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
 
@@ -5831,11 +5831,11 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         }
         auto tls = co_await WrapTlsServer(std::move(tcp), *ctx);
         if (!tls) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: {} server handshake failed",
+            LOG_NET_DEBUG("[Transport] BuildInbound: {} server handshake failed",
                              s.IsReality() ? "REALITY" : "TLS");
             co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
-        LOG_ACCESS_DEBUG("[Transport] BuildInbound: {} handshake ok",
+        LOG_NET_DEBUG("[Transport] BuildInbound: {} handshake ok",
                          s.IsReality() ? "REALITY" : "TLS");
         stream = std::move(tls);
     }
@@ -5854,7 +5854,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             std::move(stream_handler),
             conn_id);
         if (!grpc_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: gRPC server handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildInbound: gRPC server handshake failed ({})",
                              ErrorCodeToString(grpc_result.error()));
             co_return std::unexpected(grpc_result.error());
         }
@@ -5876,7 +5876,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             conn_id,
             out_real_ip);
         if (!http_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: HTTP server handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildInbound: HTTP server handshake failed ({})",
                              ErrorCodeToString(http_result.error()));
             co_return std::unexpected(http_result.error());
         }
@@ -5908,7 +5908,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             false,
             &s.xhttp);
         if (!xhttp_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: XHTTP server handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildInbound: XHTTP server handshake failed ({})",
                              ErrorCodeToString(xhttp_result.error()));
             co_return std::unexpected(xhttp_result.error());
         }
@@ -5925,7 +5925,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         }
         auto ws_result = co_await DoWsServerHandshake(std::move(stream), s.ws, conn_id, out_real_ip);
         if (!ws_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: WS server handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildInbound: WS server handshake failed ({})",
                              ErrorCodeToString(ws_result.error()));
             co_return std::unexpected(ws_result.error());
         }
@@ -5942,7 +5942,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         auto http_upgrade_result = co_await DoHttpUpgradeServerHandshake(
             std::move(stream), s.http_upgrade, conn_id, out_real_ip);
         if (!http_upgrade_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildInbound: HTTPUpgrade server handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildInbound: HTTPUpgrade server handshake failed ({})",
                              ErrorCodeToString(http_upgrade_result.error()));
             co_return std::unexpected(http_upgrade_result.error());
         }
@@ -6000,12 +6000,12 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, alpn)
             : co_await WrapTlsClient(std::move(tcp), *ctx, sni, alpn);
         if (!tls) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: {} client handshake failed (sni={})",
+            LOG_NET_DEBUG("[Transport] BuildOutbound: {} client handshake failed (sni={})",
                              s.IsReality() ? "REALITY" : "TLS",
                              sni);
             co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
-        LOG_ACCESS_DEBUG("[Transport] BuildOutbound: {} handshake ok (sni={}, alpn={})",
+        LOG_NET_DEBUG("[Transport] BuildOutbound: {} handshake ok (sni={}, alpn={})",
                          s.IsReality() ? "REALITY" : "TLS",
                          sni,
                          tls->NegotiatedAlpn().empty()
@@ -6036,7 +6036,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         auto grpc_result = co_await DoGrpcClientHandshake(
             std::move(stream), s.grpc, authority, s.IsTlsLike(), conn_id);
         if (!grpc_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: gRPC client handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildOutbound: gRPC client handshake failed ({})",
                              ErrorCodeToString(grpc_result.error()));
             co_return std::unexpected(grpc_result.error());
         }
@@ -6068,7 +6068,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
                 s.IsTlsLike(),
                 conn_id);
             if (!http2_result) {
-                LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTP/2 client handshake failed ({})",
+                LOG_NET_DEBUG("[Transport] BuildOutbound: HTTP/2 client handshake failed ({})",
                                  ErrorCodeToString(http2_result.error()));
                 co_return std::unexpected(http2_result.error());
             }
@@ -6080,7 +6080,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
                 host,
                 conn_id);
             if (!http1_result) {
-                LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTP client handshake failed ({})",
+                LOG_NET_DEBUG("[Transport] BuildOutbound: HTTP client handshake failed ({})",
                                  ErrorCodeToString(http1_result.error()));
                 co_return std::unexpected(http1_result.error());
             }
@@ -6122,7 +6122,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             s.IsTlsLike(),
             conn_id);
         if (!xhttp_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: XHTTP client handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildOutbound: XHTTP client handshake failed ({})",
                              ErrorCodeToString(xhttp_result.error()));
             co_return std::unexpected(xhttp_result.error());
         }
@@ -6145,7 +6145,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             s.ws.path.empty() ? "/" : s.ws.path,
             &s.ws.headers);
         if (!ws_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: WS client handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildOutbound: WS client handshake failed ({})",
                              ErrorCodeToString(ws_result.error()));
             co_return std::unexpected(ws_result.error());
         }
@@ -6165,7 +6165,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         auto http_upgrade_result = co_await DoHttpUpgradeClientHandshake(
             std::move(stream), s.http_upgrade, host, conn_id);
         if (!http_upgrade_result) {
-            LOG_ACCESS_DEBUG("[Transport] BuildOutbound: HTTPUpgrade client handshake failed ({})",
+            LOG_NET_DEBUG("[Transport] BuildOutbound: HTTPUpgrade client handshake failed ({})",
                              ErrorCodeToString(http_upgrade_result.error()));
             co_return std::unexpected(http_upgrade_result.error());
         }

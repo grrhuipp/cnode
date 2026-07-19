@@ -396,7 +396,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     std::string client_session_key =
         decoded->session_owner.ScopeSessionKey(protocol_session_key);
     if (client_session_key.empty()) {
-        LOG_ACCESS_DEBUG(
+        LOG_NET_DEBUG(
             "Worker[{}]: UDP decode missing authenticated session owner for client={}",
             datagram.worker_id,
             client_key_log());
@@ -407,7 +407,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
 
     if (need_new_session) {
         if (!decoded->response_context) {
-            LOG_ACCESS_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
+            LOG_NET_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
                              datagram.worker_id, client_key_log());
             return;
         }
@@ -545,7 +545,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         decoded->session_owner,
         std::move(decoded->payload),
         now)) {
-        LOG_ACCESS_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
+        LOG_NET_DEBUG("Worker[{}]: UDP link enqueue failed for client={}",
                          datagram.worker_id, client_key_log());
     }
 }

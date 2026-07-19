@@ -1519,6 +1519,27 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_access_log_target_ip_test
         COMMAND cnode_access_log_target_ip_test)
 
+    add_executable(cnode_log_format_test
+        tests/log_format_test.cpp
+        src/infra/log.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_log_format_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${concurrentqueue_SOURCE_DIR}
+    )
+    target_link_libraries(cnode_log_format_test PRIVATE
+        Threads::Threads
+        cnode_zlib
+    )
+    target_compile_options(cnode_log_format_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_log_format_test
+        COMMAND cnode_log_format_test)
+
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
         src/app/proxyman/inbound/udp_worker.cpp

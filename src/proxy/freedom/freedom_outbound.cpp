@@ -237,13 +237,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         try {
             session_result = AcquireUdpSession(ctx);
         } catch (const std::exception& e) {
-            LOG_CONN_FAIL_CTX(ctx, "UDP_DIAL_FAILED {} -> {} via {}: {}",
+            LOG_CONN_WARN(ctx, "UDP_DIAL_FAILED {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag, e.what());
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
         }
         if (!session_result) {
-            LOG_CONN_FAIL_CTX(ctx, "UDP_DIAL_FAILED {} -> {} via {}",
+            LOG_CONN_WARN(ctx, "UDP_DIAL_FAILED {} -> {} via {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag);
             co_return std::unexpected(session_result.error());
@@ -332,7 +332,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             iputil::NormalizeAddress(*dial_result.attempted_remote_addr);
     }
     if (!dial_result.Ok()) {
-        LOG_CONN_FAIL_CTX(ctx, "DIAL_FAILED {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "DIAL_FAILED {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);
@@ -356,7 +356,10 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             ctx.outbound.connected_local_addr = local_ip;
         }
     }
-    LOG_ACCESS(FormatAccessLog(ctx, &remote_ip, &local_ip));
+    LOG_CONN_EVENT(
+        ctx,
+        "connection.accepted",
+        FormatConnectionAccepted(ctx, &remote_ip, &local_ip));
 
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
@@ -411,7 +414,7 @@ Handler::AcquireUdpSession(session::Context& ctx) {
     }
 
     if (!udp_session_manager_) {
-        LOG_CONN_FAIL("Freedom UDP: UDPSessionManager not available");
+        LOG_NET_WARN("Freedom UDP: UDPSessionManager not available");
         return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
     }
 

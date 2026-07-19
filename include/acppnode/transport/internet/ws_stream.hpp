@@ -357,7 +357,7 @@ public:
         if (close_frame.size != 0) {
             try {
                 co_await WriteBytes(close_frame.bytes.data(), close_frame.size);
-                LOG_ACCESS_DEBUG("[conn={}] WS {}: sent close frame", conn_id_, is_client_ ? "client" : "server");
+                LOG_NET_DEBUG("[conn={}] WS {}: sent close frame", conn_id_, is_client_ ? "client" : "server");
             } catch (...) {
                 // 忽略发送错误
             }
@@ -472,12 +472,12 @@ protected:
             }
 
             if (payload_len > kMaxFrameSize) {
-                LOG_ACCESS_DEBUG("[conn={}] WS: frame too large: {}", conn_id_, payload_len);
+                LOG_NET_DEBUG("[conn={}] WS: frame too large: {}", conn_id_, payload_len);
                 co_return false;
             }
 
             if (opcode == ws::Opcode::CLOSE) {
-                LOG_ACCESS_DEBUG("[conn={}] WS {}: received close frame",
+                LOG_NET_DEBUG("[conn={}] WS {}: received close frame",
                           conn_id_, is_client_ ? "client" : "server");
                 if (!co_await DiscardPayload(payload_len)) {
                     co_return false;

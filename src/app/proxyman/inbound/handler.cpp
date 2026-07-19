@@ -223,11 +223,11 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             timeouts);
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
-        LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: {}", e.what());
         stats.OnError();
         access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
-        LOG_CONN_FAIL_CTX(ctx, "[Session] logical inbound process exception: unknown");
+        LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: unknown");
         stats.OnError();
         access_log.Fail(ErrorCode::INTERNAL);
     }
@@ -362,11 +362,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             timeouts);
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
-        LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "[Session] inbound process exception: {}", e.what());
         stats.OnError();
         access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
-        LOG_CONN_FAIL_CTX(ctx, "[Session] inbound process exception: unknown");
+        LOG_CONN_WARN(ctx, "[Session] inbound process exception: unknown");
         stats.OnError();
         access_log.Fail(ErrorCode::INTERNAL);
     }

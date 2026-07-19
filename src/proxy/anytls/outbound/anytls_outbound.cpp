@@ -730,7 +730,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return std::unexpected(ErrorCode::INTERNAL);
     }
     if (!stream_settings_.IsTls()) {
-        LOG_CONN_FAIL_CTX(ctx, "[AnyTLSOutbound] TLS transport is required");
+        LOG_CONN_WARN(ctx, "[AnyTLSOutbound] TLS transport is required");
         co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
@@ -769,7 +769,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
         if (!dial_result.Ok()) {
-            LOG_CONN_FAIL_CTX(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
+            LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag, dial_result.error_msg);
             co_return std::unexpected(dial_result.error);
@@ -777,7 +777,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         auto new_stream = std::move(dial_result.stream);
         new_stream->SetStreamLabel("out");
-        LOG_ACCESS(FormatAccessLog(ctx));
+        LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
 
         new_stream->SetIdleTimeout(timeouts.HandshakeTimeout());
         auto deadline = new_stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
