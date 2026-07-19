@@ -153,6 +153,9 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         ? request_load_->PressureIdleTimeout()
         : 0;
     app::AccessLogSession access_log(ctx);
+    // Authentication and request parsing have succeeded. Raw wire bytes are
+    // retained only for pre-dispatch transport/protocol/security failures.
+    ctx.inbound.read_prefix_capture.reset();
 
     RelayResult result;
     try {

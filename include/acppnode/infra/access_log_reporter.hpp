@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <vector>
 #include <string>
 #include <string_view>
 
@@ -16,7 +17,8 @@ namespace acpp::accesslog {
 inline constexpr std::string_view kServiceBaseUrl = "https://l.bt3.one";
 inline constexpr std::string_view kServiceHost = "l.bt3.one";
 inline constexpr std::string_view kServicePort = "443";
-inline constexpr std::string_view kBatchTarget = "/v1/access/batches";
+inline constexpr std::string_view kAccessBatchTarget = "/v1/access/batches";
+inline constexpr std::string_view kErrorBatchTarget = "/v1/error/batches";
 
 enum class Result : uint8_t {
     Completed = 1,
@@ -81,6 +83,9 @@ struct Event {
     uint8_t dns_state = 0;
     std::string sniff_protocol;
     std::string sniff_domain;
+    std::string error_reason;
+    std::vector<uint8_t> raw_packet;
+    bool raw_packet_truncated = false;
 };
 
 // Preserves a panel base path but removes query, fragment and userinfo. Returns
@@ -90,6 +95,9 @@ struct Event {
 
 // Keeps the durable queue colocated with the configured cnode log directory.
 [[nodiscard]] std::filesystem::path ResolveSpoolPath(
+    const std::filesystem::path& log_dir);
+
+[[nodiscard]] std::filesystem::path ResolveErrorSpoolPath(
     const std::filesystem::path& log_dir);
 
 class Reporter final {

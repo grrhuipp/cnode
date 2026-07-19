@@ -63,6 +63,9 @@ message AccessEvent {
   // Final-destination IP used by the most recent direct dial attempt. This is
   // populated even when the connection or transport handshake fails.
   string dial_ip = 29;
+  string error_reason = 30;
+  bytes raw_packet = 31;
+  bool raw_packet_truncated = 32;
 }
 
 message AccessBatch {
@@ -76,4 +79,7 @@ message AccessBatch {
   repeated AccessEvent events = 8;
   // Set by the log service from HTTP forwarding headers or the TCP peer.
   string node_ip = 9;
+  // Set authoritatively by the log service from the receiving endpoint.
+  // 1 = normal access stream, 2 = error/security stream.
+  uint32 stream_kind = 10;
 }

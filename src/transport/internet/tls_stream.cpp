@@ -294,8 +294,22 @@ public:
                 stream_->TlsLayerSocket().async_read_some(
                     buffers,
                     [this,
+                     buffers,
                      handler = std::forward<decltype(handler)>(handler)](
                         IoErrorCode ec, std::size_t n) mutable {
+                        if (!ec && n > 0) {
+                            std::size_t remaining = n;
+                            for (auto it = net::buffer_sequence_begin(buffers),
+                                      end = net::buffer_sequence_end(buffers);
+                                 it != end && remaining > 0;
+                                 ++it) {
+                                const net::mutable_buffer buffer = *it;
+                                const auto count = std::min(remaining, buffer.size());
+                                stream_->CaptureReadPrefix({
+                                    static_cast<const uint8_t*>(buffer.data()), count});
+                                remaining -= count;
+                            }
+                        }
                         stream_->EndTlsLayerRead(ec, n);
                         std::move(handler)(ec, n);
                     });

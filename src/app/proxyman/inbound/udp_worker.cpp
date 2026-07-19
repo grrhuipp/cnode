@@ -4,6 +4,7 @@
 #include "acppnode/app/access_log_session.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
@@ -368,6 +369,9 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
             rejected_ctx.inbound.access_source_ref =
                 datagram.receiver->access_source_ref;
             rejected_ctx.inbound.protocol = datagram.receiver->protocol;
+            rejected_ctx.inbound.read_prefix_capture =
+                std::make_shared<ReadPrefixCapture>();
+            rejected_ctx.inbound.read_prefix_capture->Append(datagram.payload);
             rejected_ctx.content.network = Network::UDP;
 
             IoErrorCode local_ec;

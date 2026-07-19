@@ -3,6 +3,7 @@
 #include "acppnode/common/clock.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/network.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 
 #include <algorithm>
 
@@ -108,6 +109,12 @@ accesslog::Event BuildAccessLogEvent(
     event.downlink_bytes = std::max(bytes_down, ctx.traffic.bytes_down);
     event.result = ToAccessResult(error_code);
     event.error_code = error_code;
+    event.error_reason = ErrorCodeToString(error_code);
+    if (error_code != ErrorCode::OK && ctx.inbound.read_prefix_capture) {
+        event.raw_packet = ctx.inbound.read_prefix_capture->Bytes();
+        event.raw_packet_truncated =
+            ctx.inbound.read_prefix_capture->Truncated();
+    }
     event.close_side = close_side;
     event.dns_state = static_cast<uint8_t>(ctx.content.dns_result);
     event.sniff_protocol = ctx.content.protocol;

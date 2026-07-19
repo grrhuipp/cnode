@@ -77,6 +77,8 @@ public:
     void SetStreamLabel(std::string_view label) noexcept;
     [[nodiscard]] std::string_view StreamLabel() const noexcept;
     void SetAbortiveClose(bool enable = true) noexcept;
+    void SetReadPrefixCapture(std::shared_ptr<ReadPrefixCapture> capture);
+    void CaptureReadPrefix(std::span<const uint8_t> bytes) noexcept;
 
     net::awaitable<ProxyProtocolReadResult> ReadProxyProtocolHeader(
         std::chrono::seconds timeout);

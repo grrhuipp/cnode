@@ -138,4 +138,11 @@ std::filesystem::path ResolveSpoolPath(
         : log_dir / "access-spool";
 }
 
+std::filesystem::path ResolveErrorSpoolPath(
+    const std::filesystem::path& log_dir) {
+    return log_dir.empty()
+        ? std::filesystem::path("error-spool")
+        : log_dir / "error-spool";
+}
+
 }  // namespace acpp::accesslog

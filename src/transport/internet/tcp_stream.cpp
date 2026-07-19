@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/memory_stats.hpp"
@@ -119,6 +120,7 @@ struct TcpStream::Impl {
     tcp::socket socket;
     TimeoutScheduler* timeout_scheduler = nullptr;
     buf::MultiBuffer pending_data;
+    std::shared_ptr<ReadPrefixCapture> read_prefix_capture;
     TimeoutToken idle_timer_token;
     TimeoutToken read_deadline_token;
     TimeoutToken write_deadline_token;
@@ -269,6 +271,8 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         throw IoSystemError(ec);
     }
 
+    CaptureReadPrefix(std::span<const uint8_t>(
+        static_cast<const uint8_t*>(buf.data()), n));
     TouchActivity();
     co_return n;
 }
@@ -290,6 +294,9 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     // 先消费 pending_data；MultiBuffer move 即转移剩余 Buffer 所有权。
     if (!impl_->pending_data.empty()) {
         buf::MultiBuffer pending = std::move(impl_->pending_data);
+        for (const auto* buffer : pending) {
+            if (buffer) CaptureReadPrefix(buffer->Bytes());
+        }
         TouchActivity();
         co_return pending;
     }
@@ -322,6 +329,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         }
 
         buf->Produce(static_cast<uint32_t>(n));
+        CaptureReadPrefix(buf->Bytes());
         TouchActivity();
         // 读满或连续"大包"读命中时，提前切换到 scatter-read。
         if (n == buf::Buffer::kSize || n >= kReadGrowThreshold) {
@@ -389,6 +397,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         uint32_t fill = static_cast<uint32_t>(
             std::min<size_t>(remaining, buf::Buffer::kSize));
         buffers[i]->Produce(fill);
+        CaptureReadPrefix(buffers[i]->Bytes());
         remaining -= fill;
         result.push_back(buffers[i].get());
         (void)buffers[i].release();
@@ -696,6 +705,21 @@ void TcpStream::SetAbortiveClose(bool enable) noexcept {
     impl_->SetFlag(kAbortiveClose, enable);
 }
 
+void TcpStream::SetReadPrefixCapture(
+    std::shared_ptr<ReadPrefixCapture> capture) {
+    impl_->read_prefix_capture = std::move(capture);
+}
+
+void TcpStream::CaptureReadPrefix(std::span<const uint8_t> bytes) noexcept {
+    try {
+        if (impl_->read_prefix_capture) {
+            impl_->read_prefix_capture->Append(bytes);
+        }
+    } catch (...) {
+        // Diagnostic capture is fail-open and must never affect proxy I/O.
+    }
+}
+
 tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
     return impl_->socket.get_executor();
 }
@@ -960,10 +984,13 @@ bool TcpStream::ConsumePhaseDeadline() noexcept {
 
 size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
     auto& pending = impl_->pending_data;
-    return pending.ConsumePrefixTo(
+    const auto consumed = pending.ConsumePrefixTo(
         std::span<uint8_t>(
             static_cast<uint8_t*>(target.data()),
             target.size()));
+    CaptureReadPrefix(std::span<const uint8_t>(
+        static_cast<const uint8_t*>(target.data()), consumed));
+    return consumed;
 }
 
 void TcpStream::ReleasePendingData() noexcept {

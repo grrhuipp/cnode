@@ -7,11 +7,14 @@
 
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace acpp {
+
+class ReadPrefixCapture;
 
 namespace session {
 
@@ -46,6 +49,9 @@ struct Inbound {
     // registry. Panel fields stay in the control plane and never enter the
     // Worker hot-path Context.
     uint32_t access_source_ref = 0;
+    // Worker-local raw wire prefix retained only until protocol admission
+    // succeeds. Error reporting copies it into an owning event value.
+    std::shared_ptr<ReadPrefixCapture> read_prefix_capture;
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

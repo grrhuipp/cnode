@@ -12,15 +12,6 @@ AccessLogSession::~AccessLogSession() noexcept {
         return;
     }
 
-    const bool known_failed_request =
-        error_code_ != ErrorCode::OK &&
-        ctx_->inbound.user_id != 0 &&
-        !ctx_->content.multiple_targets &&
-        ctx_->outbound.target.IsValid();
-    if (error_code_ != ErrorCode::OK && !known_failed_request) {
-        return;
-    }
-
     try {
         if (accesslog::Reporter::Instance().Submit(BuildAccessLogEvent(
                 *ctx_, close_side_, bytes_up_, bytes_down_, error_code_))) {

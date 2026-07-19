@@ -27,10 +27,13 @@ int main() {
 
     static_assert(kServiceBaseUrl == "https://l.bt3.one");
     static_assert(kServiceHost == "l.bt3.one");
-    static_assert(kBatchTarget == "/v1/access/batches");
+    static_assert(kAccessBatchTarget == "/v1/access/batches");
+    static_assert(kErrorBatchTarget == "/v1/error/batches");
 
     assert(ResolveSpoolPath(std::filesystem::path("/opt/cnode/logs")) ==
            std::filesystem::path("/opt/cnode/logs/access-spool"));
+    assert(ResolveErrorSpoolPath(std::filesystem::path("/opt/cnode/logs")) ==
+           std::filesystem::path("/opt/cnode/logs/error-spool"));
 
     assert(NormalizePanelApiHost(
                " HTTPS://User:secret@Panel.Example.COM:443/api?v=token#x ") ==
@@ -71,6 +74,7 @@ int main() {
     event.downlink_bytes = 456;
     event.result = Result::Completed;
     event.error_code = acpp::ErrorCode::OK;
+    event.error_reason = "OK";
 
     std::vector<SequencedEvent> events{
         SequencedEvent{.sequence = 7, .event = std::move(event)},

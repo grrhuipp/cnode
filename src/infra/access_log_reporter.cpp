@@ -226,13 +226,17 @@ public:
         tls_.set_verify_mode(ssl::verify_peer);
     }
 
-    SendResult Send(std::span<const uint8_t> body, std::string_view batch_id) {
+    SendResult Send(std::span<const uint8_t> body,
+                    std::string_view batch_id,
+                    std::string_view target) {
         if (cancelled_.load(std::memory_order_acquire)) {
             return {.detail = "reporter stopping"};
         }
         io_.restart();
         auto result = net::co_spawn(
-            io_, SendAsync(body, std::string(batch_id)), net::use_future);
+            io_,
+            SendAsync(body, std::string(batch_id), std::string(target)),
+            net::use_future);
         io_.run();
         try {
             return result.get();
@@ -513,7 +517,8 @@ private:
 
     net::awaitable<SendResult> SendAsync(
         std::span<const uint8_t> body,
-        std::string batch_id) {
+        std::string batch_id,
+        std::string target) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             if (cancelled_.load(std::memory_order_acquire)) {
                 co_return SendResult{.detail = "reporter stopping"};
@@ -534,7 +539,7 @@ private:
                 "X-Cnode-Server-Id: {}\r\n"
                 "X-Cnode-Batch-Id: {}\r\n"
                 "X-Cnode-Schema-Version: 1\r\n\r\n",
-                kBatchTarget,
+                target,
                 kServiceHost,
                 kBearerToken,
                 body.size(),
@@ -869,29 +874,39 @@ public:
         if (stopping_.load(std::memory_order_acquire)) {
             return false;
         }
-        spool_path_ = ResolveSpoolPath(log_dir);
-        auto spool = std::make_unique<Spool>(spool_path_);
-        if (!spool->Initialize()) {
-            LOG_ERROR("access-log reporter initialization failed spool={}",
-                      spool_path_.string());
+        access_spool_path_ = ResolveSpoolPath(log_dir);
+        error_spool_path_ = ResolveErrorSpoolPath(log_dir);
+        auto access_spool = std::make_unique<Spool>(access_spool_path_);
+        auto error_spool = std::make_unique<Spool>(error_spool_path_);
+        if (!access_spool->Initialize() || !error_spool->Initialize()) {
+            LOG_ERROR(
+                "access-log reporter initialization failed access_spool={} error_spool={}",
+                access_spool_path_.string(),
+                error_spool_path_.string());
             return false;
         }
         LOG_INFO(
-            "access-log reporter ready endpoint={} target={} spool={} pending_bytes={}",
+            "access-log reporter ready endpoint={} access_target={} error_target={} "
+            "access_spool={} error_spool={} pending_bytes={}",
             kServiceBaseUrl,
-            kBatchTarget,
-            spool_path_.string(),
-            spool->Bytes());
-        spool_ = std::move(spool);
+            kAccessBatchTarget,
+            kErrorBatchTarget,
+            access_spool_path_.string(),
+            error_spool_path_.string(),
+            access_spool->Bytes() + error_spool->Bytes());
+        access_spool_ = std::move(access_spool);
+        error_spool_ = std::move(error_spool);
         try {
             thread_ = std::thread([this] { Run(); });
         } catch (const std::exception& e) {
             LOG_ERROR("access-log reporter thread start failed: {}", e.what());
-            spool_.reset();
+            access_spool_.reset();
+            error_spool_.reset();
             return false;
         } catch (...) {
             LOG_ERROR("access-log reporter thread start failed: unknown");
-            spool_.reset();
+            access_spool_.reset();
+            error_spool_.reset();
             return false;
         }
         initialized_.store(true, std::memory_order_release);
@@ -1014,7 +1029,9 @@ private:
         }
     }
 
-    void DrainOneBatch(Spool& spool, std::vector<Event>& buffer) {
+    void DrainOneBatch(Spool& access_spool,
+                       Spool& error_spool,
+                       std::vector<Event>& buffer) {
         const size_t count = queue_.try_dequeue_bulk(buffer.data(), buffer.size());
         if (count == 0) {
             return;
@@ -1022,20 +1039,26 @@ private:
         queued_.fetch_sub(count, std::memory_order_release);
 
         const auto sources = sources_.load(std::memory_order_acquire);
-        std::vector<detail::SequencedEvent> sequenced;
-        sequenced.reserve(count);
+        std::vector<detail::SequencedEvent> access_events;
+        std::vector<detail::SequencedEvent> error_events;
+        access_events.reserve(count);
+        error_events.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             Event event = std::move(buffer[i]);
             if (event.source_ref == 0 || event.source_ref > sources->size()) {
                 dropped_events_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            sequenced.push_back({
+            auto& destination = event.error_code == ErrorCode::OK
+                ? access_events
+                : error_events;
+            destination.push_back({
                 .sequence = next_sequence_++,
                 .event = std::move(event),
             });
         }
-        PersistRange(spool, sequenced, *sources);
+        PersistRange(access_spool, access_events, *sources);
+        PersistRange(error_spool, error_events, *sources);
     }
 
     void ReportDropsIfNeeded() {
@@ -1052,14 +1075,99 @@ private:
     }
 
     void Run() noexcept {
-        Spool& spool = *spool_;
+        Spool& access_spool = *access_spool_;
+        Spool& error_spool = *error_spool_;
+
+        struct StreamState {
+            Spool* spool;
+            std::string_view target;
+            std::chrono::milliseconds retry_delay{kInitialRetry};
+            std::chrono::steady_clock::time_point next_send{
+                std::chrono::steady_clock::now()};
+            std::chrono::steady_clock::time_point next_warning{
+                std::chrono::steady_clock::time_point::min()};
+        };
+        StreamState access_stream{.spool = &access_spool,
+                                  .target = kAccessBatchTarget};
+        StreamState error_stream{.spool = &error_spool,
+                                 .target = kErrorBatchTarget};
 
         std::vector<Event> dequeue_buffer(kMaxBatchEvents);
-        auto retry_delay = kInitialRetry;
-        auto next_send = std::chrono::steady_clock::now();
-        auto next_send_warning = std::chrono::steady_clock::time_point::min();
         auto next_drop_report = std::chrono::steady_clock::now() + 60s;
         std::optional<std::chrono::steady_clock::time_point> first_queued_at;
+
+        auto send_front = [this](StreamState& stream,
+                                 std::chrono::steady_clock::time_point now) {
+            if (stream.spool->Empty() || now < stream.next_send) {
+                return;
+            }
+            const Spool::Entry* entry = stream.spool->Front();
+            auto payload = stream.spool->ReadFront();
+            if (!entry || !payload) {
+                if (entry) {
+                    LOG_ERROR("access-log reporter: discarding unreadable batch {}",
+                              entry->path.string());
+                }
+                if (stream.spool->DiscardFront()) {
+                    stream.next_send = now;
+                } else {
+                    LOG_ERROR("access-log reporter: cannot discard unreadable batch");
+                    stream.next_send = now + stream.retry_delay;
+                }
+                return;
+            }
+
+            const std::string batch_id = entry->batch_id;
+            const uint64_t event_count = entry->event_count;
+            const SendResult sent = client_.Send(*payload, batch_id, stream.target);
+            if (sent.acknowledged) {
+                if (!stream.spool->AcknowledgeFront()) {
+                    LOG_ERROR("access-log reporter: cannot remove acknowledged batch {}",
+                              batch_id);
+                    stream.next_send = now + stream.retry_delay;
+                } else {
+                    stream.retry_delay = kInitialRetry;
+                    stream.next_send = now;
+                    stream.next_warning =
+                        std::chrono::steady_clock::time_point::min();
+                }
+            } else if (sent.status == 400) {
+                LOG_ERROR(
+                    "access-log reporter: service rejected invalid target={} "
+                    "batch={} events={} detail={}",
+                    stream.target,
+                    batch_id,
+                    event_count,
+                    sent.detail);
+                if (stream.spool->DiscardFront()) {
+                    dropped_events_.fetch_add(event_count, std::memory_order_relaxed);
+                    stream.retry_delay = kInitialRetry;
+                    stream.next_send = now;
+                    stream.next_warning =
+                        std::chrono::steady_clock::time_point::min();
+                } else {
+                    LOG_ERROR("access-log reporter: cannot remove rejected batch={}",
+                              batch_id);
+                    stream.next_send = now + stream.retry_delay;
+                }
+            } else {
+                if (now >= stream.next_warning) {
+                    LOG_WARN(
+                        "access-log reporter: service unavailable target={} batch={} "
+                        "status={} retry_ms={} detail={}",
+                        stream.target,
+                        batch_id,
+                        sent.status,
+                        stream.retry_delay.count(),
+                        sent.detail);
+                    stream.next_warning = now + 60s;
+                }
+                const auto jitter = std::chrono::milliseconds(
+                    static_cast<int>(next_sequence_ % 251));
+                stream.next_send = now + stream.retry_delay + jitter;
+                stream.retry_delay = std::min(stream.retry_delay * 2, kMaxRetry);
+            }
+        };
 
         try {
             while (!stopping_.load(std::memory_order_acquire)) {
@@ -1071,77 +1179,14 @@ private:
                 if (queued > 0 &&
                     (queued >= kMaxBatchEvents ||
                      now - *first_queued_at >= kFlushInterval)) {
-                    DrainOneBatch(spool, dequeue_buffer);
+                    DrainOneBatch(access_spool, error_spool, dequeue_buffer);
                     first_queued_at = queued_.load(std::memory_order_acquire) > 0
                         ? std::optional{std::chrono::steady_clock::now()}
                         : std::nullopt;
                 }
 
-                if (!spool.Empty() && now >= next_send) {
-                    const Spool::Entry* entry = spool.Front();
-                    auto payload = spool.ReadFront();
-                    if (!entry || !payload) {
-                        if (entry) {
-                            LOG_ERROR("access-log reporter: discarding unreadable batch {}",
-                                      entry->path.string());
-                        }
-                        if (spool.DiscardFront()) {
-                            next_send = now;
-                        } else {
-                            LOG_ERROR("access-log reporter: cannot discard unreadable batch");
-                            next_send = now + retry_delay;
-                        }
-                        continue;
-                    }
-
-                    const std::string batch_id = entry->batch_id;
-                    const uint64_t event_count = entry->event_count;
-                    const SendResult sent = client_.Send(*payload, batch_id);
-                    if (sent.acknowledged) {
-                        if (!spool.AcknowledgeFront()) {
-                            LOG_ERROR("access-log reporter: cannot remove acknowledged batch {}",
-                                      batch_id);
-                            next_send = now + retry_delay;
-                        } else {
-                            retry_delay = kInitialRetry;
-                            next_send = now;
-                            next_send_warning = std::chrono::steady_clock::time_point::min();
-                        }
-                    } else if (sent.status == 400) {
-                        LOG_ERROR(
-                            "access-log reporter: service rejected invalid batch={} events={} detail={}",
-                            batch_id,
-                            event_count,
-                            sent.detail);
-                        if (spool.DiscardFront()) {
-                            dropped_events_.fetch_add(
-                                event_count, std::memory_order_relaxed);
-                            retry_delay = kInitialRetry;
-                            next_send = now;
-                            next_send_warning =
-                                std::chrono::steady_clock::time_point::min();
-                        } else {
-                            LOG_ERROR(
-                                "access-log reporter: cannot remove rejected batch={}",
-                                batch_id);
-                            next_send = now + retry_delay;
-                        }
-                    } else {
-                        if (now >= next_send_warning) {
-                            LOG_WARN(
-                                "access-log reporter: service unavailable batch={} status={} retry_ms={} detail={}",
-                                batch_id,
-                                sent.status,
-                                retry_delay.count(),
-                                sent.detail);
-                            next_send_warning = now + 60s;
-                        }
-                        const auto jitter = std::chrono::milliseconds(
-                            static_cast<int>(next_sequence_ % 251));
-                        next_send = now + retry_delay + jitter;
-                        retry_delay = std::min(retry_delay * 2, kMaxRetry);
-                    }
-                }
+                send_front(access_stream, now);
+                send_front(error_stream, now);
 
                 if (now >= next_drop_report) {
                     ReportDropsIfNeeded();
@@ -1152,8 +1197,11 @@ private:
                 if (first_queued_at) {
                     wake_at = std::min(wake_at, *first_queued_at + kFlushInterval);
                 }
-                if (!spool.Empty()) {
-                    wake_at = std::min(wake_at, next_send);
+                if (!access_spool.Empty()) {
+                    wake_at = std::min(wake_at, access_stream.next_send);
+                }
+                if (!error_spool.Empty()) {
+                    wake_at = std::min(wake_at, error_stream.next_send);
                 }
                 std::unique_lock lock(wake_mutex_);
                 wake_.wait_until(lock, wake_at, [this] {
@@ -1163,7 +1211,7 @@ private:
             }
 
             while (queued_.load(std::memory_order_acquire) > 0) {
-                DrainOneBatch(spool, dequeue_buffer);
+                DrainOneBatch(access_spool, error_spool, dequeue_buffer);
             }
             ReportDropsIfNeeded();
         } catch (const std::exception& e) {
@@ -1191,8 +1239,10 @@ private:
     std::atomic_bool stopping_{false};
     std::atomic_bool initialized_{false};
     std::mutex lifecycle_mutex_;
-    std::filesystem::path spool_path_;
-    std::unique_ptr<Spool> spool_;
+    std::filesystem::path access_spool_path_;
+    std::filesystem::path error_spool_path_;
+    std::unique_ptr<Spool> access_spool_;
+    std::unique_ptr<Spool> error_spool_;
     HttpsBatchClient client_;
     std::mutex wake_mutex_;
     std::condition_variable wake_;

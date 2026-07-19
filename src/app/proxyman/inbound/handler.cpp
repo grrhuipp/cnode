@@ -6,6 +6,7 @@
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
@@ -167,6 +168,11 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     ctx.inbound.protocol = listener.protocol;
     app::AccessLogSession access_log(ctx);
 
+    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    if (stream) {
+        stream->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
+    }
+
     if (!stream) {
         stats.OnError();
         access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -254,6 +260,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     ctx.inbound.access_source_ref = listener.access_source_ref;
     ctx.inbound.protocol = listener.protocol;
     app::AccessLogSession access_log(ctx);
+
+    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    if (raw_conn) {
+        raw_conn->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
+    }
 
     if (listener.limiter &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {

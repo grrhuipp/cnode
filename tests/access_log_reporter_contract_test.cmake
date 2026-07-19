@@ -17,8 +17,17 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/access_log_event.cpp"
     EVENT_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/tcp_stream.cpp"
+    TCP_STREAM_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/tls_stream.cpp"
+    TLS_STREAM_SOURCE)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/common/read_prefix_capture.hpp"
+    READ_CAPTURE_SOURCE)
 
-string(FIND "${REPORTER_SOURCE}" "auto spool = std::make_unique<Spool>(spool_path_)"
+string(FIND "${REPORTER_SOURCE}" "auto access_spool = std::make_unique<Spool>(access_spool_path_)"
        SPOOL_INITIALIZE_POSITION)
 string(FIND "${REPORTER_SOURCE}" "thread_ = std::thread([this] { Run(); })"
        THREAD_START_POSITION)
@@ -66,9 +75,13 @@ if(NOT SESSION_SOURCE MATCHES
         "relay failures with a known closer must retain their access-log close side")
 endif()
 if(NOT REPORTER_SOURCE MATCHES
-       "if [(][!]spool->Initialize[(][)][)]" OR
+       "access_spool->Initialize[(][)]" OR
    NOT REPORTER_SOURCE MATCHES
-       "Spool& spool = [*]spool_" OR
+       "error_spool->Initialize[(][)]" OR
+   NOT REPORTER_SOURCE MATCHES
+       "Spool& access_spool = [*]access_spool_" OR
+   NOT REPORTER_SOURCE MATCHES
+       "Spool& error_spool = [*]error_spool_" OR
    REPORTER_SOURCE MATCHES
        "const bool spool_ready = spool[.]Initialize[(][)]")
     message(FATAL_ERROR
@@ -85,7 +98,7 @@ endif()
 if(NOT REPORTER_SOURCE MATCHES
        "bool DiscardFront[(][)]" OR
    NOT REPORTER_SOURCE MATCHES
-       "if [(]spool[.]DiscardFront[(][)][)]")
+       "if [(]stream[.]spool->DiscardFront[(][)][)]")
     message(FATAL_ERROR
         "unreadable batches must remain owned until their file is removed")
 endif()
@@ -93,25 +106,39 @@ endif()
 if(NOT REPORTER_SOURCE MATCHES
        "else if [(]sent[.]status == 400[)]" OR
    NOT REPORTER_SOURCE MATCHES
-       "if [(]spool[.]DiscardFront[(][)][)]")
+       "if [(]stream[.]spool->DiscardFront[(][)][)]")
     message(FATAL_ERROR
         "permanently invalid service batches must not block later protocol logs")
 endif()
 
 if(SESSION_SOURCE MATCHES
-       "if [(]result[.]error != ErrorCode::OK[)]" OR
-   SESSION_SOURCE MATCHES
-       "AccessLogSession::Cancel" OR
-   NOT SESSION_SOURCE MATCHES
        "ctx_->inbound[.]user_id != 0" OR
-   NOT SESSION_SOURCE MATCHES
+   SESSION_SOURCE MATCHES
        "ctx_->outbound[.]target[.]IsValid[(][)]" OR
    NOT SESSION_SOURCE MATCHES
        "error_code_ = result[.]error" OR
    NOT SESSION_SOURCE MATCHES
        "AccessLogSession::Suppress")
     message(FATAL_ERROR
-        "known-user, known-target logical failures must be reported; container and unidentified failures may be suppressed")
+        "pre-authentication and targetless failures must be reported; only container events may be suppressed")
+endif()
+
+if(NOT REPORTER_SOURCE MATCHES "kAccessBatchTarget" OR
+   NOT REPORTER_SOURCE MATCHES "kErrorBatchTarget" OR
+   NOT REPORTER_SOURCE MATCHES
+       "event[.]error_code == ErrorCode::OK" OR
+   NOT EVENT_SOURCE MATCHES "raw_packet")
+    message(FATAL_ERROR
+        "normal access and error/security events must use separate durable streams")
+endif()
+
+if(NOT INBOUND_HANDLER_SOURCE MATCHES "SetReadPrefixCapture" OR
+   NOT TCP_STREAM_SOURCE MATCHES "CaptureReadPrefix" OR
+   NOT TLS_STREAM_SOURCE MATCHES "CaptureReadPrefix" OR
+   NOT DISPATCHER_SOURCE MATCHES "read_prefix_capture[.]reset[(][)]" OR
+   NOT READ_CAPTURE_SOURCE MATCHES "8U [*] 1024U")
+    message(FATAL_ERROR
+        "pre-dispatch TCP/TLS raw packet capture must remain bounded and be released after authentication")
 endif()
 
 string(FIND "${SESSION_SOURCE}"

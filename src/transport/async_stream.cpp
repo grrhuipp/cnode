@@ -1,6 +1,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/memory_stats.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 
 #include <new>
@@ -175,6 +176,13 @@ std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
         return tcp->RemoteEndpoint();
     }
     return std::nullopt;
+}
+
+void AsyncStream::SetReadPrefixCapture(
+    std::shared_ptr<ReadPrefixCapture> capture) {
+    if (auto* tcp = BaseTcpStream()) {
+        tcp->SetReadPrefixCapture(std::move(capture));
+    }
 }
 
 }  // namespace acpp

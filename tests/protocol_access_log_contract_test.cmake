@@ -76,10 +76,14 @@ foreach(SOURCE IN ITEMS
     endif()
 endforeach()
 
-if(NOT ACCESS_LOG_SESSION_SOURCE MATCHES
-       "error_code_ != ErrorCode::OK")
+if(ACCESS_LOG_SESSION_SOURCE MATCHES
+       "ctx_->inbound[.]user_id != 0" OR
+   ACCESS_LOG_SESSION_SOURCE MATCHES
+       "ctx_->outbound[.]target[.]IsValid[(][)]" OR
+   NOT ACCESS_LOG_SESSION_SOURCE MATCHES
+       "Reporter::Instance[(][)][.]Submit")
     message(FATAL_ERROR
-        "centralized access logging must submit successful requests only")
+        "centralized access logging must retain pre-authentication and targetless failures")
 endif()
 
 if(ACCESS_LOG_EVENT_SOURCE MATCHES
