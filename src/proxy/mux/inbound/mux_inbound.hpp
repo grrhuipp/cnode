@@ -2,8 +2,9 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/app/relay_types.hpp"
-#include "acppnode/app/udp_types.hpp"
 #include "acppnode/transport/link.hpp"
+
+#include <cstdint>
 
 namespace acpp {
 class AsyncStream;
@@ -26,14 +27,14 @@ struct Context;
 namespace acpp::mux {
 
 // ============================================================================
-// DoMuxRelay - Mux.Cool 多路复用 Relay（VMess Command=Mux）
+// ProcessInbound - Mux.Cool 多路复用入站容器（VMess/VLESS Command=Mux）
 //
 // 对应 xray-core common/mux server 侧职责。
 //
-// client_link: VMess inbound Link（已完成 AEAD 解密）
+// client_link: 已完成外层协议解密的 inbound Link。
 // dispatcher: 子会话回到主请求链路重新路由和出站处理。
 // ============================================================================
-net::awaitable<RelayResult> DoMuxRelay(
+net::awaitable<RelayResult> ProcessInbound(
     net::io_context& io_context,
     transport::Link client_link,
     AsyncStream& client_control,
@@ -42,7 +43,6 @@ net::awaitable<RelayResult> DoMuxRelay(
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout,
-    const UDPRelayConfig& config = UDPRelayConfig{});
+    uint32_t pressure_idle_timeout);
 
 }  // namespace acpp::mux

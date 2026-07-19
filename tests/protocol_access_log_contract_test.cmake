@@ -48,7 +48,7 @@ file(READ
     "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
     RELAY_SOURCE)
 file(READ
-    "${SOURCE_DIR}/src/common/mux/mux_relay.cpp"
+    "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp"
     MUX_RELAY_SOURCE)
 file(READ
     "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp"

@@ -359,7 +359,6 @@ set(CNODE_SOURCES
     src/app/access_log_event.cpp
     src/app/access_log_session.cpp
     src/app/dispatcher/default_dispatcher.cpp
-    src/app/mux_session_handler.cpp
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/proxyman/inbound/manager.cpp
@@ -389,7 +388,7 @@ set(CNODE_SOURCES
     src/app/static_inbound_runtime.cpp
     src/app/relay_udp.cpp        # DoUDPRelay (UDP)
     src/app/session_tracking.cpp
-    src/common/mux/mux_relay.cpp
+    src/proxy/mux/inbound/mux_inbound.cpp
     src/common/rule.cpp
     src/common/session.cpp
     src/common/sharded_user_stats.cpp
@@ -986,7 +985,7 @@ if(CNODE_BUILD_TESTS)
     )
     target_include_directories(cnode_mux_codec_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/common/mux
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/mux/inbound
     )
     target_link_libraries(cnode_mux_codec_test PRIVATE
         asio::asio

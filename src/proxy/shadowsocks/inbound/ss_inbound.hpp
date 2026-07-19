@@ -36,7 +36,8 @@ public:
         const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
         ::acpp::net::io_context& io_context,
         ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts) override;
+        const ::acpp::TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout) override;
 
     // 对应 xray-core proxy/shadowsocks/server.go 的 handleUDPPayload 解码路径。
     [[nodiscard]] std::expected<

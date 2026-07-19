@@ -26,7 +26,6 @@ class Manager;
 }  // namespace rule
 namespace app {
 class SessionTrackingState;
-class MuxSessionHandler;
 class RequestLoadState;
 namespace dns {
 class DNS;
@@ -52,7 +51,6 @@ public:
     void BindRuleManager(rule::Manager& rule_manager) noexcept;
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
     void BindDnsService(app::dns::DNS& dns_service) noexcept;
-    void BindMuxSessionHandler(app::MuxSessionHandler& mux_session_handler) noexcept;
     void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
@@ -105,7 +103,6 @@ private:
     rule::Manager* rule_manager_ = nullptr;
     app::SessionTrackingState* session_tracking_ = nullptr;
     app::dns::DNS* dns_service_ = nullptr;
-    app::MuxSessionHandler* mux_session_handler_ = nullptr;
     app::RequestLoadState* request_load_ = nullptr;
 };
 

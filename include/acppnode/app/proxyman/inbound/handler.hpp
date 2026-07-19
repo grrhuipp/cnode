@@ -10,6 +10,10 @@
 #include <memory>
 #include <string_view>
 
+namespace acpp::app {
+class RequestLoadState;
+}
+
 namespace acpp::proxyman::inbound {
 
 // ============================================================================
@@ -44,6 +48,7 @@ public:
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
         StatsShard& stats,
+        app::RequestLoadState& request_load,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> raw_conn,
         session::Context& ctx);
@@ -52,6 +57,7 @@ public:
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
         StatsShard& stats,
+        app::RequestLoadState& request_load,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> stream,
         session::Context& ctx);

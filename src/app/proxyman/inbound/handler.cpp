@@ -1,6 +1,7 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 
 #include "acppnode/app/access_log_session.hpp"
+#include "acppnode/app/request_load_state.hpp"
 
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -99,12 +100,14 @@ public:
                                net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
                                StatsShard& stats,
+                               app::RequestLoadState& request_load,
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx)
         : handler_(std::move(handler))
         , io_context_(io_context)
         , dispatcher_(dispatcher)
         , stats_(stats)
+        , request_load_(request_load)
         , timeouts_(timeouts) {
         CopyTransportBaseContext(base_ctx, base_ctx_);
         base_ctx_.conn_id = base_ctx.conn_id;
@@ -125,6 +128,7 @@ public:
                     self->io_context_,
                     self->dispatcher_,
                     self->stats_,
+                    self->request_load_,
                     self->timeouts_,
                     std::move(stream),
                     ctx);
@@ -137,6 +141,7 @@ private:
     net::io_context& io_context_;
     routing::Dispatcher& dispatcher_;
     StatsShard& stats_;
+    app::RequestLoadState& request_load_;
     TimeoutsConfig timeouts_;
     session::Context base_ctx_;
 };
@@ -151,6 +156,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     StatsShard& stats,
+    app::RequestLoadState& request_load,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> stream,
     session::Context& ctx) {
@@ -220,7 +226,8 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             listener,
             io_context,
             ctx,
-            timeouts);
+            timeouts,
+            request_load.PressureIdleTimeout());
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: {}", e.what());
@@ -237,6 +244,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     StatsShard& stats,
+    app::RequestLoadState& request_load,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> raw_conn,
     session::Context& ctx) {
@@ -287,6 +295,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             io_context,
             dispatcher,
             stats,
+            request_load,
             timeouts,
             ctx);
     }
@@ -359,7 +368,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             listener,
             io_context,
             ctx,
-            timeouts);
+            timeouts,
+            request_load.PressureIdleTimeout());
         access_log.Complete(relay_result);
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] inbound process exception: {}", e.what());

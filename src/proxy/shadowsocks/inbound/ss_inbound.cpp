@@ -136,7 +136,8 @@ proxy::shadowsocks::inbound::Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts) {
+    const TimeoutsConfig& timeouts,
+    uint32_t /*pressure_idle_timeout*/) {
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;

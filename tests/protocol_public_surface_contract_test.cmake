@@ -275,7 +275,7 @@ if(STREAM_REMOVAL_GUARD_DESTRUCTOR EQUAL -1)
         "HTTP/2 server stream removal must run while unwinding failed writes")
 endif()
 
-set(MUX_RELAY "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+set(MUX_RELAY "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp")
 file(READ "${MUX_RELAY}" MUX_RELAY_SOURCE)
 if(NOT MUX_RELAY_SOURCE MATCHES
         "ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions")
@@ -689,7 +689,8 @@ file(READ "${UDP_WORKER_HEADER_PATH}" UDP_WORKER_HEADER_SOURCE)
 file(READ "${UDP_HANDLER_HEADER_PATH}" UDP_HANDLER_HEADER_SOURCE)
 set(LINK_HEADER_PATH "${SOURCE_DIR}/include/acppnode/transport/link.hpp")
 file(READ "${LINK_HEADER_PATH}" LINK_HEADER_SOURCE)
-set(MUX_RELAY_SOURCE_PATH "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+set(MUX_RELAY_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp")
 file(READ "${MUX_RELAY_SOURCE_PATH}" MUX_RELAY_SOURCE)
 set(TROJAN_INBOUND_SOURCE_PATH
     "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp")
@@ -813,26 +814,43 @@ if(MUX_BOUNDED_QUEUE_CHECK_COUNT LESS 7)
 endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "catch [(]const std::bad_alloc&[)]")
     message(FATAL_ERROR
-        "Mux relay must enter owned async cleanup after allocation failure")
+        "Mux inbound must enter owned async cleanup after allocation failure")
 endif()
 
-foreach(MUX_CONTROL_HEADER IN ITEMS
+set(MUX_INBOUND_HEADER
+    "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.hpp")
+file(READ "${MUX_INBOUND_HEADER}" MUX_INBOUND_HEADER_SOURCE)
+if(MUX_INBOUND_HEADER_SOURCE MATCHES "AsyncStream[*]")
+    message(FATAL_ERROR
+        "Mux inbound control stream must be a required non-null reference")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "client_control[.]ClearPhaseDeadline[(][)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "client_control[.]SetIdleTimeout[(]relay_idle_timeout[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "std::chrono::seconds[(]pressure_idle_timeout[)]")
+    message(FATAL_ERROR
+        "Mux inbound must replace the handshake deadline with the pressure-aware relay timeout")
+endif()
+foreach(LEGACY_MUX_SURFACE IN ITEMS
         "${SOURCE_DIR}/include/acppnode/app/mux_session_handler.hpp"
-        "${SOURCE_DIR}/include/acppnode/common/mux/mux_relay.hpp")
-    file(READ "${MUX_CONTROL_HEADER}" MUX_CONTROL_HEADER_SOURCE)
-    if(MUX_CONTROL_HEADER_SOURCE MATCHES "AsyncStream[*]")
+        "${SOURCE_DIR}/include/acppnode/common/mux/mux_relay.hpp"
+        "${SOURCE_DIR}/src/app/mux_session_handler.cpp"
+        "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+    if(EXISTS "${LEGACY_MUX_SURFACE}")
         message(FATAL_ERROR
-            "Mux relay control stream must be a required non-null reference: ${MUX_CONTROL_HEADER}")
+            "Mux must not restore the public app wrapper or common relay path: ${LEGACY_MUX_SURFACE}")
     endif()
 endforeach()
 
 set(DEFAULT_DISPATCHER
     "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp")
 file(READ "${DEFAULT_DISPATCHER}" DEFAULT_DISPATCHER_SOURCE)
-if(NOT DEFAULT_DISPATCHER_SOURCE MATCHES
-        "if [(]!inbound_control[)]")
+if(DEFAULT_DISPATCHER_SOURCE MATCHES
+       "MuxSessionHandler|Network::MUX|ProcessInbound|DoMuxRelay")
     message(FATAL_ERROR
-        "Dispatcher must reject Mux links without a cancellable control stream")
+        "Dispatcher must not own or enter the Mux inbound container path")
 endif()
 string(REGEX MATCHALL "ActiveSessionScope relay_scope"
     DISPATCHER_ACTIVE_SESSION_SCOPES "${DEFAULT_DISPATCHER_SOURCE}")
@@ -848,18 +866,27 @@ string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
 string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
     "ActiveSessionScope relay_scope"
     DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET)
-string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
-    "mux_session_handler_->Process("
-    DISPATCHER_MUX_PROCESS_OFFSET)
-if(DISPATCHER_MUX_PROCESS_OFFSET LESS 0 OR
-   DISPATCHER_OUTBOUND_PROCESS_OFFSET LESS 0 OR
+if(DISPATCHER_OUTBOUND_PROCESS_OFFSET LESS 0 OR
    DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS 0 OR
-   NOT DISPATCHER_MUX_PROCESS_OFFSET LESS
-       DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET OR
    NOT DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS
        DISPATCHER_OUTBOUND_PROCESS_OFFSET)
     message(FATAL_ERROR
         "traffic tracking must wrap the logical outbound Process call")
+endif()
+
+foreach(MUX_OUTER_INBOUND IN ITEMS
+        "${SOURCE_DIR}/src/proxy/vmess/inbound/vmess_inbound.cpp"
+        "${SOURCE_DIR}/src/proxy/vless/inbound/vless_inbound.cpp")
+    file(READ "${MUX_OUTER_INBOUND}" MUX_OUTER_INBOUND_SOURCE)
+    if(NOT MUX_OUTER_INBOUND_SOURCE MATCHES "mux::ProcessInbound[(]")
+        message(FATAL_ERROR
+            "VMess and VLESS Mux commands must enter the private Mux inbound path: ${MUX_OUTER_INBOUND}")
+    endif()
+endforeach()
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "co_await dispatcher[.]Dispatch[(]")
+    message(FATAL_ERROR
+        "every decoded Mux child must re-enter the dispatcher request chain")
 endif()
 
 set(VLESS_OUTBOUND

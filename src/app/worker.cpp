@@ -15,7 +15,6 @@
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
-#include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
@@ -142,7 +141,6 @@ struct Worker::RuntimeState {
         , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
         , router(std::make_unique<app::router::Router>())
         , rule_manager(std::make_unique<rule::Manager>())
-        , mux_session_handler(std::make_unique<app::MuxSessionHandler>())
         , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
 
     [[nodiscard]] std::shared_ptr<const WorkerRuntimeConfig> Snapshot() const {
@@ -177,7 +175,6 @@ struct Worker::RuntimeState {
     std::unique_ptr<proxyman::outbound::Manager> outbound_manager;
     std::unique_ptr<app::router::Router> router;
     std::unique_ptr<rule::Manager> rule_manager;
-    std::unique_ptr<app::MuxSessionHandler> mux_session_handler;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
     bool started = false;
 };
@@ -258,7 +255,6 @@ net::awaitable<void> Worker::StartRuntimeTask() {
     runtime_->dispatcher->BindRuleManager(*runtime_->rule_manager);
     runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
     runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
-    runtime_->dispatcher->BindMuxSessionHandler(*runtime_->mux_session_handler);
     runtime_->dispatcher->BindRequestLoadState(runtime_->request_load);
     const auto runtime_snapshot = runtime_->Snapshot();
     runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
@@ -806,7 +802,9 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     }
 
     co_await inbound_handler->ProcessAcceptedTCP(
-        worker.runtime_->io_context, *worker.runtime_->dispatcher, worker.runtime_->stats, runtime_snapshot->timeouts,
+        worker.runtime_->io_context, *worker.runtime_->dispatcher,
+        worker.runtime_->stats, worker.runtime_->request_load,
+        runtime_snapshot->timeouts,
         std::move(tcp_stream), ctx);
 }
 

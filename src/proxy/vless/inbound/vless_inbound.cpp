@@ -1,4 +1,5 @@
 #include "vless_inbound.hpp"
+#include "../../mux/inbound/mux_inbound.hpp"
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
@@ -320,7 +321,8 @@ proxy::vless::inbound::Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts) {
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
 
@@ -545,15 +547,16 @@ proxy::vless::inbound::Handler::Process(
 
     if (net == Network::MUX) {
         VlessPendingReader mux_reader(*active_reader, leftover);
-        co_return co_await dispatcher.Dispatch(
+        co_return co_await mux::ProcessInbound(
             io_context,
-            receiver,
-            std::move(stream),
             transport::Link{&mux_reader, active_writer},
-            InitialPayload{},
+            *stream,
+            dispatcher,
+            receiver,
             ctx,
             *stats_,
-            timeouts);
+            timeouts,
+            pressure_idle_timeout);
     }
 
     if (net == Network::UDP) {

@@ -1,4 +1,4 @@
-#include "acppnode/common/mux/mux_relay.hpp"
+#include "mux_inbound.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "xudp_packet_buffer.hpp"
@@ -6,7 +6,7 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/udp_types.hpp"
+#include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
@@ -16,6 +16,8 @@
 
 #include <asio/experimental/channel.hpp>
 
+#include <algorithm>
+#include <exception>
 #include <unordered_map>
 #include <deque>
 #include <limits>
@@ -929,10 +931,8 @@ net::awaitable<void> RunTcpSubDispatch(
     TcpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    UDPRelayConfig config,
     SubLoopLease sub_loop)
 {
-    (void)config;
     (void)sub_loop;
     transport::Link link{
         static_cast<transport::MultiBufferReader*>(sub),
@@ -963,10 +963,8 @@ net::awaitable<void> RunUdpSubDispatch(
     UdpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    UDPRelayConfig config,
     SubLoopLease sub_loop)
 {
-    (void)config;
     (void)sub_loop;
     transport::Link link{
         static_cast<transport::MultiBufferReader*>(sub),
@@ -992,13 +990,15 @@ net::awaitable<void> RunUdpSubDispatch(
 
 }  // namespace
 
+namespace {
+
 // ============================================================================
-// DoMuxRelay
+// ProcessInbound
 //
 // 处理已解密的 Mux.Cool 帧流。
 // 每帧可携带 TCP 或 UDP 子会话数据；服务端负责为每个子会话拨号出站。
 // ============================================================================
-net::awaitable<RelayResult> DoMuxRelay(
+net::awaitable<RelayResult> ProcessInboundImpl(
     net::io_context& io_context,
     transport::Link client_link,
     AsyncStream& client_control,
@@ -1007,8 +1007,7 @@ net::awaitable<RelayResult> DoMuxRelay(
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout,
-    const UDPRelayConfig& config)
+    uint32_t pressure_idle_timeout)
 {
     using namespace net::experimental::awaitable_operators;
 
@@ -1018,7 +1017,19 @@ net::awaitable<RelayResult> DoMuxRelay(
         co_return error;
     }
 
-    // 回包队列：单线程，无锁；running 保护回调不在 DoMuxRelay 退出后继续推送。
+    (void)client_control.ConsumePhaseDeadline();
+    client_control.ClearPhaseDeadline();
+    auto relay_idle_timeout = timeouts.StreamIdleTimeout();
+    if (pressure_idle_timeout > 0) {
+        relay_idle_timeout = std::min(
+            relay_idle_timeout, std::chrono::seconds(pressure_idle_timeout));
+    }
+    client_control.SetIdleTimeout(relay_idle_timeout);
+    client_control.SetReadTimeout(std::chrono::seconds(0));
+    client_control.SetWriteTimeout(
+        std::min(timeouts.WriteTimeout(), relay_idle_timeout));
+
+    // 回包队列：单线程，无锁；running 保护回调不在 ProcessInbound 退出后继续推送。
     SignalChannel main_signal{io_context, 1};
     ReplyQueueState reply_queue{io_context, main_signal};
     ClientReadQueueState client_reads{io_context, main_signal};
@@ -1421,7 +1432,6 @@ net::awaitable<RelayResult> DoMuxRelay(
                                 sub_ptr,
                                 stats,
                                 timeouts,
-                                config,
                                 SubLoopLease{reply_queue}),
                             net::detached);
                     } catch (...) {
@@ -1491,7 +1501,7 @@ net::awaitable<RelayResult> DoMuxRelay(
                     TcpSubState* sub_ptr =
                         std::get<TcpSubInfo>(insert_it->second).get();
 
-                    // SubLoopLease 随协程帧持有计数，DoMuxRelay 退出前等待其析构，
+                    // SubLoopLease 随协程帧持有计数，ProcessInbound 退出前等待其析构，
                     // 保证 TcpSubState 生命周期覆盖 detached coroutine。
                     try {
                         net::co_spawn(io_context.get_executor(),
@@ -1502,7 +1512,6 @@ net::awaitable<RelayResult> DoMuxRelay(
                                 sub_ptr,
                                 stats,
                                 timeouts,
-                                config,
                                 SubLoopLease{reply_queue}),
                             net::detached);
                     } catch (...) {
@@ -1650,6 +1659,51 @@ net::awaitable<RelayResult> DoMuxRelay(
 #endif
 
     co_return result;
+}
+
+}  // namespace
+
+net::awaitable<RelayResult> ProcessInbound(
+    net::io_context& io_context,
+    transport::Link client_link,
+    AsyncStream& client_control,
+    routing::Dispatcher& dispatcher,
+    const proxyman::inbound::ReceiverSettings& receiver,
+    session::Context& parent_ctx,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
+    try {
+        LOG_CONN_EVENT(
+            parent_ctx,
+            "connection.accepted",
+            FormatConnectionAccepted(parent_ctx));
+        co_return co_await ProcessInboundImpl(
+            io_context,
+            client_link,
+            client_control,
+            dispatcher,
+            receiver,
+            parent_ctx,
+            stats,
+            timeouts,
+            pressure_idle_timeout);
+    } catch (const std::bad_alloc&) {
+        stats.OnError();
+        RelayResult result;
+        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        co_return result;
+    } catch (const IoSystemError& error) {
+        stats.OnError();
+        RelayResult result;
+        result.error = MapAsioError(error.code());
+        co_return result;
+    } catch (...) {
+        stats.OnError();
+        RelayResult result;
+        result.error = ErrorCode::INTERNAL;
+        co_return result;
+    }
 }
 
 }  // namespace acpp::mux

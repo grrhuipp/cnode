@@ -8,6 +8,7 @@
 
 namespace acpp::mux::detail {
 
+// Worker-local XUDP packet reassembly used only by the Mux inbound parser.
 class XudpPacketBuffer final {
 public:
     enum class PopResult : uint8_t {

@@ -1045,7 +1045,8 @@ Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts) {
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
     if (!stream) {
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -1070,9 +1071,16 @@ Handler::Process(
         co_return result;
     }
 
-    stream->SetIdleTimeout(timeouts.StreamIdleTimeout());
+    auto control_idle_timeout = timeouts.StreamIdleTimeout();
+    if (pressure_idle_timeout > 0) {
+        control_idle_timeout = std::min(
+            control_idle_timeout,
+            std::chrono::seconds(pressure_idle_timeout));
+    }
+    stream->SetIdleTimeout(control_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(std::min(timeouts.WriteTimeout(), timeouts.StreamIdleTimeout()));
+    stream->SetWriteTimeout(
+        std::min(timeouts.WriteTimeout(), control_idle_timeout));
     stream->ClearPhaseDeadline();
 
     std::optional<AnyTLSOnlineSession> user_session;

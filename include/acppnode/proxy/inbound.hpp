@@ -43,6 +43,7 @@ public:
     //
     // @param stream  已完成 TLS/WS 等传输层握手的字节流
     // @param ctx     会话上下文（用于填充用户信息、错误记录）
+    // @param pressure_idle_timeout Worker 当前压力模式的空闲超时秒数；0 表示未启用
     // @return        dispatcher/relay 结果；协议解析失败在进入 dispatcher 前返回错误
     // -----------------------------------------------------------------------
     virtual net::awaitable<RelayResult> Process(
@@ -51,7 +52,8 @@ public:
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts) = 0;
+        const TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout) = 0;
 };
 
 }  // namespace acpp

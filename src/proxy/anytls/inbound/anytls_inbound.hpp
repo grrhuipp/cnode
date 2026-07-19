@@ -36,7 +36,8 @@ public:
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts) override;
+        const TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout) override;
 
 private:
     ::acpp::anytls::Validator& validator_;

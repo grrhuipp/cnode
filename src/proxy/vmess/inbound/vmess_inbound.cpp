@@ -1,4 +1,5 @@
 #include "vmess_inbound.hpp"
+#include "../../mux/inbound/mux_inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
@@ -98,7 +99,8 @@ proxy::vmess::inbound::Handler::Process(
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts)
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout)
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
@@ -232,7 +234,7 @@ proxy::vmess::inbound::Handler::Process(
     if (request->command == ::acpp::vmess::Command::UDP) {
         net = Network::UDP;
     } else if (request->command == ::acpp::vmess::Command::Mux) {
-        net = Network::MUX;  // Mux.Cool 多路复用，由 DoMuxRelay 处理
+        net = Network::MUX;  // Mux.Cool 多路复用，由私有 Mux inbound 处理
     }
 
     vmess_session.SetRequest(std::move(*request));
@@ -245,6 +247,19 @@ proxy::vmess::inbound::Handler::Process(
     auto response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
     if (!request_reader || !response_writer) {
         co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+
+    if (net == Network::MUX) {
+        co_return co_await mux::ProcessInbound(
+            io_context,
+            transport::Link{request_reader.get(), response_writer.get()},
+            *stream,
+            dispatcher,
+            receiver,
+            ctx,
+            *stats_,
+            timeouts,
+            pressure_idle_timeout);
     }
 
     co_return co_await dispatcher.Dispatch(

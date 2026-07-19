@@ -3,7 +3,6 @@
 #include "acppnode/app/access_log_session.hpp"
 
 #include "acppnode/app/session_tracking.hpp"
-#include "acppnode/app/mux_session_handler.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -127,11 +126,6 @@ void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
     dns_service_ = &dns_service;
 }
 
-void DefaultDispatcher::BindMuxSessionHandler(
-    app::MuxSessionHandler& mux_session_handler) noexcept {
-    mux_session_handler_ = &mux_session_handler;
-}
-
 void DefaultDispatcher::BindRequestLoadState(
     app::RequestLoadState& request_load) noexcept {
     request_load_ = &request_load;
@@ -159,11 +153,6 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         ? request_load_->PressureIdleTimeout()
         : 0;
     app::AccessLogSession access_log(ctx);
-    if (ctx.content.network == Network::MUX) {
-        // The Mux control connection contains framing bytes and would double
-        // count traffic. Its logical TCP/UDP sub-sessions are reported instead.
-        access_log.Suppress();
-    }
 
     RelayResult result;
     try {
@@ -226,8 +215,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         inbound_control->ClearPhaseDeadline();
     }
 
-    if (ctx.content.network != Network::MUX &&
-        !ctx.outbound.target.IsValid()) {
+    if (!ctx.outbound.target.IsValid()) {
         stats.OnError();
         LOG_CONN_DEBUG(ctx, "[Session] Reject invalid outbound target");
         co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -235,38 +223,6 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
 
     LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
-
-    if (ctx.content.network == Network::MUX) {
-        if (!mux_session_handler_) {
-            stats.OnError();
-            co_return MakeRelayError(ErrorCode::INTERNAL);
-        }
-        if (!inbound_control) {
-            stats.OnError();
-            co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
-
-        // The Mux container carries framing bytes, not user payload. Each
-        // logical child re-enters Dispatch and owns the only traffic scope.
-        auto relay_result = co_await mux_session_handler_->Process(
-            io_context,
-            transport::Link{inbound_reader, inbound_writer, inbound_control},
-            *inbound_control,
-            *this,
-            receiver,
-            ctx,
-            stats,
-            timeouts,
-            pressure_idle_timeout);
-        if (relay_result.error != ErrorCode::OK) {
-            LOG_CONN_DEBUG(ctx, "[Session] Mux relay end: {} up={}B down={}B target={}",
-                           ErrorCodeToString(relay_result.error),
-                           ctx.traffic.bytes_up, ctx.traffic.bytes_down,
-                           ctx.outbound.target);
-        }
-        co_return relay_result;
-    }
 
     // 嗅探只需首部若干字节即可解析 TLS ClientHello SNI / HTTP Host；
     // 首包很大（例如客户端把大块 body pipeline 进首包）时无需整包拷贝。
