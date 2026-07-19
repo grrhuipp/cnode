@@ -54,14 +54,18 @@ if(BATCH_CALL_COUNT LESS 3)
         "Worker sampling, heap collection, and monitor loops must share the batch primitive")
 endif()
 
-string(FIND "${SHUTDOWN_SOURCE}" "co_await monitor.Stop()" MONITOR_STOP)
-string(FIND "${SHUTDOWN_SOURCE}" "co_await ctx.controller.Stop()" CONTROLLER_STOP)
-string(FIND "${SHUTDOWN_SOURCE}" "co_await ShutdownWorkers(ctx)" WORKER_STOP)
-if(MONITOR_STOP EQUAL -1 OR CONTROLLER_STOP EQUAL -1 OR WORKER_STOP EQUAL -1 OR
-   NOT MONITOR_STOP LESS CONTROLLER_STOP OR
-   NOT CONTROLLER_STOP LESS WORKER_STOP)
+string(FIND "${SHUTDOWN_SOURCE}" "std::_Exit(EXIT_SUCCESS)" FORCE_EXIT)
+if(FORCE_EXIT EQUAL -1 OR
+   NOT SHUTDOWN_SOURCE MATCHES "status=forced")
     message(FATAL_ERROR
-        "shutdown order must be RuntimeMonitor, Controller, then Workers")
+        "signal shutdown must terminate immediately without runtime teardown")
+endif()
+
+if(SHUTDOWN_SOURCE MATCHES "monitor.Stop\\(\\)" OR
+   SHUTDOWN_SOURCE MATCHES "controller.Stop\\(\\)" OR
+   SHUTDOWN_SOURCE MATCHES "ShutdownWorkers")
+    message(FATAL_ERROR
+        "signal shutdown must not enter monitor, controller, or Worker teardown")
 endif()
 
 if(RUNTIME_SOURCE MATCHES "run_for\\(" OR

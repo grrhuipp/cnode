@@ -1,6 +1,6 @@
 #pragma once
 
-#include "acppnode/app/bootstrap_runtime.hpp"
+#include "acppnode/common/asio_types.hpp"
 
 #include <asio/signal_set.hpp>
 
@@ -8,10 +8,7 @@
 
 namespace acpp {
 
-class RuntimeMonitor;
-
 [[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
-    const RuntimeContext& ctx,
-    RuntimeMonitor& monitor);
+    net::io_context& io_context);
 
 }  // namespace acpp

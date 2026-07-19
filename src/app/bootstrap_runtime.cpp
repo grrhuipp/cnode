@@ -101,7 +101,7 @@ void RunApplicationRuntime(const RuntimeContext& ctx) {
 
     RuntimeMonitor runtime_monitor(ctx);
     [[maybe_unused]] auto shutdown_signals =
-        InstallShutdownHandler(ctx, runtime_monitor);
+        InstallShutdownHandler(ctx.main_ctx);
     runtime_monitor.Start();
 
     ctx.main_ctx.run();

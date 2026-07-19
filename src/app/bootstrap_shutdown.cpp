@@ -1,76 +1,33 @@
 #include "acppnode/app/bootstrap_shutdown.hpp"
-#include "acppnode/app/bootstrap_monitor.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/app/worker.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include <asio/co_spawn.hpp>
-#include <asio/detached.hpp>
-#include <asio/post.hpp>
 #include <asio/signal_set.hpp>
-#include <asio/use_awaitable.hpp>
 
 #include <csignal>
-#include <exception>
+#include <cstdlib>
 #include <memory>
 
 namespace acpp {
-namespace {
-
-net::awaitable<void> ShutdownWorkers(const RuntimeContext& ctx) {
-    for (const auto& worker : ctx.workers) {
-        try {
-            co_await net::co_spawn(
-                worker->GetExecutor(),
-                worker->ShutdownTask(),
-                net::use_awaitable);
-        } catch (const std::exception& e) {
-            LOG_ERROR("Worker[{}]: shutdown failed: {}", worker->Id(), e.what());
-        } catch (...) {
-            LOG_ERROR("Worker[{}]: shutdown failed with unknown exception", worker->Id());
-        }
-    }
-
-    ctx.work_guards.clear();
-    for (const auto& io_ctx : ctx.io_contexts) {
-        io_ctx->stop();
-    }
-    net::post(ctx.main_ctx, [&ctx] {
-        ctx.main_ctx.stop();
-    });
-}
-
-net::awaitable<void> ShutdownRuntime(
-    const RuntimeContext& ctx,
-    RuntimeMonitor& monitor) {
-    co_await monitor.Stop();
-    co_await ctx.controller.Stop();
-    co_await ShutdownWorkers(ctx);
-}
-
-}  // namespace
 
 std::unique_ptr<net::signal_set> InstallShutdownHandler(
-    const RuntimeContext& ctx,
-    RuntimeMonitor& monitor) {
-    auto signals = std::make_unique<net::signal_set>(ctx.main_ctx);
+    net::io_context& io_context) {
+    auto signals = std::make_unique<net::signal_set>(io_context);
     signals->add(SIGINT);
     signals->add(SIGTERM);
 #ifdef _WIN32
     signals->add(SIGBREAK);
 #endif
 
-    signals->async_wait([&monitor, &ctx](
-                            const IoErrorCode& ec, int signo) {
+    signals->async_wait([](const IoErrorCode& ec, int signo) {
         if (ec) {
             return;
         }
-        LOG_CONSOLE("shutdown signal={} status=stopping", signo);
+        LOG_CONSOLE("shutdown signal={} status=forced", signo);
 
-        net::co_spawn(
-            ctx.main_ctx.get_executor(),
-            ShutdownRuntime(ctx, monitor),
-            net::detached);
+        // Stopping is intentionally immediate: active sockets and coroutines
+        // are abandoned with the process, so no runtime/static destructor may
+        // re-enter Worker-local state after its owner has gone away.
+        std::_Exit(EXIT_SUCCESS);
     });
 
     return signals;

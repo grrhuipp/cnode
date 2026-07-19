@@ -9,9 +9,6 @@ file(READ
     "${SOURCE_DIR}/src/service/controller/controller.cpp"
     CONTROLLER_SOURCE)
 file(READ
-    "${SOURCE_DIR}/src/app/bootstrap_shutdown.cpp"
-    SHUTDOWN_SOURCE)
-file(READ
     "${SOURCE_DIR}/include/acppnode/api/api.hpp"
     API_HEADER)
 file(READ
@@ -66,18 +63,3 @@ foreach(REQUIRED_CANCEL_PATH
             "V2Board cancellation is missing '${REQUIRED_CANCEL_PATH}'")
     endif()
 endforeach()
-
-string(FIND "${SHUTDOWN_SOURCE}"
-    "co_await ctx.controller.Stop()" CONTROLLER_STOP)
-string(FIND "${SHUTDOWN_SOURCE}"
-    "co_await ShutdownWorkers(ctx)" WORKER_STOP)
-if(CONTROLLER_STOP EQUAL -1 OR WORKER_STOP EQUAL -1 OR
-   NOT CONTROLLER_STOP LESS WORKER_STOP)
-    message(FATAL_ERROR
-        "shutdown must await Controller quiescence before stopping Workers")
-endif()
-
-if(SHUTDOWN_SOURCE MATCHES "[\r\n][ \t]+ctx.controller.Stop\\(\\);")
-    message(FATAL_ERROR
-        "synchronous fire-and-forget Controller stop must not return")
-endif()

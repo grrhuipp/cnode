@@ -255,10 +255,13 @@ int main(int argc, char** argv) {
         std::cerr << "child never reached hanging panel endpoint\n" << output;
         return 8;
     }
-    if (output.find("status=stopping") == std::string::npos ||
-        output.find("cnode stopped") == std::string::npos) {
-        std::cerr << "missing graceful shutdown diagnostic\n" << output;
+    if (output.find("status=forced") == std::string::npos) {
+        std::cerr << "missing forced shutdown diagnostic\n" << output;
         return 7;
+    }
+    if (output.find("cnode stopped") != std::string::npos) {
+        std::cerr << "forced shutdown entered the runtime teardown path\n" << output;
+        return 9;
     }
 
     fs::remove_all(root, ec);
