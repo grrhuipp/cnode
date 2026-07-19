@@ -261,7 +261,7 @@ proxy::trojan::outbound::Handler::Process(
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
+    LOG_ACCESS(FormatXrayAccessLog(ctx));
     auto fail_abortive = [&](ErrorCode error) {
         if (stream) {
             stream->CloseAbortive();

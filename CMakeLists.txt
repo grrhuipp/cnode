@@ -1521,7 +1521,6 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_log_format_test
         tests/log_format_test.cpp
         src/infra/log.cpp
-        src/infra/json.cpp
     )
     target_include_directories(cnode_log_format_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

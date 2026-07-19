@@ -19,20 +19,14 @@ enum class LogLevel {
     NONE
 };
 
-enum class LogChannel {
-    System,
-    Connection
-};
-
 struct ConnectionLogContext {
     uint64_t conn_id{0};
-    uint32_t worker_id{0};
-    std::string inbound;
 };
 
-// Every file and console record is emitted as one JSON object. Formatting is
-// owned here so protocols and runtime components never construct timestamps,
-// levels, channel names, or connection prefixes themselves.
+// Xray-compatible local logging:
+// - general and connection diagnostics go to the error logger and are filtered
+//   by loglevel;
+// - access records go to the access logger and intentionally have no severity.
 class Log {
 public:
     [[nodiscard]] static bool Init(const std::string& level,
@@ -49,20 +43,19 @@ public:
     static void WriteSystem(
         LogLevel level,
         std::string message,
-        std::string_view event = "diagnostic",
         std::source_location location = std::source_location::current());
 
     static void WriteConnection(
         LogLevel level,
         std::string message,
-        std::string_view event = "diagnostic",
         std::source_location location = std::source_location::current());
+
+    static void WriteAccess(std::string message);
 
     static void WriteConnection(
         LogLevel level,
         ConnectionLogContext context,
         std::string message,
-        std::string_view event = "diagnostic",
         std::source_location location = std::source_location::current());
 
     template <typename Context>
@@ -70,24 +63,19 @@ public:
         LogLevel level,
         const Context& context,
         std::string message,
-        std::string_view event = "diagnostic",
         std::source_location location = std::source_location::current()) {
         WriteConnection(
             level,
             ConnectionLogContext{
                 .conn_id = context.conn_id,
-                .worker_id = context.worker_id,
-                .inbound = std::string(context.inbound.tag),
             },
             std::move(message),
-            event,
             location);
     }
 
     static void WriteConsole(
         LogLevel level,
         std::string message,
-        std::string_view event = "status",
         std::source_location location = std::source_location::current());
 
     [[nodiscard]] static bool ShouldLog(LogLevel level) noexcept;
@@ -170,10 +158,9 @@ private:
             acpp::Log::WriteConnection(acpp::LogLevel::WARN, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
     } while (0)
 
-#define LOG_CONN_EVENT(ctx, event_name, message) \
+#define LOG_ACCESS(message) \
     do { \
-        if (acpp::Log::ShouldLog(acpp::LogLevel::INFO)) \
-            acpp::Log::WriteConnection(acpp::LogLevel::INFO, ctx, (message), (event_name)); \
+        acpp::Log::WriteAccess((message)); \
     } while (0)
 
 }  // namespace acpp

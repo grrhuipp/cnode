@@ -7,7 +7,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - `README.md` 面向使用者和贡献者，说明项目定位、运行架构、配置入口、关键语义和代码组织。
 - `AGENTS.md` 面向代码修改和自动化协作者，记录必须遵守的职责边界、禁止项、审查清单和硬性删除规则。
 - [`docs/centralized_access_logging.md`](docs/centralized_access_logging.md) 记录集中访问日志、面板节点身份、上报协议和 ClickHouse 存储设计。
-- [`docs/local_logging.md`](docs/local_logging.md) 规定本地 JSON Lines 日志模型、字段、通道和级别口径。
+- [`docs/local_logging.md`](docs/local_logging.md) 规定对齐 xray-core 的 error/access 文本格式、通道和级别口径。
 
 如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
 
@@ -173,7 +173,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - TCP scatter-read 固定最多使用 4 个 8KB Buffer，不按连接压力动态降档。
 - V2Board Shadowsocks 2022 节点会自动使用面板下发的 `server_key` 作为 identity PSK，并按 V2Board 规则从用户 UUID 前缀构造用户 PSK；无需把订阅中的两段式密码回填到用户表。
 - Shadowsocks 和 AnyTLS inbound 会自动识别 UoT v2（`sp.v2.udp-over-tcp.arpa`）及 v1（`sp.udp-over-tcp.arpa`）。Shadowsocks outbound 可用 `"uot": true` 开启 UoT（默认 v2），以 `"uotVersion": 1` 选择 v1；也接受 `"udp_over_tcp": {"enabled": true, "version": 2}`。
-- 本地日志统一为 JSON Lines；`error` 保存 system 记录，`access` 保存 connection 记录。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。
+- 本地日志对齐 xray-core：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。

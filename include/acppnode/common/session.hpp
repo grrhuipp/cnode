@@ -123,9 +123,6 @@ struct Context {
 
 }  // namespace session
 
-std::string FormatConnectionAccepted(
-    const session::Context& ctx,
-    const net::ip::address* resolved_ip = nullptr,
-    const net::ip::address* local_ip = nullptr);
+std::string FormatXrayAccessLog(const session::Context& ctx);
 
 }  // namespace acpp

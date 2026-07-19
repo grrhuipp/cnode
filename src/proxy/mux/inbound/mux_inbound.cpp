@@ -1674,10 +1674,7 @@ net::awaitable<RelayResult> ProcessInbound(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     try {
-        LOG_CONN_EVENT(
-            parent_ctx,
-            "connection.accepted",
-            FormatConnectionAccepted(parent_ctx));
+        LOG_ACCESS(FormatXrayAccessLog(parent_ctx));
         co_return co_await ProcessInboundImpl(
             io_context,
             client_link,

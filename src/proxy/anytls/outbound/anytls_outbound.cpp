@@ -777,7 +777,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         auto new_stream = std::move(dial_result.stream);
         new_stream->SetStreamLabel("out");
-        LOG_CONN_EVENT(ctx, "connection.accepted", FormatConnectionAccepted(ctx));
+        LOG_ACCESS(FormatXrayAccessLog(ctx));
 
         new_stream->SetIdleTimeout(timeouts.HandshakeTimeout());
         auto deadline = new_stream->StartPhaseDeadline(timeouts.HandshakeTimeout());

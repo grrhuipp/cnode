@@ -356,10 +356,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             ctx.outbound.connected_local_addr = local_ip;
         }
     }
-    LOG_CONN_EVENT(
-        ctx,
-        "connection.accepted",
-        FormatConnectionAccepted(ctx, &remote_ip, &local_ip));
+    LOG_ACCESS(FormatXrayAccessLog(ctx));
 
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
