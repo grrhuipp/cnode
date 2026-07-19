@@ -404,6 +404,7 @@ void WriteStderrFallback(LogLevel level, const std::string& msg) {
         .timestamp_us = NowMicros(),
         .message = msg,
         .source_file = "src/infra/log.cpp",
+        .connection = std::nullopt,
     };
     std::cerr << FormatRecord(record) << std::endl;
 }
@@ -664,6 +665,7 @@ private:
                 .timestamp_us = NowMicros(),
                 .message = std::move(msg),
                 .source_file = "src/infra/log.cpp",
+                .connection = std::nullopt,
             };
             error_file_ << FormatRecord(record) << '\n';
             if (level >= LogLevel::WARN) {
@@ -684,6 +686,7 @@ private:
             .timestamp_us = NowMicros(),
             .message = std::format("log queue dropped {} records", dropped),
             .source_file = "src/infra/log.cpp",
+            .connection = std::nullopt,
         };
         error_file_ << FormatRecord(record) << '\n';
         error_file_.flush();
@@ -819,6 +822,7 @@ void Log::WriteSystem(LogLevel level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
+        .connection = std::nullopt,
     });
 }
 
@@ -834,6 +838,7 @@ void Log::WriteConnection(LogLevel level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
+        .connection = std::nullopt,
     });
 }
 
@@ -861,6 +866,8 @@ void Log::WriteAccess(std::string message) {
         .level = LogLevel::INFO,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
+        .source_file = {},
+        .connection = std::nullopt,
     });
 }
 
@@ -878,6 +885,7 @@ void Log::WriteConsole(LogLevel level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
+        .connection = std::nullopt,
     };
     std::cout << FormatRecord(record) << std::endl;
 }
