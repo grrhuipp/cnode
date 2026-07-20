@@ -144,6 +144,7 @@ std::vector<uint8_t> EncodeEvent(
     WriteString(out, 30, event.error_reason, 128);
     WriteBytes(out, 31, event.raw_packet);
     WriteUInt(out, 32, event.raw_packet_truncated ? 1 : 0);
+    WriteUInt(out, 33, event.inbound_port);
     return out;
 }
 

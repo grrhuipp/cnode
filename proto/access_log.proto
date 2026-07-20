@@ -66,6 +66,12 @@ message AccessEvent {
   string error_reason = 30;
   bytes raw_packet = 31;
   bool raw_packet_truncated = 32;
+  // Listener port the client connected to. Distinct from local_ip, which is the
+  // node's own address on the OUTBOUND dial. This is the only port a request
+  // that fails before authenticating ever reaches, so without it such an event
+  // carries no port at all: target_port describes a destination the request
+  // never got to name.
+  uint32 inbound_port = 33;
 }
 
 message AccessBatch {

@@ -69,6 +69,10 @@ struct Event {
 
     std::string source_ip;
     uint16_t source_port = 0;
+    // Listener port the client reached us on. local_ip is the outbound side, so
+    // this is the only inbound port recorded, and the only one a pre-auth
+    // failure ever has.
+    uint16_t inbound_port = 0;
     std::string target_host;
     uint16_t target_port = 0;
     std::string remote_ip;

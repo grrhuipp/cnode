@@ -83,6 +83,9 @@ accesslog::Event BuildAccessLogEvent(
         ? AddressString(ctx.inbound.source_addr)
         : ctx.inbound.source_ip;
     event.source_port = ctx.inbound.source_port;
+    if (ctx.inbound.local_endpoint) {
+        event.inbound_port = ctx.inbound.local_endpoint->port();
+    }
 
     if (!ctx.content.multiple_targets) {
         const TargetAddress& target = ctx.outbound.target;
