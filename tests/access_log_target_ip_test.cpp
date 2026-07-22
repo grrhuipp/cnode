@@ -1,6 +1,10 @@
 #include "acppnode/app/access_log_session.hpp"
+#include "acppnode/common/read_prefix_capture.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <memory>
+#include <string>
 
 int main() {
     using namespace acpp;
@@ -60,6 +64,23 @@ int main() {
         ctx, accesslog::CloseSide::Unknown, 7, 8, ErrorCode::DIAL_REFUSED);
     assert(event.result == accesslog::Result::Failed);
     assert(event.error_code == ErrorCode::DIAL_REFUSED);
+    assert(event.failure_stage == "dial");
+
+    const std::string http =
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer secret\r\n\r\n";
+    ctx.inbound.protocol = "http";
+    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    ctx.inbound.read_prefix_capture->Append(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(http.data()), http.size()));
+    event = app::BuildAccessLogEvent(
+        ctx, accesslog::CloseSide::Unknown, 0, 0, ErrorCode::PROTOCOL_AUTH_FAILED);
+    assert(event.raw_packet_original_len == http.size());
+    assert(event.raw_packet_captured_len == http.size());
+    assert(event.raw_packet_protocol_guess == "http");
+    assert(event.raw_packet_redacted);
+    assert(event.raw_packet_sha256.size() == 64);
+    const std::string redacted(event.raw_packet.begin(), event.raw_packet.end());
+    assert(redacted.find("secret") == std::string::npos);
 
     ctx.content.multiple_targets = true;
     ctx.outbound.connected_target_addr = net::ip::make_address("203.0.113.9");

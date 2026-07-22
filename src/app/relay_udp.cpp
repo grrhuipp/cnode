@@ -192,6 +192,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
             co_await client_writer.WriteMultiBuffer(std::move(packet.payload));
             packet.payload.clear();
             ctx.traffic.bytes_down += send_len;
+            relay_detail::ObserveRelayPacket(ctx, false, true);
             result.bytes_down += send_len;
             stats_acc.AddBytesIn(send_len);
             if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {
@@ -218,6 +219,10 @@ net::awaitable<RelayResult> DoUDPRelayLink(
                 mark_close_side(true);
                 if (result.error == ErrorCode::OK) {
                     result.error = MapAsioError(e.code());
+                }
+                if (ctx.outbound.os_error_code == 0) {
+                    ctx.outbound.os_error_code = e.code().value();
+                    ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
                 }
                 break;
             } catch (...) {
@@ -281,6 +286,7 @@ net::awaitable<RelayResult> DoUDPRelayLink(
 
             relay_detail::ObserveUdpRelayTarget(ctx, read_mb);
             ctx.traffic.bytes_up += datagram_info.payload_size;
+            relay_detail::ObserveRelayPacket(ctx, true, true);
             result.bytes_up += datagram_info.payload_size;
             stats_acc.AddBytesOut(datagram_info.payload_size);
             if (stats_acc.bytes_in + stats_acc.bytes_out >= kUdpRelayStatsFlushBytes) {

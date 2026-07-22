@@ -512,6 +512,17 @@ endif()
 if(NOT DEFINED BUILD_ID OR BUILD_ID STREQUAL "")
     string(TIMESTAMP BUILD_ID "%Y%m%dT%H%M%SZ" UTC)
 endif()
+if(NOT DEFINED GIT_COMMIT OR GIT_COMMIT STREQUAL "")
+    execute_process(
+        COMMAND git rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+if(GIT_COMMIT STREQUAL "")
+    set(GIT_COMMIT "unknown")
+endif()
 if(CNODE_HEAPTRACK_BUILD)
     set(CNODE_BUILD_CHANNEL "heaptrack")
 else()
@@ -520,6 +531,8 @@ endif()
 target_compile_definitions(cnode PRIVATE
     BUILD_ID="${BUILD_ID}"
     BUILD_CHANNEL="${CNODE_BUILD_CHANNEL}"
+    CNODE_VERSION="${PROJECT_VERSION}"
+    GIT_COMMIT="${GIT_COMMIT}"
 )
 message(STATUS "Build ID: ${BUILD_ID}")
 
@@ -1504,6 +1517,7 @@ if(CNODE_BUILD_TESTS)
     )
     target_link_libraries(cnode_access_log_target_ip_test PRIVATE
         asio::asio
+        crypto
     )
     if(WIN32)
         target_link_libraries(cnode_access_log_target_ip_test PRIVATE ws2_32)

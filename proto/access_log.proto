@@ -72,6 +72,51 @@ message AccessEvent {
   // carries no port at all: target_port describes a destination the request
   // never got to name.
   uint32 inbound_port = 33;
+  string inbound_ip = 34;
+  string peer_ip = 35;
+  uint32 peer_port = 36;
+  string client_ip_source = 37;
+  bool client_ip_trusted = 38;
+  string inbound_transport = 39;
+  string inbound_security = 40;
+  string failure_stage = 41;
+  string failure_detail_code = 42;
+  int32 os_error_code = 43;
+  uint32 local_port = 44;
+  string tls_sni = 45;
+  string tls_alpn = 46;
+  string tls_version = 47;
+  string tls_fingerprint = 48;
+  string http_host = 49;
+  string transport_route_id = 50;
+  string original_target_host = 51;
+  uint32 original_target_port = 52;
+  string route_target_host = 53;
+  uint32 route_target_port = 54;
+  string final_target_host = 55;
+  uint32 final_target_port = 56;
+  string route_rule = 57;
+  uint64 dns_latency_ms = 58;
+  uint32 dns_answer_count = 59;
+  uint32 dial_attempt_count = 60;
+  repeated string dial_ips = 61;
+  uint64 transport_handshake_ms = 62;
+  uint64 auth_ms = 63;
+  uint64 dial_ms = 64;
+  uint64 first_byte_ms = 65;
+  uint64 packet_count_up = 66;
+  uint64 packet_count_down = 67;
+  uint64 datagram_count = 68;
+  uint32 distinct_target_count = 69;
+  uint64 parent_conn_id = 70;
+  uint64 stream_id = 71;
+  uint64 runtime_generation = 72;
+  uint64 config_generation = 73;
+  uint64 raw_packet_original_len = 74;
+  uint64 raw_packet_captured_len = 75;
+  string raw_packet_sha256 = 76;
+  bool raw_packet_redacted = 77;
+  string raw_packet_protocol_guess = 78;
 }
 
 message AccessBatch {
@@ -88,4 +133,7 @@ message AccessBatch {
   // Set authoritatively by the log service from the receiving endpoint.
   // 1 = normal access stream, 2 = error/security stream.
   uint32 stream_kind = 10;
+  string cnode_version = 11;
+  string build_id = 12;
+  string git_commit = 13;
 }

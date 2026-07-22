@@ -279,6 +279,7 @@ inline bool ConsumeWriteSideTimeout(AsyncStream& stream) {
 // ============================================================================
 struct DialResult : ResultStatus {
     std::unique_ptr<AsyncStream> stream;  // 成功时有效
+    int32_t native_error_code = 0;
     // The endpoint address used by the most recent transport dial attempt.
     // This is transport metadata only; an outbound decides whether the
     // endpoint represents the final destination or a proxy next hop.
@@ -294,9 +295,13 @@ struct DialResult : ResultStatus {
         return r;
     }
 
-    [[nodiscard]] static DialResult Fail(ErrorCode code, const std::string& msg = "") {
+    [[nodiscard]] static DialResult Fail(
+        ErrorCode code,
+        const std::string& msg = "",
+        int32_t native_error = 0) {
         DialResult r;
         r.SetError(code, msg);
+        r.native_error_code = native_error;
         return r;
     }
 };

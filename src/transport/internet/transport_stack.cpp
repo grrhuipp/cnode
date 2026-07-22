@@ -4815,6 +4815,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const XHttpConfig& xhttp_cfg,
     uint64_t conn_id,
     std::string* out_real_ip,
+    InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial) {
     buf::BufferGuard handshake_buf{buf::Buffer::New()};
     if (!handshake_buf) {
@@ -4854,6 +4855,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     const std::string_view method = ExtractRequestMethod(request_line);
     const std::string_view request_path = ExtractRequestPathAny(request_line);
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
+    if (transport_metadata) transport_metadata->http_host = std::string(host);
     const std::string_view transfer_encoding =
         ExtractHeaderValueCI(request, "Transfer-Encoding");
     const std::string_view content_length_header =
@@ -4900,6 +4902,10 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             val = TrimAscii(val);
             if (!val.empty()) {
                 *out_real_ip = std::string(val);
+                if (transport_metadata) {
+                    transport_metadata->real_ip = *out_real_ip;
+                    transport_metadata->real_ip_header = cfg.real_ip_header;
+                }
             }
         }
     }
@@ -5045,6 +5051,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     const HttpConfig& cfg,
     uint64_t conn_id,
     std::string* out_real_ip,
+    InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial) {
     buf::BufferGuard handshake_buf{buf::Buffer::New()};
     if (!handshake_buf) {
@@ -5084,6 +5091,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     const std::string_view method = ExtractRequestMethod(request_line);
     const std::string_view request_path = ExtractRequestPathAny(request_line);
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
+    if (transport_metadata) transport_metadata->http_host = std::string(host);
     const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
 
     LOG_NET_TRACE(
@@ -5132,6 +5140,10 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
             val = TrimAscii(val);
             if (!val.empty()) {
                 *out_real_ip = std::string(val);
+                if (transport_metadata) {
+                    transport_metadata->real_ip = *out_real_ip;
+                    transport_metadata->real_ip_header = cfg.real_ip_header;
+                }
             }
         }
     }
@@ -5177,6 +5189,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
     std::string* out_real_ip,
+    InboundTransportMetadata* transport_metadata,
     bool require_http2 = false,
     const XHttpConfig* xhttp_config = nullptr) {
     std::array<uint8_t, 24> first{};
@@ -5220,6 +5233,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             *xhttp_config,
             conn_id,
             out_real_ip,
+            transport_metadata,
             std::span<const uint8_t>(first.data(), total));
     }
 
@@ -5228,6 +5242,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
         cfg,
         conn_id,
         out_real_ip,
+        transport_metadata,
         std::span<const uint8_t>(first.data(), total));
 }
 
@@ -5385,7 +5400,8 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     std::unique_ptr<AsyncStream> stream,
     const HttpUpgradeConfig& cfg,
     uint64_t conn_id,
-    std::string* out_real_ip) {
+    std::string* out_real_ip,
+    InboundTransportMetadata* transport_metadata) {
     buf::BufferGuard handshake_buf{buf::Buffer::New()};
     if (!handshake_buf) {
         co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
@@ -5418,6 +5434,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     const std::string_view request_line = ExtractRequestLine(request);
     const std::string_view request_path = ExtractRequestPath(request_line);
     const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
+    if (transport_metadata) transport_metadata->http_host = std::string(host);
     const std::string_view upgrade = TrimAscii(ExtractHeaderValueCI(request, "Upgrade"));
     const std::string_view connection = ExtractHeaderValueCI(request, "Connection");
     const std::string_view user_agent = ExtractHeaderValueCI(request, "User-Agent");
@@ -5469,6 +5486,10 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
             val = TrimAscii(val);
             if (!val.empty()) {
                 *out_real_ip = std::string(val);
+                if (transport_metadata) {
+                    transport_metadata->real_ip = *out_real_ip;
+                    transport_metadata->real_ip_header = cfg.real_ip_header;
+                }
             }
         }
     }
@@ -5621,7 +5642,8 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     std::unique_ptr<AsyncStream> stream,
     const WsConfig& ws_cfg,
     uint64_t conn_id,
-    std::string* out_real_ip)
+    std::string* out_real_ip,
+    InboundTransportMetadata* transport_metadata)
 {
     buf::BufferGuard handshake_buf{buf::Buffer::New()};
     if (!handshake_buf) {
@@ -5664,6 +5686,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     const std::string_view request_line = ExtractRequestLine(request);
     const std::string_view request_path = ExtractRequestPath(request_line);
     const std::string_view host = ExtractHeaderValueCI(request, "Host");
+    if (transport_metadata) transport_metadata->http_host = std::string(TrimAscii(host));
     const std::string_view upgrade = ExtractHeaderValueCI(request, "Upgrade");
     const std::string_view connection = ExtractHeaderValueCI(request, "Connection");
     const std::string_view version = ExtractHeaderValueCI(request, "Sec-WebSocket-Version");
@@ -5731,7 +5754,13 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
             auto comma = val.find(',');
             if (comma != std::string_view::npos) val = val.substr(0, comma);
             val = TrimAscii(val);
-            if (!val.empty()) *out_real_ip = std::string(val);
+            if (!val.empty()) {
+                *out_real_ip = std::string(val);
+                if (transport_metadata) {
+                    transport_metadata->real_ip = *out_real_ip;
+                    transport_metadata->real_ip_header = ws_cfg.real_ip_header;
+                }
+            }
         }
     }
 
@@ -5797,7 +5826,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     const StreamSettings& s,
     std::string* out_real_ip,
     uint64_t trace_conn_id,
-    std::shared_ptr<InboundTransportStreamHandler> stream_handler)
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+    InboundTransportMetadata* metadata)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
@@ -5837,6 +5867,12 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         }
         LOG_NET_DEBUG("[Transport] BuildInbound: {} handshake ok",
                          s.IsReality() ? "REALITY" : "TLS");
+        if (metadata) {
+            metadata->tls_sni = tls->ReceivedSni();
+            metadata->tls_alpn = tls->NegotiatedAlpn();
+            metadata->tls_version = tls->NegotiatedVersion();
+            metadata->tls_fingerprint = tls->NegotiatedFingerprint();
+        }
         stream = std::move(tls);
     }
 
@@ -5874,7 +5910,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             io_context,
             std::move(stream_handler),
             conn_id,
-            out_real_ip);
+            out_real_ip,
+            metadata);
         if (!http_result) {
             LOG_NET_DEBUG("[Transport] BuildInbound: HTTP server handshake failed ({})",
                              ErrorCodeToString(http_result.error()));
@@ -5905,6 +5942,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             std::move(stream_handler),
             conn_id,
             out_real_ip,
+            metadata,
             false,
             &s.xhttp);
         if (!xhttp_result) {
@@ -5923,7 +5961,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             thread_local uint64_t s_conn_counter = 1;
             conn_id = s_conn_counter++;
         }
-        auto ws_result = co_await DoWsServerHandshake(std::move(stream), s.ws, conn_id, out_real_ip);
+        auto ws_result = co_await DoWsServerHandshake(
+            std::move(stream), s.ws, conn_id, out_real_ip, metadata);
         if (!ws_result) {
             LOG_NET_DEBUG("[Transport] BuildInbound: WS server handshake failed ({})",
                              ErrorCodeToString(ws_result.error()));
@@ -5940,7 +5979,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             conn_id = s_conn_counter++;
         }
         auto http_upgrade_result = co_await DoHttpUpgradeServerHandshake(
-            std::move(stream), s.http_upgrade, conn_id, out_real_ip);
+            std::move(stream), s.http_upgrade, conn_id, out_real_ip, metadata);
         if (!http_upgrade_result) {
             LOG_NET_DEBUG("[Transport] BuildInbound: HTTPUpgrade server handshake failed ({})",
                              ErrorCodeToString(http_upgrade_result.error()));

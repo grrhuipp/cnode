@@ -22,6 +22,59 @@ namespace acpp::proxyman::inbound {
 
 namespace {
 
+std::string_view RealIpHeader(const StreamSettings& settings) noexcept {
+    if (settings.IsWs()) return settings.ws.real_ip_header;
+    if (settings.IsHttpUpgrade()) return settings.http_upgrade.real_ip_header;
+    if (settings.IsHttp()) return settings.http.real_ip_header;
+    return {};
+}
+
+std::string TransportRouteId(const StreamSettings& settings) {
+    if (settings.IsWs()) return settings.ws.path;
+    if (settings.IsHttpUpgrade()) return settings.http_upgrade.path;
+    if (settings.IsHttp()) return settings.http.path;
+    if (settings.IsGrpc()) return settings.grpc.RequestPath();
+    if (settings.IsXHttp()) return settings.xhttp.NormalizedPath();
+    return {};
+}
+
+std::string ConfiguredHttpHost(const StreamSettings& settings) {
+    if (settings.IsHttpUpgrade()) return settings.http_upgrade.host;
+    if (settings.IsHttp()) return settings.http.host;
+    if (settings.IsGrpc()) return settings.grpc.authority;
+    if (settings.IsXHttp()) return settings.xhttp.host;
+    return {};
+}
+
+void PrepareInboundLogMetadata(
+    session::Context& ctx,
+    const ReceiverSettings& listener) {
+    ctx.inbound.transport = listener.stream_settings.network;
+    ctx.inbound.security = listener.stream_settings.security;
+    ctx.inbound.transport_route_id = TransportRouteId(listener.stream_settings);
+    ctx.inbound.http_host = ConfiguredHttpHost(listener.stream_settings);
+}
+
+void ApplyHttpRealIp(
+    session::Context& ctx,
+    std::string_view real_ip,
+    std::string_view header) {
+    if (real_ip.empty()) return;
+    IoErrorCode ec;
+    auto address = net::ip::make_address(real_ip, ec);
+    if (ec) return;
+    address = iputil::NormalizeAddress(address);
+    ctx.inbound.source_addr = address;
+    ctx.inbound.source_ip = address.to_string();
+    // Forwarded address headers do not reliably carry the original client
+    // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
+    ctx.inbound.source_port = 0;
+    ctx.inbound.client_ip_source = header.empty()
+        ? std::string("http_header")
+        : std::string("http_header:") + std::string(header);
+    ctx.inbound.client_ip_trusted = true;
+}
+
 class ConnectionLimitScope {
 public:
     ConnectionLimitScope(ConnectionLimiterPtr limiter, std::string_view ip)
@@ -87,6 +140,10 @@ void CopyTransportBaseContext(const session::Context& source,
     target.conn_id = session::NewID(source.worker_id);
     target.worker_id = source.worker_id;
     target.accept_time_us = NowMicros();
+    target.parent_conn_id = source.conn_id;
+    target.stream_id = target.conn_id;
+    target.runtime_generation = source.runtime_generation;
+    target.config_generation = source.config_generation;
     target.inbound = source.inbound;
     target.inbound.user_id = 0;
     target.inbound.user_email.clear();
@@ -103,13 +160,17 @@ public:
                                StatsShard& stats,
                                app::RequestLoadState& request_load,
                                const TimeoutsConfig& timeouts,
-                               const session::Context& base_ctx)
+                               const session::Context& base_ctx,
+                               std::shared_ptr<InboundTransportMetadata> metadata,
+                               int64_t transport_started_at_us)
         : handler_(std::move(handler))
         , io_context_(io_context)
         , dispatcher_(dispatcher)
         , stats_(stats)
         , request_load_(request_load)
-        , timeouts_(timeouts) {
+        , timeouts_(timeouts)
+        , metadata_(std::move(metadata))
+        , transport_started_at_us_(transport_started_at_us) {
         CopyTransportBaseContext(base_ctx, base_ctx_);
         base_ctx_.conn_id = base_ctx.conn_id;
         base_ctx_.accept_time_us = base_ctx.accept_time_us;
@@ -125,6 +186,25 @@ public:
             [self, stream = std::move(stream)]() mutable -> net::awaitable<void> {
                 session::Context ctx;
                 CopyTransportBaseContext(self->base_ctx_, ctx);
+                if (self->metadata_) {
+                    ctx.inbound.tls_sni = self->metadata_->tls_sni;
+                    ctx.inbound.tls_alpn = self->metadata_->tls_alpn;
+                    ctx.inbound.tls_version = self->metadata_->tls_version;
+                    ctx.inbound.tls_fingerprint = self->metadata_->tls_fingerprint;
+                    if (!self->metadata_->http_host.empty()) {
+                        ctx.inbound.http_host = self->metadata_->http_host;
+                    }
+                    ApplyHttpRealIp(
+                        ctx,
+                        self->metadata_->real_ip,
+                        self->metadata_->real_ip_header);
+                }
+                const int64_t transport_ready_at_us = NowMicros();
+                ctx.inbound.transport_ready_at_unix_us = transport_ready_at_us;
+                if (transport_ready_at_us > self->transport_started_at_us_) {
+                    ctx.inbound.transport_handshake_ms = static_cast<uint64_t>(
+                        (transport_ready_at_us - self->transport_started_at_us_) / 1000);
+                }
                 co_await self->handler_->ProcessPreparedTransportStream(
                     self->io_context_,
                     self->dispatcher_,
@@ -145,6 +225,8 @@ private:
     app::RequestLoadState& request_load_;
     TimeoutsConfig timeouts_;
     session::Context base_ctx_;
+    std::shared_ptr<InboundTransportMetadata> metadata_;
+    int64_t transport_started_at_us_ = 0;
 };
 
 }  // namespace
@@ -166,6 +248,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     ctx.inbound.access_source_ref = listener.access_source_ref;
     ctx.inbound.protocol = listener.protocol;
+    PrepareInboundLogMetadata(ctx, listener);
     app::AccessLogSession access_log(ctx);
 
     ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
@@ -259,6 +342,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     ctx.inbound.access_source_ref = listener.access_source_ref;
     ctx.inbound.protocol = listener.protocol;
+    PrepareInboundLogMetadata(ctx, listener);
     app::AccessLogSession access_log(ctx);
 
     ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
@@ -297,6 +381,10 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.security,
                    listener.stream_settings.network);
 
+    const int64_t transport_started_at_us = NowMicros();
+    auto transport_metadata = std::make_shared<InboundTransportMetadata>();
+    transport_metadata->real_ip_header =
+        std::string(RealIpHeader(listener.stream_settings));
     std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler;
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
@@ -308,7 +396,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             stats,
             request_load,
             timeouts,
-            ctx);
+            ctx,
+            transport_metadata,
+            transport_started_at_us);
     }
 
     std::string ws_real_ip;
@@ -317,7 +407,21 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         std::move(raw_conn), listener.stream_settings,
         listener.stream_settings.NeedsHttpRealIpExtraction() ? &ws_real_ip : nullptr,
         ctx.conn_id,
-        std::move(logical_stream_handler));
+        std::move(logical_stream_handler),
+        transport_metadata.get());
+    const int64_t transport_ended_at_us = NowMicros();
+    if (transport_ended_at_us > transport_started_at_us) {
+        ctx.inbound.transport_handshake_ms = static_cast<uint64_t>(
+            (transport_ended_at_us - transport_started_at_us) / 1000);
+    }
+    ctx.inbound.transport_ready_at_unix_us = transport_ended_at_us;
+    ctx.inbound.tls_sni = transport_metadata->tls_sni;
+    ctx.inbound.tls_alpn = transport_metadata->tls_alpn;
+    ctx.inbound.tls_version = transport_metadata->tls_version;
+    ctx.inbound.tls_fingerprint = transport_metadata->tls_fingerprint;
+    if (!transport_metadata->http_host.empty()) {
+        ctx.inbound.http_host = transport_metadata->http_host;
+    }
 
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "[Session] Transport handshake failed ({}/{})",
@@ -337,16 +441,10 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
 
     if (!ws_real_ip.empty()) {
-        IoErrorCode real_ip_ec;
-        auto parsed_real_ip = net::ip::make_address(ws_real_ip, real_ip_ec);
-        if (!real_ip_ec) {
-            parsed_real_ip = iputil::NormalizeAddress(parsed_real_ip);
-            ws_real_ip = parsed_real_ip.to_string();
-        }
         LOG_CONN_DEBUG(ctx, "[Session] HTTP transport real IP from header: {} -> {}",
                        ctx.inbound.source_ip, ws_real_ip);
-        ctx.inbound.source_addr = real_ip_ec ? net::ip::address{} : parsed_real_ip;
-        ctx.inbound.source_ip = std::move(ws_real_ip);
+        ApplyHttpRealIp(
+            ctx, ws_real_ip, RealIpHeader(listener.stream_settings));
     }
 
     if (connection_limit && listener.limiter) {

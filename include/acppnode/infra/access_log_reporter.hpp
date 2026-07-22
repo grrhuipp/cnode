@@ -73,11 +73,17 @@ struct Event {
     // this is the only inbound port recorded, and the only one a pre-auth
     // failure ever has.
     uint16_t inbound_port = 0;
+    std::string inbound_ip;
+    std::string peer_ip;
+    uint16_t peer_port = 0;
+    std::string client_ip_source;
+    bool client_ip_trusted = false;
     std::string target_host;
     uint16_t target_port = 0;
     std::string remote_ip;
     std::string dial_ip;
     std::string local_ip;
+    uint16_t local_port = 0;
 
     uint64_t uplink_bytes = 0;
     uint64_t downlink_bytes = 0;
@@ -90,6 +96,46 @@ struct Event {
     std::string error_reason;
     std::vector<uint8_t> raw_packet;
     bool raw_packet_truncated = false;
+    uint64_t raw_packet_original_len = 0;
+    uint64_t raw_packet_captured_len = 0;
+    std::string raw_packet_sha256;
+    bool raw_packet_redacted = false;
+    std::string raw_packet_protocol_guess;
+
+    std::string inbound_transport;
+    std::string inbound_security;
+    std::string failure_stage;
+    std::string failure_detail_code;
+    int32_t os_error_code = 0;
+    std::string tls_sni;
+    std::string tls_alpn;
+    std::string tls_version;
+    std::string tls_fingerprint;
+    std::string http_host;
+    std::string transport_route_id;
+    std::string original_target_host;
+    uint16_t original_target_port = 0;
+    std::string route_target_host;
+    uint16_t route_target_port = 0;
+    std::string final_target_host;
+    uint16_t final_target_port = 0;
+    std::string route_rule;
+    uint64_t dns_latency_ms = 0;
+    uint32_t dns_answer_count = 0;
+    uint32_t dial_attempt_count = 0;
+    std::vector<std::string> dial_ips;
+    uint64_t transport_handshake_ms = 0;
+    uint64_t auth_ms = 0;
+    uint64_t dial_ms = 0;
+    uint64_t first_byte_ms = 0;
+    uint64_t packet_count_up = 0;
+    uint64_t packet_count_down = 0;
+    uint64_t datagram_count = 0;
+    uint32_t distinct_target_count = 0;
+    uint64_t parent_conn_id = 0;
+    uint64_t stream_id = 0;
+    uint64_t runtime_generation = 1;
+    uint64_t config_generation = 1;
 };
 
 // Preserves a panel base path but removes query, fragment and userinfo. Returns

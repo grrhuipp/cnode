@@ -96,6 +96,8 @@ public:
 
     // 获取 SNI（服务端接收到的）
     std::string ReceivedSni() const;
+    std::string NegotiatedVersion() const;
+    std::string NegotiatedFingerprint() const;
 
     // AsyncStream 接口实现
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;

@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -21,7 +22,7 @@ bool Contains(std::span<const uint8_t> haystack, std::string_view needle) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace acpp::accesslog;
     using namespace acpp::accesslog::detail;
 
@@ -67,9 +68,47 @@ int main() {
     event.network = Network::Tcp;
     event.source_ip = "192.0.2.10";
     event.source_port = 50000;
+    event.inbound_ip = "10.0.0.10";
+    event.inbound_port = 443;
+    event.peer_ip = "192.0.2.9";
+    event.peer_port = 51000;
+    event.client_ip_source = "proxy_protocol";
+    event.client_ip_trusted = true;
     event.target_host = "example.com";
     event.target_port = 443;
     event.dial_ip = "198.51.100.42";
+    event.local_ip = "10.0.0.20";
+    event.local_port = 52000;
+    event.inbound_transport = "ws";
+    event.inbound_security = "tls";
+    event.tls_sni = "sni.example.com";
+    event.tls_alpn = "h2";
+    event.tls_version = "TLSv1.3";
+    event.tls_fingerprint = "sha256:negotiated";
+    event.http_host = "host.example.com";
+    event.transport_route_id = "ws:/edge";
+    event.original_target_host = "original.example.com";
+    event.original_target_port = 8443;
+    event.route_target_host = "route.example.com";
+    event.route_target_port = 443;
+    event.final_target_host = "example.com";
+    event.final_target_port = 443;
+    event.route_rule = "rule:3";
+    event.dns_latency_ms = 12;
+    event.dns_answer_count = 2;
+    event.dial_attempt_count = 2;
+    event.dial_ips = {"198.51.100.41", "198.51.100.42"};
+    event.transport_handshake_ms = 8;
+    event.auth_ms = 3;
+    event.dial_ms = 21;
+    event.first_byte_ms = 34;
+    event.packet_count_up = 7;
+    event.packet_count_down = 9;
+    event.distinct_target_count = 1;
+    event.parent_conn_id = 90;
+    event.stream_id = 17;
+    event.runtime_generation = 5;
+    event.config_generation = 6;
     event.uplink_bytes = 123;
     event.downlink_bytes = 456;
     event.result = Result::Completed;
@@ -92,6 +131,10 @@ int main() {
     assert(Contains(batch.protobuf, "example.com"));
     assert(Contains(batch.protobuf, "198.51.100.42"));
     assert(Contains(batch.protobuf, "cnode-test"));
+    assert(Contains(batch.protobuf, "proxy_protocol"));
+    assert(Contains(batch.protobuf, "sni.example.com"));
+    assert(Contains(batch.protobuf, "rule:3"));
+    assert(Contains(batch.protobuf, "1.0.0"));
 
     const auto compressed = CompressZstd(batch.protobuf);
     assert(compressed.size() >= 4);
@@ -99,5 +142,12 @@ int main() {
     assert(compressed[1] == 0xb5);
     assert(compressed[2] == 0x2f);
     assert(compressed[3] == 0xfd);
+    if (argc == 2) {
+        std::ofstream output(argv[1], std::ios::binary | std::ios::trunc);
+        output.write(
+            reinterpret_cast<const char*>(compressed.data()),
+            static_cast<std::streamsize>(compressed.size()));
+        assert(output.good());
+    }
     return 0;
 }

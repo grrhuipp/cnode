@@ -22,6 +22,7 @@ namespace acpp::app::router {
 struct RouteDecision {
     std::string_view outbound_tag;
     bool matched = false;
+    uint32_t rule_index = 0;
 };
 
 class Router {

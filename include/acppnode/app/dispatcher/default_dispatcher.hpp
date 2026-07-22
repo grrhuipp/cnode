@@ -73,6 +73,8 @@ private:
         std::string_view outbound_tag;
         bool matched = false;
         bool fixed = false;
+        bool fallback = false;
+        uint32_t rule_index = 0;
         ErrorCode error = ErrorCode::OK;
     };
 

@@ -715,6 +715,7 @@ proxy::vless::outbound::Handler::Process(
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
+        ctx.outbound.connected_local_port = local_ep->port();
     }
     LOG_ACCESS(FormatXrayAccessLog(ctx));
 

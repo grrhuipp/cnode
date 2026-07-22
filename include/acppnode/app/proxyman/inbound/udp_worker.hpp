@@ -49,6 +49,8 @@ struct UdpDatagramContext {
     StatsShard& stats;
     const TimeoutsConfig& timeouts;
     uint32_t worker_id = 0;
+    uint64_t runtime_generation = 1;
+    uint64_t config_generation = 1;
     UdpReplySink& reply_sink;
 };
 

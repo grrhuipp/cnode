@@ -9,6 +9,7 @@
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
 #include "autosign_cert.hpp"
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/tls1.h>
 #include <asio/ssl.hpp>
 #include <asio/write.hpp>
@@ -482,6 +483,34 @@ std::string TlsStream::ReceivedSni() const {
 
     const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     return name ? name : "";
+}
+
+std::string TlsStream::NegotiatedVersion() const {
+    const SSL* ssl = NativeSsl();
+    const char* version = ssl ? SSL_get_version(ssl) : nullptr;
+    return version ? version : "";
+}
+
+std::string TlsStream::NegotiatedFingerprint() const {
+    const SSL* ssl = NativeSsl();
+    if (!ssl) return {};
+    const char* cipher = SSL_get_cipher_name(ssl);
+    const std::string material = NegotiatedVersion() + "|" +
+        (cipher ? std::string(cipher) : std::string{}) + "|" +
+        NegotiatedAlpn() + "|" + ReceivedSni();
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_len = 0;
+    if (EVP_Digest(material.data(), material.size(), digest.data(), &digest_len,
+                   EVP_sha256(), nullptr) != 1) return {};
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out = "negotiated-sha256:";
+    out.resize(out.size() + digest_len * 2, '0');
+    const size_t prefix_size = std::string_view("negotiated-sha256:").size();
+    for (unsigned int i = 0; i < digest_len; ++i) {
+        out[prefix_size + i * 2] = hex[digest[i] >> 4];
+        out[prefix_size + i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    return out;
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {

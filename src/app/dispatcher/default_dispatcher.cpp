@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <new>
+#include <string>
 #include <vector>
 
 namespace acpp::app::dispatcher {
@@ -56,7 +58,13 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
         co_return std::vector<net::ip::address>{};
     }
 
+    const int64_t started_at_us = NowMicros();
     auto dns_result = co_await dns_service.Resolve(target.host);
+    const int64_t elapsed_us = std::max<int64_t>(0, NowMicros() - started_at_us);
+    ctx.outbound.dns_latency_ms = static_cast<uint32_t>(
+        std::min<int64_t>(elapsed_us / 1000, std::numeric_limits<uint32_t>::max()));
+    ctx.outbound.dns_answer_count = static_cast<uint32_t>(
+        std::min<size_t>(dns_result.addresses.size(), std::numeric_limits<uint32_t>::max()));
     if (!dns_result.Ok()) {
         ctx.content.dns_result = session::DnsResultState::Failed;
         LOG_CONN_DEBUG(ctx, "[Dispatcher] route DNS resolve failed for {}", target.host);
@@ -153,6 +161,16 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         ? request_load_->PressureIdleTimeout()
         : 0;
     app::AccessLogSession access_log(ctx);
+    const int64_t auth_completed_at_us = NowMicros();
+    const int64_t auth_started_at_us = ctx.inbound.transport_ready_at_unix_us > 0
+        ? ctx.inbound.transport_ready_at_unix_us
+        : ctx.accept_time_us;
+    if (ctx.auth_ms == 0 && auth_started_at_us > 0 &&
+        auth_completed_at_us >= auth_started_at_us) {
+        ctx.auth_ms = static_cast<uint32_t>(std::min<int64_t>(
+            (auth_completed_at_us - auth_started_at_us) / 1000,
+            std::numeric_limits<uint32_t>::max()));
+    }
     // Authentication and request parsing have succeeded. Raw wire bytes are
     // retained only for pre-dispatch transport/protocol/security failures.
     ctx.inbound.read_prefix_capture.reset();
@@ -176,6 +194,8 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (const IoSystemError& e) {
         stats.OnError();
         result = MakeRelayError(MapAsioError(e.code()));
+        ctx.outbound.os_error_code = e.code().value();
+        ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
         LOG_CONN_WARN(ctx, "dispatcher request I/O exception: {}", e.what());
     } catch (const std::exception& e) {
         stats.OnError();
@@ -443,6 +463,15 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
 
     ctx.outbound.tag = selection.outbound_tag;
     if (selection.fixed) {
+        ctx.outbound.route_rule = "fixed";
+    } else if (selection.matched) {
+        ctx.outbound.route_rule = "rule:" + std::to_string(selection.rule_index);
+    } else if (selection.fallback) {
+        ctx.outbound.route_rule = "fallback";
+    } else {
+        ctx.outbound.route_rule = "default";
+    }
+    if (selection.fixed) {
         LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
                        ctx.outbound.target, ctx.outbound.tag);
     } else {
@@ -494,6 +523,8 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
             .outbound_tag = receiver->route_policy.outbound_tag,
             .matched = true,
             .fixed = true,
+            .fallback = false,
+            .rule_index = 0,
             .error = ErrorCode::OK,
         };
     }
@@ -505,8 +536,9 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     }
 
     app::router::RouteDecision decision;
-    if (receiver &&
-        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::RouteWithFallback) {
+    const bool route_with_fallback = receiver &&
+        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::RouteWithFallback;
+    if (route_with_fallback) {
         decision = router_->RouteDetailed(ctx, receiver->route_policy.outbound_tag);
     } else {
         decision = router_->RouteDetailed(ctx);
@@ -516,6 +548,8 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
         .outbound_tag = decision.outbound_tag,
         .matched = decision.matched,
         .fixed = false,
+        .fallback = route_with_fallback && !decision.matched,
+        .rule_index = decision.rule_index,
         .error = ErrorCode::OK,
     };
 }

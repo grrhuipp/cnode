@@ -147,7 +147,12 @@ struct Worker::RuntimeState {
         return runtime_snapshot.load(std::memory_order_acquire);
     }
 
-    void StoreSnapshot(std::shared_ptr<const WorkerRuntimeConfig> snapshot) noexcept {
+    void StoreSnapshot(std::shared_ptr<WorkerRuntimeConfig> snapshot) noexcept {
+        const auto current = runtime_snapshot.load(std::memory_order_acquire);
+        if (current) {
+            snapshot->runtime_generation = current->runtime_generation + 1;
+            snapshot->config_generation = current->config_generation + 1;
+        }
         request_load.Configure(
             snapshot->pressure_threshold,
             snapshot->pressure_idle_timeout);
@@ -215,6 +220,8 @@ void ApplyProxyProtocolResult(
         ctx.inbound.source_addr = src_addr;
         ctx.inbound.source_ip = src_addr.to_string();
         ctx.inbound.source_port = result.src_port;
+        ctx.inbound.client_ip_source = "proxy_protocol";
+        ctx.inbound.client_ip_trusted = true;
         LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
                        ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
                        ctx.inbound.source_ip, result.src_port);
@@ -222,6 +229,8 @@ void ApplyProxyProtocolResult(
         ctx.inbound.source_addr = net::ip::address{};
         ctx.inbound.source_ip = result.src_ip;
         ctx.inbound.source_port = result.src_port;
+        ctx.inbound.client_ip_source = "proxy_protocol";
+        ctx.inbound.client_ip_trusted = true;
         LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
                        ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
                        ctx.inbound.source_ip, result.src_port);
@@ -731,10 +740,13 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     proxyman::inbound::ReceiverSettings& listener = inbound_handler->ReceiverSettings();
 
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
+    const auto runtime_snapshot = worker.runtime_->Snapshot();
 
     session::Context ctx;
     ctx.conn_id = session::NewID(worker.id_);
     ctx.worker_id = worker.id_;
+    ctx.runtime_generation = runtime_snapshot->runtime_generation;
+    ctx.config_generation = runtime_snapshot->config_generation;
     ctx.inbound.tag      = listener.inbound_tag;
     ctx.inbound.tags     = listener.RouteInboundTags();
     const auto local_ep = tcp_stream->LocalEndpoint();
@@ -747,10 +759,11 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         ctx.inbound.source_addr = normalized_remote;
         ctx.inbound.source_ip = normalized_remote.to_string();
         ctx.inbound.source_port = remote_ep.port();
+        ctx.inbound.peer_ip = ctx.inbound.source_ip;
+        ctx.inbound.peer_port = ctx.inbound.source_port;
     } catch (...) {
         ctx.inbound.source_ip = "unknown";
     }
-    const auto runtime_snapshot = worker.runtime_->Snapshot();
     LOG_CONN_DEBUG(ctx, "Worker[{}]: accepted TCP tag={} from {}:{}",
                    worker.id_,
                    ctx.inbound.tag,
@@ -1304,6 +1317,8 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .stats = worker.runtime_->stats,
             .timeouts = runtime_snapshot->timeouts,
             .worker_id = worker.id_,
+            .runtime_generation = runtime_snapshot->runtime_generation,
+            .config_generation = runtime_snapshot->config_generation,
             .reply_sink = *this,
         });
     }

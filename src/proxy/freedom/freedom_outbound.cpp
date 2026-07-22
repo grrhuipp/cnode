@@ -10,7 +10,9 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace acpp::proxy::freedom::outbound {
 
@@ -354,6 +356,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         local_ip = iputil::NormalizeAddress(local_ep->address());
         if (!local_ip.is_unspecified()) {
             ctx.outbound.connected_local_addr = local_ip;
+            ctx.outbound.connected_local_port = local_ep->port();
         }
     }
     LOG_ACCESS(FormatXrayAccessLog(ctx));
@@ -443,7 +446,12 @@ Handler::ResolveTargets(session::Context& ctx) {
     }
 
     // 需要 DNS 解析
+    const int64_t started_at_us = NowMicros();
     auto dns_result = co_await dns_service_.Resolve(target.host);
+    const int64_t elapsed_us = std::max<int64_t>(0, NowMicros() - started_at_us);
+    ctx.outbound.dns_latency_ms = static_cast<uint64_t>(elapsed_us / 1000);
+    ctx.outbound.dns_answer_count = static_cast<uint32_t>(std::min<size_t>(
+        dns_result.addresses.size(), std::numeric_limits<uint32_t>::max()));
 
     if (!dns_result.Ok()) {
         ctx.content.dns_result = session::DnsResultState::Failed;

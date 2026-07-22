@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,6 +18,13 @@
 namespace acpp {
 
 namespace {
+
+void RecordDialAttempt(
+    session::Context& ctx,
+    const OutboundDialCandidate& candidate) {
+    ++ctx.outbound.dial_attempt_count;
+    ctx.outbound.dial_addresses.push_back(candidate.endpoint.address());
+}
 
 net::awaitable<DialResult> DialSingleCandidate(
     net::io_context& io_context,
@@ -587,6 +595,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload = {}) {
 
+    RecordDialAttempt(ctx, candidate);
     auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
@@ -638,6 +647,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
+    RecordDialAttempt(ctx, candidate);
     auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
@@ -815,36 +825,51 @@ net::awaitable<DialResult> DialOutboundTransport(
     session::Context& ctx,
     const OutboundTransportTarget& target) {
 
-    if ((!target.single_candidate && target.candidates.empty()) || target.stream_settings == nullptr) {
-        co_return DialResult::Fail(ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
-    }
+    ctx.outbound.dial_attempt_count = 0;
+    ctx.outbound.dial_addresses.clear();
+    ctx.outbound.os_error_code = 0;
+    ctx.outbound.failure_detail_code.clear();
+    const auto started_at = std::chrono::steady_clock::now();
 
-    if (IsXHttpSplitOutbound(target)) {
+    DialResult result;
+    if ((!target.single_candidate && target.candidates.empty()) ||
+        target.stream_settings == nullptr) {
+        result = DialResult::Fail(
+            ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
+    } else if (IsXHttpSplitOutbound(target)) {
         if (target.single_candidate) {
             std::array<OutboundDialCandidate, 1> candidates{*target.single_candidate};
-            co_return co_await DialXHttpSplitOutboundTransport(
+            result = co_await DialXHttpSplitOutboundTransport(
                 io_context,
                 ctx,
                 target,
                 candidates);
+        } else {
+            result = co_await DialXHttpSplitOutboundTransport(
+                io_context,
+                ctx,
+                target,
+                target.candidates);
         }
-        co_return co_await DialXHttpSplitOutboundTransport(
-            io_context,
-            ctx,
-            target,
-            target.candidates);
+    } else if (target.single_candidate) {
+        result = co_await DialAndBuildSingleCandidate(
+            io_context, ctx, target, *target.single_candidate);
+    } else if (target.candidates.size() == 1) {
+        result = co_await DialAndBuildSingleCandidate(
+            io_context, ctx, target, target.candidates.front());
+    } else {
+        result = co_await DialAndBuildCandidatesSequential(
+            io_context, ctx, target, target.candidates);
     }
 
-    if (target.single_candidate) {
-        co_return co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, *target.single_candidate);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started_at).count();
+    ctx.outbound.dial_ms = static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
+    if (!result.Ok()) {
+        ctx.outbound.os_error_code = result.native_error_code;
+        ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
     }
-    if (target.candidates.size() == 1) {
-        co_return co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, target.candidates.front());
-    }
-    co_return co_await DialAndBuildCandidatesSequential(
-        io_context, ctx, target, target.candidates);
+    co_return result;
 }
 
 }  // namespace acpp

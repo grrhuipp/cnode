@@ -13,6 +13,8 @@
 namespace acpp {
 
 struct WorkerRuntimeConfig {
+    uint64_t runtime_generation = 1;
+    uint64_t config_generation = 1;
     ::acpp::app::dns::Config dns;
     TimeoutsConfig timeouts;
     LimitsConfig limits;

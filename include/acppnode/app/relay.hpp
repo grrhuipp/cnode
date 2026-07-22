@@ -11,6 +11,7 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/experimental/awaitable_operators.hpp>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -178,15 +179,71 @@ struct RelayCloseState {
 inline void ObserveUdpRelayTarget(
     session::Context& ctx,
     const buf::MultiBuffer& payload) noexcept {
-    if (ctx.content.network != Network::UDP ||
-        ctx.content.multiple_targets) {
+    if (ctx.content.network != Network::UDP) {
         return;
     }
     const auto datagram = buf::InspectUdpDatagram(payload);
-    if (datagram.Valid() &&
-        ctx.outbound.target.IsValid() &&
-        !ctx.outbound.target.SameEndpoint(*datagram.target)) {
+    if (!datagram.Valid()) {
+        return;
+    }
+
+    const TargetAddress& target = *datagram.target;
+    uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&](uint8_t value) noexcept {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    };
+    mix(static_cast<uint8_t>(target.type));
+    mix(static_cast<uint8_t>(target.port >> 8));
+    mix(static_cast<uint8_t>(target.port));
+    if (target.IsDomain()) {
+        for (const unsigned char ch : target.host) {
+            mix(ch);
+        }
+    } else if (target.resolved_addr) {
+        const auto normalized = iputil::NormalizeAddress(*target.resolved_addr);
+        if (normalized.is_v4()) {
+            for (const auto byte : normalized.to_v4().to_bytes()) mix(byte);
+        } else if (normalized.is_v6()) {
+            for (const auto byte : normalized.to_v6().to_bytes()) mix(byte);
+        }
+    }
+    if (hash == 0) hash = 1;
+
+    const uint32_t tracked = std::min<uint32_t>(
+        ctx.traffic.distinct_target_count,
+        static_cast<uint32_t>(ctx.traffic.distinct_target_hashes.size()));
+    for (uint32_t i = 0; i < tracked; ++i) {
+        if (ctx.traffic.distinct_target_hashes[i] == hash) return;
+    }
+    if (tracked < ctx.traffic.distinct_target_hashes.size()) {
+        ctx.traffic.distinct_target_hashes[tracked] = hash;
+        ++ctx.traffic.distinct_target_count;
+    } else {
+        ctx.traffic.distinct_target_count = static_cast<uint32_t>(
+            ctx.traffic.distinct_target_hashes.size());
+    }
+    if (ctx.traffic.distinct_target_count > 1) {
         ctx.content.multiple_targets = true;
+    }
+}
+
+inline void ObserveRelayPacket(
+    session::Context& ctx,
+    bool is_upload,
+    bool is_datagram = false) noexcept {
+    if (is_upload) {
+        ++ctx.traffic.packet_count_up;
+    } else {
+        ++ctx.traffic.packet_count_down;
+    }
+    if (is_datagram) {
+        ++ctx.traffic.datagram_count;
+    }
+    if (ctx.traffic.first_byte_ms == 0 && ctx.accept_time_us > 0) {
+        const int64_t elapsed_us = std::max<int64_t>(0, NowMicros() - ctx.accept_time_us);
+        ctx.traffic.first_byte_ms = static_cast<uint64_t>(
+            std::max<int64_t>(1, (elapsed_us + 999) / 1000));
     }
 }
 
@@ -278,6 +335,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacket(
     ClientStream& client,
     TargetStream& target,
     StatsShard& stats,
+    session::Context& ctx,
     std::span<const uint8_t> first_packet) {
 
     if (first_packet.empty()) {
@@ -314,6 +372,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacket(
             mb.clear();
         }
         stats.AddBytesOut(first_packet.size());
+        ObserveRelayPacket(ctx, true);
         co_return std::nullopt;
 
     } catch (const IoSystemError& e) {
@@ -351,6 +410,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketBuffer(
     ClientStream& client,
     TargetStream& target,
     StatsShard& stats,
+    session::Context& ctx,
     buf::Buffer*& first_packet) {
 
     if (!first_packet || first_packet->IsEmpty()) {
@@ -367,6 +427,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketBuffer(
         co_await target.WriteMultiBuffer(std::move(mb));
         mb.clear();
         stats.AddBytesOut(first_packet_size);
+        ObserveRelayPacket(ctx, true);
         co_return std::nullopt;
 
     } catch (const IoSystemError& e) {
@@ -404,6 +465,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketMultiBuffer(
     ClientStream& client,
     TargetStream& target,
     StatsShard& stats,
+    session::Context& ctx,
     buf::MultiBuffer& first_packet) {
 
     const size_t first_packet_size = buf::TotalLen(first_packet);
@@ -419,6 +481,7 @@ net::awaitable<std::optional<RelayResult>> WriteFirstPacketMultiBuffer(
         co_await target.WriteMultiBuffer(std::move(mb));
         mb.clear();
         stats.AddBytesOut(first_packet_size);
+        ObserveRelayPacket(ctx, true);
         co_return std::nullopt;
 
     } catch (const IoSystemError& e) {
@@ -609,6 +672,7 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             }
 
             total_bytes += n;
+            ObserveRelayPacket(ctx, is_upload);
             if (live_bytes_counter) {
                 *live_bytes_counter = total_bytes;
             }
@@ -624,6 +688,10 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
         } catch (const IoSystemError& e) {
             close_state.Mark(operation_side_is_client);
             error = MapAsioError(e.code());
+            if (ctx.outbound.os_error_code == 0) {
+                ctx.outbound.os_error_code = e.code().value();
+                ctx.outbound.failure_detail_code = ErrorCodeToString(error);
+            }
             if (error == ErrorCode::CANCELLED &&
                 ConsumeRelayTimeoutSignals(from_control, to_control)) {
                 error = ErrorCode::RELAY_TIMEOUT;
@@ -988,6 +1056,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 operation_side_is_client = false;
                 co_await target.WriteMultiBuffer(std::move(mb));
                 bytes += n;
+                relay_detail::ObserveRelayPacket(ctx, true);
                 ctx.traffic.bytes_up = bytes;
                 stats_acc.AddBytesOut(n);
                 if (stats_acc.bytes_in + stats_acc.bytes_out >= relay_detail::kRelayStatsFlushBytes) {
@@ -997,6 +1066,10 @@ net::awaitable<RelayResult> DoRelayLink(
                 close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 const ErrorCode error = MapAsioError(e.code());
+                if (ctx.outbound.os_error_code == 0) {
+                    ctx.outbound.os_error_code = e.code().value();
+                    ctx.outbound.failure_detail_code = ErrorCodeToString(error);
+                }
                 up_result = std::make_pair(bytes, error);
                 remember_error(error);
                 relay_detail::CancelIfSupported(target);
@@ -1030,6 +1103,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 operation_side_is_client = true;
                 co_await client_writer.WriteMultiBuffer(std::move(mb));
                 bytes += n;
+                relay_detail::ObserveRelayPacket(ctx, false);
                 ctx.traffic.bytes_down = bytes;
                 stats_acc.AddBytesIn(n);
                 if (stats_acc.bytes_in + stats_acc.bytes_out >= relay_detail::kRelayStatsFlushBytes) {
@@ -1039,6 +1113,10 @@ net::awaitable<RelayResult> DoRelayLink(
                 close_state.Mark(operation_side_is_client);
                 relay_detail::FlushRelayStats(&stats, stats_acc);
                 ErrorCode error = MapAsioError(e.code());
+                if (ctx.outbound.os_error_code == 0) {
+                    ctx.outbound.os_error_code = e.code().value();
+                    ctx.outbound.failure_detail_code = ErrorCodeToString(error);
+                }
                 if (error == ErrorCode::CANCELLED && downlink_only_timeout_fired) {
                     error = ErrorCode::RELAY_TIMEOUT;
                 }
@@ -1115,7 +1193,8 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
 
     const size_t first_packet_size = first_packet.size();
 
-    if (auto error = co_await relay_detail::WriteFirstPacket(client, target, stats, first_packet)) {
+    if (auto error = co_await relay_detail::WriteFirstPacket(
+            client, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1141,7 +1220,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = first_packet.size();
 
     if (auto error = co_await relay_detail::WriteFirstPacket(
-            target, target, stats, first_packet)) {
+            target, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1176,7 +1255,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = first_packet.size();
 
     if (auto error = co_await relay_detail::WriteFirstPacket(
-            client_control, target, stats, first_packet)) {
+            client_control, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1207,7 +1286,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = first_packet ? first_packet->Len() : 0;
 
     if (auto error = co_await relay_detail::WriteFirstPacketBuffer(
-            client, target, stats, first_packet)) {
+            client, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1233,7 +1312,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = buf::TotalLen(first_packet);
 
     if (auto error = co_await relay_detail::WriteFirstPacketMultiBuffer(
-            target, target, stats, first_packet)) {
+            target, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1268,7 +1347,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = first_packet ? first_packet->Len() : 0;
 
     if (auto error = co_await relay_detail::WriteFirstPacketBuffer(
-            client_control, target, stats, first_packet)) {
+            client_control, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1299,7 +1378,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = buf::TotalLen(first_packet);
 
     if (auto error = co_await relay_detail::WriteFirstPacketMultiBuffer(
-            client, target, stats, first_packet)) {
+            client, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 
@@ -1327,7 +1406,7 @@ net::awaitable<RelayResult> DoRelayLinkWithFirstPacket(
     const size_t first_packet_size = buf::TotalLen(first_packet);
 
     if (auto error = co_await relay_detail::WriteFirstPacketMultiBuffer(
-            client_control, target, stats, first_packet)) {
+            client_control, target, stats, ctx, first_packet)) {
         co_return *error;
     }
 

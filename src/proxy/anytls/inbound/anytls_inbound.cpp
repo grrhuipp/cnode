@@ -87,6 +87,9 @@ void CopySessionContext(const session::Context& source, session::Context& target
     target.traffic = {};
     target.sockopt = source.sockopt;
     target.worker_id = source.worker_id;
+    target.parent_conn_id = source.conn_id;
+    target.runtime_generation = source.runtime_generation;
+    target.config_generation = source.config_generation;
 }
 
 }  // namespace
@@ -722,6 +725,7 @@ void AnyTLSDemuxSession::SpawnDispatch(
     ++active_dispatches_;
     try {
         CopySessionContext(base_ctx_, sub->ctx);
+        sub->ctx.stream_id = sid;
         sub->ctx.outbound.original_target = target;
         sub->ctx.outbound.target = target;
         sub->ctx.outbound.route_target = target;

@@ -827,7 +827,7 @@ net::awaitable<DialResult> TcpStream::Connect(
 
     if (connect_ec) {
         auto err = MapAsioError(connect_ec);
-        co_return DialResult::Fail(err, connect_ec.message());
+        co_return DialResult::Fail(err, connect_ec.message(), connect_ec.value());
     }
     co_return DialResult::Success(
         std::make_unique<TcpStream>(std::move(socket)));
@@ -850,14 +850,16 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
     IoErrorCode ec;
     socket.open(remote_endpoint.protocol(), ec);
     if (ec) {
-        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
+        co_return DialResult::Fail(
+            ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
     }
 
     // 绑定本地地址
     tcp::endpoint local_endpoint(local_addr, 0);  // 端口为 0，由系统分配
     socket.bind(local_endpoint, ec);
     if (ec) {
-        co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
+        co_return DialResult::Fail(
+            ErrorCode::SOCKET_BIND_FAILED, ec.message(), ec.value());
     }
 
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
@@ -891,7 +893,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
 
     if (connect_ec) {
         auto err = MapAsioError(connect_ec);
-        co_return DialResult::Fail(err, connect_ec.message());
+        co_return DialResult::Fail(err, connect_ec.message(), connect_ec.value());
     }
     co_return DialResult::Success(
         std::make_unique<TcpStream>(std::move(socket)));

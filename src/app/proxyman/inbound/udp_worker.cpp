@@ -359,6 +359,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
             session::Context rejected_ctx;
             rejected_ctx.conn_id = session::NewID(datagram.worker_id);
             rejected_ctx.worker_id = datagram.worker_id;
+            rejected_ctx.runtime_generation = datagram.runtime_generation;
+            rejected_ctx.config_generation = datagram.config_generation;
             rejected_ctx.inbound.tag = datagram.receiver->inbound_tag.empty()
                 ? std::string_view(impl_->tag)
                 : std::string_view(datagram.receiver->inbound_tag);
@@ -366,9 +368,13 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
             rejected_ctx.inbound.source_ip = client_ip;
             rejected_ctx.inbound.source_addr = normalized_client_addr;
             rejected_ctx.inbound.source_port = datagram.client_endpoint.port();
+            rejected_ctx.inbound.peer_ip = client_ip;
+            rejected_ctx.inbound.peer_port = datagram.client_endpoint.port();
             rejected_ctx.inbound.access_source_ref =
                 datagram.receiver->access_source_ref;
             rejected_ctx.inbound.protocol = datagram.receiver->protocol;
+            rejected_ctx.inbound.transport = "udp";
+            rejected_ctx.inbound.security = datagram.receiver->stream_settings.security;
             rejected_ctx.inbound.read_prefix_capture =
                 std::make_shared<ReadPrefixCapture>();
             rejected_ctx.inbound.read_prefix_capture->Append(datagram.payload);
@@ -427,6 +433,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         auto ctx = std::make_shared<session::Context>();
         ctx->conn_id = session::NewID(datagram.worker_id);
         ctx->worker_id = datagram.worker_id;
+        ctx->runtime_generation = datagram.runtime_generation;
+        ctx->config_generation = datagram.config_generation;
         ctx->inbound.tag = receiver->inbound_tag.empty()
             ? std::string_view(impl_->tag)
             : std::string_view(receiver->inbound_tag);
@@ -434,6 +442,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->inbound.source_ip = client_ip;
         ctx->inbound.source_addr = normalized_client_addr;
         ctx->inbound.source_port = datagram.client_endpoint.port();
+        ctx->inbound.peer_ip = client_ip;
+        ctx->inbound.peer_port = datagram.client_endpoint.port();
         IoErrorCode local_ec;
         const auto local_ep = datagram.sock->local_endpoint(local_ec);
         if (!local_ec && !local_ep.address().is_unspecified()) {
@@ -447,6 +457,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->inbound.user_email = decoded->user_email;
         ctx->inbound.access_source_ref = receiver->access_source_ref;
         ctx->inbound.protocol = receiver->protocol;
+        ctx->inbound.transport = "udp";
+        ctx->inbound.security = receiver->stream_settings.security;
         ctx->content.speed_limit = decoded->speed_limit;
 
         auto response_context = std::move(decoded->response_context);

@@ -17,6 +17,16 @@ public:
     virtual void OnInboundTransportStream(std::unique_ptr<AsyncStream> stream) = 0;
 };
 
+struct InboundTransportMetadata {
+    std::string http_host;
+    std::string real_ip;
+    std::string real_ip_header;
+    std::string tls_sni;
+    std::string tls_alpn;
+    std::string tls_version;
+    std::string tls_fingerprint;
+};
+
 // 根据 StreamSettings 将原始 TCP 流包装成最终传输流。
 // 协议层调用 Process()/Handshake() 前，传入的流已经完成 TLS/WS。
 net::awaitable<TransportBuildResult> BuildInboundTransport(
@@ -25,7 +35,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     const StreamSettings& s,
     std::string* out_real_ip = nullptr,
     uint64_t trace_conn_id = 0,
-    std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr);
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
+    InboundTransportMetadata* metadata = nullptr);
 
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,
