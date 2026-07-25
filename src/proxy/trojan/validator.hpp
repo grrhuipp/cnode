@@ -13,7 +13,6 @@
 // ============================================================================
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "user_info.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -43,16 +42,7 @@ public:
     Validator(Validator&&) noexcept;
     Validator& operator=(Validator&&) noexcept;
 
-    // ── 用户存储 ─────────────────────────────────────────────────────────────
-
-    void ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
-    void AddUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
-    void RemoveUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users);
-    void ClearUsers(std::string_view tag);
-
     // ── 认证与查找 ───────────────────────────────────────────────────────────
-
-    bool Validate(std::string_view tag, std::string_view hash) const;
 
     std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential>
     FindUser(std::string_view tag, std::string_view hash) const;

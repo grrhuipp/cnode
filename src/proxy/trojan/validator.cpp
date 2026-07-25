@@ -1,27 +1,9 @@
 #include "validator.hpp"
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 
 namespace acpp::trojan {
-
-namespace {
-
-std::vector<proxyman::inbound::PreparedTrojanUser>
-ToPreparedUsers(const std::vector<TrojanUserInfo>& users) {
-    std::vector<proxyman::inbound::PreparedTrojanUser> prepared;
-    prepared.reserve(users.size());
-    for (const auto& user : users) {
-        prepared.push_back(proxyman::inbound::PreparedTrojanUser{
-            .password_hash = user.password_hash,
-            .profile = user.profile,
-        });
-    }
-    return prepared;
-}
-
-}  // namespace
 
 struct Validator::Impl {
     UserOnlineTracker stats;
@@ -34,31 +16,6 @@ Validator::Validator()
 Validator::~Validator() = default;
 Validator::Validator(Validator&&) noexcept = default;
 Validator& Validator::operator=(Validator&&) noexcept = default;
-
-void Validator::ApplyUsers(std::string_view tag, const std::vector<TrojanUserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::ApplyUsers(tag, set);
-}
-
-void Validator::AddUsers(std::string_view tag,
-                         const std::vector<TrojanUserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::AddUsers(tag, set);
-}
-
-void Validator::RemoveUsers(std::string_view tag,
-                            const std::vector<TrojanUserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::RemoveUsers(tag, set);
-}
-
-void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::Trojan, tag);
-}
-
-bool Validator::Validate(std::string_view tag, std::string_view hash) const {
-    return proxyman::inbound::UserStore::HasTrojanUser(tag, hash);
-}
 
 std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential>
 Validator::FindUser(std::string_view tag, std::string_view hash) const {

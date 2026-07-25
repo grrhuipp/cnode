@@ -380,33 +380,6 @@ void UserStore::ClearUsers(UserProtocol protocol,
     });
 }
 
-void UserStore::ClearProtocol(UserProtocol protocol) {
-    Publish([&](Snapshot& snapshot) {
-        switch (protocol) {
-            case UserProtocol::Vmess:
-                snapshot.vmess.clear();
-                break;
-            case UserProtocol::Vless:
-                snapshot.vless.clear();
-                break;
-            case UserProtocol::Trojan:
-                snapshot.trojan.clear();
-                break;
-            case UserProtocol::Shadowsocks:
-                snapshot.shadowsocks.clear();
-                break;
-            case UserProtocol::AnyTls:
-                snapshot.anytls.clear();
-                break;
-        }
-    });
-}
-
-void UserStore::ClearAll() {
-    std::shared_ptr<const Snapshot> empty = std::make_shared<const Snapshot>();
-    GlobalSnapshot().store(std::move(empty), std::memory_order_release);
-}
-
 UserStore::VmessUsersView UserStore::VmessUsers(std::string_view tag) {
     auto snapshot = LoadSnapshot();
     auto it = snapshot->vmess.find(tag);
@@ -447,29 +420,10 @@ UserStore::FindTrojanUser(std::string_view tag, std::string_view password_hash) 
     return std::shared_ptr<const TrojanCredential>(tag_it->second, &user_it->second);
 }
 
-bool UserStore::HasTrojanUser(std::string_view tag,
-                              std::string_view password_hash) {
-    return FindTrojanUser(tag, password_hash) != nullptr;
-}
-
 UserStore::ShadowsocksUsersView UserStore::ShadowsocksUsers(std::string_view tag) {
     auto snapshot = LoadSnapshot();
     auto it = snapshot->shadowsocks.find(tag);
     return {it == snapshot->shadowsocks.end() ? nullptr : it->second};
-}
-
-std::shared_ptr<const UserStore::ShadowsocksCredential>
-UserStore::FindShadowsocksUserById(std::string_view tag, int64_t user_id) {
-    auto view = ShadowsocksUsers(tag);
-    if (!view.users) {
-        return nullptr;
-    }
-    for (const auto& user : *view.users) {
-        if (user.profile && user.profile->user_id == user_id) {
-            return view.Share(user);
-        }
-    }
-    return nullptr;
 }
 
 std::shared_ptr<const UserStore::AnyTlsCredential>

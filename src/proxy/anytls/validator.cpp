@@ -1,36 +1,9 @@
 #include "validator.hpp"
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 
-#include <openssl/evp.h>
-
 namespace acpp::anytls {
-
-namespace {
-
-std::vector<proxyman::inbound::PreparedAnyTlsUser>
-ToPreparedUsers(const std::vector<UserInfo>& users) {
-    std::vector<proxyman::inbound::PreparedAnyTlsUser> prepared;
-    prepared.reserve(users.size());
-    for (const auto& user : users) {
-        prepared.push_back(proxyman::inbound::PreparedAnyTlsUser{
-            .password_hash = user.password_hash,
-            .profile = user.profile,
-        });
-    }
-    return prepared;
-}
-
-}  // namespace
-
-std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
-    std::array<uint8_t, 32> out{};
-    unsigned int out_len = 0;
-    EVP_Digest(password.data(), password.size(), out.data(), &out_len, EVP_sha256(), nullptr);
-    return out;
-}
 
 struct Validator::Impl {
     UserOnlineTracker stats;
@@ -42,25 +15,6 @@ Validator::Validator()
 Validator::~Validator() = default;
 Validator::Validator(Validator&&) noexcept = default;
 Validator& Validator::operator=(Validator&&) noexcept = default;
-
-void Validator::ApplyUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::ApplyUsers(tag, set);
-}
-
-void Validator::AddUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::AddUsers(tag, set);
-}
-
-void Validator::RemoveUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::RemoveUsers(tag, set);
-}
-
-void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::AnyTls, tag);
-}
 
 std::shared_ptr<const proxyman::inbound::UserStore::AnyTlsCredential> Validator::Validate(
     std::string_view tag,

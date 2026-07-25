@@ -1,11 +1,9 @@
 #pragma once
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "user_info.hpp"
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,17 +32,8 @@ public:
     Validator(Validator&&) noexcept;
     Validator& operator=(Validator&&) noexcept;
 
-    void ApplyUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
-    void AddUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
-    void RemoveUsers(std::string_view tag, const std::vector<SsUserInfo>& users);
-    void ClearUsers(std::string_view tag);
-
     [[nodiscard]] proxyman::inbound::UserStore::ShadowsocksUsersView
     FindUsersForTag(std::string_view tag) const;
-    [[nodiscard]] std::vector<SsUserInfo> GetUsersForTag(std::string_view tag) const;
-
-    [[nodiscard]] std::optional<SsUserInfo> FindUserById(std::string_view tag,
-                                                         int64_t user_id) const;
 
     [[nodiscard]] size_t Size() const;
     [[nodiscard]] size_t SizeForTag(std::string_view tag) const;

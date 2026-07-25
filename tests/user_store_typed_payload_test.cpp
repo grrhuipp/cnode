@@ -29,7 +29,6 @@ PreparedTrojanUser Trojan(std::string hash, int64_t user_id) {
 
 bool TestTypedUpdatesStayProtocolLocal() {
     constexpr std::string_view kTag = "shared-tag";
-    UserStore::ClearAll();
 
     UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess-1", 1)}});
     UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}});
@@ -57,7 +56,6 @@ bool TestTypedUpdatesStayProtocolLocal() {
 
 bool TestTypedClearStaysProtocolLocal() {
     constexpr std::string_view kTag = "clear-tag";
-    UserStore::ClearAll();
     UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess", 1)}});
     UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}});
 

@@ -708,7 +708,7 @@ bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
 
 struct Router::Impl {
     memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
-    std::string default_outbound_tag{std::string(constants::protocol::kDirect)};
+    std::string default_outbound_tag;
     RoutingDomainStrategy domain_strategy = RoutingDomainStrategy::AsIs;
     ::acpp::geo::GeoManager* geo_manager = nullptr;
 };
@@ -772,7 +772,7 @@ void Router::Configure(
     std::string_view default_outbound_tag,
     ::acpp::geo::GeoManager* geo_manager) {
     impl_->compound_rules.clear();
-    impl_->default_outbound_tag = std::string(constants::protocol::kDirect);
+    impl_->default_outbound_tag.clear();
     impl_->domain_strategy = routing.domain_strategy;
     impl_->geo_manager = geo_manager;
 

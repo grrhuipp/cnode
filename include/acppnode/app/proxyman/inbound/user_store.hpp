@@ -154,8 +154,6 @@ public:
                             const UserSet& users);
     static void ClearUsers(UserProtocol protocol,
                            std::string_view tag);
-    static void ClearProtocol(UserProtocol protocol);
-    static void ClearAll();
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);
     [[nodiscard]] static VlessUsersView VlessUsers(std::string_view tag);
@@ -164,11 +162,7 @@ public:
                   const std::array<uint8_t, 16>& uuid_bytes);
     [[nodiscard]] static std::shared_ptr<const TrojanCredential>
     FindTrojanUser(std::string_view tag, std::string_view password_hash);
-    [[nodiscard]] static bool HasTrojanUser(std::string_view tag,
-                                            std::string_view password_hash);
     [[nodiscard]] static ShadowsocksUsersView ShadowsocksUsers(std::string_view tag);
-    [[nodiscard]] static std::shared_ptr<const ShadowsocksCredential>
-    FindShadowsocksUserById(std::string_view tag, int64_t user_id);
     [[nodiscard]] static std::shared_ptr<const AnyTlsCredential>
     FindAnyTlsUser(std::string_view tag,
                    const std::array<uint8_t, 32>& password_hash);

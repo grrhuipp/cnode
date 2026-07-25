@@ -985,3 +985,43 @@ if(NOT RECEIVER_SETTINGS_ACCESSOR_COUNT EQUAL 1 OR
     message(FATAL_ERROR
         "prepared inbound handlers must expose only immutable settings and the physical ingress")
 endif()
+
+foreach(PROTOCOL_VALIDATOR IN ITEMS
+        "${SOURCE_DIR}/src/proxy/vmess/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/vless/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/trojan/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/shadowsocks/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/anytls/validator.hpp")
+    file(READ "${PROTOCOL_VALIDATOR}" PROTOCOL_VALIDATOR_SOURCE)
+    if(PROTOCOL_VALIDATOR_SOURCE MATCHES
+           "ApplyUsers[(]|AddUsers[(]|RemoveUsers[(]|ClearUsers[(]")
+        message(FATAL_ERROR
+            "protocol validators must remain read-only UserStore consumers: ${PROTOCOL_VALIDATOR}")
+    endif()
+endforeach()
+
+foreach(LEGACY_PROTOCOL_USER_MODEL IN ITEMS
+        "${SOURCE_DIR}/src/proxy/shadowsocks/user_info.hpp"
+        "${SOURCE_DIR}/src/proxy/trojan/user_info.hpp"
+        "${SOURCE_DIR}/src/proxy/anytls/user_info.hpp")
+    if(EXISTS "${LEGACY_PROTOCOL_USER_MODEL}")
+        message(FATAL_ERROR
+            "protocol-local public user models must not bypass RuntimeUser -> UserSet -> UserStore: ${LEGACY_PROTOCOL_USER_MODEL}")
+    endif()
+endforeach()
+
+set(WORKER_RUNTIME_CONFIG_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/worker_runtime_config.hpp")
+set(DEFAULT_ROUTER_SOURCE
+    "${SOURCE_DIR}/src/app/router/router.cpp")
+file(READ "${WORKER_RUNTIME_CONFIG_HEADER}" WORKER_RUNTIME_CONFIG_SOURCE)
+file(READ "${DEFAULT_ROUTER_SOURCE}" DEFAULT_ROUTER_SOURCE_TEXT)
+if(WORKER_SOURCE MATCHES
+       "RoutePolicyKind|constants::protocol|proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)" OR
+   WORKER_RUNTIME_CONFIG_SOURCE MATCHES
+       "constants::outbound::kDirect|proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)" OR
+   DEFAULT_ROUTER_SOURCE_TEXT MATCHES
+       "proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)")
+    message(FATAL_ERROR
+        "Worker/runtime/router must not understand concrete proxy protocols or fixed outbound policy")
+endif()

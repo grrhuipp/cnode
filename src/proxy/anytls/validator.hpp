@@ -1,7 +1,6 @@
 #pragma once
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "user_info.hpp"
 
 #include <array>
 #include <cstddef>
@@ -26,11 +25,6 @@ public:
     Validator& operator=(const Validator&) = delete;
     Validator(Validator&&) noexcept;
     Validator& operator=(Validator&&) noexcept;
-
-    void ApplyUsers(std::string_view tag, const std::vector<UserInfo>& users);
-    void AddUsers(std::string_view tag, const std::vector<UserInfo>& users);
-    void RemoveUsers(std::string_view tag, const std::vector<UserInfo>& users);
-    void ClearUsers(std::string_view tag);
 
     [[nodiscard]] std::shared_ptr<const proxyman::inbound::UserStore::AnyTlsCredential> Validate(
         std::string_view tag,

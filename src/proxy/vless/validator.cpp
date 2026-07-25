@@ -1,6 +1,5 @@
 #include "validator.hpp"
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 
@@ -34,21 +33,6 @@ MapCustomIdToUuidV5(std::string_view id) noexcept {
     out[6] = static_cast<uint8_t>((out[6] & 0x0f) | 0x50);
     out[8] = static_cast<uint8_t>((out[8] & 0x3f) | 0x80);
     return out;
-}
-
-std::vector<proxyman::inbound::PreparedVlessUser>
-ToPreparedUsers(const std::vector<UserInfo>& users) {
-    std::vector<proxyman::inbound::PreparedVlessUser> prepared;
-    prepared.reserve(users.size());
-    for (const auto& user : users) {
-        prepared.push_back(proxyman::inbound::PreparedVlessUser{
-            .uuid = user.uuid,
-            .uuid_bytes = user.uuid_bytes,
-            .flow = user.flow,
-            .profile = user.profile,
-        });
-    }
-    return prepared;
 }
 
 }  // namespace
@@ -105,25 +89,6 @@ Validator::Validator()
 Validator::~Validator() = default;
 Validator::Validator(Validator&&) noexcept = default;
 Validator& Validator::operator=(Validator&&) noexcept = default;
-
-void Validator::ApplyUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::ApplyUsers(tag, set);
-}
-
-void Validator::AddUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::AddUsers(tag, set);
-}
-
-void Validator::RemoveUsers(std::string_view tag, const std::vector<UserInfo>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::RemoveUsers(tag, set);
-}
-
-void Validator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::Vless, tag);
-}
 
 std::shared_ptr<const proxyman::inbound::UserStore::VlessCredential>
 Validator::FindUser(std::string_view tag,

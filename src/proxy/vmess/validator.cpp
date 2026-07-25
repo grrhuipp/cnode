@@ -1,5 +1,4 @@
 #include "validator.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
@@ -14,31 +13,6 @@
 
 namespace acpp {
 namespace vmess {
-
-namespace {
-
-proxyman::inbound::PreparedVmessUser ToPreparedUser(const MemoryAccount& user) {
-    return proxyman::inbound::PreparedVmessUser{
-        .uuid = user.uuid,
-        .uuid_bytes = user.uuid_bytes,
-        .cmd_key = user.cmd_key,
-        .auth_key = user.auth_key,
-        .cached_auth_aes_key = std::to_array(user.cached_auth_aes_key.key),
-        .profile = user.profile,
-    };
-}
-
-std::vector<proxyman::inbound::PreparedVmessUser>
-ToPreparedUsers(const std::vector<MemoryAccount>& users) {
-    std::vector<proxyman::inbound::PreparedVmessUser> prepared;
-    prepared.reserve(users.size());
-    for (const auto& user : users) {
-        prepared.push_back(ToPreparedUser(user));
-    }
-    return prepared;
-}
-
-}  // namespace
 
 struct TimedUserValidator::Impl {
     struct SessionKey {
@@ -191,44 +165,6 @@ TimedUserValidator::TimedUserValidator()
 TimedUserValidator::~TimedUserValidator() = default;
 TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
 TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
-
-void TimedUserValidator::ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::ApplyUsers(tag, set);
-    impl_->hot_cache.Clear();
-    impl_->session_history.Clear();
-    impl_->hot_users.reset();
-}
-
-void TimedUserValidator::AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::AddUsers(tag, set);
-    impl_->hot_cache.Clear();
-    impl_->session_history.Clear();
-    impl_->hot_users.reset();
-}
-
-void TimedUserValidator::RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users) {
-    proxyman::inbound::UserSet set{ToPreparedUsers(users)};
-    proxyman::inbound::UserStore::RemoveUsers(tag, set);
-    impl_->hot_cache.Clear();
-    impl_->session_history.Clear();
-    impl_->hot_users.reset();
-}
-
-void TimedUserValidator::ClearUsers(std::string_view tag) {
-    proxyman::inbound::UserStore::ClearUsers(proxyman::inbound::UserProtocol::Vmess, tag);
-    impl_->hot_cache.Clear();
-    impl_->session_history.Clear();
-    impl_->hot_users.reset();
-}
-
-void TimedUserValidator::Clear() {
-    proxyman::inbound::UserStore::ClearProtocol(proxyman::inbound::UserProtocol::Vmess);
-    impl_->hot_cache.Clear();
-    impl_->session_history.Clear();
-    impl_->hot_users.reset();
-}
 
 size_t TimedUserValidator::Size() const {
     return proxyman::inbound::UserStore::GetStats().vmess_accounts;

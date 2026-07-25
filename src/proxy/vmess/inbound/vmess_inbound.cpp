@@ -5,6 +5,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "../encoding/server.hpp"
+#include "../account.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"

@@ -5,7 +5,6 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
-#include "user_info.hpp"
 
 #include <array>
 #include <cstdint>
@@ -21,6 +20,9 @@ class AsyncStream;
 }
 
 namespace acpp::anytls {
+
+[[nodiscard]] std::array<uint8_t, 32>
+PasswordHash(std::string_view password) noexcept;
 
 inline constexpr uint8_t kCmdWaste = 0;
 inline constexpr uint8_t kCmdSYN = 1;

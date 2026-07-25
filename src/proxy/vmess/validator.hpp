@@ -12,7 +12,6 @@
 // ============================================================================
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "account.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -42,14 +41,6 @@ public:
     TimedUserValidator& operator=(const TimedUserValidator&) = delete;
     TimedUserValidator(TimedUserValidator&&) noexcept;
     TimedUserValidator& operator=(TimedUserValidator&&) noexcept;
-
-    // ── 用户存储 ─────────────────────────────────────────────────────────────
-
-    void ApplyUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
-    void AddUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
-    void RemoveUsers(std::string_view tag, const std::vector<MemoryAccount>& users);
-    void ClearUsers(std::string_view tag);
-    void Clear();
 
     size_t Size() const;
     size_t SizeForTag(std::string_view tag) const;

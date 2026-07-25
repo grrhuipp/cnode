@@ -237,13 +237,10 @@ net::awaitable<void> Worker::StartRuntimeTask() {
     const auto runtime_snapshot = runtime_->Snapshot();
     runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
     runtime_->dispatcher->BindOutboundManager(*runtime_->outbound_manager);
-    const std::string_view default_outbound_tag = runtime_snapshot->default_outbound_tag.empty()
-        ? std::string_view(constants::protocol::kDirect)
-        : std::string_view(runtime_snapshot->default_outbound_tag);
     runtime_->InitRouter(
         *this,
         runtime_snapshot->routing,
-        default_outbound_tag,
+        runtime_snapshot->default_outbound_tag,
         runtime_->geo_manager);
     runtime_->udp_session_manager->StartCleanup();
     runtime_->started = true;
@@ -777,12 +774,7 @@ bool Worker::RegisterInboundOnWorkerThread(
     }
     auto inbound_handler =
         std::make_unique<proxyman::inbound::Handler>(std::move(receiver), std::move(handler));
-    auto& settings = inbound_handler->ReceiverSettings();
-    if (settings.route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound &&
-        !runtime_->outbound_manager->GetHandler(settings.route_policy.outbound_tag)) {
-        LOG_WARN("Worker[{}]: listener tag={} fixed outbound '{}' not found",
-                 id_, settings.inbound_tag, settings.route_policy.outbound_tag);
-    }
+    const auto& settings = inbound_handler->ReceiverSettings();
     const std::string key(settings.inbound_tag);
     auto [slot_it, slot_inserted] =
         runtime_->listener_state->listener_slots.try_emplace(key);
@@ -867,7 +859,7 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
                   [&](const auto& outbound) { return outbound.tag == tag; });
     if (next_snapshot->default_outbound_tag == tag) {
         next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
-            ? std::string(constants::protocol::kDirect)
+            ? std::string{}
             : next_snapshot->outbounds.front().tag;
     }
 
