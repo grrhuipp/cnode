@@ -36,6 +36,19 @@
 
 namespace acpp {
 
+net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
+    AsyncStream& raw,
+    std::chrono::seconds timeout) {
+    auto* tcp = dynamic_cast<TcpStream*>(&raw);
+    if (!tcp) {
+        ProxyProtocolReadResult result;
+        result.status = ProxyProtocolReadStatus::Invalid;
+        result.result.status = ProxyProtocolParseStatus::Invalid;
+        co_return result;
+    }
+    co_return co_await tcp->ReadProxyProtocolHeader(timeout);
+}
+
 namespace {
 
 constexpr size_t kTlsContextCacheMaxEntries = 16;

@@ -36,10 +36,6 @@ public:
         return receiver_.inbound_tag;
     }
 
-    [[nodiscard]] inbound::ReceiverSettings& ReceiverSettings() noexcept {
-        return receiver_;
-    }
-
     [[nodiscard]] const inbound::ReceiverSettings& ReceiverSettings() const noexcept {
         return receiver_;
     }
@@ -53,6 +49,9 @@ public:
         std::unique_ptr<AsyncStream> raw_conn,
         session::Context& ctx);
 
+private:
+    class LogicalTransportStreamSink;
+
     net::awaitable<void> ProcessPreparedTransportStream(
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
@@ -62,7 +61,6 @@ public:
         std::unique_ptr<AsyncStream> stream,
         session::Context& ctx);
 
-private:
     inbound::ReceiverSettings receiver_;
     std::unique_ptr<Inbound> proxy_;
 };

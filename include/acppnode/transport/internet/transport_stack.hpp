@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/internet/proxy_protocol.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include <expected>
 #include <memory>
@@ -26,6 +27,13 @@ struct InboundTransportMetadata {
     std::string tls_version;
     std::string tls_fingerprint;
 };
+
+// Consume an optional PROXY protocol prefix from a raw accepted transport.
+// Parsing, timeout handling and preservation of non-PROXY bytes stay entirely
+// inside the transport layer.
+net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
+    AsyncStream& raw,
+    std::chrono::seconds timeout);
 
 // 根据 StreamSettings 将原始 TCP 流包装成最终传输流。
 // 协议层调用 Process()/Handshake() 前，传入的流已经完成 TLS/WS。

@@ -951,3 +951,37 @@ if(INBOUND_PREPARED_CONFIG_HEADER_SOURCE MATCHES
     message(FATAL_ERROR
         "generic prepared inbound config must not expose protocol-specific fields")
 endif()
+
+set(PREPARED_INBOUND_HANDLER
+    "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp")
+set(PREPARED_INBOUND_HANDLER_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/handler.hpp")
+file(READ "${PREPARED_INBOUND_HANDLER}" PREPARED_INBOUND_HANDLER_SOURCE)
+file(READ "${PREPARED_INBOUND_HANDLER_HEADER}"
+    PREPARED_INBOUND_HANDLER_HEADER_SOURCE)
+if(WORKER_SOURCE MATCHES
+       "ReadProxyProtocolHeader|ProxyProtocolReadStatus|ApplyProxyProtocolResult" OR
+   NOT PREPARED_INBOUND_HANDLER_SOURCE MATCHES
+       "ReadInboundProxyProtocol[(]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "tcp->ReadProxyProtocolHeader[(]timeout[)]")
+    message(FATAL_ERROR
+        "Worker must not parse PROXY protocol; accepted-prefix handling belongs to transport")
+endif()
+string(REGEX MATCHALL "ReceiverSettings[(][)]"
+    RECEIVER_SETTINGS_ACCESSORS "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}")
+list(LENGTH RECEIVER_SETTINGS_ACCESSORS RECEIVER_SETTINGS_ACCESSOR_COUNT)
+string(FIND "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}"
+    "private:"
+    PREPARED_HANDLER_PRIVATE_OFFSET)
+string(FIND "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}"
+    "ProcessPreparedTransportStream"
+    PREPARED_STREAM_PROCESS_OFFSET)
+if(NOT RECEIVER_SETTINGS_ACCESSOR_COUNT EQUAL 1 OR
+   PREPARED_HANDLER_PRIVATE_OFFSET LESS 0 OR
+   PREPARED_STREAM_PROCESS_OFFSET LESS 0 OR
+   NOT PREPARED_HANDLER_PRIVATE_OFFSET LESS
+       PREPARED_STREAM_PROCESS_OFFSET)
+    message(FATAL_ERROR
+        "prepared inbound handlers must expose only immutable settings and the physical ingress")
+endif()

@@ -206,37 +206,6 @@ void RemoveInboundRuntimeFromSnapshot(WorkerRuntimeConfig& snapshot, std::string
     });
 }
 
-void ApplyProxyProtocolResult(
-    uint32_t worker_id,
-    session::Context& ctx,
-    const tcp::endpoint& remote_ep,
-    const ProxyProtocolResult& result) {
-    if (!result.success()) {
-        return;
-    }
-
-    if (result.src_addr) {
-        const auto src_addr = iputil::NormalizeAddress(*result.src_addr);
-        ctx.inbound.source_addr = src_addr;
-        ctx.inbound.source_ip = src_addr.to_string();
-        ctx.inbound.source_port = result.src_port;
-        ctx.inbound.client_ip_source = "proxy_protocol";
-        ctx.inbound.client_ip_trusted = true;
-        LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
-                       ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
-                       ctx.inbound.source_ip, result.src_port);
-    } else if (!result.src_ip.empty()) {
-        ctx.inbound.source_addr = net::ip::address{};
-        ctx.inbound.source_ip = result.src_ip;
-        ctx.inbound.source_port = result.src_port;
-        ctx.inbound.client_ip_source = "proxy_protocol";
-        ctx.inbound.client_ip_trusted = true;
-        LOG_CONN_DEBUG(ctx, "[{}] PROXY protocol: proxy={} real_ip={}:{}",
-                       ctx.inbound.tag, iputil::NormalizeAddressString(remote_ep.address()),
-                       ctx.inbound.source_ip, result.src_port);
-    }
-}
-
 }  // namespace
 
 // ============================================================================
@@ -737,7 +706,8 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         socket.close();
         co_return;
     }
-    proxyman::inbound::ReceiverSettings& listener = inbound_handler->ReceiverSettings();
+    const proxyman::inbound::ReceiverSettings& listener =
+        inbound_handler->ReceiverSettings();
 
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
     const auto runtime_snapshot = worker.runtime_->Snapshot();
@@ -769,50 +739,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
                    ctx.inbound.tag,
                    ctx.inbound.source_ip,
                    ctx.inbound.source_port);
-
-    // ----------------------------------------------------------------
-    // PROXY Protocol 检测（负载均衡器透传真实客户端 IP）
-    //
-    // 读取、消耗和 pending-data 管理由 transport/internet 完成；
-    // Worker 只把解析出的真实客户端地址写入当前 session。
-    // ----------------------------------------------------------------
-    if (listener.proxy_protocol != ProxyProtocolMode::Off) {
-        auto proxy_read = co_await tcp_stream->ReadProxyProtocolHeader(
-            runtime_snapshot->timeouts.HandshakeTimeout());
-        if (!proxy_read.ok()) {
-            switch (proxy_read.status) {
-                case ProxyProtocolReadStatus::TimedOut:
-                    LOG_CONN_WARN(ctx,
-                                      "PROXY_PROTOCOL_TIMEOUT client={}",
-                                      ctx.inbound.source_ip);
-                    break;
-                case ProxyProtocolReadStatus::Truncated:
-                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TRUNCATED");
-                    break;
-                case ProxyProtocolReadStatus::TooLarge:
-                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TOO_LARGE limit={}B", 2048);
-                    break;
-                case ProxyProtocolReadStatus::Invalid:
-                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_INVALID");
-                    break;
-                case ProxyProtocolReadStatus::Ok:
-                    break;
-            }
-            tcp_stream->Close();
-            co_return;
-        }
-
-        if (listener.proxy_protocol == ProxyProtocolMode::On &&
-            proxy_read.result.status != ProxyProtocolParseStatus::Success) {
-            LOG_CONN_WARN(ctx,
-                              "PROXY_PROTOCOL_REQUIRED_MISSING client={}",
-                              ctx.inbound.source_ip);
-            tcp_stream->Close();
-            co_return;
-        }
-
-        ApplyProxyProtocolResult(worker.id_, ctx, remote_ep, proxy_read.result);
-    }
 
     co_await inbound_handler->ProcessAcceptedTCP(
         worker.runtime_->io_context, *worker.runtime_->dispatcher,

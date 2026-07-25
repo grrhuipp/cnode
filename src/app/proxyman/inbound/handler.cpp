@@ -75,6 +75,43 @@ void ApplyHttpRealIp(
     ctx.inbound.client_ip_trusted = true;
 }
 
+void ApplyProxyProtocolResult(
+    session::Context& ctx,
+    const ProxyProtocolResult& result) {
+    if (!result.success()) {
+        return;
+    }
+
+    if (result.src_addr) {
+        const auto source = iputil::NormalizeAddress(*result.src_addr);
+        ctx.inbound.source_addr = source;
+        ctx.inbound.source_ip = source.to_string();
+    } else if (!result.src_ip.empty()) {
+        ctx.inbound.source_addr = net::ip::address{};
+        ctx.inbound.source_ip = result.src_ip;
+    } else {
+        return;
+    }
+
+    ctx.inbound.source_port = result.src_port;
+    ctx.inbound.client_ip_source = "proxy_protocol";
+    ctx.inbound.client_ip_trusted = true;
+    LOG_CONN_DEBUG(
+        ctx,
+        "[{}] PROXY protocol: proxy={} real_ip={}:{}",
+        ctx.inbound.tag,
+        ctx.inbound.peer_ip,
+        ctx.inbound.source_ip,
+        ctx.inbound.source_port);
+}
+
+[[nodiscard]] ErrorCode ProxyProtocolError(
+    ProxyProtocolReadStatus status) noexcept {
+    return status == ProxyProtocolReadStatus::TimedOut
+        ? ErrorCode::TIMEOUT
+        : ErrorCode::PROTOCOL_DECODE_FAILED;
+}
+
 class ConnectionLimitScope {
 public:
     ConnectionLimitScope(ConnectionLimiterPtr limiter, std::string_view ip)
@@ -150,7 +187,9 @@ void CopyTransportBaseContext(const session::Context& source,
     target.sockopt = source.sockopt;
 }
 
-class LogicalTransportStreamSink final
+}  // namespace
+
+class Handler::LogicalTransportStreamSink final
     : public InboundTransportStreamHandler
     , public std::enable_shared_from_this<LogicalTransportStreamSink> {
 public:
@@ -228,8 +267,6 @@ private:
     std::shared_ptr<InboundTransportMetadata> metadata_;
     int64_t transport_started_at_us_ = 0;
 };
-
-}  // namespace
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy)
     : receiver_(std::move(receiver))
@@ -345,10 +382,62 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     PrepareInboundLogMetadata(ctx, listener);
     app::AccessLogSession access_log(ctx);
 
-    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
-    if (raw_conn) {
-        raw_conn->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
+    if (!raw_conn) {
+        stats.OnError();
+        access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return;
     }
+
+    if (listener.proxy_protocol != ProxyProtocolMode::Off) {
+        auto proxy_read = co_await ReadInboundProxyProtocol(
+            *raw_conn,
+            timeouts.HandshakeTimeout());
+        if (!proxy_read.ok()) {
+            switch (proxy_read.status) {
+                case ProxyProtocolReadStatus::TimedOut:
+                    LOG_CONN_WARN(
+                        ctx,
+                        "PROXY_PROTOCOL_TIMEOUT client={}",
+                        ctx.inbound.source_ip);
+                    break;
+                case ProxyProtocolReadStatus::Truncated:
+                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TRUNCATED");
+                    break;
+                case ProxyProtocolReadStatus::TooLarge:
+                    LOG_CONN_WARN(
+                        ctx,
+                        "PROXY_PROTOCOL_TOO_LARGE limit={}B",
+                        2048);
+                    break;
+                case ProxyProtocolReadStatus::Invalid:
+                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_INVALID");
+                    break;
+                case ProxyProtocolReadStatus::Ok:
+                    break;
+            }
+            stats.OnError();
+            access_log.Fail(ProxyProtocolError(proxy_read.status));
+            raw_conn->CloseAbortive();
+            co_return;
+        }
+
+        if (listener.proxy_protocol == ProxyProtocolMode::On &&
+            proxy_read.result.status != ProxyProtocolParseStatus::Success) {
+            LOG_CONN_WARN(
+                ctx,
+                "PROXY_PROTOCOL_REQUIRED_MISSING client={}",
+                ctx.inbound.source_ip);
+            stats.OnError();
+            access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
+            raw_conn->CloseAbortive();
+            co_return;
+        }
+
+        ApplyProxyProtocolResult(ctx, proxy_read.result);
+    }
+
+    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    raw_conn->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
 
     if (listener.limiter &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
