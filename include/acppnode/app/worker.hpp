@@ -14,7 +14,6 @@ namespace acpp {
 namespace proxyman::inbound {
 struct BuildRequest;
 struct ReceiverSettings;
-class UdpHandler;
 }
 namespace proxyman::outbound {
 struct PreparedOutboundConfig;

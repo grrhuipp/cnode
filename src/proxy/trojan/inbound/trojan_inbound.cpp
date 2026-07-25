@@ -306,27 +306,37 @@ proxy::trojan::inbound::Handler::Process(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
+class TrojanRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
+public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
+    acpp::trojan::Validator validator;
+};
+
 const bool kTrojanInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Trojan;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
-            acpp::trojan::Validator>>();
+        return std::make_unique<TrojanRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
-           const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* validator = deps.ValidatorAs<acpp::trojan::Validator>();
-            if (!validator || !deps.stats) {
+           const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
+            auto* trojan_runtime = dynamic_cast<TrojanRuntime*>(&runtime);
+            if (!trojan_runtime) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::trojan::inbound::Handler>(
-                *validator,
-                *deps.stats,
+                trojan_runtime->validator,
+                stats,
                 limiter);
         };
 

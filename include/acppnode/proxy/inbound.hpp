@@ -4,7 +4,9 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/relay_types.hpp"
 #include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/proxy/inbound_datagram.hpp"
 
+#include <expected>
 #include <memory>
 #include <cstdint>
 
@@ -38,6 +40,10 @@ class Inbound {
 public:
     virtual ~Inbound() noexcept = default;
 
+    // Worker-local protocol state may be transferred during an atomic handler
+    // replacement. Live sessions keep the state they already captured.
+    virtual void AdoptWorkerStateFrom(Inbound&) noexcept {}
+
     // -----------------------------------------------------------------------
     // 从已建立的传输流中解析协议头，并移交给 dispatcher。
     //
@@ -54,6 +60,14 @@ public:
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) = 0;
+
+    // Native datagrams enter through the same protocol handler abstraction.
+    // The owning UDP runtime performs the dispatcher handoff after protocol
+    // parsing and authentication.
+    [[nodiscard]] virtual std::expected<InboundDatagramResult, ErrorCode>
+    Process(const InboundDatagramRequest&) {
+        return std::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 };
 
 }  // namespace acpp

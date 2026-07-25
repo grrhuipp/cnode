@@ -97,19 +97,13 @@ void CopySessionContext(const session::Context& source, session::Context& target
 Handler::Handler(Validator& validator,
                  StatsShard& stats,
                  ConnectionLimiterPtr limiter,
-                 std::string padding_scheme)
+                 std::string padding_scheme_raw,
+                 std::string padding_scheme_md5)
     : validator_(validator)
     , stats_(&stats)
     , limiter_(limiter)
-{
-    if (!padding_scheme.empty()) {
-        auto parsed = anytls::ParsePaddingScheme(padding_scheme);
-        if (parsed) {
-            padding_scheme_raw_ = std::move(parsed->raw);
-            padding_scheme_md5_ = std::move(parsed->md5);
-        }
-    }
-}
+    , padding_scheme_raw_(std::move(padding_scheme_raw))
+    , padding_scheme_md5_(std::move(padding_scheme_md5)) {}
 
 namespace {
 
@@ -1137,26 +1131,72 @@ Handler::Process(
 }  // namespace acpp::proxy::anytls::inbound
 
 namespace {
+class AnyTlsRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
+public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
+    acpp::anytls::Validator validator;
+};
+
+class AnyTlsSettings final
+    : public acpp::proxyman::inbound::ProtocolSettings {
+public:
+    std::string padding_scheme_raw;
+    std::string padding_scheme_md5;
+};
+
+[[nodiscard]] const AnyTlsSettings* GetAnyTlsSettings(
+    const acpp::proxyman::inbound::BuildRequest& req) noexcept {
+    return dynamic_cast<const AnyTlsSettings*>(req.settings.get());
+}
+
 const bool kInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::AnyTls;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
-            acpp::anytls::Validator>>();
+        return std::make_unique<AnyTlsRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* validator = deps.ValidatorAs<acpp::anytls::Validator>();
-            if (!deps.stats || !validator) {
+            auto* anytls_runtime = dynamic_cast<AnyTlsRuntime*>(&runtime);
+            const auto* settings = GetAnyTlsSettings(req);
+            if (!anytls_runtime || !settings) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::anytls::inbound::Handler>(
-                *validator, *deps.stats, limiter, req.anytls_padding_scheme);
+                anytls_runtime->validator,
+                stats,
+                limiter,
+                settings->padding_scheme_raw,
+                settings->padding_scheme_md5);
+        };
+
+    reg.prepare_settings =
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
+            -> std::optional<std::shared_ptr<
+                const acpp::proxyman::inbound::ProtocolSettings>> {
+            auto settings = std::make_shared<AnyTlsSettings>();
+            if (!config.padding_scheme.empty()) {
+                auto parsed =
+                    acpp::anytls::ParsePaddingScheme(config.padding_scheme);
+                if (!parsed) {
+                    LOG_WARN(
+                        "AnyTLS inbound '{}': invalid padding scheme", tag);
+                    return std::nullopt;
+                }
+                settings->padding_scheme_raw = std::move(parsed->raw);
+                settings->padding_scheme_md5 = std::move(parsed->md5);
+            }
+            return settings;
         };
 
     reg.build_static_users =

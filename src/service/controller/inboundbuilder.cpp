@@ -1,8 +1,12 @@
 #include "inboundbuilder.hpp"
 #include "tls_policy.hpp"
 
+#include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
+#include "acppnode/infra/config_types.hpp"
+
+#include <stdexcept>
 
 namespace acpp::controller {
 
@@ -68,12 +72,21 @@ InboundBuild InboundBuilder(const std::string& panel_name,
     build.sniff.enabled = node_config.SniffEnabled;
     build.sniff.dest_override = node_config.DestOverride;
 
-    build.handler_request.tag = build.tag;
-    build.handler_request.protocol = build.protocol;
-    build.handler_request.cipher_method = node_config.CypherMethod.empty()
+    StaticUserConfig protocol_source;
+    protocol_source.method = node_config.CypherMethod.empty()
         ? std::string(constants::protocol::kAes256Gcm)
         : node_config.CypherMethod;
-    build.handler_request.ss_identity_password = node_config.ShadowsocksServerKey;
+    protocol_source.identity_password = node_config.ShadowsocksServerKey;
+    auto handler_request = proxyman::inbound::PrepareBuildRequest(
+        build.protocol,
+        build.tag,
+        protocol_source);
+    if (!handler_request) {
+        throw std::invalid_argument(
+            "panel inbound '" + build.tag +
+            "' has invalid protocol settings");
+    }
+    build.handler_request = std::move(*handler_request);
 
     build.binding = MakePortBinding(
         node_config.Port,

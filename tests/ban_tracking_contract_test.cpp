@@ -1,4 +1,3 @@
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/proxy/inbound.hpp"
 
@@ -14,7 +13,6 @@ concept MutableBanTracking = requires(T& handler) {
 };
 
 static_assert(!MutableBanTracking<acpp::Inbound>);
-static_assert(!MutableBanTracking<acpp::proxyman::inbound::UdpHandler>);
 
 }  // namespace
 

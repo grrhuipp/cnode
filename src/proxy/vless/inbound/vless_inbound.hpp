@@ -22,7 +22,8 @@ public:
     Handler(::acpp::vless::Validator& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
-            std::string vless_decryption = {});
+            std::shared_ptr<
+                const ::acpp::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
 
     ::acpp::net::awaitable<::acpp::RelayResult> Process(

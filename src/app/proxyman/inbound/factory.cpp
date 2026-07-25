@@ -1,6 +1,5 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/proxy/inbound.hpp"
 
 #include <map>
@@ -73,7 +72,8 @@ std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
 
 std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
-    const ProtocolDeps& deps,
+    ProtocolRuntime& runtime,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
@@ -81,27 +81,53 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
     if (it == registrations.end() || !it->second.create_tcp_handler) {
         return nullptr;
     }
-    return it->second.create_tcp_handler(deps, limiter, req);
+    return it->second.create_tcp_handler(runtime, stats, limiter, req);
 }
 
-UdpHandlerBuildResult NewUdpHandler(
+DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
-    const ProtocolDeps& deps,
+    ProtocolRuntime& runtime,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end()) {
-        return {UdpHandlerBuildStatus::Failed, nullptr};
+        return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
-    if (!it->second.create_udp_handler) {
-        return {UdpHandlerBuildStatus::Unsupported, nullptr};
+    if (!it->second.create_datagram_handler) {
+        return {DatagramHandlerBuildStatus::Unsupported, nullptr};
     }
-    auto handler = it->second.create_udp_handler(deps, limiter, req);
+    auto handler =
+        it->second.create_datagram_handler(runtime, stats, limiter, req);
     if (!handler) {
-        return {UdpHandlerBuildStatus::Failed, nullptr};
+        return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
-    return {UdpHandlerBuildStatus::Ready, std::move(handler)};
+    return {DatagramHandlerBuildStatus::Ready, std::move(handler)};
+}
+
+std::optional<BuildRequest> PrepareBuildRequest(
+    std::string_view protocol,
+    std::string_view tag,
+    const ::acpp::StaticUserConfig& config) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    if (it == registrations.end()) {
+        return std::nullopt;
+    }
+
+    BuildRequest request{
+        .tag = std::string(tag),
+        .protocol = std::string(protocol),
+    };
+    if (it->second.prepare_settings) {
+        auto settings = it->second.prepare_settings(tag, config);
+        if (!settings) {
+            return std::nullopt;
+        }
+        request.settings = std::move(*settings);
+    }
+    return request;
 }
 
 std::optional<UserSet> BuildStaticUsers(

@@ -28,7 +28,8 @@ public:
     Handler(::acpp::anytls::Validator& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
-            std::string padding_scheme = {});
+            std::string padding_scheme_raw = {},
+            std::string padding_scheme_md5 = {});
 
     net::awaitable<RelayResult> Process(
         std::unique_ptr<AsyncStream> stream,

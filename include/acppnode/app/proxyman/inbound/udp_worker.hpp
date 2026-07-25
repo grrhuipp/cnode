@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
+#include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/link.hpp"
 
 #include <chrono>
@@ -83,7 +83,7 @@ public:
     using PendingUdpReplyPtr =
         std::unique_ptr<PendingUdpReply, PendingUdpReplyDeleter>;
 
-    UdpWorker(std::string tag, std::unique_ptr<UdpHandler> proxy);
+    UdpWorker(std::string tag, std::unique_ptr<::acpp::Inbound> proxy);
     ~UdpWorker() noexcept;
 
     UdpWorker(const UdpWorker&) = delete;
@@ -94,7 +94,8 @@ public:
     [[nodiscard]] std::string_view Tag() const noexcept;
 
     // Keep Worker-local sockets stable while replacing cold-path protocol state.
-    [[nodiscard]] bool ReplaceHandler(std::unique_ptr<UdpHandler> proxy) noexcept;
+    [[nodiscard]] bool ReplaceHandler(
+        std::unique_ptr<::acpp::Inbound> proxy) noexcept;
     void Close() noexcept;
 
     void ProcessDatagram(const UdpDatagramContext& datagram);
@@ -128,13 +129,13 @@ public:
         net::io_context& io_context,
         ReplyCallback reply_callback,
         udp::endpoint reply_endpoint,
-        UdpSessionOwner session_owner,
+        ::acpp::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point now);
     [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
                                          const std::string& client_key,
                                          const TargetAddress& target,
                                          udp::endpoint reply_endpoint,
-                                         const UdpSessionOwner& session_owner,
+                                         const ::acpp::InboundDatagramOwner& session_owner,
                                          buf::MultiBuffer payload,
                                          std::chrono::steady_clock::time_point now);
     void CleanupIdleClientSessions(const std::string& socket_key,
@@ -173,14 +174,15 @@ public:
     ClientSession(net::io_context& io_context,
                   ReplyCallback reply_callback,
                   udp::endpoint reply_endpoint,
-                  UdpSessionOwner session_owner);
+                  ::acpp::InboundDatagramOwner session_owner);
     ~ClientSession() noexcept override;
 
     ClientSession(const ClientSession&) = delete;
     ClientSession& operator=(const ClientSession&) = delete;
 
     [[nodiscard]] bool Closed() const noexcept;
-    [[nodiscard]] bool Owns(const UdpSessionOwner& owner) const noexcept;
+    [[nodiscard]] bool Owns(
+        const ::acpp::InboundDatagramOwner& owner) const noexcept;
 
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     [[nodiscard]] bool Push(

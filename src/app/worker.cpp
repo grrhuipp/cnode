@@ -75,7 +75,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     [[nodiscard]] bool StartUdpListening(
         Worker& worker,
         const PortBinding& binding,
-        std::unique_ptr<proxyman::inbound::UdpHandler> handler);
+        std::unique_ptr<Inbound> handler);
     [[nodiscard]] ListenerKeys CollectUdpSocketKeys(const std::string& tag) const;
     void ResetUdpListening(const std::string& tag,
                            ListenerKeys socket_keys) noexcept;
@@ -1064,7 +1064,7 @@ Worker::CollectRuntimeStatsTask() const {
 // ============================================================================
 // UDP 监听（SO_REUSEPORT，与 TCP acceptor 同端口）
 //
-// 具体的解码、认证和 ban 逻辑委托给 inbound UdpHandler；Worker 只维护监听
+// 具体的解码、认证和 ban 逻辑委托给统一 Inbound；Worker 只维护监听
 // socket 与当前 Worker-local UdpWorker 生命周期。
 // ============================================================================
 
@@ -1073,13 +1073,14 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
     std::string protocol,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req) {
-    auto result = runtime_->inbound_manager->NewUdpHandler(protocol, limiter, req);
+    auto result =
+        runtime_->inbound_manager->NewDatagramHandler(protocol, limiter, req);
     switch (result.status) {
-        case proxyman::inbound::UdpHandlerBuildStatus::Unsupported:
+        case proxyman::inbound::DatagramHandlerBuildStatus::Unsupported:
             co_return true;
-        case proxyman::inbound::UdpHandlerBuildStatus::Failed:
+        case proxyman::inbound::DatagramHandlerBuildStatus::Failed:
             co_return false;
-        case proxyman::inbound::UdpHandlerBuildStatus::Ready:
+        case proxyman::inbound::DatagramHandlerBuildStatus::Ready:
             if (!result.handler) {
                 co_return false;
             }
@@ -1092,7 +1093,7 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
 bool Worker::ListenerState::StartUdpListening(
     Worker& worker,
     const PortBinding& binding,
-    std::unique_ptr<proxyman::inbound::UdpHandler> handler) {
+    std::unique_ptr<Inbound> handler) {
 #ifdef _WIN32
     // TCP follows the same ownership rule above.  A UDP socket and its client
     // session table stay on the Worker that bound the socket.

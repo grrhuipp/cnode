@@ -290,25 +290,14 @@ proxy::vless::inbound::Handler::Handler(
     ::acpp::vless::Validator& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter,
-    std::string vless_decryption)
+    std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption)
     : validator_(validator)
     , stats_(&stats)
-    , limiter_(std::move(limiter)) {
-    if (!::acpp::vless::IsNoVlessEncryption(vless_decryption)) {
-        auto parsed =
-            ::acpp::vless::ParseVlessServerDecryption(vless_decryption);
-        if (parsed) {
-            decryption_ =
-                std::make_shared<::acpp::vless::VlessEncryptionConfig>(
-                    std::move(*parsed.config));
-            decryption_tickets_ = std::make_unique<
-                ::acpp::vless::VlessEncryptionServerTicketStore>();
-        } else {
-            LOG_WARN("VLESS inbound decryption ignored '{}': {}",
-                     vless_decryption,
-                     ::acpp::vless::VlessEncryptionParseErrorMessage(
-                         parsed.error));
-        }
+    , limiter_(std::move(limiter))
+    , decryption_(std::move(decryption)) {
+    if (decryption_) {
+        decryption_tickets_ = std::make_unique<
+            ::acpp::vless::VlessEncryptionServerTicketStore>();
     }
 }
 
@@ -610,30 +599,75 @@ proxy::vless::inbound::Handler::Process(
 }  // namespace acpp
 
 namespace {
+class VlessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
+public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
+    acpp::vless::Validator validator;
+};
+
+class VlessSettings final
+    : public acpp::proxyman::inbound::ProtocolSettings {
+public:
+    std::shared_ptr<const acpp::vless::VlessEncryptionConfig> decryption;
+};
+
+[[nodiscard]] const VlessSettings* GetVlessSettings(
+    const acpp::proxyman::inbound::BuildRequest& req) noexcept {
+    return dynamic_cast<const VlessSettings*>(req.settings.get());
+}
+
 const bool kVlessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vless;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
-            acpp::vless::Validator>>();
+        return std::make_unique<VlessRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
-            auto* validator = deps.ValidatorAs<acpp::vless::Validator>();
-            if (!validator || !deps.stats) {
+            auto* vless_runtime = dynamic_cast<VlessRuntime*>(&runtime);
+            const auto* settings = GetVlessSettings(req);
+            if (!vless_runtime || !settings) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::vless::inbound::Handler>(
-                *validator,
-                *deps.stats,
+                vless_runtime->validator,
+                stats,
                 limiter,
-                req.vless_decryption);
+                settings->decryption);
+        };
+
+    reg.prepare_settings =
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
+            -> std::optional<std::shared_ptr<
+                const acpp::proxyman::inbound::ProtocolSettings>> {
+            auto settings = std::make_shared<VlessSettings>();
+            if (!acpp::vless::IsNoVlessEncryption(config.vless_decryption)) {
+                auto parsed = acpp::vless::ParseVlessServerDecryption(
+                    config.vless_decryption);
+                if (!parsed) {
+                    LOG_WARN("VLESS inbound '{}': invalid decryption '{}': {}",
+                             tag,
+                             config.vless_decryption,
+                             acpp::vless::VlessEncryptionParseErrorMessage(
+                                 parsed.error));
+                    return std::nullopt;
+                }
+                settings->decryption =
+                    std::make_shared<acpp::vless::VlessEncryptionConfig>(
+                        std::move(*parsed.config));
+            }
+            return settings;
         };
 
     reg.build_static_users =

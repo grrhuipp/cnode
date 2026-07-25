@@ -21,17 +21,16 @@ struct StatsShard;
 
 namespace acpp::proxyman::inbound {
 
-class UdpHandler;
-
-enum class UdpHandlerBuildStatus : uint8_t {
+enum class DatagramHandlerBuildStatus : uint8_t {
     Unsupported,
     Failed,
     Ready,
 };
 
-struct UdpHandlerBuildResult {
-    UdpHandlerBuildStatus status = UdpHandlerBuildStatus::Unsupported;
-    std::unique_ptr<UdpHandler> handler;
+struct DatagramHandlerBuildResult {
+    DatagramHandlerBuildStatus status =
+        DatagramHandlerBuildStatus::Unsupported;
+    std::unique_ptr<::acpp::Inbound> handler;
 };
 
 // ============================================================================
@@ -41,38 +40,8 @@ class ProtocolRuntime {
 public:
     virtual ~ProtocolRuntime() noexcept = default;
 
-    [[nodiscard]] virtual void* Validator() noexcept = 0;
     [[nodiscard]] virtual std::vector<::acpp::OnlineDevice>
     GetOnlineDevices(std::string_view tag) const = 0;
-};
-
-template <typename ValidatorType>
-class ValidatorProtocolRuntime final : public ProtocolRuntime {
-public:
-    [[nodiscard]] void* Validator() noexcept override {
-        return &validator_;
-    }
-
-    [[nodiscard]] std::vector<::acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator_.GetOnlineDevices(tag);
-    }
-
-private:
-    ValidatorType validator_;
-};
-
-// ============================================================================
-// ProtocolDeps - 入站协议构建依赖（由 inbound manager 提供）
-// ============================================================================
-struct ProtocolDeps {
-    ProtocolRuntime* runtime = nullptr;
-    ::acpp::StatsShard* stats = nullptr;
-
-    template <typename T>
-    [[nodiscard]] T* ValidatorAs() const noexcept {
-        return runtime ? static_cast<T*>(runtime->Validator()) : nullptr;
-    }
 };
 
 // ============================================================================
@@ -88,15 +57,24 @@ struct ProxyRegistration {
 
     // 创建 TCP 入站处理器（必须）
     std::unique_ptr<::acpp::Inbound> (*create_tcp_handler)(
-        const ProtocolDeps& deps,
+        ProtocolRuntime& runtime,
+        ::acpp::StatsShard& stats,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
-    std::unique_ptr<UdpHandler> (*create_udp_handler)(
-        const ProtocolDeps& deps,
+    std::unique_ptr<::acpp::Inbound> (*create_datagram_handler)(
+        ProtocolRuntime& runtime,
+        ::acpp::StatsShard& stats,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req) = nullptr;
+
+    // Parse protocol-specific source fields on the cold path. The returned
+    // immutable type remains private to the protocol implementation.
+    std::optional<std::shared_ptr<const ProtocolSettings>>
+    (*prepare_settings)(
+        std::string_view tag,
+        const ::acpp::StaticUserConfig& config) = nullptr;
 
     // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。
     std::optional<UserSet> (*build_static_users)(
@@ -124,15 +102,22 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 
 [[nodiscard]] std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
-    const ProtocolDeps& deps,
+    ProtocolRuntime& runtime,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req);
 
-[[nodiscard]] UdpHandlerBuildResult NewUdpHandler(
+[[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
-    const ProtocolDeps& deps,
+    ProtocolRuntime& runtime,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req);
+
+[[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
+    std::string_view protocol,
+    std::string_view tag,
+    const ::acpp::StaticUserConfig& config);
 
 [[nodiscard]] std::optional<UserSet> BuildStaticUsers(
     std::string_view protocol,

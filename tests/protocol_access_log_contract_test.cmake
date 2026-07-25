@@ -51,8 +51,8 @@ file(READ
     "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp"
     MUX_RELAY_SOURCE)
 file(READ
-    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp"
-    UDP_HANDLER_SOURCE)
+    "${SOURCE_DIR}/include/acppnode/proxy/inbound.hpp"
+    INBOUND_HANDLER_SOURCE)
 file(READ
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp"
     UDP_WORKER_SOURCE)
@@ -120,10 +120,10 @@ if(NOT MUX_RELAY_SOURCE MATCHES
         "Mux TCP and UDP dispatch admission failures must reach access logging")
 endif()
 
-if(UDP_HANDLER_SOURCE MATCHES
-       "optional<UdpDecodeResult>" OR
-   NOT UDP_HANDLER_SOURCE MATCHES
-       "expected<UdpDecodeResult, ErrorCode>" OR
+if(INBOUND_HANDLER_SOURCE MATCHES
+       "optional<InboundDatagramResult>" OR
+   NOT INBOUND_HANDLER_SOURCE MATCHES
+       "expected<InboundDatagramResult, ErrorCode>" OR
    NOT UDP_WORKER_SOURCE MATCHES
        "access_log[.]Fail[(]decoded[.]error[(][)][)]")
     message(FATAL_ERROR

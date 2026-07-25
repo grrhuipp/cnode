@@ -65,7 +65,7 @@ private:
     memory::ThreadLocalString client_ip_;
 };
 
-class ShadowsocksUdpResponseContext final : public proxyman::inbound::UdpResponseContext {
+class ShadowsocksUdpResponseContext final : public InboundDatagramResponse {
 public:
     ShadowsocksUdpResponseContext(ss::KeyBytes reply_key, ss::SsCipherInfo cipher_info)
         : reply_key_(std::move(reply_key))
@@ -92,23 +92,14 @@ proxy::shadowsocks::inbound::Handler::Handler(
     ss::Validator& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter,
-    std::string cipher_method)
+    ss::SsCipherInfo cipher_info)
     : validator_(validator)
     , stats_(&stats)
     , limiter_(std::move(limiter))
-    , cipher_method_(std::move(cipher_method)) {
-    auto info = ss::ParseCipherMethod(cipher_method_);
-    if (info) {
-        cipher_info_ = *info;
-    } else {
-        // 默认 aes-256-gcm
-        LOG_WARN("[SS] Unknown cipher method '{}', falling back to aes-256-gcm", cipher_method_);
-        cipher_info_ = ss::SsCipherInfo{ss::SsCipherType::AES_256_GCM, 32, 32};
-    }
-}
+    , cipher_info_(cipher_info) {}
 
 void proxy::shadowsocks::inbound::Handler::AdoptWorkerStateFrom(
-    proxyman::inbound::UdpHandler& previous) noexcept {
+    Inbound& previous) noexcept {
     auto* previous_handler = dynamic_cast<Handler*>(&previous);
     if (!previous_handler) {
         return;
@@ -300,12 +291,11 @@ proxy::shadowsocks::inbound::Handler::Process(
         timeouts);
 }
 
-std::expected<acpp::proxyman::inbound::UdpDecodeResult, acpp::ErrorCode>
-proxy::shadowsocks::inbound::Handler::DecodeUdp(
-    std::string_view tag,
-    std::string_view client_ip,
-    const uint8_t* data,
-    size_t len) {
+std::expected<acpp::InboundDatagramResult, acpp::ErrorCode>
+proxy::shadowsocks::inbound::Handler::Process(
+    const InboundDatagramRequest& request) {
+    const auto tag = request.tag;
+    const auto client_ip = request.client_ip;
 
     if (limiter_ && limiter_->GetLimiter().IsBanned(tag, client_ip)) {
         LOG_NET_DEBUG("source={} rejected=ip_banned inbound={} network=udp",
@@ -319,7 +309,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     }
 
     auto decoded = ss::DecodeUdpPacket(
-        data, len, users,
+        request.payload.data(), request.payload.size(), users,
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
         udp_replay_cache_);
     if (!decoded) {
@@ -332,7 +322,7 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     const auto& user = users[decoded->user_index];
     const auto& profile = *user.profile;
 
-    proxyman::inbound::UdpDecodeResult result;
+    InboundDatagramResult result;
     if (!result.session_owner.Assign(user.derived_key.span())) {
         return std::unexpected(ErrorCode::INTERNAL);
     }
@@ -343,10 +333,10 @@ proxy::shadowsocks::inbound::Handler::DecodeUdp(
     result.user_email = profile.email;
     result.speed_limit = profile.speed_limit;
     if (decoded->ss2022_session) {
-        result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
+        result.response = std::make_shared<ShadowsocksUdpResponseContext>(
             std::move(decoded->ss2022_session));
     } else {
-        result.response_context = std::make_shared<ShadowsocksUdpResponseContext>(
+        result.response = std::make_shared<ShadowsocksUdpResponseContext>(
             ToSsKey(user.derived_key),
             cipher_info_);
     }
@@ -500,48 +490,86 @@ acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) 
     return prepared;
 }
 
+class ShadowsocksRuntime final
+    : public acpp::proxyman::inbound::ProtocolRuntime {
+public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
+    acpp::ss::Validator validator;
+};
+
+class ShadowsocksSettings final
+    : public acpp::proxyman::inbound::ProtocolSettings {
+public:
+    acpp::ss::SsCipherInfo cipher;
+    std::string identity_password;
+};
+
+[[nodiscard]] const ShadowsocksSettings* GetSettings(
+    const acpp::proxyman::inbound::BuildRequest& req) noexcept {
+    return dynamic_cast<const ShadowsocksSettings*>(req.settings.get());
+}
+
 const bool kSsInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Shadowsocks;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
-            acpp::ss::Validator>>();
+        return std::make_unique<ShadowsocksRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* validator = deps.ValidatorAs<acpp::ss::Validator>();
-            if (!validator || !deps.stats) {
+            auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
+            const auto* settings = GetSettings(req);
+            if (!ss_runtime || !settings) {
                 return nullptr;
             }
-            const std::string method = req.cipher_method.empty()
-                ? std::string(acpp::constants::protocol::kAes256Gcm)
-                : req.cipher_method;
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
-                *validator,
-                *deps.stats,
+                ss_runtime->validator,
+                stats,
                 limiter,
-                method);
+                settings->cipher);
         };
 
-    reg.create_udp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+    reg.create_datagram_handler =
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
-            -> std::unique_ptr<acpp::proxyman::inbound::UdpHandler> {
-            auto* validator = deps.ValidatorAs<acpp::ss::Validator>();
-            if (!validator || !deps.stats) {
+            -> std::unique_ptr<acpp::Inbound> {
+            auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
+            const auto* settings = GetSettings(req);
+            if (!ss_runtime || !settings) {
                 return nullptr;
             }
-            const std::string method = req.cipher_method.empty()
-                ? std::string(acpp::constants::protocol::kAes256Gcm)
-                : req.cipher_method;
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
-                *validator, *deps.stats, limiter, method);
+                ss_runtime->validator, stats, limiter, settings->cipher);
+        };
+
+    reg.prepare_settings =
+        [](std::string_view tag, const acpp::StaticUserConfig& config)
+            -> std::optional<std::shared_ptr<
+                const acpp::proxyman::inbound::ProtocolSettings>> {
+            const std::string method = config.method.empty()
+                ? std::string(acpp::constants::protocol::kAes256Gcm)
+                : config.method;
+            auto cipher = acpp::ss::ParseCipherMethod(method);
+            if (!cipher) {
+                LOG_WARN("Inbound '{}': unknown SS cipher '{}'", tag, method);
+                return std::nullopt;
+            }
+            auto settings = std::make_shared<ShadowsocksSettings>();
+            settings->cipher = *cipher;
+            settings->identity_password = config.identity_password;
+            return settings;
         };
 
     reg.build_static_users =
@@ -601,34 +629,34 @@ const bool kSsInboundRegistered = [] {
         [](const acpp::proxyman::inbound::BuildRequest& req,
            std::span<const acpp::proxyman::inbound::RuntimeUser> runtime_users)
             -> std::optional<acpp::proxyman::inbound::UserSet> {
-            const std::string method = req.cipher_method.empty()
-                ? std::string(acpp::constants::protocol::kAes256Gcm)
-                : req.cipher_method;
-            auto cipher_info = acpp::ss::ParseCipherMethod(method);
-            if (!cipher_info) {
-                LOG_WARN("Inbound '{}': unknown SS cipher '{}'", req.tag, method);
+            const auto* settings = GetSettings(req);
+            if (!settings) {
+                LOG_WARN("Inbound '{}': missing prepared SS settings", req.tag);
                 return std::nullopt;
             }
+            const auto& cipher_info = settings->cipher;
 
             std::vector<acpp::proxyman::inbound::PreparedShadowsocksUser> users;
             users.reserve(runtime_users.size());
             acpp::proxyman::inbound::PreparedKeyBytes identity_key;
             const bool has_uuid_backed_2022_users =
-                acpp::ss::Is2022AesCipher(cipher_info->type) &&
+                acpp::ss::Is2022AesCipher(cipher_info.type) &&
                 std::ranges::any_of(
                     runtime_users,
                     [](const auto& user) {
                         return !user.uuid.empty() && user.password == user.uuid;
                     });
-            if (has_uuid_backed_2022_users && req.ss_identity_password.empty()) {
+            if (has_uuid_backed_2022_users &&
+                settings->identity_password.empty()) {
                 LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key",
                          req.tag);
                 return std::nullopt;
             }
-            if (acpp::ss::Is2022Cipher(*cipher_info) &&
-                !req.ss_identity_password.empty()) {
+            if (acpp::ss::Is2022Cipher(cipher_info) &&
+                !settings->identity_password.empty()) {
                 identity_key = ToPreparedKey(
-                    acpp::ss::BuildMasterKey(req.ss_identity_password, *cipher_info));
+                    acpp::ss::BuildMasterKey(
+                        settings->identity_password, cipher_info));
                 if (identity_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS2022 identity password", req.tag);
                     return std::nullopt;
@@ -645,18 +673,18 @@ const bool kSsInboundRegistered = [] {
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;
                 info.profile.device_limit = runtime_user.device_limit;
-                info.cipher_type = ToPreparedCipher(cipher_info->type);
-                info.key_size = cipher_info->key_size;
-                info.salt_size = cipher_info->salt_size;
+                info.cipher_type = ToPreparedCipher(cipher_info.type);
+                info.key_size = cipher_info.key_size;
+                info.salt_size = cipher_info.salt_size;
                 const bool uuid_backed_2022_key =
-                    acpp::ss::Is2022Cipher(*cipher_info) &&
+                    acpp::ss::Is2022Cipher(cipher_info) &&
                     !runtime_user.uuid.empty() &&
                     runtime_user.password == runtime_user.uuid;
                 info.derived_key = ToPreparedKey(uuid_backed_2022_key
                     ? acpp::ss::Build2022UserKeyFromUuid(
-                        runtime_user.uuid, *cipher_info)
+                        runtime_user.uuid, cipher_info)
                     : acpp::ss::BuildMasterKey(
-                        runtime_user.password, *cipher_info));
+                        runtime_user.password, cipher_info));
                 info.identity_key = identity_key;
                 if (info.derived_key.empty()) {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",

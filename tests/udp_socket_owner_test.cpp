@@ -1,5 +1,6 @@
 #include "acppnode/app/proxyman/inbound/udp_worker.hpp"
 #include "acppnode/app/access_log_session.hpp"
+#include "acppnode/transport/async_stream.hpp"
 #include "udp_receive_buffer.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -20,15 +21,15 @@
 
 namespace {
 
-class DummyUdpHandler final : public acpp::proxyman::inbound::UdpHandler {
+class DummyDatagramHandler final : public acpp::Inbound {
 public:
-    explicit DummyUdpHandler(
+    explicit DummyDatagramHandler(
         std::shared_ptr<int> adopted_state = {})
         : adopted_state_(std::move(adopted_state)) {}
 
     void AdoptWorkerStateFrom(
-        acpp::proxyman::inbound::UdpHandler& previous) noexcept override {
-        const auto* old = dynamic_cast<const DummyUdpHandler*>(&previous);
+        acpp::Inbound& previous) noexcept override {
+        const auto* old = dynamic_cast<const DummyDatagramHandler*>(&previous);
         if (!old) {
             return;
         }
@@ -38,13 +39,21 @@ public:
         }
     }
 
+    acpp::net::awaitable<acpp::RelayResult> Process(
+        std::unique_ptr<acpp::AsyncStream>,
+        acpp::routing::Dispatcher&,
+        const acpp::proxyman::inbound::ReceiverSettings&,
+        acpp::net::io_context&,
+        acpp::session::Context&,
+        const acpp::TimeoutsConfig&,
+        uint32_t) override {
+        co_return acpp::RelayResult{};
+    }
+
     std::expected<
-        acpp::proxyman::inbound::UdpDecodeResult,
-        acpp::ErrorCode> DecodeUdp(
-        std::string_view,
-        std::string_view,
-        const uint8_t*,
-        size_t) override {
+        acpp::InboundDatagramResult,
+        acpp::ErrorCode> Process(
+        const acpp::InboundDatagramRequest&) override {
         return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -54,7 +63,7 @@ private:
 };
 
 class CountingUdpResponseContext final
-    : public acpp::proxyman::inbound::UdpResponseContext {
+    : public acpp::InboundDatagramResponse {
 public:
     acpp::buf::MultiBuffer Encode(acpp::UDPPacketView packet) override {
         ++calls;
@@ -70,7 +79,7 @@ static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().Close()));
 static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().ReplaceHandler(
-        std::declval<std::unique_ptr<acpp::proxyman::inbound::UdpHandler>>())));
+        std::declval<std::unique_ptr<acpp::Inbound>>())));
 static_assert(noexcept(
     std::declval<acpp::proxyman::inbound::UdpWorker&>().CleanupAllClientSessions()));
 static_assert(noexcept(
@@ -126,7 +135,7 @@ int main() {
         acpp::net::ip::address_v4::loopback(), 10001);
     const acpp::udp::endpoint reply_endpoint_b(
         acpp::net::ip::address_v4::loopback(), 10002);
-    const acpp::proxyman::inbound::UdpSessionOwner default_owner;
+    const acpp::InboundDatagramOwner default_owner;
 
     acpp::proxyman::inbound::UdpWorker::ClientSession failing_reply_session(
         io_context,
@@ -345,7 +354,7 @@ int main() {
     if (ec) Fail("owned UDP socket did not release its bound port");
 
     acpp::proxyman::inbound::UdpWorker worker(
-        "test-inbound", std::make_unique<DummyUdpHandler>());
+        "test-inbound", std::make_unique<DummyDatagramHandler>());
 
     for (size_t i = 0; i < 512; ++i) {
         (void)worker.EnqueueReply(
@@ -403,8 +412,8 @@ int main() {
     }
     worker.ClearReplyQueue("reply-generation");
 
-    acpp::proxyman::inbound::UdpSessionOwner owner_a;
-    acpp::proxyman::inbound::UdpSessionOwner owner_b;
+    acpp::InboundDatagramOwner owner_a;
+    acpp::InboundDatagramOwner owner_b;
     std::array<uint8_t, 16> owner_a_bytes{};
     std::array<uint8_t, 16> owner_b_bytes{};
     owner_a_bytes.fill(0x11);
@@ -546,7 +555,7 @@ int main() {
         default_owner);
     auto adopted_worker_state = std::make_shared<int>(-1);
     if (!worker.ReplaceHandler(
-            std::make_unique<DummyUdpHandler>(adopted_worker_state))) {
+            std::make_unique<DummyDatagramHandler>(adopted_worker_state))) {
         Fail("valid UDP handler replacement was rejected");
     }
     if (*adopted_worker_state != 73) {

@@ -109,7 +109,7 @@ struct UdpWorker::ClientSession::Impl {
     Impl(net::io_context& io_context,
          ReplyCallback reply_callback,
          udp::endpoint reply_endpoint,
-         UdpSessionOwner session_owner)
+         InboundDatagramOwner session_owner)
         : io_context(io_context)
         , reader_signal(io_context, 1)
         , reply_callback(std::move(reply_callback))
@@ -133,14 +133,14 @@ struct UdpWorker::ClientSession::Impl {
     bool shrink_queue_on_drain = false;
     bool closed = false;
     ErrorCode terminal_error = ErrorCode::OK;
-    UdpSessionOwner session_owner;
+    InboundDatagramOwner session_owner;
 };
 
 UdpWorker::ClientSession::ClientSession(
     net::io_context& io_context,
     ReplyCallback reply_callback,
     udp::endpoint reply_endpoint,
-    UdpSessionOwner session_owner)
+    InboundDatagramOwner session_owner)
     : impl_(std::make_unique<Impl>(
           io_context,
           std::move(reply_callback),
@@ -156,7 +156,7 @@ bool UdpWorker::ClientSession::Closed() const noexcept {
 }
 
 bool UdpWorker::ClientSession::Owns(
-    const UdpSessionOwner& owner) const noexcept {
+    const InboundDatagramOwner& owner) const noexcept {
     return impl_->session_owner.Same(owner);
 }
 
@@ -295,18 +295,20 @@ struct UdpWorker::Impl {
     using UdpSocketMap =
         memory::ThreadLocalUnorderedMap<std::string, UdpWorker::SocketPtr>;
 
-    Impl(std::string tag, std::unique_ptr<UdpHandler> proxy)
+    Impl(std::string tag, std::unique_ptr<::acpp::Inbound> proxy)
         : tag(std::move(tag))
         , proxy(std::move(proxy)) {}
 
     std::string tag;
-    std::unique_ptr<UdpHandler> proxy;
+    std::unique_ptr<::acpp::Inbound> proxy;
     UdpSocketMap udp_sockets;
     memory::ThreadLocalUnorderedMap<std::string, UdpReplyQueueState> reply_queues;
     memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap> client_sessions;
 };
 
-UdpWorker::UdpWorker(std::string tag, std::unique_ptr<UdpHandler> proxy)
+UdpWorker::UdpWorker(
+    std::string tag,
+    std::unique_ptr<::acpp::Inbound> proxy)
     : impl_(std::make_unique<Impl>(std::move(tag), std::move(proxy))) {}
 
 UdpWorker::~UdpWorker() noexcept = default;
@@ -322,7 +324,8 @@ std::string_view UdpWorker::Tag() const noexcept {
     return impl_->tag;
 }
 
-bool UdpWorker::ReplaceHandler(std::unique_ptr<UdpHandler> proxy) noexcept {
+bool UdpWorker::ReplaceHandler(
+    std::unique_ptr<::acpp::Inbound> proxy) noexcept {
     if (!proxy) {
         return false;
     }
@@ -352,8 +355,11 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         iputil::NormalizeAddressString(datagram.client_endpoint.address());
     const auto normalized_client_addr =
         iputil::NormalizeAddress(datagram.client_endpoint.address());
-    auto decoded = impl_->proxy->DecodeUdp(
-        impl_->tag, client_ip, datagram.payload.data(), datagram.payload.size());
+    auto decoded = impl_->proxy->Process(InboundDatagramRequest{
+        .tag = impl_->tag,
+        .client_ip = client_ip,
+        .payload = datagram.payload,
+    });
     if (!decoded) {
         if (datagram.receiver && datagram.receiver->access_source_ref != 0) {
             session::Context rejected_ctx;
@@ -416,7 +422,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     const bool need_new_session = !HasClientSession(socket_key, client_session_key);
 
     if (need_new_session) {
-        if (!decoded->response_context) {
+        if (!decoded->response) {
             LOG_NET_DEBUG("Worker[{}]: UDP decode missing response context for client={}",
                              datagram.worker_id, client_key_log());
             return;
@@ -461,7 +467,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->inbound.security = receiver->stream_settings.security;
         ctx->content.speed_limit = decoded->speed_limit;
 
-        auto response_context = std::move(decoded->response_context);
+        auto response_context = std::move(decoded->response);
         udp::socket* sock = datagram.sock;
         auto& reply_sink = datagram.reply_sink;
         const uint32_t worker_id = datagram.worker_id;
@@ -711,7 +717,7 @@ UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
     net::io_context& io_context,
     ReplyCallback reply_callback,
     udp::endpoint reply_endpoint,
-    UdpSessionOwner session_owner,
+    InboundDatagramOwner session_owner,
     std::chrono::steady_clock::time_point now) {
     auto session = std::make_shared<ClientSession>(
         io_context,
@@ -731,7 +737,7 @@ bool UdpWorker::PushClientPayload(
     const std::string& client_key,
     const TargetAddress& target,
     udp::endpoint reply_endpoint,
-    const UdpSessionOwner& session_owner,
+    const InboundDatagramOwner& session_owner,
     buf::MultiBuffer payload,
     std::chrono::steady_clock::time_point now) {
     auto sessions_it = impl_->client_sessions.find(socket_key);

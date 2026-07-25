@@ -279,27 +279,37 @@ proxy::vmess::inbound::Handler::Process(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
+class VmessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
+public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
+    acpp::vmess::TimedUserValidator validator;
+};
+
 const bool kVmessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vmess;
 
     reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<acpp::proxyman::inbound::ValidatorProtocolRuntime<
-            acpp::vmess::TimedUserValidator>>();
+        return std::make_unique<VmessRuntime>();
     };
 
     reg.create_tcp_handler =
-        [](const acpp::proxyman::inbound::ProtocolDeps& deps,
+        [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
-           const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
-            auto* validator = deps.ValidatorAs<acpp::vmess::TimedUserValidator>();
-            if (!validator || !deps.stats) {
+           const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
+            auto* vmess_runtime = dynamic_cast<VmessRuntime*>(&runtime);
+            if (!vmess_runtime) {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::vmess::inbound::Handler>(
-                *validator,
-                *deps.stats,
+                vmess_runtime->validator,
+                stats,
                 limiter);
         };
 

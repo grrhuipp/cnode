@@ -2,6 +2,7 @@
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <format>
@@ -19,13 +20,21 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
     std::string_view tag,
     const api::NodeInfo& node_config,
     const std::vector<api::UserInfo>& api_users) const {
-    proxyman::inbound::BuildRequest req;
-    req.tag = std::string(tag);
-    req.protocol = std::string(protocol);
-    req.cipher_method = node_config.CypherMethod.empty()
+    StaticUserConfig protocol_source;
+    protocol_source.method = node_config.CypherMethod.empty()
         ? std::string(constants::protocol::kAes256Gcm)
         : node_config.CypherMethod;
-    req.ss_identity_password = node_config.ShadowsocksServerKey;
+    protocol_source.identity_password = node_config.ShadowsocksServerKey;
+    auto req = proxyman::inbound::PrepareBuildRequest(
+        protocol,
+        tag,
+        protocol_source);
+    if (!req) {
+        LOG_WARN(
+            "BuildUsersForInbound: invalid protocol settings for '{}'",
+            protocol);
+        return std::nullopt;
+    }
 
     std::vector<proxyman::inbound::RuntimeUser> users;
     users.reserve(api_users.size());
@@ -41,7 +50,7 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
         users.push_back(std::move(user));
     }
 
-    auto result = proxyman::inbound::BuildUsers(protocol, req, users);
+    auto result = proxyman::inbound::BuildUsers(protocol, *req, users);
     if (!result) {
         LOG_WARN("BuildUsersForInbound: unsupported user builder for protocol '{}'", protocol);
     }

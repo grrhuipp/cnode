@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -17,13 +18,17 @@ namespace acpp::proxyman::inbound {
 // ============================================================================
 // BuildRequest - prepared inbound handler construction input
 // ============================================================================
+class ProtocolSettings {
+public:
+    virtual ~ProtocolSettings() noexcept = default;
+};
+
 struct BuildRequest {
     std::string tag;
     std::string protocol;
-    std::string cipher_method;  // SS uses this; other protocols may ignore it.
-    std::string ss_identity_password;
-    std::string anytls_padding_scheme;
-    std::string vless_decryption;
+    // The concrete type is private to the registered protocol implementation.
+    // Generic runtime layers only carry the immutable prepared value.
+    std::shared_ptr<const ProtocolSettings> settings;
 };
 
 struct RuntimeUser {

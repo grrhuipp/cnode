@@ -2,7 +2,6 @@
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/online_device.hpp"
@@ -36,13 +35,6 @@ struct Manager::Impl {
         return result.first->second.get();
     }
 
-    [[nodiscard]] ProtocolDeps Deps(std::string_view protocol) {
-        return ProtocolDeps{
-            .runtime = EnsureRuntime(protocol),
-            .stats = &stats,
-        };
-    }
-
     StatsShard& stats;
     RuntimeMap runtimes;
     HandlerMap handlers;
@@ -68,16 +60,24 @@ std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
     std::string_view protocol,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
+    auto* runtime = impl_->EnsureRuntime(protocol);
+    if (!runtime) {
+        return nullptr;
+    }
     return ::acpp::proxyman::inbound::NewHandler(
-        protocol, impl_->Deps(protocol), std::move(limiter), req);
+        protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
-UdpHandlerBuildResult Manager::NewUdpHandler(
+DatagramHandlerBuildResult Manager::NewDatagramHandler(
     std::string_view protocol,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
-    return ::acpp::proxyman::inbound::NewUdpHandler(
-        protocol, impl_->Deps(protocol), std::move(limiter), req);
+    auto* runtime = impl_->EnsureRuntime(protocol);
+    if (!runtime) {
+        return {DatagramHandlerBuildStatus::Failed, nullptr};
+    }
+    return ::acpp::proxyman::inbound::NewDatagramHandler(
+        protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
 Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {

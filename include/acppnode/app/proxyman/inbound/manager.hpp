@@ -17,7 +17,7 @@ struct StatsShard;
 namespace acpp::proxyman::inbound {
 
 class Handler;
-struct UdpHandlerBuildResult;
+struct DatagramHandlerBuildResult;
 // ============================================================================
 // Manager - per-Worker inbound handler manager
 //
@@ -43,7 +43,7 @@ public:
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
-    [[nodiscard]] UdpHandlerBuildResult NewUdpHandler(
+    [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
         std::string_view protocol,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);

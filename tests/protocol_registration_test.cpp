@@ -1,8 +1,9 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/udp_handler.hpp"
+#include "acppnode/app/stats.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/proxy/inbound.hpp"
+#include "acppnode/transport/async_stream.hpp"
 #include "source_config.hpp"
 
 #include <concepts>
@@ -44,23 +45,29 @@ bool Throws(Function&& function) {
 
 class DummyRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
-    void* Validator() noexcept override { return this; }
-
     std::vector<acpp::OnlineDevice>
     GetOnlineDevices(std::string_view) const override {
         return {};
     }
 };
 
-class DummyUdpHandler final : public acpp::proxyman::inbound::UdpHandler {
+class DummyDatagramHandler final : public acpp::Inbound {
 public:
+    acpp::net::awaitable<acpp::RelayResult> Process(
+        std::unique_ptr<acpp::AsyncStream>,
+        acpp::routing::Dispatcher&,
+        const acpp::proxyman::inbound::ReceiverSettings&,
+        acpp::net::io_context&,
+        acpp::session::Context&,
+        const acpp::TimeoutsConfig&,
+        uint32_t) override {
+        co_return acpp::RelayResult{};
+    }
+
     std::expected<
-        acpp::proxyman::inbound::UdpDecodeResult,
-        acpp::ErrorCode> DecodeUdp(
-        std::string_view,
-        std::string_view,
-        const uint8_t*,
-        size_t) override {
+        acpp::InboundDatagramResult,
+        acpp::ErrorCode> Process(
+        const acpp::InboundDatagramRequest&) override {
         return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
@@ -96,24 +103,27 @@ CreateInboundRuntime() {
 }
 
 std::unique_ptr<acpp::Inbound> CreateInboundHandler(
-    const acpp::proxyman::inbound::ProtocolDeps&,
+    acpp::proxyman::inbound::ProtocolRuntime&,
+    acpp::StatsShard&,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
 
-std::unique_ptr<acpp::proxyman::inbound::UdpHandler> FailUdpHandler(
-    const acpp::proxyman::inbound::ProtocolDeps&,
+std::unique_ptr<acpp::Inbound> FailDatagramHandler(
+    acpp::proxyman::inbound::ProtocolRuntime&,
+    acpp::StatsShard&,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
 
-std::unique_ptr<acpp::proxyman::inbound::UdpHandler> CreateUdpHandler(
-    const acpp::proxyman::inbound::ProtocolDeps&,
+std::unique_ptr<acpp::Inbound> CreateDatagramHandler(
+    acpp::proxyman::inbound::ProtocolRuntime&,
+    acpp::StatsShard&,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
-    return std::make_unique<DummyUdpHandler>();
+    return std::make_unique<DummyDatagramHandler>();
 }
 
 std::optional<acpp::proxyman::inbound::UserSet> BuildVmessUsers(
@@ -236,43 +246,44 @@ bool TestInboundRegistration() {
     }
 
     const acpp::proxyman::inbound::BuildRequest request;
-    const acpp::proxyman::inbound::ProtocolDeps deps;
-    auto unknown_udp = acpp::proxyman::inbound::NewUdpHandler(
-        "unknown-udp", deps, nullptr, request);
+    DummyRuntime runtime;
+    acpp::StatsShard stats;
+    auto unknown_udp = acpp::proxyman::inbound::NewDatagramHandler(
+        "unknown-udp", runtime, stats, nullptr, request);
     if (unknown_udp.status !=
-            acpp::proxyman::inbound::UdpHandlerBuildStatus::Failed ||
+            acpp::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         unknown_udp.handler) {
         return false;
     }
 
-    auto unsupported_udp = acpp::proxyman::inbound::NewUdpHandler(
-        "test-inbound", deps, nullptr, request);
+    auto unsupported_udp = acpp::proxyman::inbound::NewDatagramHandler(
+        "test-inbound", runtime, stats, nullptr, request);
     if (unsupported_udp.status !=
-            acpp::proxyman::inbound::UdpHandlerBuildStatus::Unsupported ||
+            acpp::proxyman::inbound::DatagramHandlerBuildStatus::Unsupported ||
         unsupported_udp.handler) {
         return false;
     }
 
     auto failed_udp_registration = valid;
-    failed_udp_registration.create_udp_handler = &FailUdpHandler;
+    failed_udp_registration.create_datagram_handler = &FailDatagramHandler;
     acpp::proxyman::inbound::RegisterProxy(
         "failed-udp", failed_udp_registration);
-    auto failed_udp = acpp::proxyman::inbound::NewUdpHandler(
-        "failed-udp", deps, nullptr, request);
+    auto failed_udp = acpp::proxyman::inbound::NewDatagramHandler(
+        "failed-udp", runtime, stats, nullptr, request);
     if (failed_udp.status !=
-            acpp::proxyman::inbound::UdpHandlerBuildStatus::Failed ||
+            acpp::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         failed_udp.handler) {
         return false;
     }
 
     auto ready_udp_registration = valid;
-    ready_udp_registration.create_udp_handler = &CreateUdpHandler;
+    ready_udp_registration.create_datagram_handler = &CreateDatagramHandler;
     acpp::proxyman::inbound::RegisterProxy(
         "ready-udp", ready_udp_registration);
-    auto ready_udp = acpp::proxyman::inbound::NewUdpHandler(
-        "ready-udp", deps, nullptr, request);
+    auto ready_udp = acpp::proxyman::inbound::NewDatagramHandler(
+        "ready-udp", runtime, stats, nullptr, request);
     if (ready_udp.status !=
-            acpp::proxyman::inbound::UdpHandlerBuildStatus::Ready ||
+            acpp::proxyman::inbound::DatagramHandlerBuildStatus::Ready ||
         !ready_udp.handler) {
         return false;
     }

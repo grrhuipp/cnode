@@ -682,11 +682,14 @@ set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
 set(UDP_WORKER_HEADER_PATH
     "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp")
-set(UDP_HANDLER_HEADER_PATH
-    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp")
+set(INBOUND_HANDLER_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/proxy/inbound.hpp")
+set(INBOUND_DATAGRAM_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/proxy/inbound_datagram.hpp")
 file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
 file(READ "${UDP_WORKER_HEADER_PATH}" UDP_WORKER_HEADER_SOURCE)
-file(READ "${UDP_HANDLER_HEADER_PATH}" UDP_HANDLER_HEADER_SOURCE)
+file(READ "${INBOUND_HANDLER_HEADER_PATH}" INBOUND_HANDLER_HEADER_SOURCE)
+file(READ "${INBOUND_DATAGRAM_HEADER_PATH}" INBOUND_DATAGRAM_HEADER_SOURCE)
 set(LINK_HEADER_PATH "${SOURCE_DIR}/include/acppnode/transport/link.hpp")
 file(READ "${LINK_HEADER_PATH}" LINK_HEADER_SOURCE)
 set(MUX_RELAY_SOURCE_PATH
@@ -738,19 +741,19 @@ if(NOT UDP_WORKER_SOURCE MATCHES
     message(FATAL_ERROR
         "UDP session key collisions must not cross authenticated owners")
 endif()
-if(NOT UDP_HANDLER_HEADER_SOURCE MATCHES "ScopeSessionKey" OR
+if(NOT INBOUND_DATAGRAM_HEADER_SOURCE MATCHES "ScopeSessionKey" OR
    NOT UDP_WORKER_SOURCE MATCHES
         "decoded->session_owner[.]ScopeSessionKey[(]protocol_session_key[)]")
     message(FATAL_ERROR
         "UDP protocol session IDs must be scoped by authenticated owner identity")
 endif()
-if(UDP_HANDLER_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
+if(INBOUND_DATAGRAM_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
    UDP_WORKER_SOURCE MATCHES "impl_->proxy->EncodeUdpResponse" OR
    NOT UDP_WORKER_SOURCE MATCHES "response_context->Encode[(]pkt[)]")
     message(FATAL_ERROR
         "live UDP sessions must encode replies through their captured response context")
 endif()
-if(NOT UDP_HANDLER_HEADER_SOURCE MATCHES "AdoptWorkerStateFrom" OR
+if(NOT INBOUND_HANDLER_HEADER_SOURCE MATCHES "AdoptWorkerStateFrom" OR
    NOT UDP_WORKER_SOURCE MATCHES
         "proxy->AdoptWorkerStateFrom[(][*]impl_->proxy[)]" OR
    UDP_WORKER_SOURCE MATCHES
@@ -921,4 +924,30 @@ endif()
 if(MUX_CODEC_SOURCE MATCHES "Remaining[(][)] >= 8")
     message(FATAL_ERROR
         "Mux GlobalID must be exactly eight metadata bytes")
+endif()
+
+set(INBOUND_FACTORY_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/factory.hpp")
+set(INBOUND_PREPARED_CONFIG_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/prepared_config.hpp")
+file(READ "${INBOUND_FACTORY_HEADER}" INBOUND_FACTORY_HEADER_SOURCE)
+file(READ "${INBOUND_PREPARED_CONFIG_HEADER}"
+    INBOUND_PREPARED_CONFIG_HEADER_SOURCE)
+if(EXISTS
+   "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp" OR
+   INBOUND_FACTORY_HEADER_SOURCE MATCHES
+       "UdpHandler|ProtocolDeps|ValidatorAs|void[*][ \t]+Validator" OR
+   NOT INBOUND_FACTORY_HEADER_SOURCE MATCHES
+       "create_datagram_handler" OR
+   NOT INBOUND_HANDLER_HEADER_SOURCE MATCHES
+       "Process[(]const InboundDatagramRequest&")
+    message(FATAL_ERROR
+        "native UDP must use the common Inbound handler/runtime boundary")
+endif()
+if(INBOUND_PREPARED_CONFIG_HEADER_SOURCE MATCHES
+       "cipher_method|ss_identity_password|anytls_padding_scheme|vless_decryption" OR
+   NOT INBOUND_PREPARED_CONFIG_HEADER_SOURCE MATCHES
+       "shared_ptr<const ProtocolSettings> settings")
+    message(FATAL_ERROR
+        "generic prepared inbound config must not expose protocol-specific fields")
 endif()

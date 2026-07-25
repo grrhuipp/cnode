@@ -39,12 +39,16 @@ PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
             entry.protocol + "'");
     }
 
-    entry.build_request.tag = entry.tag;
-    entry.build_request.protocol = entry.protocol;
-    entry.build_request.cipher_method = source.static_users.method;
-    entry.build_request.ss_identity_password = source.static_users.identity_password;
-    entry.build_request.anytls_padding_scheme = source.static_users.padding_scheme;
-    entry.build_request.vless_decryption = source.static_users.vless_decryption;
+    auto build_request = proxyman::inbound::PrepareBuildRequest(
+        entry.protocol,
+        entry.tag,
+        source.static_users);
+    if (!build_request) {
+        throw std::invalid_argument(
+            "static inbound '" + entry.tag +
+            "' has invalid protocol settings");
+    }
+    entry.build_request = std::move(*build_request);
 
     auto users = proxyman::inbound::BuildStaticUsers(
         entry.protocol,
