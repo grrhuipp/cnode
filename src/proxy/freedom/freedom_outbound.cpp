@@ -5,7 +5,7 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../app/proxyman/outbound/source_config.hpp"
+#include "../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
@@ -536,7 +536,7 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
 namespace {
 const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kFreedom,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
         acpp::proxy::freedom::outbound::FreedomSettings settings;

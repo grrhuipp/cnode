@@ -320,6 +320,7 @@ set(CNODE_SOURCES
     src/infra/config_loader.cpp
     src/infra/config_semantics.cpp
     src/infra/config_validation.cpp
+    src/infra/outbound_source_config.cpp
 
     # App - DNS
     src/app/dns/dns.cpp
@@ -362,11 +363,10 @@ set(CNODE_SOURCES
     src/app/proxyman/inbound/factory.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/proxyman/inbound/manager.cpp
-    src/app/proxyman/inbound/tcp_worker.cpp
-    src/app/proxyman/inbound/udp_worker.cpp
+    src/app/worker/tcp_listener.cpp
+    src/app/worker/udp_ingress.cpp
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
-    src/app/proxyman/outbound/source_config.cpp
     src/app/proxyman/outbound/manager.cpp
     src/app/worker.cpp
     src/service/controller/controller.cpp
@@ -1414,11 +1414,12 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_inbound_listen_test
         tests/inbound_listen_test.cpp
-        src/app/proxyman/inbound/tcp_worker.cpp
+        src/app/worker/tcp_listener.cpp
         src/transport/internet/inbound_listen.cpp
     )
     target_include_directories(cnode_inbound_listen_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
     )
     target_link_libraries(cnode_inbound_listen_test PRIVATE
         asio::asio
@@ -1554,7 +1555,7 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
-        src/app/proxyman/inbound/udp_worker.cpp
+        src/app/worker/udp_ingress.cpp
         src/common/session.cpp
         src/infra/log.cpp
     )
@@ -1940,6 +1941,12 @@ if(CNODE_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND}
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_public_surface_contract_test.cmake)
+
+    add_test(
+        NAME cnode_architecture_layering_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/architecture_layering_contract_test.cmake)
 
     add_test(
         NAME cnode_worker_runtime_transaction_contract_test

@@ -154,7 +154,6 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                     proxyman::inbound::RoutePolicy::RouteWithFallback(inbound.tag),
                     access_source_ref);
                 return [](Worker* current,
-                          std::string protocol,
                           ConnectionLimiterPtr current_limiter,
                           proxyman::inbound::BuildRequest request,
                           proxyman::inbound::ReceiverSettings current_receiver,
@@ -162,13 +161,11 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                     *result = co_await net::co_spawn(
                         current->GetExecutor(),
                         current->RegisterInboundTask(
-                            std::move(protocol),
                             current_limiter,
                             std::move(request),
                             std::move(current_receiver)),
                         net::use_awaitable);
                 }(&worker,
-                  inbound.protocol,
                   limiter,
                   inbound.handler_request,
                   std::move(receiver),
@@ -189,7 +186,6 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                 auto* limiter = limiters_[worker.Id()].get();
                 return [](Worker* current,
                           PortBinding binding,
-                          std::string protocol,
                           ConnectionLimiterPtr current_limiter,
                           proxyman::inbound::BuildRequest request,
                           WorkerBindResult* result) -> net::awaitable<void> {
@@ -204,13 +200,11 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                         current->GetExecutor(),
                         current->AddUdpListenerTask(
                             std::move(binding),
-                            std::move(protocol),
                             current_limiter,
                             std::move(request)),
                         net::use_awaitable);
                 }(&worker,
                   inbound.binding,
-                  inbound.protocol,
                   limiter,
                   inbound.handler_request,
                   &bound[index]);

@@ -3,7 +3,7 @@
 #include "../udp_framing.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -387,7 +387,7 @@ proxy::trojan::outbound::Handler::Process(
 namespace {
 const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kTrojan,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
 

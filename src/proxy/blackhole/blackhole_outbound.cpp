@@ -1,6 +1,6 @@
 #include "blackhole_outbound.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../app/proxyman/outbound/source_config.hpp"
+#include "../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
@@ -66,7 +66,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 namespace {
 const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kBlackhole,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         acpp::proxy::blackhole::outbound::BlackholeSettings settings;
         if (const auto* p = cfg.settings.if_contains("response")) {

@@ -2,7 +2,6 @@
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/string_hash.hpp"
@@ -57,27 +56,25 @@ Manager::GetHandler(std::string_view tag) const noexcept {
 }
 
 std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
-    std::string_view protocol,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
-    auto* runtime = impl_->EnsureRuntime(protocol);
+    auto* runtime = impl_->EnsureRuntime(req.protocol);
     if (!runtime) {
         return nullptr;
     }
     return ::acpp::proxyman::inbound::NewHandler(
-        protocol, *runtime, impl_->stats, std::move(limiter), req);
+        req.protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
 DatagramHandlerBuildResult Manager::NewDatagramHandler(
-    std::string_view protocol,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
-    auto* runtime = impl_->EnsureRuntime(protocol);
+    auto* runtime = impl_->EnsureRuntime(req.protocol);
     if (!runtime) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
     return ::acpp::proxyman::inbound::NewDatagramHandler(
-        protocol, *runtime, impl_->stats, std::move(limiter), req);
+        req.protocol, *runtime, impl_->stats, std::move(limiter), req);
 }
 
 Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
@@ -113,17 +110,6 @@ Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const
         return it->second->GetOnlineDevices(tag);
     }
     return {};
-}
-
-Manager::UserMemoryStats Manager::GetUserMemoryStats() const noexcept {
-    const auto stats = UserStore::GetStats();
-    return UserMemoryStats{
-        stats.vmess_accounts,
-        stats.vless_users,
-        stats.trojan_users,
-        stats.shadowsocks_users,
-        stats.anytls_users,
-    };
 }
 
 }  // namespace acpp::proxyman::inbound

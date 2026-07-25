@@ -75,7 +75,6 @@ public:
 
     // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行。
     net::awaitable<bool> RegisterInboundTask(
-        std::string protocol,
         ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req,
         proxyman::inbound::ReceiverSettings receiver);
@@ -84,7 +83,6 @@ public:
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
     net::awaitable<bool> AddUdpListenerTask(
         PortBinding binding,
-        std::string protocol,
         ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req);
 
@@ -135,7 +133,6 @@ private:
     struct RuntimeState;
 
     [[nodiscard]] bool RegisterInboundOnWorkerThread(
-        std::string_view protocol,
         ConnectionLimiterPtr limiter,
         const proxyman::inbound::BuildRequest& req,
         proxyman::inbound::ReceiverSettings receiver);

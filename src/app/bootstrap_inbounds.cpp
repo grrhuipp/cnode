@@ -100,7 +100,6 @@ net::awaitable<bool> SetupWorkerInbounds(
             0);  // Custom/static inbounds never enter centralized access logs.
 
         if (!co_await worker.RegisterInboundTask(
-                inbound.protocol,
                 connection_limiter,
                 inbound.build_request,
                 std::move(receiver))) {
@@ -120,7 +119,6 @@ net::awaitable<bool> SetupWorkerInbounds(
 
         if (!co_await worker.AddUdpListenerTask(
                 binding,
-                inbound.protocol,
                 connection_limiter,
                 inbound.build_request)) {
             co_await RemoveInstalledInbounds(worker, installed, inbound.tag);

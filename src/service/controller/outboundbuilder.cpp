@@ -1,9 +1,10 @@
 #include "outboundbuilder.hpp"
 
 #include "acppnode/core/constants.hpp"
+#include "acppnode/infra/outbound_source_config.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include "../../app/proxyman/outbound/source_config.hpp"
+#include "../../app/proxyman/outbound/registration.hpp"
 
 namespace acpp::controller {
 
@@ -21,7 +22,7 @@ std::optional<proxyman::outbound::PreparedOutboundConfig> OutboundBuilder(
         }
     }
 
-    proxyman::outbound::OutboundSourceConfig source;
+    infra::OutboundSourceConfig source;
     source.tag = tag;
     source.protocol = std::string(constants::protocol::kFreedom);
     source.send_through = panel_config

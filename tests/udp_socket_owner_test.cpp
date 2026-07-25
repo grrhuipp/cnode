@@ -1,4 +1,4 @@
-#include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "worker/udp_ingress.hpp"
 #include "acppnode/app/access_log_session.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "udp_receive_buffer.hpp"
@@ -76,17 +76,17 @@ public:
 };
 
 static_assert(noexcept(
-    std::declval<acpp::proxyman::inbound::UdpWorker&>().Close()));
+    std::declval<acpp::worker_detail::UdpIngress&>().Close()));
 static_assert(noexcept(
-    std::declval<acpp::proxyman::inbound::UdpWorker&>().ReplaceHandler(
+    std::declval<acpp::worker_detail::UdpIngress&>().ReplaceHandler(
         std::declval<std::unique_ptr<acpp::Inbound>>())));
 static_assert(noexcept(
-    std::declval<acpp::proxyman::inbound::UdpWorker&>().CleanupAllClientSessions()));
+    std::declval<acpp::worker_detail::UdpIngress&>().CleanupAllClientSessions()));
 static_assert(noexcept(
-    std::declval<acpp::proxyman::inbound::UdpWorker&>().CloseSocket(
+    std::declval<acpp::worker_detail::UdpIngress&>().CloseSocket(
         std::declval<const std::string&>())));
 static_assert(noexcept(
-    std::declval<acpp::proxyman::inbound::UdpWorker&>().CloseAllSockets()));
+    std::declval<acpp::worker_detail::UdpIngress&>().CloseAllSockets()));
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -137,7 +137,7 @@ int main() {
         acpp::net::ip::address_v4::loopback(), 10002);
     const acpp::InboundDatagramOwner default_owner;
 
-    acpp::proxyman::inbound::UdpWorker::ClientSession failing_reply_session(
+    acpp::worker_detail::UdpIngress::ClientSession failing_reply_session(
         io_context,
         acpp::RoutedPacketCallback{
             [](acpp::UDPPacketView, const acpp::udp::endpoint&) { throw 9; }},
@@ -163,7 +163,7 @@ int main() {
     io_context.restart();
 
     size_t raw_reply_callbacks = 0;
-    acpp::proxyman::inbound::UdpWorker::ClientSession raw_reply_session(
+    acpp::worker_detail::UdpIngress::ClientSession raw_reply_session(
         io_context,
         acpp::RoutedPacketCallback{
             [&](acpp::UDPPacketView, const acpp::udp::endpoint&) {
@@ -202,7 +202,7 @@ int main() {
     size_t large_callback_count = 0;
     bool large_callback_matches = false;
     acpp::udp::endpoint observed_reply_endpoint;
-    acpp::proxyman::inbound::UdpWorker::ClientSession large_reply_session(
+    acpp::worker_detail::UdpIngress::ClientSession large_reply_session(
         io_context,
         acpp::RoutedPacketCallback{[&](
             acpp::UDPPacketView packet,
@@ -257,7 +257,7 @@ int main() {
     }
     io_context.restart();
 
-    acpp::proxyman::inbound::UdpWorker::ClientSession bounded_input_session(
+    acpp::worker_detail::UdpIngress::ClientSession bounded_input_session(
         io_context,
         acpp::RoutedPacketCallback{
             [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
@@ -281,7 +281,7 @@ int main() {
     }
     bounded_input_session.Close();
 
-    auto first = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
+    auto first = acpp::worker_detail::UdpIngress::MakeSocket(io_context);
     first->open(acpp::udp::v4(), ec);
     if (ec) Fail("failed to open first UDP socket");
     first->bind(acpp::udp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
@@ -347,13 +347,13 @@ int main() {
     }
     io_context.restart();
 
-    auto second = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
+    auto second = acpp::worker_detail::UdpIngress::MakeSocket(io_context);
     second->open(acpp::udp::v4(), ec);
     if (ec) Fail("failed to open second UDP socket");
     second->bind(endpoint, ec);
     if (ec) Fail("owned UDP socket did not release its bound port");
 
-    acpp::proxyman::inbound::UdpWorker worker(
+    acpp::worker_detail::UdpIngress worker(
         "test-inbound", std::make_unique<DummyDatagramHandler>());
 
     for (size_t i = 0; i < 512; ++i) {
@@ -374,7 +374,7 @@ int main() {
 
     if (worker.EnqueueReply(
             "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
-        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
+        acpp::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the first UDP reply generation");
     }
     auto stale_reply = worker.BeginReplySend("reply-generation");
@@ -385,7 +385,7 @@ int main() {
 
     if (worker.EnqueueReply(
             "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
-        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
+        acpp::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the replacement UDP reply generation");
     }
     auto active_reply = worker.BeginReplySend("reply-generation");
@@ -397,7 +397,7 @@ int main() {
     }
     if (worker.EnqueueReply(
             "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
-        acpp::proxyman::inbound::UdpWorker::ReplyEnqueueResult::Queued) {
+        acpp::worker_detail::UdpIngress::ReplyEnqueueResult::Queued) {
         Fail("stale UDP reply completion released a replacement queue");
     }
     if (!worker.CompleteReplySend("reply-generation", *active_reply)) {
@@ -486,7 +486,7 @@ int main() {
         Fail("UDP session ID collision blocked a different authenticated owner");
     }
 
-    acpp::proxyman::inbound::UdpWorker::ClientSession overflow_session(
+    acpp::worker_detail::UdpIngress::ClientSession overflow_session(
         io_context,
         acpp::RoutedPacketCallback{
             [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
@@ -531,7 +531,7 @@ int main() {
         Fail("failed to attach initial UDP socket");
     }
 
-    auto duplicate = acpp::proxyman::inbound::UdpWorker::MakeSocket(io_context);
+    auto duplicate = acpp::worker_detail::UdpIngress::MakeSocket(io_context);
     duplicate->open(acpp::udp::v4(), ec);
     if (ec) Fail("failed to open duplicate UDP socket");
     if (worker.AttachSocket("stable-socket", std::move(duplicate)) != nullptr) {
@@ -542,7 +542,7 @@ int main() {
     }
 
     auto response_context = std::make_shared<CountingUdpResponseContext>();
-    acpp::proxyman::inbound::UdpWorker::ClientSession snapshot_reply_session(
+    acpp::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
         io_context,
         acpp::RoutedPacketCallback{
             [response_context](
@@ -617,7 +617,7 @@ int main() {
 
     return 0;
 }
-// This ownership-focused target compiles UdpWorker without the production
+// This ownership-focused target compiles UdpIngress without the production
 // reporter graph. Keep the access-log boundary inert here; its admission and
 // UDP failure contracts are covered by their dedicated tests.
 namespace acpp::app {

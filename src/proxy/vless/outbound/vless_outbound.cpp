@@ -9,7 +9,7 @@
 #include "../vless_vision.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -942,7 +942,7 @@ proxy::vless::outbound::Handler::Process(
 namespace {
 const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kVless,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         auto json_string = [](const acpp::json::object& obj,
                               std::string_view key) -> std::string {

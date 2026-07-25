@@ -18,8 +18,8 @@
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
-#include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "worker/tcp_listener.hpp"
+#include "worker/udp_ingress.hpp"
 #include "acppnode/app/proxyman/outbound/manager.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/dns/dns.hpp"
@@ -52,12 +52,12 @@ struct Worker::ListenerSlot {
     // 配置热更新只替换当前 inbound handler；每个已接受连接复制 shared_ptr，
     // 让 HTTP/2/gRPC/XHTTP detached 逻辑子流覆盖 handler 的完整生命周期。
     std::shared_ptr<proxyman::inbound::Handler> handler;
-    std::unique_ptr<proxyman::inbound::TcpWorker> tcp_worker;
+    std::unique_ptr<worker_detail::TcpListenerOwner> tcp_worker;
     std::optional<PortBinding> tcp_binding;
     std::optional<PortBinding> udp_binding;
 };
 
-struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
+struct Worker::ListenerState : worker_detail::UdpReplySink {
     using ListenerSlotMap =
         memory::ThreadLocalUnorderedMap<std::string, ListenerSlot>;
     using ListenerKeys = memory::ThreadLocalVector<std::string>;
@@ -65,7 +65,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
     memory::ThreadLocalUnorderedMap<std::string, std::string> tcp_listener_tags;
     ListenerSlotMap listener_slots;
     memory::ThreadLocalUnorderedMap<std::string, std::string> udp_socket_tags;
-    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<proxyman::inbound::UdpWorker>>
+    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<worker_detail::UdpIngress>>
         udp_workers;
 
     [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
@@ -87,7 +87,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         Worker& worker,
         std::string listener_key,
         std::string tag,
-        proxyman::inbound::TcpWorker::AcceptorPtr acceptor,
+        worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
         ListenerSlot* slot);
 
     net::awaitable<void> ProcessReceivedConnection(
@@ -100,12 +100,12 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         Worker& worker,
         std::string socket_key,
         std::string tag,
-        proxyman::inbound::UdpWorker::SocketPtr sock,
+        worker_detail::UdpIngress::SocketPtr sock,
         ListenerSlot* listener_slot);
 
-    [[nodiscard]] proxyman::inbound::UdpWorker*
+    [[nodiscard]] worker_detail::UdpIngress*
     FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept;
-    [[nodiscard]] const proxyman::inbound::UdpWorker*
+    [[nodiscard]] const worker_detail::UdpIngress*
     FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept;
 
     [[nodiscard]] bool EnqueueUdpReply(
@@ -115,7 +115,7 @@ struct Worker::ListenerState : proxyman::inbound::UdpReplySink {
         buf::MultiBuffer payload,
         uint32_t worker_id) override;
     void StartUdpReplySend(const std::string& tag,
-                           proxyman::inbound::UdpWorker::SocketPtr sock,
+                           worker_detail::UdpIngress::SocketPtr sock,
                            uint32_t worker_id);
 };
 
@@ -322,7 +322,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
 
     PortBinding committed_binding = binding;
     auto replacement_worker =
-        std::make_unique<proxyman::inbound::TcpWorker>(binding.tag);
+        std::make_unique<worker_detail::TcpListenerOwner>(binding.tag);
     ListenerKeys prepared_listener_keys;
     decltype(tcp_listener_tags) prepared_listener_tags;
 
@@ -472,7 +472,7 @@ void Worker::ListenerState::StopListening(
     }
 }
 
-proxyman::inbound::UdpWorker*
+worker_detail::UdpIngress*
 Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept {
     auto tag_it = udp_socket_tags.find(socket_key);
     if (tag_it == udp_socket_tags.end()) {
@@ -485,7 +485,7 @@ Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) n
     return worker_it->second.get();
 }
 
-const proxyman::inbound::UdpWorker*
+const worker_detail::UdpIngress*
 Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept {
     auto tag_it = udp_socket_tags.find(socket_key);
     if (tag_it == udp_socket_tags.end()) {
@@ -569,17 +569,17 @@ bool Worker::ListenerState::EnqueueUdpReply(
 
     const auto admitted = udp_worker->EnqueueReply(
         tag, std::move(endpoint), std::move(payload));
-    if (admitted == proxyman::inbound::UdpWorker::ReplyEnqueueResult::Rejected) {
+    if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::Rejected) {
         return false;
     }
-    if (admitted == proxyman::inbound::UdpWorker::ReplyEnqueueResult::StartSend) {
+    if (admitted == worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
         StartUdpReplySend(tag, udp_worker->FindSocket(tag), worker_id);
     }
     return true;
 }
 
 void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
-                                              proxyman::inbound::UdpWorker::SocketPtr sock,
+                                              worker_detail::UdpIngress::SocketPtr sock,
                                               uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
     if (!udp_worker || !sock ||
@@ -593,9 +593,9 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
     }
 
     const auto send_buffers =
-        proxyman::inbound::UdpWorker::ReplySendBuffers(*packet);
+        worker_detail::UdpIngress::ReplySendBuffers(*packet);
     const auto endpoint =
-        proxyman::inbound::UdpWorker::ReplyEndpoint(*packet);
+        worker_detail::UdpIngress::ReplyEndpoint(*packet);
 
     sock->async_send_to(
         send_buffers,
@@ -630,7 +630,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
     Worker& worker,
     std::string listener_key,
     std::string tag,
-    proxyman::inbound::TcpWorker::AcceptorPtr acceptor,
+    worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
     ListenerSlot* slot) {
     const auto owns_acceptor = [&]() {
         return acceptor && slot && slot->tcp_worker &&
@@ -762,14 +762,13 @@ net::awaitable<void> Worker::ShutdownTask() {
 }
 
 bool Worker::RegisterInboundOnWorkerThread(
-    std::string_view protocol,
     ConnectionLimiterPtr limiter,
     const proxyman::inbound::BuildRequest& req,
     proxyman::inbound::ReceiverSettings receiver) {
-    auto handler = runtime_->inbound_manager->NewHandler(protocol, limiter, req);
+    auto handler = runtime_->inbound_manager->NewHandler(limiter, req);
     if (!handler) {
         LOG_WARN("Worker[{}]: failed to create inbound handler tag={} protocol={}",
-                 id_, receiver.inbound_tag, protocol);
+                 id_, receiver.inbound_tag, req.protocol);
         return false;
     }
     auto inbound_handler =
@@ -800,12 +799,11 @@ bool Worker::RegisterInboundOnWorkerThread(
 }
 
 net::awaitable<bool> Worker::RegisterInboundTask(
-    std::string protocol,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req,
     proxyman::inbound::ReceiverSettings receiver) {
     co_return RegisterInboundOnWorkerThread(
-        protocol, limiter, req, std::move(receiver));
+        limiter, req, std::move(receiver));
 }
 
 void Worker::AddOutboundOnWorkerThread(
@@ -983,16 +981,15 @@ Worker::CollectRuntimeStatsTask() const {
 // UDP 监听（SO_REUSEPORT，与 TCP acceptor 同端口）
 //
 // 具体的解码、认证和 ban 逻辑委托给统一 Inbound；Worker 只维护监听
-// socket 与当前 Worker-local UdpWorker 生命周期。
+// socket 与当前 Worker-local UDP ingress 生命周期。
 // ============================================================================
 
 net::awaitable<bool> Worker::AddUdpListenerTask(
     PortBinding binding,
-    std::string protocol,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req) {
     auto result =
-        runtime_->inbound_manager->NewDatagramHandler(protocol, limiter, req);
+        runtime_->inbound_manager->NewDatagramHandler(limiter, req);
     switch (result.status) {
         case proxyman::inbound::DatagramHandlerBuildStatus::Unsupported:
             co_return true;
@@ -1034,7 +1031,7 @@ bool Worker::ListenerState::StartUdpListening(
 
     PortBinding committed_binding = binding;
     auto replacement_worker =
-        std::make_unique<proxyman::inbound::UdpWorker>(
+        std::make_unique<worker_detail::UdpIngress>(
             binding.tag, std::move(handler));
     ListenerKeys prepared_socket_keys;
     decltype(udp_socket_tags) prepared_socket_tags;
@@ -1155,8 +1152,8 @@ bool Worker::ListenerState::StartUdpListening(
 // UdpReceiveLoop — 通用 UDP 数据报收发主循环（协议无关）
 //
 // 设计参考 xray-core transport/internet/udp.Dispatcher：
-//   - Worker 只做 UDP socket 收发；inbound UDP datagram 处理下沉到 UdpWorker。
-//   - 每个客户端 (IP:port) 由 UdpWorker 维护一个 transport::Link，首包创建后
+//   - Worker 只做 UDP socket 收发；inbound UDP datagram 处理下沉到私有 ingress。
+//   - 每个客户端 (IP:port) 由 UDP ingress 维护一个 transport::Link，首包创建后
 //     交给 dispatcher.Dispatch；路由、出站选择和 UDP relay 均在主链路内完成。
 //   - 会话空闲超过配置的 session idle 后关闭 link，relay 自然退出。
 // ============================================================================
@@ -1165,12 +1162,12 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
     std::string socket_key,
     std::string tag,
-    proxyman::inbound::UdpWorker::SocketPtr sock,
+    worker_detail::UdpIngress::SocketPtr sock,
     ListenerSlot* listener_slot) {
     const auto runtime_snapshot = worker.runtime_->Snapshot();
     const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
 
-    const auto find_current_worker = [&]() -> proxyman::inbound::UdpWorker* {
+    const auto find_current_worker = [&]() -> worker_detail::UdpIngress* {
         auto* current = FindUdpWorkerBySocketKey(socket_key);
         return current && current->OwnsSocket(socket_key, sock.get())
             ? current
@@ -1225,7 +1222,7 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
                 ? &listener_slot->handler->ReceiverSettings()
                 : nullptr;
 
-        udp_worker->ProcessDatagram(proxyman::inbound::UdpDatagramContext{
+        udp_worker->ProcessDatagram(worker_detail::UdpDatagramContext{
             .socket_key = socket_key,
             .sock = sock.get(),
             .client_endpoint = client_ep,

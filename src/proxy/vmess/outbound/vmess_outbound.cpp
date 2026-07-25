@@ -4,7 +4,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -296,7 +296,7 @@ proxy::vmess::outbound::Handler::Process(
 namespace {
 const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kVmess,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         const auto& s = cfg.settings;
 

@@ -20,11 +20,13 @@ struct TimeoutsConfig;
 namespace routing {
 class Dispatcher;
 }
+
+namespace proxyman::inbound {
+struct ReceiverSettings;
+}
 }  // namespace acpp
 
-namespace acpp::proxyman::inbound {
-
-struct ReceiverSettings;
+namespace acpp::worker_detail {
 
 class UdpReplySink {
 public:
@@ -43,7 +45,7 @@ struct UdpDatagramContext {
     udp::socket* sock = nullptr;
     udp::endpoint client_endpoint;
     std::span<const uint8_t> payload;
-    const ReceiverSettings* receiver = nullptr;
+    const proxyman::inbound::ReceiverSettings* receiver = nullptr;
     net::io_context& io_context;
     routing::Dispatcher& dispatcher;
     StatsShard& stats;
@@ -54,13 +56,8 @@ struct UdpDatagramContext {
     UdpReplySink& reply_sink;
 };
 
-// ============================================================================
-// UdpWorker - per-Worker UDP inbound worker
-//
-// 对齐 xray-core app/proxyman/inbound udpWorker 的职责起点：绑定 tag 和
-// inbound UDP handler 实例。SO_REUSEPORT socket 与回包队列归属当前 Worker。
-// ============================================================================
-class UdpWorker final {
+// Worker-private owner for native UDP sockets, client sessions and reply queues.
+class UdpIngress final {
 public:
     // Handles remain Worker-local; receive/send operations retain them only
     // across their own asynchronous cancellation boundary.
@@ -83,13 +80,13 @@ public:
     using PendingUdpReplyPtr =
         std::unique_ptr<PendingUdpReply, PendingUdpReplyDeleter>;
 
-    UdpWorker(std::string tag, std::unique_ptr<::acpp::Inbound> proxy);
-    ~UdpWorker() noexcept;
+    UdpIngress(std::string tag, std::unique_ptr<::acpp::Inbound> proxy);
+    ~UdpIngress() noexcept;
 
-    UdpWorker(const UdpWorker&) = delete;
-    UdpWorker& operator=(const UdpWorker&) = delete;
-    UdpWorker(UdpWorker&&) noexcept;
-    UdpWorker& operator=(UdpWorker&&) noexcept;
+    UdpIngress(const UdpIngress&) = delete;
+    UdpIngress& operator=(const UdpIngress&) = delete;
+    UdpIngress(UdpIngress&&) noexcept;
+    UdpIngress& operator=(UdpIngress&&) noexcept;
 
     [[nodiscard]] std::string_view Tag() const noexcept;
 
@@ -167,7 +164,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-class UdpWorker::ClientSession final
+class UdpIngress::ClientSession final
     : public transport::MultiBufferReader,
       public transport::MultiBufferWriter {
 public:
@@ -200,4 +197,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace acpp::worker_detail

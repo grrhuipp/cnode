@@ -13,7 +13,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -1089,7 +1089,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 namespace {
 const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kAnyTLS,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         auto settings = acpp::proxy::anytls::outbound::ParseSettings(cfg.settings);
         if (!settings) {

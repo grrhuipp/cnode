@@ -4,7 +4,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
-#include "source_config.hpp"
+#include "registration.hpp"
 
 #include <concepts>
 #include <iostream>
@@ -143,7 +143,7 @@ std::optional<acpp::proxyman::inbound::UserSet> BuildTrojanUsers(
 
 std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateOutboundConfig(
-    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view tag,
            acpp::net::io_context&,
@@ -156,7 +156,7 @@ CreateOutboundConfig(
 
 std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateMismatchedOutboundConfig(
-    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view,
            acpp::net::io_context&,
@@ -169,7 +169,7 @@ CreateMismatchedOutboundConfig(
 
 std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateNullOutboundConfig(
-    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view,
            acpp::net::io_context&,
@@ -182,7 +182,7 @@ CreateNullOutboundConfig(
 
 std::optional<acpp::proxyman::outbound::PreparedOutboundCreator>
 CreateEmptyOutboundConfig(
-    const acpp::proxyman::outbound::OutboundSourceConfig&) {
+    const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{};
 }
 
@@ -345,7 +345,7 @@ bool TestOutboundRegistration() {
         return false;
     }
 
-    acpp::proxyman::outbound::OutboundSourceConfig source;
+    acpp::infra::OutboundSourceConfig source;
     source.tag = "source-owned-tag";
     source.protocol = "test-outbound";
     auto prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);

@@ -1,4 +1,4 @@
-#include "acppnode/app/proxyman/inbound/udp_worker.hpp"
+#include "udp_ingress.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/access_log_session.hpp"
@@ -21,9 +21,9 @@
 
 #include <unordered_map>
 
-namespace acpp::proxyman::inbound {
+namespace acpp::worker_detail {
 
-class UdpWorker::PendingUdpReply {
+class UdpIngress::PendingUdpReply {
 public:
     udp::endpoint endpoint;
     buf::MultiBuffer payload;
@@ -87,14 +87,14 @@ constexpr size_t kMaxQueuedUdpBytes = 512 * 1024;
 }
 
 struct UdpReplyQueueState {
-    memory::ThreadLocalDeque<UdpWorker::PendingUdpReply> pending;
+    memory::ThreadLocalDeque<UdpIngress::PendingUdpReply> pending;
     size_t queued_bytes = 0;
-    UdpWorker::PendingUdpReply* active_reply = nullptr;
+    UdpIngress::PendingUdpReply* active_reply = nullptr;
     bool shrink_pending_on_drain = false;
 };
 
 struct UdpClientSession {
-    UdpWorker::ClientSessionPtr link;
+    UdpIngress::ClientSessionPtr link;
     std::chrono::steady_clock::time_point last_active;
 };
 
@@ -105,7 +105,7 @@ using UdpClientSessionMap =
 
 }  // namespace
 
-struct UdpWorker::ClientSession::Impl {
+struct UdpIngress::ClientSession::Impl {
     Impl(net::io_context& io_context,
          ReplyCallback reply_callback,
          udp::endpoint reply_endpoint,
@@ -136,7 +136,7 @@ struct UdpWorker::ClientSession::Impl {
     InboundDatagramOwner session_owner;
 };
 
-UdpWorker::ClientSession::ClientSession(
+UdpIngress::ClientSession::ClientSession(
     net::io_context& io_context,
     ReplyCallback reply_callback,
     udp::endpoint reply_endpoint,
@@ -147,25 +147,25 @@ UdpWorker::ClientSession::ClientSession(
           std::move(reply_endpoint),
           std::move(session_owner))) {}
 
-UdpWorker::ClientSession::~ClientSession() noexcept {
+UdpIngress::ClientSession::~ClientSession() noexcept {
     Close();
 }
 
-bool UdpWorker::ClientSession::Closed() const noexcept {
+bool UdpIngress::ClientSession::Closed() const noexcept {
     return impl_->closed;
 }
 
-bool UdpWorker::ClientSession::Owns(
+bool UdpIngress::ClientSession::Owns(
     const InboundDatagramOwner& owner) const noexcept {
     return impl_->session_owner.Same(owner);
 }
 
-void UdpWorker::ClientSession::UpdateReplyEndpoint(
+void UdpIngress::ClientSession::UpdateReplyEndpoint(
     udp::endpoint endpoint) noexcept {
     impl_->reply_endpoint = std::move(endpoint);
 }
 
-bool UdpWorker::ClientSession::Push(
+bool UdpIngress::ClientSession::Push(
     const TargetAddress& target,
     buf::MultiBuffer payload) {
     const size_t payload_size = buf::TotalLen(payload);
@@ -195,11 +195,11 @@ bool UdpWorker::ClientSession::Push(
     return true;
 }
 
-void UdpWorker::ClientSession::Close() noexcept {
+void UdpIngress::ClientSession::Close() noexcept {
     CloseWithError(ErrorCode::OK);
 }
 
-void UdpWorker::ClientSession::CloseWithError(ErrorCode error) noexcept {
+void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
     if (impl_->closed) {
         return;
     }
@@ -211,7 +211,7 @@ void UdpWorker::ClientSession::CloseWithError(ErrorCode error) noexcept {
 }
 
 net::awaitable<buf::MultiBuffer>
-UdpWorker::ClientSession::ReadMultiBuffer() {
+UdpIngress::ClientSession::ReadMultiBuffer() {
     while (true) {
         if (!impl_->input_queue.empty()) {
             auto input = std::move(impl_->input_queue.front());
@@ -244,7 +244,7 @@ UdpWorker::ClientSession::ReadMultiBuffer() {
 }
 
 net::awaitable<void>
-UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
+UdpIngress::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (impl_->closed || !impl_->reply_callback) {
         mb.clear();
         throw IoSystemError(
@@ -291,9 +291,9 @@ UdpWorker::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
     co_return;
 }
 
-struct UdpWorker::Impl {
+struct UdpIngress::Impl {
     using UdpSocketMap =
-        memory::ThreadLocalUnorderedMap<std::string, UdpWorker::SocketPtr>;
+        memory::ThreadLocalUnorderedMap<std::string, UdpIngress::SocketPtr>;
 
     Impl(std::string tag, std::unique_ptr<::acpp::Inbound> proxy)
         : tag(std::move(tag))
@@ -306,25 +306,25 @@ struct UdpWorker::Impl {
     memory::ThreadLocalUnorderedMap<std::string, UdpClientSessionMap> client_sessions;
 };
 
-UdpWorker::UdpWorker(
+UdpIngress::UdpIngress(
     std::string tag,
     std::unique_ptr<::acpp::Inbound> proxy)
     : impl_(std::make_unique<Impl>(std::move(tag), std::move(proxy))) {}
 
-UdpWorker::~UdpWorker() noexcept = default;
-UdpWorker::UdpWorker(UdpWorker&&) noexcept = default;
-UdpWorker& UdpWorker::operator=(UdpWorker&&) noexcept = default;
+UdpIngress::~UdpIngress() noexcept = default;
+UdpIngress::UdpIngress(UdpIngress&&) noexcept = default;
+UdpIngress& UdpIngress::operator=(UdpIngress&&) noexcept = default;
 
-void UdpWorker::PendingUdpReplyDeleter::operator()(
+void UdpIngress::PendingUdpReplyDeleter::operator()(
     PendingUdpReply* reply) const noexcept {
     delete reply;
 }
 
-std::string_view UdpWorker::Tag() const noexcept {
+std::string_view UdpIngress::Tag() const noexcept {
     return impl_->tag;
 }
 
-bool UdpWorker::ReplaceHandler(
+bool UdpIngress::ReplaceHandler(
     std::unique_ptr<::acpp::Inbound> proxy) noexcept {
     if (!proxy) {
         return false;
@@ -336,14 +336,14 @@ bool UdpWorker::ReplaceHandler(
     return true;
 }
 
-void UdpWorker::Close() noexcept {
+void UdpIngress::Close() noexcept {
     CloseAllSockets();
     CleanupAllClientSessions();
     impl_->reply_queues.clear();
     MaybeShrinkHashContainer(impl_->reply_queues, 8);
 }
 
-void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
+void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     if (!impl_->proxy || !datagram.sock || datagram.payload.empty()) {
         return;
     }
@@ -428,7 +428,8 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
             return;
         }
 
-        auto receiver = std::make_shared<ReceiverSettings>();
+        auto receiver =
+            std::make_shared<proxyman::inbound::ReceiverSettings>();
         if (datagram.receiver) {
             *receiver = *datagram.receiver;
         } else {
@@ -572,7 +573,7 @@ void UdpWorker::ProcessDatagram(const UdpDatagramContext& datagram) {
     }
 }
 
-UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
+UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     const std::string& socket_key,
     udp::endpoint endpoint,
     buf::MultiBuffer payload) {
@@ -602,7 +603,7 @@ UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
         : ReplyEnqueueResult::Queued;
 }
 
-UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
+UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     const std::string& socket_key,
     udp::endpoint endpoint,
     buf::BufferGuard payload) {
@@ -632,8 +633,8 @@ UdpWorker::ReplyEnqueueResult UdpWorker::EnqueueReply(
         : ReplyEnqueueResult::Queued;
 }
 
-UdpWorker::PendingUdpReplyPtr
-UdpWorker::BeginReplySend(const std::string& socket_key) {
+UdpIngress::PendingUdpReplyPtr
+UdpIngress::BeginReplySend(const std::string& socket_key) {
     auto it = impl_->reply_queues.find(socket_key);
     if (it == impl_->reply_queues.end()) {
         return nullptr;
@@ -654,16 +655,16 @@ UdpWorker::BeginReplySend(const std::string& socket_key) {
 }
 
 std::span<const net::const_buffer>
-UdpWorker::ReplySendBuffers(const PendingUdpReply& reply) noexcept {
+UdpIngress::ReplySendBuffers(const PendingUdpReply& reply) noexcept {
     return reply.SendBuffers();
 }
 
 const udp::endpoint&
-UdpWorker::ReplyEndpoint(const PendingUdpReply& reply) noexcept {
+UdpIngress::ReplyEndpoint(const PendingUdpReply& reply) noexcept {
     return reply.endpoint;
 }
 
-bool UdpWorker::CompleteReplySend(
+bool UdpIngress::CompleteReplySend(
     const std::string& socket_key,
     const PendingUdpReply& completed_reply) {
     auto it = impl_->reply_queues.find(socket_key);
@@ -686,18 +687,18 @@ bool UdpWorker::CompleteReplySend(
     return true;
 }
 
-void UdpWorker::ClearReplyQueue(const std::string& socket_key) {
+void UdpIngress::ClearReplyQueue(const std::string& socket_key) {
     impl_->reply_queues.erase(socket_key);
     MaybeShrinkHashContainer(impl_->reply_queues, 8);
 }
 
-bool UdpWorker::HasClientSession(const std::string& socket_key,
+bool UdpIngress::HasClientSession(const std::string& socket_key,
                                  const std::string& client_key) const noexcept {
     auto session = FindClientSession(socket_key, client_key);
     return session && !session->Closed();
 }
 
-UdpWorker::ClientSessionPtr UdpWorker::FindClientSession(
+UdpIngress::ClientSessionPtr UdpIngress::FindClientSession(
     const std::string& socket_key,
     const std::string& client_key) const noexcept {
     auto sessions_it = impl_->client_sessions.find(socket_key);
@@ -711,7 +712,7 @@ UdpWorker::ClientSessionPtr UdpWorker::FindClientSession(
     return session_it->second.link;
 }
 
-UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
+UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     const std::string& socket_key,
     const std::string& client_key,
     net::io_context& io_context,
@@ -732,7 +733,7 @@ UdpWorker::ClientSessionPtr UdpWorker::CreateClientSession(
     return session;
 }
 
-bool UdpWorker::PushClientPayload(
+bool UdpIngress::PushClientPayload(
     const std::string& socket_key,
     const std::string& client_key,
     const TargetAddress& target,
@@ -760,7 +761,7 @@ bool UdpWorker::PushClientPayload(
     return session.link->Push(target, std::move(payload));
 }
 
-void UdpWorker::CleanupIdleClientSessions(
+void UdpIngress::CleanupIdleClientSessions(
     const std::string& socket_key,
     std::chrono::steady_clock::time_point now,
     std::chrono::seconds idle_timeout) {
@@ -790,7 +791,7 @@ void UdpWorker::CleanupIdleClientSessions(
     }
 }
 
-void UdpWorker::CleanupClientSessions(const std::string& socket_key) noexcept {
+void UdpIngress::CleanupClientSessions(const std::string& socket_key) noexcept {
     auto sessions_it = impl_->client_sessions.find(socket_key);
     if (sessions_it == impl_->client_sessions.end()) {
         return;
@@ -807,13 +808,13 @@ void UdpWorker::CleanupClientSessions(const std::string& socket_key) noexcept {
     MaybeShrinkHashContainer(impl_->client_sessions, 8);
 }
 
-void UdpWorker::CleanupAllClientSessions() noexcept {
+void UdpIngress::CleanupAllClientSessions() noexcept {
     while (!impl_->client_sessions.empty()) {
         CleanupClientSessions(impl_->client_sessions.begin()->first);
     }
 }
 
-UdpWorker::SocketPtr UdpWorker::AttachSocket(
+UdpIngress::SocketPtr UdpIngress::AttachSocket(
     const std::string& socket_key,
     SocketPtr socket) {
     if (!socket) {
@@ -824,19 +825,19 @@ UdpWorker::SocketPtr UdpWorker::AttachSocket(
     return inserted ? std::move(socket) : nullptr;
 }
 
-UdpWorker::SocketPtr UdpWorker::FindSocket(
+UdpIngress::SocketPtr UdpIngress::FindSocket(
     const std::string& socket_key) noexcept {
     auto it = impl_->udp_sockets.find(socket_key);
     return it == impl_->udp_sockets.end() ? nullptr : it->second;
 }
 
-std::shared_ptr<const udp::socket> UdpWorker::FindSocket(
+std::shared_ptr<const udp::socket> UdpIngress::FindSocket(
     const std::string& socket_key) const noexcept {
     auto it = impl_->udp_sockets.find(socket_key);
     return it == impl_->udp_sockets.end() ? nullptr : it->second;
 }
 
-bool UdpWorker::OwnsSocket(
+bool UdpIngress::OwnsSocket(
     const std::string& socket_key,
     const udp::socket* socket) const noexcept {
     auto it = impl_->udp_sockets.find(socket_key);
@@ -844,7 +845,7 @@ bool UdpWorker::OwnsSocket(
         it->second.get() == socket;
 }
 
-std::vector<std::string> UdpWorker::SocketKeys() const {
+std::vector<std::string> UdpIngress::SocketKeys() const {
     std::vector<std::string> keys;
     keys.reserve(impl_->udp_sockets.size());
     for (const auto& [socket_key, socket] : impl_->udp_sockets) {
@@ -854,7 +855,7 @@ std::vector<std::string> UdpWorker::SocketKeys() const {
     return keys;
 }
 
-void UdpWorker::CloseSocket(const std::string& socket_key) noexcept {
+void UdpIngress::CloseSocket(const std::string& socket_key) noexcept {
     CleanupClientSessions(socket_key);
     ClearReplyQueue(socket_key);
 
@@ -872,10 +873,10 @@ void UdpWorker::CloseSocket(const std::string& socket_key) noexcept {
     socket->close(ec);
 }
 
-void UdpWorker::CloseAllSockets() noexcept {
+void UdpIngress::CloseAllSockets() noexcept {
     while (!impl_->udp_sockets.empty()) {
         CloseSocket(impl_->udp_sockets.begin()->first);
     }
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace acpp::worker_detail

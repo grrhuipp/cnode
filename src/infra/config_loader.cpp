@@ -2,7 +2,8 @@
 #include "acppnode/infra/log.hpp"
 
 #include "acppnode/infra/json.hpp"
-#include "../app/proxyman/outbound/source_config.hpp"
+#include "acppnode/infra/outbound_source_config.hpp"
+#include "../app/proxyman/outbound/registration.hpp"
 #include "config_semantics.hpp"
 
 #include <fstream>
@@ -82,7 +83,7 @@ RoutingConfig ParseRoutingConfigValue(const json::value& value) {
 }
 
 proxyman::outbound::PreparedOutboundConfig PrepareOutboundForLoad(
-    proxyman::outbound::OutboundSourceConfig raw_config) {
+    infra::OutboundSourceConfig raw_config) {
     auto prepared = proxyman::outbound::PrepareOutboundConfig(raw_config);
     if (!prepared) {
         throw std::invalid_argument(
@@ -112,7 +113,7 @@ void LoadOutboundItems(
     size_t count_before = outbounds.size();
     LoadConfigItems(value, [&](const json::object& item) {
         outbounds.push_back(PrepareOutboundForLoad(
-            proxyman::outbound::OutboundSourceConfig::FromJson(item)));
+            infra::OutboundSourceConfig::FromJson(item)));
     });
     LOG_CONSOLE("config.sidecar loaded file={} outbounds={}",
                 source_name,
@@ -250,7 +251,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     }
 
     if (!has_direct) {
-        proxyman::outbound::OutboundSourceConfig direct;
+        infra::OutboundSourceConfig direct;
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
         auto prepared = proxyman::outbound::PrepareOutboundConfig(direct);
@@ -265,7 +266,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     }
 
     if (!has_blackhole) {
-        proxyman::outbound::OutboundSourceConfig blackhole;
+        infra::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
         auto prepared = proxyman::outbound::PrepareOutboundConfig(blackhole);

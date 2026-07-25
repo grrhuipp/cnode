@@ -3,9 +3,9 @@ if(NOT DEFINED SOURCE_DIR)
 endif()
 
 file(READ "${SOURCE_DIR}/src/app/worker.cpp" WORKER_SOURCE)
-file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/tcp_worker.hpp"
+file(READ "${SOURCE_DIR}/src/app/worker/tcp_listener.hpp"
     TCP_WORKER_HEADER_SOURCE)
-file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp"
+file(READ "${SOURCE_DIR}/src/app/worker/udp_ingress.hpp"
     UDP_WORKER_HEADER_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp" BOOTSTRAP_RUNTIME_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp" BOOTSTRAP_INBOUNDS_SOURCE)

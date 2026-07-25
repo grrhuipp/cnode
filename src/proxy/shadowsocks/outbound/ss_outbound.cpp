@@ -5,7 +5,7 @@
 #include "../../uot/uot.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "../../../app/proxyman/outbound/source_config.hpp"
+#include "../../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/udp_session.hpp"
@@ -791,7 +791,7 @@ proxy::shadowsocks::outbound::Handler::Handler(std::string tag,
 namespace {
 const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
     acpp::constants::protocol::kShadowsocks,
-    [](const acpp::proxyman::outbound::OutboundSourceConfig& cfg)
+    [](const acpp::infra::OutboundSourceConfig& cfg)
         -> std::optional<acpp::proxyman::outbound::PreparedOutboundCreator> {
         auto json_string = [](const acpp::json::object& obj,
                               std::string_view key) -> std::string {

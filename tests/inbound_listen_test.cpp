@@ -1,6 +1,6 @@
 #include "acppnode/transport/internet/inbound_listen.hpp"
 #include "acppnode/app/port_binding.hpp"
-#include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
+#include "worker/tcp_listener.hpp"
 
 #include <array>
 #include <string_view>
@@ -56,7 +56,7 @@ int main() {
     }
 
     acpp::net::io_context io_context;
-    acpp::proxyman::inbound::TcpWorker worker("test-inbound");
+    acpp::worker_detail::TcpListenerOwner worker("test-inbound");
     auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
     if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor ||
         !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;

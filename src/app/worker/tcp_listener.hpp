@@ -7,29 +7,22 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp::proxyman::inbound {
+namespace acpp::worker_detail {
 
-// ============================================================================
-// TcpWorker - per-Worker TCP inbound listener worker
-//
-// 对齐 xray-core app/proxyman/inbound tcpWorker 的资源职责：保存该 tag 下
-// 已启动的 listener hub/acceptor，并提供 Start/Close/Port/Tag 风格入口。
-// cnode 仍由 Worker 负责 SO_REUSEPORT bind 和 AcceptLoop 调度，避免在
-// accept 热路径引入额外动态分派。
-// ============================================================================
-class TcpWorker final {
+// Worker-private owner for one inbound tag's TCP acceptors.
+class TcpListenerOwner final {
 public:
     // Handles remain Worker-local; accept loops retain them only until a
     // close/cancel completion has resumed and observed owner-map retirement.
     using AcceptorPtr = std::shared_ptr<tcp::acceptor>;
 
-    explicit TcpWorker(std::string tag);
-    ~TcpWorker() noexcept;
+    explicit TcpListenerOwner(std::string tag);
+    ~TcpListenerOwner() noexcept;
 
-    TcpWorker(const TcpWorker&) = delete;
-    TcpWorker& operator=(const TcpWorker&) = delete;
-    TcpWorker(TcpWorker&&) noexcept;
-    TcpWorker& operator=(TcpWorker&&) noexcept;
+    TcpListenerOwner(const TcpListenerOwner&) = delete;
+    TcpListenerOwner& operator=(const TcpListenerOwner&) = delete;
+    TcpListenerOwner(TcpListenerOwner&&) noexcept;
+    TcpListenerOwner& operator=(TcpListenerOwner&&) noexcept;
 
     [[nodiscard]] std::string_view Tag() const noexcept;
 
@@ -54,4 +47,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace acpp::worker_detail

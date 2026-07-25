@@ -39,12 +39,10 @@ public:
     GetHandler(std::string_view tag) const noexcept;
 
     [[nodiscard]] std::unique_ptr<::acpp::Inbound> NewHandler(
-        std::string_view protocol,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
     [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
-        std::string_view protocol,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
@@ -57,16 +55,6 @@ public:
 
     [[nodiscard]] std::vector<::acpp::OnlineDevice>
     GetOnlineDevices(std::string_view protocol, std::string_view tag) const;
-
-    struct UserMemoryStats {
-        size_t vmess_accounts = 0;
-        size_t vless_users = 0;
-        size_t trojan_users = 0;
-        size_t shadowsocks_users = 0;
-        size_t anytls_users = 0;
-    };
-
-    [[nodiscard]] UserMemoryStats GetUserMemoryStats() const noexcept;
 
 private:
     struct Impl;

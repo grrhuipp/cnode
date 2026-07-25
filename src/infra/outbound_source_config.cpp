@@ -1,11 +1,11 @@
-#include "source_config.hpp"
+#include "acppnode/infra/outbound_source_config.hpp"
 #include "acppnode/infra/json_object.hpp"
 
 #include <format>
 #include <stdexcept>
 #include <utility>
 
-namespace acpp::proxyman::outbound {
+namespace acpp::infra {
 
 OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
@@ -58,4 +58,4 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
-}  // namespace acpp::proxyman::outbound
+}  // namespace acpp::infra

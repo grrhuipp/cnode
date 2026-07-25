@@ -54,10 +54,10 @@ file(READ
     "${SOURCE_DIR}/include/acppnode/proxy/inbound.hpp"
     INBOUND_HANDLER_SOURCE)
 file(READ
-    "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp"
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp"
     UDP_WORKER_SOURCE)
 file(READ
-    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp"
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.hpp"
     UDP_WORKER_HEADER_SOURCE)
 file(READ
     "${SOURCE_DIR}/src/app/worker.cpp"

@@ -1,6 +1,6 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 
-#include "source_config.hpp"
+#include "registration.hpp"
 
 #include <map>
 #include <ranges>
@@ -13,7 +13,7 @@ namespace {
 using CreatorMap = std::map<
     std::string,
     std::optional<PreparedOutboundCreator> (*)(
-        const OutboundSourceConfig& config),
+        const infra::OutboundSourceConfig& config),
     std::less<>>;
 
 CreatorMap& Proxies() noexcept {
@@ -26,7 +26,7 @@ CreatorMap& Proxies() noexcept {
 void RegisterProxy(
     std::string_view protocol,
     std::optional<PreparedOutboundCreator> (*creator)(
-        const OutboundSourceConfig& config)) {
+        const infra::OutboundSourceConfig& config)) {
     if (protocol.empty() || !creator) {
         throw std::invalid_argument(
             "invalid outbound protocol registration for '" +
@@ -40,7 +40,7 @@ void RegisterProxy(
 }
 
 std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
-    const OutboundSourceConfig& config) {
+    const infra::OutboundSourceConfig& config) {
     auto& proxies = Proxies();
     auto it = proxies.find(config.protocol);
     if (it == proxies.end()) {

@@ -679,9 +679,9 @@ if(NOT UDP_TYPES_HEADER_SOURCE MATCHES
         "UDP callback rejection must propagate through inline type erasure")
 endif()
 set(UDP_WORKER_SOURCE_PATH
-    "${SOURCE_DIR}/src/app/proxyman/inbound/udp_worker.cpp")
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp")
 set(UDP_WORKER_HEADER_PATH
-    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_worker.hpp")
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.hpp")
 set(INBOUND_HANDLER_HEADER_PATH
     "${SOURCE_DIR}/include/acppnode/proxy/inbound.hpp")
 set(INBOUND_DATAGRAM_HEADER_PATH

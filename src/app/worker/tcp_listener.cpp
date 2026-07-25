@@ -1,36 +1,36 @@
-#include "acppnode/app/proxyman/inbound/tcp_worker.hpp"
+#include "tcp_listener.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 
-namespace acpp::proxyman::inbound {
+namespace acpp::worker_detail {
 
-struct TcpWorker::Impl {
+struct TcpListenerOwner::Impl {
     explicit Impl(std::string tag)
         : tag(std::move(tag)) {}
 
     std::string tag;
-    memory::ThreadLocalUnorderedMap<std::string, TcpWorker::AcceptorPtr> acceptors;
+    memory::ThreadLocalUnorderedMap<std::string, TcpListenerOwner::AcceptorPtr> acceptors;
 };
 
-TcpWorker::TcpWorker(std::string tag)
+TcpListenerOwner::TcpListenerOwner(std::string tag)
     : impl_(std::make_unique<Impl>(std::move(tag))) {}
 
-TcpWorker::~TcpWorker() noexcept = default;
-TcpWorker::TcpWorker(TcpWorker&&) noexcept = default;
-TcpWorker& TcpWorker::operator=(TcpWorker&&) noexcept = default;
+TcpListenerOwner::~TcpListenerOwner() noexcept = default;
+TcpListenerOwner::TcpListenerOwner(TcpListenerOwner&&) noexcept = default;
+TcpListenerOwner& TcpListenerOwner::operator=(TcpListenerOwner&&) noexcept = default;
 
-std::string_view TcpWorker::Tag() const noexcept {
+std::string_view TcpListenerOwner::Tag() const noexcept {
     return impl_->tag;
 }
 
-void TcpWorker::Close() noexcept {
+void TcpListenerOwner::Close() noexcept {
     while (!impl_->acceptors.empty()) {
         CloseAcceptor(impl_->acceptors.begin()->first);
     }
 }
 
-TcpWorker::AcceptorPtr TcpWorker::CreateAcceptor(
+TcpListenerOwner::AcceptorPtr TcpListenerOwner::CreateAcceptor(
     std::string listener_key,
     net::io_context& io_context) {
     auto acceptor = std::make_shared<tcp::acceptor>(io_context);
@@ -39,19 +39,19 @@ TcpWorker::AcceptorPtr TcpWorker::CreateAcceptor(
     return inserted ? std::move(acceptor) : nullptr;
 }
 
-TcpWorker::AcceptorPtr TcpWorker::FindAcceptor(
+TcpListenerOwner::AcceptorPtr TcpListenerOwner::FindAcceptor(
     const std::string& listener_key) noexcept {
     auto it = impl_->acceptors.find(listener_key);
     return it == impl_->acceptors.end() ? nullptr : it->second;
 }
 
-std::shared_ptr<const tcp::acceptor> TcpWorker::FindAcceptor(
+std::shared_ptr<const tcp::acceptor> TcpListenerOwner::FindAcceptor(
     const std::string& listener_key) const noexcept {
     auto it = impl_->acceptors.find(listener_key);
     return it == impl_->acceptors.end() ? nullptr : it->second;
 }
 
-bool TcpWorker::OwnsAcceptor(
+bool TcpListenerOwner::OwnsAcceptor(
     const std::string& listener_key,
     const tcp::acceptor* acceptor) const noexcept {
     auto it = impl_->acceptors.find(listener_key);
@@ -59,7 +59,7 @@ bool TcpWorker::OwnsAcceptor(
         it->second.get() == acceptor;
 }
 
-std::vector<std::string> TcpWorker::ListenerKeys() const {
+std::vector<std::string> TcpListenerOwner::ListenerKeys() const {
     std::vector<std::string> keys;
     keys.reserve(impl_->acceptors.size());
     for (const auto& [listener_key, acceptor] : impl_->acceptors) {
@@ -69,7 +69,7 @@ std::vector<std::string> TcpWorker::ListenerKeys() const {
     return keys;
 }
 
-void TcpWorker::CloseAcceptor(const std::string& listener_key) noexcept {
+void TcpListenerOwner::CloseAcceptor(const std::string& listener_key) noexcept {
     auto it = impl_->acceptors.find(listener_key);
     if (it == impl_->acceptors.end()) {
         return;
@@ -83,4 +83,4 @@ void TcpWorker::CloseAcceptor(const std::string& listener_key) noexcept {
     acceptor->close(ec);
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace acpp::worker_detail
