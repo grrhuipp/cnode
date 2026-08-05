@@ -484,6 +484,8 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 
     cfg.rotate_daily = jbool(j, {"rotateDaily"}, cfg.rotate_daily);
     cfg.gzip = jbool(j, {"gzip", "compress"}, cfg.gzip);
+    cfg.disable_upload = jbool(
+        j, {"disableUpload"}, cfg.disable_upload);
     return cfg;
 }
 

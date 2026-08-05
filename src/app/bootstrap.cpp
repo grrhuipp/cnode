@@ -127,8 +127,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!accesslog::Reporter::Instance().Initialize(config.GetLog().log_dir)) {
-        LOG_ERROR("Failed to initialize centralized access-log reporter");
+    const bool upload_disabled = config.GetLog().disable_upload;
+    if (!upload_disabled) {
+        if (!accesslog::Reporter::Instance().Initialize(config.GetLog().log_dir)) {
+            LOG_ERROR("Failed to initialize centralized access-log reporter");
+        }
+    } else {
+        LOG_INFO("centralized access-log upload disabled by configuration");
     }
 
     try {

@@ -3,7 +3,8 @@
     "loglevel": "info",
     "access": "/var/log/cnode/access.log",
     "error": "/var/log/cnode/error.log",
-    "logDir": "/var/log/cnode"
+    "logDir": "/var/log/cnode",
+    "disableUpload": false
   },
   "workers": 0,
   "dns": {

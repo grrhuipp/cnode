@@ -81,6 +81,49 @@ function(expect_started case_name main_content sidecar_name sidecar_content)
     endif()
 endfunction()
 
+function(expect_log_upload_state case_name disable_upload_value expect_spool)
+    set(case_dir "${TEST_ROOT}/${case_name}")
+    file(REMOVE_RECURSE "${case_dir}")
+    file(MAKE_DIRECTORY "${case_dir}")
+    file(TO_CMAKE_PATH "${case_dir}/logs" log_dir)
+    if("${disable_upload_value}" STREQUAL "")
+        set(disable_upload_json "")
+    else()
+        set(disable_upload_json
+            ",\"disableUpload\":${disable_upload_value}")
+    endif()
+    file(WRITE "${case_dir}/config.json"
+        "{\"workers\":1,\"log\":{\"logDir\":\"${log_dir}\"${disable_upload_json}}}")
+
+    execute_process(
+        COMMAND "${CNODE_EXE}" --config-dir "${case_dir}"
+        RESULT_VARIABLE result
+        OUTPUT_VARIABLE stdout
+        ERROR_VARIABLE stderr
+        TIMEOUT 1)
+
+    if("${result}" MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "${case_name}: valid config exited before startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
+    endif()
+    if(NOT "${stdout}" MATCHES "server started")
+        message(FATAL_ERROR
+            "${case_name}: valid config did not reach startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
+    endif()
+
+    set(access_spool "${log_dir}/access-spool")
+    set(error_spool "${log_dir}/error-spool")
+    if(expect_spool)
+        if(NOT IS_DIRECTORY "${access_spool}" OR NOT IS_DIRECTORY "${error_spool}")
+            message(FATAL_ERROR
+                "${case_name}: enabled log upload did not initialize both spool directories")
+        endif()
+    elseif(IS_DIRECTORY "${access_spool}" OR IS_DIRECTORY "${error_spool}")
+        message(FATAL_ERROR
+            "${case_name}: disabled log upload created a spool directory")
+    endif()
+endfunction()
+
 expect_rejected(malformed_main "{" "" "")
 expect_rejected(malformed_inbounds "{}" "inbounds.json" "{")
 expect_rejected(malformed_outbounds "{}" "outbounds.json" "{")
@@ -130,6 +173,11 @@ expect_rejected(conflicting_log_compression
     "gzip and compress must match")
 expect_started(equal_log_compression_aliases
     [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
+expect_rejected(non_boolean_disable_log_upload
+    [=[{"log":{"disableUpload":"true"}}]=] "" ""
+    "disableUpload must be a boolean")
+expect_log_upload_state(default_log_upload "" TRUE)
+expect_log_upload_state(disabled_log_upload true FALSE)
 expect_rejected(non_string_log_level
     [=[{"log":{"loglevel":123}}]=] "" ""
     "loglevel must be a string")
