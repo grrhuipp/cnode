@@ -37,6 +37,16 @@ if(SPOOL_INITIALIZE_POSITION EQUAL -1 OR THREAD_START_POSITION EQUAL -1 OR
         "access-log durable spool must initialize before the reporter thread starts")
 endif()
 
+if(NOT REPORTER_SOURCE MATCHES
+       "kMaxSpoolBytes = 128ULL [*] 1024 [*] 1024" OR
+   NOT REPORTER_SOURCE MATCHES
+       "while [(]bytes_ > kMaxSpoolBytes && !entries_[.]empty[(][)][)]" OR
+   NOT REPORTER_SOURCE MATCHES
+       "while [(]bytes_ [+] payload[.]size[(][)] > kMaxSpoolBytes && !entries_[.]empty[(][)][)]")
+    message(FATAL_ERROR
+        "each access/error spool must evict oldest batches at the 128 MiB hard limit")
+endif()
+
 if(INBOUND_HANDLER_SOURCE MATCHES
        "access_log[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
    NOT INBOUND_HANDLER_SOURCE MATCHES
