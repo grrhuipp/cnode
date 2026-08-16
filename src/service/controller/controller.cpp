@@ -174,6 +174,11 @@ net::awaitable<void> Controller::Impl::panelMonitor(
     net::steady_timer timer(io_context_);
     CancelableTimerRegistry::Registration timer_registration(
         monitor_timers_, timer);
+    LOG_CONSOLE("panel status name={} node={} state=connecting type={} host={}",
+                panel_name,
+                client_info.NodeID,
+                client_info.NodeType,
+                client_info.APIHost);
 
     const auto interval = [&](bool pull) {
         if (const auto state = committed_nodes_.find(panel);
@@ -197,12 +202,12 @@ net::awaitable<void> Controller::Impl::panelMonitor(
             try {
                 co_await nodeInfoMonitor(panel);
             } catch (const std::exception& e) {
-                LOG_WARN("Panel {}/{}: config pull failed: {}",
+                LOG_WARN("panel status name={} node={} state=unavailable phase=pull error={}",
                          panel_name,
                          client_info.NodeID,
                          e.what());
             } catch (...) {
-                LOG_WARN("Panel {}/{}: config pull failed with unknown exception",
+                LOG_WARN("panel status name={} node={} state=unavailable phase=pull error=unknown",
                          panel_name,
                          client_info.NodeID);
             }
@@ -228,12 +233,12 @@ net::awaitable<void> Controller::Impl::panelMonitor(
                 try {
                     co_await userInfoMonitor(panel, tag, protocol);
                 } catch (const std::exception& e) {
-                    LOG_WARN("Panel {}/{}: status push failed: {}",
+                    LOG_WARN("panel report name={} node={} state=unavailable error={}",
                              panel_name,
                              client_info.NodeID,
                              e.what());
                 } catch (...) {
-                    LOG_WARN("Panel {}/{}: status push failed with unknown exception",
+                    LOG_WARN("panel report name={} node={} state=unavailable error=unknown",
                              panel_name,
                              client_info.NodeID);
                 }
@@ -261,7 +266,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
         if (attempt > 0) {
             const int delay = kRetryBaseSec * attempt;
-            LOG_WARN("Panel {}/{}: retry {}/{} in {}s",
+            LOG_WARN("panel sync name={} node={} state=retrying retry={}/{} delay={}s",
                      panel_name, node_id, attempt, kMaxAttempts - 1, delay);
             net::steady_timer timer(io_context_);
             CancelableTimerRegistry::Registration timer_registration(
@@ -275,6 +280,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             auto config_result = co_await panel->GetNodeInfo();
             if (config_result.missing) {
                 auto state_it = committed_nodes_.find(panel);
+                const bool removed = state_it != committed_nodes_.end();
                 if (state_it != committed_nodes_.end()) {
                     std::string old_protocol =
                         naming::ResolveProtocolOrDefault(state_it->second.config.NodeType);
@@ -291,6 +297,10 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     LOG_CONSOLE("node removed panel={} node={} inbound={}",
                                 panel_name, node_id, old_tag);
                 }
+                LOG_CONSOLE("panel status name={} node={} state=missing action={}",
+                            panel_name,
+                            node_id,
+                            removed ? "removed" : "none");
                 co_return;
             }
 
@@ -609,6 +619,32 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     panel_name, node_id, tag, old_config != nullptr);
             }
 
+            const auto committed = committed_nodes_.find(panel);
+            if (committed == committed_nodes_.end()) {
+                throw std::runtime_error("panel sync completed without committed node state");
+            }
+            const auto& committed_state = committed->second;
+            const bool complete_sync = rules_result.Ok() && users_result.Ok();
+            const auto pull_interval = controller::PanelInterval(
+                committed_state.config.PullInterval,
+                defaults::kPanelPullInterval);
+            const auto push_interval = controller::PanelInterval(
+                committed_state.config.PushInterval,
+                defaults::kPanelPushInterval);
+            LOG_CONSOLE(
+                "panel status name={} node={} state={} inbound={} protocol={} port={} "
+                "users={} rules={} pull={}s push={}s",
+                panel_name,
+                node_id,
+                complete_sync ? "ready" : "degraded",
+                committed_state.inbound_started ? "ready" : "stopped",
+                protocol,
+                committed_state.config.Port,
+                committed_state.users.size(),
+                committed_state.rules.size(),
+                pull_interval.count(),
+                push_interval.count());
+
             co_return;
 
         } catch (const std::exception& e) {
@@ -616,11 +652,12 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 co_return;
             }
             if (attempt + 1 < kMaxAttempts) {
-                LOG_WARN("Panel {}/{}: attempt {}/{} failed: {}",
+                LOG_WARN("panel sync name={} node={} state=failed attempt={}/{} error={}",
                          panel_name, node_id, attempt + 1, kMaxAttempts, e.what());
             } else {
-                LOG_ERROR("Panel {}/{}: all {} attempts failed: {}",
-                          panel_name, node_id, kMaxAttempts, e.what());
+                LOG_ERROR(
+                    "panel status name={} node={} state=unavailable phase=pull attempts={} error={}",
+                    panel_name, node_id, kMaxAttempts, e.what());
             }
         }
     }

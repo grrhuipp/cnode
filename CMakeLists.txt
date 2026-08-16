@@ -1790,6 +1790,12 @@ if(CNODE_BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_panel_schedule_contract_test.cmake)
 
     add_test(
+        NAME cnode_controller_panel_console_log_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/controller_panel_console_log_contract_test.cmake)
+
+    add_test(
         NAME cnode_controller_shutdown_contract_test
         COMMAND ${CMAKE_COMMAND}
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"

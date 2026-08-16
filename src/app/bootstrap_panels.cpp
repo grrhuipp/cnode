@@ -38,7 +38,7 @@ void SetupPanels(net::io_context& main_ctx,
             if (i > 0) node_ids_str += ", ";
             node_ids_str += std::to_string(node_ids[i]);
         }
-        LOG_CONSOLE("panel ready name={} type={} host={} nodes=[{}]",
+        LOG_CONSOLE("panel configured name={} type={} host={} nodes=[{}]",
                     panel_config.Name, panel_config.NodeType,
                     panel_config.APIHost, node_ids_str);
     }

@@ -65,6 +65,16 @@ access 记录不带 `[Info]`，也不写组件、源码行或 Worker。它只表
 - 后台 writer 负责落盘、刷新、按日轮转、gzip 和保留期清理。
 - 队列满时不阻塞 Worker，丢弃数量写入 error logger。
 
+面板控制台日志使用固定的状态行，避免把“配置已加载”误认为“面板已连接”：
+
+```text
+panel configured name=jx type=V2board host=https://panel.example.com nodes=[1, 2]
+panel status name=jx node=1 state=ready inbound=ready protocol=vmess port=10086 users=120 rules=3 pull=60s push=60s
+panel report name=jx node=1 state=ok node_status=ok traffic=ok traffic_users=8 online=ok online_users=5 illegal=idle illegal_events=0
+```
+
+`panel status` 的 `connecting / ready / degraded / missing / unavailable` 分别表示正在首次连接、完整同步成功、部分数据沿用旧快照、面板已删除节点、连续重试仍失败。`panel report` 汇总节点状态、流量、在线用户和审计结果的上报状态；没有待上报数据时显示 `idle`。
+
 ## 5. 约束
 
 - error 和 access 不得混写。
