@@ -66,8 +66,12 @@ namespace ssl = net::ssl;
 
 constexpr std::string_view kBearerToken =
     "51aba8b656f39b65d249ae6b2145fe07c1103dc64037b55d4c9d2b174d03ecb3";
-constexpr size_t kQueueCapacity = 65536;
 constexpr size_t kMaxBatchEvents = 1000;
+// Event owns many strings and is intentionally preallocated so Submit stays
+// non-blocking. Eight full flush batches absorb short bursts without keeping
+// tens of thousands of these large objects resident while the node is idle.
+constexpr size_t kEventQueueCapacity = 8 * 1024;
+static_assert(kEventQueueCapacity >= 8 * kMaxBatchEvents);
 constexpr size_t kMaxBatchProtobufBytes = 1024 * 1024;
 constexpr uint64_t kMaxSpoolBytes = 128ULL * 1024 * 1024;
 constexpr size_t kMaxSpoolFileBytes = 8 * 1024 * 1024;
@@ -857,7 +861,7 @@ private:
 class Reporter::Impl final {
 public:
     Impl()
-        : queue_(kQueueCapacity)
+        : queue_(kEventQueueCapacity)
         , sources_(std::make_shared<const std::vector<Source>>())
         , boot_id_(MakeBootId())
         , server_id_(ResolveServerId()) {}
@@ -959,7 +963,7 @@ public:
         }
 
         const size_t previous = queued_.fetch_add(1, std::memory_order_acq_rel);
-        if (previous >= kQueueCapacity) {
+        if (previous >= kEventQueueCapacity) {
             queued_.fetch_sub(1, std::memory_order_release);
             dropped_events_.fetch_add(1, std::memory_order_relaxed);
             return false;

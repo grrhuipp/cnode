@@ -57,7 +57,9 @@ struct DailyLogSpec {
 
 std::mutex g_lifecycle_mutex;
 std::mutex g_console_mutex;
-constexpr size_t kAsyncLogQueueSize = 65536;
+// The writer drains continuously. Keep a bounded burst window without paying
+// for 65K preallocated LogRecord slots throughout the process lifetime.
+constexpr size_t kAsyncLogQueueCapacity = 8 * 1024;
 constexpr auto kLogIdleSleep = 1ms;
 constexpr auto kRotationCheckInterval = 1s;
 
@@ -422,7 +424,7 @@ LogLevel ParseLevel(std::string_view level) {
 
 class AsyncLogBackend {
 public:
-    AsyncLogBackend() : queue_(kAsyncLogQueueSize) {}
+    AsyncLogBackend() : queue_(kAsyncLogQueueCapacity) {}
 
     ~AsyncLogBackend() {
         Stop();
