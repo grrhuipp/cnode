@@ -101,7 +101,8 @@ public:
     // ========================================================================
     // buf::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
     //
-    // 默认实现基于 AsyncRead/AsyncWrite，子类可 override 实现更高效的路径：
+    // 读路径由每个具体 stream 实现，以便先等待可读数据，再申请
+    // 唯一的 8KB payload Buffer；写路径保留通用默认实现。
     //   - TcpStream: scatter-write (writev)
     //   - VMessStream: 解密直写 pool Buffer，省去一次 memcpy
     //
@@ -116,7 +117,7 @@ public:
      * @return buf::MultiBuffer（无有效数据 = EOF）；返回值按 RAII 自动归还 Buffer
      * @throws IoSystemError 网络错误
      */
-    virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer();
+    virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() = 0;
 
     /**
      * 批量写入 buf::MultiBuffer（接管所有权，写完后自动 Free）

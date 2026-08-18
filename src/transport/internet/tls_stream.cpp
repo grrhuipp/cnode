@@ -536,6 +536,28 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
         ThrowTlsReadError("TLS handshake failed during read");
     }
 
+    SSL* ssl = NativeSsl();
+    if (!ssl) {
+        co_return buf::MultiBuffer{};
+    }
+
+    // OpenSSL 已有解密/待处理记录时必须直接 SSL_read；否则先等待
+    // 底层 TCP 可读，避免给每条空闲 TLS 连接预留 8KB payload Buffer。
+    if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
+        TcpStream* tcp = BaseTcpStream();
+        if (!tcp) {
+            co_return buf::MultiBuffer{};
+        }
+        const IoErrorCode wait_ec = co_await tcp->WaitReadable();
+        if (wait_ec) {
+            if (wait_ec == io_error::eof ||
+                wait_ec == io_error::operation_aborted) {
+                co_return buf::MultiBuffer{};
+            }
+            throw IoSystemError(wait_ec);
+        }
+    }
+
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
         co_return buf::MultiBuffer{};

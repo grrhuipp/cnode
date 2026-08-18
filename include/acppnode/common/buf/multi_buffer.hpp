@@ -325,7 +325,7 @@ struct BufferGuard {
 // 所有权语义：
 //   - MultiBuffer 是 owning 容器；析构和 clear() 都归还持有的 Buffer
 //   - std::move(mb) 即为所有权转移，零数据拷贝（只移动指针）
-//   - 常规 relay/readv 路径最多 8 个 Buffer，指针链内联保存，避免每次
+//   - 常规协议/分帧路径最多 8 个 Buffer，指针链内联保存，避免每次
 //     ReadMultiBuffer() 为 vector 元数据再做一次堆分配；超过 8 个才 spill
 //     到同一 Worker thread-local heap。
 // ============================================================================

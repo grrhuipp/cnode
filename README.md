@@ -177,7 +177,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - `ProxyProtocol` 是 cnode 自有三态设置：`"off"`、`"auto"`、`"on"`。省略 `ProxyProtocol` 时默认使用 `"auto"`。
 - `SendIP: "auto"` 表示 direct outbound 优先绑定入站连接命中的本地 IP，用于多 IP 服务器源进源出。
 - `EnableDNS` 默认值为 `true`。
-- TCP scatter-read 固定最多使用 4 个 8KB Buffer，不按连接压力动态降档。
+- 每条 TCP relay 连接的每个方向最多挂起一个 8KB payload Buffer，双向 payload 容量总计 16KB；空闲时先等待可读事件、不持有 payload Buffer，持续流量通过连续读取推进。
 - V2Board Shadowsocks 2022 节点会自动使用面板下发的 `server_key` 作为 identity PSK，并按 V2Board 规则从用户 UUID 前缀构造用户 PSK；无需把订阅中的两段式密码回填到用户表。
 - Shadowsocks 和 AnyTLS inbound 会自动识别 UoT v2（`sp.v2.udp-over-tcp.arpa`）及 v1（`sp.udp-over-tcp.arpa`）。Shadowsocks outbound 可用 `"uot": true` 开启 UoT（默认 v2），以 `"uotVersion": 1` 选择 v1；也接受 `"udp_over_tcp": {"enabled": true, "version": 2}`。
 - 本地日志对齐 xray-core：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。`log.disableUpload` 默认是 `false`；设为 `true` 只关闭结构化集中日志上传及其 spool，不影响本地 access/error 文件日志。

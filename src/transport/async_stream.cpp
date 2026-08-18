@@ -48,27 +48,6 @@ void AsyncStream::operator delete(
 }
 
 // ============================================================================
-// AsyncStream::ReadMultiBuffer - 默认实现
-//
-// 分配一个 8KB pool Buffer，调用 AsyncRead 填充，返回指针。
-// 子类（TcpStream、VMessStream 等）可 override 实现零拷贝优化路径。
-// ============================================================================
-net::awaitable<buf::MultiBuffer> AsyncStream::ReadMultiBuffer() {
-    buf::BufferGuard buf{buf::Buffer::New()};
-    if (!buf) co_return buf::MultiBuffer{};
-
-    size_t n = co_await AsyncRead(
-        net::mutable_buffer(buf->Tail().data(), buf->Available()));
-
-    if (n == 0) {
-        co_return buf::MultiBuffer{};  // EOF
-    }
-
-    buf->Produce(static_cast<uint32_t>(n));
-    co_return buf::MultiBuffer{buf.release()};
-}
-
-// ============================================================================
 // AsyncStream::WriteMultiBuffer - 默认实现
 //
 // 逐个 Buffer 调用 AsyncWrite，写完后释放。

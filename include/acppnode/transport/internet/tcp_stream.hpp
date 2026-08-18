@@ -38,7 +38,7 @@ public:
     net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
 
     // buf::MultiBuffer 优化路径
-    // ReadMultiBuffer : async_read_some 直填 pool Buffer
+    // ReadMultiBuffer : 可读后才申请每方向唯一的 8KB Buffer
     // WriteMultiBuffer: scatter-write (WSASend / writev)，多 Buffer 合并为单次系统调用
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void>        WriteMultiBuffer(buf::MultiBuffer mb) override;
@@ -52,6 +52,9 @@ public:
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;
+    // 仅等待底层 socket 可读，不接收数据、不申请 payload Buffer。
+    // TLS 层用它将 8KB 申请延后到首个可读事件之后。
+    net::awaitable<IoErrorCode> WaitReadable();
     tcp::socket& TlsLayerSocket() noexcept;
     [[nodiscard]] bool TlsLayerCanRead() const noexcept;
     [[nodiscard]] bool TlsLayerCanWrite() const noexcept;

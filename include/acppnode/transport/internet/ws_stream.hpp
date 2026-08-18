@@ -241,6 +241,46 @@ public:
         }
     }
 
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        while (frame_payload_remaining_ == 0) {
+            if (!co_await PrepareNextDataFrame()) {
+                if (peer_closed_cleanly_ || transport_eof_) {
+                    co_return buf::MultiBuffer{};
+                }
+                ThrowWsStreamError("WebSocket read frame header failed");
+            }
+        }
+
+        // 帧头可读后才申请 payload Buffer；空闲 WS 连接只等待小栈头。
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            throw std::bad_alloc();
+        }
+
+        const size_t chunk = static_cast<size_t>(std::min<uint64_t>(
+            out->Available(), frame_payload_remaining_));
+        if (!co_await ReadFull(out->Tail().data(), chunk)) {
+            frame_payload_remaining_ = 0;
+            frame_mask_offset_ = 0;
+            if (transport_eof_) {
+                co_return buf::MultiBuffer{};
+            }
+            ThrowWsStreamError("WebSocket read frame payload failed");
+        }
+
+        if (frame_masked_) {
+            ws::MaskData(out->Tail().data(), chunk,
+                         frame_mask_key_.data(), frame_mask_offset_);
+            frame_mask_offset_ += chunk;
+        }
+        out->Produce(static_cast<uint32_t>(chunk));
+        frame_payload_remaining_ -= chunk;
+        if (frame_payload_remaining_ == 0) {
+            frame_mask_offset_ = 0;
+        }
+        co_return buf::MultiBuffer{out.release()};
+    }
+
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (!CanWrite()) {
             ThrowWsStreamError("WebSocket write on closed stream");

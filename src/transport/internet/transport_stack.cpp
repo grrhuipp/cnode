@@ -601,6 +601,9 @@ public:
             }
             co_return co_await inner_->ReadMultiBuffer();
         }
+        if (!co_await EnsureChunkPayload()) {
+            co_return buf::MultiBuffer{};
+        }
         buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) {
             throw std::bad_alloc();
@@ -822,6 +825,31 @@ private:
         throw IoSystemError(io_error::invalid_argument, what);
     }
 
+    net::awaitable<bool> EnsureChunkPayload() {
+        if (read_closed_) {
+            co_return false;
+        }
+        while (chunk_remaining_ == 0) {
+            std::string line;
+            if (!co_await ReadLine(line)) {
+                FailChunkedRead("incomplete HTTP/1 chunk-size line");
+            }
+            auto chunk_size = ParseChunkSize(line);
+            if (!chunk_size) {
+                FailChunkedRead("invalid HTTP/1 chunk-size line");
+            }
+            if (*chunk_size == 0) {
+                if (!co_await ConsumeTrailers()) {
+                    FailChunkedRead("incomplete HTTP/1 chunk trailers");
+                }
+                read_closed_ = true;
+                co_return false;
+            }
+            chunk_remaining_ = *chunk_size;
+        }
+        co_return true;
+    }
+
     net::awaitable<size_t> ReadChunked(net::mutable_buffer buffer) {
         if (read_closed_) {
             co_return 0;
@@ -838,22 +866,9 @@ private:
                 if (copied > 0) {
                     co_return copied;
                 }
-                std::string line;
-                if (!co_await ReadLine(line)) {
-                    FailChunkedRead("incomplete HTTP/1 chunk-size line");
-                }
-                auto chunk_size = ParseChunkSize(line);
-                if (!chunk_size) {
-                    FailChunkedRead("invalid HTTP/1 chunk-size line");
-                }
-                if (*chunk_size == 0) {
-                    if (!co_await ConsumeTrailers()) {
-                        FailChunkedRead("incomplete HTTP/1 chunk trailers");
-                    }
-                    read_closed_ = true;
+                if (!co_await EnsureChunkPayload()) {
                     co_return copied;
                 }
-                chunk_remaining_ = *chunk_size;
             }
 
             const size_t want = std::min(capacity - copied, chunk_remaining_);
@@ -2430,13 +2445,8 @@ public:
         }
 
         if (payload_codec_ == H2PayloadCodec::RawData) {
-            while (h2_data_offset_ >= h2_data_end_) {
-                h2_data_.clear();
-                h2_data_offset_ = 0;
-                h2_data_end_ = 0;
-                if (!co_await ReadNextDataFrame()) {
-                    co_return 0;
-                }
+            if (!co_await EnsureReadablePayload()) {
+                co_return 0;
             }
             const size_t n = std::min(capacity, h2_data_end_ - h2_data_offset_);
             std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
@@ -2449,10 +2459,8 @@ public:
             co_return n;
         }
 
-        while (read_offset_ >= read_payload_end_) {
-            if (!co_await ReadNextGrpcMessage()) {
-                co_return 0;
-            }
+        if (!co_await EnsureReadablePayload()) {
+            co_return 0;
         }
 
         const size_t n = std::min(capacity, read_payload_end_ - read_offset_);
@@ -2488,6 +2496,9 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (!co_await EnsureReadablePayload()) {
+            co_return buf::MultiBuffer{};
+        }
         buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) {
             throw std::bad_alloc();
@@ -2653,6 +2664,27 @@ protected:
     }
 
 private:
+    net::awaitable<bool> EnsureReadablePayload() {
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            while (h2_data_offset_ >= h2_data_end_) {
+                h2_data_.clear();
+                h2_data_offset_ = 0;
+                h2_data_end_ = 0;
+                if (!co_await ReadNextDataFrame()) {
+                    co_return false;
+                }
+            }
+            co_return true;
+        }
+
+        while (read_offset_ >= read_payload_end_) {
+            if (!co_await ReadNextGrpcMessage()) {
+                co_return false;
+            }
+        }
+        co_return true;
+    }
+
     net::awaitable<bool> WriteGrpcMessage(std::span<const uint8_t> data) {
         co_return co_await WriteGrpcHunkMessage(*inner_, stream_id_, data);
     }
@@ -2897,6 +2929,8 @@ private:
 
     net::awaitable<bool> ReadNextGrpcMessage();
     net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len);
+    net::awaitable<bool> EnsureReadablePayload();
+    net::awaitable<bool> WaitForRawData();
     net::awaitable<size_t> AsyncReadRaw(net::mutable_buffer buffer);
     void MarkQueueForShrinkIfLarge() noexcept;
     void ShrinkQueueIfDrained() noexcept;
@@ -3828,6 +3862,9 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncWrite(
 }
 
 net::awaitable<buf::MultiBuffer> GrpcServerSubStreamState::ReadMultiBuffer() {
+    if (!co_await EnsureReadablePayload()) {
+        co_return buf::MultiBuffer{};
+    }
     buf::BufferGuard buffer{buf::Buffer::New()};
     if (!buffer) {
         throw std::bad_alloc();
@@ -3970,11 +4007,7 @@ void GrpcServerSubStreamState::ClearH2Queue() noexcept {
     }
 }
 
-net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
-    net::mutable_buffer buffer) {
-    auto* out = static_cast<uint8_t*>(buffer.data());
-    const size_t capacity = buffer.size();
-
+net::awaitable<bool> GrpcServerSubStreamState::WaitForRawData() {
     while (!cancelled_) {
         if (read_cancelled_) {
             read_cancelled_ = false;
@@ -3996,26 +4029,47 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
         }
 
         if (!h2_data_queue_.empty()) {
-            const auto& front = h2_data_queue_.front();
-            const size_t n = std::min(
-                capacity,
-                front.end - h2_data_offset_);
-            std::memcpy(out, front.data.data() + h2_data_offset_, n);
-            h2_data_offset_ += n;
-            co_return n;
+            co_return true;
         }
 
         if (input_done_ || read_closed_) {
-            co_return 0;
+            co_return false;
         }
 
         auto [ec] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
         if (ec) {
-            co_return 0;
+            co_return false;
         }
     }
-    co_return 0;
+    co_return false;
+}
+
+net::awaitable<bool> GrpcServerSubStreamState::EnsureReadablePayload() {
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        co_return co_await WaitForRawData();
+    }
+    while (read_offset_ >= read_payload_end_) {
+        if (!co_await ReadNextGrpcMessage()) {
+            co_return false;
+        }
+    }
+    co_return true;
+}
+
+net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
+    net::mutable_buffer buffer) {
+    auto* out = static_cast<uint8_t*>(buffer.data());
+    const size_t capacity = buffer.size();
+    if (capacity == 0 || !co_await WaitForRawData()) {
+        co_return 0;
+    }
+
+    const auto& front = h2_data_queue_.front();
+    const size_t n = std::min(capacity, front.end - h2_data_offset_);
+    std::memcpy(out, front.data.data() + h2_data_offset_, n);
+    h2_data_offset_ += n;
+    co_return n;
 }
 
 net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {

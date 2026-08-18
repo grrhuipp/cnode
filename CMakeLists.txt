@@ -1559,6 +1559,12 @@ if(CNODE_BUILD_TESTS)
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/log_queue_memory_contract_test.cmake)
 
+    add_test(
+        NAME cnode_tcp_read_buffer_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/tcp_read_buffer_contract_test.cmake)
+
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
         src/app/worker/udp_ingress.cpp

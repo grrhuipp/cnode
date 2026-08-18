@@ -28,9 +28,6 @@
 namespace acpp {
 
 namespace {
-constexpr uint32_t kMaxReadAllocBuffers = 4;
-constexpr uint32_t kReadGrowThreshold = buf::Buffer::kSize / 2;
-constexpr uint8_t kReadGrowStreakRequired = 1;
 constexpr size_t kProxyHeaderMaxBytes = 2048;
 constexpr size_t kProxyProbeBytes = 256;
 using std::chrono::steady_clock;
@@ -126,8 +123,6 @@ struct TcpStream::Impl {
     TimeoutToken write_deadline_token;
     TimeoutToken phase_deadline_token;
     std::chrono::steady_clock::time_point write_deadline_at;
-    uint32_t read_alloc_count = 1;
-    uint8_t read_grow_streak = 0;
     StreamLabelKind stream_label = StreamLabelKind::Unknown;
     uint8_t flags = 0;
     uint32_t idle_timeout_sec = 0;
@@ -173,8 +168,6 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     : impl_(std::make_unique<Impl>(std::move(other.impl_->socket))) {
     impl_->pending_data = std::move(other.impl_->pending_data);
     impl_->write_deadline_at = other.impl_->write_deadline_at;
-    impl_->read_alloc_count = other.impl_->read_alloc_count;
-    impl_->read_grow_streak = other.impl_->read_grow_streak;
     impl_->stream_label = other.impl_->stream_label;
     impl_->flags = other.impl_->flags;
     impl_->idle_timeout_sec = other.impl_->idle_timeout_sec;
@@ -191,8 +184,6 @@ TcpStream::TcpStream(TcpStream&& other) noexcept
     other.impl_->write_timeout_sec = 0;
     other.impl_->flags = static_cast<uint8_t>(kReadShutdown | kWriteShutdown);
     other.impl_->stream_label = StreamLabelKind::Unknown;
-    other.impl_->read_alloc_count = 1;
-    other.impl_->read_grow_streak = 0;
 }
 
 TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
@@ -206,8 +197,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         ReleasePendingData();
         impl_->timeout_scheduler = &TimeoutScheduler::ForIoContext(SocketIoContext(impl_->socket));
         impl_->pending_data = std::move(other.impl_->pending_data);
-        impl_->read_alloc_count = other.impl_->read_alloc_count;
-        impl_->read_grow_streak = other.impl_->read_grow_streak;
         impl_->stream_label = other.impl_->stream_label;
         impl_->flags = other.impl_->flags;
         impl_->idle_timeout_sec = other.impl_->idle_timeout_sec;
@@ -227,8 +216,6 @@ TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
         other.impl_->write_timeout_sec = 0;
         other.impl_->flags = static_cast<uint8_t>(kReadShutdown | kWriteShutdown);
         other.impl_->stream_label = StreamLabelKind::Unknown;
-        other.impl_->read_alloc_count = 1;
-        other.impl_->read_grow_streak = 0;
     }
     return *this;
 }
@@ -283,10 +270,8 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 // 优化路径：async_read_some 直接填充 pool Buffer，省去 relay buffer 中转。
 // pending_data 优先返回（保持与 AsyncRead 相同语义）。
 //
-// 自适应散读（仿 Xray ReadVReader allocStrategy）：
-//   - 低流量 / 启动：单 Buffer 快速路径，零额外堆分配
-//   - 连续大包后按 1/2/4 个 Buffer 自适应增长
-//   - 未读满则收缩到实际使用数，避免浪费
+// 每个 relay 方向只允许一个挂起的 8KB payload Buffer，双向 payload
+// 容量总计 16KB。吞吐依靠连续 async_read_some 驱动，不再预分配 readv 批量。
 // ============================================================================
 net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) co_return buf::MultiBuffer{};
@@ -301,76 +286,29 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         co_return pending;
     }
 
-    // ── 快速路径：单 Buffer（低流量 / 启动阶段）───────────────────────
-    // 对齐 xray-core：直接挂起 read 到 8KB Buffer，避免 wait+read 的双
-    // IOCP 往返。Buffer 只在一次挂起读生命周期内持有，不进入长期池。
-    if (impl_->read_alloc_count == 1) {
-        ArmReadDeadline();
-        buf::BufferGuard buf{buf::Buffer::New()};
-        if (!buf) {
-            CancelReadDeadline();
+    const IoErrorCode wait_ec = co_await WaitReadable();
+    if (wait_ec) {
+        if (wait_ec == io_error::eof ||
+            wait_ec == io_error::operation_aborted) {
             co_return buf::MultiBuffer{};
         }
-        auto [ec, n] = co_await impl_->socket.async_read_some(
-            net::mutable_buffer(buf->Tail().data(), buf->Available()),
-            net::as_tuple(net::use_awaitable));
-        CancelReadDeadline();
-
-        if (ec || n == 0) {
-            if (!ec || ec == io_error::eof ||
-                ec == io_error::operation_aborted)
-                co_return buf::MultiBuffer{};
-            if (ec == io_error::connection_reset ||
-                ec == io_error::broken_pipe) {
-                LOG_NET_DEBUG("ReadMultiBuffer: {} (fd={})", ec.message(), NativeHandle());
-                co_return buf::MultiBuffer{};
-            }
-            throw IoSystemError(ec);
+        if (wait_ec == io_error::connection_reset ||
+            wait_ec == io_error::broken_pipe) {
+            LOG_NET_DEBUG("ReadMultiBuffer wait: {} (fd={})",
+                          wait_ec.message(), NativeHandle());
+            co_return buf::MultiBuffer{};
         }
-
-        buf->Produce(static_cast<uint32_t>(n));
-        CaptureReadPrefix(buf->Bytes());
-        TouchActivity();
-        // 读满或连续"大包"读命中时，提前切换到 scatter-read。
-        if (n == buf::Buffer::kSize || n >= kReadGrowThreshold) {
-            if (impl_->read_grow_streak < 0xff) {
-                ++impl_->read_grow_streak;
-            }
-            if (impl_->read_grow_streak >= kReadGrowStreakRequired) {
-                impl_->read_alloc_count = 2;
-                impl_->read_grow_streak = 0;
-            }
-        } else {
-            impl_->read_grow_streak = 0;
-        }
-        co_return buf::MultiBuffer{buf.release()};
+        throw IoSystemError(wait_ec);
     }
 
-    // ── 散读路径：已证明活跃，跳过 pre-wait，直接预分配并散读 ──────────
-    // read_alloc_count>=2 表示连接连续命中大包；省去 async_wait 的额外一次
-    // reactor 往返，直接 readv / WSARecv。转空闲后下方自适应会收回 alloc_count，
-    // 自动退回上面的 wait-first 低流量档。
+    buf::BufferGuard buffer{buf::Buffer::New()};
+    if (!buffer) {
+        co_return buf::MultiBuffer{};
+    }
     ArmReadDeadline();
-    const uint32_t n_alloc = impl_->read_alloc_count;
-
-    // 在协程帧上分配（co_await 期间保持有效），最多 kMaxReadAllocBuffers 个。
-    std::array<buf::BufferGuard, kMaxReadAllocBuffers> buffers{};
-    for (uint32_t i = 0; i < n_alloc; ++i) {
-        buffers[i] = buf::BufferGuard{buf::Buffer::New()};
-        if (!buffers[i]) {
-            CancelReadDeadline();
-            throw std::bad_alloc();
-        }
-    }
-
-    // 构造 scatter iovec（栈分配，n_alloc <= kMaxReadAllocBuffers）
-    std::array<net::mutable_buffer, kMaxReadAllocBuffers> iov_arr;
-    for (uint32_t i = 0; i < n_alloc; ++i)
-        iov_arr[i] = net::mutable_buffer(buffers[i]->Tail().data(), buf::Buffer::kSize);
-    auto iov = std::span(iov_arr.data(), n_alloc);
-
     auto [ec, n] = co_await impl_->socket.async_read_some(
-        iov, net::as_tuple(net::use_awaitable));
+        net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
+        net::as_tuple(net::use_awaitable));
     CancelReadDeadline();
 
     if (ec || n == 0) {
@@ -379,42 +317,16 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
             co_return buf::MultiBuffer{};
         if (ec == io_error::connection_reset ||
             ec == io_error::broken_pipe) {
-            LOG_NET_DEBUG("ReadMultiBuffer(scatter): {} (fd={})", ec.message(), NativeHandle());
+            LOG_NET_DEBUG("ReadMultiBuffer: {} (fd={})", ec.message(), NativeHandle());
             co_return buf::MultiBuffer{};
         }
         throw IoSystemError(ec);
     }
 
-    // scatter-read 按顺序填充各 Buffer，将 n 字节分配给实际用到的 Buffer
-    buf::MultiBuffer result;
-    result.reserve(n_alloc);
-    size_t remaining = n;
-    uint32_t used = 0;
-    for (uint32_t i = 0; i < n_alloc; ++i) {
-        if (remaining == 0) {
-            continue;
-        }
-        uint32_t fill = static_cast<uint32_t>(
-            std::min<size_t>(remaining, buf::Buffer::kSize));
-        buffers[i]->Produce(fill);
-        CaptureReadPrefix(buffers[i]->Bytes());
-        remaining -= fill;
-        result.push_back(buffers[i].get());
-        (void)buffers[i].release();
-        ++used;
-    }
-
+    buffer->Produce(static_cast<uint32_t>(n));
+    CaptureReadPrefix(buffer->Bytes());
     TouchActivity();
-
-    // 自适应调整：全部读满时增长到固定 readv4 上限，否则收缩到实际使用数。
-    if (used >= n_alloc) {
-        impl_->read_alloc_count = std::min(n_alloc * 2u, kMaxReadAllocBuffers);
-    } else {
-        impl_->read_alloc_count = std::max(used, 1u);
-    }
-    impl_->read_grow_streak = 0;
-
-    co_return result;
+    co_return buf::MultiBuffer{buffer.release()};
 }
 
 // ============================================================================
@@ -722,6 +634,22 @@ void TcpStream::CaptureReadPrefix(std::span<const uint8_t> bytes) noexcept {
 
 tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
     return impl_->socket.get_executor();
+}
+
+net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        co_return io_error::eof;
+    }
+    if (buf::HasData(impl_->pending_data)) {
+        co_return IoErrorCode{};
+    }
+
+    ArmReadDeadline();
+    auto [ec] = co_await impl_->socket.async_wait(
+        tcp::socket::wait_read,
+        net::as_tuple(net::use_awaitable));
+    CancelReadDeadline();
+    co_return ec;
 }
 
 tcp::socket& TcpStream::TlsLayerSocket() noexcept {
