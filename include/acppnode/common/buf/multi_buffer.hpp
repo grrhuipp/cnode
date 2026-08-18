@@ -100,10 +100,6 @@ struct Buffer {
     [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
     [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
     [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
-    [[nodiscard]] const TargetAddress* MaybeUDP() const noexcept {
-        return udp_ ? std::addressof(*udp_) : nullptr;
-    }
-
     // 从 Worker-local 回收缓存或 allocator 获取；仅初始化游标，payload 保持
     // 未初始化以避免热路径无谓 memset。命中回收缓存时省去 8KB 全局分配。
     [[nodiscard]] static Buffer* New() noexcept {
@@ -283,41 +279,6 @@ struct BufferGuard {
     [[nodiscard]] Buffer* operator->() const noexcept { return ptr; }
     [[nodiscard]] Buffer& operator*() const noexcept { return *ptr; }
 };
-
-[[nodiscard]] inline bool AdvanceBufferToSuffix(Buffer& buffer,
-                                                std::span<const uint8_t> suffix) noexcept {
-    if (suffix.empty()) {
-        return false;
-    }
-    const auto bytes = buffer.Bytes();
-    const auto* base = bytes.data();
-    const auto* end = base + bytes.size();
-    const auto* suffix_data = suffix.data();
-    if (suffix_data < base ||
-        suffix_data > end ||
-        suffix.size() > static_cast<size_t>(end - suffix_data)) {
-        return false;
-    }
-    const size_t suffix_offset = static_cast<size_t>(suffix_data - base);
-    if (suffix_offset > bytes.size() ||
-        suffix.size() > bytes.size() - suffix_offset ||
-        suffix_offset + suffix.size() != bytes.size()) {
-        return false;
-    }
-    buffer.Advance(static_cast<uint32_t>(suffix_offset));
-    return true;
-}
-
-[[nodiscard]] inline bool TakeBufferSuffix(BufferGuard& owner,
-                                           std::span<const uint8_t> suffix,
-                                           BufferGuard& out) noexcept {
-    if (!owner || out || !AdvanceBufferToSuffix(*owner, suffix)) {
-        return false;
-    }
-    out = std::move(owner);
-    owner = BufferGuard{};
-    return true;
-}
 
 // ============================================================================
 // MultiBuffer - Buffer 指针链（对应 Xray buf.MultiBuffer）

@@ -166,7 +166,6 @@ struct RealityConfig {
     // 调试/兼容字段
     std::string master_key_log;
 
-    [[nodiscard]] bool IsServer() const noexcept { return private_key.has_value(); }
     [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
 
     static RealityConfig FromJson(const json::object& j);

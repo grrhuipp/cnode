@@ -83,11 +83,14 @@ net::awaitable<bool> SetupWorkerInbounds(
     installed.reserve(inbounds.size());
 
     for (const auto& inbound : inbounds) {
-        auto outbound_policy = inbound.routing_enabled
-            ? routing::OutboundSelectionPolicy(routing::RouteWithFallback(
-                  std::string(constants::protocol::kDirect)))
-            : routing::OutboundSelectionPolicy(routing::ForceOutbound(
-                  std::string(constants::protocol::kDirect)));
+        auto outbound_policy = [&]() -> routing::OutboundSelectionPolicy {
+            if (inbound.routing_enabled) {
+                return routing::RouteWithFallback(
+                    std::string(constants::protocol::kDirect));
+            }
+            return routing::ForceOutbound(
+                std::string(constants::protocol::kDirect));
+        }();
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
             inbound.all_tags,

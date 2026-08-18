@@ -325,6 +325,7 @@ api/* 拉取 panel 原始 users
 
 - 优先沿用现有目录职责、命名风格、协程模型、RAII 和错误处理方式。
 - 公共头保持窄接口，避免暴露协议私有 helper、运行态存储、完整配置对象或跨层依赖。
+- 公共 helper / method 必须有当前生产或测试调用；不为假设中的未来需求保留未使用的格式化、转换、清空、兼容或 convenience API。
 - 协议私有 reader、writer、codec、crypto helper 留在 `src/proxy/<protocol>` 内部。
 - 冷路径可以做 JSON 解析、字段兼容和对象构建；热路径避免 JSON 解析、panel 字段判断、重复分配、重复拷贝和不必要锁。
 - Buffer / MultiBuffer 必须保持清晰所有权，move 后即视为转移，消费结束后及时归还或释放。
@@ -397,6 +398,7 @@ cnode 应满足：
 13. Router 的无匹配结果为空，显式 fallback 只能在 Dispatcher 中解析；系统不存在隐式全局默认出口。
 14. 面板 DetectRule 通过 RequestPolicy 抽象接入，不污染 Router 或 Dispatcher 类型边界。
 15. 未启用 routing 的静态 inbound 使用 `ForceOutbound(direct)`，即使规则可命中也不得进入 Router。
+16. 公共头不存在全仓无调用的 helper / method；删除入口时同步删除只为该入口服务的实现、状态和 include。
 
 ## 部署约束
 

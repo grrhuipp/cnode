@@ -8,6 +8,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 
@@ -46,7 +47,6 @@ namespace app::dispatcher {
 class DefaultDispatcher final : public routing::Dispatcher {
 public:
     DefaultDispatcher() = default;
-    explicit DefaultDispatcher(app::router::Router& router) noexcept;
 
     void BindRouter(app::router::Router& router) noexcept;
     void BindOutboundManager(features::outbound::Manager& outbound_manager) noexcept;
@@ -68,16 +68,19 @@ public:
 private:
     struct RouteResult {
         std::shared_ptr<Outbound> handler;
-        ErrorCode error = ErrorCode::OK;
+        ErrorCode error;
+    };
+
+    enum class RouteSource : uint8_t {
+        Forced,
+        Rule,
+        Fallback,
     };
 
     struct RouteSelection {
         std::string_view outbound_tag;
-        bool matched = false;
-        bool fixed = false;
-        bool fallback = false;
-        uint32_t rule_index = 0;
-        ErrorCode error = ErrorCode::OK;
+        RouteSource source;
+        uint32_t rule_index;
     };
 
     net::awaitable<RelayResult> DispatchPreparedLink(

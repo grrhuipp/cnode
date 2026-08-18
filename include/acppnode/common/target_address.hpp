@@ -89,11 +89,6 @@ struct TargetAddress {
         return type == AddressType::IPv6;
     }
 
-    // 判断是否已解析
-    bool IsResolved() const {
-        return resolved_addr.has_value();
-    }
-
     // 转换为字符串
     std::string ToString() const {
         if (host.empty() && resolved_addr) {

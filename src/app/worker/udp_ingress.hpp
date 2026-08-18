@@ -10,7 +10,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 struct TargetAddress;
@@ -85,8 +84,6 @@ public:
 
     UdpIngress(const UdpIngress&) = delete;
     UdpIngress& operator=(const UdpIngress&) = delete;
-    UdpIngress(UdpIngress&&) noexcept;
-    UdpIngress& operator=(UdpIngress&&) noexcept;
 
     [[nodiscard]] std::string_view Tag() const noexcept;
 
@@ -155,7 +152,6 @@ public:
     [[nodiscard]] bool OwnsSocket(
         const std::string& socket_key,
         const udp::socket* socket) const noexcept;
-    [[nodiscard]] std::vector<std::string> SocketKeys() const;
     void CloseSocket(const std::string& socket_key) noexcept;
     void CloseAllSockets() noexcept;
 

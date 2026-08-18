@@ -8,8 +8,6 @@
 
 namespace acpp {
 
-struct TargetAddress;
-
 // ============================================================================
 // 嗅探结果
 // ============================================================================
@@ -19,10 +17,6 @@ struct SniffResult {
     std::string domain;             // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
 
-    // 转换为 TargetAddress
-    [[nodiscard]] TargetAddress ToTarget() const;
-
-    [[nodiscard]] std::string ToString() const;
 };
 
 // ============================================================================

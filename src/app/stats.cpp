@@ -6,23 +6,6 @@
 namespace acpp {
 
 // ============================================================================
-// StatsSnapshot 实现
-// ============================================================================
-
-std::string StatsSnapshot::ToString() const {
-    return std::format(
-        "conn={}/{} bytes_in={} bytes_out={} "
-        "in_rate={}/s out_rate={}/s err={}",
-        connections_active,
-        connections_total,
-        FormatBytes(bytes_in),
-        FormatBytes(bytes_out),
-        FormatBytes(static_cast<uint64_t>(bytes_in_rate)),
-        FormatBytes(static_cast<uint64_t>(bytes_out_rate)),
-        errors);
-}
-
-// ============================================================================
 // ShardedStats 实现
 // ============================================================================
 
@@ -32,30 +15,10 @@ ShardedStats::ShardedStats(uint32_t num_workers)
     // samples_ 默认初始化（valid = false），无需额外处理
 }
 
-StatsSnapshot ShardedStats::Aggregate() const {
-    StatsSnapshot snapshot;
-
-    for (const auto& shard : shards_) {
-        // 热点数据
-        snapshot.bytes_in += shard.hot.bytes_in;
-        snapshot.bytes_out += shard.hot.bytes_out;
-
-        // 冷数据
-        snapshot.connections_total += shard.cold.connections_total;
-        snapshot.connections_active += shard.cold.connections_active;
-        snapshot.errors += shard.cold.errors;
-    }
-    return snapshot;
-}
-
 StatsSnapshot ShardedStats::WithCurrentRate(StatsSnapshot snapshot) const {
     snapshot.bytes_in_rate  = current_in_rate_;
     snapshot.bytes_out_rate = current_out_rate_;
     return snapshot;
-}
-
-void ShardedStats::SampleNow() {
-    SampleNow(Aggregate());
 }
 
 void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {

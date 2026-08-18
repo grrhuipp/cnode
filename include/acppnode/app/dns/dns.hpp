@@ -32,17 +32,11 @@ public:
 
     DNS(const DNS&) = delete;
     DNS& operator=(const DNS&) = delete;
-    DNS(DNS&&) noexcept;
-    DNS& operator=(DNS&&) noexcept;
 
     net::awaitable<DnsResult> Resolve(std::string_view domain);
 
     DnsCacheStats GetCacheStats() const;
-    void ClearCache();
     [[nodiscard]] static DnsCacheStats GetGlobalCacheStats();
-    static void ClearGlobalCache();
-
-    net::awaitable<void> Prefetch(const std::vector<std::string>& domains);
 
 private:
     struct Impl;

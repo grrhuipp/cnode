@@ -4,7 +4,6 @@
 
 #include <array>
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace acpp {
@@ -37,7 +36,6 @@ struct StatsSnapshot {
     double bytes_out_rate = 0;
     double connections_rate = 0;
 
-    [[nodiscard]] std::string ToString() const;
 };
 
 // ============================================================================
@@ -153,18 +151,9 @@ public:
         return shards_[worker_id % shards_.size()];
     }
 
-    // 快速路径：只获取热点数据分片
-    HotStatsShard& GetHotShard(uint32_t worker_id) {
-        return shards_[worker_id % shards_.size()].hot;
-    }
-
-    // 汇总所有分片
-    [[nodiscard]] StatsSnapshot Aggregate() const;
-
     [[nodiscard]] StatsSnapshot WithCurrentRate(StatsSnapshot snapshot) const;
 
     // 采样（每秒调用）
-    void SampleNow();
     void SampleNow(const StatsSnapshot& snapshot);
 
 private:

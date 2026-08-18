@@ -29,7 +29,6 @@ public:
     static void PublishBatch(std::span<const GlobalDnsCacheUpdate> updates);
 
     [[nodiscard]] static DnsCacheStats GetStats();
-    static void Clear();
 };
 
 }  // namespace acpp::app::dns

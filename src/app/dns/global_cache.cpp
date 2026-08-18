@@ -374,9 +374,4 @@ DnsCacheStats GlobalDnsCache::GetStats() {
     return stats;
 }
 
-void GlobalDnsCache::Clear() {
-    ClearShards();
-    ResetStats();
-}
-
 }  // namespace acpp::app::dns

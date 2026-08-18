@@ -139,27 +139,5 @@ void EncodeEndTo(memory::ByteVector& out,
 // Mux 线上格式:         IPv4=1, Domain=2, IPv6=3
 // ============================================================================
 [[nodiscard]] uint8_t     ToMuxAddrType(AddressType t) noexcept;
-// ============================================================================
-// GlobalID 辅助函数
-// ============================================================================
-
-// 将 8 字节 GlobalID 转为 uint64_t key（big-endian 解释）
-[[nodiscard]] inline uint64_t GlobalIdToKey(
-    const std::array<uint8_t, 8>& gid) noexcept
-{
-    uint64_t k = 0;
-    for (int i = 0; i < 8; ++i)
-        k = (k << 8) | gid[i];
-    return k;
-}
-
-// 判断 GlobalID 是否全零（不启用跨连接路由）
-[[nodiscard]] inline bool IsNullGlobalId(
-    const std::array<uint8_t, 8>& gid) noexcept
-{
-    for (uint8_t b : gid)
-        if (b != 0) return false;
-    return true;
-}
 
 }  // namespace acpp::mux

@@ -62,19 +62,6 @@ inline void* AllocateRaw(size_t size,
     return ::operator new(size, std::nothrow);
 }
 
-inline void* AllocateArrayRaw(size_t count,
-                              size_t elem_size,
-                              size_t alignment = alignof(std::max_align_t)) noexcept {
-    if (count == 0 || elem_size == 0) {
-        count = 1;
-        elem_size = 1;
-    }
-    if (count > std::numeric_limits<size_t>::max() / elem_size) {
-        return nullptr;
-    }
-    return AllocateRaw(count * elem_size, alignment);
-}
-
 inline void DeallocateRaw(void* p,
                           size_t /*size*/ = 0,
                           size_t alignment = alignof(std::max_align_t)) noexcept {

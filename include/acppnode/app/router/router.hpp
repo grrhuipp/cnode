@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <string_view>
 
 namespace acpp::geo {
@@ -29,8 +28,6 @@ class Router {
 public:
     Router();
     ~Router() noexcept;
-    Router(Router&&) noexcept;
-    Router& operator=(Router&&) noexcept;
     Router(const Router&) = delete;
     Router& operator=(const Router&) = delete;
 
@@ -40,7 +37,7 @@ public:
         ::acpp::geo::GeoManager* geo_manager);
 
     // Hot path: return a tag only when a normalized routing rule matches.
-    [[nodiscard]] RouteDecision RouteDetailed(const session::Context& ctx) const;
+    [[nodiscard]] RouteDecision Route(const session::Context& ctx) const;
 
     [[nodiscard]] ::acpp::RoutingDomainStrategy DomainStrategy() const noexcept;
 

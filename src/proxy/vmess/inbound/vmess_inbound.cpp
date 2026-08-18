@@ -15,7 +15,6 @@
 #include "acppnode/common/session.hpp"
 
 #include <algorithm>
-#include <array>
 #include <expected>
 #include <span>
 #include <utility>
@@ -336,7 +335,7 @@ const bool kVmessInboundRegistered = [] {
                     .uuid_bytes = user->uuid_bytes,
                     .cmd_key = user->cmd_key,
                     .auth_key = user->auth_key,
-                    .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
+                    .cached_auth_aes_key = user->cached_auth_aes_key,
                     .profile = user->profile,
                 });
             }
@@ -363,7 +362,7 @@ const bool kVmessInboundRegistered = [] {
                         .uuid_bytes = user->uuid_bytes,
                         .cmd_key = user->cmd_key,
                         .auth_key = user->auth_key,
-                        .cached_auth_aes_key = std::to_array(user->cached_auth_aes_key.key),
+                        .cached_auth_aes_key = user->cached_auth_aes_key,
                         .profile = user->profile,
                     });
                 }

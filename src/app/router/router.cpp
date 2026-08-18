@@ -715,10 +715,8 @@ struct Router::Impl {
 Router::Router()
     : impl_(std::make_unique<Impl>()) {}
 Router::~Router() noexcept = default;
-Router::Router(Router&&) noexcept = default;
-Router& Router::operator=(Router&&) noexcept = default;
 
-RouteDecision Router::RouteDetailed(const session::Context& ctx) const {
+RouteDecision Router::Route(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
     // 顺序检查复合规则（AND 语义）

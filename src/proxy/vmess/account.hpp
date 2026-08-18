@@ -17,21 +17,12 @@
 
 namespace acpp::vmess {
 
-// 缓存的 AES-128 ECB 解密 key。公开在 MemoryAccount 中作为预计算身份数据，
-// 具体 AES 实现留在 VMess 私有 crypto helper。
-struct CachedAESKey {
-    uint8_t key[16] = {};
-
-    void InitDecryptKey(const uint8_t* k);
-    void ECBDecrypt(const uint8_t* ciphertext, uint8_t* plaintext) const;
-};
-
 struct MemoryAccount {
     std::string             uuid;
     std::array<uint8_t, 16> uuid_bytes;
     std::array<uint8_t, 16> cmd_key;
     std::array<uint8_t, 16> auth_key;
-    CachedAESKey cached_auth_aes_key;
+    std::array<uint8_t, 16> cached_auth_aes_key;
     ::acpp::UserProfile profile;
 
     static std::optional<MemoryAccount> FromUUID(

@@ -30,8 +30,6 @@ public:
 
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
-    UserOnlineTracker(UserOnlineTracker&&) noexcept;
-    UserOnlineTracker& operator=(UserOnlineTracker&&) noexcept;
 
     void OnUserConnected(std::string_view tag,
                          uint64_t user_id,
@@ -48,10 +46,6 @@ public:
 
     [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
                                            uint64_t user_id) const;
-
-    void ClearTag(std::string_view tag);
-
-    void Clear();
 
     std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 private:

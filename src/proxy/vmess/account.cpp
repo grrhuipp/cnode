@@ -39,7 +39,7 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(
         KDFSalt::AUTH_ID_ENCRYPTION_KEY
     };
     account.auth_key = KDF16(account.cmd_key.data(), 16, auth_key_path);
-    account.cached_auth_aes_key.InitDecryptKey(account.auth_key.data());
+    account.cached_auth_aes_key = account.auth_key;
 
     return account;
 }

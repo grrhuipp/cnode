@@ -153,14 +153,6 @@ void DnsCache::PutNegative(std::string_view domain,
     }
 }
 
-void DnsCache::Clear() {
-    for (auto& shard : shards_) {
-        shard.cache.clear();
-        shard.lru_list.clear();
-    }
-    total_entries_ = 0;
-}
-
 DnsCacheStats DnsCache::GetStats() const {
     DnsCacheStats stats;
     stats.hits = hits_;

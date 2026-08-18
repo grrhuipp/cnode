@@ -31,7 +31,6 @@ public:
              uint32_t ttl);
     void PutNegative(std::string_view domain,
                      uint32_t ttl = 60);
-    void Clear();
     DnsCacheStats GetStats() const;
 
 private:

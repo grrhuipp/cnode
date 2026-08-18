@@ -173,9 +173,17 @@ endforeach()
 file(READ "${SOURCE_DIR}/include/acppnode/app/router/router.hpp"
      ROUTER_INTERFACE_SOURCE)
 if(ROUTER_INTERFACE_SOURCE MATCHES
-       "std::string_view +Route *[(]")
+       "std::string_view +Route *[(]|RouteDetailed|Router *[(] *Router&&")
     message(FATAL_ERROR
-        "Router public interface must expose the complete matched-rule decision only")
+        "Router public interface must expose only the complete RouteDecision entry")
+endif()
+
+file(READ "${SOURCE_DIR}/include/acppnode/app/dispatcher/default_dispatcher.hpp"
+     DEFAULT_DISPATCHER_INTERFACE_SOURCE)
+if(DEFAULT_DISPATCHER_INTERFACE_SOURCE MATCHES
+       "DefaultDispatcher *[(] *app::router::Router")
+    message(FATAL_ERROR
+        "Dispatcher must be bound explicitly during Worker runtime initialization")
 endif()
 
 foreach(CHILD_DISPATCH_FILE IN ITEMS

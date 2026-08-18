@@ -1,7 +1,6 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
-#include "acppnode/core/constants.hpp"
 
 #include <asio/ip/address.hpp>
 
@@ -10,12 +9,6 @@
 #include <string_view>
 
 namespace acpp::iputil {
-
-inline bool IsWildcardBindAddress(std::string_view value) noexcept {
-    return value.empty() ||
-           value == constants::network::kAnyIpv4 ||
-           value == "::";
-}
 
 inline net::ip::address NormalizeAddress(
     const net::ip::address& addr) {
@@ -40,12 +33,6 @@ inline net::ip::address NormalizeAddress(
 inline std::string NormalizeAddressString(
     const net::ip::address& addr) {
     return NormalizeAddress(addr).to_string();
-}
-
-inline bool IsIpLiteral(std::string_view host) {
-    IoErrorCode ec;
-    auto addr = net::ip::make_address(host, ec);
-    return !ec && (addr.is_v4() || addr.is_v6());
 }
 
 inline bool NeedsIpv6Brackets(std::string_view host) noexcept {

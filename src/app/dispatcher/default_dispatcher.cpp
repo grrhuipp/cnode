@@ -110,9 +110,6 @@ struct ActiveSessionScope {
 
 }  // namespace
 
-DefaultDispatcher::DefaultDispatcher(app::router::Router& router) noexcept
-    : router_(&router) {}
-
 void DefaultDispatcher::BindRouter(app::router::Router& router) noexcept {
     router_ = &router;
 }
@@ -454,24 +451,20 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
 DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     session::Context& ctx,
     const RouteSelection& selection) const noexcept {
-    if (selection.error != ErrorCode::OK) {
-        LOG_CONN_WARN(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
-                          ctx.inbound.source_ip, ctx.outbound.target);
-        return RouteResult{
-            .handler = {},
-            .error = selection.error,
-        };
-    }
-
     ctx.outbound.tag = selection.outbound_tag;
-    if (selection.fixed) {
-        ctx.outbound.route_rule = "fixed";
-    } else if (selection.matched) {
-        ctx.outbound.route_rule = "rule:" + std::to_string(selection.rule_index);
-    } else if (selection.fallback) {
-        ctx.outbound.route_rule = "fallback";
+    switch (selection.source) {
+        case RouteSource::Forced:
+            ctx.outbound.route_rule = "fixed";
+            break;
+        case RouteSource::Rule:
+            ctx.outbound.route_rule =
+                "rule:" + std::to_string(selection.rule_index);
+            break;
+        case RouteSource::Fallback:
+            ctx.outbound.route_rule = "fallback";
+            break;
     }
-    if (selection.fixed) {
+    if (selection.source == RouteSource::Forced) {
         LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
                        ctx.outbound.target, ctx.outbound.tag);
     } else {
@@ -509,7 +502,7 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     const routing::DispatchPolicy& policy) const noexcept {
     app::router::RouteDecision decision;
     if (router_ && detail::RequiresRouting(policy.outbound)) {
-        decision = router_->RouteDetailed(ctx);
+        decision = router_->Route(ctx);
     }
 
     const auto selection = detail::SelectOutbound(
@@ -520,13 +513,23 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
             .rule_index = decision.rule_index,
         });
 
+    RouteSource source = RouteSource::Fallback;
+    switch (selection.source) {
+        case detail::SelectionSource::Forced:
+            source = RouteSource::Forced;
+            break;
+        case detail::SelectionSource::Rule:
+            source = RouteSource::Rule;
+            break;
+        case detail::SelectionSource::Fallback:
+            source = RouteSource::Fallback;
+            break;
+    }
+
     return RouteSelection{
         .outbound_tag = selection.outbound_tag,
-        .matched = selection.source == detail::SelectionSource::Rule,
-        .fixed = selection.source == detail::SelectionSource::Forced,
-        .fallback = selection.source == detail::SelectionSource::Fallback,
+        .source = source,
         .rule_index = selection.rule_index,
-        .error = ErrorCode::OK,
     };
 }
 
@@ -546,29 +549,35 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
 
     auto select_with_addresses =
         [&](const std::vector<net::ip::address>& addresses) -> RouteSelection {
-            RouteSelection last;
-            for (const auto& addr : addresses) {
+            auto select_address = [&](const net::ip::address& addr) {
                 ctx.outbound.target.resolved_addr = addr;
                 if (ctx.outbound.route_target.IsDomain() &&
                     ctx.outbound.route_target.host == ctx.outbound.target.host &&
                     ctx.outbound.route_target.port == ctx.outbound.target.port) {
                     ctx.outbound.route_target.resolved_addr = addr;
                 }
-                auto selection = SelectRoute(ctx, policy);
+                return SelectRoute(ctx, policy);
+            };
+
+            auto address = addresses.begin();
+            auto last = select_address(*address);
+            if (last.source != RouteSource::Fallback) {
+                return last;
+            }
+            for (++address; address != addresses.end(); ++address) {
+                auto selection = select_address(*address);
                 last = selection;
-                if (selection.error != ErrorCode::OK || selection.fixed || selection.matched) {
+                if (selection.source != RouteSource::Fallback) {
                     return selection;
                 }
             }
-            if (!addresses.empty()) {
-                ctx.outbound.target.resolved_addr = addresses.front();
-            }
+            ctx.outbound.target.resolved_addr = addresses.front();
             return last;
         };
 
     if (strategy == RoutingDomainStrategy::IPIfNonMatch) {
         auto initial = SelectRoute(ctx, policy);
-        if (initial.error != ErrorCode::OK || initial.fixed || initial.matched) {
+        if (initial.source != RouteSource::Fallback) {
             co_return FinishRoute(ctx, initial);
         }
 

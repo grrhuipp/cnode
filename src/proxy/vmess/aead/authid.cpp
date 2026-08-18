@@ -1,22 +1,12 @@
 #include "../vmess_crypto.hpp"
-#include "../account.hpp"
 
 #include <openssl/rand.h>
 #include <openssl/evp.h>
 
-#include <cstring>
 #include <zlib.h>
 
 namespace acpp {
 namespace vmess {
-
-void CachedAESKey::InitDecryptKey(const uint8_t* k) {
-    std::memcpy(key, k, 16);
-}
-
-void CachedAESKey::ECBDecrypt(const uint8_t* ciphertext, uint8_t* plaintext) const {
-    AES128ECBDecrypt(key, ciphertext, plaintext);
-}
 
 void AES128ECBEncrypt(const uint8_t* key, const uint8_t* plaintext, uint8_t* ciphertext) {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();

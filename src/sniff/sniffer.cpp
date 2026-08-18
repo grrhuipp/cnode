@@ -1,28 +1,9 @@
 #include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/common/target_address.hpp"
 #include "acppnode/core/constants.hpp"
 
 #include <algorithm>
 
 namespace acpp {
-
-TargetAddress SniffResult::ToTarget() const {
-    return TargetAddress(domain, port);
-}
-
-std::string SniffResult::ToString() const {
-    if (!success) return std::string(constants::state::kNone);
-    std::string out;
-    out.reserve(protocol.size() + 1 + domain.size() + (port > 0 ? 6 : 0));
-    out.append(protocol);
-    out.push_back(':');
-    out.append(domain.data(), domain.size());
-    if (port > 0) {
-        out.push_back(':');
-        out.append(std::to_string(port));
-    }
-    return out;
-}
 
 // ============================================================================
 SniffResult BittorrentSniffer::Sniff(std::span<const uint8_t> data) {

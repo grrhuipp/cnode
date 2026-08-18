@@ -34,10 +34,6 @@ UserOnlineTracker::UserOnlineTracker() : impl_(std::make_unique<Impl>()) {}
 
 UserOnlineTracker::~UserOnlineTracker() = default;
 
-UserOnlineTracker::UserOnlineTracker(UserOnlineTracker&&) noexcept = default;
-
-UserOnlineTracker& UserOnlineTracker::operator=(UserOnlineTracker&&) noexcept = default;
-
 void UserOnlineTracker::OnUserConnected(std::string_view tag,
                                         uint64_t user_id,
                                         std::string_view client_ip) {
@@ -124,20 +120,6 @@ size_t UserOnlineTracker::OnlineDeviceCount(std::string_view tag,
         return 0;
     }
     return user_it->second.size();
-}
-
-void UserOnlineTracker::ClearTag(std::string_view tag) {
-    if (auto it = impl_->connections.find(tag); it != impl_->connections.end()) {
-        impl_->connections.erase(it);
-    }
-    if (auto it = impl_->devices.find(tag); it != impl_->devices.end()) {
-        impl_->devices.erase(it);
-    }
-}
-
-void UserOnlineTracker::Clear() {
-    impl_->connections.clear();
-    impl_->devices.clear();
 }
 
 std::vector<UserOnlineTracker::OnlineDevice>

@@ -13,7 +13,6 @@
 
 #include <array>
 #include <chrono>
-#include <string>
 #include <string_view>
 #include <cstdint>
 #include "acppnode/infra/log.hpp"
@@ -42,14 +41,6 @@ enum class Reject : uint8_t {
     IPRateLimit,      // IP 速率超限
     IPBanned,         // IP 被屏蔽（认证失败）
 };
-
-inline const char* ToString(Reject r) {
-    static const char* names[] = {
-        "None", "GlobalLimit", "IPConnLimit",
-        "IPRateLimit", "IPBanned"
-    };
-    return names[static_cast<int>(r)];
-}
 
 // ============================================================================
 // 时间戳（秒）
@@ -360,7 +351,7 @@ public:
 
     ConnectionLimiter() = default;
     explicit ConnectionLimiter(const RateLimitConfig& c)
-        : lim_(c), cfg_(c) {}
+        : lim_(c) {}
 
     RejectReason TryAcceptGlobal() {
         return lim_.CheckGlobal() == Reject::None ?
@@ -384,12 +375,10 @@ public:
         lim_.OnAuthFailTracked(tag, ip);
     }
 
-    const RateLimitConfig& GetConfig() const { return cfg_; }
     DefaultRateLimiter& GetLimiter() { return lim_; }
 
 private:
     DefaultRateLimiter lim_;
-    RateLimitConfig cfg_;
 };
 
 }  // namespace acpp

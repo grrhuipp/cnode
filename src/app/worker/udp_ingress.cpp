@@ -312,8 +312,6 @@ UdpIngress::UdpIngress(
     : impl_(std::make_unique<Impl>(std::move(tag), std::move(proxy))) {}
 
 UdpIngress::~UdpIngress() noexcept = default;
-UdpIngress::UdpIngress(UdpIngress&&) noexcept = default;
-UdpIngress& UdpIngress::operator=(UdpIngress&&) noexcept = default;
 
 void UdpIngress::PendingUdpReplyDeleter::operator()(
     PendingUdpReply* reply) const noexcept {
@@ -844,16 +842,6 @@ bool UdpIngress::OwnsSocket(
     auto it = impl_->udp_sockets.find(socket_key);
     return socket && it != impl_->udp_sockets.end() &&
         it->second.get() == socket;
-}
-
-std::vector<std::string> UdpIngress::SocketKeys() const {
-    std::vector<std::string> keys;
-    keys.reserve(impl_->udp_sockets.size());
-    for (const auto& [socket_key, socket] : impl_->udp_sockets) {
-        (void)socket;
-        keys.push_back(socket_key);
-    }
-    return keys;
 }
 
 void UdpIngress::CloseSocket(const std::string& socket_key) noexcept {

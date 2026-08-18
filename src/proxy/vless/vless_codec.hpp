@@ -48,11 +48,6 @@ public:
     static size_t EncodeResponseHeaderTo(uint8_t* output,
                                          size_t output_size) noexcept;
 
-    static std::optional<size_t> ParseResponseHeader(
-        const uint8_t* data,
-        size_t len,
-        size_t& consumed) noexcept;
-
     static size_t EncodeUdpPacketTo(const uint8_t* payload,
                                     size_t payload_len,
                                     uint8_t* output,

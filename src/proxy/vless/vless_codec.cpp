@@ -324,25 +324,6 @@ size_t Codec::EncodeResponseHeaderTo(uint8_t* output,
     return 2;
 }
 
-std::optional<size_t> Codec::ParseResponseHeader(
-    const uint8_t* data,
-    size_t len,
-    size_t& consumed) noexcept {
-    consumed = 0;
-    if (len < 2) {
-        return std::nullopt;
-    }
-    if (data[0] != kVersion) {
-        return std::nullopt;
-    }
-    const size_t addons_len = data[1];
-    if (len < 2 + addons_len) {
-        return std::nullopt;
-    }
-    consumed = 2 + addons_len;
-    return consumed;
-}
-
 size_t Codec::EncodeUdpPacketTo(const uint8_t* payload,
                                 size_t payload_len,
                                 uint8_t* output,

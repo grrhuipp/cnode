@@ -1,6 +1,5 @@
 #include "cache_internal.hpp"
 #include "global_cache.hpp"
-#include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/experimental/channel.hpp>
@@ -142,8 +141,6 @@ struct DNS::Impl {
 
     net::awaitable<DnsResult> Resolve(std::string_view domain);
     DnsCacheStats GetCacheStats() const;
-    void ClearCache();
-    net::awaitable<void> Prefetch(const std::vector<std::string>& domains);
 
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
     net::awaitable<DnsResult> QueryServer(
@@ -645,46 +642,11 @@ DnsCacheStats DNS::Impl::GetCacheStats() const {
     return cache.GetStats();
 }
 
-void DNS::Impl::ClearCache() {
-    cache.Clear();
-}
-
-net::awaitable<void> DNS::Impl::Prefetch(
-    const std::vector<std::string>& domains) {
-    if (domains.empty()) {
-        co_return;
-    }
-
-    LOG_DEBUG("DNS prefetch starting for {} domains", domains.size());
-    for (const auto& domain : domains) {
-        if (domain.empty() || cache.Get(domain)) {
-            continue;
-        }
-
-        try {
-            auto result = co_await Resolve(domain);
-            if (result.Ok()) {
-                LOG_DEBUG("DNS prefetch: {} -> {} (ttl={}s)",
-                          domain,
-                          result.addresses.front().to_string(),
-                          result.ttl);
-            } else {
-                LOG_DEBUG("DNS prefetch failed: {} - {}",
-                          domain, result.error_msg);
-            }
-        } catch (const std::exception& e) {
-            LOG_DEBUG("DNS prefetch exception: {} - {}", domain, e.what());
-        }
-    }
-}
-
 DNS::DNS(net::io_context& io_context, const Config& config)
     : impl_(std::make_unique<Impl>(io_context, config)) {
 }
 
 DNS::~DNS() = default;
-DNS::DNS(DNS&&) noexcept = default;
-DNS& DNS::operator=(DNS&&) noexcept = default;
 
 net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
     return impl_->Resolve(domain);
@@ -694,20 +656,8 @@ DnsCacheStats DNS::GetCacheStats() const {
     return impl_->GetCacheStats();
 }
 
-void DNS::ClearCache() {
-    impl_->ClearCache();
-}
-
 DnsCacheStats DNS::GetGlobalCacheStats() {
     return GlobalDnsCache::GetStats();
-}
-
-void DNS::ClearGlobalCache() {
-    GlobalDnsCache::Clear();
-}
-
-net::awaitable<void> DNS::Prefetch(const std::vector<std::string>& domains) {
-    return impl_->Prefetch(domains);
 }
 
 }  // namespace acpp::app::dns
