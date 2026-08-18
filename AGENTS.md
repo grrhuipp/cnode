@@ -23,6 +23,7 @@
 - cnode 与 XrayR YAML 配置布局有意不同，不回退到 YAML 默认入口或旧 sidecar path 字段。
 - 任意配置来源都必须先归一化，再进入 runtime。
 - 任意热路径对象都必须能明确指出所属 Worker；跨线程访问只能通过投递、快照或冷路径同步完成。
+- 集中结构化日志的待发送批次只能驻留在有界进程内存；禁止创建或恢复 `access-spool` / `error-spool` 磁盘队列。
 - proxyman receiver 在冷路径构建完整监听语义；进入 Dispatcher 时只能传不可变的窄 `DispatchPolicy`，不能传 `ReceiverSettings`。
 - Router 只返回真实规则命中；强制出口和入站显式 fallback 由 Dispatcher 编排，不存在 Worker 全局默认出口。
 - 每个 receiver 必须在冷路径明确构造 `ForceOutbound` 或 `RouteWithFallback`；策略不可默认构造，空 tag 不得进入热路径。

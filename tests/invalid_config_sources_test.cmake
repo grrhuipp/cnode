@@ -81,7 +81,7 @@ function(expect_started case_name main_content sidecar_name sidecar_content)
     endif()
 endfunction()
 
-function(expect_log_upload_state case_name disable_upload_value expect_spool)
+function(expect_log_upload_state case_name disable_upload_value expect_enabled)
     set(case_dir "${TEST_ROOT}/${case_name}")
     file(REMOVE_RECURSE "${case_dir}")
     file(MAKE_DIRECTORY "${case_dir}")
@@ -113,14 +113,25 @@ function(expect_log_upload_state case_name disable_upload_value expect_spool)
 
     set(access_spool "${log_dir}/access-spool")
     set(error_spool "${log_dir}/error-spool")
-    if(expect_spool)
-        if(NOT IS_DIRECTORY "${access_spool}" OR NOT IS_DIRECTORY "${error_spool}")
-            message(FATAL_ERROR
-                "${case_name}: enabled log upload did not initialize both spool directories")
-        endif()
-    elseif(IS_DIRECTORY "${access_spool}" OR IS_DIRECTORY "${error_spool}")
+    if(IS_DIRECTORY "${access_spool}" OR IS_DIRECTORY "${error_spool}")
         message(FATAL_ERROR
-            "${case_name}: disabled log upload created a spool directory")
+            "${case_name}: centralized log upload must not create spool directories")
+    endif()
+    set(reporter_log "")
+    file(GLOB error_logs "${log_dir}/error_*.log")
+    foreach(error_log IN LISTS error_logs)
+        file(READ "${error_log}" error_log_content)
+        string(APPEND reporter_log "${error_log_content}")
+    endforeach()
+    if(expect_enabled)
+        if(NOT "${reporter_log}" MATCHES "access-log reporter ready")
+            message(FATAL_ERROR
+                "${case_name}: default centralized log upload did not start the reporter")
+        endif()
+    elseif(NOT "${reporter_log}" MATCHES
+           "centralized access-log upload disabled by configuration")
+        message(FATAL_ERROR
+            "${case_name}: disabled centralized log upload did not report its state")
     endif()
 endfunction()
 

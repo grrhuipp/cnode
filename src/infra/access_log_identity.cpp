@@ -131,18 +131,4 @@ std::string NormalizePanelApiHost(std::string_view api_host) {
     return normalized;
 }
 
-std::filesystem::path ResolveSpoolPath(
-    const std::filesystem::path& log_dir) {
-    return log_dir.empty()
-        ? std::filesystem::path("access-spool")
-        : log_dir / "access-spool";
-}
-
-std::filesystem::path ResolveErrorSpoolPath(
-    const std::filesystem::path& log_dir) {
-    return log_dir.empty()
-        ? std::filesystem::path("error-spool")
-        : log_dir / "error-spool";
-}
-
 }  // namespace acpp::accesslog

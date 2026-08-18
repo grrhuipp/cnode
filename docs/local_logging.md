@@ -28,7 +28,7 @@ YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: message
 ```text
 2026/07/19 20:42:06 [Info] [4294967338] app/dispatcher/default_dispatcher: taking detour [direct] for tcp:example.com:443
 2026/07/19 20:42:06 [Warning] [4294967338] proxy/freedom/freedom_outbound: dial failed tcp:example.com:443: connection refused
-2026/07/19 20:42:07 [Error] infra/access_log_reporter: spool write failed events=1000 bytes=81920
+2026/07/19 20:42:07 [Error] infra/access_log_reporter: pending batch rejected events=1000 bytes=81920
 ```
 
 级别口径：

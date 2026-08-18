@@ -28,10 +28,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <future>
 #include <format>
 #include <limits>
@@ -48,13 +45,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <io.h>
 #include <windows.h>
 #include <wincrypt.h>
 #pragma comment(lib, "crypt32.lib")
-#else
-#include <fcntl.h>
-#include <unistd.h>
 #endif
 
 namespace acpp::accesslog {
@@ -73,8 +66,8 @@ constexpr size_t kMaxBatchEvents = 1000;
 constexpr size_t kEventQueueCapacity = 8 * 1024;
 static_assert(kEventQueueCapacity >= 8 * kMaxBatchEvents);
 constexpr size_t kMaxBatchProtobufBytes = 1024 * 1024;
-constexpr uint64_t kMaxSpoolBytes = 128ULL * 1024 * 1024;
-constexpr size_t kMaxSpoolFileBytes = 8 * 1024 * 1024;
+constexpr uint64_t kMaxPendingBatchBytesPerStream = 32ULL * 1024 * 1024;
+constexpr size_t kMaxBatchPayloadBytes = 8 * 1024 * 1024;
 constexpr auto kFlushInterval = 250ms;
 constexpr auto kConnectTimeout = 3s;
 constexpr auto kRequestTimeout = 10s;
@@ -97,15 +90,6 @@ std::string TrimCopy(std::string_view value) {
         value.remove_suffix(1);
     }
     return std::string(value);
-}
-
-bool IsHexId(std::string_view value) noexcept {
-    if (value.size() != 32) {
-        return false;
-    }
-    return std::ranges::all_of(value, [](unsigned char ch) {
-        return std::isxdigit(ch) != 0;
-    });
 }
 
 detail::Id128 MakeBootId() noexcept {
@@ -133,48 +117,6 @@ std::string ResolveServerId() {
     } catch (...) {
     }
     return "cnode-unknown";
-}
-
-bool DurableWrite(const std::filesystem::path& path,
-                  std::span<const uint8_t> payload) {
-#ifdef _WIN32
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path.c_str(), L"wb") != 0) {
-        return false;
-    }
-#else
-    FILE* file = std::fopen(path.string().c_str(), "wb");
-    if (!file) {
-        return false;
-    }
-#endif
-    const size_t written = payload.empty()
-        ? 0
-        : std::fwrite(payload.data(), 1, payload.size(), file);
-    bool ok = written == payload.size() && std::fflush(file) == 0;
-    if (ok) {
-#ifdef _WIN32
-        ok = _commit(_fileno(file)) == 0;
-#else
-        ok = ::fsync(fileno(file)) == 0;
-#endif
-    }
-    if (std::fclose(file) != 0) {
-        ok = false;
-    }
-    return ok;
-}
-
-void SyncDirectory(const std::filesystem::path& path) noexcept {
-#ifndef _WIN32
-    const int fd = ::open(path.string().c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) {
-        (void)::fsync(fd);
-        (void)::close(fd);
-    }
-#else
-    (void)path;
-#endif
 }
 
 #ifdef _WIN32
@@ -597,194 +539,41 @@ private:
     std::atomic_bool cancelled_{false};
 };
 
-class Spool final {
+class PendingBatchQueue final {
 public:
     struct Entry {
-        std::filesystem::path path;
+        std::vector<uint8_t> payload;
         std::string batch_id;
-        uint64_t bytes = 0;
         uint64_t event_count = 0;
     };
 
-    explicit Spool(std::filesystem::path path)
-        : path_(std::move(path)) {}
-
-    bool Initialize() {
-        std::error_code ec;
-        std::filesystem::create_directories(path_, ec);
-        if (ec) {
-            LOG_ERROR("access-log reporter: cannot create spool {}: {}",
-                      path_.string(), ec.message());
-            return false;
-        }
-#ifndef _WIN32
-        std::filesystem::permissions(
-            path_,
-            std::filesystem::perms::owner_all,
-            std::filesystem::perm_options::replace,
-            ec);
-        ec.clear();
-#endif
-
-        std::vector<Entry> loaded;
-        for (std::filesystem::directory_iterator it(path_, ec), end;
-             !ec && it != end;
-             it.increment(ec)) {
-            if (!it->is_regular_file(ec)) {
-                ec.clear();
-                continue;
-            }
-            const auto path = it->path();
-            if (path.extension() == ".tmp" || path.extension() == ".bad") {
-                std::filesystem::remove(path, ec);
-                if (ec) {
-                    LOG_ERROR("access-log reporter: cannot remove stale spool file {}: {}",
-                              path.string(), ec.message());
-                    return false;
-                }
-                continue;
-            }
-            if (path.extension() != ".batch") {
-                continue;
-            }
-            const std::string stem = path.stem().string();
-            const size_t underscore = stem.rfind('_');
-            if (underscore == std::string::npos ||
-                !IsHexId(std::string_view(stem).substr(underscore + 1))) {
-                LOG_WARN("access-log reporter: removing malformed spool file {}",
-                         path.string());
-                std::filesystem::remove(path, ec);
-                if (ec) {
-                    LOG_ERROR("access-log reporter: cannot remove malformed spool file {}: {}",
-                              path.string(), ec.message());
-                    return false;
-                }
-                continue;
-            }
-            uint64_t event_count = 0;
-            if (underscore > 0) {
-                const size_t count_separator = stem.rfind('_', underscore - 1);
-                if (count_separator != std::string::npos) {
-                    const std::string_view count_text(stem.data() + count_separator + 1,
-                                                      underscore - count_separator - 1);
-                    const auto parsed = std::from_chars(
-                        count_text.data(), count_text.data() + count_text.size(),
-                        event_count);
-                    if (parsed.ec != std::errc{} ||
-                        parsed.ptr != count_text.data() + count_text.size()) {
-                        event_count = 0;
-                    }
-                }
-            }
-            const uint64_t size = std::filesystem::file_size(path, ec);
-            if (ec || size > kMaxSpoolFileBytes) {
-                const auto size_error = ec;
-                ec.clear();
-                LOG_WARN("access-log reporter: removing invalid spool file {}",
-                         path.string());
-                std::filesystem::remove(path, ec);
-                if (ec) {
-                    LOG_ERROR("access-log reporter: cannot remove invalid spool file {}: {}",
-                              path.string(), ec.message());
-                    return false;
-                }
-                if (size_error) {
-                    LOG_WARN("access-log reporter: invalid spool size for {}: {}",
-                             path.string(), size_error.message());
-                }
-                continue;
-            }
-            loaded.push_back({
-                .path = path,
-                .batch_id = stem.substr(underscore + 1),
-                .bytes = size,
-                .event_count = event_count,
-            });
-        }
-        if (ec) {
-            LOG_ERROR("access-log reporter: cannot scan spool {}: {}",
-                      path_.string(), ec.message());
-            return false;
-        }
-        std::ranges::sort(loaded, {}, [](const Entry& entry) {
-            return entry.path.filename().string();
-        });
-        for (auto& entry : loaded) {
-            bytes_ += entry.bytes;
-            entries_.push_back(std::move(entry));
-        }
-        uint64_t evicted_events = 0;
-        while (bytes_ > kMaxSpoolBytes && !entries_.empty()) {
-            std::filesystem::remove(entries_.front().path, ec);
-            if (ec) {
-                LOG_ERROR(
-                    "access-log reporter: cannot enforce spool limit for {}: {}",
-                    entries_.front().path.string(),
-                    ec.message());
-                return false;
-            }
-            evicted_events += entries_.front().event_count;
-            bytes_ -= entries_.front().bytes;
-            entries_.pop_front();
-        }
-        if (evicted_events > 0) {
-            LOG_WARN(
-                "access-log reporter: startup spool limit evicted_events={}",
-                evicted_events);
-        }
-        initialized_ = true;
-        return true;
-    }
-
-    bool Write(std::span<const uint8_t> payload,
-               std::string batch_id,
-               uint64_t event_count,
-               uint64_t& evicted_events) {
+    bool Push(std::vector<uint8_t> payload,
+              std::string batch_id,
+              uint64_t event_count,
+              uint64_t& evicted_events) {
         evicted_events = 0;
-        if (!initialized_ || payload.empty() ||
-            payload.size() > kMaxSpoolFileBytes ||
-            payload.size() > kMaxSpoolBytes) {
+        if (payload.empty() ||
+            payload.size() > kMaxBatchPayloadBytes ||
+            payload.size() > kMaxPendingBatchBytesPerStream) {
             return false;
         }
 
-        while (bytes_ + payload.size() > kMaxSpoolBytes && !entries_.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(entries_.front().path, ec);
-            if (ec) {
-                return false;
-            }
+        while (bytes_ + payload.size() > kMaxPendingBatchBytesPerStream &&
+               !entries_.empty()) {
             evicted_events += entries_.front().event_count;
-            bytes_ -= entries_.front().bytes;
+            bytes_ -= entries_.front().payload.size();
+            event_count_ -= entries_.front().event_count;
             entries_.pop_front();
         }
 
-        const std::string filename = std::format(
-            "{:020}_{:010}_{}.batch", NowMicros(), event_count, batch_id);
-        const auto final_path = path_ / filename;
-        auto tmp_path = final_path;
-        tmp_path += ".tmp";
-
-        if (!DurableWrite(tmp_path, payload)) {
-            std::error_code ignored;
-            std::filesystem::remove(tmp_path, ignored);
-            return false;
-        }
-
-        std::error_code ec;
-        std::filesystem::rename(tmp_path, final_path, ec);
-        if (ec) {
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-        SyncDirectory(path_);
-
+        const size_t payload_size = payload.size();
         entries_.push_back({
-            .path = final_path,
+            .payload = std::move(payload),
             .batch_id = std::move(batch_id),
-            .bytes = payload.size(),
             .event_count = event_count,
         });
-        bytes_ += payload.size();
+        bytes_ += payload_size;
+        event_count_ += event_count;
         return true;
     }
 
@@ -792,67 +581,32 @@ public:
         return entries_.empty();
     }
 
-    [[nodiscard]] uint64_t Bytes() const noexcept {
-        return bytes_;
+    [[nodiscard]] uint64_t EventCount() const noexcept {
+        return event_count_;
     }
 
     [[nodiscard]] const Entry* Front() const noexcept {
         return entries_.empty() ? nullptr : &entries_.front();
     }
 
-    std::optional<std::vector<uint8_t>> ReadFront() const {
-        const Entry* entry = Front();
-        if (!entry || entry->bytes > kMaxSpoolFileBytes) {
-            return std::nullopt;
+    void PopFront() noexcept {
+        if (entries_.empty()) {
+            return;
         }
-        std::ifstream input(entry->path, std::ios::binary);
-        if (!input) {
-            return std::nullopt;
-        }
-        std::vector<uint8_t> data(static_cast<size_t>(entry->bytes));
-        if (!data.empty()) {
-            input.read(
-                reinterpret_cast<char*>(data.data()),
-                static_cast<std::streamsize>(data.size()));
-        }
-        if (!input || static_cast<size_t>(input.gcount()) != data.size()) {
-            return std::nullopt;
-        }
-        return data;
+        bytes_ -= entries_.front().payload.size();
+        event_count_ -= entries_.front().event_count;
+        entries_.pop_front();
     }
 
-    bool AcknowledgeFront() {
-        if (entries_.empty()) {
-            return false;
-        }
-        std::error_code ec;
-        std::filesystem::remove(entries_.front().path, ec);
-        if (ec) {
-            return false;
-        }
-        bytes_ -= entries_.front().bytes;
-        entries_.pop_front();
-        return true;
-    }
-
-    bool DiscardFront() {
-        if (entries_.empty()) {
-            return false;
-        }
-        std::error_code ec;
-        std::filesystem::remove(entries_.front().path, ec);
-        if (ec) {
-            return false;
-        }
-        bytes_ -= entries_.front().bytes;
-        entries_.pop_front();
-        return true;
+    void Clear() noexcept {
+        entries_.clear();
+        bytes_ = 0;
+        event_count_ = 0;
     }
 
 private:
-    std::filesystem::path path_;
-    bool initialized_ = false;
     uint64_t bytes_ = 0;
+    uint64_t event_count_ = 0;
     std::deque<Entry> entries_;
 };
 
@@ -870,7 +624,7 @@ public:
         Shutdown();
     }
 
-    bool Initialize(const std::filesystem::path& log_dir) {
+    bool Initialize() {
         std::lock_guard lock(lifecycle_mutex_);
         if (initialized_.load(std::memory_order_acquire)) {
             return true;
@@ -878,42 +632,23 @@ public:
         if (stopping_.load(std::memory_order_acquire)) {
             return false;
         }
-        access_spool_path_ = ResolveSpoolPath(log_dir);
-        error_spool_path_ = ResolveErrorSpoolPath(log_dir);
-        auto access_spool = std::make_unique<Spool>(access_spool_path_);
-        auto error_spool = std::make_unique<Spool>(error_spool_path_);
-        if (!access_spool->Initialize() || !error_spool->Initialize()) {
-            LOG_ERROR(
-                "access-log reporter initialization failed access_spool={} error_spool={}",
-                access_spool_path_.string(),
-                error_spool_path_.string());
-            return false;
-        }
-        LOG_INFO(
-            "access-log reporter ready endpoint={} access_target={} error_target={} "
-            "access_spool={} error_spool={} pending_bytes={}",
-            kServiceBaseUrl,
-            kAccessBatchTarget,
-            kErrorBatchTarget,
-            access_spool_path_.string(),
-            error_spool_path_.string(),
-            access_spool->Bytes() + error_spool->Bytes());
-        access_spool_ = std::move(access_spool);
-        error_spool_ = std::move(error_spool);
         try {
             thread_ = std::thread([this] { Run(); });
         } catch (const std::exception& e) {
             LOG_ERROR("access-log reporter thread start failed: {}", e.what());
-            access_spool_.reset();
-            error_spool_.reset();
             return false;
         } catch (...) {
             LOG_ERROR("access-log reporter thread start failed: unknown");
-            access_spool_.reset();
-            error_spool_.reset();
             return false;
         }
         initialized_.store(true, std::memory_order_release);
+        LOG_INFO(
+            "access-log reporter ready endpoint={} access_target={} error_target={} "
+            "pending_memory_limit_per_stream={}",
+            kServiceBaseUrl,
+            kAccessBatchTarget,
+            kErrorBatchTarget,
+            kMaxPendingBatchBytesPerStream);
         return true;
     }
 
@@ -991,8 +726,8 @@ public:
     }
 
 private:
-    void PersistRange(
-        Spool& spool,
+    void EnqueueRange(
+        PendingBatchQueue& pending,
         std::span<const detail::SequencedEvent> events,
         std::span<const Source> sources) {
         if (events.empty()) {
@@ -1005,8 +740,8 @@ private:
         }
         if (batch.protobuf.size() > kMaxBatchProtobufBytes && events.size() > 1) {
             const size_t middle = events.size() / 2;
-            PersistRange(spool, events.first(middle), sources);
-            PersistRange(spool, events.subspan(middle), sources);
+            EnqueueRange(pending, events.first(middle), sources);
+            EnqueueRange(pending, events.subspan(middle), sources);
             return;
         }
 
@@ -1018,14 +753,17 @@ private:
         }
 
         uint64_t evicted_events = 0;
-        if (!spool.Write(
-                compressed,
+        const size_t compressed_size = compressed.size();
+        if (!pending.Push(
+                std::move(compressed),
                 detail::HexId(batch.batch_id),
                 events.size(),
                 evicted_events)) {
             dropped_events_.fetch_add(events.size(), std::memory_order_relaxed);
-            LOG_ERROR("access-log reporter: spool write failed events={} bytes={}",
-                      events.size(), compressed.size());
+            LOG_ERROR(
+                "access-log reporter: pending batch rejected events={} bytes={}",
+                events.size(),
+                compressed_size);
             return;
         }
         if (evicted_events > 0) {
@@ -1033,8 +771,8 @@ private:
         }
     }
 
-    void DrainOneBatch(Spool& access_spool,
-                       Spool& error_spool,
+    void DrainOneBatch(PendingBatchQueue& access_pending,
+                       PendingBatchQueue& error_pending,
                        std::vector<Event>& buffer) {
         const size_t count = queue_.try_dequeue_bulk(buffer.data(), buffer.size());
         if (count == 0) {
@@ -1061,8 +799,8 @@ private:
                 .event = std::move(event),
             });
         }
-        PersistRange(access_spool, access_events, *sources);
-        PersistRange(error_spool, error_events, *sources);
+        EnqueueRange(access_pending, access_events, *sources);
+        EnqueueRange(error_pending, error_events, *sources);
     }
 
     void ReportDropsIfNeeded() {
@@ -1079,11 +817,11 @@ private:
     }
 
     void Run() noexcept {
-        Spool& access_spool = *access_spool_;
-        Spool& error_spool = *error_spool_;
+        PendingBatchQueue& access_pending = access_pending_;
+        PendingBatchQueue& error_pending = error_pending_;
 
         struct StreamState {
-            Spool* spool;
+            PendingBatchQueue* pending;
             std::string_view target;
             std::chrono::milliseconds retry_delay{kInitialRetry};
             std::chrono::steady_clock::time_point next_send{
@@ -1091,9 +829,9 @@ private:
             std::chrono::steady_clock::time_point next_warning{
                 std::chrono::steady_clock::time_point::min()};
         };
-        StreamState access_stream{.spool = &access_spool,
+        StreamState access_stream{.pending = &access_pending,
                                   .target = kAccessBatchTarget};
-        StreamState error_stream{.spool = &error_spool,
+        StreamState error_stream{.pending = &error_pending,
                                  .target = kErrorBatchTarget};
 
         std::vector<Event> dequeue_buffer(kMaxBatchEvents);
@@ -1102,39 +840,24 @@ private:
 
         auto send_front = [this](StreamState& stream,
                                  std::chrono::steady_clock::time_point now) {
-            if (stream.spool->Empty() || now < stream.next_send) {
+            if (now < stream.next_send) {
                 return;
             }
-            const Spool::Entry* entry = stream.spool->Front();
-            auto payload = stream.spool->ReadFront();
-            if (!entry || !payload) {
-                if (entry) {
-                    LOG_ERROR("access-log reporter: discarding unreadable batch {}",
-                              entry->path.string());
-                }
-                if (stream.spool->DiscardFront()) {
-                    stream.next_send = now;
-                } else {
-                    LOG_ERROR("access-log reporter: cannot discard unreadable batch");
-                    stream.next_send = now + stream.retry_delay;
-                }
+            const PendingBatchQueue::Entry* entry = stream.pending->Front();
+            if (!entry) {
                 return;
             }
 
             const std::string batch_id = entry->batch_id;
             const uint64_t event_count = entry->event_count;
-            const SendResult sent = client_.Send(*payload, batch_id, stream.target);
+            const SendResult sent = client_.Send(
+                entry->payload, batch_id, stream.target);
             if (sent.acknowledged) {
-                if (!stream.spool->AcknowledgeFront()) {
-                    LOG_ERROR("access-log reporter: cannot remove acknowledged batch {}",
-                              batch_id);
-                    stream.next_send = now + stream.retry_delay;
-                } else {
-                    stream.retry_delay = kInitialRetry;
-                    stream.next_send = now;
-                    stream.next_warning =
-                        std::chrono::steady_clock::time_point::min();
-                }
+                stream.pending->PopFront();
+                stream.retry_delay = kInitialRetry;
+                stream.next_send = now;
+                stream.next_warning =
+                    std::chrono::steady_clock::time_point::min();
             } else if (sent.status == 400) {
                 LOG_ERROR(
                     "access-log reporter: service rejected invalid target={} "
@@ -1143,17 +866,12 @@ private:
                     batch_id,
                     event_count,
                     sent.detail);
-                if (stream.spool->DiscardFront()) {
-                    dropped_events_.fetch_add(event_count, std::memory_order_relaxed);
-                    stream.retry_delay = kInitialRetry;
-                    stream.next_send = now;
-                    stream.next_warning =
-                        std::chrono::steady_clock::time_point::min();
-                } else {
-                    LOG_ERROR("access-log reporter: cannot remove rejected batch={}",
-                              batch_id);
-                    stream.next_send = now + stream.retry_delay;
-                }
+                stream.pending->PopFront();
+                dropped_events_.fetch_add(event_count, std::memory_order_relaxed);
+                stream.retry_delay = kInitialRetry;
+                stream.next_send = now;
+                stream.next_warning =
+                    std::chrono::steady_clock::time_point::min();
             } else {
                 if (now >= stream.next_warning) {
                     LOG_WARN(
@@ -1183,7 +901,7 @@ private:
                 if (queued > 0 &&
                     (queued >= kMaxBatchEvents ||
                      now - *first_queued_at >= kFlushInterval)) {
-                    DrainOneBatch(access_spool, error_spool, dequeue_buffer);
+                    DrainOneBatch(access_pending, error_pending, dequeue_buffer);
                     first_queued_at = queued_.load(std::memory_order_acquire) > 0
                         ? std::optional{std::chrono::steady_clock::now()}
                         : std::nullopt;
@@ -1201,10 +919,10 @@ private:
                 if (first_queued_at) {
                     wake_at = std::min(wake_at, *first_queued_at + kFlushInterval);
                 }
-                if (!access_spool.Empty()) {
+                if (!access_pending.Empty()) {
                     wake_at = std::min(wake_at, access_stream.next_send);
                 }
-                if (!error_spool.Empty()) {
+                if (!error_pending.Empty()) {
                     wake_at = std::min(wake_at, error_stream.next_send);
                 }
                 std::unique_lock lock(wake_mutex_);
@@ -1214,9 +932,24 @@ private:
                 });
             }
 
+            uint64_t shutdown_dropped =
+                access_pending.EventCount() + error_pending.EventCount();
             while (queued_.load(std::memory_order_acquire) > 0) {
-                DrainOneBatch(access_spool, error_spool, dequeue_buffer);
+                const size_t count = queue_.try_dequeue_bulk(
+                    dequeue_buffer.data(), dequeue_buffer.size());
+                if (count == 0) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                queued_.fetch_sub(count, std::memory_order_release);
+                shutdown_dropped += count;
             }
+            if (shutdown_dropped > 0) {
+                dropped_events_.fetch_add(
+                    shutdown_dropped, std::memory_order_relaxed);
+            }
+            access_pending.Clear();
+            error_pending.Clear();
             ReportDropsIfNeeded();
         } catch (const std::exception& e) {
             LOG_ERROR("access-log reporter thread failed: {}", e.what());
@@ -1243,10 +976,8 @@ private:
     std::atomic_bool stopping_{false};
     std::atomic_bool initialized_{false};
     std::mutex lifecycle_mutex_;
-    std::filesystem::path access_spool_path_;
-    std::filesystem::path error_spool_path_;
-    std::unique_ptr<Spool> access_spool_;
-    std::unique_ptr<Spool> error_spool_;
+    PendingBatchQueue access_pending_;
+    PendingBatchQueue error_pending_;
     HttpsBatchClient client_;
     std::mutex wake_mutex_;
     std::condition_variable wake_;
@@ -1263,8 +994,8 @@ Reporter::Reporter()
 
 Reporter::~Reporter() = default;
 
-bool Reporter::Initialize(const std::filesystem::path& log_dir) {
-    return impl_->Initialize(log_dir);
+bool Reporter::Initialize() {
+    return impl_->Initialize();
 }
 
 uint32_t Reporter::RegisterSource(Source source) {

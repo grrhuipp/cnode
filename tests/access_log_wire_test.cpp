@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
 #include <span>
 #include <string_view>
@@ -30,11 +29,6 @@ int main(int argc, char** argv) {
     static_assert(kServiceHost == "l.bt3.one");
     static_assert(kAccessBatchTarget == "/v1/access/batches");
     static_assert(kErrorBatchTarget == "/v1/error/batches");
-
-    assert(ResolveSpoolPath(std::filesystem::path("/opt/cnode/logs")) ==
-           std::filesystem::path("/opt/cnode/logs/access-spool"));
-    assert(ResolveErrorSpoolPath(std::filesystem::path("/opt/cnode/logs")) ==
-           std::filesystem::path("/opt/cnode/logs/error-spool"));
 
     assert(NormalizePanelApiHost(
                " HTTPS://User:secret@Panel.Example.COM:443/api?v=token#x ") ==

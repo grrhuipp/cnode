@@ -3,7 +3,6 @@
 #include "acppnode/common/error.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <vector>
 #include <string>
@@ -143,13 +142,6 @@ struct Event {
 // the reporter.
 [[nodiscard]] std::string NormalizePanelApiHost(std::string_view api_host);
 
-// Keeps the durable queue colocated with the configured cnode log directory.
-[[nodiscard]] std::filesystem::path ResolveSpoolPath(
-    const std::filesystem::path& log_dir);
-
-[[nodiscard]] std::filesystem::path ResolveErrorSpoolPath(
-    const std::filesystem::path& log_dir);
-
 class Reporter final {
 public:
     static Reporter& Instance();
@@ -159,9 +151,9 @@ public:
     Reporter(Reporter&&) = delete;
     Reporter& operator=(Reporter&&) = delete;
 
-    // Starts the background reporter and places durable batches under
-    // <log_dir>/access-spool. Calling it again has no effect.
-    [[nodiscard]] bool Initialize(const std::filesystem::path& log_dir);
+    // Starts the background reporter with bounded process-memory batch queues.
+    // Calling it again has no effect.
+    [[nodiscard]] bool Initialize();
 
     // Cold-path registration. Equal (APIHost, NodeType, NodeID) descriptors
     // return the same process-lifetime reference.
@@ -171,8 +163,8 @@ public:
     // event is not eligible or the queue is full.
     [[nodiscard]] bool Submit(Event event) noexcept;
 
-    // Flushes the in-memory queue to the local spool and joins the reporter.
-    // Network acknowledgement is not awaited during shutdown.
+    // Stops network work and joins the reporter. Unacknowledged in-memory
+    // events are counted as dropped; no batch data is persisted to disk.
     void Shutdown() noexcept;
 
 private:

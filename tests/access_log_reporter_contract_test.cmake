@@ -27,24 +27,28 @@ file(READ
     "${SOURCE_DIR}/include/acppnode/common/read_prefix_capture.hpp"
     READ_CAPTURE_SOURCE)
 
-string(FIND "${REPORTER_SOURCE}" "auto access_spool = std::make_unique<Spool>(access_spool_path_)"
-       SPOOL_INITIALIZE_POSITION)
-string(FIND "${REPORTER_SOURCE}" "thread_ = std::thread([this] { Run(); })"
-       THREAD_START_POSITION)
-if(SPOOL_INITIALIZE_POSITION EQUAL -1 OR THREAD_START_POSITION EQUAL -1 OR
-   NOT SPOOL_INITIALIZE_POSITION LESS THREAD_START_POSITION)
+if(REPORTER_SOURCE MATCHES
+       "std::filesystem|DurableWrite|SyncDirectory|class Spool|access-spool|error-spool" OR
+   NOT REPORTER_SOURCE MATCHES
+       "PendingBatchQueue access_pending_" OR
+   NOT REPORTER_SOURCE MATCHES
+       "PendingBatchQueue error_pending_" OR
+   NOT REPORTER_SOURCE MATCHES
+       "thread_ = std::thread")
     message(FATAL_ERROR
-        "access-log durable spool must initialize before the reporter thread starts")
+        "access-log reporter must use process-memory queues and perform no spool filesystem I/O")
 endif()
 
 if(NOT REPORTER_SOURCE MATCHES
-       "kMaxSpoolBytes = 128ULL [*] 1024 [*] 1024" OR
+       "kMaxPendingBatchBytesPerStream = 32ULL [*] 1024 [*] 1024" OR
    NOT REPORTER_SOURCE MATCHES
-       "while [(]bytes_ > kMaxSpoolBytes && !entries_[.]empty[(][)][)]" OR
+       "std::vector<uint8_t> payload" OR
    NOT REPORTER_SOURCE MATCHES
-       "while [(]bytes_ [+] payload[.]size[(][)] > kMaxSpoolBytes && !entries_[.]empty[(][)][)]")
+       "while [(]bytes_ [+] payload[.]size[(][)] > kMaxPendingBatchBytesPerStream" OR
+   NOT REPORTER_SOURCE MATCHES
+       "[.]payload = std::move[(]payload[)]")
     message(FATAL_ERROR
-        "each access/error spool must evict oldest batches at the 128 MiB hard limit")
+        "each access/error memory queue must evict oldest batches at the 32 MiB hard limit")
 endif()
 
 if(INBOUND_HANDLER_SOURCE MATCHES
@@ -85,38 +89,19 @@ if(NOT SESSION_SOURCE MATCHES
         "relay failures with a known closer must retain their access-log close side")
 endif()
 if(NOT REPORTER_SOURCE MATCHES
-       "access_spool->Initialize[(][)]" OR
+       "const PendingBatchQueue::Entry[*] entry = stream[.]pending->Front[(][)]" OR
    NOT REPORTER_SOURCE MATCHES
-       "error_spool->Initialize[(][)]" OR
-   NOT REPORTER_SOURCE MATCHES
-       "Spool& access_spool = [*]access_spool_" OR
-   NOT REPORTER_SOURCE MATCHES
-       "Spool& error_spool = [*]error_spool_" OR
+       "entry->payload, batch_id, stream[.]target" OR
    REPORTER_SOURCE MATCHES
-       "const bool spool_ready = spool[.]Initialize[(][)]")
+       "ReadFront|ifstream|ofstream|[.]batch\"")
     message(FATAL_ERROR
-        "access-log Initialize must fail closed and hand one prepared spool to Run")
-endif()
-
-if(REPORTER_SOURCE MATCHES "QuarantineFront" OR
-   REPORTER_SOURCE MATCHES "replace_extension[(]\"[.]bad\"[)]" OR
-   REPORTER_SOURCE MATCHES "ignoring malformed spool file" OR
-   REPORTER_SOURCE MATCHES "ignoring invalid spool file")
-    message(FATAL_ERROR
-        "access-log spool must not abandon invalid files outside its capacity accounting")
-endif()
-if(NOT REPORTER_SOURCE MATCHES
-       "bool DiscardFront[(][)]" OR
-   NOT REPORTER_SOURCE MATCHES
-       "if [(]stream[.]spool->DiscardFront[(][)][)]")
-    message(FATAL_ERROR
-        "unreadable batches must remain owned until their file is removed")
+        "network retries must reuse the immutable in-memory batch payload")
 endif()
 
 if(NOT REPORTER_SOURCE MATCHES
        "else if [(]sent[.]status == 400[)]" OR
    NOT REPORTER_SOURCE MATCHES
-       "if [(]stream[.]spool->DiscardFront[(][)][)]")
+       "stream[.]pending->PopFront[(][)]")
     message(FATAL_ERROR
         "permanently invalid service batches must not block later protocol logs")
 endif()
@@ -139,7 +124,7 @@ if(NOT REPORTER_SOURCE MATCHES "kAccessBatchTarget" OR
        "event[.]error_code == ErrorCode::OK" OR
    NOT EVENT_SOURCE MATCHES "raw_packet")
     message(FATAL_ERROR
-        "normal access and error/security events must use separate durable streams")
+        "normal access and error/security events must use separate bounded memory streams")
 endif()
 
 if(NOT INBOUND_HANDLER_SOURCE MATCHES "SetReadPrefixCapture" OR
