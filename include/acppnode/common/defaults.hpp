@@ -35,6 +35,7 @@ constexpr uint32_t kDnsMaxTTL = 3600;
 // 面板配置
 constexpr uint32_t kPanelPullInterval = 60;
 constexpr uint32_t kPanelPushInterval = 60;
+constexpr uint32_t kPanelStatusLogInterval = 60;
 constexpr uint32_t kPanelConfigRefreshInterval = 300;
 constexpr uint32_t kControllerSyncMaxAttempts = 4;
 constexpr uint32_t kControllerSyncRetryBaseSeconds = 5;

@@ -32,6 +32,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         uint64_t generation);
     net::awaitable<void> panelMonitor(api::API* panel, uint64_t generation);
     net::awaitable<void> nodeInfoMonitor(api::API* panel);
+    void logPanelStatus(api::API* panel) const;
     net::awaitable<void> userInfoMonitor(api::API* panel,
                                          const std::string& tag,
                                          const std::string& protocol);
@@ -74,6 +75,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         std::vector<api::UserInfo> users;
         std::vector<api::DetectRule> rules;
         bool inbound_started = false;
+        bool complete_sync = false;
     };
     std::map<api::API*, CommittedNodeState> committed_nodes_;
 

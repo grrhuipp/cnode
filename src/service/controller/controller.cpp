@@ -171,6 +171,7 @@ net::awaitable<void> Controller::Impl::panelMonitor(
     const std::string panel_name = ResolvePanelName(panel, panel_configs_);
     auto next_pull = Clock::now();
     auto next_push = next_pull;
+    auto next_status = next_pull;
     net::steady_timer timer(io_context_);
     CancelableTimerRegistry::Registration timer_registration(
         monitor_timers_, timer);
@@ -246,10 +247,17 @@ net::awaitable<void> Controller::Impl::panelMonitor(
             next_push = Clock::now() + interval(false);
         }
 
+        now = Clock::now();
+        if (running_ && generation == monitor_generation_ && now >= next_status) {
+            logPanelStatus(panel);
+            next_status = now + std::chrono::seconds(
+                defaults::kPanelStatusLogInterval);
+        }
+
         if (!running_ || generation != monitor_generation_) {
             break;
         }
-        timer.expires_at(std::min(next_pull, next_push));
+        timer.expires_at(std::min({next_pull, next_push, next_status}));
         (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
     }
     co_return;
@@ -599,6 +607,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                         .users = *next_users,
                         .rules = *next_rules,
                         .inbound_started = true,
+                        .complete_sync = false,
                     };
                     committed_nodes_.insert_or_assign(panel, std::move(next_state));
                     committed_stats.user_count = next_users->size();
@@ -619,31 +628,12 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     panel_name, node_id, tag, old_config != nullptr);
             }
 
-            const auto committed = committed_nodes_.find(panel);
+            auto committed = committed_nodes_.find(panel);
             if (committed == committed_nodes_.end()) {
                 throw std::runtime_error("panel sync completed without committed node state");
             }
-            const auto& committed_state = committed->second;
             const bool complete_sync = rules_result.Ok() && users_result.Ok();
-            const auto pull_interval = controller::PanelInterval(
-                committed_state.config.PullInterval,
-                defaults::kPanelPullInterval);
-            const auto push_interval = controller::PanelInterval(
-                committed_state.config.PushInterval,
-                defaults::kPanelPushInterval);
-            LOG_CONSOLE(
-                "panel status name={} node={} state={} inbound={} protocol={} port={} "
-                "users={} rules={} pull={}s push={}s",
-                panel_name,
-                node_id,
-                complete_sync ? "ready" : "degraded",
-                committed_state.inbound_started ? "ready" : "stopped",
-                protocol,
-                committed_state.config.Port,
-                committed_state.users.size(),
-                committed_state.rules.size(),
-                pull_interval.count(),
-                push_interval.count());
+            committed->second.complete_sync = complete_sync;
 
             co_return;
 
@@ -661,6 +651,40 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             }
         }
     }
+}
+
+void Controller::Impl::logPanelStatus(api::API* panel) const {
+    const auto committed = committed_nodes_.find(panel);
+    if (committed == committed_nodes_.end()) {
+        return;
+    }
+
+    const auto client_info = panel->Describe();
+    const int node_id = client_info.NodeID;
+    const std::string panel_name = ResolvePanelName(panel, panel_configs_);
+    const auto& committed_state = committed->second;
+    const bool complete_sync = committed_state.complete_sync;
+    const std::string protocol =
+        naming::ResolveProtocolOrDefault(committed_state.config.NodeType);
+    const auto pull_interval = controller::PanelInterval(
+        committed_state.config.PullInterval,
+        defaults::kPanelPullInterval);
+    const auto push_interval = controller::PanelInterval(
+        committed_state.config.PushInterval,
+        defaults::kPanelPushInterval);
+    LOG_CONSOLE(
+        "panel status name={} node={} state={} inbound={} protocol={} port={} "
+        "users={} rules={} pull={}s push={}s",
+        panel_name,
+        node_id,
+        complete_sync ? "ready" : "degraded",
+        committed_state.inbound_started ? "ready" : "stopped",
+        protocol,
+        committed_state.config.Port,
+        committed_state.users.size(),
+        committed_state.rules.size(),
+        pull_interval.count(),
+        push_interval.count());
 }
 
 }  // namespace acpp

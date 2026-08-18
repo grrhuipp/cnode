@@ -75,6 +75,8 @@ panel report name=jx node=1 state=ok node_status=ok traffic=ok traffic_users=8 o
 
 `panel status` 的 `connecting / ready / degraded / missing / unavailable` 分别表示正在首次连接、完整同步成功、部分数据沿用旧快照、面板已删除节点、连续重试仍失败。`panel report` 汇总节点状态、流量、在线用户和审计结果的上报状态；没有待上报数据时显示 `idle`。
 
+稳定运行时的 `panel status` 状态行固定每 60 秒输出一次，不跟随面板下发的 `pull_interval` 或 `push_interval` 改变；连接、节点缺失和同步失败等状态变化仍会即时记录。
+
 ## 5. 约束
 
 - error 和 access 不得混写。
