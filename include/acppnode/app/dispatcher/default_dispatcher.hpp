@@ -9,9 +9,12 @@
 #include "acppnode/transport/link.hpp"
 
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace acpp {
+
+class Outbound;
 
 namespace app::router {
 class Router;
@@ -21,9 +24,9 @@ namespace features::outbound {
 class Manager;
 }  // namespace features::outbound
 
-namespace rule {
-class Manager;
-}  // namespace rule
+namespace features::policy {
+class RequestPolicy;
+}  // namespace features::policy
 namespace app {
 class SessionTrackingState;
 class RequestLoadState;
@@ -38,8 +41,8 @@ namespace app::dispatcher {
 // DefaultDispatcher - app/dispatcher implementation
 //
 // 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。Router 和
-// outbound 表仍在 Worker 冷路径完成绑定；热路径 Dispatch 只做固定出口检查
-// 和 Router::Route 调用。
+// outbound 表仍在 Worker 冷路径完成绑定；热路径只消费窄 DispatchPolicy，
+// 编排强制出口、Router 规则决策、fallback/default 和通用请求策略。
 // ============================================================================
 class DefaultDispatcher final : public routing::Dispatcher {
 public:
@@ -48,14 +51,16 @@ public:
 
     void BindRouter(app::router::Router& router) noexcept;
     void BindOutboundManager(features::outbound::Manager& outbound_manager) noexcept;
-    void BindRuleManager(rule::Manager& rule_manager) noexcept;
+    void BindRequestPolicy(features::policy::RequestPolicy& request_policy) noexcept;
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
     void BindDnsService(app::dns::DNS& dns_service) noexcept;
     void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
+    void SetDefaultOutbound(std::string default_outbound_tag) noexcept;
+    [[nodiscard]] std::string_view DefaultOutbound() const noexcept;
 
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
-        const proxyman::inbound::ReceiverSettings& receiver,
+        const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,
         InitialPayload first_packet,
@@ -63,12 +68,12 @@ public:
         StatsShard& stats,
         const TimeoutsConfig& timeouts) override;
 
-    [[nodiscard]] routing::DispatchResult Route(
-        session::Context& ctx,
-        const proxyman::inbound::ReceiverSettings& receiver) const noexcept override;
-    [[nodiscard]] routing::DispatchResult Route(session::Context& ctx) const noexcept override;
-
 private:
+    struct RouteResult {
+        std::shared_ptr<Outbound> handler;
+        ErrorCode error = ErrorCode::OK;
+    };
+
     struct RouteSelection {
         std::string_view outbound_tag;
         bool matched = false;
@@ -80,7 +85,7 @@ private:
 
     net::awaitable<RelayResult> DispatchPreparedLink(
         net::io_context& io_context,
-        const proxyman::inbound::ReceiverSettings& receiver,
+        const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,
         InitialPayload first_packet,
@@ -92,20 +97,21 @@ private:
         std::string_view tag) const noexcept;
     [[nodiscard]] RouteSelection SelectRoute(
         session::Context& ctx,
-        const proxyman::inbound::ReceiverSettings* receiver) const noexcept;
-    [[nodiscard]] routing::DispatchResult FinishRoute(
+        const routing::DispatchPolicy& policy) const noexcept;
+    [[nodiscard]] RouteResult FinishRoute(
         session::Context& ctx,
         const RouteSelection& selection) const noexcept;
-    [[nodiscard]] net::awaitable<routing::DispatchResult> RouteAsync(
+    [[nodiscard]] net::awaitable<RouteResult> RouteAsync(
         session::Context& ctx,
-        const proxyman::inbound::ReceiverSettings* receiver);
+        const routing::DispatchPolicy& policy);
 
     app::router::Router* router_ = nullptr;
     features::outbound::Manager* outbound_manager_ = nullptr;
-    rule::Manager* rule_manager_ = nullptr;
+    features::policy::RequestPolicy* request_policy_ = nullptr;
     app::SessionTrackingState* session_tracking_ = nullptr;
     app::dns::DNS* dns_service_ = nullptr;
     app::RequestLoadState* request_load_ = nullptr;
+    std::string default_outbound_tag_;
 };
 
 }  // namespace app::dispatcher

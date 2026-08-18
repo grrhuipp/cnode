@@ -6,6 +6,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -274,7 +275,7 @@ proxy::trojan::inbound::Handler::Process(
         TrojanUdpWriter udp_writer(*stream);
         co_return co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
             InitialPayload{},
@@ -291,7 +292,7 @@ proxy::trojan::inbound::Handler::Process(
     auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver,
+        receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
         std::move(first_packet),

@@ -12,12 +12,9 @@ struct StatsShard;
 struct TimeoutsConfig;
 }  // namespace acpp
 
-namespace acpp::proxyman::inbound {
-struct ReceiverSettings;
-}  // namespace acpp::proxyman::inbound
-
 namespace acpp::routing {
 class Dispatcher;
+struct DispatchPolicy;
 }  // namespace acpp::routing
 
 namespace acpp::session {
@@ -39,7 +36,7 @@ net::awaitable<RelayResult> ProcessInbound(
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,

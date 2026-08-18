@@ -518,7 +518,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                     try {
                         RelayResult relay_result = co_await dispatcher->Dispatch(
                             *io_context,
-                            *receiver,
+                            receiver->dispatch_policy,
                             nullptr,
                             transport::Link{client_session.get(), client_session.get()},
                             InitialPayload{},

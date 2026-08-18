@@ -61,7 +61,7 @@ if(NOT SOURCE_REGISTRATION_FAILURE_HANDLER MATCHES "co_return false;")
 endif()
 
 if(NOT BOOTSTRAP_INBOUNDS_SOURCE MATCHES
-       "std::move[(]route_policy[)],\r?\n[ \t]*0[)]")
+       "std::move[(]outbound_policy[)],\r?\n[ \t]*0[)]")
     message(FATAL_ERROR
         "custom/static inbounds must explicitly disable centralized access logging")
 endif()

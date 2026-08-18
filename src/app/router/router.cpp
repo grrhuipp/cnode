@@ -708,7 +708,6 @@ bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
 
 struct Router::Impl {
     memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
-    std::string default_outbound_tag;
     RoutingDomainStrategy domain_strategy = RoutingDomainStrategy::AsIs;
     ::acpp::geo::GeoManager* geo_manager = nullptr;
 };
@@ -720,26 +719,11 @@ Router::Router(Router&&) noexcept = default;
 Router& Router::operator=(Router&&) noexcept = default;
 
 std::string_view Router::Route(const session::Context& ctx) const {
-    return RouteDetailed(ctx, impl_->default_outbound_tag).outbound_tag;
-}
-
-std::string_view Router::Route(
-    const session::Context& ctx,
-    std::string_view default_outbound_tag) const {
-    return RouteDetailed(ctx, default_outbound_tag).outbound_tag;
+    return RouteDetailed(ctx).outbound_tag;
 }
 
 RouteDecision Router::RouteDetailed(const session::Context& ctx) const {
-    return RouteDetailed(ctx, impl_->default_outbound_tag);
-}
-
-RouteDecision Router::RouteDetailed(
-    const session::Context& ctx,
-    std::string_view default_outbound_tag) const {
     const auto& target = ctx.outbound.target;
-    if (default_outbound_tag.empty()) {
-        default_outbound_tag = impl_->default_outbound_tag;
-    }
 
     // 顺序检查复合规则（AND 语义）
     for (uint32_t rule_index = 0;
@@ -757,11 +741,10 @@ RouteDecision Router::RouteDetailed(
         }
     }
 
-    // 无匹配，返回默认出站
-    LOG_NET_DEBUG("Router: {} -> {} (default)",
-              target, default_outbound_tag);
+    // No match is an explicit empty decision. Dispatcher owns fallback/default.
+    LOG_NET_DEBUG("Router: {} no matching rule", target);
     return RouteDecision{
-        .outbound_tag = default_outbound_tag,
+        .outbound_tag = {},
         .matched = false,
         .rule_index = 0,
     };
@@ -769,16 +752,10 @@ RouteDecision Router::RouteDetailed(
 
 void Router::Configure(
     const RoutingConfig& routing,
-    std::string_view default_outbound_tag,
     ::acpp::geo::GeoManager* geo_manager) {
     impl_->compound_rules.clear();
-    impl_->default_outbound_tag.clear();
     impl_->domain_strategy = routing.domain_strategy;
     impl_->geo_manager = geo_manager;
-
-    if (!default_outbound_tag.empty()) {
-        impl_->default_outbound_tag = std::string(default_outbound_tag);
-    }
 
     for (const auto& rc : routing.rules) {
         CompoundRoutingRule compound;
@@ -862,14 +839,6 @@ void Router::Configure(
         }
         impl_->compound_rules.push_back(std::move(compound));
     }
-}
-
-void Router::SetDefaultOutbound(std::string default_outbound_tag) noexcept {
-    impl_->default_outbound_tag = std::move(default_outbound_tag);
-}
-
-std::string_view Router::DefaultOutbound() const {
-    return impl_->default_outbound_tag;
 }
 
 ::acpp::RoutingDomainStrategy Router::DomainStrategy() const noexcept {

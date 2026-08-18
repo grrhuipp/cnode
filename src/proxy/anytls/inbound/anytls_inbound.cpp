@@ -13,6 +13,7 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "../validator.hpp"
 
@@ -399,7 +400,7 @@ class AnyTLSDemuxSession final : public std::enable_shared_from_this<AnyTLSDemux
 public:
     AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
-                       const proxyman::inbound::ReceiverSettings& receiver,
+                       const routing::DispatchPolicy& policy,
                        net::io_context& io_context,
                        const session::Context& base_ctx,
                        StatsShard& stats,
@@ -408,7 +409,7 @@ public:
                        std::string padding_scheme_md5)
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
-        , receiver_(receiver)
+        , policy_(policy)
         , io_context_(io_context)
         , stats_(stats)
         , timeouts_(timeouts)
@@ -545,7 +546,7 @@ private:
 
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
-    const proxyman::inbound::ReceiverSettings& receiver_;
+    const routing::DispatchPolicy& policy_;
     net::io_context& io_context_;
     session::Context base_ctx_;
     StatsShard& stats_;
@@ -680,7 +681,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     if (uot_version) {
         result = co_await dispatcher_.Dispatch(
             io_context_,
-            receiver_,
+            policy_,
             nullptr,
             transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
             InitialPayload{},
@@ -690,7 +691,7 @@ net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
     } else {
         result = co_await dispatcher_.Dispatch(
             io_context_,
-            receiver_,
+            policy_,
             nullptr,
             transport::Link{sub.get(), sub.get()},
             InitialPayload{},
@@ -1118,7 +1119,7 @@ Handler::Process(
     auto demux = std::make_shared<AnyTLSDemuxSession>(
         std::move(stream),
         dispatcher,
-        receiver,
+        receiver.dispatch_policy,
         io_context,
         ctx,
         *stats_,

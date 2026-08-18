@@ -541,7 +541,7 @@ proxy::vless::inbound::Handler::Process(
             transport::Link{&mux_reader, active_writer},
             *stream,
             dispatcher,
-            receiver,
+            receiver.dispatch_policy,
             ctx,
             *stats_,
             timeouts,
@@ -554,7 +554,7 @@ proxy::vless::inbound::Handler::Process(
         VlessUdpWriter udp_writer(*active_writer, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
             InitialPayload{},
@@ -576,7 +576,7 @@ proxy::vless::inbound::Handler::Process(
         ::acpp::vless::VisionWriter vision_writer(*active_writer, request->uuid);
         co_return co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&vision_reader, &vision_writer},
             InitialPayload{},
@@ -587,7 +587,7 @@ proxy::vless::inbound::Handler::Process(
 
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver,
+        receiver.dispatch_policy,
         std::move(stream),
         transport::Link{active_reader, active_writer},
         std::move(first_packet),

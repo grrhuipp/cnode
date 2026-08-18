@@ -23,6 +23,8 @@
 - cnode 与 XrayR YAML 配置布局有意不同，不回退到 YAML 默认入口或旧 sidecar path 字段。
 - 任意配置来源都必须先归一化，再进入 runtime。
 - 任意热路径对象都必须能明确指出所属 Worker；跨线程访问只能通过投递、快照或冷路径同步完成。
+- proxyman receiver 在冷路径构建完整监听语义；进入 Dispatcher 时只能传不可变的窄 `DispatchPolicy`，不能传 `ReceiverSettings`。
+- Router 只返回真实规则命中；强制出口、入站 fallback 和 Worker 默认出口由 Dispatcher 编排。
 
 ## 唯一请求链路
 
@@ -69,9 +71,10 @@ dispatcher 是请求链路的路由分发入口。
 
 负责：
 
-- 接收 inbound 交给它的 session / context / link。
-- 调用 router 做路由决策。
-- 根据路由结果选择 outbound handler。
+- 接收 inbound 交给它的不可变 `DispatchPolicy`、session / context / link。
+- 按 `forced outbound -> Router matched rule -> inbound fallback -> Worker default` 的优先级完成出站选择。
+- 通过通用 `RequestPolicy` 接口取得 allow / block 结果。
+- 根据选择结果查找 outbound handler。
 - 调用 `outbound.Process`。
 
 不负责：
@@ -81,6 +84,9 @@ dispatcher 是请求链路的路由分发入口。
 - 包含 VMess / Trojan / Shadowsocks / AnyTLS 特判。
 - 直接执行 relay。
 - 读取或理解 panel 配置字段。
+- 接收完整 `proxyman::inbound::ReceiverSettings`。
+- 依赖具体 `rule::Manager`、`DetectRule` 或其他面板策略实现。
+- 把 forced / fallback / default 伪装成 Router 规则命中。
 
 ### router
 
@@ -89,7 +95,7 @@ router 只做路由决策。
 负责：
 
 - 接收归一化后的 session metadata。
-- 输出 outbound tag / route decision。
+- 仅在规则真实命中时输出 outbound tag / route decision。
 
 不负责：
 
@@ -98,6 +104,25 @@ router 只做路由决策。
 - 访问协议实现。
 - 依赖 proxyman 具体类型。
 - 理解 Worker 资源细节。
+- 保存或选择 forced outbound、入站 fallback、Worker 默认 outbound。
+- 依赖 outbound manager 或请求策略实现。
+
+### request policy
+
+request policy 是路由完成后的通用请求准入边界。
+
+负责：
+
+- 接收统一 session context。
+- 返回 allow / block 结果。
+- Worker-local 实现可以在冷路径发布规则，并在所属 Worker 内记录命中结果。
+
+不负责：
+
+- 路由选择。
+- 查找或调用 outbound handler。
+- 解析协议。
+- 向 Dispatcher 暴露面板原始规则或具体 manager 类型。
 
 ### outbound
 
@@ -163,7 +188,7 @@ proxyman 只负责 prepared inbound / outbound handler 的构建、持有和按 
 负责：
 
 - 管理 inbound / outbound handler 生命周期。
-- 将控制面准备好的 runtime 对象发布给 Worker-local handler 表。
+- 将控制面准备好的 runtime 对象发布给 Worker-local handler 表；完整 receiver 内嵌冷路径构建的不可变 `DispatchPolicy`。
 - 为 dispatcher 提供 outbound handler 选择结果。
 
 不负责：
@@ -307,7 +332,9 @@ api/* 拉取 panel 原始 users
 
 - Worker 不直接访问协议 validator、panel 字段或具体 outbound 实现。
 - Dispatcher 不 include 具体协议，不绕过 router/outbound/relay。
-- Router 只返回路由决策，不创建连接，不访问 relay。
+- Dispatcher 只接收窄 `DispatchPolicy`，不接收 `ReceiverSettings`，不依赖具体面板规则 manager。
+- Router 只返回真实规则命中，不持有 forced / fallback / default，不创建连接，不访问 outbound manager 或 relay。
+- RequestPolicy 只返回准入结果，不选择路由或 outbound。
 - Relay 只搬运数据，不解析协议，不理解面板。
 - Panel/client/controller 不进入热路径，不修改 live handler 内部状态。
 - 禁止跨线程或跨 Worker 直接访问无锁热路径对象；无锁的前提是单 Worker 所有权，不是任意线程可访问。
@@ -343,6 +370,10 @@ api/* 拉取 panel 原始 users
 18. controller 按协议构建认证用户凭据。
 19. 面板用户绕过 `RuntimeUser -> UserSet -> UserStore` 链路进入热路径。
 20. DNS service、inflight resolve、socket、timeout scheduler 或 Worker L1 DNS cache 跨 Worker 共享。
+21. Dispatcher 公开接口或实现接收、保存 `ReceiverSettings` 或依赖 `proxyman::inbound`。
+22. Router 保存或选择 forced outbound、入站 fallback、Worker 默认 outbound。
+23. Dispatcher 依赖具体 `rule::Manager`、`DetectRule` 或面板策略类型，而不是通用 `RequestPolicy`。
+24. Mux / AnyTLS 子流为重新进入 Dispatcher 而保存完整 receiver，而不是窄 `DispatchPolicy`。
 
 ## 审查清单
 
@@ -359,6 +390,9 @@ cnode 应满足：
 9. 替换 router 规则不会影响 inbound / outbound 实现。
 10. 仓库结构表达最终职责，而不是表达迁移历史。
 11. 任意无锁对象都能明确指出所属 Worker，跨线程访问只能通过投递、快照或冷路径同步完成。
+12. Dispatcher 的公开热路径只暴露 `Dispatch`，参数中没有 proxyman receiver 或面板策略实现。
+13. Router 的无匹配结果为空，fallback/default 只能在 Dispatcher 中解析。
+14. 面板 DetectRule 通过 RequestPolicy 抽象接入，不污染 Router 或 Dispatcher 类型边界。
 
 ## 部署约束
 

@@ -79,6 +79,53 @@ foreach(HOT_PATH_FILE IN LISTS HOT_PATH_FILES)
     endif()
 endforeach()
 
+set(DISPATCHER_BOUNDARY_FILES
+    "${SOURCE_DIR}/include/acppnode/features/routing/dispatcher.hpp"
+    "${SOURCE_DIR}/include/acppnode/app/dispatcher/default_dispatcher.hpp"
+    "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp")
+foreach(DISPATCHER_BOUNDARY_FILE IN LISTS DISPATCHER_BOUNDARY_FILES)
+    file(READ "${DISPATCHER_BOUNDARY_FILE}" DISPATCHER_BOUNDARY_SOURCE)
+    if(DISPATCHER_BOUNDARY_SOURCE MATCHES
+           "ReceiverSettings|proxyman::inbound")
+        message(FATAL_ERROR
+            "Dispatcher must consume narrow DispatchPolicy, not proxyman receiver state: ${DISPATCHER_BOUNDARY_FILE}")
+    endif()
+    if(DISPATCHER_BOUNDARY_SOURCE MATCHES
+           "acppnode/common/rule|rule::Manager")
+        message(FATAL_ERROR
+            "Dispatcher must depend on RequestPolicy, not the panel rule manager: ${DISPATCHER_BOUNDARY_FILE}")
+    endif()
+endforeach()
+
+file(READ "${SOURCE_DIR}/include/acppnode/features/routing/dispatcher.hpp"
+     DISPATCHER_INTERFACE_SOURCE)
+if(DISPATCHER_INTERFACE_SOURCE MATCHES
+       "Route[ \t\r\n]*[(]|DispatchResult")
+    message(FATAL_ERROR
+        "Dispatcher public interface must expose only the canonical Dispatch entry")
+endif()
+
+foreach(ROUTER_BOUNDARY_FILE IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/router/router.hpp"
+        "${SOURCE_DIR}/src/app/router/router.cpp")
+    file(READ "${ROUTER_BOUNDARY_FILE}" ROUTER_BOUNDARY_SOURCE)
+    if(ROUTER_BOUNDARY_SOURCE MATCHES
+           "default_outbound|DefaultOutbound|SetDefaultOutbound")
+        message(FATAL_ERROR
+            "Router must return only matched rules; Dispatcher owns fallback/default: ${ROUTER_BOUNDARY_FILE}")
+    endif()
+endforeach()
+
+foreach(CHILD_DISPATCH_FILE IN ITEMS
+        "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.hpp"
+        "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp")
+    file(READ "${CHILD_DISPATCH_FILE}" CHILD_DISPATCH_SOURCE)
+    if(CHILD_DISPATCH_SOURCE MATCHES "ReceiverSettings|proxyman::inbound")
+        message(FATAL_ERROR
+            "Mux child dispatch must retain only DispatchPolicy: ${CHILD_DISPATCH_FILE}")
+    endif()
+endforeach()
+
 file(GLOB_RECURSE CPP_SOURCES "${SOURCE_DIR}/src/*.cpp")
 foreach(CPP_SOURCE_PATH IN LISTS CPP_SOURCES)
     file(TO_CMAKE_PATH "${CPP_SOURCE_PATH}" CPP_SOURCE_NORMALIZED)

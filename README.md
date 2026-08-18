@@ -42,11 +42,17 @@ main
   -> listener / accept
   -> TransportStack(TCP / TLS / WebSocket / PROXY protocol)
   -> InboundHandler(VMess / VLESS / Trojan / Shadowsocks / AnyTLS)
-  -> Dispatcher
-  -> Router
+  -> Dispatcher::Dispatch(immutable DispatchPolicy)
+       -> sniffing
+       -> forced outbound, or Router matched-rule decision
+       -> no-match inbound fallback, or Worker default outbound
+       -> RequestPolicy allow / block
+       -> outbound handler lookup
   -> OutboundHandler(Freedom / VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Blackhole)
   -> Relay(TCP / UDP / Mux)
 ```
+
+这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
 控制面链路：
 
@@ -86,8 +92,9 @@ Worker DNS service
 | 层级 | 负责 | 不负责 |
 | --- | --- | --- |
 | inbound | 认证、入站协议解析、用户识别、目标地址解析、session metadata、调用 dispatcher | 路由选择、出站连接、relay 细节、访问 outbound manager 内部结构 |
-| dispatcher | 接收 session / context / link，调用 router，选择 outbound handler，调用 outbound.Process | 解析协议、创建协议专属对象、协议特判、执行 relay、读取 panel 字段 |
-| router | 基于归一化 metadata 输出 outbound tag / route decision | 创建连接、访问 relay、访问协议实现、理解 Worker 资源 |
+| dispatcher | 接收只读 DispatchPolicy / session / link；编排 sniff、强制出口、Router 规则、fallback/default、通用 RequestPolicy；选择 handler 并调用 outbound.Process | 接收完整 ReceiverSettings、依赖具体 DetectRule manager、解析协议、协议特判、执行 relay、读取 panel 字段 |
+| router | 基于归一化 metadata 只返回真实命中的 outbound tag / rule decision | 强制出口、默认出口、未命中 fallback、创建连接、访问 outbound manager / relay / 协议实现 |
+| request policy | 基于统一 session context 返回 allow / block；Worker-local 实现可记录策略命中 | 路由选择、outbound handler 查找、协议解析、暴露面板原始字段 |
 | outbound | 建立目标连接或下一跳连接，执行出站协议握手和编码，交给 relay | 路由决策、读取 panel 原始配置、绕过 dispatcher |
 | relay | TCP / UDP / Mux 数据搬运和流量统计打点 | 解析协议、选择 outbound、访问 panel、暴露 wrapper API |
 | Worker | 事件循环、accept 生命周期、运行态组件持有、thread-local allocator / buffer provider | 协议解析、路由、panel 同步、理解具体 validator 或 outbound 类型 |

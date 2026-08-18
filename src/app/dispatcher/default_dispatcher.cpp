@@ -5,10 +5,9 @@
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/common/ip_utils.hpp"
-#include "acppnode/common/rule.hpp"
 #include "acppnode/common/session.hpp"
+#include "acppnode/features/policy/request_policy.hpp"
 #include "acppnode/features/outbound/outbound.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -121,8 +120,9 @@ void DefaultDispatcher::BindOutboundManager(
     outbound_manager_ = &outbound_manager;
 }
 
-void DefaultDispatcher::BindRuleManager(rule::Manager& rule_manager) noexcept {
-    rule_manager_ = &rule_manager;
+void DefaultDispatcher::BindRequestPolicy(
+    features::policy::RequestPolicy& request_policy) noexcept {
+    request_policy_ = &request_policy;
 }
 
 void DefaultDispatcher::BindSessionTracking(
@@ -139,6 +139,15 @@ void DefaultDispatcher::BindRequestLoadState(
     request_load_ = &request_load;
 }
 
+void DefaultDispatcher::SetDefaultOutbound(
+    std::string default_outbound_tag) noexcept {
+    default_outbound_tag_ = std::move(default_outbound_tag);
+}
+
+std::string_view DefaultDispatcher::DefaultOutbound() const noexcept {
+    return default_outbound_tag_;
+}
+
 std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
@@ -149,7 +158,7 @@ std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
 
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     net::io_context& io_context,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
     transport::Link inbound_link,
     InitialPayload first_packet,
@@ -179,7 +188,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     try {
         result = co_await DispatchPreparedLink(
             io_context,
-            receiver,
+            policy,
             std::move(inbound),
             inbound_link,
             std::move(first_packet),
@@ -212,7 +221,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
 
 net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     net::io_context& io_context,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
     transport::Link inbound_link,
     InitialPayload first_packet,
@@ -272,7 +281,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
     };
 
-    if (receiver.sniff_config.enabled) {
+    if (policy.sniffing.enabled) {
         if (!first_packet.empty()) {
             if (first_packet.IsContiguous()) {
                 sniff_data = first_packet.span();
@@ -327,9 +336,9 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                            result.protocol, sniff_domain);
 
             const bool excluded =
-                receiver.sniff_config.IsDomainExcluded(sniff_domain);
+                policy.sniffing.IsDomainExcluded(sniff_domain);
 
-            if (receiver.sniff_config.MatchesDestOverride(result.protocol) && !excluded) {
+            if (policy.sniffing.MatchesDestOverride(result.protocol) && !excluded) {
                 const uint16_t final_port = result.port > 0
                     ? result.port
                     : ctx.outbound.original_target.port;
@@ -347,7 +356,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
     }
 
-    routing::DispatchResult dispatch = co_await RouteAsync(ctx, &receiver);
+    RouteResult dispatch = co_await RouteAsync(ctx, policy);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
@@ -449,13 +458,13 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     co_return relay_result;
 }
 
-routing::DispatchResult DefaultDispatcher::FinishRoute(
+DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     session::Context& ctx,
     const RouteSelection& selection) const noexcept {
     if (selection.error != ErrorCode::OK) {
         LOG_CONN_WARN(ctx, "DISPATCHER_NOT_BOUND {} -> {}",
                           ctx.inbound.source_ip, ctx.outbound.target);
-        return routing::DispatchResult{
+        return RouteResult{
             .handler = {},
             .error = selection.error,
         };
@@ -479,21 +488,11 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
                        ctx.outbound.target, ctx.outbound.tag);
     }
 
-    if (rule_manager_ && ctx.inbound.user_id > 0 &&
-        rule_manager_->HasRule(ctx.inbound.tag)) {
-        // Worker-local 复用 destination scratch，省去每连接的 target 串分配。
-        thread_local std::string rule_dest;
-        ctx.outbound.target.ToStringInto(rule_dest);
-        if (rule_manager_->Detect(
-                ctx.inbound.tag,
-                rule_dest,
-                std::string_view(ctx.inbound.user_email.data(),
-                                 ctx.inbound.user_email.size()))) {
-            return routing::DispatchResult{
-                .handler = {},
-                .error = ErrorCode::BLOCKED,
-            };
-        }
+    if (request_policy_ && request_policy_->Blocked(ctx)) {
+        return RouteResult{
+            .handler = {},
+            .error = ErrorCode::BLOCKED,
+        };
     }
 
     auto handler = ResolveOutboundHandler(selection.outbound_tag);
@@ -502,13 +501,13 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
         ctx.outbound.tag = handler_tag;
     }
     if (!handler) {
-        return routing::DispatchResult{
+        return RouteResult{
             .handler = {},
             .error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND,
         };
     }
 
-    return routing::DispatchResult{
+    return RouteResult{
         .handler = std::move(handler),
         .error = ErrorCode::OK,
     };
@@ -516,11 +515,10 @@ routing::DispatchResult DefaultDispatcher::FinishRoute(
 
 DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     session::Context& ctx,
-    const proxyman::inbound::ReceiverSettings* receiver) const noexcept {
-    if (receiver &&
-        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound) {
+    const routing::DispatchPolicy& policy) const noexcept {
+    if (policy.outbound.kind == routing::OutboundSelectionKind::ForceOutbound) {
         return RouteSelection{
-            .outbound_tag = receiver->route_policy.outbound_tag,
+            .outbound_tag = policy.outbound.outbound_tag,
             .matched = true,
             .fixed = true,
             .fallback = false,
@@ -529,23 +527,19 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
         };
     }
 
-    if (!router_) {
-        RouteSelection selection;
-        selection.error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND;
-        return selection;
-    }
-
     app::router::RouteDecision decision;
-    const bool route_with_fallback = receiver &&
-        receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::RouteWithFallback;
-    if (route_with_fallback) {
-        decision = router_->RouteDetailed(ctx, receiver->route_policy.outbound_tag);
-    } else {
+    if (router_) {
         decision = router_->RouteDetailed(ctx);
     }
 
+    const bool route_with_fallback =
+        policy.outbound.kind == routing::OutboundSelectionKind::RouteWithFallback;
+    const std::string_view no_match_tag = route_with_fallback
+        ? std::string_view(policy.outbound.outbound_tag)
+        : std::string_view(default_outbound_tag_);
+
     return RouteSelection{
-        .outbound_tag = decision.outbound_tag,
+        .outbound_tag = decision.matched ? decision.outbound_tag : no_match_tag,
         .matched = decision.matched,
         .fixed = false,
         .fallback = route_with_fallback && !decision.matched,
@@ -554,30 +548,19 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     };
 }
 
-routing::DispatchResult DefaultDispatcher::Route(
+net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
-    const proxyman::inbound::ReceiverSettings& receiver) const noexcept {
-    return FinishRoute(ctx, SelectRoute(ctx, &receiver));
-}
-
-routing::DispatchResult DefaultDispatcher::Route(session::Context& ctx) const noexcept {
-    return FinishRoute(ctx, SelectRoute(ctx, nullptr));
-}
-
-net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
-    session::Context& ctx,
-    const proxyman::inbound::ReceiverSettings* receiver) {
+    const routing::DispatchPolicy& policy) {
     if (!router_ ||
-        (receiver &&
-         receiver->route_policy.kind == proxyman::inbound::RoutePolicyKind::FixedOutbound) ||
+        policy.outbound.kind == routing::OutboundSelectionKind::ForceOutbound ||
         !ctx.outbound.target.IsDomain() ||
         ctx.outbound.target.resolved_addr) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
+        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     const auto strategy = router_->DomainStrategy();
     if (strategy == RoutingDomainStrategy::AsIs || !dns_service_) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
+        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     auto select_with_addresses =
@@ -590,7 +573,7 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
                     ctx.outbound.route_target.port == ctx.outbound.target.port) {
                     ctx.outbound.route_target.resolved_addr = addr;
                 }
-                auto selection = SelectRoute(ctx, receiver);
+                auto selection = SelectRoute(ctx, policy);
                 last = selection;
                 if (selection.error != ErrorCode::OK || selection.fixed || selection.matched) {
                     return selection;
@@ -603,7 +586,7 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
         };
 
     if (strategy == RoutingDomainStrategy::IPIfNonMatch) {
-        auto initial = SelectRoute(ctx, receiver);
+        auto initial = SelectRoute(ctx, policy);
         if (initial.error != ErrorCode::OK || initial.fixed || initial.matched) {
             co_return FinishRoute(ctx, initial);
         }
@@ -612,14 +595,14 @@ net::awaitable<routing::DispatchResult> DefaultDispatcher::RouteAsync(
         if (!addresses.empty()) {
             co_return FinishRoute(ctx, select_with_addresses(addresses));
         }
-        co_return FinishRoute(ctx, initial);
+        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
     if (!addresses.empty()) {
         co_return FinishRoute(ctx, select_with_addresses(addresses));
     }
-    co_return FinishRoute(ctx, SelectRoute(ctx, receiver));
+    co_return FinishRoute(ctx, SelectRoute(ctx, policy));
 }
 
 }  // namespace acpp::app::dispatcher

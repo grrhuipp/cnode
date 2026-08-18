@@ -8,6 +8,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -271,7 +272,7 @@ proxy::shadowsocks::inbound::Handler::Process(
 
         co_return co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&uot_reader, &uot_writer},
             InitialPayload{},
@@ -282,7 +283,7 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver,
+        receiver.dispatch_policy,
         std::move(stream),
         transport::Link{request_reader.get(), response_writer.get()},
         std::move(session_result->initial_payload),

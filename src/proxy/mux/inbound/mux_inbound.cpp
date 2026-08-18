@@ -5,7 +5,6 @@
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/access_log_session.hpp"
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
@@ -927,7 +926,7 @@ void ReportDispatchAdmissionFailure(session::Context& ctx) noexcept {
 net::awaitable<void> RunTcpSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     TcpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -942,7 +941,7 @@ net::awaitable<void> RunTcpSubDispatch(
     try {
         (void)co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            policy,
             nullptr,
             link,
             InitialPayload{},
@@ -959,7 +958,7 @@ net::awaitable<void> RunTcpSubDispatch(
 net::awaitable<void> RunUdpSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     UdpSubState* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -974,7 +973,7 @@ net::awaitable<void> RunUdpSubDispatch(
     try {
         (void)co_await dispatcher.Dispatch(
             io_context,
-            receiver,
+            policy,
             nullptr,
             link,
             InitialPayload{},
@@ -1003,7 +1002,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -1423,7 +1422,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             RunUdpSubDispatch(
                                 io_context,
                                 dispatcher,
-                                receiver,
+                                policy,
                                 sub_ptr,
                                 stats,
                                 timeouts,
@@ -1498,7 +1497,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             RunTcpSubDispatch(
                                 io_context,
                                 dispatcher,
-                                receiver,
+                                policy,
                                 sub_ptr,
                                 stats,
                                 timeouts,
@@ -1658,7 +1657,7 @@ net::awaitable<RelayResult> ProcessInbound(
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
-    const proxyman::inbound::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& policy,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -1670,7 +1669,7 @@ net::awaitable<RelayResult> ProcessInbound(
             client_link,
             client_control,
             dispatcher,
-            receiver,
+            policy,
             parent_ctx,
             stats,
             timeouts,

@@ -83,10 +83,10 @@ net::awaitable<bool> SetupWorkerInbounds(
     installed.reserve(inbounds.size());
 
     for (const auto& inbound : inbounds) {
-        auto route_policy = inbound.routing_enabled
-            ? proxyman::inbound::RoutePolicy::RouteWithFallback(
+        auto outbound_policy = inbound.routing_enabled
+            ? routing::OutboundSelectionPolicy::RouteWithFallback(
                   std::string(constants::protocol::kDirect))
-            : proxyman::inbound::RoutePolicy::Fixed(
+            : routing::OutboundSelectionPolicy::Force(
                   std::string(constants::protocol::kDirect));
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
@@ -96,7 +96,7 @@ net::awaitable<bool> SetupWorkerInbounds(
             inbound.sniffing,
             connection_limiter,
             ProxyProtocolMode::Auto,
-            std::move(route_policy),
+            std::move(outbound_policy),
             0);  // Custom/static inbounds never enter centralized access logs.
 
         if (!co_await worker.RegisterInboundTask(

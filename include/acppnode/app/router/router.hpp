@@ -37,23 +37,12 @@ public:
     // Cold path: build immutable routing matchers from normalized runtime config.
     void Configure(
         const RoutingConfig& routing,
-        std::string_view default_outbound_tag,
         ::acpp::geo::GeoManager* geo_manager);
 
-    // Cold path: switch only the fallback outbound without rebuilding matchers.
-    void SetDefaultOutbound(std::string default_outbound_tag) noexcept;
-
-    // Hot path: return the selected outbound tag, or the configured default tag.
+    // Hot path: return a tag only when a normalized routing rule matches.
     [[nodiscard]] std::string_view Route(const session::Context& ctx) const;
-    [[nodiscard]] std::string_view Route(
-        const session::Context& ctx,
-        std::string_view default_outbound_tag) const;
     [[nodiscard]] RouteDecision RouteDetailed(const session::Context& ctx) const;
-    [[nodiscard]] RouteDecision RouteDetailed(
-        const session::Context& ctx,
-        std::string_view default_outbound_tag) const;
 
-    [[nodiscard]] std::string_view DefaultOutbound() const;
     [[nodiscard]] ::acpp::RoutingDomainStrategy DomainStrategy() const noexcept;
 
 private:

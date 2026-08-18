@@ -7,6 +7,7 @@
 #include "../encoding/server.hpp"
 #include "../account.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -256,7 +257,7 @@ proxy::vmess::inbound::Handler::Process(
             transport::Link{request_reader.get(), response_writer.get()},
             *stream,
             dispatcher,
-            receiver,
+            receiver.dispatch_policy,
             ctx,
             *stats_,
             timeouts,
@@ -265,7 +266,7 @@ proxy::vmess::inbound::Handler::Process(
 
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver,
+        receiver.dispatch_policy,
         std::move(stream),
         transport::Link{request_reader.get(), response_writer.get()},
         InitialPayload{},

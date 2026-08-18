@@ -1,6 +1,7 @@
 #include "acppnode/common/rule.hpp"
 
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/session.hpp"
 #include "acppnode/common/string_hash.hpp"
 
 #include <charconv>
@@ -147,6 +148,22 @@ bool Manager::Detect(std::string_view tag,
         });
     }
     return true;
+}
+
+bool Manager::Blocked(const session::Context& ctx) {
+    if (ctx.inbound.user_id == 0 || !HasRule(ctx.inbound.tag)) {
+        return false;
+    }
+
+    // Worker-local scratch avoids a per-request destination string allocation.
+    thread_local std::string destination;
+    ctx.outbound.target.ToStringInto(destination);
+    return Detect(
+        ctx.inbound.tag,
+        destination,
+        std::string_view(
+            ctx.inbound.user_email.data(),
+            ctx.inbound.user_email.size()));
 }
 
 }  // namespace acpp::rule

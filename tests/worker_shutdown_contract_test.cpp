@@ -1,5 +1,6 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/request_load_state.hpp"
+#include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 
@@ -21,7 +22,7 @@ static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().UnregisterListenerTask(
         std::declval<std::string>())),
     acpp::net::awaitable<void>>);
-static_assert(noexcept(std::declval<acpp::app::router::Router&>().SetDefaultOutbound(
+static_assert(noexcept(std::declval<acpp::app::dispatcher::DefaultDispatcher&>().SetDefaultOutbound(
     std::declval<std::string>())));
 
 int main() {

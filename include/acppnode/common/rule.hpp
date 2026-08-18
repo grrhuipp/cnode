@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/rule_types.hpp"
+#include "acppnode/features/policy/request_policy.hpp"
 
 #include <memory>
 #include <string_view>
@@ -10,7 +11,7 @@ namespace acpp::rule {
 
 // XrayR common/rule.Manager counterpart.
 // Owned by one Worker and accessed only on that Worker's io_context.
-class Manager {
+class Manager final : public features::policy::RequestPolicy {
 public:
     Manager();
     ~Manager();
@@ -26,6 +27,8 @@ public:
     [[nodiscard]] bool Detect(std::string_view tag,
                               std::string_view destination,
                               std::string_view email);
+    [[nodiscard]] bool Blocked(
+        const session::Context& ctx) override;
 
 private:
     struct Impl;
