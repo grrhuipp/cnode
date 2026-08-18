@@ -44,25 +44,27 @@ struct ReceiverSettings {
     StreamSettings stream_settings,
     SniffConfig sniff_config,
     ConnectionLimiter* limiter,
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto,
-    routing::OutboundSelectionPolicy outbound_policy = {},
+    ProxyProtocolMode proxy_protocol,
+    routing::OutboundSelectionPolicy outbound_policy,
     uint32_t access_source_ref = 0) {
-    ReceiverSettings settings;
-    settings.inbound_tag     = std::move(inbound_tag);
-    settings.inbound_tags    = std::move(inbound_tags);
-    settings.protocol        = std::move(protocol);
-    settings.stream_settings = std::move(stream_settings);
-    settings.dispatch_policy.sniffing = std::move(sniff_config);
-    settings.dispatch_policy.sniffing.RefreshHotPathFields();
-    settings.dispatch_policy.outbound = std::move(outbound_policy);
-    settings.proxy_protocol  = proxy_protocol;
-    settings.has_route_inbound_tags =
-        !settings.inbound_tags.empty() &&
-        !(settings.inbound_tags.size() == 1 &&
-          settings.inbound_tags.front() == settings.inbound_tag);
-    settings.limiter         = limiter;
-    settings.access_source_ref = access_source_ref;
-    return settings;
+    sniff_config.RefreshHotPathFields();
+    const bool has_route_inbound_tags =
+        !inbound_tags.empty() &&
+        !(inbound_tags.size() == 1 && inbound_tags.front() == inbound_tag);
+    return ReceiverSettings{
+        .inbound_tag = std::move(inbound_tag),
+        .inbound_tags = std::move(inbound_tags),
+        .protocol = std::move(protocol),
+        .stream_settings = std::move(stream_settings),
+        .dispatch_policy = {
+            .sniffing = std::move(sniff_config),
+            .outbound = std::move(outbound_policy),
+        },
+        .proxy_protocol = proxy_protocol,
+        .has_route_inbound_tags = has_route_inbound_tags,
+        .limiter = limiter,
+        .access_source_ref = access_source_ref,
+    };
 }
 
 }  // namespace acpp::proxyman::inbound

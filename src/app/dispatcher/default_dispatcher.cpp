@@ -1,5 +1,7 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 
+#include "outbound_selection.hpp"
+
 #include "acppnode/app/access_log_session.hpp"
 
 #include "acppnode/app/session_tracking.hpp"
@@ -137,15 +139,6 @@ void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
 void DefaultDispatcher::BindRequestLoadState(
     app::RequestLoadState& request_load) noexcept {
     request_load_ = &request_load;
-}
-
-void DefaultDispatcher::SetDefaultOutbound(
-    std::string default_outbound_tag) noexcept {
-    default_outbound_tag_ = std::move(default_outbound_tag);
-}
-
-std::string_view DefaultDispatcher::DefaultOutbound() const noexcept {
-    return default_outbound_tag_;
 }
 
 std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
@@ -477,8 +470,6 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
         ctx.outbound.route_rule = "rule:" + std::to_string(selection.rule_index);
     } else if (selection.fallback) {
         ctx.outbound.route_rule = "fallback";
-    } else {
-        ctx.outbound.route_rule = "default";
     }
     if (selection.fixed) {
         LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
@@ -516,34 +507,25 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
 DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) const noexcept {
-    if (policy.outbound.kind == routing::OutboundSelectionKind::ForceOutbound) {
-        return RouteSelection{
-            .outbound_tag = policy.outbound.outbound_tag,
-            .matched = true,
-            .fixed = true,
-            .fallback = false,
-            .rule_index = 0,
-            .error = ErrorCode::OK,
-        };
-    }
-
     app::router::RouteDecision decision;
-    if (router_) {
+    if (router_ && detail::RequiresRouting(policy.outbound)) {
         decision = router_->RouteDetailed(ctx);
     }
 
-    const bool route_with_fallback =
-        policy.outbound.kind == routing::OutboundSelectionKind::RouteWithFallback;
-    const std::string_view no_match_tag = route_with_fallback
-        ? std::string_view(policy.outbound.outbound_tag)
-        : std::string_view(default_outbound_tag_);
+    const auto selection = detail::SelectOutbound(
+        policy.outbound,
+        detail::RuleSelection{
+            .outbound_tag = decision.outbound_tag,
+            .matched = decision.matched,
+            .rule_index = decision.rule_index,
+        });
 
     return RouteSelection{
-        .outbound_tag = decision.matched ? decision.outbound_tag : no_match_tag,
-        .matched = decision.matched,
-        .fixed = false,
-        .fallback = route_with_fallback && !decision.matched,
-        .rule_index = decision.rule_index,
+        .outbound_tag = selection.outbound_tag,
+        .matched = selection.source == detail::SelectionSource::Rule,
+        .fixed = selection.source == detail::SelectionSource::Forced,
+        .fallback = selection.source == detail::SelectionSource::Fallback,
+        .rule_index = selection.rule_index,
         .error = ErrorCode::OK,
     };
 }
@@ -551,8 +533,7 @@ DefaultDispatcher::RouteSelection DefaultDispatcher::SelectRoute(
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) {
-    if (!router_ ||
-        policy.outbound.kind == routing::OutboundSelectionKind::ForceOutbound ||
+    if (!router_ || !detail::RequiresRouting(policy.outbound) ||
         !ctx.outbound.target.IsDomain() ||
         ctx.outbound.target.resolved_addr) {
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));

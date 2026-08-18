@@ -347,6 +347,13 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     if (!impl_->proxy || !datagram.sock || datagram.payload.empty()) {
         return;
     }
+    if (!datagram.receiver) {
+        LOG_NET_DEBUG(
+            "Worker[{}]: UDP datagram missing prepared receiver tag={}",
+            datagram.worker_id,
+            impl_->tag);
+        return;
+    }
 
     const std::string socket_key(datagram.socket_key);
     const auto now = std::chrono::steady_clock::now();
@@ -361,7 +368,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         .payload = datagram.payload,
     });
     if (!decoded) {
-        if (datagram.receiver && datagram.receiver->access_source_ref != 0) {
+        if (datagram.receiver->access_source_ref != 0) {
             session::Context rejected_ctx;
             rejected_ctx.conn_id = session::NewID(datagram.worker_id);
             rejected_ctx.worker_id = datagram.worker_id;
@@ -428,14 +435,8 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             return;
         }
 
-        auto receiver =
-            std::make_shared<proxyman::inbound::ReceiverSettings>();
-        if (datagram.receiver) {
-            *receiver = *datagram.receiver;
-        } else {
-            receiver->inbound_tag = impl_->tag;
-            receiver->inbound_tags = {impl_->tag};
-        }
+        auto receiver = std::make_shared<proxyman::inbound::ReceiverSettings>(
+            *datagram.receiver);
 
         auto ctx = std::make_shared<session::Context>();
         ctx->conn_id = session::NewID(datagram.worker_id);

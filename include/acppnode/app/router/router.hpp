@@ -40,7 +40,6 @@ public:
         ::acpp::geo::GeoManager* geo_manager);
 
     // Hot path: return a tag only when a normalized routing rule matches.
-    [[nodiscard]] std::string_view Route(const session::Context& ctx) const;
     [[nodiscard]] RouteDecision RouteDetailed(const session::Context& ctx) const;
 
     [[nodiscard]] ::acpp::RoutingDomainStrategy DomainStrategy() const noexcept;

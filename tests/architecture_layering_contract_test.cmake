@@ -95,6 +95,60 @@ foreach(DISPATCHER_BOUNDARY_FILE IN LISTS DISPATCHER_BOUNDARY_FILES)
         message(FATAL_ERROR
             "Dispatcher must depend on RequestPolicy, not the panel rule manager: ${DISPATCHER_BOUNDARY_FILE}")
     endif()
+    if(DISPATCHER_BOUNDARY_SOURCE MATCHES
+           "default_outbound|DefaultOutbound|SetDefaultOutbound")
+        message(FATAL_ERROR
+            "Dispatcher must use the receiver's explicit policy, not mutable global default state: ${DISPATCHER_BOUNDARY_FILE}")
+    endif()
+endforeach()
+
+file(READ "${SOURCE_DIR}/include/acppnode/features/routing/dispatch_policy.hpp"
+     DISPATCH_POLICY_SOURCE)
+if(DISPATCH_POLICY_SOURCE MATCHES
+       "OutboundSelectionKind|HasOutboundTag")
+    message(FATAL_ERROR
+        "outbound selection policy must be an exhaustive non-defaultable type")
+endif()
+
+file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/receiver_settings.hpp"
+     RECEIVER_SETTINGS_SOURCE)
+if(RECEIVER_SETTINGS_SOURCE MATCHES
+       "OutboundSelectionPolicy +outbound_policy *=")
+    message(FATAL_ERROR
+        "receiver construction must require an explicit outbound selection policy")
+endif()
+
+file(READ "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp"
+     UDP_INGRESS_SOURCE)
+if(UDP_INGRESS_SOURCE MATCHES
+       "make_shared<proxyman::inbound::ReceiverSettings> *[(] *[)]")
+    message(FATAL_ERROR
+        "native UDP must retain its prepared receiver instead of inventing a default policy")
+endif()
+
+file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp"
+     STATIC_INBOUND_BOOTSTRAP_SOURCE)
+foreach(STATIC_INBOUND_POLICY_TOKEN IN ITEMS
+        "routing_enabled"
+        "RouteWithFallback"
+        "ForceOutbound")
+    if(NOT STATIC_INBOUND_BOOTSTRAP_SOURCE MATCHES
+           "${STATIC_INBOUND_POLICY_TOKEN}")
+        message(FATAL_ERROR
+            "static inbound bootstrap must map routingEnabled=false to ForceOutbound and true to RouteWithFallback")
+    endif()
+endforeach()
+
+foreach(GLOBAL_DEFAULT_FILE IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/worker_runtime_config.hpp"
+        "${SOURCE_DIR}/src/app/worker.cpp"
+        "${SOURCE_DIR}/src/app/bootstrap_setup.cpp")
+    file(READ "${GLOBAL_DEFAULT_FILE}" GLOBAL_DEFAULT_SOURCE)
+    if(GLOBAL_DEFAULT_SOURCE MATCHES
+           "default_outbound_tag|DefaultOutbound|SetDefaultOutbound")
+        message(FATAL_ERROR
+            "Worker runtime must not derive or publish an implicit global default outbound: ${GLOBAL_DEFAULT_FILE}")
+    endif()
 endforeach()
 
 file(READ "${SOURCE_DIR}/include/acppnode/features/routing/dispatcher.hpp"
@@ -112,9 +166,17 @@ foreach(ROUTER_BOUNDARY_FILE IN ITEMS
     if(ROUTER_BOUNDARY_SOURCE MATCHES
            "default_outbound|DefaultOutbound|SetDefaultOutbound")
         message(FATAL_ERROR
-            "Router must return only matched rules; Dispatcher owns fallback/default: ${ROUTER_BOUNDARY_FILE}")
+            "Router must return only matched rules; Dispatcher owns the receiver's explicit fallback: ${ROUTER_BOUNDARY_FILE}")
     endif()
 endforeach()
+
+file(READ "${SOURCE_DIR}/include/acppnode/app/router/router.hpp"
+     ROUTER_INTERFACE_SOURCE)
+if(ROUTER_INTERFACE_SOURCE MATCHES
+       "std::string_view +Route *[(]")
+    message(FATAL_ERROR
+        "Router public interface must expose the complete matched-rule decision only")
+endif()
 
 foreach(CHILD_DISPATCH_FILE IN ITEMS
         "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.hpp"

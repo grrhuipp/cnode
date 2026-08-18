@@ -152,7 +152,7 @@ net::awaitable<bool> Controller::Impl::addInbound(api::API* panel,
                     inbound.sniff,
                     limiter,
                     inbound.proxy_protocol,
-                    routing::OutboundSelectionPolicy::RouteWithFallback(inbound.tag),
+                    routing::RouteWithFallback(inbound.tag),
                     access_source_ref);
                 return [](Worker* current,
                           ConnectionLimiterPtr current_limiter,

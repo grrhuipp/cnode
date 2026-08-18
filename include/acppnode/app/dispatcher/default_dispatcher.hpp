@@ -9,7 +9,6 @@
 #include "acppnode/transport/link.hpp"
 
 #include <memory>
-#include <string>
 #include <string_view>
 
 namespace acpp {
@@ -42,7 +41,7 @@ namespace app::dispatcher {
 //
 // 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。Router 和
 // outbound 表仍在 Worker 冷路径完成绑定；热路径只消费窄 DispatchPolicy，
-// 编排强制出口、Router 规则决策、fallback/default 和通用请求策略。
+// 编排强制出口、Router 规则决策、显式 fallback 和通用请求策略。
 // ============================================================================
 class DefaultDispatcher final : public routing::Dispatcher {
 public:
@@ -55,8 +54,6 @@ public:
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
     void BindDnsService(app::dns::DNS& dns_service) noexcept;
     void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
-    void SetDefaultOutbound(std::string default_outbound_tag) noexcept;
-    [[nodiscard]] std::string_view DefaultOutbound() const noexcept;
 
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
@@ -111,7 +108,6 @@ private:
     app::SessionTrackingState* session_tracking_ = nullptr;
     app::dns::DNS* dns_service_ = nullptr;
     app::RequestLoadState* request_load_ = nullptr;
-    std::string default_outbound_tag_;
 };
 
 }  // namespace app::dispatcher

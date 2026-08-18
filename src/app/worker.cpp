@@ -163,7 +163,6 @@ struct Worker::RuntimeState {
                        const std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds);
     void InitRouter(Worker& worker,
                     const RoutingConfig& routing,
-                    std::string_view default_outbound_tag,
                     geo::GeoManager* geo_manager_ref);
 
     net::io_context& io_context;
@@ -240,7 +239,6 @@ net::awaitable<void> Worker::StartRuntimeTask() {
     runtime_->InitRouter(
         *this,
         runtime_snapshot->routing,
-        runtime_snapshot->default_outbound_tag,
         runtime_->geo_manager);
     runtime_->udp_session_manager->StartCleanup();
     runtime_->started = true;
@@ -279,14 +277,12 @@ void Worker::RuntimeState::InitOutbounds(
 void Worker::RuntimeState::InitRouter(
     Worker& worker,
     const RoutingConfig& routing,
-    std::string_view default_outbound_tag,
     geo::GeoManager* geo_manager_ref) {
     router->Configure(routing, geo_manager_ref);
     dispatcher->BindRouter(*router);
-    dispatcher->SetDefaultOutbound(std::string(default_outbound_tag));
 
-    LOG_DEBUG("Worker[{}]: router initialized, {} rules, default='{}'",
-              worker.id_, routing.rules.size(), dispatcher->DefaultOutbound());
+    LOG_DEBUG("Worker[{}]: router initialized, {} rules",
+              worker.id_, routing.rules.size());
 }
 
 // ============================================================================
@@ -819,25 +815,12 @@ void Worker::AddOutboundOnWorkerThread(
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == config.tag; });
     next_snapshot->outbounds.push_back(std::move(config));
-    if (next_snapshot->default_outbound_tag.empty()) {
-        next_snapshot->default_outbound_tag = next_snapshot->outbounds.front().tag;
-    }
-
-    const bool update_dispatcher_default =
-        runtime_->dispatcher->DefaultOutbound() != next_snapshot->default_outbound_tag;
-    std::string next_dispatcher_default;
-    if (update_dispatcher_default) {
-        next_dispatcher_default = next_snapshot->default_outbound_tag;
-    }
     const std::string_view installed_protocol = next_snapshot->outbounds.back().protocol;
     const std::string_view installed_tag = next_snapshot->outbounds.back().tag;
 
     if (!runtime_->outbound_manager->ReplaceHandler(std::move(handler))) {
         throw std::logic_error(
             "failed to install dynamic outbound '" + std::string(installed_tag) + "'");
-    }
-    if (update_dispatcher_default) {
-        runtime_->dispatcher->SetDefaultOutbound(std::move(next_dispatcher_default));
     }
     runtime_->StoreSnapshot(std::move(next_snapshot));
 
@@ -856,23 +839,8 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
     auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == tag; });
-    if (next_snapshot->default_outbound_tag == tag) {
-        next_snapshot->default_outbound_tag = next_snapshot->outbounds.empty()
-            ? std::string{}
-            : next_snapshot->outbounds.front().tag;
-    }
-
-    const bool update_dispatcher_default =
-        runtime_->dispatcher->DefaultOutbound() != next_snapshot->default_outbound_tag;
-    std::string next_dispatcher_default;
-    if (update_dispatcher_default) {
-        next_dispatcher_default = next_snapshot->default_outbound_tag;
-    }
 
     runtime_->outbound_manager->RemoveHandler(tag);
-    if (update_dispatcher_default) {
-        runtime_->dispatcher->SetDefaultOutbound(std::move(next_dispatcher_default));
-    }
     runtime_->StoreSnapshot(std::move(next_snapshot));
 }
 

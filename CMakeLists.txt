@@ -1388,6 +1388,21 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_routing_ip_network_test
         COMMAND cnode_routing_ip_network_test)
 
+    add_executable(cnode_outbound_selection_test
+        tests/outbound_selection_test.cpp
+    )
+    target_include_directories(cnode_outbound_selection_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_compile_options(cnode_outbound_selection_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_outbound_selection_test
+        COMMAND cnode_outbound_selection_test)
+
     add_executable(cnode_outbound_bind_test
         tests/outbound_bind_test.cpp
         src/transport/internet/outbound_bind.cpp

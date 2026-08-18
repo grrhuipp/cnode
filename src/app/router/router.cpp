@@ -718,10 +718,6 @@ Router::~Router() noexcept = default;
 Router::Router(Router&&) noexcept = default;
 Router& Router::operator=(Router&&) noexcept = default;
 
-std::string_view Router::Route(const session::Context& ctx) const {
-    return RouteDetailed(ctx).outbound_tag;
-}
-
 RouteDecision Router::RouteDetailed(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
@@ -741,7 +737,8 @@ RouteDecision Router::RouteDetailed(const session::Context& ctx) const {
         }
     }
 
-    // No match is an explicit empty decision. Dispatcher owns fallback/default.
+    // No match is an explicit empty decision. Dispatcher owns the receiver's
+    // explicit fallback.
     LOG_NET_DEBUG("Router: {} no matching rule", target);
     return RouteDecision{
         .outbound_tag = {},

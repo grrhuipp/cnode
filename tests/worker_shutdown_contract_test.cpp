@@ -22,8 +22,7 @@ static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().UnregisterListenerTask(
         std::declval<std::string>())),
     acpp::net::awaitable<void>>);
-static_assert(noexcept(std::declval<acpp::app::dispatcher::DefaultDispatcher&>().SetDefaultOutbound(
-    std::declval<std::string>())));
+static_assert(!std::default_initializable<acpp::routing::OutboundSelectionPolicy>);
 
 int main() {
     acpp::app::RequestLoadState load(3, 7);

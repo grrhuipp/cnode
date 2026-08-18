@@ -84,10 +84,10 @@ net::awaitable<bool> SetupWorkerInbounds(
 
     for (const auto& inbound : inbounds) {
         auto outbound_policy = inbound.routing_enabled
-            ? routing::OutboundSelectionPolicy::RouteWithFallback(
-                  std::string(constants::protocol::kDirect))
-            : routing::OutboundSelectionPolicy::Force(
-                  std::string(constants::protocol::kDirect));
+            ? routing::OutboundSelectionPolicy(routing::RouteWithFallback(
+                  std::string(constants::protocol::kDirect)))
+            : routing::OutboundSelectionPolicy(routing::ForceOutbound(
+                  std::string(constants::protocol::kDirect)));
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
             inbound.all_tags,

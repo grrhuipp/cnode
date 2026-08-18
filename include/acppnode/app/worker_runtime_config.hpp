@@ -7,7 +7,6 @@
 #include "acppnode/infra/runtime_config_types.hpp"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace acpp {
@@ -19,7 +18,6 @@ struct WorkerRuntimeConfig {
     TimeoutsConfig timeouts;
     LimitsConfig limits;
     RoutingConfig routing;
-    std::string default_outbound_tag;
     std::vector<StaticInboundRuntimeEntry> static_inbounds;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
     uint32_t workers = 0;

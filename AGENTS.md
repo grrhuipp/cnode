@@ -24,7 +24,8 @@
 - 任意配置来源都必须先归一化，再进入 runtime。
 - 任意热路径对象都必须能明确指出所属 Worker；跨线程访问只能通过投递、快照或冷路径同步完成。
 - proxyman receiver 在冷路径构建完整监听语义；进入 Dispatcher 时只能传不可变的窄 `DispatchPolicy`，不能传 `ReceiverSettings`。
-- Router 只返回真实规则命中；强制出口、入站 fallback 和 Worker 默认出口由 Dispatcher 编排。
+- Router 只返回真实规则命中；强制出口和入站显式 fallback 由 Dispatcher 编排，不存在 Worker 全局默认出口。
+- 每个 receiver 必须在冷路径明确构造 `ForceOutbound` 或 `RouteWithFallback`；策略不可默认构造，空 tag 不得进入热路径。
 
 ## 唯一请求链路
 
@@ -72,7 +73,7 @@ dispatcher 是请求链路的路由分发入口。
 负责：
 
 - 接收 inbound 交给它的不可变 `DispatchPolicy`、session / context / link。
-- 按 `forced outbound -> Router matched rule -> inbound fallback -> Worker default` 的优先级完成出站选择。
+- 按 `forced outbound` 或 `Router matched rule -> explicit inbound fallback` 的互斥策略完成出站选择。
 - 通过通用 `RequestPolicy` 接口取得 allow / block 结果。
 - 根据选择结果查找 outbound handler。
 - 调用 `outbound.Process`。
@@ -86,7 +87,8 @@ dispatcher 是请求链路的路由分发入口。
 - 读取或理解 panel 配置字段。
 - 接收完整 `proxyman::inbound::ReceiverSettings`。
 - 依赖具体 `rule::Manager`、`DetectRule` 或其他面板策略实现。
-- 把 forced / fallback / default 伪装成 Router 规则命中。
+- 把 forced / fallback 伪装成 Router 规则命中。
+- 保存或推导 Worker 全局默认出口，或在策略缺失时选择第一个 outbound。
 
 ### router
 
@@ -104,7 +106,7 @@ router 只做路由决策。
 - 访问协议实现。
 - 依赖 proxyman 具体类型。
 - 理解 Worker 资源细节。
-- 保存或选择 forced outbound、入站 fallback、Worker 默认 outbound。
+- 保存或选择 forced outbound、入站 fallback、隐式默认 outbound。
 - 依赖 outbound manager 或请求策略实现。
 
 ### request policy
@@ -333,7 +335,7 @@ api/* 拉取 panel 原始 users
 - Worker 不直接访问协议 validator、panel 字段或具体 outbound 实现。
 - Dispatcher 不 include 具体协议，不绕过 router/outbound/relay。
 - Dispatcher 只接收窄 `DispatchPolicy`，不接收 `ReceiverSettings`，不依赖具体面板规则 manager。
-- Router 只返回真实规则命中，不持有 forced / fallback / default，不创建连接，不访问 outbound manager 或 relay。
+- Router 只返回真实规则命中，不持有 forced / fallback / implicit default，不创建连接，不访问 outbound manager 或 relay。
 - RequestPolicy 只返回准入结果，不选择路由或 outbound。
 - Relay 只搬运数据，不解析协议，不理解面板。
 - Panel/client/controller 不进入热路径，不修改 live handler 内部状态。
@@ -371,9 +373,10 @@ api/* 拉取 panel 原始 users
 19. 面板用户绕过 `RuntimeUser -> UserSet -> UserStore` 链路进入热路径。
 20. DNS service、inflight resolve、socket、timeout scheduler 或 Worker L1 DNS cache 跨 Worker 共享。
 21. Dispatcher 公开接口或实现接收、保存 `ReceiverSettings` 或依赖 `proxyman::inbound`。
-22. Router 保存或选择 forced outbound、入站 fallback、Worker 默认 outbound。
+22. Router 保存或选择 forced outbound、入站 fallback、隐式默认 outbound。
 23. Dispatcher 依赖具体 `rule::Manager`、`DetectRule` 或面板策略类型，而不是通用 `RequestPolicy`。
 24. Mux / AnyTLS 子流为重新进入 Dispatcher 而保存完整 receiver，而不是窄 `DispatchPolicy`。
+25. receiver 的出口策略可以默认构造、接受空 tag，或由 Worker / Dispatcher 回退到第一个 outbound。
 
 ## 审查清单
 
@@ -391,8 +394,9 @@ cnode 应满足：
 10. 仓库结构表达最终职责，而不是表达迁移历史。
 11. 任意无锁对象都能明确指出所属 Worker，跨线程访问只能通过投递、快照或冷路径同步完成。
 12. Dispatcher 的公开热路径只暴露 `Dispatch`，参数中没有 proxyman receiver 或面板策略实现。
-13. Router 的无匹配结果为空，fallback/default 只能在 Dispatcher 中解析。
+13. Router 的无匹配结果为空，显式 fallback 只能在 Dispatcher 中解析；系统不存在隐式全局默认出口。
 14. 面板 DetectRule 通过 RequestPolicy 抽象接入，不污染 Router 或 Dispatcher 类型边界。
+15. 未启用 routing 的静态 inbound 使用 `ForceOutbound(direct)`，即使规则可命中也不得进入 Router。
 
 ## 部署约束
 

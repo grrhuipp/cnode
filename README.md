@@ -45,14 +45,14 @@ main
   -> Dispatcher::Dispatch(immutable DispatchPolicy)
        -> sniffing
        -> forced outbound, or Router matched-rule decision
-       -> no-match inbound fallback, or Worker default outbound
+       -> no-match explicit inbound fallback
        -> RequestPolicy allow / block
        -> outbound handler lookup
   -> OutboundHandler(Freedom / VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Blackhole)
   -> Relay(TCP / UDP / Mux)
 ```
 
-这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
+这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
 控制面链路：
 
@@ -92,8 +92,8 @@ Worker DNS service
 | 层级 | 负责 | 不负责 |
 | --- | --- | --- |
 | inbound | 认证、入站协议解析、用户识别、目标地址解析、session metadata、调用 dispatcher | 路由选择、出站连接、relay 细节、访问 outbound manager 内部结构 |
-| dispatcher | 接收只读 DispatchPolicy / session / link；编排 sniff、强制出口、Router 规则、fallback/default、通用 RequestPolicy；选择 handler 并调用 outbound.Process | 接收完整 ReceiverSettings、依赖具体 DetectRule manager、解析协议、协议特判、执行 relay、读取 panel 字段 |
-| router | 基于归一化 metadata 只返回真实命中的 outbound tag / rule decision | 强制出口、默认出口、未命中 fallback、创建连接、访问 outbound manager / relay / 协议实现 |
+| dispatcher | 接收只读 DispatchPolicy / session / link；编排 sniff、强制出口、Router 规则、显式 fallback、通用 RequestPolicy；选择 handler 并调用 outbound.Process | 接收完整 ReceiverSettings、依赖具体 DetectRule manager、维护全局默认出口、解析协议、协议特判、执行 relay、读取 panel 字段 |
+| router | 基于归一化 metadata 只返回真实命中的 outbound tag / rule decision | 强制出口、隐式默认出口、未命中 fallback、创建连接、访问 outbound manager / relay / 协议实现 |
 | request policy | 基于统一 session context 返回 allow / block；Worker-local 实现可记录策略命中 | 路由选择、outbound handler 查找、协议解析、暴露面板原始字段 |
 | outbound | 建立目标连接或下一跳连接，执行出站协议握手和编码，交给 relay | 路由决策、读取 panel 原始配置、绕过 dispatcher |
 | relay | TCP / UDP / Mux 数据搬运和流量统计打点 | 解析协议、选择 outbound、访问 panel、暴露 wrapper API |
@@ -185,6 +185,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
+- 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 按 xray-core wire model 实现：TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写、`settings.users` 和 `settings.paddingScheme` 语义。
 - REALITY 当前只实现原生 TLS 1.3 + Ed25519 认证握手，不实现未认证连接的 `dest` / `target` 回落、uTLS `fingerprint` 模拟、`spiderX` 爬虫或 ML-DSA-65 证书附加签名/验证；配置这些字段或启用非零 `xver` 会在启动时明确拒绝。
 
