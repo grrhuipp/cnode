@@ -21,6 +21,10 @@ foreach(REQUIRED_TEXT
         "generation == monitor_generation_"
         "config.PullInterval"
         "config.PushInterval"
+        "auto next_push = Clock::time_point::max()"
+        "committed_nodes_.contains(panel)"
+        "const auto scheduled_push = now + interval(false)"
+        "next_push = scheduled_push"
         "next_status"
         "defaults::kPanelStatusLogInterval"
         "logPanelStatus(panel)"
@@ -34,13 +38,44 @@ foreach(REQUIRED_TEXT
 endforeach()
 
 if(CONTROLLER_SOURCE MATCHES
+   "auto next_push[ \t]*=[ \t]*next_pull")
+    message(FATAL_ERROR
+        "the first panel report must wait one full push interval")
+endif()
+
+if(CONTROLLER_SOURCE MATCHES
    "expires_after\\(std::chrono::seconds\\(defaults::kPanelPullInterval\\)\\)")
     message(FATAL_ERROR
         "panel scheduling must not collapse back to one fixed pull interval")
 endif()
 
+foreach(FORBIDDEN_RETRY
+        "kControllerSyncMaxAttempts"
+        "kControllerSyncRetryBaseSeconds"
+        "state=retrying"
+        "attempts={}")
+    string(FIND "${CONTROLLER_SOURCE}" "${FORBIDDEN_RETRY}" RETRY_POSITION)
+    if(NOT RETRY_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "panel pulls must attempt once per configured interval; found '${FORBIDDEN_RETRY}'")
+    endif()
+endforeach()
+
+if(DEFAULTS_SOURCE MATCHES "kControllerSync(MaxAttempts|RetryBaseSeconds)")
+    message(FATAL_ERROR
+        "single-attempt panel scheduling must not retain retry defaults")
+endif()
+
+string(REGEX MATCHALL "GetNodeInfo\\(\\)" NODE_PULL_CALLS
+    "${CONTROLLER_SOURCE}")
+list(LENGTH NODE_PULL_CALLS NODE_PULL_CALL_COUNT)
+if(NOT NODE_PULL_CALL_COUNT EQUAL 1)
+    message(FATAL_ERROR
+        "panel scheduling must have exactly one node pull call path")
+endif()
+
 string(REGEX MATCHALL
-    "userInfoMonitor\\(panel, tag, protocol\\)" PUSH_CALLS
+    "userInfoMonitor\\(panel, tag\\)" PUSH_CALLS
     "${CONTROLLER_SOURCE}")
 list(LENGTH PUSH_CALLS PUSH_CALL_COUNT)
 if(NOT PUSH_CALL_COUNT EQUAL 1)

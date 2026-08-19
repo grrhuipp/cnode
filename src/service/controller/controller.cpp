@@ -67,6 +67,7 @@ void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
     panels_.push_back(std::move(panel));
     panel_configs_[p] = panel_config;
     panel_nodes_.push_back(p);
+    panel_states_[p] = PanelState::Connecting;
 }
 
 void Controller::Impl::Start() {
@@ -170,12 +171,14 @@ net::awaitable<void> Controller::Impl::panelMonitor(
     const auto client_info = panel->Describe();
     const std::string panel_name = ResolvePanelName(panel, panel_configs_);
     auto next_pull = Clock::now();
-    auto next_push = next_pull;
+    // Match v2node reporting semantics: the first traffic/online snapshot
+    // needs one complete push interval to accumulate meaningful activity.
+    auto next_push = Clock::time_point::max();
     auto next_status = next_pull;
     net::steady_timer timer(io_context_);
     CancelableTimerRegistry::Registration timer_registration(
         monitor_timers_, timer);
-    LOG_CONSOLE("panel status name={} node={} state=connecting type={} host={}",
+    LOG_CONSOLE("Panel {}/{} status: connecting | {} | {}",
                 panel_name,
                 client_info.NodeID,
                 client_info.NodeType,
@@ -203,12 +206,14 @@ net::awaitable<void> Controller::Impl::panelMonitor(
             try {
                 co_await nodeInfoMonitor(panel);
             } catch (const std::exception& e) {
-                LOG_WARN("panel status name={} node={} state=unavailable phase=pull error={}",
+                panel_states_[panel] = PanelState::Unavailable;
+                LOG_WARN("Panel {}/{} sync: unavailable | pull | {}",
                          panel_name,
                          client_info.NodeID,
                          e.what());
             } catch (...) {
-                LOG_WARN("panel status name={} node={} state=unavailable phase=pull error=unknown",
+                panel_states_[panel] = PanelState::Unavailable;
+                LOG_WARN("Panel {}/{} sync: unavailable | pull | unknown error",
                          panel_name,
                          client_info.NodeID);
             }
@@ -217,7 +222,16 @@ net::awaitable<void> Controller::Impl::panelMonitor(
             }
             now = Clock::now();
             next_pull = now + interval(true);
-            next_push = std::min(next_push, now + interval(false));
+            if (committed_nodes_.contains(panel)) {
+                const auto scheduled_push = now + interval(false);
+                if (next_push == Clock::time_point::max()) {
+                    next_push = scheduled_push;
+                } else {
+                    next_push = std::min(next_push, scheduled_push);
+                }
+            } else {
+                next_push = Clock::time_point::max();
+            }
         }
 
         now = Clock::now();
@@ -232,14 +246,14 @@ net::awaitable<void> Controller::Impl::panelMonitor(
                     protocol,
                     config.Port);
                 try {
-                    co_await userInfoMonitor(panel, tag, protocol);
+                    co_await userInfoMonitor(panel, tag);
                 } catch (const std::exception& e) {
-                    LOG_WARN("panel report name={} node={} state=unavailable error={}",
+                    LOG_WARN("Panel {}/{} report: unavailable | {}",
                              panel_name,
                              client_info.NodeID,
                              e.what());
                 } catch (...) {
-                    LOG_WARN("panel report name={} node={} state=unavailable error=unknown",
+                    LOG_WARN("Panel {}/{} report: unavailable | unknown error",
                              panel_name,
                              client_info.NodeID);
                 }
@@ -264,26 +278,13 @@ net::awaitable<void> Controller::Impl::panelMonitor(
 }
 
 net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
-    constexpr int kMaxAttempts  = defaults::kControllerSyncMaxAttempts;
-    constexpr int kRetryBaseSec = defaults::kControllerSyncRetryBaseSeconds;
     const auto client_info = panel->Describe();
     const int node_id = client_info.NodeID;
     const std::string panel_name = ResolvePanelName(panel, panel_configs_);
     std::string stats_key = naming::BuildPanelNodeStatsKey(panel_name, node_id);
 
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        if (attempt > 0) {
-            const int delay = kRetryBaseSec * attempt;
-            LOG_WARN("panel sync name={} node={} state=retrying retry={}/{} delay={}s",
-                     panel_name, node_id, attempt, kMaxAttempts - 1, delay);
-            net::steady_timer timer(io_context_);
-            CancelableTimerRegistry::Registration timer_registration(
-                monitor_timers_, timer);
-            timer.expires_after(std::chrono::seconds(delay));
-            (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-            if (!running_) co_return;
-        }
-
+    // One pull attempt is made for each scheduler invocation.
+    {
         try {
             auto config_result = co_await panel->GetNodeInfo();
             if (config_result.missing) {
@@ -302,13 +303,14 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     committed_nodes_.erase(state_it);
                     node_stats_.erase(stats_key);
 
-                    LOG_CONSOLE("node removed panel={} node={} inbound={}",
+                    LOG_CONSOLE("Panel {}/{} config: removed | inbound {}",
                                 panel_name, node_id, old_tag);
                 }
-                LOG_CONSOLE("panel status name={} node={} state=missing action={}",
+                panel_states_[panel] = PanelState::Missing;
+                LOG_CONSOLE("Panel {}/{} sync: missing | {}",
                             panel_name,
                             node_id,
-                            removed ? "removed" : "none");
+                            removed ? "removed" : "unchanged");
                 co_return;
             }
 
@@ -348,7 +350,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
                 || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
                 || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
-                LOG_CONSOLE("node config_changed panel={} node={} action=recreate",
+                LOG_CONSOLE("Panel {}/{} config: changed | recreate",
                             panel_name, node_id);
             }
 
@@ -359,7 +361,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     throw std::runtime_error(ErrorMessage(
                         rules_result.error, rules_result.error_msg));
                 }
-                LOG_WARN("Panel {}/{}: GetNodeRule failed: {}",
+                LOG_WARN("Panel {}/{} sync: degraded | rules | {}",
                          panel_name, node_id,
                          rules_result.error_msg.empty()
                             ? ErrorCodeToString(rules_result.error)
@@ -383,7 +385,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                     throw std::runtime_error(ErrorMessage(
                         users_result.error, users_result.error_msg));
                 }
-                LOG_WARN("Panel {}/{}: user sync skipped: {}",
+                LOG_WARN("Panel {}/{} sync: degraded | users | {}",
                          panel_name, node_id,
                          users_result.error_msg.empty()
                             ? ErrorCodeToString(users_result.error)
@@ -444,7 +446,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                             proxyman::inbound::UserStore::ApplyUsers(
                                 tag, *previous_user_set);
                         } catch (...) {
-                            LOG_ERROR("Node {}/{}: refresh user rollback incomplete",
+                            LOG_ERROR("Panel {}/{} sync: rollback incomplete | users",
                                       panel_name, node_id);
                         }
                     }
@@ -452,7 +454,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                         try {
                             co_await UpdateRule(tag, old_state->rules);
                         } catch (...) {
-                            LOG_ERROR("Node {}/{}: refresh rule rollback incomplete",
+                            LOG_ERROR("Panel {}/{} sync: rollback incomplete | rules",
                                       panel_name, node_id);
                         }
                     }
@@ -607,7 +609,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                         .users = *next_users,
                         .rules = *next_rules,
                         .inbound_started = true,
-                        .complete_sync = false,
                     };
                     committed_nodes_.insert_or_assign(panel, std::move(next_state));
                     committed_stats.user_count = next_users->size();
@@ -617,23 +618,24 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 if (transition_failure) {
                     const bool restored = co_await rollback();
                     if (!restored) {
-                        LOG_ERROR("Node {}/{}: rollback incomplete after transition failure",
+                        LOG_ERROR("Panel {}/{} sync: rollback incomplete | transition",
                                   panel_name, node_id);
                     }
                     std::rethrow_exception(transition_failure);
                 }
 
-                LOG_CONSOLE(
-                    "node config_committed panel={} node={} tag={} replaced={}",
-                    panel_name, node_id, tag, old_config != nullptr);
+                LOG_CONSOLE("Panel {}/{} config: ready | {} | replaced {}",
+                            panel_name, node_id, tag,
+                            old_config != nullptr ? "yes" : "no");
             }
 
             auto committed = committed_nodes_.find(panel);
             if (committed == committed_nodes_.end()) {
                 throw std::runtime_error("panel sync completed without committed node state");
             }
-            const bool complete_sync = rules_result.Ok() && users_result.Ok();
-            committed->second.complete_sync = complete_sync;
+            panel_states_[panel] = rules_result.Ok() && users_result.Ok()
+                ? PanelState::Ready
+                : PanelState::Degraded;
 
             co_return;
 
@@ -641,29 +643,45 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             if (!running_) {
                 co_return;
             }
-            if (attempt + 1 < kMaxAttempts) {
-                LOG_WARN("panel sync name={} node={} state=failed attempt={}/{} error={}",
-                         panel_name, node_id, attempt + 1, kMaxAttempts, e.what());
-            } else {
-                LOG_ERROR(
-                    "panel status name={} node={} state=unavailable phase=pull attempts={} error={}",
-                    panel_name, node_id, kMaxAttempts, e.what());
-            }
+            panel_states_[panel] = PanelState::Unavailable;
+            LOG_ERROR("Panel {}/{} sync: unavailable | pull | {}",
+                      panel_name, node_id, e.what());
         }
     }
 }
 
 void Controller::Impl::logPanelStatus(api::API* panel) const {
-    const auto committed = committed_nodes_.find(panel);
-    if (committed == committed_nodes_.end()) {
-        return;
-    }
-
     const auto client_info = panel->Describe();
     const int node_id = client_info.NodeID;
     const std::string panel_name = ResolvePanelName(panel, panel_configs_);
+    const auto state_it = panel_states_.find(panel);
+    const PanelState state = state_it != panel_states_.end()
+        ? state_it->second
+        : PanelState::Connecting;
+    const std::string_view state_text = [&]() -> std::string_view {
+        switch (state) {
+            case PanelState::Connecting: return "connecting";
+            case PanelState::Ready: return "ready";
+            case PanelState::Degraded: return "degraded";
+            case PanelState::Missing: return "missing";
+            case PanelState::Unavailable: return "unavailable";
+        }
+        return "unavailable";
+    }();
+
+    const auto committed = committed_nodes_.find(panel);
+    if (committed == committed_nodes_.end()) {
+        LOG_CONSOLE(
+            "Panel {}/{} status: {} | inbound stopped | {} | {}",
+            panel_name,
+            node_id,
+            state_text,
+            client_info.NodeType,
+            client_info.APIHost);
+        return;
+    }
+
     const auto& committed_state = committed->second;
-    const bool complete_sync = committed_state.complete_sync;
     const std::string protocol =
         naming::ResolveProtocolOrDefault(committed_state.config.NodeType);
     const auto pull_interval = controller::PanelInterval(
@@ -673,11 +691,11 @@ void Controller::Impl::logPanelStatus(api::API* panel) const {
         committed_state.config.PushInterval,
         defaults::kPanelPushInterval);
     LOG_CONSOLE(
-        "panel status name={} node={} state={} inbound={} protocol={} port={} "
-        "users={} rules={} pull={}s push={}s",
+        "Panel {}/{} status: {} | inbound {} | {}:{} | users {} | rules {} | "
+        "pull/push {}s/{}s",
         panel_name,
         node_id,
-        complete_sync ? "ready" : "degraded",
+        state_text,
         committed_state.inbound_started ? "ready" : "stopped",
         protocol,
         committed_state.config.Port,

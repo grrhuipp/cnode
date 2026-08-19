@@ -12,19 +12,24 @@ file(READ
     "${SOURCE_DIR}/src/service/controller/control.cpp"
     CONTROL_SOURCE)
 
-if(NOT BOOTSTRAP_SOURCE MATCHES "panel configured name=" OR
-   BOOTSTRAP_SOURCE MATCHES "panel ready name=")
+string(FIND "${BOOTSTRAP_SOURCE}"
+    "Panel {}: configured |" CONFIGURED_POSITION)
+string(FIND "${BOOTSTRAP_SOURCE}"
+    "Panel {}: ready" READY_POSITION)
+if(CONFIGURED_POSITION EQUAL -1 OR NOT READY_POSITION EQUAL -1)
     message(FATAL_ERROR
         "panel console output must distinguish configured from connected")
 endif()
 
 foreach(REQUIRED_STATUS
-        [=[state=connecting]=]
-        [=[state=missing]=]
-        [=[state=unavailable phase=pull]=]
-        [=[complete_sync ? "ready" : "degraded"]=]
-        [=[inbound_started ? "ready" : "stopped"]=]
-        [=[users={} rules={} pull={}s push={}s]=])
+        [=[status: connecting]=]
+        [=[sync: missing]=]
+        [=[sync: unavailable | pull]=]
+        [=[case PanelState::Ready: return "ready"]=]
+        [=[case PanelState::Degraded: return "degraded"]=]
+        [=[status: {} | inbound {}]=]
+        [=[users {} | rules {}]=]
+        [=[pull/push {}s/{}s]=])
     string(FIND "${CONTROLLER_SOURCE}" "${REQUIRED_STATUS}" STATUS_POSITION)
     if(STATUS_POSITION EQUAL -1)
         message(FATAL_ERROR
@@ -33,9 +38,11 @@ foreach(REQUIRED_STATUS
 endforeach()
 
 foreach(REQUIRED_REPORT
-        [=[panel report name={} node={} state={}]=]
-        [=[node_status={} traffic={} traffic_users={}]=]
-        [=[online={} online_users={} illegal={} illegal_events={}]=]
+        [=[Panel {}/{} report: {}]=]
+        [=[node {} | traffic {}/{}]=]
+        [=[online {}/{}]=]
+        [=[devices {}]=]
+        [=[illegal {}/{}]=]
         [=[report_ok ? "ok" : "degraded"]=]
         [=[return "idle"]=])
     string(FIND "${CONTROL_SOURCE}" "${REQUIRED_REPORT}" REPORT_POSITION)

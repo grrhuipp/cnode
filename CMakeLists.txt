@@ -372,6 +372,7 @@ set(CNODE_SOURCES
     src/service/controller/controller.cpp
     src/common/awaitable_batch.cpp
     src/service/controller/node_transition.cpp
+    src/service/controller/online_snapshot.cpp
     src/service/controller/config.cpp
     src/service/controller/panel_node_ids.cpp
     src/service/controller/inboundbuilder.cpp
@@ -471,6 +472,7 @@ set(CNODE_SOURCES
 
     # API / panel clients
     src/api/v2board/node_info_json.cpp
+    src/api/v2board/online_report.cpp
     src/api/v2board/user_list_json.cpp
     src/api/v2board/v2board.cpp
 
@@ -1066,6 +1068,63 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_v2board_http_response_test
         COMMAND cnode_v2board_http_response_test)
+
+    add_executable(cnode_online_snapshot_test
+        tests/online_snapshot_test.cpp
+        src/service/controller/online_snapshot.cpp
+    )
+    target_include_directories(cnode_online_snapshot_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller
+    )
+    target_link_libraries(cnode_online_snapshot_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_online_snapshot_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_online_snapshot_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_online_snapshot_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_online_snapshot_test
+        COMMAND cnode_online_snapshot_test)
+
+    add_executable(cnode_v2board_online_report_test
+        tests/v2board_online_report_test.cpp
+        src/api/v2board/online_report.cpp
+        src/infra/json.cpp
+    )
+    target_include_directories(cnode_v2board_online_report_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/api/v2board
+    )
+    target_link_libraries(cnode_v2board_online_report_test PRIVATE
+        asio::asio
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(cnode_v2board_online_report_test PRIVATE ws2_32)
+        target_compile_definitions(
+            cnode_v2board_online_report_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_v2board_online_report_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_v2board_online_report_test
+        COMMAND cnode_v2board_online_report_test)
+
+    add_test(
+        NAME cnode_v2board_online_report_contract_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2board_online_report_contract_test.cmake)
 
     add_executable(cnode_v2board_node_info_json_test
         tests/v2board_node_info_json_test.cpp

@@ -28,7 +28,7 @@ endif()
 string(FIND "${CONTROLLER_SOURCE}"
     "std::exception_ptr transition_failure" TRANSITION_BEGIN)
 string(FIND "${CONTROLLER_SOURCE}"
-    "node config_committed" TRANSITION_END)
+    "config: ready" TRANSITION_END)
 if(TRANSITION_BEGIN EQUAL -1 OR TRANSITION_END EQUAL -1 OR
    NOT TRANSITION_BEGIN LESS TRANSITION_END)
     message(FATAL_ERROR "could not isolate candidate transition commit path")

@@ -290,9 +290,8 @@ Controller::Impl::getTraffic(const std::string& tag) {
     co_return result;
 }
 
-net::awaitable<std::vector<api::OnlineUser>>
-Controller::Impl::GetOnlineDevice(const std::string& tag,
-                            const std::string& /*protocol*/) {
+net::awaitable<controller::OnlineSnapshot>
+Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
     std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
 
     std::vector<net::awaitable<void>> tasks;
@@ -320,18 +319,7 @@ Controller::Impl::GetOnlineDevice(const std::string& tag,
     for (const auto& online : per_worker) {
         devices.insert(devices.end(), online.begin(), online.end());
     }
-    std::sort(devices.begin(), devices.end());
-    devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
-
-    std::vector<api::OnlineUser> users;
-    users.reserve(devices.size());
-    for (const auto& device : devices) {
-        users.push_back(api::OnlineUser{
-            .UID = device.user_id,
-            .IP = device.ip,
-        });
-    }
-    co_return users;
+    co_return controller::BuildOnlineSnapshot(std::move(devices));
 }
 
 net::awaitable<void> Controller::Impl::UpdateRule(
@@ -398,8 +386,7 @@ Controller::Impl::GetDetectResult(const std::string& tag) {
 }
 
 net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
-                                                 const std::string& tag,
-                                                 const std::string& protocol) {
+                                                 const std::string& tag) {
     const auto client_info = panel->Describe();
     const int node_id = client_info.NodeID;
     const auto panel_cfg_it = panel_configs_.find(panel);
@@ -413,53 +400,47 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
         api::NodeStatus node_status = serverstatus::GetSystemInfo();
         node_status_ok = co_await panel->ReportNodeStatus(node_status);
         if (!node_status_ok) {
-            LOG_WARN("Panel {}/{}: ReportNodeStatus failed", panel_name, node_id);
+            LOG_WARN("Panel {}/{} report: node failed", panel_name, node_id);
         }
     } catch (const std::exception& e) {
-        LOG_WARN("Panel {}/{}: ReportNodeStatus failed: {}",
+        LOG_WARN("Panel {}/{} report: node failed | {}",
                  panel_name, node_id, e.what());
     }
 
     auto traffic_data = co_await getTraffic(tag);
-    const bool traffic_attempted = !traffic_data.empty();
-    bool traffic_ok = !traffic_attempted;
+    bool traffic_ok = false;
     {
         std::string ukey = naming::BuildPanelNodeStatsKey(panel_name, node_id);
         auto& ns = node_stats_[ukey];
+        // Match V2Board/v2node: node online users are the unique UIDs that
+        // produced traffic during this push interval.
+        ns.online_count = traffic_data.size();
         for (const auto& td : traffic_data) {
             ns.bytes_up   += td.Upload;
             ns.bytes_down += td.Download;
         }
     }
 
-    auto online_users = co_await GetOnlineDevice(tag, protocol);
-    {
-        std::string ukey = naming::BuildPanelNodeStatsKey(panel_name, node_id);
-        node_stats_[ukey].online_count = online_users.size();
+    auto online = co_await GetOnlineSnapshot(tag);
+
+    try {
+        // An empty push clears the panel's previous online-user count.
+        traffic_ok = co_await panel->ReportUserTraffic(traffic_data);
+        if (traffic_ok) {
+            LOG_DEBUG("Panel {}/{} report: traffic ok | users {}",
+                      panel_name, node_id, traffic_data.size());
+        }
+    } catch (const std::exception& e) {
+        LOG_WARN("Panel {}/{} report: traffic failed | {}",
+                 panel_name, node_id, e.what());
     }
 
-    if (!traffic_data.empty()) {
-        try {
-            traffic_ok = co_await panel->ReportUserTraffic(traffic_data);
-            if (traffic_ok) {
-                LOG_DEBUG("Panel {}/{}: reported traffic for {} users",
-                          panel_name, node_id, traffic_data.size());
-            }
-        } catch (const std::exception& e) {
-            LOG_WARN("Panel {}/{}: ReportUserTraffic failed: {}",
-                     panel_name, node_id, e.what());
-        }
-    }
-
-    const bool online_attempted = !online_users.empty();
-    bool online_ok = !online_attempted;
-    if (online_attempted) {
-        try {
-            online_ok = co_await panel->ReportNodeOnlineUsers(online_users);
-        } catch (const std::exception& e) {
-            LOG_WARN("Panel {}/{}: ReportNodeOnlineUsers failed: {}",
-                     panel_name, node_id, e.what());
-        }
+    bool online_ok = false;
+    try {
+        online_ok = co_await panel->ReportNodeOnlineUsers(online.entries);
+    } catch (const std::exception& e) {
+        LOG_WARN("Panel {}/{} report: online failed | {}",
+                 panel_name, node_id, e.what());
     }
 
     auto detect_results = co_await GetDetectResult(tag);
@@ -469,11 +450,11 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
         try {
             illegal_ok = co_await panel->ReportIllegal(detect_results);
             if (illegal_ok) {
-                LOG_DEBUG("Panel {}/{}: reported {} illegal behaviors",
+                LOG_DEBUG("Panel {}/{} report: illegal ok | events {}",
                           panel_name, node_id, detect_results.size());
             }
         } catch (const std::exception& e) {
-            LOG_WARN("Panel {}/{}: ReportIllegal failed: {}",
+            LOG_WARN("Panel {}/{} report: illegal failed | {}",
                      panel_name, node_id, e.what());
         }
     }
@@ -485,16 +466,17 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(api::API* panel,
     };
     const bool report_ok = node_status_ok && traffic_ok && online_ok && illegal_ok;
     LOG_CONSOLE(
-        "panel report name={} node={} state={} node_status={} traffic={} traffic_users={} "
-        "online={} online_users={} illegal={} illegal_events={}",
+        "Panel {}/{} report: {} | node {} | traffic {}/{} | online {}/{} | "
+        "devices {} | illegal {}/{}",
         panel_name,
         node_id,
         report_ok ? "ok" : "degraded",
         node_status_ok ? "ok" : "failed",
-        result_text(traffic_attempted, traffic_ok),
+        traffic_ok ? "ok" : "failed",
         traffic_data.size(),
-        result_text(online_attempted, online_ok),
-        online_users.size(),
+        online_ok ? "ok" : "failed",
+        online.user_count,
+        online.entries.size(),
         result_text(illegal_attempted, illegal_ok),
         detect_results.size());
     co_return;

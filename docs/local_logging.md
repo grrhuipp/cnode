@@ -68,14 +68,18 @@ access 记录不带 `[Info]`，也不写组件、源码行或 Worker。它只表
 面板控制台日志使用固定的状态行，避免把“配置已加载”误认为“面板已连接”：
 
 ```text
-panel configured name=jx type=V2board host=https://panel.example.com nodes=[1, 2]
-panel status name=jx node=1 state=ready inbound=ready protocol=vmess port=10086 users=120 rules=3 pull=60s push=60s
-panel report name=jx node=1 state=ok node_status=ok traffic=ok traffic_users=8 online=ok online_users=5 illegal=idle illegal_events=0
+Panel jx: configured | V2board | nodes [1, 2] | https://panel.example.com
+Panel jx/1 status: ready | inbound ready | vmess:10086 | users 120 | rules 3 | pull/push 60s/60s
+Panel jx/1 report: ok | node ok | traffic ok/8 | online ok/5 | devices 7 | illegal idle/0
 ```
 
-`panel status` 的 `connecting / ready / degraded / missing / unavailable` 分别表示正在首次连接、完整同步成功、部分数据沿用旧快照、面板已删除节点、连续重试仍失败。`panel report` 汇总节点状态、流量、在线用户和审计结果的上报状态；没有待上报数据时显示 `idle`。
+`status` 中的 `connecting / ready / degraded / missing / unavailable` 分别表示正在首次连接、完整同步成功、部分数据沿用旧快照、面板已删除节点、本轮拉取失败。`report` 汇总节点状态、流量、在线用户和审计结果的上报状态；没有待上报数据时显示 `idle`。
 
-稳定运行时的 `panel status` 状态行固定每 60 秒输出一次，不跟随面板下发的 `pull_interval` 或 `push_interval` 改变；连接、节点缺失和同步失败等状态变化仍会即时记录。
+`panel status` 状态行固定每 60 秒输出一次，不跟随面板下发的 `pull_interval` 或 `push_interval` 改变；即使尚未成功连接面板，也会按固定周期输出 `connecting`、`missing` 或 `unavailable`。节点拉取每到面板下发的 `pull_interval` 只尝试一次，失败后等待下一个拉取周期，不在单次调度内连续重试；首次尚未取得面板配置时使用默认 60 秒拉取周期。节点缺失和同步失败等状态变化仍通过 `panel sync` 日志即时记录。
+
+V2Board 节点卡片和 `runtime.nodes` 的 `online` 沿用 v2node 口径：统计本次 push 周期内产生过流量的不同 UID。即使本周期人数为 0，也会发送空 `/push`，及时清除上一周期的在线人数。`report` 状态行中的 `online` 是当前连接快照中的不同 UID，`devices` 是不同的 `UID + IP` 组合；同一用户同时使用多个 IP 时，前者计 1，后者按 IP 数量统计并上报 `/alive`。
+
+首次启动会立即输出 panel 连接状态，但流量和在线人数要等待一个完整的面板 `push_interval` 后首次上报，避免刚启动、尚未积累流量时打印无意义的 0。
 
 ## 5. 约束
 

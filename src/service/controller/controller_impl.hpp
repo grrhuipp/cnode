@@ -6,6 +6,7 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/service/controller/config.hpp"
 #include "../../common/cancelable_timer_registry.hpp"
+#include "online_snapshot.hpp"
 
 #include <map>
 #include <optional>
@@ -34,12 +35,11 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     net::awaitable<void> nodeInfoMonitor(api::API* panel);
     void logPanelStatus(api::API* panel) const;
     net::awaitable<void> userInfoMonitor(api::API* panel,
-                                         const std::string& tag,
-                                         const std::string& protocol);
+                                         const std::string& tag);
 
     net::awaitable<std::vector<api::UserTraffic>> getTraffic(const std::string& tag);
-    net::awaitable<std::vector<api::OnlineUser>> GetOnlineDevice(const std::string& tag,
-                                                                 const std::string& protocol);
+    net::awaitable<controller::OnlineSnapshot>
+    GetOnlineSnapshot(const std::string& tag);
     net::awaitable<void> UpdateRule(
         const std::string& tag,
         const std::vector<api::DetectRule>& new_rule_list);
@@ -70,12 +70,19 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     std::vector<std::unique_ptr<api::API>>         panels_;
     std::map<api::API*, PanelConfig>               panel_configs_;
     std::vector<api::API*>                         panel_nodes_;
+    enum class PanelState {
+        Connecting,
+        Ready,
+        Degraded,
+        Missing,
+        Unavailable,
+    };
+    std::map<api::API*, PanelState> panel_states_;
     struct CommittedNodeState {
         api::NodeInfo config;
         std::vector<api::UserInfo> users;
         std::vector<api::DetectRule> rules;
         bool inbound_started = false;
-        bool complete_sync = false;
     };
     std::map<api::API*, CommittedNodeState> committed_nodes_;
 

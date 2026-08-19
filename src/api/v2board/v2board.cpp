@@ -7,6 +7,7 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "http_response.hpp"
 #include "node_info_json.hpp"
+#include "online_report.hpp"
 #include "user_list_json.hpp"
 
 #include <asio/ip/tcp.hpp>
@@ -21,7 +22,6 @@
 #include <charconv>
 #include <format>
 #include <limits>
-#include <map>
 #include <regex>
 #include <stdexcept>
 #include <vector>
@@ -818,10 +818,6 @@ net::awaitable<bool>
 APIClient::Impl::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
     const int node_id = config_.NodeID;
 
-    if (data.empty()) {
-        co_return true;
-    }
-
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
     json::object body;
     for (const auto& t : data) {
@@ -854,43 +850,22 @@ APIClient::Impl::ReportNodeStatus(const ::acpp::api::NodeStatus& node_status) {
 net::awaitable<bool>
 APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
+    auto report = BuildOnlineReportPayload(online_users, node_id);
 
-    if (online_users.empty()) {
-        co_return true;
-    }
-
-    // 格式: {uid: [ip_nodeid, ...], ...}
-    // XrayR V2Board 使用 OnlineUser{UID, IP}，V2Board alive 接口值为 IP_nodeID。
-    std::map<int64_t, json::array> grouped;
-    for (const auto& user : online_users) {
-        if (user.UID <= 0) {
-            continue;
+    if (!report.alive_body.empty()) {
+        const std::string alive_path = std::format(
+            "/api/v1/server/UniProxy/alive?node_id={}&node_type={}",
+            node_id, ApiNodeType());
+        auto alive_resp = co_await HttpPost(alive_path, report.alive_body);
+        if (alive_resp.status != 200) {
+            LOG_WARN("V2Board[{}]: online device report failed for node {}: {}",
+                     config_.Name, node_id, FormatHttpFailure(alive_resp));
+            co_return false;
         }
-        const std::string ip = user.IP.empty() ? "0.0.0.0" : user.IP;
-        grouped[user.UID].push_back(ip + "_" + std::to_string(node_id));
-    }
-    if (grouped.empty()) {
-        co_return true;
     }
 
-    json::object body;
-    for (auto& [uid, values] : grouped) {
-        body[std::to_string(uid)] = std::move(values);
-    }
-
-    // 路径包含 node_id 和 node_type
-    std::string path = std::format("/api/v1/server/UniProxy/alive?node_id={}&node_type={}",
-                                   node_id, ApiNodeType());
-
-    auto resp = co_await HttpPost(path, body);
-
-    if (resp.status != 200) {
-        LOG_WARN("V2Board[{}]: ReportNodeOnlineUsers failed for node {}: {}",
-                 config_.Name, node_id, FormatHttpFailure(resp));
-        co_return false;
-    }
-
-    LOG_DEBUG("V2Board[{}]: reported {} online users", config_.Name, online_users.size());
+    LOG_DEBUG("V2Board[{}]: reported {} connected users across {} devices",
+              config_.Name, report.user_count, report.device_count);
     co_return true;
 }
 
