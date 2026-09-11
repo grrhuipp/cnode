@@ -1,4 +1,6 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "tls_client_context.hpp"
 
@@ -56,21 +58,23 @@ bool EncodeTlsAlpnProtocols(
 }
 
 bool ConfigureTlsServerIdentity(
-    SSL* ssl, std::string_view identity) noexcept {
+    SSL* ssl, std::string_view identity) {
     if (!ssl || identity.empty() || identity.find('\0') != std::string_view::npos) {
         return false;
     }
 
-    const std::string identity_text(identity);
-    IoErrorCode parse_error;
-    const auto address = net::ip::make_address(identity_text, parse_error);
-    if (!parse_error) {
-        (void)address;
+    if (const auto address = iputil::ParseLiteral(identity)) {
         X509_VERIFY_PARAM* parameters = SSL_get0_param(ssl);
-        return parameters &&
-            X509_VERIFY_PARAM_set1_ip_asc(
-                parameters, identity_text.c_str()) == 1;
+        if (!parameters) return false;
+        if (address->is_v4()) {
+            const auto bytes = address->to_v4().to_bytes();
+            return X509_VERIFY_PARAM_set1_ip(parameters, bytes.data(), bytes.size()) == 1;
+        }
+        const auto bytes = address->to_v6().to_bytes();
+        return X509_VERIFY_PARAM_set1_ip(parameters, bytes.data(), bytes.size()) == 1;
     }
+    if (!domain::IsValidDnsHostname(identity, domain::TrailingDotPolicy::Allow)) return false;
+    const std::string identity_text(identity);
 
     if (SSL_set_tlsext_host_name(ssl, identity_text.c_str()) != 1) {
         return false;

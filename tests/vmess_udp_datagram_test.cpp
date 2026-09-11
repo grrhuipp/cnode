@@ -22,11 +22,11 @@ void Check(bool condition, std::string_view message) {
     }
 }
 
-buf::Buffer* MakeBuffer(size_t size,
+buf::BufferGuard MakeBuffer(size_t size,
                         const TargetAddress* target,
                         uint8_t value = 0x6d) {
-    buf::Buffer* buffer = buf::Buffer::New();
-    Check(buffer != nullptr && size <= buffer->Available(),
+    buf::BufferGuard buffer{buf::Buffer::New()};
+    Check(buffer && size <= buffer->Available(),
           "failed to allocate VMess UDP test buffer");
     std::fill_n(buffer->Tail().data(), size, value);
     buffer->Produce(static_cast<uint32_t>(size));

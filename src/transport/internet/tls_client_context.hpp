@@ -12,7 +12,7 @@
 namespace acpp {
 
 [[nodiscard]] bool ConfigureTlsServerIdentity(
-    SSL* ssl, std::string_view identity) noexcept;
+    SSL* ssl, std::string_view identity);
 
 [[nodiscard]] bool ConfigureTlsProtocolVersions(
     SSL_CTX* context,

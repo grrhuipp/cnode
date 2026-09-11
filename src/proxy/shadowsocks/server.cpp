@@ -119,6 +119,9 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
 
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
+
     RequestBodyReader(SsCipherType cipher_type,
                       size_t key_size,
                       std::span<const uint8_t> read_subkey,
@@ -517,7 +520,7 @@ private:
                 chunk_size +
                 SsAeadCipher::kTagSize;
             out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(out.release());
+            out_mb.push_back(std::move(out));
 
             data += chunk_size;
             remaining -= chunk_size;
@@ -641,7 +644,7 @@ private:
             state.write_nonce_ = 2;
             payload_cipher->Produce(static_cast<uint32_t>(
                 first_payload.size() + SsAeadCipher::kTagSize));
-            state.pending_prefix_.push_back(payload_cipher.release());
+            state.pending_prefix_.push_back(std::move(payload_cipher));
         }
         state.write_init_ = true;
         co_return true;
@@ -852,8 +855,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
     }
     offset += padding_len;
     if (offset < variable_len) {
-        result.initial_payload.append(variable_plain + offset,
-                                      variable_len - offset);
+        result.initial_payload.append({variable_plain + offset, variable_len - offset});
     }
 
     try {
@@ -988,7 +990,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
             co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         plain->Produce(static_cast<uint32_t>(produced));
-        payload_mb.push_back(plain.release());
+        payload_mb.push_back(std::move(plain));
         remaining -= to_process;
     }
 
@@ -1032,9 +1034,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
                 skip -= bytes.size();
                 continue;
             }
-            result.initial_payload.append(
-                bytes.data() + skip,
-                bytes.size() - skip);
+            result.initial_payload.append(bytes.subspan(skip));
             skip = 0;
         }
     }

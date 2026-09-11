@@ -27,8 +27,6 @@ struct OnlineDevice;
 
 namespace acpp::trojan {
 
-[[nodiscard]] std::string HashPassword(const std::string& password);
-
 // ============================================================================
 // Trojan 用户管理器
 // ============================================================================

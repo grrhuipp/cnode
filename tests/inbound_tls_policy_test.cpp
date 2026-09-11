@@ -3,31 +3,29 @@
 int main() {
     acpp::api::NodeInfo node;
 
-    if (acpp::controller::ShouldEnableInboundTls(nullptr, node)) return 1;
-    node.EnableTLS = true;
-    if (!acpp::controller::ShouldEnableInboundTls(nullptr, node)) return 2;
-
     acpp::PanelConfig panel;
-    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 3;
+    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 1;
+    node.EnableTLS = true;
+    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 2;
 
     panel.TLSEnable = true;
-    if (!acpp::controller::ShouldEnableInboundTls(&panel, node)) return 4;
+    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 3;
 
     node.EnableTLS = false;
-    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 5;
+    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 4;
 
     node.NodeType = "anytls";
-    if (!acpp::controller::ShouldEnableInboundTls(&panel, node)) return 6;
+    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 5;
 
     panel.TLSEnable = false;
-    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 7;
+    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 6;
 
     node.NodeType = "trojan";
     panel.TLSEnable = true;
-    if (!acpp::controller::ShouldEnableInboundTls(&panel, node)) return 8;
+    if (!acpp::controller::ShouldEnableInboundTls(panel, node)) return 7;
 
     panel.TLSEnable = false;
-    if (acpp::controller::ShouldEnableInboundTls(&panel, node)) return 9;
+    if (acpp::controller::ShouldEnableInboundTls(panel, node)) return 8;
 
     return 0;
 }

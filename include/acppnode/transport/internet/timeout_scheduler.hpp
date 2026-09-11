@@ -2,8 +2,6 @@
 
 #include "acppnode/common/asio_types.hpp"
 
-#include <asio/experimental/channel.hpp>
-
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -31,7 +29,7 @@ public:
 
     // Assignment replaces ownership: a still-live destination event is
     // cancelled before the source handle is adopted.
-    TimeoutToken& operator=(TimeoutToken&& other);
+    TimeoutToken& operator=(TimeoutToken&& other) noexcept;
 
     [[nodiscard]] bool Valid() const noexcept {
         return id_ != 0 && owner_ != nullptr;
@@ -54,7 +52,7 @@ private:
 // 目标：
 //   - 用每分片 1 个 steady_timer 承载大量连接的 deadline/timeout
 //   - 避免 TcpStream 每连接常驻多个 timer 对象
-//   - 只按最近 deadline 重挂共享 timer，避免每个连接独立 timer
+//   - 始终只保留一个在途等待，更早 deadline 唤醒它，由完成回调统一重挂
 //   - 分片内 Schedule/Cancel/OnTimer 在对应 io_context 线程执行，不做热路径锁同步
 // ============================================================================
 class TimeoutScheduler {
@@ -75,7 +73,9 @@ public:
         std::chrono::milliseconds delay,
         Callback cb);
 
-    void Cancel(TimeoutToken& token);
+    // Erases the callback without allocating or re-arming the timer. Safe for
+    // owner destruction and reentrant cancellation within a callback batch.
+    void Cancel(TimeoutToken& token) noexcept;
 
 private:
     friend class TimeoutSchedulerService;
@@ -85,26 +85,6 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
-};
-
-class ScheduledSleep {
-public:
-    explicit ScheduledSleep(net::io_context& io_context);
-    ~ScheduledSleep() noexcept;
-
-    ScheduledSleep(const ScheduledSleep&) = delete;
-    ScheduledSleep& operator=(const ScheduledSleep&) = delete;
-
-    // One instance represents one outstanding sleep. Concurrent waits are a
-    // logic error because the cancellation token and wake channel are shared.
-    [[nodiscard]] net::awaitable<void> WaitFor(std::chrono::milliseconds delay);
-    void Cancel() noexcept;
-
-private:
-    TimeoutScheduler& scheduler_;
-    TimeoutToken token_;
-    net::experimental::channel<void(IoErrorCode)> signal_;
-    bool waiting_ = false;
 };
 
 }  // namespace acpp

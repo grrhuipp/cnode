@@ -134,6 +134,7 @@ struct UdpIngress::ClientSession::Impl {
     bool closed = false;
     ErrorCode terminal_error = ErrorCode::OK;
     InboundDatagramOwner session_owner;
+    transport::CancellationSource cancellation;
 };
 
 UdpIngress::ClientSession::ClientSession(
@@ -149,6 +150,10 @@ UdpIngress::ClientSession::ClientSession(
 
 UdpIngress::ClientSession::~ClientSession() noexcept {
     Close();
+}
+
+transport::CancellationSource& UdpIngress::ClientSession::Cancellation() noexcept {
+    return impl_->cancellation;
 }
 
 bool UdpIngress::ClientSession::Closed() const noexcept {
@@ -205,6 +210,7 @@ void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
     }
     impl_->closed = true;
     impl_->terminal_error = error;
+    impl_->cancellation.Stop(error);
     impl_->input_queue.clear();
     impl_->queued_bytes = 0;
     impl_->WakeReader();
@@ -622,7 +628,7 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     PendingUdpReply reply;
     reply.endpoint = std::move(endpoint);
     reply.payload_size = payload_size;
-    reply.payload.push_back(payload.release());
+    reply.payload.push_back(std::move(payload));
     queue.pending.push_back(std::move(reply));
     if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
         queue.shrink_pending_on_drain = true;

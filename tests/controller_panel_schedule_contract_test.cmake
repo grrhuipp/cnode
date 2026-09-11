@@ -16,19 +16,18 @@ if(NOT DEFAULTS_SOURCE MATCHES
 endif()
 
 foreach(REQUIRED_TEXT
-        "runPanelMonitors"
-        "panelMonitor(panel, generation)"
-        "generation == monitor_generation_"
+        "self->panelSyncLoop(*panel)"
+        "self->panelStatusLoop(*panel)"
         "config.PullInterval"
         "config.PushInterval"
         "auto next_push = Clock::time_point::max()"
-        "committed_nodes_.contains(panel)"
+        "if (panel.node.committed)"
         "const auto scheduled_push = now + interval(false)"
         "next_push = scheduled_push"
         "next_status"
         "defaults::kPanelStatusLogInterval"
         "logPanelStatus(panel)"
-        "std::min({next_pull, next_push, next_status})"
+        "std::min(next_pull, next_push)"
         "PanelInterval")
     string(FIND "${CONTROLLER_SOURCE}" "${REQUIRED_TEXT}" REQUIRED_POSITION)
     if(REQUIRED_POSITION EQUAL -1)
@@ -36,6 +35,22 @@ foreach(REQUIRED_TEXT
             "panel scheduler is missing '${REQUIRED_TEXT}'")
     endif()
 endforeach()
+
+string(FIND "${CONTROLLER_SOURCE}" "Controller::Impl::panelSyncLoop" SYNC_BEGIN)
+string(FIND "${CONTROLLER_SOURCE}" "Controller::Impl::panelStatusLoop" STATUS_BEGIN)
+string(FIND "${CONTROLLER_SOURCE}" "Controller::Impl::nodeInfoMonitor" NODE_BEGIN)
+if(SYNC_BEGIN EQUAL -1 OR STATUS_BEGIN EQUAL -1 OR NODE_BEGIN EQUAL -1 OR
+   NOT SYNC_BEGIN LESS STATUS_BEGIN OR NOT STATUS_BEGIN LESS NODE_BEGIN)
+    message(FATAL_ERROR "could not isolate the independent panel loops")
+endif()
+math(EXPR SYNC_LENGTH "${STATUS_BEGIN} - ${SYNC_BEGIN}")
+math(EXPR STATUS_LENGTH "${NODE_BEGIN} - ${STATUS_BEGIN}")
+string(SUBSTRING "${CONTROLLER_SOURCE}" ${SYNC_BEGIN} ${SYNC_LENGTH} SYNC_SOURCE)
+string(SUBSTRING "${CONTROLLER_SOURCE}" ${STATUS_BEGIN} ${STATUS_LENGTH} STATUS_SOURCE)
+if(SYNC_SOURCE MATCHES "next_status|logPanelStatus|kPanelStatusLogInterval" OR
+   STATUS_SOURCE MATCHES "nodeInfoMonitor|userInfoMonitor|next_pull|next_push|GetNodeInfo|GetUserList")
+    message(FATAL_ERROR "status heartbeats and network synchronization must have independent waits")
+endif()
 
 if(CONTROLLER_SOURCE MATCHES
    "auto next_push[ \t]*=[ \t]*next_pull")

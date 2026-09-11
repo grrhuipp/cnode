@@ -1,9 +1,7 @@
 #include "trojan_codec.hpp"
-#include "validator.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/unsafe.hpp"
-#include <openssl/sha.h>
 
 namespace acpp::trojan {
 
@@ -11,23 +9,6 @@ using acpp::AddressType;
 using acpp::TargetAddress;
 
 const uint8_t TrojanCodec::CRLF[2] = {0x0D, 0x0A};
-static const char HEX_CHARS[] = "0123456789abcdef";
-
-std::string HashPassword(const std::string& password) {
-    unsigned char hash[SHA224_DIGEST_LENGTH];
-    SHA224(unsafe::ptr_cast<const unsigned char>(password.data()),
-           password.size(), hash);
-
-    std::string result;
-    result.reserve(SHA224_DIGEST_LENGTH * 2);
-
-    for (int i = 0; i < SHA224_DIGEST_LENGTH; ++i) {
-        result.push_back(HEX_CHARS[hash[i] >> 4]);
-        result.push_back(HEX_CHARS[hash[i] & 0x0F]);
-    }
-
-    return result;
-}
 
 namespace {
 
@@ -177,7 +158,7 @@ std::optional<TrojanRequest> TrojanCodec::ParseRequest(
 }
 
 size_t TrojanCodec::EncodeRequestTo(
-    const std::string& password,
+    std::span<const char, 56> password_hash,
     TrojanCommand cmd,
     const TargetAddress& target,
     uint8_t* output,
@@ -198,8 +179,7 @@ size_t TrojanCodec::EncodeRequestTo(
 
     ByteWriter writer(output, output_size);
 
-    std::string hash = HashPassword(password);
-    writer.WriteString(hash);
+    writer.WriteString(std::string_view(password_hash.data(), password_hash.size()));
     writer.WriteU8(0x0D);
     writer.WriteU8(0x0A);
     writer.WriteU8(static_cast<uint8_t>(cmd));

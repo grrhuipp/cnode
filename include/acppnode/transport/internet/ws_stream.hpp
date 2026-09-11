@@ -191,7 +191,7 @@ public:
                                       static_cast<size_t>(buffer->Available()));
             std::memcpy(buffer->Tail().data(), data + offset, n);
             buffer->Produce(static_cast<uint32_t>(n));
-            pending_data_.push_back(buffer.release());
+            pending_data_.push_back(std::move(buffer));
             offset += n;
         }
     }
@@ -278,7 +278,7 @@ public:
         if (frame_payload_remaining_ == 0) {
             frame_mask_offset_ = 0;
         }
-        co_return buf::MultiBuffer{out.release()};
+        co_return buf::MultiBuffer{std::move(out)};
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -359,6 +359,7 @@ public:
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;  // 幂等
         }
@@ -367,6 +368,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -407,6 +409,7 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         inner_->Cancel();
     }
 

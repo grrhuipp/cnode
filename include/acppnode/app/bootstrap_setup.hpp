@@ -28,9 +28,10 @@ struct WorkerRuntimeConfig;
 namespace acpp {
 
 struct WorkerPool {
-    // Destruction order is the reverse of this declaration:
+    // Cold construction failure unwinds in reverse declaration order:
     // work guards release first, then Workers destroy every socket/service
     // while its io_context is still alive; io_contexts are destroyed last.
+    // After runtime handoff these owners live until immediate process exit.
     std::vector<std::unique_ptr<net::io_context>> io_contexts;
     std::vector<std::unique_ptr<Worker>> workers;
     std::vector<net::executor_work_guard<net::io_context::executor_type>> work_guards;

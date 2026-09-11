@@ -27,7 +27,6 @@ struct VMessOutboundConfig {
     std::string address;           // 服务器地址
     std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
     uint16_t port = 443;           // 服务器端口
-    std::string uuid;              // 用户 UUID
     vmess::Security security = vmess::Security::AES_128_GCM;
 
     // 传输层配置（JSON 格式保持不变）
@@ -47,6 +46,7 @@ class Handler final : public ::acpp::Outbound {
 public:
     Handler(std::string tag,
             const ::acpp::VMessOutboundConfig& config,
+            const ::acpp::vmess::MemoryAccount& user,
             ::acpp::app::dns::DNS& dns_service);
 
     // Outbound 接口
@@ -58,16 +58,15 @@ public:
         ::acpp::transport::Link inbound,
         ::acpp::StatsShard& stats,
         const ::acpp::RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        ::acpp::buf::MultiBuffer& first_payload,
+        ::acpp::buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
     std::string tag_;
-    ::acpp::VMessOutboundConfig config_;
-    std::optional<::acpp::vmess::MemoryAccount> user_;
+    const ::acpp::VMessOutboundConfig config_;
+    const ::acpp::vmess::MemoryAccount user_;
     ::acpp::app::dns::DNS& dns_service_;
 };
 

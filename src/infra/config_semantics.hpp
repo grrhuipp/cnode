@@ -16,6 +16,7 @@ enum class ConfigSemanticError {
     None,
     NoOutbounds,
     EmptyOutboundTag,
+    ReservedOutboundTag,
     DuplicateOutboundTag,
     EmptyRouteOutboundTag,
     UnknownRouteOutboundTag,
@@ -40,6 +41,7 @@ enum class StaticInboundSemanticError {
     None,
     InvalidPort,
     EmptyTag,
+    ReservedTag,
     DuplicateTag,
     DuplicateEndpoint,
 };
@@ -53,6 +55,8 @@ struct StaticInboundSemanticValidation {
     [[nodiscard]] bool Ok() const noexcept {
         return error == StaticInboundSemanticError::None;
     }
+
+    [[nodiscard]] std::string Message() const;
 };
 
 [[nodiscard]] ConfigSemanticValidation ValidateOutboundRoutingSemantics(

@@ -1,6 +1,6 @@
 #include "acppnode/infra/runtime_config_types.hpp"
 
-#include "acppnode/common/asio_types.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -17,11 +17,11 @@ std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) 
     }
 
     const auto address_text = value.substr(0, slash);
-    IoErrorCode address_error;
-    const auto address = net::ip::make_address(std::string(address_text), address_error);
-    if (address_error) {
+    const auto parsed = iputil::ParseLiteral(address_text);
+    if (!parsed) {
         return std::nullopt;
     }
+    const auto& address = *parsed;
 
     const uint32_t max_prefix = address.is_v4() ? 32U : 128U;
     uint32_t prefix = max_prefix;

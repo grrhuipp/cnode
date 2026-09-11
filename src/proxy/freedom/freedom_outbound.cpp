@@ -7,6 +7,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/registration.hpp"
 #include "acppnode/app/udp_session.hpp"
+#include "acppnode/app/udp_channel.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -207,10 +208,6 @@ Handler::Handler(
         explicit_udp_session_id_ =
             MakeUdpSessionId(*settings_.send_through.ExplicitAddress());
     }
-
-    stream_settings_.network = std::string(constants::protocol::kTcp);
-    stream_settings_.security = std::string(constants::protocol::kNone);
-    stream_settings_.RecomputeModes();
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
@@ -221,15 +218,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     transport::Link inbound,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    std::span<const uint8_t> initial_payload,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoUDPRelayLink。
+    // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义），首包/嗅探 payload 不适用于 UDP。
     if (ctx.content.network == Network::UDP) {
         if (!settings_.enable_udp) {
@@ -251,10 +247,15 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             co_return std::unexpected(session_result.error());
         }
         std::shared_ptr<UDPSession> session = std::move(*session_result);
-        UDPRelayConfig udp_cfg;
-        udp_cfg.speed_limit = ctx.content.speed_limit;
-        co_return co_await DoUDPRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *session, ctx, stats, udp_cfg);
+        UDPChannel target(io_context, std::move(session));
+        target.SetIdleTimeout(relay_idle_timeout);
+        target.SetWriteTimeout(relay_write_timeout);
+        if (inbound.control) {
+            co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
+                *inbound.control, target, ctx, stats, relay_config);
+        }
+        co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
+            target, ctx, stats, relay_config);
     }
 
     // redirect：替换目标地址（Xray freedom redirect 语义）
@@ -366,33 +367,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream->SetWriteTimeout(relay_write_timeout);
     AsyncStream* inbound_control = inbound.control;
 
-    if (buf::HasData(first_payload)) {
-        if (inbound_control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound_control,
-                *stream, ctx, stats, first_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats,
-            first_payload, relay_config);
-    }
-    if (!initial_payload.empty()) {
-        if (inbound_control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound_control,
-                *stream, ctx, stats, initial_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats,
-            initial_payload, relay_config);
-    }
     if (inbound_control) {
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer, *inbound_control,
-            *stream, ctx, stats, relay_config);
+            *stream, ctx, stats, relay_config, std::move(first_payload));
     }
     co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
+        io_context, *inbound.reader, *inbound.writer,
+        *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
 std::expected<std::shared_ptr<UDPSession>, ErrorCode>

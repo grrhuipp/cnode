@@ -1,7 +1,8 @@
-#include "acppnode/app/static_inbound_runtime.hpp"
+#include "startup_inbounds.hpp"
+#include "../infra/config_semantics.hpp"
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/config_types.hpp"
 
@@ -12,12 +13,22 @@ namespace acpp {
 
 namespace {
 
-struct PreparedStaticInbound {
-    StaticInboundRuntimeEntry entry;
-    proxyman::inbound::UserSet users;
-};
+StaticInboundConfig MakeTestInboundConfig() {
+    StaticInboundConfig source;
+    source.protocol = constants::protocol::kDefaultNodeProtocol;
+    source.tags.emplace_back(constants::test::kTestInboundTag);
+    source.port = constants::test::kTestPort;
+    // The ordinary StreamSettings default is already normalized TCP/none.
+    source.sniffing.enabled = true;
+    source.sniffing.dest_override = {
+        std::string(constants::protocol::kTls), std::string(constants::protocol::kHttp)};
+    source.static_users.clients.push_back(StaticUser{
+        .id = std::string(constants::test::kTestVmessUuid),
+        .password = {}, .email = "test@example.com", .flow = {}});
+    return source;
+}
 
-PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
+PreparedStartupInbound PrepareInbound(
     const StaticInboundConfig& source) {
     StaticInboundRuntimeEntry entry;
     entry.protocol = source.protocol;
@@ -63,29 +74,28 @@ PreparedStaticInbound PrepareStaticInboundRuntimeEntry(
             "static inbound '" + entry.tag + "' has no valid users");
     }
 
-    return PreparedStaticInbound{
-        .entry = std::move(entry),
+    return PreparedStartupInbound{
+        .runtime = std::move(entry),
         .users = std::move(*users),
     };
 }
 
 }  // namespace
 
-std::vector<StaticInboundRuntimeEntry> BuildStaticInboundRuntimeEntries(
-    const std::vector<StaticInboundConfig>& sources) {
-    std::vector<PreparedStaticInbound> prepared;
+std::vector<PreparedStartupInbound> PrepareStartupInbounds(
+    std::vector<StaticInboundConfig> sources, bool enable_test_mode) {
+    if (enable_test_mode) sources.push_back(MakeTestInboundConfig());
+    const auto validation = ValidateStaticInboundSemantics(sources);
+    if (!validation.Ok()) {
+        throw std::invalid_argument("startup inbound " + validation.Message());
+    }
+    std::vector<PreparedStartupInbound> prepared;
     prepared.reserve(sources.size());
     for (const auto& source : sources) {
-        prepared.push_back(PrepareStaticInboundRuntimeEntry(source));
+        prepared.push_back(PrepareInbound(source));
     }
 
-    std::vector<StaticInboundRuntimeEntry> entries;
-    entries.reserve(prepared.size());
-    for (auto& inbound : prepared) {
-        proxyman::inbound::UserStore::ApplyUsers(inbound.entry.tag, inbound.users);
-        entries.push_back(std::move(inbound.entry));
-    }
-    return entries;
+    return prepared;
 }
 
 }  // namespace acpp

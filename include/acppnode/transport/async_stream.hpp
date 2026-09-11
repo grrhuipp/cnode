@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/transport/link.hpp"
+#include "acppnode/transport/cancellation.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -65,8 +66,7 @@ private:
 class AsyncStream : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
     // Stream 对象是每连接常驻热路径状态。所有 AsyncStream 派生类的
-    // std::make_unique 分配都会走 system allocator；ThreadScope 只保留为
-    // 热路径作用域标记，不再切换进程 allocator。
+    // std::make_unique 分配都会走 system allocator，并记录流对象分配统计。
     [[nodiscard]] static void* operator new(std::size_t size);
     [[nodiscard]] static void* operator new(std::size_t size, std::align_val_t alignment);
     static void operator delete(void* ptr) noexcept;
@@ -179,6 +179,9 @@ public:
      */
     virtual void Cancel() noexcept = 0;
 
+    // Observe cancellation while higher layers wait outside socket I/O.
+    transport::CancellationSource& Cancellation() noexcept override;
+
     /**
      * 完全关闭连接（幂等）
      *
@@ -244,6 +247,8 @@ public:
     void SetReadPrefixCapture(std::shared_ptr<ReadPrefixCapture> capture);
 
 protected:
+    void NotifyCancellation() noexcept { Cancellation().CancelPending(); }
+    void NotifyClosed() noexcept { Cancellation().Stop(); }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
     friend class BaseWsStream;
@@ -256,6 +261,8 @@ protected:
     virtual TcpStream* BaseTcpStream() { return nullptr; }
     virtual const TcpStream* BaseTcpStream() const { return nullptr; }
 
+private:
+    transport::CancellationSource cancellation_;
 };
 
 // ============================================================================

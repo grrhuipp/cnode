@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -146,8 +147,16 @@ public:
         }
     };
 
+    struct UserUpdate {
+        std::string_view tag;
+        const UserSet& users;
+    };
+
     static void ApplyUsers(std::string_view tag,
                            const UserSet& users);
+    // Synchronous cold-path batch: all updates publish in one RCU snapshot.
+    // Allocation failure leaves the previously published snapshot untouched.
+    static void ApplyUsers(std::span<const UserUpdate> updates);
     static void AddUsers(std::string_view tag,
                          const UserSet& users);
     static void RemoveUsers(std::string_view tag,

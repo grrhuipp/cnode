@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acpp {
@@ -219,9 +221,6 @@ struct StreamSettings {
                (IsHttp() && !http.real_ip_header.empty());
     }
 
-    // 供手动赋值场景调用（如面板动态配置构建）
-    void RecomputeModes() noexcept;
-
     static StreamSettings FromJson(
         const json::object& j, StreamEndpointRole role);
 };
@@ -232,5 +231,18 @@ struct XHttpDownloadSettings {
     OutboundBind send_through;
     StreamSettings stream_settings;
 };
+
+struct OutboundStreamDefaults {
+    bool require_tls = false;
+    std::string_view fallback_server_name;
+    bool allow_insecure = false;
+    std::span<const std::string> alpn;
+};
+
+// Cold-path value transformations. The source remains unchanged, including
+// when normalization or default construction fails to allocate.
+[[nodiscard]] StreamSettings NormalizeStreamSettings(const StreamSettings& source);
+[[nodiscard]] StreamSettings NormalizeOutboundStreamSettings(
+    const StreamSettings& source, const OutboundStreamDefaults& defaults = {});
 
 }  // namespace acpp

@@ -27,10 +27,6 @@ public:
     TcpStream(const TcpStream&) = delete;
     TcpStream& operator=(const TcpStream&) = delete;
 
-    // 允许移动
-    TcpStream(TcpStream&& other) noexcept;
-    TcpStream& operator=(TcpStream&& other) noexcept;
-
     ~TcpStream() override;
 
     // AsyncStream 接口实现

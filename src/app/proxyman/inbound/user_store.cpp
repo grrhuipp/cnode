@@ -223,17 +223,25 @@ size_t UserStore::Array32Hash::operator()(const std::array<uint8_t, 32>& value) 
 
 void UserStore::ApplyUsers(std::string_view tag,
                            const UserSet& users) {
+    const UserUpdate update{tag, users};
+    ApplyUsers(std::span(&update, 1));
+}
+
+void UserStore::ApplyUsers(std::span<const UserUpdate> updates) {
+    if (updates.empty()) return;
     Publish([&](Snapshot& snapshot) {
-        if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
-            SetOrErase(snapshot.vmess, tag, BuildVmessUsers(*vmess));
-        } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
-            SetOrErase(snapshot.vless, tag, BuildVlessUsers(*vless));
-        } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
-            SetOrErase(snapshot.trojan, tag, BuildTrojanUsers(*trojan));
-        } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
-            SetOrErase(snapshot.shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
-        } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
-            SetOrErase(snapshot.anytls, tag, BuildAnyTlsUsers(*anytls));
+        for (const auto& [tag, users] : updates) {
+            if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
+                SetOrErase(snapshot.vmess, tag, BuildVmessUsers(*vmess));
+            } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
+                SetOrErase(snapshot.vless, tag, BuildVlessUsers(*vless));
+            } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
+                SetOrErase(snapshot.trojan, tag, BuildTrojanUsers(*trojan));
+            } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
+                SetOrErase(snapshot.shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
+            } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
+                SetOrErase(snapshot.anytls, tag, BuildAnyTlsUsers(*anytls));
+            }
         }
     });
 }

@@ -10,23 +10,12 @@
 
 namespace acpp::controller {
 
-namespace {
-
-std::string ResolveNodeTag(const std::string& panel_name, const api::NodeInfo& config) {
-    return naming::BuildPanelNodeTag(
-        panel_name,
-        naming::ResolveProtocolOrDefault(config.NodeType),
-        config.Port);
-}
-
-}  // namespace
-
-InboundBuild InboundBuilder(const std::string& panel_name,
-                            const PanelConfig* panel_config,
+InboundBuild InboundBuilder(const PanelConfig& panel_config,
                             const api::NodeInfo& node_config) {
     InboundBuild build;
     build.protocol = naming::ResolveProtocolOrDefault(node_config.NodeType);
-    build.tag = ResolveNodeTag(panel_name, node_config);
+    build.tag = naming::BuildPanelNodeTag(
+        panel_config.Name, panel_config.NodeIDs.Front(), build.protocol, node_config.Port);
 
     build.stream_settings.network = node_config.TransportProtocol.empty()
         ? std::string(constants::protocol::kTcp)
@@ -36,20 +25,16 @@ InboundBuild InboundBuilder(const std::string& panel_name,
     // The panel node still decides whether this particular inbound uses TLS.
     const bool tls_enable = ShouldEnableInboundTls(panel_config, node_config);
 
-    if (panel_config) {
-        build.proxy_protocol = panel_config->ProxyProtocol;
-    }
+    build.proxy_protocol = panel_config.ProxyProtocol;
 
     if (tls_enable) {
         build.stream_settings.security = std::string(constants::protocol::kTls);
-        if (panel_config) {
-            build.stream_settings.tls.cert_file = panel_config->TLSCert;
-            build.stream_settings.tls.key_file = panel_config->TLSKey;
-        }
+        build.stream_settings.tls.cert_file = panel_config.TLSCert;
+        build.stream_settings.tls.key_file = panel_config.TLSKey;
         build.stream_settings.tls.server_name = node_config.TLSServerName;
     }
 
-    build.stream_settings.RecomputeModes();
+    build.stream_settings = NormalizeStreamSettings(build.stream_settings);
 
     if (build.stream_settings.IsWs()) {
         build.stream_settings.ws.path = node_config.Path.empty()
@@ -67,8 +52,6 @@ InboundBuild InboundBuilder(const std::string& panel_name,
             build.stream_settings.http_upgrade.host = node_config.Host;
         }
     }
-    build.stream_settings.RecomputeModes();
-
     build.sniff.enabled = node_config.SniffEnabled;
     build.sniff.dest_override = node_config.DestOverride;
 
@@ -92,8 +75,7 @@ InboundBuild InboundBuilder(const std::string& panel_name,
         node_config.Port,
         build.protocol,
         build.tag,
-        panel_config ? panel_config->ListenIP
-                     : InboundListen{});
+        panel_config.ListenIP);
 
     return build;
 }

@@ -10,8 +10,6 @@
 #include <chrono>
 #include <expected>
 #include <optional>
-#include <span>
-#include <string>
 #include <string_view>
 
 namespace acpp::app::dns {
@@ -19,13 +17,6 @@ class DNS;
 }  // namespace acpp::app::dns
 
 namespace acpp {
-
-struct OutboundStreamDefaults {
-    bool require_tls = false;
-    std::string_view fallback_server_name;
-    bool allow_insecure = false;
-    std::span<const std::string> alpn;
-};
 
 struct OutboundTargetOptions {
     app::dns::DNS* dns_service = nullptr;
@@ -39,13 +30,6 @@ struct OutboundTargetOptions {
     std::string_view tls_server_name;
     std::string_view ws_host;
 };
-
-[[nodiscard]] std::optional<net::ip::address> ParseLiteralAddress(
-    std::string_view address);
-
-void NormalizeOutboundStreamSettings(
-    StreamSettings& settings,
-    const OutboundStreamDefaults& defaults = {});
 
 [[nodiscard]] std::string_view ResolveOutboundTlsServerName(
     const StreamSettings& settings,

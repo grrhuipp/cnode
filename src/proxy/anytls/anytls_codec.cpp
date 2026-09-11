@@ -1,4 +1,5 @@
 #include "anytls_codec.hpp"
+#include "padding.hpp"
 #include "../uot/uot.hpp"
 
 #include "acppnode/common/allocator.hpp"
@@ -8,30 +9,12 @@
 #include <array>
 #include <charconv>
 #include <cstring>
-#include <openssl/evp.h>
-#include <random>
+#include <utility>
 
 namespace acpp::anytls {
 
-std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
-    std::array<uint8_t, 32> out{};
-    unsigned int out_len = 0;
-    EVP_Digest(
-        password.data(),
-        password.size(),
-        out.data(),
-        &out_len,
-        EVP_sha256(),
-        nullptr);
-    return out;
-}
 
 namespace {
-
-const std::array<uint8_t, buf::Buffer::kSize>& ZeroPaddingBlock() {
-    static const std::array<uint8_t, buf::Buffer::kSize> zeros{};
-    return zeros;
-}
 
 void WriteU16BE(uint8_t* out, uint16_t value) noexcept {
     out[0] = static_cast<uint8_t>(value >> 8);
@@ -68,8 +51,11 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     return header;
 }
 
-ErrorCode MapWriteException(const IoSystemError& e) noexcept {
-    return MapAsioError(e.code());
+void AppendWaste(memory::ByteVector& out, uint16_t payload_size) {
+    const auto header = BuildFrameHeaderBytes(kCmdWaste, 0, payload_size);
+    const size_t offset = out.size();
+    out.resize(offset + header.size() + payload_size, uint8_t{0});
+    std::memcpy(out.data() + offset, header.data(), header.size());
 }
 
 net::awaitable<std::expected<void, ErrorCode>>
@@ -126,10 +112,7 @@ WriteMultiBufferAsFrameBatchImpl(AsyncStream& stream,
             co_await stream.WriteBuffers(buffers);
         } catch (const IoSystemError& e) {
             mb.clear();
-            co_return std::unexpected(MapWriteException(e));
-        } catch (...) {
-            mb.clear();
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return std::unexpected(MapAsioError(e.code()));
         }
     }
 
@@ -195,124 +178,11 @@ WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
         try {
             co_await stream.WriteBuffers(buffers);
         } catch (const IoSystemError& e) {
-            co_return std::unexpected(MapWriteException(e));
-        } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return std::unexpected(MapAsioError(e.code()));
         }
     }
 
     co_return std::expected<void, ErrorCode>{};
-}
-
-std::optional<int> ParseInt(std::string_view text) {
-    int value = 0;
-    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (ec != std::errc{} || ptr != text.data() + text.size()) {
-        return std::nullopt;
-    }
-    return value;
-}
-
-std::vector<std::string_view> Split(std::string_view text, char delimiter) {
-    std::vector<std::string_view> out;
-    while (true) {
-        const auto pos = text.find(delimiter);
-        auto item = pos == std::string_view::npos ? text : text.substr(0, pos);
-        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) {
-            item.remove_prefix(1);
-        }
-        while (!item.empty() &&
-               (item.back() == ' ' || item.back() == '\t' || item.back() == '\r')) {
-            item.remove_suffix(1);
-        }
-        if (!item.empty()) {
-            out.push_back(item);
-        }
-        if (pos == std::string_view::npos) {
-            break;
-        }
-        text.remove_prefix(pos + 1);
-    }
-    return out;
-}
-
-std::string HexDigest(const unsigned char* bytes, unsigned int size) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(size * 2);
-    for (unsigned int i = 0; i < size; ++i) {
-        out.push_back(kHex[bytes[i] >> 4]);
-        out.push_back(kHex[bytes[i] & 0x0f]);
-    }
-    return out;
-}
-
-std::string Md5Hex(std::string_view text) {
-    unsigned char digest[EVP_MAX_MD_SIZE]{};
-    unsigned int digest_len = 0;
-    EVP_Digest(text.data(), text.size(), digest, &digest_len, EVP_md5(), nullptr);
-    return HexDigest(digest, digest_len);
-}
-
-std::vector<PaddingRecord> ParsePaddingRecord(std::string_view text) {
-    std::vector<PaddingRecord> out;
-    for (auto item : Split(text, ',')) {
-        if (item == "c") {
-            out.push_back(PaddingRecord{.copy_payload = true});
-            continue;
-        }
-        const auto dash = item.find('-');
-        if (dash == std::string_view::npos) {
-            continue;
-        }
-        auto min_value = ParseInt(item.substr(0, dash));
-        auto max_value = ParseInt(item.substr(dash + 1));
-        if (!min_value || !max_value) {
-            continue;
-        }
-        int lo = *min_value;
-        int hi = *max_value;
-        if (lo > hi) {
-            std::swap(lo, hi);
-        }
-        if (lo <= 0 || hi <= 0) {
-            continue;
-        }
-        out.push_back(PaddingRecord{
-            .copy_payload = false,
-            .min_size = lo,
-            .max_size_exclusive = hi == lo ? lo : hi,
-        });
-    }
-    return out;
-}
-
-const std::vector<PaddingRecord>* FindPaddingRecord(
-    const PaddingScheme& scheme,
-    uint32_t packet_index) noexcept {
-    if (packet_index >= scheme.stop ||
-        packet_index >= scheme.records.size() ||
-        scheme.records[packet_index].empty()) {
-        return nullptr;
-    }
-    return &scheme.records[packet_index];
-}
-
-int GenerateRecordPayloadSize(const PaddingRecord& record) {
-    if (record.copy_payload) {
-        return -1;
-    }
-    if (record.min_size <= 0 || record.max_size_exclusive <= 0) {
-        return 0;
-    }
-    if (record.min_size == record.max_size_exclusive) {
-        return record.min_size;
-    }
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<int> dist(
-        record.min_size,
-        record.max_size_exclusive - 1);
-    return dist(rng);
 }
 
 }  // namespace
@@ -326,81 +196,42 @@ WriteMultiBufferAsFrameBatch(AsyncStream& stream,
         stream, cmd, sid, std::move(mb));
 }
 
-PaddingScheme DefaultPaddingScheme() {
-    static constexpr std::string_view kRaw =
-        "stop=8\n"
-        "0=30-30\n"
-        "1=100-400\n"
-        "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n"
-        "3=9-9,500-1000\n"
-        "4=500-1000\n"
-        "5=500-1000\n"
-        "6=500-1000\n"
-        "7=500-1000";
-    return *ParsePaddingScheme(kRaw);
+std::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
+    PeerSettings result;
+    bool has_version = false;
+    bool has_padding_md5 = false;
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        auto line = text.substr(0, end);
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+        if (line.ends_with('\r')) line.remove_suffix(1);
+        if (line.empty()) continue;
+        const auto separator = line.find('=');
+        if (separator == std::string_view::npos || separator == 0)
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        const auto key = line.substr(0, separator);
+        const auto value = line.substr(separator + 1);
+        if (key == "v") {
+            if (std::exchange(has_version, true) || value.empty())
+                return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            uint32_t peer_version = 0;
+            const auto [ptr, error] = std::from_chars(value.data(), value.data() + value.size(), peer_version);
+            if (error != std::errc{} || ptr != value.data() + value.size() || peer_version == 0)
+                return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            result.version = std::min(peer_version, kProtocolVersion) >= 2
+                ? SessionVersion::V2 : SessionVersion::V1;
+        } else if (key == "padding-md5") {
+            if (std::exchange(has_padding_md5, true))
+                return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            result.padding_md5.assign(value);
+        }
+        // Unknown well-formed keys belong to extensions, never feature gates.
+    }
+    return result;
 }
 
-std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
-    if (raw.empty()) {
-        return std::nullopt;
-    }
-    PaddingScheme scheme;
-    scheme.raw.assign(raw);
-    scheme.md5 = Md5Hex(raw);
-    size_t parsed_records = 0;
-    for (auto line : Split(raw, '\n')) {
-        const auto eq = line.find('=');
-        if (eq == std::string_view::npos) {
-            continue;
-        }
-        const auto key = line.substr(0, eq);
-        const auto value = line.substr(eq + 1);
-        if (key == "stop") {
-            auto stop = ParseInt(value);
-            if (!stop || *stop <= 0) {
-                return std::nullopt;
-            }
-            scheme.stop = static_cast<uint32_t>(*stop);
-            continue;
-        }
-
-        auto index = ParseInt(key);
-        if (!index || *index < 0) {
-            continue;
-        }
-
-        auto record = ParsePaddingRecord(value);
-        if (record.empty()) {
-            continue;
-        }
-        const auto record_index = static_cast<size_t>(*index);
-        if (record_index >= scheme.records.size()) {
-            scheme.records.resize(record_index + 1);
-        }
-        if (scheme.records[record_index].empty()) {
-            ++parsed_records;
-        }
-        scheme.records[record_index] = std::move(record);
-    }
-    if (scheme.stop == 0 || parsed_records == 0) {
-        return std::nullopt;
-    }
-    return scheme;
-}
-
-uint16_t AuthPaddingSize(const PaddingScheme& scheme) noexcept {
-    const auto* record = FindPaddingRecord(scheme, 0);
-    if (record && !record->front().copy_payload) {
-        const int size = record->front().min_size;
-        if (size > 0 && size <= 0xffff) {
-            return static_cast<uint16_t>(size);
-        }
-    }
-    return kDefaultAuthPaddingSize;
-}
-
-std::string DefaultClientSettings() {
-    return "v=2\nclient=xray\npadding-md5=" + DefaultPaddingScheme().md5;
+std::string ClientSettings(const PaddingScheme& scheme) {
+    return "v=" + std::to_string(kProtocolVersion) + "\nclient=cnode\npadding-md5=" + std::string(scheme.Digest());
 }
 
 std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target) {
@@ -467,9 +298,7 @@ WriteAll(AsyncStream& stream, std::span<const uint8_t> data) {
             }
             data = data.subspan(n);
         } catch (const IoSystemError& e) {
-            co_return std::unexpected(MapWriteException(e));
-        } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return std::unexpected(MapAsioError(e.code()));
         }
     }
     co_return std::expected<void, ErrorCode>{};
@@ -488,9 +317,7 @@ WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8
     try {
         co_await stream.WriteBuffers(buffers);
     } catch (const IoSystemError& e) {
-        co_return std::unexpected(MapWriteException(e));
-    } catch (...) {
-        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return std::unexpected(MapAsioError(e.code()));
     }
     co_return std::expected<void, ErrorCode>{};
 }
@@ -510,8 +337,8 @@ WritePacketWithPadding(AsyncStream& stream,
         co_return std::expected<void, ErrorCode>{};
     }
 
-    const auto* record_rules = FindPaddingRecord(scheme, packet_index);
-    if (!record_rules) {
+    const auto record_rules = scheme.RecordFor(packet_index);
+    if (record_rules.empty()) {
         co_return co_await WriteAll(
             stream,
             std::span<const uint8_t>(packet.data(), packet.size()));
@@ -519,61 +346,38 @@ WritePacketWithPadding(AsyncStream& stream,
 
     size_t offset = 0;
     memory::ByteVector record;
-    for (const PaddingRecord& rule : *record_rules) {
-        const int size = GenerateRecordPayloadSize(rule);
-        if (size == -1) {
+    for (const PaddingRecord& rule : record_rules) {
+        const int sampled_size = rule.SampleSize();
+        if (sampled_size == -1) {
             if (offset >= packet.size()) {
                 break;
             }
             continue;
         }
-        if (size <= static_cast<int>(kFrameHeaderSize) ||
-            size >= static_cast<int>(buf::Buffer::kSize)) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-
+        // Compiled records are positive and every possible Waste fits uint16.
+        const size_t size = static_cast<size_t>(sampled_size);
         record.clear();
         const size_t remaining = packet.size() - offset;
-        if (remaining > static_cast<size_t>(size)) {
-            const auto* data = packet.data() + offset;
-            record.assign(data, data + static_cast<size_t>(size));
-            offset += static_cast<size_t>(size);
+        std::span<const uint8_t> output;
+        if (remaining >= size) {
+            output = std::span<const uint8_t>(packet).subspan(offset, size);
+            offset += size;
         } else if (remaining > 0) {
-            const auto* data = packet.data() + offset;
-            record.assign(data, data + remaining);
+            output = std::span<const uint8_t>(packet).subspan(offset);
             offset = packet.size();
-            const int padding =
-                size - static_cast<int>(remaining) - static_cast<int>(kFrameHeaderSize);
-            if (padding > 0) {
-                const auto& zeros = ZeroPaddingBlock();
-                auto waste = AppendFrameBytesTo(
-                    record,
-                    kCmdWaste,
-                    0,
-                    std::span<const uint8_t>(zeros.data(), static_cast<size_t>(padding)));
-                if (!waste) {
-                    co_return std::unexpected(waste.error());
-                }
+            if (size - remaining > kFrameHeaderSize) {
+                record.assign(output.begin(), output.end());
+                AppendWaste(record, static_cast<uint16_t>(size - remaining - kFrameHeaderSize));
+                output = record;
             }
         } else {
-            const auto& zeros = ZeroPaddingBlock();
-            auto waste = AppendFrameBytesTo(
-                record,
-                kCmdWaste,
-                0,
-                std::span<const uint8_t>(zeros.data(), static_cast<size_t>(size)));
-            if (!waste) {
-                co_return std::unexpected(waste.error());
-            }
+            AppendWaste(record, static_cast<uint16_t>(size));
+            output = record;
         }
 
-        if (!record.empty()) {
-            auto ok = co_await WriteAll(
-                stream,
-                std::span<const uint8_t>(record.data(), record.size()));
-            if (!ok) {
-                co_return std::unexpected(ok.error());
-            }
+        auto ok = co_await WriteAll(stream, output);
+        if (!ok) {
+            co_return std::unexpected(ok.error());
         }
     }
 
@@ -592,7 +396,7 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
                                     uint8_t cmd,
                                     uint32_t sid,
                                     buf::MultiBuffer mb) {
-    if (!FindPaddingRecord(scheme, packet_index)) {
+    if (scheme.RecordFor(packet_index).empty()) {
         co_return co_await WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
     }
 
@@ -618,7 +422,7 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
                                 uint8_t cmd,
                                 uint32_t sid,
                                 std::span<const net::const_buffer> buffers) {
-    if (!FindPaddingRecord(scheme, packet_index)) {
+    if (scheme.RecordFor(packet_index).empty()) {
         co_return co_await WriteBuffersAsFrameBatchImpl(stream, cmd, sid, buffers);
     }
 
@@ -667,8 +471,6 @@ ReadFrameHeader(AsyncStream& stream) {
             offset += n;
         } catch (const IoSystemError& e) {
             co_return std::unexpected(MapAsioError(e.code()));
-        } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
     }
 
@@ -696,8 +498,6 @@ ReadFrameText(AsyncStream& stream, uint16_t length) {
             offset += n;
         } catch (const IoSystemError& e) {
             co_return std::unexpected(MapAsioError(e.code()));
-        } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
     }
     co_return text;
@@ -717,8 +517,6 @@ DiscardFramePayload(AsyncStream& stream, uint16_t length) {
             remaining -= n;
         } catch (const IoSystemError& e) {
             co_return std::unexpected(MapAsioError(e.code()));
-        } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
     }
     co_return std::expected<void, ErrorCode>{};
@@ -745,13 +543,11 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
                 offset += n;
             } catch (const IoSystemError& e) {
                 co_return std::unexpected(MapAsioError(e.code()));
-            } catch (...) {
-                co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
             }
         }
         buffer->Produce(static_cast<uint32_t>(want));
         remaining -= want;
-        mb.push_back(buffer.release());
+        mb.push_back(std::move(buffer));
     }
     co_return mb;
 }

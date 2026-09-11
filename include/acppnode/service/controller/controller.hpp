@@ -30,7 +30,7 @@ class API;
 class Controller {
 public:
     Controller(net::io_context& io_context,
-               std::vector<std::unique_ptr<Worker>>& workers,
+               const std::vector<std::unique_ptr<Worker>>& workers,
                const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
     ~Controller();
 
@@ -41,7 +41,6 @@ public:
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
     void Start();
-    net::awaitable<void> Stop();
 
     struct NodeStatsInfo {
         std::string panel_name;

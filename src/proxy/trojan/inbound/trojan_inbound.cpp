@@ -1,6 +1,7 @@
 #include "trojan_inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "../trojan_codec.hpp"
+#include "../credentials.hpp"
 #include "../udp_framing.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
@@ -65,11 +66,13 @@ private:
 // Trojan UDP reader/writer helper
 //
 // 把 TCP 隧道上的 Trojan UDP 帧解析/封装为携带逐包目标的 MultiBuffer，
-// 供 dispatcher.Dispatch -> outbound.Process -> DoUDPRelayLink 以协议无关方式中继。
+// 供 dispatcher.Dispatch -> outbound.Process -> DoRelayLink 以协议无关方式中继。
 // 对齐 xray-core 把 UDP 封帧放在入站 reader/writer，而非 relay 内部。
 // ============================================================================
 class TrojanUdpReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+
     TrojanUdpReader(AsyncStream& src, std::span<const uint8_t> first_packet)
         : src_(src) {
         if (!first_packet.empty()) {
@@ -286,7 +289,7 @@ proxy::trojan::inbound::Handler::Process(
 
     InitialPayload first_packet;
     if (!leftover.empty()) {
-        first_packet.assign(leftover.begin(), leftover.end());
+        first_packet.assign(leftover);
     }
 
     auto* tcp_stream = stream.get();
@@ -352,7 +355,8 @@ const bool kTrojanInboundRegistered = [] {
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedTrojanUser info;
-                info.password_hash = acpp::trojan::HashPassword(client.password);
+                const auto hash = acpp::trojan::HashPassword(client.password);
+                info.password_hash.assign(hash.data(), hash.size());
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
@@ -372,7 +376,8 @@ const bool kTrojanInboundRegistered = [] {
                     continue;
                 }
                 acpp::proxyman::inbound::PreparedTrojanUser info;
-                info.password_hash = acpp::trojan::HashPassword(runtime_user.password);
+                const auto hash = acpp::trojan::HashPassword(runtime_user.password);
+                info.password_hash.assign(hash.data(), hash.size());
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;

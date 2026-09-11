@@ -38,6 +38,31 @@ int main() {
         if (acpp::InboundListen::Parse(value)) return 5;
     }
 
+    struct OverlapCase { std::string_view left, right; bool overlaps; };
+    for (const auto& item : std::array{
+             OverlapCase{"127.0.0.1", "127.0.0.1", true},
+             OverlapCase{"127.0.0.1", "127.0.0.2", false},
+             OverlapCase{"0.0.0.0", "127.0.0.1", true},
+             OverlapCase{"::", "::1", true},
+             OverlapCase{"::1", "127.0.0.1", false},
+             OverlapCase{"::", "0.0.0.0", false},
+             OverlapCase{"auto", "127.0.0.1", true},
+             OverlapCase{"auto", "::1", true},
+             OverlapCase{"auto", "auto", true},
+             OverlapCase{"::ffff:127.0.0.1", "127.0.0.1", true},
+             OverlapCase{"fe80::1%1", "fe80::1%2", false}}) {
+        const auto left = acpp::InboundListen::Parse(item.left);
+        const auto right = acpp::InboundListen::Parse(item.right);
+        if (!left || !right || left->Overlaps(*right) != item.overlaps ||
+            right->Overlaps(*left) != item.overlaps) return 16;
+    }
+
+    for (const auto value : std::array<std::string_view, 7>{"127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
+             "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
+             std::string_view("::1\0ignored", 11)}) {
+        if (acpp::InboundListen::Parse(value)) return 20;
+    }
+
     auto socket_binding = acpp::MakePortBinding(
         443, "vmess", "stable-inbound", *ipv4);
     auto protocol_update = acpp::MakePortBinding(

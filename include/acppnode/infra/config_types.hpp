@@ -38,7 +38,7 @@ struct LogConfig {
 struct DnsConfig {
     DnsConfig();
 
-    std::vector<net::ip::address> servers;
+    std::vector<udp::endpoint> servers;
     uint32_t timeout = defaults::kDnsTimeout;
     uint32_t cache_size = defaults::kDnsCacheSize;
     uint32_t min_ttl = defaults::kDnsMinTTL;

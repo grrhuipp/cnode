@@ -86,8 +86,7 @@ public:
         acpp::transport::Link,
         acpp::StatsShard&,
         const acpp::RelayConfig&,
-        std::span<const uint8_t>,
-        acpp::buf::MultiBuffer&,
+        acpp::buf::MultiBuffer,
         std::chrono::seconds,
         std::chrono::seconds) override {
         co_return acpp::RelayResult{};

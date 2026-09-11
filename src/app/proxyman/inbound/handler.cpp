@@ -1,4 +1,5 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/request_load_state.hpp"
@@ -12,10 +13,12 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "acppnode/transport/link_error.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <exception>
+#include <new>
 #include <optional>
 
 namespace acpp::proxyman::inbound {
@@ -60,10 +63,9 @@ void ApplyHttpRealIp(
     std::string_view real_ip,
     std::string_view header) {
     if (real_ip.empty()) return;
-    IoErrorCode ec;
-    auto address = net::ip::make_address(real_ip, ec);
-    if (ec) return;
-    address = iputil::NormalizeAddress(address);
+    const auto literal = iputil::ParseLiteral(real_ip);
+    if (!literal) return;
+    const auto address = iputil::NormalizeAddress(*literal);
     ctx.inbound.source_addr = address;
     ctx.inbound.source_ip = address.to_string();
     // Forwarded address headers do not reliably carry the original client
@@ -355,6 +357,15 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             timeouts,
             request_load.PressureIdleTimeout());
         access_log.Complete(relay_result);
+    } catch (const transport::LinkError& e) {
+        stats.OnError();
+        access_log.Fail(e.code());
+    } catch (const std::bad_alloc&) {
+        stats.OnError();
+        access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const IoSystemError& e) {
+        stats.OnError();
+        access_log.Fail(MapAsioError(e.code()));
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: {}", e.what());
         stats.OnError();
@@ -569,6 +580,15 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             timeouts,
             request_load.PressureIdleTimeout());
         access_log.Complete(relay_result);
+    } catch (const transport::LinkError& e) {
+        stats.OnError();
+        access_log.Fail(e.code());
+    } catch (const std::bad_alloc&) {
+        stats.OnError();
+        access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const IoSystemError& e) {
+        stats.OnError();
+        access_log.Fail(MapAsioError(e.code()));
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] inbound process exception: {}", e.what());
         stats.OnError();

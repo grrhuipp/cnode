@@ -34,6 +34,12 @@ int main() {
         if (acpp::OutboundBind::Parse(value)) return 5;
     }
 
+    for (const auto value : std::array<std::string_view, 7>{"127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
+             "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
+             std::string_view("::1\0ignored", 11)}) {
+        if (acpp::OutboundBind::Parse(value)) return 20;
+    }
+
     if (acpp::OutboundBind::Auto().GetMode() != Mode::Auto) return 6;
     return 0;
 }

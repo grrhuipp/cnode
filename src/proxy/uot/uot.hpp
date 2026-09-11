@@ -56,6 +56,9 @@ struct EncodedRequest {
 
 class PacketReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
+
     PacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,
                  TargetAddress destination,
@@ -83,6 +86,7 @@ public:
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
+    bool WriteShutdownClosesLink() const noexcept override { return writer_.WriteShutdownClosesLink(); }
 
 private:
     net::awaitable<void> WritePacket(
@@ -123,6 +127,10 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override {
         co_await writer_.AsyncShutdownWrite();
     }
+
+    transport::CancellationSource& Cancellation() noexcept override { return underlying_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
+    bool WriteShutdownClosesLink() const noexcept override { return writer_.WriteShutdownClosesLink(); }
 
     void Cancel() noexcept {
         if constexpr (requires(Underlying& endpoint) { endpoint.Cancel(); }) {
@@ -193,16 +201,6 @@ public:
                 endpoint.ConsumePhaseDeadline();
             }) {
             return underlying_.ConsumePhaseDeadline();
-        } else {
-            return false;
-        }
-    }
-
-    [[nodiscard]] bool ForwardHalfCloseOnPeerEof() const noexcept {
-        if constexpr (requires(const Underlying& endpoint) {
-                endpoint.ForwardHalfCloseOnPeerEof();
-            }) {
-            return underlying_.ForwardHalfCloseOnPeerEof();
         } else {
             return false;
         }

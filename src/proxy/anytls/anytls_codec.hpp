@@ -6,23 +6,17 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
 
-#include <array>
 #include <cstdint>
 #include <expected>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 class AsyncStream;
 }
 
 namespace acpp::anytls {
-
-[[nodiscard]] std::array<uint8_t, 32>
-PasswordHash(std::string_view password) noexcept;
 
 inline constexpr uint8_t kCmdWaste = 0;
 inline constexpr uint8_t kCmdSYN = 1;
@@ -38,7 +32,17 @@ inline constexpr uint8_t kCmdServerSettings = 10;
 
 inline constexpr size_t kFrameHeaderSize = 7;
 inline constexpr size_t kMaxFramePayload = 0xffff;
-inline constexpr uint16_t kDefaultAuthPaddingSize = 30;
+
+inline constexpr uint32_t kProtocolVersion = 2;
+
+enum class SessionVersion : uint8_t { V1 = 1, V2 = 2 };
+
+struct PeerSettings {
+    SessionVersion version = SessionVersion::V1;
+    std::string padding_md5; // Handshake-only metadata, never retained by a session.
+};
+
+[[nodiscard]] std::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text);
 
 struct FrameHeader {
     uint8_t cmd = 0;
@@ -46,23 +50,9 @@ struct FrameHeader {
     uint16_t length = 0;
 };
 
-struct PaddingRecord {
-    bool copy_payload = false;
-    int min_size = 0;
-    int max_size_exclusive = 0;
-};
+class PaddingScheme;
 
-struct PaddingScheme {
-    std::string raw;
-    std::string md5;
-    uint32_t stop = 0;
-    std::vector<std::vector<PaddingRecord>> records;
-};
-
-[[nodiscard]] PaddingScheme DefaultPaddingScheme();
-[[nodiscard]] std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
-[[nodiscard]] uint16_t AuthPaddingSize(const PaddingScheme& scheme) noexcept;
-[[nodiscard]] std::string DefaultClientSettings();
+[[nodiscard]] std::string ClientSettings(const PaddingScheme& scheme);
 [[nodiscard]] std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target);
 [[nodiscard]] std::expected<void, ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
@@ -70,6 +60,8 @@ struct PaddingScheme {
     uint32_t sid,
     std::span<const uint8_t> payload);
 
+// Protocol validation and actual I/O errors are values. Non-I/O exceptions
+// retain their types for the owning request/session boundary to classify.
 net::awaitable<std::expected<void, ErrorCode>>
 WriteAll(AsyncStream& stream, std::span<const uint8_t> data);
 

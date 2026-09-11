@@ -40,31 +40,19 @@ public:
     UDPSession(UDPSession&&) = delete;
     UDPSession& operator=(UDPSession&&) = delete;
 
-    // UDP 发送/接收接口
-    net::awaitable<ErrorCode> SendTo(
-        const TargetAddress& target,
-        const uint8_t* data,
-        size_t len,
-        uint64_t callback_id);
-
-    net::awaitable<ErrorCode> SendTo(
-        const TargetAddress& target,
-        buf::MultiBuffer payload,
-        uint64_t callback_id);
-
-    // 注册 Full Cone 回调，返回 callback_id 用于后续取消；
-    // session 未运行、回调为空或容量耗尽时返回 0。
-    // 注意：Per-Worker 模式，无需 executor 参数，回调在同一线程执行
-    uint64_t RegisterCallback(PacketCallback callback);
-
-    // 取消注册
-    void UnregisterCallback(uint64_t callback_id);
-
     // 获取本地端口
     uint16_t LocalPort() const;
 
 private:
     friend class UDPSessionManager;
+    friend class UDPChannel;
+
+    // Only a request channel may own callback identity and initiate sends.
+    net::awaitable<ErrorCode> SendTo(
+        const TargetAddress& target, buf::MultiBuffer payload, uint64_t callback_id);
+    uint64_t RegisterCallback(PacketCallback callback);
+    void UnregisterCallback(uint64_t callback_id) noexcept;
+
 
     ErrorCode Start(const net::ip::address& bind_address);
     ErrorCode StartReceive();
@@ -97,9 +85,6 @@ public:
 
     // 启动清理定时器
     void StartCleanup();
-
-    // 停止所有会话
-    void StopAll();
 
     // 获取活跃会话数量
     size_t ActiveSessionCount() const;

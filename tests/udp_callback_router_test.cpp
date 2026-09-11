@@ -6,8 +6,19 @@
 #include <cstdlib>
 #include <iostream>
 #include <source_location>
+#include <new>
 
 namespace {
+
+thread_local bool reject_allocations = false;
+thread_local size_t allocation_attempts = 0;
+
+struct RejectAllocations {
+    RejectAllocations() noexcept { reject_allocations = true; }
+    ~RejectAllocations() noexcept { reject_allocations = false; }
+};
+
+static_assert(noexcept(std::declval<acpp::detail::UdpCallbackRouter&>().Unregister(1)));
 
 [[noreturn]] void Fail(
     std::source_location location = std::source_location::current()) {
@@ -17,6 +28,18 @@ namespace {
 }
 
 }  // namespace
+
+void* operator new(std::size_t size) {
+    if (reject_allocations) { ++allocation_attempts; throw std::bad_alloc(); }
+    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
+    throw std::bad_alloc();
+}
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (...) { return nullptr; }
+}
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
 
 int main() {
     using namespace std::chrono_literals;
@@ -39,8 +62,12 @@ int main() {
     first_id = router.Register(acpp::PacketCallback{
         [&](acpp::UDPPacketView) {
             ++first_calls;
-            if (!router.Unregister(first_id) ||
-                !router.Unregister(second_id)) {
+            bool removed = false;
+            {
+                RejectAllocations reject;
+                removed = router.Unregister(first_id) && router.Unregister(second_id);
+            }
+            if (!removed) {
                 Fail();
             }
             return true;
@@ -157,5 +184,18 @@ int main() {
         Fail();
     }
 
+    router.Clear();
+    std::array<uint64_t, 128> teardown_ids{};
+    for (auto& id : teardown_ids) {
+        id = router.Register(acpp::PacketCallback{[](acpp::UDPPacketView) { return true; }});
+        if (id == 0) Fail();
+    }
+    const auto attempts_before = allocation_attempts;
+    bool removed_all = true;
+    {
+        RejectAllocations reject;
+        for (auto id : teardown_ids) removed_all = router.Unregister(id) && removed_all;
+    }
+    if (!removed_all || allocation_attempts != attempts_before || router.RegisteredCount() != 0) Fail();
     return 0;
 }

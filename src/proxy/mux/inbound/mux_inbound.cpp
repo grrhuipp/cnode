@@ -1,4 +1,5 @@
 #include "mux_inbound.hpp"
+#include "../../../common/awaitable_task_group.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "xudp_packet_buffer.hpp"
@@ -9,7 +10,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -70,7 +71,6 @@ struct MuxReply {
 struct ReplyQueueState {
     explicit ReplyQueueState(net::io_context& io_context, SignalChannel& main_signal)
         : io_context_(io_context)
-        , sub_done_signal(io_context, 1)
         , main_signal_(main_signal) {}
 
     net::io_context& io_context_;
@@ -78,7 +78,6 @@ struct ReplyQueueState {
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
-    SignalChannel sub_done_signal;
     SignalChannel& main_signal_;
     bool running = true;
     bool tcp_overflowed = false;
@@ -186,7 +185,6 @@ struct ReplyQueueState {
         if (io_context_.stopped()) {
             return;
         }
-        (void)sub_done_signal.try_send(IoErrorCode{});
         WakeReplyWriter();
     }
 };
@@ -220,12 +218,10 @@ struct ClientReadQueueState {
     explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
         : io_context_(io_context)
         , space_signal(io_context, 1)
-        , done_signal(io_context, 1)
         , main_signal_(main_signal) {}
 
     net::io_context& io_context_;
     SignalChannel space_signal;
-    SignalChannel done_signal;
     SignalChannel& main_signal_;
     struct QueuedInput {
         QueuedInput(buf::MultiBuffer p, size_t n) noexcept
@@ -247,14 +243,6 @@ struct ClientReadQueueState {
             return;
         }
         (void)main_signal_.try_send(IoErrorCode{});
-    }
-
-    void WakeDone() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)done_signal.try_send(IoErrorCode{});
-        WakeMain();
     }
 
     void WakeSpace() noexcept {
@@ -312,7 +300,7 @@ struct ClientReadQueueState {
         }
         done = true;
         error = ec;
-        WakeDone();
+        WakeMain();
     }
 };
 
@@ -320,6 +308,8 @@ class TcpSubState final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+
     TcpSubState(
         net::io_context& io_context,
         uint16_t session_id,
@@ -409,8 +399,8 @@ public:
         ThrowInputError("Mux TCP input cancelled");
     }
 
-    [[nodiscard]] bool ForwardHalfCloseToPeerOnEof() const noexcept {
-        return true;
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::ShutdownPeerWrite;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -545,6 +535,7 @@ public:
         }
         cancelled_ = true;
         terminal_error_ = error;
+        cancellation_.Stop(error);
         input_done_ = true;
         output_sleep_.Cancel();
         WakeInputReader();
@@ -560,6 +551,8 @@ public:
     session::Context ctx;
 
 private:
+    transport::CancellationSource cancellation_;
+
     [[noreturn]] void ThrowInputError(const char* what) const {
         if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
             throw IoSystemError(io_error::no_buffer_space, what);
@@ -598,7 +591,7 @@ private:
     }
 
     net::io_context& io_context_;
-    ScheduledSleep output_sleep_;
+    AsyncDelay output_sleep_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
@@ -627,6 +620,8 @@ class UdpSubState final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+
     UdpSubState(
         net::io_context& io_context,
         uint16_t session_id,
@@ -785,6 +780,7 @@ public:
         }
         cancelled_ = true;
         terminal_error_ = error;
+        cancellation_.Stop(error);
         input_done_ = true;
         WakeInputReader();
         input_queue_.clear();
@@ -800,6 +796,8 @@ public:
     session::Context ctx;
 
 private:
+    transport::CancellationSource cancellation_;
+
     [[noreturn]] void ThrowInputError(const char* what) const {
         if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
             throw IoSystemError(io_error::no_buffer_space, what);
@@ -1008,8 +1006,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
-    using namespace net::experimental::awaitable_operators;
-
     if (!client_link.Valid()) {
         RelayResult error;
         error.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -1087,480 +1083,435 @@ net::awaitable<RelayResult> ProcessInboundImpl(
         client_reads.MarkDone(ErrorCode::OK);
     };
 
-    net::co_spawn(io_context.get_executor(), client_reader_loop(), net::detached);
-    auto release_write_frame = [&]() noexcept {
-        write_frame.clear();
-        ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
-    };
-    auto write_frame_to_client =
-        [&](memory::ByteVector& frame) -> net::awaitable<bool> {
-            const size_t frame_size = frame.size();
-            if (frame_size == 0) {
-                release_write_frame();
-                co_return true;
-            }
-
-            std::array<net::const_buffer, 1> buffers{
-                net::const_buffer(frame.data(), frame.size())};
-            try {
-                co_await client_link.writer->WriteBuffers(buffers);
-                parent_ctx.traffic.bytes_down += frame_size;
-                result.bytes_down += frame_size;
-                release_write_frame();
-                co_return true;
-            } catch (const IoSystemError&) {
-                if (ConsumeWriteSideTimeout(client_control)) {
-                    result.error = ErrorCode::RELAY_TIMEOUT;
-                }
-            } catch (...) {
-            }
-            release_write_frame();
-            co_return false;
+    auto process_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+        auto release_write_frame = [&]() noexcept {
+            write_frame.clear();
+            ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
         };
+        auto write_frame_to_client =
+            [&](memory::ByteVector& frame) -> net::awaitable<bool> {
+                const size_t frame_size = frame.size();
+                if (frame_size == 0) {
+                    release_write_frame();
+                    co_return true;
+                }
 
-    auto write_payload_frame_to_client =
-        [&](memory::ByteVector& frame, MuxReply& reply) -> net::awaitable<bool> {
-            const size_t payload_size = reply.PayloadSize();
-            const size_t frame_size = frame.size() + payload_size;
-            if (frame_size == 0) {
+                std::array<net::const_buffer, 1> buffers{
+                    net::const_buffer(frame.data(), frame.size())};
+                try {
+                    co_await client_link.writer->WriteBuffers(buffers);
+                    parent_ctx.traffic.bytes_down += frame_size;
+                    result.bytes_down += frame_size;
+                    release_write_frame();
+                    co_return true;
+                } catch (const IoSystemError&) {
+                    if (ConsumeWriteSideTimeout(client_control)) {
+                        result.error = ErrorCode::RELAY_TIMEOUT;
+                    }
+                } catch (...) {
+                }
                 release_write_frame();
-                co_return true;
-            }
-
-            std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity>
-                inline_buffers{};
-            memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-            size_t buffer_count = 0;
-            auto append_buffer = [&](net::const_buffer send_buffer) {
-                if (buffer_count < inline_buffers.size()) {
-                    inline_buffers[buffer_count++] = send_buffer;
-                    return;
-                }
-                if (spill_buffers.empty()) {
-                    spill_buffers.reserve(1 + reply.payload.size());
-                    spill_buffers.insert(
-                        spill_buffers.end(),
-                        inline_buffers.begin(),
-                        inline_buffers.begin() + buffer_count);
-                }
-                spill_buffers.emplace_back(send_buffer);
-                ++buffer_count;
+                co_return false;
             };
 
-            if (!frame.empty()) {
-                append_buffer(net::const_buffer(frame.data(), frame.size()));
-            }
-            for (const auto* buffer : reply.payload) {
-                if (!buffer || buffer->IsEmpty()) {
-                    continue;
-                }
-                const auto bytes = buffer->Bytes();
-                append_buffer(net::const_buffer(bytes.data(), bytes.size()));
-            }
-
-            const auto buffers = spill_buffers.empty()
-                ? std::span<const net::const_buffer>(
-                    inline_buffers.data(),
-                    buffer_count)
-                : std::span<const net::const_buffer>(
-                    spill_buffers.data(),
-                    spill_buffers.size());
-
-            try {
-                co_await client_link.writer->WriteBuffers(buffers);
-                reply.payload.clear();
-                parent_ctx.traffic.bytes_down += frame_size;
-                result.bytes_down += frame_size;
-                release_write_frame();
-                co_return true;
-            } catch (const IoSystemError&) {
-                if (ConsumeWriteSideTimeout(client_control)) {
-                    result.error = ErrorCode::RELAY_TIMEOUT;
-                }
-            } catch (...) {
-            }
-            reply.payload.clear();
-            release_write_frame();
-            co_return false;
-        };
-
-    try {
-        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
-
-        while (running) {
-        // --------------------------------------------------------------------
-        // 1. 排空回包队列 → 序列化写回客户端
-        // --------------------------------------------------------------------
-        MuxReply reply;
-        while (reply_queue.Pop(reply)) {
-            if (reply.is_end || reply.dispatch_done) {
-                if (reply.is_end) {
-                    mux::EncodeEndTo(write_frame, reply.session_id);
-                }
-                if (reply.dispatch_done) {
-                    sub_sessions.erase(reply.session_id);
-                }
-                if (!reply.is_end) {
-                    continue;
-                }
-            } else if (reply.is_udp) {
+        auto write_payload_frame_to_client =
+            [&](memory::ByteVector& frame, MuxReply& reply) -> net::awaitable<bool> {
                 const size_t payload_size = reply.PayloadSize();
-                if (!mux::EncodeKeepUDPHeaderTo(
-                    write_frame,
-                    reply.session_id, reply.udp_src,
-                    payload_size)) {
-                    LOG_CONN_DEBUG(parent_ctx,
-                        "[MuxRelay] UDP reply header encode failed sid={} src={} payload={}B",
-                        reply.session_id, reply.udp_src, payload_size);
+                const size_t frame_size = frame.size() + payload_size;
+                if (frame_size == 0) {
+                    release_write_frame();
+                    co_return true;
+                }
+
+                std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity>
+                    inline_buffers{};
+                memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+                size_t buffer_count = 0;
+                auto append_buffer = [&](net::const_buffer send_buffer) {
+                    if (buffer_count < inline_buffers.size()) {
+                        inline_buffers[buffer_count++] = send_buffer;
+                        return;
+                    }
+                    if (spill_buffers.empty()) {
+                        spill_buffers.reserve(1 + reply.payload.size());
+                        spill_buffers.insert(
+                            spill_buffers.end(),
+                            inline_buffers.begin(),
+                            inline_buffers.begin() + buffer_count);
+                    }
+                    spill_buffers.emplace_back(send_buffer);
+                    ++buffer_count;
+                };
+
+                if (!frame.empty()) {
+                    append_buffer(net::const_buffer(frame.data(), frame.size()));
+                }
+                for (const auto* buffer : reply.payload) {
+                    if (!buffer || buffer->IsEmpty()) {
+                        continue;
+                    }
+                    const auto bytes = buffer->Bytes();
+                    append_buffer(net::const_buffer(bytes.data(), bytes.size()));
+                }
+
+                const auto buffers = spill_buffers.empty()
+                    ? std::span<const net::const_buffer>(
+                        inline_buffers.data(),
+                        buffer_count)
+                    : std::span<const net::const_buffer>(
+                        spill_buffers.data(),
+                        spill_buffers.size());
+
+                try {
+                    co_await client_link.writer->WriteBuffers(buffers);
+                    reply.payload.clear();
+                    parent_ctx.traffic.bytes_down += frame_size;
+                    result.bytes_down += frame_size;
+                    release_write_frame();
+                    co_return true;
+                } catch (const IoSystemError&) {
+                    if (ConsumeWriteSideTimeout(client_control)) {
+                        result.error = ErrorCode::RELAY_TIMEOUT;
+                    }
+                } catch (...) {
+                }
+                reply.payload.clear();
+                release_write_frame();
+                co_return false;
+            };
+
+        try {
+            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
+
+            while (running) {
+            // --------------------------------------------------------------------
+            // 1. 排空回包队列 → 序列化写回客户端
+            // --------------------------------------------------------------------
+            MuxReply reply;
+            while (reply_queue.Pop(reply)) {
+                if (reply.is_end || reply.dispatch_done) {
+                    if (reply.is_end) {
+                        mux::EncodeEndTo(write_frame, reply.session_id);
+                    }
+                    if (reply.dispatch_done) {
+                        sub_sessions.erase(reply.session_id);
+                    }
+                    if (!reply.is_end) {
+                        continue;
+                    }
+                } else if (reply.is_udp) {
+                    const size_t payload_size = reply.PayloadSize();
+                    if (!mux::EncodeKeepUDPHeaderTo(
+                        write_frame,
+                        reply.session_id, reply.udp_src,
+                        payload_size)) {
+                        LOG_CONN_DEBUG(parent_ctx,
+                            "[MuxRelay] UDP reply header encode failed sid={} src={} payload={}B",
+                            reply.session_id, reply.udp_src, payload_size);
+                        continue;
+                    }
+                    if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                        running = false;
+                        break;
+                    }
+                    continue;
+                } else {
+                    if (!mux::EncodeKeepDataHeaderTo(
+                            write_frame,
+                            reply.session_id,
+                            reply.PayloadSize())) {
+                        reply.payload.clear();
+                        result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
+                        running = false;
+                        break;
+                    }
+                    if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                        running = false;
+                        break;
+                    }
                     continue;
                 }
-                if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+
+                if (!co_await write_frame_to_client(write_frame)) {
+                    running = false;
+                    break;
+                }
+            }
+            if (!running) break;
+
+            if (reply_queue.tcp_overflowed) {
+                reply_queue.tcp_overflowed = false;
+                LOG_CONN_DEBUG(parent_ctx,
+                    "[MuxRelay] Reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
+                    reply_queue.tcp_queued_bytes, reply_queue.udp_queued_bytes,
+                    reply_queue.queue.size(), kMuxQueueEmergencyBytes);
+                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                break;
+            }
+
+            if (client_input_done) {
+                if (reply_queue.Empty() && reply_queue.active_sub_loops == 0) {
+                    break;
+                }
+                auto [ec] = co_await main_signal.async_receive(
+                    net::as_tuple(net::use_awaitable));
+                if (ec) {
                     running = false;
                     break;
                 }
                 continue;
-            } else {
-                if (!mux::EncodeKeepDataHeaderTo(
-                        write_frame,
-                        reply.session_id,
-                        reply.PayloadSize())) {
-                    reply.payload.clear();
-                    result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
-                    running = false;
-                    break;
+            }
+
+            // --------------------------------------------------------------------
+            // 2. 消费客户端读队列。读操作由独立协程持有，避免为了轮询回包而
+            //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
+            // --------------------------------------------------------------------
+            buf::MultiBuffer read_mb;
+            if (!client_reads.Pop(read_mb)) {
+                if (!reply_queue.Empty()) {
+                    continue;
                 }
-                if (!co_await write_payload_frame_to_client(write_frame, reply)) {
-                    running = false;
-                    break;
-                }
-                continue;
-            }
-
-            if (!co_await write_frame_to_client(write_frame)) {
-                running = false;
-                break;
-            }
-        }
-        if (!running) break;
-
-        if (reply_queue.tcp_overflowed) {
-            reply_queue.tcp_overflowed = false;
-            LOG_CONN_DEBUG(parent_ctx,
-                "[MuxRelay] Reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
-                reply_queue.tcp_queued_bytes, reply_queue.udp_queued_bytes,
-                reply_queue.queue.size(), kMuxQueueEmergencyBytes);
-            result.error = ErrorCode::RESOURCE_EXHAUSTED;
-            break;
-        }
-
-        if (client_input_done) {
-            if (reply_queue.Empty() && reply_queue.active_sub_loops == 0) {
-                break;
-            }
-            auto [ec] = co_await main_signal.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                running = false;
-                break;
-            }
-            continue;
-        }
-
-        // --------------------------------------------------------------------
-        // 2. 消费客户端读队列。读操作由独立协程持有，避免为了轮询回包而
-        //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
-        // --------------------------------------------------------------------
-        buf::MultiBuffer read_mb;
-        if (!client_reads.Pop(read_mb)) {
-            if (!reply_queue.Empty()) {
-                continue;
-            }
-            if (client_reads.done) {
-                if (client_reads.error != ErrorCode::OK) {
-                    if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                if (client_reads.done) {
+                    if (client_reads.error != ErrorCode::OK) {
+                        if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
+                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                        }
+                        result.error = client_reads.error;
+                        running = false;
+                        break;
                     }
+                    client_input_done = true;
+                    continue;
+                }
+
+                auto [ec] = co_await main_signal.async_receive(
+                    net::as_tuple(net::use_awaitable));
+                (void)ec;
+                continue;
+            }
+
+            const size_t read_bytes = buf::TotalLen(read_mb);
+            if (read_bytes == 0) {
+                if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
+                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
+                    result.error = ErrorCode::RELAY_TIMEOUT;
+                    running = false;
+                    break;
+                }
+                if (client_reads.done && client_reads.error != ErrorCode::OK) {
                     result.error = client_reads.error;
                     running = false;
                     break;
                 }
-                client_input_done = true;
                 continue;
             }
+            parent_ctx.traffic.bytes_up += read_bytes;
+            result.bytes_up += read_bytes;
 
-            auto [ec] = co_await main_signal.async_receive(
-                net::as_tuple(net::use_awaitable));
-            (void)ec;
-            continue;
-        }
+            read_mb.MoveTo(frame_buf);
+            frame_buf_bytes += read_bytes;
 
-        const size_t read_bytes = buf::TotalLen(read_mb);
-        if (read_bytes == 0) {
-            if (client_reads.done && client_reads.error == ErrorCode::RELAY_TIMEOUT) {
-                LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Read-side timeout");
-                result.error = ErrorCode::RELAY_TIMEOUT;
-                running = false;
-                break;
-            }
-            if (client_reads.done && client_reads.error != ErrorCode::OK) {
-                result.error = client_reads.error;
-                running = false;
-                break;
-            }
-            continue;
-        }
-        parent_ctx.traffic.bytes_up += read_bytes;
-        result.bytes_up += read_bytes;
+            // --------------------------------------------------------------------
+            // 3. 循环解析并分发 Mux 帧
+            // --------------------------------------------------------------------
+            while (running && frame_buf_bytes > 0) {
+                std::optional<mux::FrameHeader> opt_hdr;
+                const auto prefix = frame_buf.FrontSpan();
+                if (!prefix.empty()) {
+                    opt_hdr = mux::DecodeFramePrefix(
+                        prefix.data(),
+                        prefix.size(),
+                        frame_buf_bytes);
+                }
+                if (!opt_hdr) {
+                    opt_hdr = mux::DecodeFrame(frame_buf, 0, frame_buf_bytes);
+                }
+                if (!opt_hdr) break;  // 数据不足，等待下次读取
 
-        read_mb.MoveTo(frame_buf);
-        frame_buf_bytes += read_bytes;
-
-        // --------------------------------------------------------------------
-        // 3. 循环解析并分发 Mux 帧
-        // --------------------------------------------------------------------
-        while (running && frame_buf_bytes > 0) {
-            std::optional<mux::FrameHeader> opt_hdr;
-            const auto prefix = frame_buf.FrontSpan();
-            if (!prefix.empty()) {
-                opt_hdr = mux::DecodeFramePrefix(
-                    prefix.data(),
-                    prefix.size(),
-                    frame_buf_bytes);
-            }
-            if (!opt_hdr) {
-                opt_hdr = mux::DecodeFrame(frame_buf, 0, frame_buf_bytes);
-            }
-            if (!opt_hdr) break;  // 数据不足，等待下次读取
-
-            const mux::FrameHeader& hdr = *opt_hdr;
-            if (hdr.frame_size == 0) {
-                LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Invalid frame");
-                result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
-                running = false;
-                break;
-            }
-
-            buf::MultiBuffer frame_payload;
-            if (hdr.has_data && hdr.data_len > 0) {
-                if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
-                    !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
-                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] payload extraction failed");
-                    result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                const mux::FrameHeader& hdr = *opt_hdr;
+                if (hdr.frame_size == 0) {
+                    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Invalid frame");
+                    result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
                     running = false;
                     break;
                 }
-            } else {
-                frame_buf.DropPrefixBytes(hdr.frame_size);
-            }
-            frame_buf_bytes -= std::min(frame_buf_bytes, hdr.frame_size);
 
-            switch (hdr.status) {
-
-            // ----------------------------------------------------------------
-            case mux::SessionStatus::KEEPALIVE: {
-                mux::EncodeKeepAliveTo(write_frame);
-                if (!co_await write_frame_to_client(write_frame)) {
-                    running = false;
-                }
-                break;
-            }
-
-            // ----------------------------------------------------------------
-            case mux::SessionStatus::NEW: {
-                if (hdr.network == mux::NetworkType::UDP) {
-                    // ---- 新建 UDP 子会话 ----
-                    LOG_CONN_DEBUG(parent_ctx,
-                        "[MuxRelay] New UDP sid={} target={} data={}B global_id={}",
-                        hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
-
-                    uint16_t sid = hdr.session_id;
-                    if (sub_sessions.contains(sid)) {
-                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                        (void)co_await write_frame_to_client(write_frame);
-                        break;
-                    }
-
-                    auto sub_state = std::make_unique<UdpSubState>(
-                        io_context,
-                        sid,
-                        reply_queue,
-                        parent_conn_id,
-                        hdr.target,
-                        hdr.has_global_id);
-                    auto& sub_ctx = sub_state->ctx;
-                    sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                    sub_ctx.worker_id                = parent_ctx.worker_id;
-                    sub_ctx.parent_conn_id           = parent_conn_id;
-                    sub_ctx.stream_id                = sid;
-                    sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
-                    sub_ctx.config_generation        = parent_ctx.config_generation;
-                    sub_ctx.inbound                  = parent_ctx.inbound;
-                    sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
-                    sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
-                    sub_ctx.content.network          = Network::UDP;
-                    sub_ctx.outbound.original_target = hdr.target;
-                    sub_ctx.outbound.target          = hdr.target;
-
-                    if (buf::HasData(frame_payload)) {
-                        for (auto* buffer : frame_payload) {
-                            if (buffer && !buffer->IsEmpty()) {
-                                buffer->SetUDP(hdr.target);
-                            }
-                        }
-                        sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
-                    }
-
-                    auto [insert_it, inserted] = sub_sessions.try_emplace(
-                        sid,
-                        UdpSubInfo{std::move(sub_state)});
-                    (void)inserted;
-                    UdpSubState* sub_ptr =
-                        std::get<UdpSubInfo>(insert_it->second).get();
-
-                    try {
-                        net::co_spawn(io_context.get_executor(),
-                            RunUdpSubDispatch(
-                                io_context,
-                                dispatcher,
-                                policy,
-                                sub_ptr,
-                                stats,
-                                timeouts,
-                                SubLoopLease{reply_queue}),
-                            net::detached);
-                    } catch (...) {
-                        ReportDispatchAdmissionFailure(sub_ptr->ctx);
-                        sub_ptr->Cancel();
-                        sub_ptr->MarkDispatchDone();
+                buf::MultiBuffer frame_payload;
+                if (hdr.has_data && hdr.data_len > 0) {
+                    if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
+                        !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
+                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] payload extraction failed");
                         result.error = ErrorCode::RESOURCE_EXHAUSTED;
                         running = false;
-                    }
-
-                } else {
-                    // ---- 新建 TCP 子会话 ----
-                    if (hdr.has_target) {
-                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> {}",
-                            hdr.session_id, hdr.target);
-                    } else {
-                        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> ?",
-                            hdr.session_id);
-                    }
-
-                    uint16_t    sid  = hdr.session_id;
-
-                    if (sub_sessions.contains(sid)) {
-                        LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] duplicate TCP sid={}", sid);
-                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                        (void)co_await write_frame_to_client(write_frame);
                         break;
                     }
+                } else {
+                    frame_buf.DropPrefixBytes(hdr.frame_size);
+                }
+                frame_buf_bytes -= std::min(frame_buf_bytes, hdr.frame_size);
 
-                    auto sub_state = std::make_unique<TcpSubState>(
-                        io_context, sid, reply_queue);
-                    auto& sub_ctx = sub_state->ctx;
-                    sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                    sub_ctx.worker_id                = parent_ctx.worker_id;
-                    sub_ctx.parent_conn_id           = parent_conn_id;
-                    sub_ctx.stream_id                = sid;
-                    sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
-                    sub_ctx.config_generation        = parent_ctx.config_generation;
-                    sub_ctx.inbound                  = parent_ctx.inbound;
-                    sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
-                    sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
-                    sub_ctx.content.network          = Network::TCP;
-                    if (hdr.has_target) {
+                switch (hdr.status) {
+
+                // ----------------------------------------------------------------
+                case mux::SessionStatus::KEEPALIVE: {
+                    mux::EncodeKeepAliveTo(write_frame);
+                    if (!co_await write_frame_to_client(write_frame)) {
+                        running = false;
+                    }
+                    break;
+                }
+
+                // ----------------------------------------------------------------
+                case mux::SessionStatus::NEW: {
+                    if (hdr.network == mux::NetworkType::UDP) {
+                        // ---- 新建 UDP 子会话 ----
+                        LOG_CONN_DEBUG(parent_ctx,
+                            "[MuxRelay] New UDP sid={} target={} data={}B global_id={}",
+                            hdr.session_id, hdr.target, hdr.data_len, hdr.has_global_id);
+
+                        uint16_t sid = hdr.session_id;
+                        if (sub_sessions.contains(sid)) {
+                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(write_frame);
+                            break;
+                        }
+
+                        auto sub_state = std::make_unique<UdpSubState>(
+                            io_context,
+                            sid,
+                            reply_queue,
+                            parent_conn_id,
+                            hdr.target,
+                            hdr.has_global_id);
+                        auto& sub_ctx = sub_state->ctx;
+                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
+                        sub_ctx.worker_id                = parent_ctx.worker_id;
+                        sub_ctx.parent_conn_id           = parent_conn_id;
+                        sub_ctx.stream_id                = sid;
+                        sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
+                        sub_ctx.config_generation        = parent_ctx.config_generation;
+                        sub_ctx.inbound                  = parent_ctx.inbound;
+                        sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
+                        sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
+                        sub_ctx.content.network          = Network::UDP;
                         sub_ctx.outbound.original_target = hdr.target;
                         sub_ctx.outbound.target          = hdr.target;
-                    }
 
-                    if (buf::HasData(frame_payload) &&
-                        !sub_state->PushClientPayload(std::move(frame_payload))) {
-                        LOG_CONN_DEBUG(parent_ctx,
-                            "[MuxRelay] TCP input queue overflow sid={}", sid);
-                        mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                        (void)co_await write_frame_to_client(write_frame);
-                        break;
-                    }
-
-                    auto [insert_it, inserted] = sub_sessions.try_emplace(
-                        sid,
-                        TcpSubInfo{std::move(sub_state)});
-                    (void)inserted;
-                    TcpSubState* sub_ptr =
-                        std::get<TcpSubInfo>(insert_it->second).get();
-
-                    // SubLoopLease 随协程帧持有计数，ProcessInbound 退出前等待其析构，
-                    // 保证 TcpSubState 生命周期覆盖 detached coroutine。
-                    try {
-                        net::co_spawn(io_context.get_executor(),
-                            RunTcpSubDispatch(
-                                io_context,
-                                dispatcher,
-                                policy,
-                                sub_ptr,
-                                stats,
-                                timeouts,
-                                SubLoopLease{reply_queue}),
-                            net::detached);
-                    } catch (...) {
-                        ReportDispatchAdmissionFailure(sub_ptr->ctx);
-                        sub_ptr->Cancel();
-                        sub_ptr->MarkDispatchDone();
-                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
-                        running = false;
-                    }
-                }
-                break;
-            }
-
-            // ----------------------------------------------------------------
-            case mux::SessionStatus::KEEP: {
-                auto session_it = sub_sessions.find(hdr.session_id);
-                auto* udp_sub = session_it == sub_sessions.end()
-                    ? nullptr
-                    : std::get_if<UdpSubInfo>(&session_it->second);
-                if (udp_sub) {
-                    if (hdr.has_target && buf::HasData(frame_payload)) {
-                        for (auto* buffer : frame_payload) {
-                            if (buffer && !buffer->IsEmpty()) {
-                                buffer->SetUDP(hdr.target);
+                        if (buf::HasData(frame_payload)) {
+                            for (auto* buffer : frame_payload) {
+                                if (buffer && !buffer->IsEmpty()) {
+                                    buffer->SetUDP(hdr.target);
+                                }
                             }
+                            sub_state->PushClientPayload(std::move(frame_payload), hdr.data_len);
                         }
-                    }
-                    if (buf::HasData(frame_payload)) {
-                        (*udp_sub)->PushClientPayload(std::move(frame_payload), hdr.data_len);
-                    }
-                } else {
-                    // TCP 数据
-                    auto* tcp_sub = session_it == sub_sessions.end()
-                        ? nullptr
-                        : std::get_if<TcpSubInfo>(&session_it->second);
-                    bool tcp_write_failed = false;
-                    if (tcp_sub && buf::HasData(frame_payload)) {
-                        if (!(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
-                            tcp_write_failed = true;
+
+                        auto [insert_it, inserted] = sub_sessions.try_emplace(
+                            sid,
+                            UdpSubInfo{std::move(sub_state)});
+                        (void)inserted;
+                        UdpSubState* sub_ptr =
+                            std::get<UdpSubInfo>(insert_it->second).get();
+
+                        try {
+                            tasks.Spawn(RunUdpSubDispatch(
+                                    io_context,
+                                    dispatcher,
+                                    policy,
+                                    sub_ptr,
+                                    stats,
+                                    timeouts,
+                                    SubLoopLease{reply_queue}));
+                        } catch (...) {
+                            ReportDispatchAdmissionFailure(sub_ptr->ctx);
+                            sub_ptr->Cancel();
+                            sub_ptr->MarkDispatchDone();
+                            result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                            running = false;
                         }
-                    }
-                    if (tcp_write_failed) {
-                        (*tcp_sub)->Cancel();
-                        mux::EncodeEndTo(write_frame, hdr.session_id);
-                        if (!co_await write_frame_to_client(write_frame)) {
+
+                    } else {
+                        // ---- 新建 TCP 子会话 ----
+                        if (hdr.has_target) {
+                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> {}",
+                                hdr.session_id, hdr.target);
+                        } else {
+                            LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] New TCP sid={} -> ?",
+                                hdr.session_id);
+                        }
+
+                        uint16_t    sid  = hdr.session_id;
+
+                        if (sub_sessions.contains(sid)) {
+                            LOG_CONN_DEBUG(parent_ctx,
+                                "[MuxRelay] duplicate TCP sid={}", sid);
+                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(write_frame);
+                            break;
+                        }
+
+                        auto sub_state = std::make_unique<TcpSubState>(
+                            io_context, sid, reply_queue);
+                        auto& sub_ctx = sub_state->ctx;
+                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
+                        sub_ctx.worker_id                = parent_ctx.worker_id;
+                        sub_ctx.parent_conn_id           = parent_conn_id;
+                        sub_ctx.stream_id                = sid;
+                        sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
+                        sub_ctx.config_generation        = parent_ctx.config_generation;
+                        sub_ctx.inbound                  = parent_ctx.inbound;
+                        sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
+                        sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
+                        sub_ctx.content.network          = Network::TCP;
+                        if (hdr.has_target) {
+                            sub_ctx.outbound.original_target = hdr.target;
+                            sub_ctx.outbound.target          = hdr.target;
+                        }
+
+                        if (buf::HasData(frame_payload) &&
+                            !sub_state->PushClientPayload(std::move(frame_payload))) {
+                            LOG_CONN_DEBUG(parent_ctx,
+                                "[MuxRelay] TCP input queue overflow sid={}", sid);
+                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(write_frame);
+                            break;
+                        }
+
+                        auto [insert_it, inserted] = sub_sessions.try_emplace(
+                            sid,
+                            TcpSubInfo{std::move(sub_state)});
+                        (void)inserted;
+                        TcpSubState* sub_ptr =
+                            std::get<TcpSubInfo>(insert_it->second).get();
+
+                        // 计数仅用于正常 EOF 排空；任务组持有并 join 真正的完成回调。
+                        try {
+                            tasks.Spawn(RunTcpSubDispatch(
+                                    io_context,
+                                    dispatcher,
+                                    policy,
+                                    sub_ptr,
+                                    stats,
+                                    timeouts,
+                                    SubLoopLease{reply_queue}));
+                        } catch (...) {
+                            ReportDispatchAdmissionFailure(sub_ptr->ctx);
+                            sub_ptr->Cancel();
+                            sub_ptr->MarkDispatchDone();
+                            result.error = ErrorCode::RESOURCE_EXHAUSTED;
                             running = false;
                         }
                     }
+                    break;
                 }
-                break;
-            }
 
-            // ----------------------------------------------------------------
-            case mux::SessionStatus::END: {
-                uint16_t sid = hdr.session_id;
-                auto session_it = sub_sessions.find(sid);
-                const bool known_session = session_it != sub_sessions.end();
-
-                if (known_session) {
-                    if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
+                // ----------------------------------------------------------------
+                case mux::SessionStatus::KEEP: {
+                    auto session_it = sub_sessions.find(hdr.session_id);
+                    auto* udp_sub = session_it == sub_sessions.end()
+                        ? nullptr
+                        : std::get_if<UdpSubInfo>(&session_it->second);
+                    if (udp_sub) {
                         if (hdr.has_target && buf::HasData(frame_payload)) {
                             for (auto* buffer : frame_payload) {
                                 if (buffer && !buffer->IsEmpty()) {
@@ -1569,76 +1520,113 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             }
                         }
                         if (buf::HasData(frame_payload)) {
-                            (*udp_sub)->PushClientPayload(
-                                std::move(frame_payload), hdr.data_len);
+                            (*udp_sub)->PushClientPayload(std::move(frame_payload), hdr.data_len);
                         }
-                        (*udp_sub)->CloseClientInput();
-                        if ((*udp_sub)->DispatchDone()) {
-                            sub_sessions.erase(session_it);
+                    } else {
+                        // TCP 数据
+                        auto* tcp_sub = session_it == sub_sessions.end()
+                            ? nullptr
+                            : std::get_if<TcpSubInfo>(&session_it->second);
+                        bool tcp_write_failed = false;
+                        if (tcp_sub && buf::HasData(frame_payload)) {
+                            if (!(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
+                                tcp_write_failed = true;
+                            }
                         }
-                    } else if (auto* tcp_sub =
-                                   std::get_if<TcpSubInfo>(&session_it->second)) {
-                        if (buf::HasData(frame_payload) &&
-                            !(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
+                        if (tcp_write_failed) {
                             (*tcp_sub)->Cancel();
-                        }
-                        (*tcp_sub)->CloseClientInput();
-                        if ((*tcp_sub)->DispatchDone()) {
-                            sub_sessions.erase(session_it);
+                            mux::EncodeEndTo(write_frame, hdr.session_id);
+                            if (!co_await write_frame_to_client(write_frame)) {
+                                running = false;
+                            }
                         }
                     }
+                    break;
                 }
 
-                // 已知子会话的 END 只表示客户端输入结束；真正回给客户端的
-                // END 由子会话 dispatch 完成时发送，避免先于最后一批回包到达。
-                if (!known_session) {
-                    mux::EncodeEndTo(write_frame, sid);
-                    if (!co_await write_frame_to_client(write_frame)) {
-                        running = false;
+                // ----------------------------------------------------------------
+                case mux::SessionStatus::END: {
+                    uint16_t sid = hdr.session_id;
+                    auto session_it = sub_sessions.find(sid);
+                    const bool known_session = session_it != sub_sessions.end();
+
+                    if (known_session) {
+                        if (auto* udp_sub = std::get_if<UdpSubInfo>(&session_it->second)) {
+                            if (hdr.has_target && buf::HasData(frame_payload)) {
+                                for (auto* buffer : frame_payload) {
+                                    if (buffer && !buffer->IsEmpty()) {
+                                        buffer->SetUDP(hdr.target);
+                                    }
+                                }
+                            }
+                            if (buf::HasData(frame_payload)) {
+                                (*udp_sub)->PushClientPayload(
+                                    std::move(frame_payload), hdr.data_len);
+                            }
+                            (*udp_sub)->CloseClientInput();
+                            if ((*udp_sub)->DispatchDone()) {
+                                sub_sessions.erase(session_it);
+                            }
+                        } else if (auto* tcp_sub =
+                                       std::get_if<TcpSubInfo>(&session_it->second)) {
+                            if (buf::HasData(frame_payload) &&
+                                !(*tcp_sub)->PushClientPayload(std::move(frame_payload))) {
+                                (*tcp_sub)->Cancel();
+                            }
+                            (*tcp_sub)->CloseClientInput();
+                            if ((*tcp_sub)->DispatchDone()) {
+                                sub_sessions.erase(session_it);
+                            }
+                        }
                     }
+
+                    // 已知子会话的 END 只表示客户端输入结束；真正回给客户端的
+                    // END 由子会话 dispatch 完成时发送，避免先于最后一批回包到达。
+                    if (!known_session) {
+                        mux::EncodeEndTo(write_frame, sid);
+                        if (!co_await write_frame_to_client(write_frame)) {
+                            running = false;
+                        }
+                    }
+                    break;
                 }
-                break;
+
+                }  // switch (hdr.status)
             }
-
-            }  // switch (hdr.status)
+            }
+        } catch (const std::bad_alloc&) {
+            result.error = ErrorCode::RESOURCE_EXHAUSTED;
+        } catch (...) {
+            result.error = ErrorCode::INTERNAL;
         }
+
+        release_write_frame();
+
+        // ------------------------------------------------------------------------
+        // 清理所有存活的子会话
+        // ------------------------------------------------------------------------
+        // 先标记停止，阻止回调继续推送到 reply_queue
+        reply_queue.running = false;
+        client_reads.running = false;
+        client_reads.WakeSpace();
+        client_control.Cancel();
+        LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: sub_sessions={}",
+            sub_sessions.size());
+
+        for (auto& [sid, sub] : sub_sessions) {
+            std::visit([](auto& state) { state->Cancel(); }, sub);
         }
-    } catch (const std::bad_alloc&) {
-        result.error = ErrorCode::RESOURCE_EXHAUSTED;
-    } catch (...) {
-        result.error = ErrorCode::INTERNAL;
-    }
+        tasks.Cancel();
+    };
 
-    release_write_frame();
-
-    // ------------------------------------------------------------------------
-    // 清理所有存活的子会话
-    // ------------------------------------------------------------------------
-    // 先标记停止，阻止回调继续推送到 reply_queue
-    reply_queue.running = false;
-    client_reads.running = false;
-    client_reads.WakeSpace();
-    client_control.Cancel();
-    while (!client_reads.done) {
-        auto [ec] = co_await client_reads.done_signal.async_receive(
-            net::as_tuple(net::use_awaitable));
-        if (ec) {
-            break;
-        }
-    }
-    co_await net::post(io_context.get_executor(), net::use_awaitable);
-
-    LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Cleanup: sub_sessions={}",
-        sub_sessions.size());
-
-    for (auto& [sid, sub] : sub_sessions) {
-        std::visit([](auto& state) { state->Cancel(); }, sub);
-    }
-    while (reply_queue.active_sub_loops > 0) {
-        auto [ec] = co_await reply_queue.sub_done_signal.async_receive(
-            net::as_tuple(net::use_awaitable));
-        (void)ec;
-    }
+    // Acquire the join continuation before any task starts. Session storage is
+    // released only after the reader, frame loop and every dynamic dispatch have
+    // delivered their co_spawn completion, including failure/cancellation.
+    co_await RunAwaitableTaskGroup(io_context.get_executor(),
+        [&](AwaitableTaskGroup& tasks) {
+            tasks.Spawn(client_reader_loop());
+            tasks.Spawn(process_frames(tasks));
+        });
 
 #ifndef NDEBUG
     const uint64_t udp_dropped = reply_queue.udp_dropped;

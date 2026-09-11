@@ -5,6 +5,7 @@
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -25,10 +26,12 @@ class DNS;
 // acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
 namespace proxy::anytls::outbound {
 
+template<class Session> class SessionPool;
+
 struct Settings {
     std::string address;
     uint16_t port = 0;
-    std::string password;
+    std::array<uint8_t, 32> password_hash{};
     std::optional<net::ip::address> literal_address;
     OutboundBind send_through;
     std::chrono::seconds idle_session_check_interval{30};
@@ -46,6 +49,7 @@ struct Settings {
 class Handler final : public Outbound {
 public:
     Handler(std::string tag,
+            net::io_context& io_context,
             Settings settings,
             StreamSettings stream_settings,
             std::chrono::seconds dial_timeout,
@@ -60,8 +64,7 @@ public:
         transport::Link inbound,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        buf::MultiBuffer& first_payload,
+        buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
@@ -70,22 +73,17 @@ public:
     }
 
 private:
+    struct PaddingState;
     struct ClientSession;
     struct LogicalStreamLease;
 
-    static void CloseSession(std::shared_ptr<ClientSession> session) noexcept;
-    void PruneSessions();
-
     std::string tag_;
-    Settings settings_;
-    StreamSettings stream_settings_;
+    const Settings settings_;
+    const StreamSettings stream_settings_;
     std::chrono::seconds dial_timeout_;
-    app::dns::DNS* dns_service_ = nullptr;
-    memory::ThreadLocalVector<std::shared_ptr<ClientSession>> sessions_;
-    memory::ThreadLocalVector<std::shared_ptr<ClientSession>> idle_sessions_;
-    std::chrono::seconds idle_session_check_interval_{30};
-    std::chrono::seconds idle_session_timeout_{60};
-    size_t min_idle_sessions_ = 0;
+    app::dns::DNS& dns_service_;
+    std::shared_ptr<PaddingState> padding_;
+    std::unique_ptr<SessionPool<ClientSession>> pool_;
 };
 
 }  // namespace proxy::anytls::outbound

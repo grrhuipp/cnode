@@ -12,6 +12,10 @@
 #include "udp_callback_router.hpp"
 #include "udp_receive_buffer.hpp"
 
+#include <asio/as_tuple.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/use_awaitable.hpp>
+
 #include <new>
 #include <optional>
 #include <span>
@@ -116,7 +120,7 @@ struct UDPSession::Impl {
             co_return ErrorCode::SUCCESS;
         } catch (const IoSystemError& e) {
             LOG_NET_DEBUG("UDP session {} SendTo error: {}", session_id, e.what());
-            co_return ErrorCode::NETWORK_IO_ERROR;
+            co_return MapAsioError(e.code());
         } catch (const std::bad_alloc&) {
             co_return ErrorCode::RESOURCE_EXHAUSTED;
         }
@@ -234,30 +238,6 @@ UDPSession::Impl::ResolveEndpoint(const TargetAddress& target) {
 
 net::awaitable<ErrorCode> UDPSession::SendTo(
     const TargetAddress& target,
-    const uint8_t* data,
-    size_t len,
-    uint64_t callback_id) {
-
-    if (!impl_->running) {
-        co_return ErrorCode::CONNECTION_CLOSED;
-    }
-    if (len == 0) {
-        co_return ErrorCode::SUCCESS;
-    }
-    if (!data) {
-        co_return ErrorCode::INVALID_ARGUMENT;
-    }
-
-    auto [resolve_error, remote_ep] = co_await impl_->ResolveEndpoint(target);
-    if (resolve_error != ErrorCode::SUCCESS) {
-        co_return resolve_error;
-    }
-    co_return co_await impl_->SendResolved(
-        remote_ep, net::buffer(data, len), len, callback_id);
-}
-
-net::awaitable<ErrorCode> UDPSession::SendTo(
-    const TargetAddress& target,
     buf::MultiBuffer payload,
     uint64_t callback_id) {
 
@@ -366,10 +346,8 @@ uint64_t UDPSession::RegisterCallback(PacketCallback callback) {
     return id;
 }
 
-void UDPSession::UnregisterCallback(uint64_t callback_id) {
-    if (impl_->callbacks.Unregister(callback_id)) {
-        LOG_NET_DEBUG("UDP session {} unregistered Full Cone callback {}", impl_->session_id, callback_id);
-    }
+void UDPSession::UnregisterCallback(uint64_t callback_id) noexcept {
+    (void)impl_->callbacks.Unregister(callback_id);
 }
 
 net::awaitable<void> UDPSession::Impl::RunReceive(std::shared_ptr<Impl> self) {
@@ -546,7 +524,13 @@ UDPSessionManager::UDPSessionManager(net::io_context& io_context,
 }
 
 UDPSessionManager::~UDPSessionManager() {
-    StopAll();
+    impl_->running = false;
+    if (impl_->cleanup_token.Valid()) {
+        TimeoutScheduler::ForIoContext(impl_->io_context).Cancel(impl_->cleanup_token);
+    }
+    for (const auto& [id, session] : impl_->sessions) {
+        session->Stop();
+    }
 }
 
 std::expected<std::shared_ptr<UDPSession>, ErrorCode>
@@ -659,19 +643,6 @@ void UDPSessionManager::CleanupExpiredSessions() {
             CleanupExpiredSessions();
         }
     });
-}
-
-void UDPSessionManager::StopAll() {
-    impl_->running = false;
-    if (impl_->cleanup_token.Valid()) {
-        TimeoutScheduler::ForIoContext(impl_->io_context).Cancel(impl_->cleanup_token);
-    }
-
-    for (const auto& [id, session] : impl_->sessions) {
-        session->Stop();
-    }
-    impl_->sessions.clear();
-    MaybeShrinkHashContainer(impl_->sessions, 64);
 }
 
 size_t UDPSessionManager::ActiveSessionCount() const {

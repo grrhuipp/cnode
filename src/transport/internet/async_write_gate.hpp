@@ -58,6 +58,9 @@ public:
     explicit AsyncWriteGate(net::io_context& io_context)
         : signal_(io_context, 1) {}
 
+    explicit AsyncWriteGate(net::any_io_executor executor)
+        : signal_(std::move(executor), 1) {}
+
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 

@@ -22,6 +22,7 @@ void SetupPanels(net::io_context& main_ctx,
             api_config.Name = panel_config.Name;
             api_config.APIHost = panel_config.APIHost;
             api_config.Key = panel_config.Key;
+            api_config.RequestTimeout = panel_config.RequestTimeout;
             api_config.NodeID = node_id;
             api_config.NodeType = panel_config.NodeType;
 

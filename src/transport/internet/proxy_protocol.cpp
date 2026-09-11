@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/proxy_protocol.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/ip_utils.hpp"
 
@@ -159,11 +160,10 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
     auto sp2 = line.find(' ');
     if (sp2 == std::string_view::npos) return MakeInvalid();
     std::string_view src_ip = line.substr(0, sp2);
-    IoErrorCode src_ec;
-    auto src_addr = net::ip::make_address(src_ip, src_ec);
-    if (src_ec ||
-        (family == "TCP4" && !src_addr.is_v4()) ||
-        (family == "TCP6" && !src_addr.is_v6())) {
+    const auto src_addr = iputil::ParseLiteral(src_ip);
+    if (!src_addr ||
+        (family == "TCP4" && !src_addr->is_v4()) ||
+        (family == "TCP6" && !src_addr->is_v6())) {
         return MakeInvalid();
     }
     line.remove_prefix(sp2 + 1);
@@ -184,7 +184,7 @@ ProxyProtocolResult ProxyProtocolParser::ParseV1(const uint8_t* data, size_t len
     ProxyProtocolResult r;
     r.status   = ProxyProtocolParseStatus::Success;
     r.src_ip.assign(src_ip.data(), src_ip.size());
-    r.src_addr = iputil::NormalizeAddress(src_addr);
+    r.src_addr = iputil::NormalizeAddress(*src_addr);
     r.src_port = src_port;
     r.consumed = static_cast<size_t>(crlf - data) + 2;
     return r;

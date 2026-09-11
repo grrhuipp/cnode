@@ -1,33 +1,30 @@
 #pragma once
 
-#include "acppnode/app/bootstrap_inbounds.hpp"
 #include "acppnode/common/asio_types.hpp"
 
-#include <asio/executor_work_guard.hpp>
-
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace acpp {
 class Controller;
 class ShardedStats;
 class Worker;
+struct InboundStartup;
 }
 
 namespace acpp {
 
 struct RuntimeContext {
-    net::io_context&                                      main_ctx;
-    ShardedStats&                                         stats;
-    std::vector<std::unique_ptr<Worker>>&                 workers;
-    Controller&                                     controller;
-    std::vector<std::unique_ptr<net::io_context>>&        io_contexts;
-    std::vector<net::executor_work_guard<net::io_context::executor_type>>& work_guards;
-    InboundStartup&                                      inbound_startup;
-    bool                                                  enable_controller = false;
+    net::io_context& main_ctx;
+    ShardedStats& stats;
+    const std::vector<std::unique_ptr<Worker>>& workers;
+    Controller& controller;
+    const std::vector<std::unique_ptr<net::io_context>>& io_contexts;
+    InboundStartup& inbound_startup;
+    bool enable_controller = false;
 };
 
-void RunApplicationRuntime(const RuntimeContext& ctx);
+// Transfers control to the process-lifetime runtime; never unwinds active Workers.
+[[noreturn]] void RunApplicationRuntime(const RuntimeContext& ctx) noexcept;
 
 }  // namespace acpp

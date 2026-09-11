@@ -7,9 +7,9 @@
 namespace acpp::controller {
 
 [[nodiscard]] inline bool ShouldEnableInboundTls(
-    const PanelConfig* panel_config,
+    const PanelConfig& panel_config,
     const api::NodeInfo& node_config) noexcept {
-    if (panel_config && !panel_config->TLSEnable) {
+    if (!panel_config.TLSEnable) {
         return false;
     }
 

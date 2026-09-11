@@ -1,4 +1,7 @@
 #include "anytls_outbound_settings.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
+#include "../credentials.hpp"
 
 #include "acppnode/infra/json_port.hpp"
 
@@ -76,6 +79,12 @@ std::expected<std::chrono::seconds, std::string> ReadPositiveSeconds(
         return std::unexpected(std::format(
             "{} exceeds the seconds range", *aliases.begin()));
     }
+    const auto clock_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::duration::max()).count();
+    if (*parsed->value > static_cast<uint64_t>(clock_seconds)) {
+        return std::unexpected(std::format(
+            "{} exceeds the steady clock range", *aliases.begin()));
+    }
     return std::chrono::seconds(static_cast<Rep>(*parsed->value));
 }
 
@@ -93,8 +102,8 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
     }
     if (port.Valid()) result.port = port.value;
 
-    result.password = ReadString(source, "password");
-    if (result.password.empty()) result.password = ReadString(source, "key");
+    auto password = ReadString(source, "password");
+    if (password.empty()) password = ReadString(source, "key");
 
     auto check_interval = ReadPositiveSeconds(
         source,
@@ -122,13 +131,15 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
         result.min_idle_sessions = static_cast<size_t>(*min_idle->value);
     }
 
-    IoErrorCode address_error;
-    auto literal_address = net::ip::make_address(result.address, address_error);
-    if (!address_error) result.literal_address = literal_address;
-
     if (result.address.empty()) return std::unexpected("AnyTLS address is required");
-    if (result.password.empty()) return std::unexpected("AnyTLS password is required");
+    result.literal_address = iputil::ParseLiteral(result.address);
+    if (!result.literal_address && !domain::IsValidDnsHostname(
+            result.address, domain::TrailingDotPolicy::Allow)) {
+        return std::unexpected("AnyTLS address must be an IP literal or DNS hostname");
+    }
+    if (password.empty()) return std::unexpected("AnyTLS password is required");
     if (result.port == 0) return std::unexpected("AnyTLS port is required");
+    result.password_hash = acpp::anytls::PasswordHash(password);
     return result;
 }
 

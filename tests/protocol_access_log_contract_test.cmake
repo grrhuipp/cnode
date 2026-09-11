@@ -42,8 +42,8 @@ file(READ
     "${SOURCE_DIR}/src/app/access_log_session.cpp"
     ACCESS_LOG_SESSION_SOURCE)
 file(READ
-    "${SOURCE_DIR}/src/app/relay_udp.cpp"
-    UDP_RELAY_SOURCE)
+    "${SOURCE_DIR}/src/app/udp_channel.cpp"
+    UDP_CHANNEL_SOURCE)
 file(READ
     "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
     RELAY_SOURCE)
@@ -64,15 +64,12 @@ file(READ
     WORKER_SOURCE)
 
 foreach(SOURCE IN ITEMS
-        VLESS_OUTBOUND_SOURCE
-        TROJAN_OUTBOUND_SOURCE
-        ANYTLS_OUTBOUND_SOURCE)
-    if(NOT "${${SOURCE}}" MATCHES
-           "result[.]bytes_up [+]= prewritten_bytes" OR
-       NOT "${${SOURCE}}" MATCHES
-           "ctx[.]traffic[.]bytes_up = result[.]bytes_up")
+        VLESS_OUTBOUND_SOURCE TROJAN_OUTBOUND_SOURCE ANYTLS_OUTBOUND_SOURCE
+        VMESS_OUTBOUND_SOURCE SHADOWSOCKS_OUTBOUND_SOURCE FREEDOM_OUTBOUND_SOURCE)
+    if("${${SOURCE}}" MATCHES "prewritten_bytes|prewrote_.*payload|stats[.]AddBytesOut|ctx[.]traffic[.]bytes_up =" OR
+       NOT "${${SOURCE}}" MATCHES "std::move[(]first_payload[)]")
         message(FATAL_ERROR
-            "${SOURCE}: prewritten proxy payload must remain visible to access logging")
+            "${SOURCE}: application payload ownership and byte accounting must transfer into relay")
     endif()
 endforeach()
 
@@ -177,46 +174,21 @@ if(NOT MUX_RELAY_SOURCE MATCHES
         "Mux child input failures must remain visible to access logging")
 endif()
 
-string(FIND "${UDP_RELAY_SOURCE}"
-       "auto send_result = co_await session.SendTo"
-       UDP_SEND_POSITION)
-string(FIND "${UDP_RELAY_SOURCE}"
-       "ctx.traffic.bytes_up += datagram_info.payload_size"
-       UDP_ACCOUNT_POSITION)
-if(UDP_SEND_POSITION EQUAL -1 OR UDP_ACCOUNT_POSITION EQUAL -1 OR
-   NOT UDP_SEND_POSITION LESS UDP_ACCOUNT_POSITION OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "result[.]error = send_result")
-    message(FATAL_ERROR
-        "UDP access traffic must be accounted only after a successful datagram send")
+# Datagram endpoints now use the same accounting and close-state path as
+# streams. Keep the error-domain and queue-pressure boundaries explicit.
+if(NOT UDP_CHANNEL_SOURCE MATCHES "transport::LinkError" OR
+   NOT RELAY_SOURCE MATCHES "catch [(]const transport::LinkError& e[)]" OR
+   NOT RELAY_SOURCE MATCHES "error = e[.]code[(][)]")
+    message(FATAL_ERROR "logical UDP failures must retain their application error code in relay")
 endif()
-
-if(NOT UDP_RELAY_SOURCE MATCHES
-       "state[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "result[.]error = state[.]terminal_error" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "UDP Full Cone reply queue exhausted")
-    message(FATAL_ERROR
-        "Full Cone UDP reply rejection must terminate the relay and reach access logging")
-endif()
-
-if(NOT UDP_RELAY_SOURCE MATCHES
-       "auto mark_close_side" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "catch [(]const IoSystemError& e[)] [{][\r\n ]*mark_close_side[(]true[)]" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "UDP reply write failed")
-    message(FATAL_ERROR
-        "UDP client read and reply-write failures must publish client close-side evidence")
+if(NOT UDP_CHANNEL_SOURCE MATCHES "Stop[(]ErrorCode::RESOURCE_EXHAUSTED[)]")
+    message(FATAL_ERROR "UDP queue exhaustion must terminate the request and reach relay")
 endif()
 
 if(NOT RELAY_SOURCE MATCHES
        "ObserveUdpRelayTarget" OR
    NOT RELAY_SOURCE MATCHES
        "ctx[.]content[.]multiple_targets = true" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "ObserveUdpRelayTarget[(]ctx, read_mb[)]" OR
    NOT ACCESS_LOG_EVENT_SOURCE MATCHES
        "if [(][!]ctx[.]content[.]multiple_targets[)]")
     message(FATAL_ERROR
@@ -228,29 +200,16 @@ if(NOT RELAY_SOURCE MATCHES
    NOT RELAY_SOURCE MATCHES
        "close_state[.]Mark[(]is_upload[)]" OR
    NOT RELAY_SOURCE MATCHES
-       "result[.]close_side_known = close_state[.]known" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-       "result[.]close_side_known = true")
+       "result[.]close_side_known = close_state[.]known")
     message(FATAL_ERROR
         "relay must capture the first terminal endpoint and publish its close-side evidence")
 endif()
 
-string(REGEX MATCHALL
-       "result[.]client_closed_first = false"
-       FIRST_PACKET_REMOTE_FAILURES
-       "${RELAY_SOURCE}")
-list(LENGTH FIRST_PACKET_REMOTE_FAILURES FIRST_PACKET_REMOTE_FAILURE_COUNT)
-string(REGEX MATCHALL
-       "result[.]close_side_known = true"
-       FIRST_PACKET_KNOWN_FAILURES
-       "${RELAY_SOURCE}")
-list(LENGTH FIRST_PACKET_KNOWN_FAILURES FIRST_PACKET_KNOWN_FAILURE_COUNT)
-if(NOT FIRST_PACKET_REMOTE_FAILURE_COUNT EQUAL 6 OR
-   NOT FIRST_PACKET_KNOWN_FAILURE_COUNT EQUAL 6 OR
-   NOT RELAY_SOURCE MATCHES
-       "result[.]error = ErrorCode::RESOURCE_EXHAUSTED;[\r\n ]*result[.]error_msg = .first packet allocation failed.")
+if(RELAY_SOURCE MATCHES "DoRelayLinkWithFirstPacket|WriteFirstPacket" OR
+   NOT RELAY_SOURCE MATCHES "buf::MultiBuffer initial_payload" OR
+   NOT RELAY_SOURCE MATCHES "close_state[.]MarkLocalFailure[(][)]")
     message(FATAL_ERROR
-        "first-packet target failures must report Remote while allocation failures stay local")
+        "initial payload must use the ordinary relay loop and allocation failures must stay local")
 endif()
 
 foreach(SOURCE IN ITEMS
@@ -274,21 +233,21 @@ if(ANYTLS_INBOUND_SOURCE MATCHES "access_event_submitted" OR
 endif()
 
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "report_predispatch_failure" OR
+       "error = co_await ProcessStream[(][*]sub[,)]" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
        "access_log[.]Fail[(]error[)]" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "report_predispatch_failure[(]request[.]error[(][)][)]" OR
+       "app::AccessLogSession access_log[(]sub->ctx[)]" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "report_predispatch_failure[(]ErrorCode::PROTOCOL_INVALID_ADDRESS[)]")
+       "if [(][!]request[)] co_return request[.]error[(][)]")
     message(FATAL_ERROR
         "AnyTLS UoT child failures before dispatcher entry must reach access logging")
 endif()
 
-if(NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "report_child_creation_failure" OR
+if(ANYTLS_INBOUND_SOURCE MATCHES
+       "report_child_creation_failure|report_predispatch_failure" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "report_child_creation_failure[(][\r\n ]*sid,[\r\n ]*TargetAddress[{][}]" OR
+       "if [(][!]parsed[)] co_return parsed[.]error[(][)]" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
        "ErrorCode::PROTOCOL_INVALID_ADDRESS" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
@@ -298,7 +257,9 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES
 endif()
 
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
-       "session::Context& ctx = sub->ctx" OR
+       "CopySessionContext[(]base_ctx_, sub->ctx[)]" OR
+   NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "sub->ctx[.]stream_id = sid" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
        "ReportStreamFailure[(]sid, ErrorCode::RESOURCE_EXHAUSTED[)]" OR
    NOT ANYTLS_INBOUND_SOURCE MATCHES
@@ -312,19 +273,11 @@ if(NOT ANYTLS_INBOUND_SOURCE MATCHES
    ANYTLS_INBOUND_SOURCE MATCHES
        "if [(]ec[)] [{][\r\n ]*co_return buf::MultiBuffer[{][}]" OR
    NOT ANYTLS_OUTBOUND_SOURCE MATCHES
-       "payload[.]error[(][)] == ErrorCode::RESOURCE_EXHAUSTED" OR
+       "throw transport::LinkError[(]payload[.]error[(][)][)]" OR
    NOT ANYTLS_OUTBOUND_SOURCE MATCHES
-       "io_error::no_buffer_space")
+       "throw transport::LinkError[(]ok[.]error[(][)][)]")
     message(FATAL_ERROR
         "AnyTLS child termination must remain visible to access logging")
-endif()
-
-if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
-       "if [(][!]prewrote_initial_payload && [!]initial_payload[.]empty[(][)][)]" OR
-   NOT ANYTLS_OUTBOUND_SOURCE MATCHES
-       "stats[.]AddBytesOut[(]prewritten_bytes[)]")
-    message(FATAL_ERROR
-        "AnyTLS open-packet payload must be sent once and counted as access traffic")
 endif()
 
 foreach(SOURCE IN ITEMS

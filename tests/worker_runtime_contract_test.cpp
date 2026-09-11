@@ -8,9 +8,6 @@
 #include <utility>
 
 static_assert(std::same_as<
-    decltype(std::declval<acpp::Worker&>().ShutdownTask()),
-    acpp::net::awaitable<void>>);
-static_assert(std::same_as<
     decltype(std::declval<acpp::Worker&>().StartRuntimeTask()),
     acpp::net::awaitable<void>>);
 static_assert(std::same_as<

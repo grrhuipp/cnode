@@ -53,5 +53,11 @@ int main() {
         if (!Rejects(value)) return 7;
     }
 
+    using namespace std::string_view_literals;
+    for (const auto value : {"192.0.2.1:9/24"sv, "192.0.2.1\0ignored/24"sv,
+                             "[2001:db8::1]/64"sv, "192.0.2.1 /24"sv,
+                             "192.00.2.1/24"sv, "fe80::1%invalid/64"sv}) {
+        if (!Rejects(value)) return 8;
+    }
     return 0;
 }

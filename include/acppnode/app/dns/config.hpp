@@ -9,7 +9,7 @@
 namespace acpp::app::dns {
 
 struct Config {
-    std::vector<net::ip::address> servers;
+    std::vector<udp::endpoint> servers;
     uint32_t timeout_sec = 5;
     size_t cache_size = 1024;
     size_t global_cache_size = 10000;

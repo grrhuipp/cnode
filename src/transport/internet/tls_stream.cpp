@@ -12,6 +12,8 @@
 #include <openssl/evp.h>
 #include <openssl/tls1.h>
 #include <asio/ssl.hpp>
+#include <asio/associated_cancellation_slot.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/write.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -291,10 +293,11 @@ public:
                     break;
                 }
 
+                const auto cancellation = net::get_associated_cancellation_slot(handler);
                 stream_->BeginTlsLayerRead();
                 stream_->TlsLayerSocket().async_read_some(
                     buffers,
-                    [this,
+                    net::bind_cancellation_slot(cancellation, [this,
                      buffers,
                      handler = std::forward<decltype(handler)>(handler)](
                         IoErrorCode ec, std::size_t n) mutable {
@@ -313,7 +316,7 @@ public:
                         }
                         stream_->EndTlsLayerRead(ec, n);
                         std::move(handler)(ec, n);
-                    });
+                    }));
             },
             token,
             buffers);
@@ -334,15 +337,16 @@ public:
                     return;
                 }
 
+                const auto cancellation = net::get_associated_cancellation_slot(handler);
                 stream_->BeginTlsLayerWrite();
                 stream_->TlsLayerSocket().async_write_some(
                     buffers,
-                    [this,
+                    net::bind_cancellation_slot(cancellation, [this,
                      handler = std::forward<decltype(handler)>(handler)](
                         IoErrorCode ec, std::size_t n) mutable {
                         stream_->EndTlsLayerWrite(ec, n);
                         std::move(handler)(ec, n);
-                    });
+                    }));
             },
             token,
             buffers);
@@ -577,7 +581,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
     }
 
     out->Produce(static_cast<uint32_t>(n));
-    co_return buf::MultiBuffer{out.release()};
+    co_return buf::MultiBuffer{std::move(out)};
 }
 
 net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
@@ -662,6 +666,7 @@ net::awaitable<void> TlsStream::AsyncShutdownWrite() {
 }
 
 void TlsStream::Close() {
+    NotifyClosed();
     shutdown_initiated_ = true;
     if (impl_) {
         impl_->stream.next_layer().Tcp().Close();
@@ -669,6 +674,7 @@ void TlsStream::Close() {
 }
 
 void TlsStream::CloseAbortive() {
+    NotifyClosed();
     shutdown_initiated_ = true;
     if (impl_) {
         impl_->stream.next_layer().Tcp().SetAbortiveClose(true);
@@ -677,6 +683,7 @@ void TlsStream::CloseAbortive() {
 }
 
 void TlsStream::Cancel() noexcept {
+    NotifyCancellation();
     if (impl_) {
         impl_->stream.next_layer().Tcp().Cancel();
     }

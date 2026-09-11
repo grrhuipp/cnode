@@ -1,4 +1,5 @@
 #include "config_semantics.hpp"
+#include "acppnode/core/naming.hpp"
 
 #include <vector>
 
@@ -105,6 +106,33 @@ int main() {
     inbounds[1] = Inbound("second", "127.0.0.2", 12001);
     inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
     if (!inbound_result.Ok()) return 14;
+
+    for (const char* wildcard : {"0.0.0.0", "auto"}) {
+        inbounds[0] = Inbound("first", wildcard, 12001);
+        inbounds[1] = Inbound("second", "127.0.0.1", 12001);
+        inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
+        if (inbound_result.error != StaticInboundSemanticError::DuplicateEndpoint) return 15;
+        std::swap(inbounds[0], inbounds[1]);
+        if (acpp::ValidateStaticInboundSemantics(inbounds).error !=
+            StaticInboundSemanticError::DuplicateEndpoint) return 16;
+    }
+    inbounds[0] = Inbound("first", "::", 12001);
+    inbounds[1] = Inbound("second", "127.0.0.1", 12001);
+    if (!acpp::ValidateStaticInboundSemantics(inbounds).Ok()) return 17;
+    inbounds[0] = Inbound("first", "auto", 12002);
+    if (!acpp::ValidateStaticInboundSemantics(inbounds).Ok()) return 18;
+
+    const auto first_node = acpp::naming::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
+    const auto second_node = acpp::naming::BuildPanelNodeTag("same-panel", 2, "vmess", 12001);
+    if (first_node == second_node || first_node ==
+        acpp::naming::BuildPanelNodeTag("other-panel", 1, "vmess", 12001)) return 19;
+    inbounds[0].tags[0] = first_node;
+    inbound_result = acpp::ValidateStaticInboundSemantics(inbounds);
+    if (inbound_result.error != StaticInboundSemanticError::ReservedTag ||
+        inbound_result.detail != first_node) return 20;
+    outbounds[0].tag = first_node;
+    result = acpp::ValidateOutboundRoutingSemantics(outbounds, {});
+    if (result.error != ConfigSemanticError::ReservedOutboundTag || result.tag != first_node) return 21;
 
     return 0;
 }

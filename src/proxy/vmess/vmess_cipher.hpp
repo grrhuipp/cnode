@@ -49,8 +49,6 @@ public:
     // plaintext 必须有 len - Overhead() 字节空间
     ssize_t Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* plaintext);
 
-    void ResetCount() { count_ = 0; }
-
 private:
     void BuildNonce(uint16_t count, uint8_t* nonce);
 

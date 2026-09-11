@@ -155,12 +155,4 @@ struct UDPRelayResult : ResultStatus {
     bool client_closed_first = false;
 };
 
-// ============================================================================
-// UDP Relay 配置
-// ============================================================================
-struct UDPRelayConfig {
-    size_t max_packet_size = 65535;          // 最大包大小
-    uint64_t speed_limit = 0;               // 限速 (bytes/s), 0 = 不限速
-};
-
 }  // namespace acpp

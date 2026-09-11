@@ -2,12 +2,9 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <algorithm>
-#include <asio/as_tuple.hpp>
 #include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
-#include <asio/use_awaitable.hpp>
 
-#include <stdexcept>
 
 namespace acpp {
 
@@ -49,8 +46,8 @@ struct TimeoutScheduler::Impl {
     memory::ThreadLocalVector<HeapEntry> deadline_heap;
     memory::ThreadLocalVector<uint64_t> ready_event_ids;
     uint64_t next_id = 1;
-    uint64_t timer_generation = 0;
-    bool timer_armed = false;
+    bool wait_pending = false;
+    bool wakeup_requested = false;
     bool released = false;
     bool dispatching_ready_batch = false;
     std::chrono::steady_clock::time_point armed_deadline{};
@@ -90,23 +87,23 @@ struct TimeoutScheduler::Impl {
             return;
         }
 
-        // Cancellation only erases the authoritative event. Rebuild the
-        // derived deadline index once tombstones dominate so a long-lived
-        // earlier timer cannot retain an unbounded cancelled tail. Build the
-        // replacement transactionally because Cancel is used by noexcept
-        // owner destructors and compaction is only a best-effort cold path.
-        try {
-            memory::ThreadLocalVector<HeapEntry> compacted;
-            compacted.reserve(std::max(kInitialEventReserve, events.size()));
-            for (const auto& [id, event] : events) {
-                compacted.push_back(HeapEntry{event.deadline, id});
-            }
-            std::make_heap(compacted.begin(), compacted.end(), HeapCompare{});
-            deadline_heap.swap(compacted);
-        } catch (...) {
-            // The original heap remains intact until swap, so allocation
-            // failure can safely defer compaction to a later cancellation.
+        // The index contains trivial values, so cancelled entries can be
+        // removed in place. Cancellation and owner destruction never need a
+        // replacement allocation, even when the stale tail is large.
+        std::erase_if(deadline_heap, [this](const HeapEntry& entry) {
+            const auto it = events.find(entry.id);
+            return it == events.end() || it->second.deadline != entry.deadline;
+        });
+        std::make_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
+    }
+
+    void RequestWakeup() noexcept {
+        if (!wait_pending || wakeup_requested) {
+            return;
         }
+        IoErrorCode ec;
+        timer.cancel(ec);
+        wakeup_requested = true;
     }
 
     void ArmTimer() {
@@ -117,45 +114,43 @@ struct TimeoutScheduler::Impl {
 
         const auto next_deadline = deadline_heap.front().deadline;
 
-        if (timer_armed && next_deadline >= armed_deadline) {
+        if (wait_pending) {
+            // Preserve the existing operation until its completion is
+            // delivered. An earlier event only wakes it; scheduling a second
+            // wait here could cancel the old one and then fail to allocate.
+            if (next_deadline < armed_deadline) {
+                RequestWakeup();
+            }
             return;
         }
 
-        const uint64_t generation = ++timer_generation;
-        armed_deadline = next_deadline;
-        timer_armed = true;
         timer.expires_at(next_deadline);
-        timer.async_wait([this, generation](const IoErrorCode& ec) {
-            if (generation != timer_generation) {
-                return;
-            }
+        timer.async_wait([this](const IoErrorCode& ec) {
             OnTimer(ec);
         });
+        // async_wait never invokes inline. Publish ownership only after its
+        // initiation succeeds; an exception must leave no fictitious wait.
+        armed_deadline = next_deadline;
+        wait_pending = true;
+        wakeup_requested = false;
     }
 
-    void ReconcileTimerAfterCancellation() {
+    void ReconcileTimerAfterCancellation() noexcept {
         PruneHeapTop();
-        if (!timer_armed) {
-            return;
-        }
-        if (!deadline_heap.empty() &&
-            deadline_heap.front().deadline == armed_deadline) {
-            return;
-        }
-
-        ++timer_generation;
-        IoErrorCode ec;
-        timer.cancel(ec);
-        timer_armed = false;
-        if (!deadline_heap.empty()) {
-            ArmTimer();
+        // A later remaining deadline can use the already-armed earlier wake.
+        // With no events, wake now so io_context::run can finish promptly.
+        if (deadline_heap.empty()) {
+            RequestWakeup();
         }
     }
 
     void OnTimer(const IoErrorCode& ec) {
-        timer_armed = false;
+        wait_pending = false;
+        wakeup_requested = false;
         if (released) return;
-        if (ec) return;  // cancelled / stopped
+        if (ec && ec != io_error::operation_aborted) {
+            throw IoSystemError(ec);
+        }
 
         auto& ready = ready_event_ids;
         ready.clear();
@@ -191,9 +186,9 @@ struct TimeoutScheduler::Impl {
                 if (cb) cb();
             } catch (...) {
                 // Asio propagates handler exceptions out of io_context::run().
-                // Worker thread entrypoints intentionally have no catch-all;
-                // isolate each timeout so one owner cannot terminate a Worker
-                // or suppress later callbacks in the same ready batch.
+                // Isolate owner callbacks so one failed timeout cannot skip
+                // later callbacks. Scheduler infrastructure failures still
+                // propagate to the process runtime failure boundary.
             }
             if (released) {
                 break;
@@ -210,10 +205,7 @@ struct TimeoutScheduler::Impl {
 
     void Release() noexcept {
         released = true;
-        ++timer_generation;
-        IoErrorCode ec;
-        timer.cancel(ec);
-        timer_armed = false;
+        RequestWakeup();
         dispatching_ready_batch = false;
         events.clear();
         deadline_heap.clear();
@@ -267,20 +259,12 @@ TimeoutScheduler::TimeoutScheduler(net::io_context& io_context)
     : impl_(std::make_unique<Impl>(io_context)) {}
 
 TimeoutToken::~TimeoutToken() noexcept {
-    if (!Valid()) {
-        return;
-    }
-    try {
+    if (Valid()) {
         owner_->Cancel(*this);
-    } catch (...) {
-        // Cancel erases this token's event before timer reconciliation can
-        // allocate. Destruction must not leak an exception if re-arming a
-        // different event fails under allocation pressure.
-        Reset();
     }
 }
 
-TimeoutToken& TimeoutToken::operator=(TimeoutToken&& other) {
+TimeoutToken& TimeoutToken::operator=(TimeoutToken&& other) noexcept {
     if (this != &other) {
         if (Valid()) {
             owner_->Cancel(*this);
@@ -334,7 +318,12 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
     TimeoutToken token;
     token.id_ = impl_->next_id++;
     token.owner_ = this;
-    const auto deadline = std::chrono::steady_clock::now() + delay;
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::time_point::max() - now);
+    const auto deadline = delay >= remaining
+        ? Clock::time_point::max() : now + delay;
 
     impl_->events.emplace(token.id_, Impl::Event{deadline, std::move(cb)});
     impl_->PushHeap(Impl::HeapEntry{deadline, token.id_});
@@ -343,7 +332,7 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
     return token;
 }
 
-void TimeoutScheduler::Cancel(TimeoutToken& token) {
+void TimeoutScheduler::Cancel(TimeoutToken& token) noexcept {
     if (!token.Valid()) return;
     if (token.owner_ != this) {
         return;
@@ -357,53 +346,6 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) {
             impl_->ReconcileTimerAfterCancellation();
             impl_->MaybeCompactHeap();
         }
-    }
-}
-
-ScheduledSleep::ScheduledSleep(net::io_context& io_context)
-    : scheduler_(TimeoutScheduler::ForIoContext(io_context))
-    , signal_(io_context, 1) {}
-
-ScheduledSleep::~ScheduledSleep() noexcept {
-    Cancel();
-}
-
-net::awaitable<void> ScheduledSleep::WaitFor(std::chrono::milliseconds delay) {
-    if (delay <= std::chrono::milliseconds::zero()) {
-        co_return;
-    }
-    if (waiting_) {
-        throw std::logic_error(
-            "ScheduledSleep does not support concurrent WaitFor calls");
-    }
-
-    Cancel();
-    waiting_ = true;
-    try {
-        token_ = scheduler_.ScheduleAfter(delay, [this]() {
-            token_.Reset();
-            if (waiting_) {
-                (void)signal_.try_send(IoErrorCode{});
-            }
-        });
-
-        auto [ec] = co_await signal_.async_receive(
-            net::as_tuple(net::use_awaitable));
-        (void)ec;
-        waiting_ = false;
-    } catch (...) {
-        waiting_ = false;
-        scheduler_.Cancel(token_);
-        throw;
-    }
-}
-
-void ScheduledSleep::Cancel() noexcept {
-    if (!token_.Valid()) return;
-
-    scheduler_.Cancel(token_);
-    if (waiting_) {
-        (void)signal_.try_send(io_error::operation_aborted);
     }
 }
 

@@ -93,7 +93,6 @@ struct Context;
 
 namespace api {
 class API;
-struct ClientInfo;
 }  // namespace api
 
 class Config;

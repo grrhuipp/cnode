@@ -106,7 +106,10 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
         return -1;
     }
 
-    if (EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, static_cast<int>(len)) != 1) {
+    // A null input is a finalization signal for custom EVP ciphers. Empty
+    // VMess chunks must finalize exactly once, through EncryptFinal below.
+    if (len > 0 &&
+        EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, static_cast<int>(len)) != 1) {
         return -1;
     }
 

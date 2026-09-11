@@ -1,4 +1,6 @@
 #include "trojan_outbound.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "../trojan_codec.hpp"
 #include "../udp_framing.hpp"
 #include "acppnode/app/relay.hpp"
@@ -33,53 +35,6 @@ net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t l
     try {
         co_await stream.WriteBuffers(
             std::span<const net::const_buffer>{&buffer, 1});
-    } catch (...) {
-        co_return false;
-    }
-    co_return true;
-}
-
-net::awaitable<bool> WriteTrojanTcpInitial(
-    AsyncStream& stream,
-    std::span<const uint8_t> header,
-    buf::MultiBuffer& first_payload,
-    std::span<const uint8_t> initial_payload) {
-    std::array<net::const_buffer, 2 + buf::MultiBuffer::kInlineCapacity> stack_buffers{};
-    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-    const bool use_spill = first_payload.size() > buf::MultiBuffer::kInlineCapacity;
-    if (use_spill) {
-        spill_buffers.reserve(2 + first_payload.size());
-    }
-    size_t stack_count = 0;
-
-    auto append = [&](net::const_buffer buffer) {
-        if (buffer.size() == 0) {
-            return;
-        }
-        if (use_spill) {
-            spill_buffers.push_back(buffer);
-            return;
-        }
-        stack_buffers[stack_count++] = buffer;
-    };
-
-    append(net::const_buffer(header.data(), header.size()));
-    for (const buf::Buffer* buffer : first_payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        append(net::const_buffer(bytes.data(), bytes.size()));
-    }
-    if (!initial_payload.empty()) {
-        append(net::const_buffer(initial_payload.data(), initial_payload.size()));
-    }
-
-    const auto buffers = use_spill
-        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
-        : std::span<const net::const_buffer>(stack_buffers.data(), stack_count);
-    try {
-        co_await stream.WriteBuffers(buffers);
     } catch (...) {
         co_return false;
     }
@@ -173,6 +128,8 @@ public:
         stream_.Cancel();
     }
 
+    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
+
     void SetAbortiveClose(bool enable = true) noexcept {
         stream_.SetAbortiveClose(enable);
     }
@@ -194,17 +151,7 @@ proxy::trojan::outbound::Handler::Handler(std::string tag,
                                           ::acpp::app::dns::DNS& dns_service)
     : tag_(std::move(tag))
     , config_(config)
-    , dns_service_(dns_service) {
-    config_.literal_address = ParseLiteralAddress(config_.address);
-    NormalizeOutboundStreamSettings(
-        config_.stream_settings,
-        OutboundStreamDefaults{
-            .require_tls = true,
-            .fallback_server_name = config_.GetServerName(),
-            .allow_insecure = config_.allow_insecure,
-            .alpn = std::span<const std::string>(config_.alpn.data(), config_.alpn.size()),
-        });
-}
+    , dns_service_(dns_service) {}
 
 proxy::trojan::outbound::Handler::~Handler() = default;
 
@@ -217,8 +164,7 @@ proxy::trojan::outbound::Handler::Process(
     transport::Link inbound,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    std::span<const uint8_t> initial_payload,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
@@ -237,7 +183,7 @@ proxy::trojan::outbound::Handler::Process(
         .send_through = config_.send_through,
         .inbound_local_addr = inbound_local_addr,
         .tls_server_name = ResolveOutboundTlsServerName(
-            config_.stream_settings, config_.GetServerName()),
+            config_.stream_settings, config_.address),
         .ws_host = config_.address,
     });
     if (!transport_target) {
@@ -278,7 +224,7 @@ proxy::trojan::outbound::Handler::Process(
 
     std::array<uint8_t, 512> header{};
     size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
-        config_.password,
+        config_.password_hash,
         is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
                : ::acpp::trojan::TrojanCommand::CONNECT,
         target,
@@ -289,31 +235,12 @@ proxy::trojan::outbound::Handler::Process(
     }
 
     try {
-        uint64_t prewritten_bytes = 0;
-        const size_t first_payload_size = buf::TotalLen(first_payload);
-        const size_t initial_payload_size = initial_payload.size();
-        const bool handshake_ok = is_udp
-            ? co_await WriteFull(*stream, header.data(), header_len)
-            : co_await WriteTrojanTcpInitial(
-                *stream,
-                std::span<const uint8_t>(header.data(), header_len),
-                first_payload,
-                initial_payload);
+        const bool handshake_ok = co_await WriteFull(*stream, header.data(), header_len);
         if (!handshake_ok) {
             LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake write failed");
             co_return fail_abortive(outbound_protocol_deadline.Expired()
                 ? ErrorCode::TIMEOUT
                 : ErrorCode::SOCKET_WRITE_FAILED);
-        }
-
-        if (!is_udp) {
-            first_payload.clear();
-            prewritten_bytes += first_payload_size;
-            prewritten_bytes += initial_payload_size;
-            if (prewritten_bytes > 0) {
-                stats.AddBytesOut(prewritten_bytes);
-                ctx.traffic.bytes_up = prewritten_bytes;
-            }
         }
 
         LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
@@ -324,48 +251,24 @@ proxy::trojan::outbound::Handler::Process(
 
         if (is_udp) {
             TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
-            if (first_payload_size > 0) {
-                if (inbound.control) {
-                    co_return co_await DoRelayLinkWithFirstPacket(
-                        io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                        target_endpoint, ctx, stats, first_payload, relay_config);
-                }
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, target_endpoint,
-                    ctx, stats, first_payload, relay_config);
-            }
-            if (!initial_payload.empty()) {
-                if (inbound.control) {
-                    co_return co_await DoRelayLinkWithFirstPacket(
-                        io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                        target_endpoint, ctx, stats, initial_payload, relay_config);
-                }
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, target_endpoint,
-                    ctx, stats, initial_payload, relay_config);
-            }
             if (inbound.control) {
                 co_return co_await DoRelayLink(
                     io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    target_endpoint, ctx, stats, relay_config);
+                    target_endpoint, ctx, stats, relay_config, std::move(first_payload));
             }
             co_return co_await DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer,
-                target_endpoint, ctx, stats, relay_config);
+                target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
 
-        RelayResult result;
         if (inbound.control) {
-            result = co_await DoRelayLink(
+            co_return co_await DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                *stream, ctx, stats, relay_config);
-        } else {
-            result = co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *stream, ctx, stats, relay_config);
+                *stream, ctx, stats, relay_config, std::move(first_payload));
         }
-        result.bytes_up += prewritten_bytes;
-        ctx.traffic.bytes_up = result.bytes_up;
-        co_return result;
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer,
+            *stream, ctx, stats, relay_config, std::move(first_payload));
     } catch (const IoSystemError& e) {
         co_return fail_abortive(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
@@ -420,6 +323,10 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return out;
         };
+        std::string password;
+        std::string server_name;
+        bool allow_insecure = false;
+        std::vector<std::string> alpn;
         auto read_trojan_server = [&](const acpp::json::object& obj,
                                       acpp::TrojanOutboundConfig& config) {
             config.address = json_string(obj, "address");
@@ -434,19 +341,19 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (port.Valid()) {
                 config.port = port.value;
             }
-            config.password = json_string(obj, "password");
-            config.server_name = json_string(obj, "serverName");
-            if (config.server_name.empty()) {
-                config.server_name = json_string(obj, "server_name");
+            password = json_string(obj, "password");
+            server_name = json_string(obj, "serverName");
+            if (server_name.empty()) {
+                server_name = json_string(obj, "server_name");
             }
-            if (config.server_name.empty()) {
-                config.server_name = json_string(obj, "sni");
+            if (server_name.empty()) {
+                server_name = json_string(obj, "sni");
             }
-            config.allow_insecure = json_bool(
+            allow_insecure = json_bool(
                 obj,
                 "allowInsecure",
-                json_bool(obj, "allow_insecure", config.allow_insecure));
-            config.alpn = json_string_array(obj, "alpn");
+                json_bool(obj, "allow_insecure", allow_insecure));
+            alpn = json_string_array(obj, "alpn");
             return true;
         };
 
@@ -467,22 +374,29 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 return std::nullopt;
             }
         }
-        trojan_config.stream_settings = cfg.stream_settings;
         trojan_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        acpp::NormalizeOutboundStreamSettings(
-            trojan_config.stream_settings,
+        trojan_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
+            cfg.stream_settings,
             acpp::OutboundStreamDefaults{
                 .require_tls = true,
-                .fallback_server_name = trojan_config.GetServerName(),
-                .allow_insecure = trojan_config.allow_insecure,
+                .fallback_server_name = server_name.empty() ? std::string_view(trojan_config.address) : std::string_view(server_name),
+                .allow_insecure = allow_insecure,
                 .alpn = std::span<const std::string>(
-                    trojan_config.alpn.data(),
-                    trojan_config.alpn.size()),
+                    alpn.data(),
+                    alpn.size()),
             });
 
-        if (trojan_config.address.empty() || trojan_config.password.empty() ||
+        if (trojan_config.address.empty() || password.empty() ||
             trojan_config.port == 0) {
             return std::nullopt;  // 配置不完整
+        }
+
+        trojan_config.password_hash = acpp::trojan::HashPassword(password);
+        trojan_config.literal_address = acpp::iputil::ParseLiteral(trojan_config.address);
+        if (!trojan_config.literal_address && !acpp::domain::IsValidDnsHostname(
+                trojan_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
+            LOG_ERROR("trojan outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
+            return std::nullopt;
         }
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{

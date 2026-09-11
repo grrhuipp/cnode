@@ -1,6 +1,7 @@
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "acppnode/core/constants.hpp"
 
 namespace acpp {
@@ -20,17 +21,16 @@ std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
         return Auto();
     }
 
-    IoErrorCode error;
-    auto address = net::ip::make_address(value, error);
-    if (error) {
+    auto address = iputil::ParseLiteral(value);
+    if (!address) {
         return std::nullopt;
     }
-    address = iputil::NormalizeAddress(address);
-    if (address.is_unspecified()) {
+    *address = iputil::NormalizeAddress(*address);
+    if (address->is_unspecified()) {
         return bind;
     }
     bind.mode_ = Mode::Explicit;
-    bind.explicit_address_ = std::move(address);
+    bind.explicit_address_ = std::move(*address);
     return bind;
 }
 

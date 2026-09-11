@@ -35,15 +35,35 @@ endif()
 
 set(ANYTLS_INBOUND
     "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp")
+file(READ "${SOURCE_DIR}/src/proxy/anytls/anytls_codec.cpp" ANYTLS_CODEC_SOURCE)
+if(ANYTLS_CODEC_SOURCE MATCHES "catch[ \t]*[(][.][.][.][)]|MapWriteException")
+    message(FATAL_ERROR
+        "AnyTLS codec must preserve non-I/O exceptions for the owning request or physical task")
+endif()
 file(READ "${ANYTLS_INBOUND}" ANYTLS_INBOUND_SOURCE)
-if(NOT ANYTLS_INBOUND_SOURCE MATCHES "co_await WaitForDispatches\\(\\)")
+if(ANYTLS_INBOUND_SOURCE MATCHES
+       "active_dispatches_|dispatch_completion_|WaitForDispatches|CompleteDispatch|FinishRun|enable_shared_from_this|shared_ptr<AnyTLSDemuxSession>")
     message(FATAL_ERROR
-        "AnyTLS demux must await every owned child dispatch before Run returns")
+        "AnyTLS demux must not restore detached lifetime counters or cyclic session ownership")
 endif()
-if(NOT ANYTLS_INBOUND_SOURCE MATCHES "active_dispatches_")
+if(ANYTLS_INBOUND_SOURCE MATCHES "stream_states_|GetOrCreateStream|StreamEntry|PendingTarget|PendingUotRequest|MultiBufferByteReader|ParseSocksAddress|SpawnDispatch|StartDispatch")
     message(FATAL_ERROR
-        "AnyTLS demux must own explicit child dispatch lifetime state")
+        "AnyTLS stream identity and receive state must not use separate mutable indexes or reopen existing streams")
 endif()
+if(ANYTLS_INBOUND_SOURCE MATCHES "QueuedInput|queued_bytes_|ShrinkQueueIfDrained|shrink_queue_on_drain_|kSubStreamQueueShrinkItems")
+    message(FATAL_ERROR
+        "AnyTLS logical input must not restore per-frame queues, duplicate byte counts or shrink bookkeeping")
+endif()
+file(READ "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp" MUX_INBOUND_SOURCE)
+foreach(container_source IN ITEMS ANYTLS_INBOUND_SOURCE MUX_INBOUND_SOURCE)
+    if(${container_source} MATCHES "net::detached|net::co_spawn" OR
+       NOT ${container_source} MATCHES "co_await RunAwaitableTaskGroup" OR
+       NOT ${container_source} MATCHES "tasks[.]Spawn[(]" OR
+       NOT ${container_source} MATCHES "tasks[.]Cancel[(][)]")
+        message(FATAL_ERROR
+            "Mux/AnyTLS must cancel and join all dynamic children through the owned task group")
+    endif()
+endforeach()
 if(NOT ANYTLS_INBOUND_SOURCE MATCHES
        "transport::internet::AsyncWriteGate write_gate_" OR
    ANYTLS_INBOUND_SOURCE MATCHES "write_busy_|write_signal_")
@@ -54,6 +74,38 @@ endif()
 set(ANYTLS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp")
 file(READ "${ANYTLS_OUTBOUND}" ANYTLS_OUTBOUND_SOURCE)
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES "co_await logical->PushPayload[(]" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES "payload_space_signal_[.]async_receive" OR
+   ANYTLS_OUTBOUND_SOURCE MATCHES "Close[(]ErrorCode::RESOURCE_EXHAUSTED[)]")
+    message(FATAL_ERROR
+        "AnyTLS outbound queue capacity must backpressure its owned physical reader, not reject a byte stream")
+endif()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES
+       "struct QueuedPayload|ThreadLocalDeque|queued_bytes_|ShrinkQueueIfDrained|shrink_queue_on_drain_|kLogicalQueueShrinkItems|uint32_t Sid[(][)]|uint32_t sid_ =")
+    message(FATAL_ERROR
+        "AnyTLS outbound must not restore per-frame queues, duplicate byte counts or unused stream identity")
+endif()
+foreach(queue_source IN ITEMS ANYTLS_INBOUND_SOURCE ANYTLS_OUTBOUND_SOURCE)
+    if(NOT ${queue_source} MATCHES "AppendQueuedPayload[(]")
+        message(FATAL_ERROR "AnyTLS physical readers must share their private payload aggregation")
+    endif()
+endforeach()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES "net::co_spawn|net::detached|read_loop_started")
+    message(FATAL_ERROR
+        "AnyTLS physical task lifetime must belong to the session pool, not individual requests")
+endif()
+file(READ "${SOURCE_DIR}/src/proxy/anytls/outbound/session_pool.hpp" ANYTLS_POOL_SOURCE)
+if(ANYTLS_POOL_SOURCE MATCHES "net::detached")
+    message(FATAL_ERROR "AnyTLS physical task completion and exceptions must be observed")
+endif()
+foreach(container_source IN ITEMS ANYTLS_INBOUND_SOURCE ANYTLS_OUTBOUND_SOURCE)
+    if(${container_source} MATCHES "peer_version|handshake_done_|ParseSettingsPaddingMd5|optional<[^>]*PeerSettings>" OR
+       NOT ${container_source} MATCHES "ParsePeerSettings" OR
+       NOT ${container_source} MATCHES "optional<[^>]*SessionVersion>" OR
+       NOT ${container_source} MATCHES "SessionVersion::V2")
+        message(FATAL_ERROR "AnyTLS sessions must use parsed peer settings and negotiated feature gates")
+    endif()
+endforeach()
 if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES "LogicalStreamLease")
     message(FATAL_ERROR
         "AnyTLS outbound logical streams must use exception-safe RAII ownership")
@@ -461,9 +513,9 @@ set(SHADOWSOCKS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/ss_outbound.cpp")
 file(READ "${SHADOWSOCKS_OUTBOUND}" SHADOWSOCKS_OUTBOUND_SOURCE)
 if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "buf::InspectUdpDatagram[(]mb[)]" OR
+        "buf::InspectUdpDatagram[(]payload[)]" OR
    NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "buf::ContiguousBufferView payload[(]mb[)]")
+        "buf::ContiguousBufferView view[(]payload[)]")
     message(FATAL_ERROR
         "Shadowsocks outbound must encode one complete MultiBuffer datagram")
 endif()
@@ -473,7 +525,7 @@ if(SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
         "Shadowsocks outbound must not encode one UDP packet per Buffer")
 endif()
 if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "Shadowsocks UDP scatter write requires a target")
+        "Shadowsocks UDP requires one datagram target")
     message(FATAL_ERROR
         "Shadowsocks UDP scatter writes must not be silently discarded")
 endif()
@@ -514,12 +566,12 @@ if(SHADOWSOCKS_INBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "Shadowsocks UDP response encoding must belong to its captured session context")
 endif()
-set(UDP_RELAY "${SOURCE_DIR}/src/app/relay_udp.cpp")
+set(UDP_RELAY "${SOURCE_DIR}/src/app/udp_channel.cpp")
 file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
 if(NOT UDP_RELAY_SOURCE MATCHES
-        "buf::InspectUdpDatagram[(]read_mb[)]")
+        "buf::InspectUdpDatagram[(]payload[)]")
     message(FATAL_ERROR
-        "UDP relay must preserve one ReadMultiBuffer as one datagram")
+        "UDP channel must preserve one MultiBuffer as one datagram")
 endif()
 set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
 set(UDP_CALLBACK_ROUTER "${SOURCE_DIR}/src/app/udp_callback_router.cpp")
@@ -543,14 +595,14 @@ endif()
 string(REGEX MATCHALL "ResolveEndpoint[(]target[)]"
     UDP_RESOLVE_CALLS "${UDP_SESSION_SOURCE}")
 list(LENGTH UDP_RESOLVE_CALLS UDP_RESOLVE_CALL_COUNT)
-if(NOT UDP_RESOLVE_CALL_COUNT EQUAL 2)
+if(NOT UDP_RESOLVE_CALL_COUNT EQUAL 1)
     message(FATAL_ERROR
-        "both UDPSession SendTo paths must share endpoint resolution")
+        "UDPSession must have one owning datagram send path")
 endif()
 string(REGEX MATCHALL "SendResolved[\r\n (]"
     UDP_SEND_CALLS "${UDP_SESSION_SOURCE}")
 list(LENGTH UDP_SEND_CALLS UDP_SEND_CALL_COUNT)
-if(UDP_SEND_CALL_COUNT LESS 3)
+if(NOT UDP_SEND_CALL_COUNT EQUAL 2)
     message(FATAL_ERROR
         "UDPSession must centralize socket send, accounting and payload limits")
 endif()
@@ -594,7 +646,7 @@ file(READ "${FREEDOM_OUTBOUND_SOURCE_PATH}" FREEDOM_OUTBOUND_SOURCE)
 if(NOT FREEDOM_OUTBOUND_SOURCE MATCHES
         "std::shared_ptr<UDPSession> session =" OR
    NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "std::shared_ptr<UDPSession> session_" OR
+        "UDPChannel channel_" OR
    FREEDOM_OUTBOUND_SOURCE MATCHES
         "UDPSession[*] session =" OR
    SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
@@ -617,10 +669,19 @@ if(UDP_SESSION_SOURCE MATCHES "retired_sessions")
     message(FATAL_ERROR
         "UDPSessionManager must not retain every removed session until shutdown")
 endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-    "UDPSessionManager::~UDPSessionManager[(][)] \\{[\r\n ]+StopAll[(][)];")
+string(FIND "${UDP_SESSION_SOURCE}" "UDPSessionManager::~UDPSessionManager()" UDP_MANAGER_DTOR_BEGIN)
+string(FIND "${UDP_SESSION_SOURCE}" "UDPSessionManager::AcquireSession(" UDP_MANAGER_DTOR_END)
+if(UDP_MANAGER_DTOR_BEGIN LESS 0 OR UDP_MANAGER_DTOR_END LESS UDP_MANAGER_DTOR_BEGIN)
+    message(FATAL_ERROR "could not isolate UDP manager destruction")
+endif()
+math(EXPR UDP_MANAGER_DTOR_LENGTH "${UDP_MANAGER_DTOR_END} - ${UDP_MANAGER_DTOR_BEGIN}")
+string(SUBSTRING "${UDP_SESSION_SOURCE}" ${UDP_MANAGER_DTOR_BEGIN}
+    ${UDP_MANAGER_DTOR_LENGTH} UDP_MANAGER_DTOR_SOURCE)
+if(NOT UDP_MANAGER_DTOR_SOURCE MATCHES "Cancel[(]impl_->cleanup_token[)]" OR
+   NOT UDP_MANAGER_DTOR_SOURCE MATCHES "session->Stop[(][)]" OR
+   UDP_SESSION_HEADER_SOURCE MATCHES "StopAll[(]")
     message(FATAL_ERROR
-        "UDPSessionManager destruction must cancel cleanup and live sessions")
+        "UDP manager destruction must cancel cleanup and live sessions without restoring the unused public shutdown API")
 endif()
 if(NOT UDP_SESSION_SOURCE MATCHES
         "StartCleanup[(][)] \\{[\r\n ]+if [(]impl_->running[)]" OR
@@ -774,20 +835,15 @@ if(NOT WORKER_SOURCE MATCHES
         "native UDP inbound must share the full-datagram receive path")
 endif()
 if(NOT UDP_RELAY_SOURCE MATCHES
-        "session[.]SendTo[\r\n ()*,a-zA-Z0-9_.]*datagram[.]data[(][)]")
-    message(FATAL_ERROR
-        "UDP relay must send the coalesced datagram instead of each Buffer")
+        "self->session->SendTo[(]target, std::move[(]payload[)], callback_id[)]" OR
+   UDP_SESSION_HEADER_SOURCE MATCHES "const uint8_t[*] data")
+    message(FATAL_ERROR "UDP sends must transfer one owning MultiBuffer datagram")
 endif()
-if(NOT UDP_RELAY_SOURCE MATCHES
-        "kMaxUdpRelayQueuedReplies = 256" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-        "kMaxUdpRelayQueuedBytes = 512 [*] 1024" OR
-   NOT UDP_RELAY_SOURCE MATCHES
-        "if [(]callback_id == 0[)]" OR
-   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "if [(][!]target_endpoint[.]Start[(][)][)]")
-    message(FATAL_ERROR
-        "UDP relay queues and callback registration must expose bounded failure")
+if(NOT UDP_RELAY_SOURCE MATCHES "kMaxPackets = 256" OR
+   NOT UDP_RELAY_SOURCE MATCHES "kMaxBytes = 512 [*] 1024" OR
+   NOT UDP_RELAY_SOURCE MATCHES "callback_id == 0" OR
+   SHADOWSOCKS_OUTBOUND_SOURCE MATCHES "RegisterCallback|StopAndDrain|read_timer_|phase_timer_")
+    message(FATAL_ERROR "UDP registration, bounded queues and deadlines must belong to the generic request channel")
 endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR

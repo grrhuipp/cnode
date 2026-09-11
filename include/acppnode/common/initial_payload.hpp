@@ -1,7 +1,5 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 
 #include <algorithm>
@@ -9,8 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iterator>
-#include <memory>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 #include <span>
 
 namespace acpp {
@@ -18,73 +17,43 @@ namespace acpp {
 class InitialPayload {
 public:
     // Keep the always-present coroutine-frame footprint small. Larger early
-    // payloads use the Worker heap and are handed to first-packet relay once.
+    // payloads use the Worker heap and are transferred into the ordinary relay loop once.
     static constexpr size_t kInlineSize = 256;
 
     InitialPayload() = default;
+    explicit InitialPayload(buf::MultiBuffer data) noexcept : overflow_(std::move(data)) {}
     ~InitialPayload() noexcept = default;
 
-    InitialPayload(const InitialPayload& other) {
-        if (other.overflow_.empty()) {
-            size_ = other.size_;
-            std::copy_n(other.inline_.begin(), other.size_, inline_.begin());
-            return;
-        }
-        AppendBuffers(other.overflow_);
-    }
-
-    InitialPayload& operator=(const InitialPayload& other) {
-        if (this == &other) {
-            return *this;
-        }
-        clear();
-        if (other.overflow_.empty()) {
-            size_ = other.size_;
-            std::copy_n(other.inline_.begin(), other.size_, inline_.begin());
-            return *this;
-        }
-        AppendBuffers(other.overflow_);
-        return *this;
-    }
+    InitialPayload(const InitialPayload&) = delete;
+    InitialPayload& operator=(const InitialPayload&) = delete;
 
     InitialPayload(InitialPayload&& other) noexcept
         : overflow_(std::move(other.overflow_))
-        , size_(other.size_) {
-        if (overflow_.empty()) {
-            std::copy_n(other.inline_.begin(), other.size_, inline_.begin());
-        }
-        other.size_ = 0;
+        , inline_size_(std::exchange(other.inline_size_, 0)) {
+        std::copy_n(other.inline_.begin(), inline_size_, inline_.begin());
     }
 
     InitialPayload& operator=(InitialPayload&& other) noexcept {
-        if (this == &other) {
-            return *this;
+        if (this != &other) {
+            overflow_ = std::move(other.overflow_);
+            inline_size_ = std::exchange(other.inline_size_, 0);
+            std::copy_n(other.inline_.begin(), inline_size_, inline_.begin());
         }
-        clear();
-        size_ = other.size_;
-        overflow_ = std::move(other.overflow_);
-        if (overflow_.empty()) {
-            std::copy_n(other.inline_.begin(), other.size_, inline_.begin());
-        }
-        other.size_ = 0;
         return *this;
     }
 
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-    [[nodiscard]] size_t size() const noexcept { return size_; }
-    [[nodiscard]] const uint8_t* data() const noexcept {
-        return overflow_.empty() ? inline_.data() : nullptr;
-    }
+    [[nodiscard]] bool empty() const noexcept { return size() == 0; }
+    [[nodiscard]] size_t size() const noexcept { return overflow_.empty() ? inline_size_ : overflow_.byte_size(); }
     [[nodiscard]] std::span<const uint8_t> span() const noexcept {
         return overflow_.empty()
-            ? std::span<const uint8_t>{inline_.data(), size_}
+            ? std::span<const uint8_t>{inline_.data(), inline_size_}
             : std::span<const uint8_t>{};
     }
     [[nodiscard]] bool IsContiguous() const noexcept {
         return overflow_.empty();
     }
     [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const noexcept {
-        if (len == 0 || len > size_) {
+        if (len == 0 || len > size()) {
             return {};
         }
         if (overflow_.empty()) {
@@ -108,7 +77,7 @@ public:
         if (!out || out_size == 0) {
             return 0;
         }
-        const size_t want = std::min(out_size, size_);
+        const size_t want = std::min(out_size, size());
         if (overflow_.empty()) {
             std::memcpy(out, inline_.data(), want);
             return want;
@@ -131,79 +100,46 @@ public:
 
     [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() {
         if (!overflow_.empty()) {
-            size_ = 0;
+            inline_size_ = 0;
             return std::move(overflow_);
         }
         buf::MultiBuffer mb;
-        (void)buf::AppendSpanToMultiBuffer(span(), mb);
-        size_ = 0;
+        if (!buf::AppendSpanToMultiBuffer(span(), mb)) throw std::bad_alloc();
+        inline_size_ = 0;
         return mb;
     }
 
-    void clear() noexcept {
-        size_ = 0;
-        overflow_.clear();
+    void assign(std::span<const uint8_t> data) {
+        InitialPayload replacement;
+        replacement.append(data);
+        *this = std::move(replacement);
     }
 
-    template <typename It>
-    void assign(It first, It last) {
-        const size_t len = static_cast<size_t>(std::distance(first, last));
-        clear();
-        if (len <= inline_.size()) {
-            std::copy(first, last, inline_.begin());
-            size_ = len;
+    void append(std::span<const uint8_t> data) {
+        if (data.empty()) return;
+        if (data.size() > std::numeric_limits<size_t>::max() - size())
+            throw std::length_error("InitialPayload size overflow");
+        if (overflow_.empty() && data.size() <= inline_.size() - inline_size_) {
+            std::memmove(inline_.data() + inline_size_, data.data(), data.size());
+            inline_size_ += data.size();
             return;
         }
-        size_t written = 0;
-        while (first != last) {
-            buf::BufferGuard buffer{buf::Buffer::New()};
-            if (!buffer) {
-                throw std::bad_alloc();
-            }
-            while (first != last && buffer->Available() > 0) {
-                buffer->Tail().front() = static_cast<uint8_t>(*first);
-                buffer->Produce(1);
-                ++first;
-                ++written;
-            }
-            overflow_.push_back(buffer.release());
-        }
-        size_ = written;
-    }
-
-    void append(const uint8_t* data, size_t len) {
-        if (!data || len == 0) {
-            return;
-        }
-        const size_t old_size = size_;
-        const size_t new_size = old_size + len;
-        if (new_size <= inline_.size() && overflow_.empty()) {
-            std::memcpy(inline_.data() + old_size, data, len);
-            size_ = new_size;
+        if (!overflow_.empty()) {
+            if (!buf::AppendSpanToMultiBuffer(data, overflow_)) throw std::bad_alloc();
             return;
         }
 
-        if (overflow_.empty() && old_size > 0) {
-            (void)buf::AppendSpanToMultiBuffer({inline_.data(), old_size}, overflow_);
-        }
-        (void)buf::AppendSpanToMultiBuffer({data, len}, overflow_);
-        size_ = new_size;
+        buf::MultiBuffer replacement;
+        if (!buf::AppendSpanToMultiBuffer(span(), replacement) ||
+            !buf::AppendSpanToMultiBuffer(data, replacement)) throw std::bad_alloc();
+        overflow_ = std::move(replacement);
+        inline_size_ = 0;
     }
 
 private:
-    void AppendBuffers(const buf::MultiBuffer& buffers) {
-        for (const auto* buffer : buffers) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            append(bytes.data(), bytes.size());
-        }
-    }
-
     std::array<uint8_t, kInlineSize> inline_{};
     buf::MultiBuffer overflow_;
-    size_t size_ = 0;
+    size_t inline_size_ = 0;
 };
 
 }  // namespace acpp

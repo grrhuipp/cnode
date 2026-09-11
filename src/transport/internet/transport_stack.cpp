@@ -1,6 +1,7 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "async_write_gate.hpp"
 #include "http2_settings.hpp"
+#include "grpc_hunk.hpp"
 #include "http_path_match.hpp"
 #include "tls_context_cache.hpp"
 #include "tls_context_cache_key.hpp"
@@ -388,7 +389,7 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
             net::buffer(buffer->Tail().data(), capacity));
         if (n > 0) {
             buffer->Produce(static_cast<uint32_t>(n));
-            out.push_back(buffer.release());
+            out.push_back(std::move(buffer));
         }
         co_return n;
     } catch (...) {
@@ -419,7 +420,7 @@ public:
                 static_cast<size_t>(buffer->Available()));
             std::memcpy(buffer->Tail().data(), data + offset, n);
             buffer->Produce(static_cast<uint32_t>(n));
-            pending_.push_back(buffer.release());
+            pending_.push_back(std::move(buffer));
             offset += n;
         }
     }
@@ -473,10 +474,12 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         inner_->Cancel();
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -486,6 +489,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -615,7 +619,7 @@ public:
         }
         buffer->Produce(static_cast<uint32_t>(n));
         buf::MultiBuffer mb;
-        mb.push_back(buffer.release());
+        mb.push_back(std::move(buffer));
         co_return mb;
     }
 
@@ -684,10 +688,12 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         inner_->Cancel();
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -697,6 +703,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -905,6 +912,7 @@ private:
 
 class XHttpPacketUpSession final {
 public:
+    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     explicit XHttpPacketUpSession(net::io_context& io_context)
         : io_context_(io_context)
         , input_signal_(io_context) {}
@@ -947,6 +955,7 @@ public:
         }
         closed_ = true;
         input_closed_ = true;
+        cancellation_.Stop();
         packet_queue_.Clear();
         if (auto stream = stream_input_.Take()) {
             stream->Close();
@@ -959,6 +968,7 @@ public:
             return;
         }
         read_cancelled_ = true;
+        cancellation_.CancelPending();
         if (auto stream = stream_input_.Snapshot()) {
             stream->Cancel();
         }
@@ -1065,6 +1075,7 @@ private:
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     detail::XHttpPacketQueue packet_queue_;
     detail::XHttpUploadStreamSlot stream_input_;
+    transport::CancellationSource cancellation_;
     bool input_closed_ = false;
     bool closed_ = false;
     bool read_cancelled_ = false;
@@ -1228,7 +1239,15 @@ public:
     XHttpPacketUpServerStream(std::shared_ptr<XHttpPacketUpSession> session,
                               std::unique_ptr<AsyncStream> downlink)
         : session_(std::move(session))
-        , downlink_(std::move(downlink)) {}
+        , downlink_(std::move(downlink))
+        , session_cancel_(session_->Cancellation(), [](void* raw, transport::Cancellation cancellation) noexcept {
+            auto& self = *static_cast<XHttpPacketUpServerStream*>(raw);
+            if (cancellation.terminal) self.downlink_->Cancellation().Stop(cancellation.reason);
+            else {
+                self.session_cancel_.Resubscribe(self.session_->Cancellation());
+                self.downlink_->Cancellation().CancelPending(cancellation.reason);
+            }
+        }, this) {}
 
     ~XHttpPacketUpServerStream() noexcept override {
         Close();
@@ -1290,6 +1309,7 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         if (session_) {
             session_->CancelPendingOperations();
         }
@@ -1299,6 +1319,7 @@ public:
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -1312,6 +1333,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -1344,6 +1366,7 @@ protected:
 private:
     std::shared_ptr<XHttpPacketUpSession> session_;
     std::unique_ptr<AsyncStream> downlink_;
+    transport::CancellationSubscription session_cancel_;
     bool closed_ = false;
 };
 
@@ -1393,6 +1416,14 @@ enum class H2FrameType : uint8_t {
     GOAWAY = 0x7,
     WINDOW_UPDATE = 0x8,
     CONTINUATION = 0x9,
+};
+
+enum class H2Error : uint32_t {
+    Protocol = 0x1,
+    FrameSize = 0x6,
+    RefusedStream = 0x7,
+    Cancel = 0x8,
+    ExcessiveLoad = 0xb,
 };
 
 struct H2Frame {
@@ -1776,11 +1807,11 @@ net::awaitable<bool> WriteH2DataPayloadBuffers(
 
 size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept;
 
-[[noreturn]] void ThrowGrpcStreamError(const char* what) {
+[[noreturn]] void ThrowHttp2StreamError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
 }
 
-net::awaitable<bool> WriteGrpcHunkMessage(
+net::awaitable<bool> WriteGrpcHunkRecord(
     AsyncStream& stream,
     uint32_t stream_id,
     std::span<const uint8_t> data) {
@@ -1793,7 +1824,7 @@ net::awaitable<bool> WriteGrpcHunkMessage(
              (data.size() < 0x20'0000) ? 3 :
              (data.size() < 0x1000'0000) ? 4 : 5) +
         data.size();
-    if (hunk_len > 0xffff'ffffull) {
+    if (hunk_len > transport::internet::kMaxGrpcHunkMessageSize) {
         co_return false;
     }
     WriteU32(prefix.data() + prefix_len, static_cast<uint32_t>(hunk_len));
@@ -1843,6 +1874,20 @@ net::awaitable<bool> WriteGrpcHunkMessage(
     co_return true;
 }
 
+net::awaitable<bool> WriteGrpcHunkMessage(
+    AsyncStream& stream,
+    uint32_t stream_id,
+    std::span<const uint8_t> data) {
+    // Reserve room for a field key and the longest uint32 length varint.
+    constexpr size_t kPayloadLimit = transport::internet::kMaxGrpcHunkMessageSize - 6;
+    do {
+        const size_t size = std::min(data.size(), kPayloadLimit);
+        if (!co_await WriteGrpcHunkRecord(stream, stream_id, data.first(size))) co_return false;
+        data = data.subspan(size);
+    } while (!data.empty());
+    co_return true;
+}
+
 size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept {
     size_t n = 0;
     while (value >= 0x80) {
@@ -1851,81 +1896,6 @@ size_t WriteProtoVarint(uint8_t* out, uint64_t value) noexcept {
     }
     out[n++] = static_cast<uint8_t>(value);
     return n;
-}
-
-bool ReadProtoVarint(std::span<const uint8_t> data,
-                     size_t& offset,
-                     uint64_t& value) noexcept {
-    value = 0;
-    uint32_t shift = 0;
-    while (offset < data.size() && shift < 64) {
-        const uint8_t byte = data[offset++];
-        value |= static_cast<uint64_t>(byte & 0x7f) << shift;
-        if ((byte & 0x80) == 0) {
-            return true;
-        }
-        shift += 7;
-    }
-    return false;
-}
-
-struct GrpcHunkData {
-    size_t offset = 0;
-    size_t size = 0;
-};
-
-[[nodiscard]] std::optional<GrpcHunkData> DecodeGrpcHunkData(
-    std::span<const uint8_t> message) {
-    size_t offset = 0;
-    while (offset < message.size()) {
-        uint64_t key = 0;
-        if (!ReadProtoVarint(message, offset, key)) {
-            return std::nullopt;
-        }
-        const uint32_t field = static_cast<uint32_t>(key >> 3);
-        const uint32_t wire = static_cast<uint32_t>(key & 0x7);
-        if (field == 1 && wire == 2) {
-            uint64_t len = 0;
-            if (!ReadProtoVarint(message, offset, len) ||
-                len > message.size() - offset) {
-                return std::nullopt;
-            }
-            return GrpcHunkData{
-                .offset = offset,
-                .size = static_cast<size_t>(len),
-            };
-        }
-
-        switch (wire) {
-        case 0: {
-            uint64_t ignored = 0;
-            if (!ReadProtoVarint(message, offset, ignored)) {
-                return std::nullopt;
-            }
-            break;
-        }
-        case 1:
-            if (message.size() - offset < 8) return std::nullopt;
-            offset += 8;
-            break;
-        case 2: {
-            uint64_t len = 0;
-            if (!ReadProtoVarint(message, offset, len) ||
-                len > message.size() - offset) {
-                return std::nullopt;
-            }
-            offset += static_cast<size_t>(len);
-            break;
-        }
-        case 5:
-            if (message.size() - offset < 4) return std::nullopt;
-            offset += 4;
-            break;
-        default:
-            return std::nullopt;
-        }
-    }
-    return GrpcHunkData{};
 }
 
 net::awaitable<void> AcknowledgeH2Settings(AsyncStream& stream) {
@@ -2415,25 +2385,22 @@ struct H2RequestHeaders {
     return request;
 }
 
-class GrpcStream final : public AsyncStream {
+class Http2ClientStream final : public AsyncStream {
 public:
-    enum class Role {
-        Client,
-        Server,
-    };
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::ShutdownPeerWrite;
+    }
 
-    GrpcStream(std::unique_ptr<AsyncStream> inner,
+    Http2ClientStream(net::any_io_executor executor,
+               std::unique_ptr<AsyncStream> inner,
                uint32_t stream_id,
-               Role role,
-               H2PayloadCodec payload_codec,
-               uint64_t conn_id)
+               H2PayloadCodec payload_codec)
         : inner_(std::move(inner))
+        , write_gate_(std::move(executor))
         , stream_id_(stream_id)
-        , role_(role)
-        , payload_codec_(payload_codec)
-        , conn_id_(conn_id) {}
+        , payload_codec_(payload_codec) {}
 
-    ~GrpcStream() noexcept override {
+    ~Http2ClientStream() noexcept override {
         Close();
     }
 
@@ -2463,20 +2430,17 @@ public:
             co_return 0;
         }
 
-        const size_t n = std::min(capacity, read_payload_end_ - read_offset_);
-        std::memcpy(out, read_payload_.data() + read_offset_, n);
-        read_offset_ += n;
-        if (read_offset_ >= read_payload_end_) {
-            read_payload_.clear();
-            read_offset_ = 0;
-            read_payload_end_ = 0;
-        }
+        const auto payload = hunk_.Payload();
+        const size_t n = std::min(capacity, payload.size());
+        std::memcpy(out, payload.data(), n);
+        hunk_.Consume(n);
         co_return n;
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
+        auto lease = co_await AcquireWrite();
         if (write_closed_) {
-            ThrowGrpcStreamError("gRPC write on closed stream");
+            ThrowHttp2StreamError("gRPC write on closed stream");
         }
         const auto* data = static_cast<const uint8_t*>(buffer.data());
         const size_t len = buffer.size();
@@ -2485,12 +2449,12 @@ public:
                     *inner_,
                     stream_id_,
                     std::span<const uint8_t>(data, len))) {
-                ThrowGrpcStreamError("HTTP/2 raw write failed");
+                ThrowHttp2StreamError("HTTP/2 raw write failed");
             }
             co_return len;
         }
         if (!co_await WriteGrpcMessage(std::span<const uint8_t>(data, len))) {
-            ThrowGrpcStreamError("gRPC write failed");
+            ThrowHttp2StreamError("gRPC write failed");
         }
         co_return len;
     }
@@ -2510,11 +2474,13 @@ public:
         }
         buffer->Produce(static_cast<uint32_t>(n));
         buf::MultiBuffer mb;
-        mb.push_back(buffer.release());
+        mb.push_back(std::move(buffer));
         co_return mb;
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+        auto lease = co_await AcquireWrite();
+        if (write_closed_) ThrowHttp2StreamError("HTTP/2 write on closed stream");
         if (payload_codec_ == H2PayloadCodec::RawData) {
             ConstBufferSpanBuilder<16> payloads;
             payloads.AppendMultiBuffer(mb);
@@ -2525,7 +2491,7 @@ public:
                             *inner_,
                             stream_id_,
                             payloads.Span())) {
-                        ThrowGrpcStreamError("HTTP/2 raw WriteMultiBuffer failed");
+                        ThrowHttp2StreamError("HTTP/2 raw WriteMultiBuffer failed");
                     }
                 }
             } catch (...) {
@@ -2545,7 +2511,7 @@ public:
                 const auto bytes = buffer->Bytes();
                 if (!co_await WriteGrpcMessage(bytes)) {
                     mb.FreeSlot(buffer);
-                    ThrowGrpcStreamError("gRPC WriteMultiBuffer failed");
+                    ThrowHttp2StreamError("gRPC WriteMultiBuffer failed");
                 }
             }
             mb.FreeSlot(buffer);
@@ -2555,12 +2521,14 @@ public:
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
+        auto lease = co_await AcquireWrite();
+        if (write_closed_) ThrowHttp2StreamError("HTTP/2 write on closed stream");
         if (payload_codec_ == H2PayloadCodec::RawData) {
             if (!co_await WriteH2DataPayloadBuffers(
                     *inner_,
                     stream_id_,
                     buffers)) {
-                ThrowGrpcStreamError("HTTP/2 raw WriteBuffers failed");
+                ThrowHttp2StreamError("HTTP/2 raw WriteBuffers failed");
             }
             co_return;
         }
@@ -2572,16 +2540,14 @@ public:
             const auto* data = static_cast<const uint8_t*>(buffer.data());
             if (!co_await WriteGrpcMessage(
                     std::span<const uint8_t>(data, buffer.size()))) {
-                ThrowGrpcStreamError("gRPC WriteBuffers failed");
+                ThrowHttp2StreamError("gRPC WriteBuffers failed");
             }
         }
     }
 
     void ShutdownRead() override {
         read_closed_ = true;
-        read_payload_.clear();
-        read_offset_ = 0;
-        read_payload_end_ = 0;
+        hunk_.Clear();
         h2_data_.clear();
         h2_data_offset_ = 0;
         h2_data_end_ = 0;
@@ -2597,20 +2563,13 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
+        auto lease = co_await AcquireWrite();
         if (write_closed_) {
             co_return;
         }
         write_closed_ = true;
         if (payload_codec_ == H2PayloadCodec::RawData) {
             (void)co_await WriteH2DataPayload(*inner_, stream_id_, {}, true);
-        } else if (role_ == Role::Server) {
-            auto trailers = EncodeGrpcTrailers();
-            (void)co_await WriteH2Frame(
-                *inner_,
-                H2FrameType::HEADERS,
-                0x4 | 0x1,
-                stream_id_,
-                trailers);
         } else {
             (void)co_await WriteH2Frame(
                 *inner_,
@@ -2621,17 +2580,19 @@ public:
     }
 
     void Cancel() noexcept override {
+        write_gate_.Cancel();
+        NotifyCancellation();
         inner_->Cancel();
     }
 
     void Close() override {
+        write_gate_.Cancel();
+        NotifyClosed();
         if (closed_) {
             return;
         }
         closed_ = true;
-        read_payload_.clear();
-        read_offset_ = 0;
-        read_payload_end_ = 0;
+        hunk_.Clear();
         h2_data_.clear();
         h2_data_offset_ = 0;
         h2_data_end_ = 0;
@@ -2639,6 +2600,8 @@ public:
     }
 
     void CloseAbortive() override {
+        write_gate_.Cancel();
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -2664,25 +2627,35 @@ protected:
     }
 
 private:
-    net::awaitable<bool> EnsureReadablePayload() {
-        if (payload_codec_ == H2PayloadCodec::RawData) {
-            while (h2_data_offset_ >= h2_data_end_) {
-                h2_data_.clear();
-                h2_data_offset_ = 0;
-                h2_data_end_ = 0;
-                if (!co_await ReadNextDataFrame()) {
-                    co_return false;
-                }
-            }
-            co_return true;
-        }
-
-        while (read_offset_ >= read_payload_end_) {
-            if (!co_await ReadNextGrpcMessage()) {
-                co_return false;
-            }
+    net::awaitable<bool> WaitForRawData() {
+        while (h2_data_offset_ >= h2_data_end_) {
+            h2_data_.clear();
+            h2_data_offset_ = h2_data_end_ = 0;
+            if (!co_await ReadNextDataFrame()) co_return false;
         }
         co_return true;
+    }
+
+    net::awaitable<bool> EnsureReadablePayload() {
+        if (payload_codec_ == H2PayloadCodec::RawData) co_return co_await WaitForRawData();
+        while (hunk_.Payload().empty()) {
+            if (!co_await WaitForRawData()) {
+                if (!hunk_.AtMessageBoundary()) ThrowHttp2StreamError("truncated gRPC message");
+                co_return false;
+            }
+            const auto bytes = std::span<const uint8_t>(h2_data_).subspan(
+                h2_data_offset_, h2_data_end_ - h2_data_offset_);
+            const auto consumed = hunk_.Feed(bytes);
+            if (!consumed) ThrowHttp2StreamError(consumed.error().data());
+            h2_data_offset_ += *consumed;
+        }
+        co_return true;
+    }
+
+    net::awaitable<transport::internet::AsyncWriteGate::Lease> AcquireWrite() {
+        auto lease = co_await write_gate_.Acquire();
+        if (!lease) ThrowHttp2StreamError("HTTP/2 write cancelled");
+        co_return lease;
     }
 
     net::awaitable<bool> WriteGrpcMessage(std::span<const uint8_t> data) {
@@ -2693,7 +2666,7 @@ private:
         const bool end_stream = (frame.flags & 0x1) != 0;
         auto first_fragment = H2HeaderBlockPayload(frame);
         if (!first_fragment || first_fragment->size() > kHttp2MaxHeaderBlockSize) {
-            ThrowGrpcStreamError("invalid HTTP/2 response header block");
+            ThrowHttp2StreamError("invalid HTTP/2 response header block");
         }
 
         memory::ByteVector header_block(
@@ -2706,7 +2679,7 @@ private:
                 continuation->stream_id != stream_id_ ||
                 continuation->payload.size() >
                     kHttp2MaxHeaderBlockSize - header_block.size()) {
-                ThrowGrpcStreamError("invalid HTTP/2 response continuation");
+                ThrowHttp2StreamError("invalid HTTP/2 response continuation");
             }
             header_block.insert(
                 header_block.end(),
@@ -2717,7 +2690,7 @@ private:
 
         auto fields = response_decoder_.Decode(header_block);
         if (!fields) {
-            ThrowGrpcStreamError("failed to decode HTTP/2 response headers");
+            ThrowHttp2StreamError("failed to decode HTTP/2 response headers");
         }
         std::string_view status;
         for (const auto& field : *fields) {
@@ -2727,73 +2700,18 @@ private:
             }
         }
         if (status.size() != 3 || status.front() != '2') {
-            ThrowGrpcStreamError("HTTP/2 server rejected request");
+            ThrowHttp2StreamError("HTTP/2 server rejected request");
         }
         response_headers_received_ = true;
         co_return end_stream;
     }
 
-    net::awaitable<bool> ReadNextGrpcMessage() {
-        if (read_closed_) {
-            co_return false;
-        }
-
-        std::array<uint8_t, 5> prefix{};
-        if (!co_await ReadGrpcBytes(prefix.data(), prefix.size())) {
-            co_return false;
-        }
-        if (prefix[0] != 0) {
-            LOG_NET_DEBUG("[gRPC:{}] compressed messages are not supported", conn_id_);
-            co_return false;
-        }
-        const uint32_t len = ReadU32(prefix.data() + 1);
-        memory::ByteVector message(len);
-        read_offset_ = 0;
-        if (len > 0 &&
-            !co_await ReadGrpcBytes(message.data(), message.size())) {
-            co_return false;
-        }
-
-        auto hunk = DecodeGrpcHunkData(message);
-        if (!hunk) {
-            LOG_NET_DEBUG("[gRPC:{}] invalid Hunk protobuf message", conn_id_);
-            co_return false;
-        }
-        read_payload_ = std::move(message);
-        read_offset_ = hunk->offset;
-        read_payload_end_ = hunk->offset + hunk->size;
-        co_return true;
-    }
-
-    net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len) {
-        size_t copied = 0;
-        while (copied < len) {
-            if (h2_data_offset_ >= h2_data_end_) {
-                h2_data_.clear();
-                h2_data_offset_ = 0;
-                h2_data_end_ = 0;
-                if (!co_await ReadNextDataFrame()) {
-                    co_return false;
-                }
-                continue;
-            }
-
-            const size_t n = std::min(
-                len - copied,
-                h2_data_end_ - h2_data_offset_);
-            std::memcpy(out + copied, h2_data_.data() + h2_data_offset_, n);
-            copied += n;
-            h2_data_offset_ += n;
-        }
-        co_return true;
-    }
-
     net::awaitable<bool> ReadNextDataFrame() {
-        while (!read_closed_) {
+        while (!read_closed_ && !input_done_) {
             auto frame = co_await ReadH2Frame(*inner_);
             if (!frame) {
-                if (role_ == Role::Client && !response_headers_received_) {
-                    ThrowGrpcStreamError("HTTP/2 peer closed before response headers");
+                if (!response_headers_received_) {
+                    ThrowHttp2StreamError("HTTP/2 peer closed before response headers");
                 }
                 co_return false;
             }
@@ -2801,19 +2719,22 @@ private:
             switch (frame->type) {
             case H2FrameType::SETTINGS:
                 if ((frame->flags & 0x1) == 0) {
+                    auto lease = co_await AcquireWrite();
                     co_await AcknowledgeH2Settings(*inner_);
                 }
                 break;
-            case H2FrameType::PING:
+            case H2FrameType::PING: {
+                auto lease = co_await AcquireWrite();
                 co_await ReplyH2Ping(*inner_, *frame);
                 break;
+            }
             case H2FrameType::WINDOW_UPDATE:
             case H2FrameType::PRIORITY:
             case H2FrameType::CONTINUATION:
                 break;
             case H2FrameType::HEADERS:
                 if (frame->stream_id == stream_id_) {
-                    if (role_ == Role::Client && !response_headers_received_) {
+                    if (!response_headers_received_) {
                         if (co_await ReadClientResponseHeaders(std::move(*frame))) {
                             read_closed_ = true;
                             co_return false;
@@ -2828,9 +2749,10 @@ private:
                 if (frame->stream_id != stream_id_) {
                     break;
                 }
-                if (role_ == Role::Client && !response_headers_received_) {
-                    ThrowGrpcStreamError("HTTP/2 DATA arrived before response headers");
+                if (!response_headers_received_) {
+                    ThrowHttp2StreamError("HTTP/2 DATA arrived before response headers");
                 }
+                input_done_ = (frame->flags & 0x1) != 0;
                 const auto data = H2DataPayload(*frame);
                 const size_t data_len = data.size();
                 if (data_len > 0) {
@@ -2838,6 +2760,7 @@ private:
                         data.data() - frame->payload.data());
                     h2_data_end_ = h2_data_offset_ + data_len;
                     h2_data_ = std::move(frame->payload);
+                    auto lease = co_await AcquireWrite();
                     co_await SendWindowUpdate(
                         *inner_,
                         0,
@@ -2856,11 +2779,11 @@ private:
             }
             case H2FrameType::RST_STREAM:
                 if (frame->stream_id == stream_id_) {
-                    ThrowGrpcStreamError("HTTP/2 stream reset by peer");
+                    ThrowHttp2StreamError("HTTP/2 stream reset by peer");
                 }
                 break;
             case H2FrameType::GOAWAY:
-                ThrowGrpcStreamError("HTTP/2 connection closed by peer");
+                ThrowHttp2StreamError("HTTP/2 connection closed by peer");
             default:
                 break;
             }
@@ -2869,38 +2792,32 @@ private:
     }
 
     std::unique_ptr<AsyncStream> inner_;
+    transport::internet::AsyncWriteGate write_gate_;
     uint32_t stream_id_ = 1;
-    Role role_ = Role::Client;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
-    uint64_t conn_id_ = 0;
     HpackDecoder response_decoder_;
     memory::ByteVector h2_data_;
     size_t h2_data_offset_ = 0;
     size_t h2_data_end_ = 0;
-    memory::ByteVector read_payload_;
-    size_t read_offset_ = 0;
-    size_t read_payload_end_ = 0;
+    transport::internet::GrpcHunkDecoder hunk_;
     bool read_closed_ = false;
     bool write_closed_ = false;
     bool closed_ = false;
     bool response_headers_received_ = false;
+    bool input_done_ = false;
 };
 
-class GrpcServerSession;
+class Http2ServerSession;
 
-class GrpcServerSubStreamState final {
+class Http2ServerSubStreamState final {
 public:
-    GrpcServerSubStreamState(net::io_context& io_context,
-                             std::shared_ptr<GrpcServerSession> session,
+    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    Http2ServerSubStreamState(net::io_context& io_context,
+                             std::shared_ptr<Http2ServerSession> session,
                              uint32_t stream_id,
-                             H2PayloadCodec payload_codec,
-                             uint64_t conn_id);
+                             H2PayloadCodec payload_codec);
 
-    [[nodiscard]] uint32_t StreamId() const noexcept {
-        return stream_id_;
-    }
-
-    [[nodiscard]] std::shared_ptr<GrpcServerSession> LockSession() const noexcept {
+    [[nodiscard]] std::shared_ptr<Http2ServerSession> LockSession() const noexcept {
         return session_.lock();
     }
 
@@ -2909,6 +2826,7 @@ public:
     void CancelFromSession() noexcept;
     void CancelPendingOperations() noexcept;
     void CloseLocal() noexcept;
+    void AbortLocal() noexcept;
     void ShutdownRead() noexcept;
     void ShutdownWrite() noexcept;
 
@@ -2927,8 +2845,6 @@ private:
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
-    net::awaitable<bool> ReadNextGrpcMessage();
-    net::awaitable<bool> ReadGrpcBytes(uint8_t* out, size_t len);
     net::awaitable<bool> EnsureReadablePayload();
     net::awaitable<bool> WaitForRawData();
     net::awaitable<size_t> AsyncReadRaw(net::mutable_buffer buffer);
@@ -2938,10 +2854,10 @@ private:
 
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
-    std::weak_ptr<GrpcServerSession> session_;
+    std::weak_ptr<Http2ServerSession> session_;
+    transport::CancellationSource cancellation_;
     uint32_t stream_id_ = 0;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
-    uint64_t conn_id_ = 0;
     struct QueuedH2Data {
         memory::ByteVector data;
         size_t offset = 0;
@@ -2955,9 +2871,7 @@ private:
     size_t h2_data_offset_ = 0;
     size_t queued_bytes_ = 0;
     bool shrink_h2_queue_on_drain_ = false;
-    memory::ByteVector read_payload_;
-    size_t read_offset_ = 0;
-    size_t read_payload_end_ = 0;
+    transport::internet::GrpcHunkDecoder hunk_;
     bool input_done_ = false;
     bool read_cancelled_ = false;
     bool read_closed_ = false;
@@ -2967,12 +2881,26 @@ private:
     bool cancelled_ = false;
 };
 
-class GrpcServerSubStream final : public AsyncStream {
+class Http2ServerSubStream final : public AsyncStream {
 public:
-    explicit GrpcServerSubStream(std::shared_ptr<GrpcServerSubStreamState> state)
-        : state_(std::move(state)) {}
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::ShutdownPeerWrite;
+    }
 
-    ~GrpcServerSubStream() noexcept override {
+    explicit Http2ServerSubStream(std::shared_ptr<Http2ServerSubStreamState> state)
+        : state_(std::move(state))
+        , state_cancel_(state_->Cancellation(), [](void* raw, transport::Cancellation cancellation) noexcept {
+            auto& self = *static_cast<Http2ServerSubStream*>(raw);
+            if (cancellation.terminal) self.cancellation_.Stop(cancellation.reason);
+            else {
+                self.state_cancel_.Resubscribe(self.state_->Cancellation());
+                self.cancellation_.CancelPending(cancellation.reason);
+            }
+        }, this) {}
+
+    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+
+    ~Http2ServerSubStream() noexcept override {
         Close();
     }
 
@@ -2985,7 +2913,7 @@ public:
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!state_) {
-            ThrowGrpcStreamError("gRPC write on closed stream");
+            ThrowHttp2StreamError("gRPC write on closed stream");
         }
         co_return co_await state_->AsyncWrite(buffer);
     }
@@ -3000,7 +2928,7 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!state_) {
             mb.clear();
-            ThrowGrpcStreamError("gRPC WriteMultiBuffer on closed stream");
+            ThrowHttp2StreamError("gRPC WriteMultiBuffer on closed stream");
         }
         co_await state_->WriteMultiBuffer(std::move(mb));
     }
@@ -3008,7 +2936,7 @@ public:
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
         if (!state_) {
-            ThrowGrpcStreamError("gRPC WriteBuffers on closed stream");
+            ThrowHttp2StreamError("gRPC WriteBuffers on closed stream");
         }
         co_await state_->WriteBuffers(buffers);
     }
@@ -3032,12 +2960,14 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         if (state_) {
             state_->CancelPendingOperations();
         }
     }
 
     void Close() override {
+        NotifyClosed();
         if (!state_) {
             return;
         }
@@ -3046,7 +2976,11 @@ public:
     }
 
     void CloseAbortive() override {
-        Close();
+        NotifyClosed();
+        if (state_) {
+            state_->AbortLocal();
+            state_.reset();
+        }
     }
 
     int NativeHandle() const override;
@@ -3057,13 +2991,15 @@ protected:
     const TcpStream* BaseTcpStream() const override;
 
 private:
-    std::shared_ptr<GrpcServerSubStreamState> state_;
+    std::shared_ptr<Http2ServerSubStreamState> state_;
+    transport::CancellationSource cancellation_;
+    transport::CancellationSubscription state_cancel_;
 };
 
-class GrpcServerSession final
-    : public std::enable_shared_from_this<GrpcServerSession> {
+class Http2ServerSession final
+    : public std::enable_shared_from_this<Http2ServerSession> {
 public:
-    GrpcServerSession(net::io_context& io_context,
+    Http2ServerSession(net::io_context& io_context,
                       std::unique_ptr<AsyncStream> stream,
                       std::shared_ptr<InboundTransportStreamHandler> stream_handler,
                       H2PayloadCodec payload_codec,
@@ -3081,12 +3017,12 @@ public:
         , xhttp_config_(std::move(xhttp_config))
         , conn_id_(conn_id) {}
 
-    ~GrpcServerSession() noexcept {
+    ~Http2ServerSession() noexcept {
         CancelAll();
     }
 
-    GrpcServerSession(const GrpcServerSession&) = delete;
-    GrpcServerSession& operator=(const GrpcServerSession&) = delete;
+    Http2ServerSession(const Http2ServerSession&) = delete;
+    Http2ServerSession& operator=(const Http2ServerSession&) = delete;
 
     [[nodiscard]] AsyncStream* InnerStream() noexcept {
         return stream_.get();
@@ -3094,24 +3030,6 @@ public:
 
     [[nodiscard]] const AsyncStream* InnerStream() const noexcept {
         return stream_.get();
-    }
-
-    std::shared_ptr<GrpcServerSubStreamState> CreateStream(uint32_t stream_id) {
-        if (stream_id == 0 ||
-            (stream_id & 1u) == 0 ||
-            stream_id <= last_remote_stream_id_ ||
-            streams_.size() >= kHttp2MaxConcurrentStreams) {
-            return nullptr;
-        }
-        auto sub = std::make_shared<GrpcServerSubStreamState>(
-            io_context_,
-            shared_from_this(),
-            stream_id,
-            payload_codec_,
-            conn_id_);
-        streams_.emplace(stream_id, sub);
-        last_remote_stream_id_ = stream_id;
-        return sub;
     }
 
     void RemoveStream(uint32_t stream_id) noexcept {
@@ -3150,7 +3068,8 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> payload = {}) {
         auto write_lease = co_await write_gate_.Acquire();
-        if (!write_lease || cancelled_ || !stream_) {
+        if (!write_lease || cancelled_ || !stream_ ||
+            (stream_id != 0 && type != H2FrameType::RST_STREAM && !streams_.contains(stream_id))) {
             co_return false;
         }
 
@@ -3166,7 +3085,7 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> data) {
         auto write_lease = co_await write_gate_.Acquire();
-        if (!write_lease || cancelled_ || !stream_) {
+        if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
 
@@ -3178,7 +3097,7 @@ public:
         std::span<const uint8_t> data,
         bool end_stream = false) {
         auto write_lease = co_await write_gate_.Acquire();
-        if (!write_lease || cancelled_ || !stream_) {
+        if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
 
@@ -3194,7 +3113,7 @@ public:
         std::span<const net::const_buffer> buffers,
         bool end_stream = false) {
         auto write_lease = co_await write_gate_.Acquire();
-        if (!write_lease || cancelled_ || !stream_) {
+        if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
 
@@ -3244,8 +3163,68 @@ public:
             payload);
     }
 
-    net::awaitable<bool> HandleInitialHeadersFrame(H2Frame frame) {
-        co_return co_await HandleHeadersFrame(std::move(frame));
+    net::awaitable<bool> ResetStream(uint32_t stream_id, H2Error error) {
+        RemoveStream(stream_id);
+        std::array<uint8_t, 4> payload{};
+        WriteU32(payload.data(), static_cast<uint32_t>(error));
+        co_return co_await WriteFrameSerialized(H2FrameType::RST_STREAM, 0, stream_id, payload);
+    }
+
+    net::awaitable<bool> FailConnection(H2Error error) {
+        std::array<uint8_t, 8> payload{};
+        WriteU32(payload.data(), last_remote_stream_id_);
+        WriteU32(payload.data() + 4, static_cast<uint32_t>(error));
+        (void)co_await WriteFrameSerialized(H2FrameType::GOAWAY, 0, 0, payload);
+        CancelAll();
+        co_return false;
+    }
+
+    net::awaitable<bool> HandleFrame(H2Frame frame) {
+        switch (frame.type) {
+        case H2FrameType::SETTINGS:
+            if (frame.stream_id != 0) co_return co_await FailConnection(H2Error::Protocol);
+            if (frame.payload.size() % 6 != 0 ||
+                ((frame.flags & 0x1) && !frame.payload.empty())) {
+                co_return co_await FailConnection(H2Error::FrameSize);
+            }
+            if (!(frame.flags & 0x1)) {
+                co_return co_await WriteFrameSerialized(H2FrameType::SETTINGS, 0x1, 0);
+            }
+            break;
+        case H2FrameType::PING:
+            if (frame.stream_id != 0) co_return co_await FailConnection(H2Error::Protocol);
+            if (frame.payload.size() != 8) co_return co_await FailConnection(H2Error::FrameSize);
+            if (!(frame.flags & 0x1)) {
+                co_return co_await WriteFrameSerialized(H2FrameType::PING, 0x1, 0, frame.payload);
+            }
+            break;
+        case H2FrameType::HEADERS:
+            co_return co_await HandleHeadersFrame(std::move(frame));
+        case H2FrameType::DATA:
+            if (frame.stream_id == 0 || (frame.stream_id & 1u) == 0 ||
+                frame.stream_id > last_remote_stream_id_) {
+                co_return co_await FailConnection(H2Error::Protocol);
+            }
+            co_await HandleDataFrame(std::move(frame));
+            break;
+        case H2FrameType::RST_STREAM:
+            if (frame.payload.size() != 4) co_return co_await FailConnection(H2Error::FrameSize);
+            if (frame.stream_id == 0 || (frame.stream_id & 1u) == 0 ||
+                frame.stream_id > last_remote_stream_id_) {
+                co_return co_await FailConnection(H2Error::Protocol);
+            }
+            RemoveStream(frame.stream_id);
+            break;
+        case H2FrameType::GOAWAY:
+            CancelAll();
+            co_return false;
+        case H2FrameType::CONTINUATION:
+        case H2FrameType::PUSH_PROMISE:
+            co_return co_await FailConnection(H2Error::Protocol);
+        default:
+            break;
+        }
+        co_return !cancelled_;
     }
 
     net::awaitable<void> RunReadLoop() {
@@ -3256,60 +3235,16 @@ public:
                     break;
                 }
 
-                switch (frame->type) {
-                case H2FrameType::SETTINGS:
-                    if ((frame->flags & 0x1) == 0) {
-                        (void)co_await WriteFrameSerialized(
-                            H2FrameType::SETTINGS,
-                            0x1,
-                            0);
-                    }
-                    break;
-                case H2FrameType::PING:
-                    if (frame->payload.size() == 8 &&
-                        (frame->flags & 0x1) == 0) {
-                        (void)co_await WriteFrameSerialized(
-                            H2FrameType::PING,
-                            0x1,
-                            0,
-                            std::span<const uint8_t>(
-                                frame->payload.data(),
-                                frame->payload.size()));
-                    }
-                    break;
-                case H2FrameType::HEADERS:
-                    if (!co_await HandleHeadersFrame(std::move(*frame))) {
-                        CancelAll();
-                        co_return;
-                    }
-                    break;
-                case H2FrameType::DATA:
-                    co_await HandleDataFrame(std::move(*frame));
-                    break;
-                case H2FrameType::RST_STREAM:
-                    if (frame->stream_id != 0) {
-                        RemoveStream(frame->stream_id);
-                    }
-                    break;
-                case H2FrameType::GOAWAY:
-                    CancelAll();
-                    co_return;
-                case H2FrameType::WINDOW_UPDATE:
-                case H2FrameType::PRIORITY:
-                case H2FrameType::CONTINUATION:
-                    break;
-                default:
-                    break;
-                }
+                if (!co_await HandleFrame(std::move(*frame))) break;
             }
         } catch (const std::exception& e) {
             LOG_NET_DEBUG(
-                "[gRPC:{}] server: read loop exception: {}",
+                "[HTTP/2:{}] server: read loop exception: {}",
                 conn_id_,
                 e.what());
         } catch (...) {
             LOG_NET_DEBUG(
-                "[gRPC:{}] server: read loop exception: unknown",
+                "[HTTP/2:{}] server: read loop exception: unknown",
                 conn_id_);
         }
         CancelAll();
@@ -3347,19 +3282,26 @@ private:
             frame = std::move(*cont);
         }
 
+        // Decode even rejected streams to preserve connection-wide HPACK state.
+        auto request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
+        if (!request) {
+            co_return false;
+        }
+        if ((stream_id & 1u) == 0 || stream_id <= last_remote_stream_id_) {
+            co_return co_await FailConnection(H2Error::Protocol);
+        }
+        last_remote_stream_id_ = stream_id;
+        if (streams_.size() >= kHttp2MaxConcurrentStreams) {
+            co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
+        }
+        auto sub = std::make_shared<Http2ServerSubStreamState>(
+            io_context_, shared_from_this(), stream_id, payload_codec_);
+        streams_.emplace(stream_id, sub);
+
         if (xhttp_config_ && http_config_ &&
             payload_codec_ == H2PayloadCodec::RawData) {
             co_return co_await HandleXHttpHeadersFrame(
-                stream_id,
-                initial_flags,
-                std::span<const uint8_t>(
-                    header_block.data(),
-                    header_block.size()));
-        }
-
-        auto sub = CreateStream(stream_id);
-        if (!sub) {
-            co_return false;
+                stream_id, initial_flags, *request, std::move(sub));
         }
         if (payload_codec_ == H2PayloadCodec::RawData) {
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
@@ -3389,53 +3331,44 @@ private:
         auto handler = stream_handler_;
         if (handler && sub) {
             handler->OnInboundTransportStream(
-                std::make_unique<GrpcServerSubStream>(std::move(sub)));
+                std::make_unique<Http2ServerSubStream>(std::move(sub)));
         } else if (sub) {
             sub->CloseLocal();
         }
         co_return true;
     }
 
-    net::awaitable<bool> HandleXHttpHeadersFrame(uint32_t stream_id,
-                                                 uint8_t initial_flags,
-                                                 std::span<const uint8_t> header_block) {
-        auto request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
-        if (!request) {
-            LOG_NET_DEBUG("[XHTTP:{}] server: failed to decode H2 request headers stream_id={}",
-                             conn_id_,
-                             stream_id);
-            co_return false;
-        }
+    net::awaitable<bool> HandleXHttpHeadersFrame(
+        uint32_t stream_id,
+        uint8_t initial_flags,
+        const H2RequestHeaders& request,
+        std::shared_ptr<Http2ServerSubStreamState> sub) {
         if (const std::string_view expected_host = TrimAscii(ExpectedHttpHost(*http_config_));
             !expected_host.empty() &&
-            !EqualsAsciiCI(TrimAscii(request->authority), expected_host)) {
+            !EqualsAsciiCI(TrimAscii(request.authority), expected_host)) {
             LOG_NET_DEBUG(
                 "[XHTTP:{}] server: H2 host mismatch expected='{}' actual='{}'",
                 conn_id_,
                 SanitizeForLog(expected_host),
-                SanitizeForLog(request->authority));
-            co_return false;
+                SanitizeForLog(request.authority));
+            co_return co_await ResetStream(stream_id, H2Error::Protocol);
         }
 
         const auto meta = ParseXHttpRequestMeta(
             http_config_->path,
-            request->path,
-            request->method);
+            request.path,
+            request.method);
         if (meta.kind == XHttpRequestMeta::Kind::Unknown) {
             LOG_NET_DEBUG("[XHTTP:{}] server: unknown H2 request method='{}' path='{}'",
                              conn_id_,
-                             SanitizeForLog(request->method),
-                             SanitizeForLog(request->path));
-            co_return false;
+                             SanitizeForLog(request.method),
+                             SanitizeForLog(request.path));
+            co_return co_await ResetStream(stream_id, H2Error::Protocol);
         }
 
         if (meta.kind == XHttpRequestMeta::Kind::StreamOne) {
             if (!xhttp_config_->AcceptsStreamOne()) {
-                co_return false;
-            }
-            auto sub = CreateStream(stream_id);
-            if (!sub) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
@@ -3449,7 +3382,7 @@ private:
             auto handler = stream_handler_;
             if (handler && sub) {
                 handler->OnInboundTransportStream(
-                    std::make_unique<GrpcServerSubStream>(std::move(sub)));
+                    std::make_unique<Http2ServerSubStream>(std::move(sub)));
             } else if (sub) {
                 sub->CloseLocal();
             }
@@ -3459,18 +3392,14 @@ private:
         if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
             if (!xhttp_config_->AcceptsPacketUp() &&
                 !xhttp_config_->AcceptsStreamUp()) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = GetXHttpPacketSession(
                 io_context_,
                 meta.session_id,
                 true);
             if (!xsession) {
-                co_return false;
-            }
-            auto sub = CreateStream(stream_id);
-            if (!sub) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
@@ -3488,7 +3417,7 @@ private:
                 handler->OnInboundTransportStream(
                     std::make_unique<XHttpPacketUpServerStream>(
                         std::move(xsession),
-                        std::make_unique<GrpcServerSubStream>(std::move(sub))));
+                        std::make_unique<Http2ServerSubStream>(std::move(sub))));
             } else if (sub) {
                 sub->CloseLocal();
             }
@@ -3497,18 +3426,14 @@ private:
 
         if (meta.kind == XHttpRequestMeta::Kind::StreamUp) {
             if (!xhttp_config_->AcceptsStreamUp()) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = GetXHttpPacketSession(
                 io_context_,
                 meta.session_id,
                 true);
             if (!xsession) {
-                co_return false;
-            }
-            auto sub = CreateStream(stream_id);
-            if (!sub) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
@@ -3521,7 +3446,7 @@ private:
                              meta.session_id,
                              stream_id);
             if (!xsession->AttachStream(
-                    std::make_unique<GrpcServerSubStream>(std::move(sub)))) {
+                    std::make_unique<Http2ServerSubStream>(std::move(sub)))) {
                 LOG_NET_DEBUG(
                     "[XHTTP:{}] server: rejected concurrent H2 stream-up session={}",
                     conn_id_,
@@ -3532,18 +3457,14 @@ private:
 
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp) {
             if (!xhttp_config_->AcceptsPacketUp()) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             auto xsession = GetXHttpPacketSession(
                 io_context_,
                 meta.session_id,
                 false);
             if (!xsession) {
-                co_return false;
-            }
-            auto sub = CreateStream(stream_id);
-            if (!sub) {
-                co_return false;
+                co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (!co_await WriteHttpResponseHeadersSerialized(stream_id)) {
                 co_return false;
@@ -3551,7 +3472,8 @@ private:
             if ((initial_flags & 0x1) != 0 && sub) {
                 sub->CloseInput();
             }
-            auto upload = std::make_unique<GrpcServerSubStream>(std::move(sub));
+            auto upload = std::make_unique<Http2ServerSubStream>(std::move(sub));
+            bool spawn_failed = false;
             try {
                 net::co_spawn(
                     io_context_.get_executor(),
@@ -3598,20 +3520,18 @@ private:
                     },
                     net::detached);
             } catch (...) {
-                upload->CloseAbortive();
-                co_return false;
+                spawn_failed = true;
+            }
+            if (spawn_failed) {
+                co_return co_await ResetStream(stream_id, H2Error::Cancel);
             }
             co_return true;
         }
 
-        co_return false;
+        co_return co_await ResetStream(stream_id, H2Error::Protocol);
     }
 
     net::awaitable<void> HandleDataFrame(H2Frame frame) {
-        if (frame.stream_id == 0) {
-            co_return;
-        }
-
         const auto data = H2DataPayload(frame);
         const size_t data_len = data.size();
         if (data_len > 0) {
@@ -3631,11 +3551,9 @@ private:
                     data_offset,
                     data_len);
                 if (!queued) {
-                    RemoveStream(frame.stream_id);
-                    (void)co_await WriteFrameSerialized(
-                        H2FrameType::RST_STREAM,
-                        0,
-                        frame.stream_id);
+                    if (!co_await ResetStream(frame.stream_id, H2Error::ExcessiveLoad)) {
+                        CancelAll();
+                    }
                 }
             }
         }
@@ -3652,7 +3570,7 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     transport::internet::AsyncWriteGate write_gate_;
-    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<GrpcServerSubStreamState>>
+    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>
         streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     transport::internet::HttpHeaders response_headers_;
@@ -3664,20 +3582,18 @@ private:
     bool cancelled_ = false;
 };
 
-GrpcServerSubStreamState::GrpcServerSubStreamState(
+Http2ServerSubStreamState::Http2ServerSubStreamState(
     net::io_context& io_context,
-    std::shared_ptr<GrpcServerSession> session,
+    std::shared_ptr<Http2ServerSession> session,
     uint32_t stream_id,
-    H2PayloadCodec payload_codec,
-    uint64_t conn_id)
+    H2PayloadCodec payload_codec)
     : io_context_(io_context)
     , input_signal_(io_context, 1)
     , session_(std::move(session))
     , stream_id_(stream_id)
-    , payload_codec_(payload_codec)
-    , conn_id_(conn_id) {}
+    , payload_codec_(payload_codec) {}
 
-bool GrpcServerSubStreamState::PushH2Data(
+bool Http2ServerSubStreamState::PushH2Data(
     memory::ByteVector data,
     size_t offset,
     size_t size) {
@@ -3705,7 +3621,7 @@ bool GrpcServerSubStreamState::PushH2Data(
     return true;
 }
 
-void GrpcServerSubStreamState::CloseInput() {
+void Http2ServerSubStreamState::CloseInput() {
     if (input_done_) {
         return;
     }
@@ -3713,7 +3629,8 @@ void GrpcServerSubStreamState::CloseInput() {
     WakeInputReader();
 }
 
-void GrpcServerSubStreamState::CancelFromSession() noexcept {
+void Http2ServerSubStreamState::CancelFromSession() noexcept {
+    cancellation_.Stop();
     if (cancelled_) {
         return;
     }
@@ -3724,13 +3641,12 @@ void GrpcServerSubStreamState::CancelFromSession() noexcept {
     trailers_sent_ = true;
     closing_local_ = true;
     ClearH2Queue();
-    read_payload_.clear();
-    read_offset_ = 0;
-    read_payload_end_ = 0;
+    hunk_.Clear();
     WakeInputReader();
 }
 
-void GrpcServerSubStreamState::CancelPendingOperations() noexcept {
+void Http2ServerSubStreamState::CancelPendingOperations() noexcept {
+    cancellation_.CancelPending();
     if (cancelled_) {
         return;
     }
@@ -3738,7 +3654,33 @@ void GrpcServerSubStreamState::CancelPendingOperations() noexcept {
     WakeInputReader();
 }
 
-void GrpcServerSubStreamState::CloseLocal() noexcept {
+void Http2ServerSubStreamState::AbortLocal() noexcept {
+    if (cancelled_) return;
+    auto session = LockSession();
+    if (!session) {
+        CancelFromSession();
+        return;
+    }
+    const auto stream_id = stream_id_;
+    session->RemoveStream(stream_id);
+    try {
+        net::co_spawn(io_context_.get_executor(),
+            [session, stream_id]() -> net::awaitable<void> {
+                try {
+                    if (!co_await session->ResetStream(stream_id, H2Error::Cancel)) {
+                        session->CancelAll();
+                    }
+                } catch (...) {
+                    session->CancelAll();
+                }
+            }, net::detached);
+    } catch (...) {
+        session->CancelAll();
+    }
+}
+
+void Http2ServerSubStreamState::CloseLocal() noexcept {
+    cancellation_.Stop();
     if (cancelled_ || closing_local_) {
         return;
     }
@@ -3746,9 +3688,7 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
     input_done_ = true;
     read_closed_ = true;
     ClearH2Queue();
-    read_payload_.clear();
-    read_offset_ = 0;
-    read_payload_end_ = 0;
+    hunk_.Clear();
     WakeInputReader();
 
     auto session = session_.lock();
@@ -3766,7 +3706,7 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
                 io_context_.get_executor(),
                 [session, stream_id, codec = payload_codec_]() -> net::awaitable<void> {
                     struct StreamRemovalGuard final {
-                        std::shared_ptr<GrpcServerSession> session;
+                        std::shared_ptr<Http2ServerSession> session;
                         uint32_t stream_id;
 
                         ~StreamRemovalGuard() noexcept {
@@ -3791,21 +3731,19 @@ void GrpcServerSubStreamState::CloseLocal() noexcept {
     }
 }
 
-void GrpcServerSubStreamState::ShutdownRead() noexcept {
+void Http2ServerSubStreamState::ShutdownRead() noexcept {
     read_closed_ = true;
     input_done_ = true;
     ClearH2Queue();
-    read_payload_.clear();
-    read_offset_ = 0;
-    read_payload_end_ = 0;
+    hunk_.Clear();
     WakeInputReader();
 }
 
-void GrpcServerSubStreamState::ShutdownWrite() noexcept {
+void Http2ServerSubStreamState::ShutdownWrite() noexcept {
     write_closed_ = true;
 }
 
-net::awaitable<size_t> GrpcServerSubStreamState::AsyncRead(
+net::awaitable<size_t> Http2ServerSubStreamState::AsyncRead(
     net::mutable_buffer buffer) {
     auto* out = static_cast<uint8_t*>(buffer.data());
     const size_t capacity = buffer.size();
@@ -3817,31 +3755,22 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncRead(
         co_return co_await AsyncReadRaw(buffer);
     }
 
-    while (read_offset_ >= read_payload_end_) {
-        if (!co_await ReadNextGrpcMessage()) {
-            co_return 0;
-        }
-    }
-
-    const size_t n = std::min(capacity, read_payload_end_ - read_offset_);
-    std::memcpy(out, read_payload_.data() + read_offset_, n);
-    read_offset_ += n;
-    if (read_offset_ >= read_payload_end_) {
-        read_payload_.clear();
-        read_offset_ = 0;
-        read_payload_end_ = 0;
-    }
+    if (!co_await EnsureReadablePayload()) co_return 0;
+    const auto payload = hunk_.Payload();
+    const size_t n = std::min(capacity, payload.size());
+    std::memcpy(out, payload.data(), n);
+    hunk_.Consume(n);
     co_return n;
 }
 
-net::awaitable<size_t> GrpcServerSubStreamState::AsyncWrite(
+net::awaitable<size_t> Http2ServerSubStreamState::AsyncWrite(
     net::const_buffer buffer) {
     if (write_closed_ || cancelled_) {
-        ThrowGrpcStreamError("gRPC write on closed server stream");
+        ThrowHttp2StreamError("gRPC write on closed server stream");
     }
     auto session = session_.lock();
     if (!session) {
-        ThrowGrpcStreamError("gRPC write without server session");
+        ThrowHttp2StreamError("gRPC write without server session");
     }
     const auto* data = static_cast<const uint8_t*>(buffer.data());
     const size_t len = buffer.size();
@@ -3849,19 +3778,19 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncWrite(
         if (!co_await session->WriteRawDataSerialized(
                 stream_id_,
                 std::span<const uint8_t>(data, len))) {
-            ThrowGrpcStreamError("HTTP/2 raw server stream write failed");
+            ThrowHttp2StreamError("HTTP/2 raw server stream write failed");
         }
         co_return len;
     }
     if (!co_await session->WriteGrpcMessageSerialized(
             stream_id_,
             std::span<const uint8_t>(data, len))) {
-        ThrowGrpcStreamError("gRPC server stream write failed");
+        ThrowHttp2StreamError("gRPC server stream write failed");
     }
     co_return len;
 }
 
-net::awaitable<buf::MultiBuffer> GrpcServerSubStreamState::ReadMultiBuffer() {
+net::awaitable<buf::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer() {
     if (!co_await EnsureReadablePayload()) {
         co_return buf::MultiBuffer{};
     }
@@ -3876,11 +3805,11 @@ net::awaitable<buf::MultiBuffer> GrpcServerSubStreamState::ReadMultiBuffer() {
     }
     buffer->Produce(static_cast<uint32_t>(n));
     buf::MultiBuffer mb;
-    mb.push_back(buffer.release());
+    mb.push_back(std::move(buffer));
     co_return mb;
 }
 
-net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
+net::awaitable<void> Http2ServerSubStreamState::WriteMultiBuffer(
     buf::MultiBuffer mb) {
     if (payload_codec_ == H2PayloadCodec::RawData) {
         ConstBufferSpanBuilder<16> payloads;
@@ -3889,16 +3818,16 @@ net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
         try {
             if (!payloads.empty()) {
                 if (write_closed_ || cancelled_) {
-                    ThrowGrpcStreamError("gRPC write on closed server stream");
+                    ThrowHttp2StreamError("gRPC write on closed server stream");
                 }
                 auto session = session_.lock();
                 if (!session) {
-                    ThrowGrpcStreamError("gRPC write without server session");
+                    ThrowHttp2StreamError("gRPC write without server session");
                 }
                 if (!co_await session->WriteRawDataBuffersSerialized(
                         stream_id_,
                         payloads.Span())) {
-                    ThrowGrpcStreamError("HTTP/2 raw server stream WriteMultiBuffer failed");
+                    ThrowHttp2StreamError("HTTP/2 raw server stream WriteMultiBuffer failed");
                 }
             }
         } catch (...) {
@@ -3932,7 +3861,7 @@ net::awaitable<void> GrpcServerSubStreamState::WriteMultiBuffer(
     mb.clear();
 }
 
-net::awaitable<void> GrpcServerSubStreamState::WriteBuffers(
+net::awaitable<void> Http2ServerSubStreamState::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (payload_codec_ == H2PayloadCodec::RawData) {
         bool has_data = false;
@@ -3946,16 +3875,16 @@ net::awaitable<void> GrpcServerSubStreamState::WriteBuffers(
             co_return;
         }
         if (write_closed_ || cancelled_) {
-            ThrowGrpcStreamError("gRPC write on closed server stream");
+            ThrowHttp2StreamError("gRPC write on closed server stream");
         }
         auto session = session_.lock();
         if (!session) {
-            ThrowGrpcStreamError("gRPC write without server session");
+            ThrowHttp2StreamError("gRPC write without server session");
         }
         if (!co_await session->WriteRawDataBuffersSerialized(
                 stream_id_,
                 buffers)) {
-            ThrowGrpcStreamError("HTTP/2 raw server stream WriteBuffers failed");
+            ThrowHttp2StreamError("HTTP/2 raw server stream WriteBuffers failed");
         }
         co_return;
     }
@@ -3968,7 +3897,7 @@ net::awaitable<void> GrpcServerSubStreamState::WriteBuffers(
     }
 }
 
-net::awaitable<void> GrpcServerSubStreamState::AsyncShutdownWrite() {
+net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
     if (trailers_sent_) {
         co_return;
     }
@@ -3984,20 +3913,20 @@ net::awaitable<void> GrpcServerSubStreamState::AsyncShutdownWrite() {
     }
 }
 
-void GrpcServerSubStreamState::MarkQueueForShrinkIfLarge() noexcept {
+void Http2ServerSubStreamState::MarkQueueForShrinkIfLarge() noexcept {
     if (h2_data_queue_.size() >= kGrpcServerH2QueueShrinkItems) {
         shrink_h2_queue_on_drain_ = true;
     }
 }
 
-void GrpcServerSubStreamState::ShrinkQueueIfDrained() noexcept {
+void Http2ServerSubStreamState::ShrinkQueueIfDrained() noexcept {
     if (h2_data_queue_.empty() && shrink_h2_queue_on_drain_) {
         TryShrinkSequence(h2_data_queue_);
         shrink_h2_queue_on_drain_ = false;
     }
 }
 
-void GrpcServerSubStreamState::ClearH2Queue() noexcept {
+void Http2ServerSubStreamState::ClearH2Queue() noexcept {
     h2_data_queue_.clear();
     queued_bytes_ = 0;
     h2_data_offset_ = 0;
@@ -4007,7 +3936,7 @@ void GrpcServerSubStreamState::ClearH2Queue() noexcept {
     }
 }
 
-net::awaitable<bool> GrpcServerSubStreamState::WaitForRawData() {
+net::awaitable<bool> Http2ServerSubStreamState::WaitForRawData() {
     while (!cancelled_) {
         if (read_cancelled_) {
             read_cancelled_ = false;
@@ -4045,19 +3974,24 @@ net::awaitable<bool> GrpcServerSubStreamState::WaitForRawData() {
     co_return false;
 }
 
-net::awaitable<bool> GrpcServerSubStreamState::EnsureReadablePayload() {
-    if (payload_codec_ == H2PayloadCodec::RawData) {
-        co_return co_await WaitForRawData();
-    }
-    while (read_offset_ >= read_payload_end_) {
-        if (!co_await ReadNextGrpcMessage()) {
+net::awaitable<bool> Http2ServerSubStreamState::EnsureReadablePayload() {
+    if (payload_codec_ == H2PayloadCodec::RawData) co_return co_await WaitForRawData();
+    while (hunk_.Payload().empty()) {
+        if (!co_await WaitForRawData()) {
+            if (!hunk_.AtMessageBoundary()) ThrowHttp2StreamError("truncated gRPC message");
             co_return false;
         }
+        const auto& front = h2_data_queue_.front();
+        const auto bytes = std::span<const uint8_t>(front.data).subspan(
+            h2_data_offset_, front.end - h2_data_offset_);
+        const auto consumed = hunk_.Feed(bytes);
+        if (!consumed) ThrowHttp2StreamError(consumed.error().data());
+        h2_data_offset_ += *consumed;
     }
     co_return true;
 }
 
-net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
+net::awaitable<size_t> Http2ServerSubStreamState::AsyncReadRaw(
     net::mutable_buffer buffer) {
     auto* out = static_cast<uint8_t*>(buffer.data());
     const size_t capacity = buffer.size();
@@ -4072,95 +4006,7 @@ net::awaitable<size_t> GrpcServerSubStreamState::AsyncReadRaw(
     co_return n;
 }
 
-net::awaitable<bool> GrpcServerSubStreamState::ReadNextGrpcMessage() {
-    if (read_closed_ || cancelled_) {
-        co_return false;
-    }
-
-    std::array<uint8_t, 5> prefix{};
-    if (!co_await ReadGrpcBytes(prefix.data(), prefix.size())) {
-        co_return false;
-    }
-    if (prefix[0] != 0) {
-        LOG_NET_DEBUG(
-            "[gRPC:{}] server: compressed messages are not supported",
-            conn_id_);
-        co_return false;
-    }
-    const uint32_t len = ReadU32(prefix.data() + 1);
-    memory::ByteVector message(len);
-    read_offset_ = 0;
-    if (len > 0 &&
-        !co_await ReadGrpcBytes(message.data(), message.size())) {
-        co_return false;
-    }
-
-    auto hunk = DecodeGrpcHunkData(message);
-    if (!hunk) {
-        LOG_NET_DEBUG(
-            "[gRPC:{}] server: invalid Hunk protobuf message",
-            conn_id_);
-        co_return false;
-    }
-    read_payload_ = std::move(message);
-    read_offset_ = hunk->offset;
-    read_payload_end_ = hunk->offset + hunk->size;
-    co_return true;
-}
-
-net::awaitable<bool> GrpcServerSubStreamState::ReadGrpcBytes(
-    uint8_t* out,
-    size_t len) {
-    size_t copied = 0;
-    while (copied < len && !cancelled_) {
-        if (read_cancelled_) {
-            read_cancelled_ = false;
-            throw IoSystemError(io_error::operation_aborted, "gRPC read cancelled");
-        }
-
-        while (!h2_data_queue_.empty()) {
-            const auto& front = h2_data_queue_.front();
-            if (h2_data_offset_ < front.offset) {
-                h2_data_offset_ = front.offset;
-            }
-            if (h2_data_offset_ < front.end) {
-                break;
-            }
-            queued_bytes_ -= std::min(queued_bytes_, front.Size());
-            h2_data_queue_.pop_front();
-            ShrinkQueueIfDrained();
-            h2_data_offset_ = 0;
-        }
-
-        if (!h2_data_queue_.empty()) {
-            const auto& front = h2_data_queue_.front();
-            const size_t n = std::min(
-                len - copied,
-                front.end - h2_data_offset_);
-            std::memcpy(out + copied, front.data.data() + h2_data_offset_, n);
-            copied += n;
-            h2_data_offset_ += n;
-            continue;
-        }
-
-        if (input_done_ || read_closed_) {
-            co_return false;
-        }
-
-        auto [ec] = co_await input_signal_.async_receive(
-            net::as_tuple(net::use_awaitable));
-        if (ec) {
-            co_return false;
-        }
-    }
-    if (read_cancelled_) {
-        read_cancelled_ = false;
-        throw IoSystemError(io_error::operation_aborted, "gRPC read cancelled");
-    }
-    co_return copied == len;
-}
-
-int GrpcServerSubStream::NativeHandle() const {
+int Http2ServerSubStream::NativeHandle() const {
     if (!state_) {
         return -1;
     }
@@ -4169,7 +4015,7 @@ int GrpcServerSubStream::NativeHandle() const {
     return inner ? inner->NativeHandle() : -1;
 }
 
-bool GrpcServerSubStream::IsOpen() const {
+bool Http2ServerSubStream::IsOpen() const {
     if (!state_) {
         return false;
     }
@@ -4178,7 +4024,7 @@ bool GrpcServerSubStream::IsOpen() const {
     return inner && inner->IsOpen();
 }
 
-TcpStream* GrpcServerSubStream::BaseTcpStream() {
+TcpStream* Http2ServerSubStream::BaseTcpStream() {
     if (!state_) {
         return nullptr;
     }
@@ -4187,7 +4033,7 @@ TcpStream* GrpcServerSubStream::BaseTcpStream() {
     return inner ? BaseTcpStreamOf(*inner) : nullptr;
 }
 
-const TcpStream* GrpcServerSubStream::BaseTcpStream() const {
+const TcpStream* Http2ServerSubStream::BaseTcpStream() const {
     if (!state_) {
         return nullptr;
     }
@@ -4198,6 +4044,42 @@ const TcpStream* GrpcServerSubStream::BaseTcpStream() const {
 
 [[nodiscard]] uint32_t GrpcInitialWindow(const GrpcConfig& cfg) noexcept {
     return cfg.initial_window_size.value_or(kGrpcInitialWindow);
+}
+
+net::awaitable<TransportBuildResult> StartHttp2ServerSession(
+    std::unique_ptr<AsyncStream> stream,
+    uint32_t initial_window,
+    H2PayloadCodec payload_codec,
+    transport::internet::HttpHeaders response_headers,
+    net::io_context& io_context,
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+    uint64_t conn_id,
+    std::optional<HttpConfig> http_config = std::nullopt,
+    std::optional<XHttpConfig> xhttp_config = std::nullopt) {
+    auto session = std::make_shared<Http2ServerSession>(
+        io_context, std::move(stream), std::move(stream_handler), payload_codec,
+        std::move(response_headers), conn_id, std::move(http_config), std::move(xhttp_config));
+    auto settings = transport::internet::EncodeInitialWindowSetting(initial_window);
+    settings.resize(12);
+    settings[6] = 0;
+    settings[7] = 3; // SETTINGS_MAX_CONCURRENT_STREAMS
+    WriteU32(settings.data() + 8, kHttp2MaxConcurrentStreams);
+    if (!co_await session->WriteFrameSerialized(H2FrameType::SETTINGS, 0, 0, settings)) {
+        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    while (true) {
+        auto frame = co_await ReadH2Frame(*session->InnerStream());
+        if (!frame) co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        const bool first_headers = frame->type == H2FrameType::HEADERS;
+        if (!co_await session->HandleFrame(std::move(*frame))) {
+            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        if (!first_headers) continue;
+        net::co_spawn(io_context.get_executor(),
+            [session]() -> net::awaitable<void> { co_await session->RunReadLoop(); },
+            net::detached);
+        co_return std::unique_ptr<AsyncStream>{};
+    }
 }
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
@@ -4214,88 +4096,9 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto settings = transport::internet::EncodeInitialWindowSetting(
-        GrpcInitialWindow(cfg));
-    if (!co_await WriteH2Frame(
-            *stream,
-            H2FrameType::SETTINGS,
-            0,
-            0,
-            settings)) {
-        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-
-    while (true) {
-        auto frame = co_await ReadH2Frame(*stream);
-        if (!frame) {
-            co_return std::unexpected(ErrorCode::SOCKET_EOF);
-        }
-
-        switch (frame->type) {
-        case H2FrameType::SETTINGS:
-            if ((frame->flags & 0x1) == 0) {
-                co_await AcknowledgeH2Settings(*stream);
-            }
-            break;
-        case H2FrameType::PING:
-            co_await ReplyH2Ping(*stream, *frame);
-            break;
-        case H2FrameType::HEADERS: {
-            if (frame->stream_id == 0) {
-                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            uint32_t stream_id = frame->stream_id;
-            while ((frame->flags & 0x4) == 0) {
-                auto cont = co_await ReadH2Frame(*stream);
-                if (!cont ||
-                    cont->type != H2FrameType::CONTINUATION ||
-                    cont->stream_id != stream_id) {
-                    co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                frame = std::move(cont);
-            }
-
-            auto session = std::make_shared<GrpcServerSession>(
-                io_context,
-                std::move(stream),
-                std::move(stream_handler),
-                H2PayloadCodec::GrpcHunk,
-                transport::internet::HttpHeaders{},
-                conn_id);
-            auto sub = session->CreateStream(stream_id);
-            if (!sub) {
-                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            auto response_headers = EncodeGrpcResponseHeaders();
-            if (!co_await session->WriteFrameSerialized(
-                    H2FrameType::HEADERS,
-                    0x4,
-                    stream_id,
-                    response_headers)) {
-                co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            if ((frame->flags & 0x1) != 0 && sub) {
-                sub->CloseInput();
-            }
-
-            LOG_NET_DEBUG(
-                "[gRPC:{}] server: handshake ok stream_id={} path={}",
-                conn_id,
-                stream_id,
-                cfg.RequestPath());
-            net::co_spawn(
-                io_context.get_executor(),
-                [session]() -> net::awaitable<void> {
-                    co_await session->RunReadLoop();
-                },
-                net::detached);
-            co_return std::unique_ptr<AsyncStream>(
-                std::make_unique<GrpcServerSubStream>(std::move(sub)));
-        }
-        default:
-            break;
-        }
-    }
+    co_return co_await StartHttp2ServerSession(
+        std::move(stream), GrpcInitialWindow(cfg), H2PayloadCodec::GrpcHunk, {},
+        io_context, std::move(stream_handler), conn_id);
 }
 
 net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
@@ -4344,12 +4147,11 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         authority.empty() ? "-" : std::string(authority),
         path);
     co_return std::unique_ptr<AsyncStream>(
-        std::make_unique<GrpcStream>(
+        std::make_unique<Http2ClientStream>(
+            co_await net::this_coro::executor,
             std::move(stream),
             1,
-            GrpcStream::Role::Client,
-        H2PayloadCodec::GrpcHunk,
-            conn_id));
+            H2PayloadCodec::GrpcHunk));
 }
 
 [[nodiscard]] uint32_t HttpInitialWindow(const HttpConfig& cfg) noexcept {
@@ -4812,69 +4614,6 @@ net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
            (pos + 3 == status_line.size() || status_line[pos + 3] == ' ');
 }
 
-net::awaitable<TransportBuildResult> DoHttp2ServerHandshakeAfterPreface(
-    std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
-    net::io_context& io_context,
-    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id,
-    const XHttpConfig* xhttp_config = nullptr) {
-    auto settings = transport::internet::EncodeInitialWindowSetting(
-        HttpInitialWindow(cfg));
-    if (!co_await WriteH2Frame(
-            *stream,
-            H2FrameType::SETTINGS,
-            0,
-            0,
-            settings)) {
-        co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    }
-
-    while (true) {
-        auto frame = co_await ReadH2Frame(*stream);
-        if (!frame) {
-            co_return std::unexpected(ErrorCode::SOCKET_EOF);
-        }
-
-        switch (frame->type) {
-        case H2FrameType::SETTINGS:
-            if ((frame->flags & 0x1) == 0) {
-                co_await AcknowledgeH2Settings(*stream);
-            }
-            break;
-        case H2FrameType::PING:
-            co_await ReplyH2Ping(*stream, *frame);
-            break;
-        case H2FrameType::HEADERS: {
-            if (frame->stream_id == 0) {
-                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            auto session = std::make_shared<GrpcServerSession>(
-                io_context,
-                std::move(stream),
-                std::move(stream_handler),
-                H2PayloadCodec::RawData,
-                cfg.headers,
-                conn_id,
-                cfg,
-                xhttp_config ? std::optional<XHttpConfig>(*xhttp_config) : std::nullopt);
-            if (!co_await session->HandleInitialHeadersFrame(std::move(*frame))) {
-                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            net::co_spawn(
-                io_context.get_executor(),
-                [session]() -> net::awaitable<void> {
-                    co_await session->RunReadLoop();
-                },
-                net::detached);
-            co_return std::unique_ptr<AsyncStream>{};
-        }
-        default:
-            break;
-        }
-    }
-}
-
 net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
@@ -5279,13 +5018,16 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     if (total == first.size() &&
         std::string_view(unsafe::ptr_cast<const char>(first.data()), first.size()) ==
             kHttp2ClientPreface) {
-        co_return co_await DoHttp2ServerHandshakeAfterPreface(
+        co_return co_await StartHttp2ServerSession(
             std::move(stream),
-            cfg,
+            HttpInitialWindow(cfg),
+            H2PayloadCodec::RawData,
+            cfg.headers,
             io_context,
             std::move(stream_handler),
             conn_id,
-            xhttp_config);
+            cfg,
+            xhttp_config ? std::optional<XHttpConfig>(*xhttp_config) : std::nullopt);
     }
 
     if (require_http2) {
@@ -5359,12 +5101,11 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
         authority.empty() ? "-" : std::string(authority),
         EffectivePath(cfg.path));
     co_return std::unique_ptr<AsyncStream>(
-        std::make_unique<GrpcStream>(
+        std::make_unique<Http2ClientStream>(
+            co_await net::this_coro::executor,
             std::move(stream),
             1,
-            GrpcStream::Role::Client,
-            H2PayloadCodec::RawData,
-            conn_id));
+            H2PayloadCodec::RawData));
 }
 
 net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(

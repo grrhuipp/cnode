@@ -51,9 +51,9 @@ if(NOT REPORTER_SOURCE MATCHES
         "each access/error memory queue must evict oldest batches at the 32 MiB hard limit")
 endif()
 
-if(INBOUND_HANDLER_SOURCE MATCHES
-       "access_log[.]Fail[(]ErrorCode::RESOURCE_EXHAUSTED[)]" OR
-   NOT INBOUND_HANDLER_SOURCE MATCHES
+# RESOURCE_EXHAUSTED is valid for exceptions from protocol Process. Admission
+# rejection and resource allocation failure must remain distinct categories.
+if(NOT INBOUND_HANDLER_SOURCE MATCHES
        "access_log[.]Fail[(]ErrorCode::CONNECTION_LIMITED[)]" OR
    NOT EVENT_SOURCE MATCHES
        "case ErrorCode::CONNECTION_LIMITED:")

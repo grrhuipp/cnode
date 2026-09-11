@@ -74,10 +74,8 @@ private:
 class GeoIPData {
 public:
     void AddCIDR(const CIDR& cidr);
-    void AddCIDR(const std::string& cidr_str);
     void BuildIndex();
     bool Match(const net::ip::address& ip) const;
-    bool Match(const std::string& ip_str) const;
     size_t Size() const { return cidrs_v4_.size() + cidrs_v6_.size(); }
 
 private:
@@ -144,12 +142,8 @@ public:
     explicit GeoIPLoader(const std::filesystem::path& dat_path);
 
     GeoIPData* Get(const std::string& tag);
-    bool Match(std::string_view tag, const net::ip::address& ip);
-    bool HasTag(const std::string& tag);
-    std::vector<std::string> GetAllTags();
     size_t LoadedCount() const;
     void Finalize() { finalized_ = true; }
-    bool IsFinalized() const { return finalized_; }
 
 private:
     bool LoadIndex();
@@ -179,12 +173,8 @@ public:
     explicit GeoSiteLoader(const std::filesystem::path& dat_path);
 
     GeoSiteData* Get(const std::string& tag);
-    bool Match(std::string_view tag, std::string_view domain);
-    bool HasTag(const std::string& tag);
-    std::vector<std::string> GetAllTags();
     size_t LoadedCount() const;
     void Finalize() { finalized_ = true; }
-    bool IsFinalized() const { return finalized_; }
 
 private:
     bool LoadIndex();
@@ -271,52 +261,6 @@ bool CIDR::Contains(const net::ip::address& ip) const {
     auto ip_bytes = ip.to_v4().to_bytes();
     return MatchPrefix(ip_bytes.data(), addr.data(), prefix);
 }
-
-namespace {
-
-// 解析 CIDR 字符串
-std::optional<CIDR> ParseCIDR(const std::string& str) {
-    auto slash_pos = str.find('/');
-    if (slash_pos == std::string::npos) {
-        return std::nullopt;
-    }
-
-    std::string ip_str = str.substr(0, slash_pos);
-    std::string prefix_str = str.substr(slash_pos + 1);
-
-    IoErrorCode ec;
-    auto addr = net::ip::make_address(ip_str, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-
-    int prefix = std::stoi(prefix_str);
-
-    if (addr.is_v4()) {
-        if (prefix < 0 || prefix > 32) {
-            return std::nullopt;
-        }
-        CIDR cidr;
-        cidr.prefix = static_cast<uint8_t>(prefix);
-        auto bytes = addr.to_v4().to_bytes();
-        std::memcpy(cidr.addr.data(), bytes.data(), 4);
-        return cidr;
-    } else if (addr.is_v6()) {
-        if (prefix < 0 || prefix > 128) {
-            return std::nullopt;
-        }
-        CIDR cidr;
-        cidr.prefix = static_cast<uint8_t>(prefix);
-        cidr.is_v6 = true;
-        auto bytes = addr.to_v6().to_bytes();
-        std::memcpy(cidr.addr.data(), bytes.data(), 16);
-        return cidr;
-    } else {
-        return std::nullopt;
-    }
-}
-
-}  // anonymous namespace
 
 // ============================================================================
 // IPv4 Radix Trie 实现
@@ -444,13 +388,6 @@ void GeoIPData::AddCIDR(const CIDR& cidr) {
     }
 }
 
-void GeoIPData::AddCIDR(const std::string& cidr_str) {
-    auto cidr = ParseCIDR(cidr_str);
-    if (cidr) {
-        AddCIDR(*cidr);
-    }
-}
-
 void GeoIPData::BuildIndex() {
     if (index_built_) return;
 
@@ -502,15 +439,6 @@ bool GeoIPData::Match(const net::ip::address& ip) const {
         }
     }
     return false;
-}
-
-bool GeoIPData::Match(const std::string& ip_str) const {
-    IoErrorCode ec;
-    auto ip = net::ip::make_address(ip_str, ec);
-    if (ec) {
-        return false;
-    }
-    return Match(ip);
 }
 
 // ============================================================================
@@ -753,19 +681,6 @@ GeoIPData* GeoIPLoader::Get(const std::string& tag) {
     return LoadTag(lower_tag);
 }
 
-bool GeoIPLoader::Match(std::string_view tag, const net::ip::address& ip) {
-    if (finalized_) {
-        // Route construction lowercases geo tags before finalize; hot path only
-        // does a read-only lookup and never allocates a compatibility copy.
-        auto it = loaded_.find(tag);
-        return it != loaded_.end() && it->second && it->second->Match(ip);
-    }
-
-    std::string lower_tag = LowerTag(tag);
-    auto data = Get(lower_tag);
-    return data && data->Match(ip);
-}
-
 GeoIPData* GeoIPLoader::LoadTag(const std::string& tag) {
     std::unique_lock lock(mutex_);
 
@@ -852,27 +767,6 @@ GeoIPData* GeoIPLoader::LoadTag(const std::string& tag) {
     LOG_DEBUG("GeoIP: loaded tag '{}' with {} CIDRs", tag, geoip_ptr->Size());
 
     return geoip_ptr;
-}
-
-bool GeoIPLoader::HasTag(const std::string& tag) {
-    if (!index_loaded_) {
-        LoadIndex();
-    }
-
-    std::string lower_tag = LowerTag(tag);
-    return tag_index_.count(lower_tag) > 0;
-}
-
-std::vector<std::string> GeoIPLoader::GetAllTags() {
-    if (!index_loaded_) {
-        LoadIndex();
-    }
-
-    std::vector<std::string> tags;
-    for (const auto& [tag, _] : tag_index_) {
-        tags.push_back(tag);
-    }
-    return tags;
 }
 
 size_t GeoIPLoader::LoadedCount() const {
@@ -975,19 +869,6 @@ GeoSiteData* GeoSiteLoader::Get(const std::string& tag) {
     return LoadTag(lower_tag);
 }
 
-bool GeoSiteLoader::Match(std::string_view tag, std::string_view domain) {
-    if (finalized_) {
-        // Route construction lowercases geo tags before finalize; hot path only
-        // does a read-only lookup and never allocates a compatibility copy.
-        auto it = loaded_.find(tag);
-        return it != loaded_.end() && it->second && it->second->Match(domain);
-    }
-
-    std::string lower_tag = LowerTag(tag);
-    auto data = Get(lower_tag);
-    return data && data->Match(domain);
-}
-
 GeoSiteData* GeoSiteLoader::LoadTag(const std::string& tag) {
     std::unique_lock lock(mutex_);
 
@@ -1073,27 +954,6 @@ GeoSiteData* GeoSiteLoader::LoadTag(const std::string& tag) {
     return geosite_ptr;
 }
 
-bool GeoSiteLoader::HasTag(const std::string& tag) {
-    if (!index_loaded_) {
-        LoadIndex();
-    }
-
-    std::string lower_tag = LowerTag(tag);
-    return tag_index_.count(lower_tag) > 0;
-}
-
-std::vector<std::string> GeoSiteLoader::GetAllTags() {
-    if (!index_loaded_) {
-        LoadIndex();
-    }
-
-    std::vector<std::string> tags;
-    for (const auto& [tag, _] : tag_index_) {
-        tags.push_back(tag);
-    }
-    return tags;
-}
-
 size_t GeoSiteLoader::LoadedCount() const {
     if (finalized_) {
         return loaded_.size();
@@ -1111,10 +971,6 @@ GeoManager::GeoManager()
 }
 
 GeoManager::~GeoManager() = default;
-
-GeoManager::GeoManager(GeoManager&&) noexcept = default;
-
-GeoManager& GeoManager::operator=(GeoManager&&) noexcept = default;
 
 bool GeoManager::Init(const std::filesystem::path& geoip_path,
                       const std::filesystem::path& geosite_path) {
@@ -1152,20 +1008,6 @@ void GeoManager::PreloadTags(const std::vector<std::string>& geoip_tags,
         LOG_DEBUG("GeoSite finalized: {} tags loaded, lock-free queries enabled",
                  impl_->geosite_loader->LoadedCount());
     }
-}
-
-bool GeoManager::MatchGeoIP(std::string_view tag, const net::ip::address& ip) const {
-    if (!impl_->geoip_loader) {
-        return false;
-    }
-    return impl_->geoip_loader->Match(tag, ip);
-}
-
-bool GeoManager::MatchGeoSite(std::string_view tag, std::string_view domain) const {
-    if (!impl_->geosite_loader) {
-        return false;
-    }
-    return impl_->geosite_loader->Match(tag, domain);
 }
 
 GeoManager::GeoIPTagHandle GeoManager::ResolveGeoIPTag(std::string_view tag) const {

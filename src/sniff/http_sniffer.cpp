@@ -1,4 +1,5 @@
 #include "acppnode/sniff/sniffer.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_utils.hpp"
@@ -145,9 +146,8 @@ std::optional<HttpSniffer::HostPortView> HttpSniffer::ParseHttpHost(
                     return std::nullopt;
                 }
                 parsed.host = value.substr(1, close - 1);
-                IoErrorCode ip_error;
-                (void)net::ip::make_address_v6(parsed.host, ip_error);
-                if (ip_error) return std::nullopt;
+                const auto address = iputil::ParseLiteral(parsed.host);
+                if (!address || !address->is_v6()) return std::nullopt;
                 const std::string_view suffix = value.substr(close + 1);
                 if (!suffix.empty() &&
                     (suffix.front() != ':' ||

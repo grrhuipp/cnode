@@ -2,6 +2,8 @@
 
 #include "acppnode/core/naming.hpp"
 
+#include <format>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -27,6 +29,9 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
                 .index = i,
                 .tag = {},
             };
+        }
+        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+            return {.error = ConfigSemanticError::ReservedOutboundTag, .index = i, .tag = tag};
         }
         if (!tags.insert(tag).second) {
             return {
@@ -85,12 +90,27 @@ std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
     return ignored;
 }
 
+std::string StaticInboundSemanticValidation::Message() const {
+    switch (error) {
+        case StaticInboundSemanticError::None: return {};
+        case StaticInboundSemanticError::InvalidPort:
+            return std::format("at index {} has an invalid port", index);
+        case StaticInboundSemanticError::EmptyTag:
+            return std::format("at index {} has an empty tag", index);
+        case StaticInboundSemanticError::ReservedTag:
+            return std::format("at index {} uses reserved panel tag '{}'", index, detail);
+        case StaticInboundSemanticError::DuplicateTag:
+            return std::format("at index {} duplicates tag '{}' from index {}", index, detail, conflicting_index);
+        case StaticInboundSemanticError::DuplicateEndpoint:
+            return std::format("at index {} duplicates listen endpoint '{}' from index {}", index, detail, conflicting_index);
+    }
+    throw std::logic_error("unknown static inbound validation result");
+}
+
 StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds) {
     std::unordered_map<std::string, size_t> tags;
-    std::unordered_map<std::string, size_t> endpoints;
     tags.reserve(inbounds.size());
-    endpoints.reserve(inbounds.size() * 2);
 
     for (size_t i = 0; i < inbounds.size(); ++i) {
         const auto& inbound = inbounds[i];
@@ -114,6 +134,10 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
                 .detail = {},
             };
         }
+        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+            return {.error = StaticInboundSemanticError::ReservedTag,
+                    .index = i, .conflicting_index = 0, .detail = std::move(tag)};
+        }
         if (const auto [it, inserted] = tags.emplace(tag, i); !inserted) {
             return {
                 .error = StaticInboundSemanticError::DuplicateTag,
@@ -123,16 +147,14 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             };
         }
 
-        for (const auto& address : inbound.listen.Candidates()) {
-            std::string endpoint = address.to_string();
-            endpoint.push_back('|');
-            endpoint.append(std::to_string(inbound.port));
-            if (const auto [it, inserted] = endpoints.emplace(endpoint, i); !inserted) {
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (inbounds[previous].port == inbound.port &&
+                inbounds[previous].listen.Overlaps(inbound.listen)) {
                 return {
                     .error = StaticInboundSemanticError::DuplicateEndpoint,
                     .index = i,
-                    .conflicting_index = it->second,
-                    .detail = std::move(endpoint),
+                    .conflicting_index = previous,
+                    .detail = std::to_string(inbound.port),
                 };
             }
         }

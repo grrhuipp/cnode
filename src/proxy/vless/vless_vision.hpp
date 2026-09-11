@@ -19,6 +19,9 @@ inline constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
 class VisionReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+
     VisionReader(transport::MultiBufferReader& src,
                  std::array<uint8_t, 16> user_uuid,
                  std::span<const uint8_t> initial = {});

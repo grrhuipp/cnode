@@ -45,25 +45,9 @@ bool Config::Validate() const {
     }
 
     const auto inbound_semantic = ValidateStaticInboundSemantics(static_inbounds_);
-    switch (inbound_semantic.error) {
-        case StaticInboundSemanticError::None:
-            break;
-        case StaticInboundSemanticError::InvalidPort:
-            LOG_ERROR("Static inbound at index {} has an invalid port", inbound_semantic.index);
-            return false;
-        case StaticInboundSemanticError::EmptyTag:
-            LOG_ERROR("Static inbound at index {} has an empty tag", inbound_semantic.index);
-            return false;
-        case StaticInboundSemanticError::DuplicateTag:
-            LOG_ERROR("Static inbound at index {} duplicates tag '{}' from index {}",
-                      inbound_semantic.index, inbound_semantic.detail,
-                      inbound_semantic.conflicting_index);
-            return false;
-        case StaticInboundSemanticError::DuplicateEndpoint:
-            LOG_ERROR("Static inbound at index {} duplicates listen endpoint '{}' from index {}",
-                      inbound_semantic.index, inbound_semantic.detail,
-                      inbound_semantic.conflicting_index);
-            return false;
+    if (!inbound_semantic.Ok()) {
+        LOG_ERROR("Static inbound {}", inbound_semantic.Message());
+        return false;
     }
 
     const auto semantic = ValidateOutboundRoutingSemantics(
@@ -76,6 +60,9 @@ bool Config::Validate() const {
             return false;
         case ConfigSemanticError::EmptyOutboundTag:
             LOG_ERROR("Outbound at index {} has an empty tag", semantic.index);
+            return false;
+        case ConfigSemanticError::ReservedOutboundTag:
+            LOG_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
             return false;
         case ConfigSemanticError::DuplicateOutboundTag:
             LOG_ERROR("Duplicate outbound tag '{}' at index {}",

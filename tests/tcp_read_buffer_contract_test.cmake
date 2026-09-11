@@ -96,7 +96,7 @@ if(NOT TRANSPORT_STACK_SOURCE MATCHES
    NOT TRANSPORT_STACK_SOURCE MATCHES
        "ReadMultiBuffer[(][)] override [{][\n\r ]*if [(]!co_await EnsureReadablePayload[(][)][)]" OR
    NOT TRANSPORT_STACK_SOURCE MATCHES
-       "GrpcServerSubStreamState::ReadMultiBuffer[(][)] [{][\n\r ]*if [(]!co_await EnsureReadablePayload[(][)][)]")
+       "Http2ServerSubStreamState::ReadMultiBuffer[(][)] [{][\n\r ]*if [(]!co_await EnsureReadablePayload[(][)][)]")
     message(FATAL_ERROR
         "framed transports must await readable payload before Buffer allocation")
 endif()

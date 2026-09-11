@@ -7,8 +7,6 @@
 
 #include <chrono>
 #include <expected>
-#include <cstdint>
-#include <span>
 #include <string>
 #include <string_view>
 
@@ -39,6 +37,7 @@ public:
 
     // xray-core style outbound entry. The outbound implementation owns
     // transport target resolution, dialing, protocol setup, and relay.
+    // first_payload transfers ownership; all application bytes enter relay.
     virtual net::awaitable<OutboundProcessResult> Process(
         net::io_context& io_context,
         const tcp::endpoint* inbound_local_addr,
@@ -47,8 +46,7 @@ public:
         transport::Link inbound,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        buf::MultiBuffer& first_payload,
+        buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) = 0;
 };

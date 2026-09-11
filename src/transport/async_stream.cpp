@@ -110,6 +110,12 @@ void AsyncStream::CloseAbortive() {
     Close();
 }
 
+transport::CancellationSource& AsyncStream::Cancellation() noexcept {
+    if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)
+        return tcp->Cancellation();
+    return cancellation_;
+}
+
 bool AsyncStream::ConsumeIdleTimeout() noexcept {
     auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeIdleTimeout();

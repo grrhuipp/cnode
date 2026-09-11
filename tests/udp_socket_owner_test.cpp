@@ -148,7 +148,7 @@ int main() {
     reply_buffer->Tail()[0] = 0x33;
     reply_buffer->Produce(1);
     reply_buffer->SetUDP(callback_source);
-    acpp::buf::MultiBuffer reply_payload{reply_buffer.release()};
+    acpp::buf::MultiBuffer reply_payload{std::move(reply_buffer)};
     bool reply_failure_reported = false;
     acpp::net::co_spawn(
         io_context,
@@ -268,7 +268,7 @@ int main() {
         if (!buffer) Fail("failed to allocate bounded UDP queue payload");
         buffer->Tail()[0] = 0x7a;
         buffer->Produce(1);
-        return acpp::buf::MultiBuffer{buffer.release()};
+        return acpp::buf::MultiBuffer{std::move(buffer)};
     };
     for (size_t i = 0; i < 256; ++i) {
         if (!bounded_input_session.Push(
@@ -443,7 +443,7 @@ int main() {
         if (!buffer) Fail("failed to allocate UDP owner payload");
         buffer->Tail()[0] = 0x44;
         buffer->Produce(1);
-        return acpp::buf::MultiBuffer{buffer.release()};
+        return acpp::buf::MultiBuffer{std::move(buffer)};
     };
     if (worker.PushClientPayload(
             "owner-socket",
@@ -501,7 +501,7 @@ int main() {
         std::memset(buffer->Tail().data(), 0x5a, n);
         buffer->Produce(static_cast<uint32_t>(n));
         oversized_bytes += n;
-        oversized_input.push_back(buffer.release());
+        oversized_input.push_back(std::move(buffer));
     }
     if (overflow_session.Push(callback_source, std::move(oversized_input)) ||
         !overflow_session.Closed()) {
@@ -573,7 +573,7 @@ int main() {
     acpp::net::co_spawn(
         io_context,
         snapshot_reply_session.WriteMultiBuffer(
-            acpp::buf::MultiBuffer{snapshot_reply.release()}),
+            acpp::buf::MultiBuffer{std::move(snapshot_reply)}),
         [&](std::exception_ptr error) {
             snapshot_reply_failed = error != nullptr;
         });

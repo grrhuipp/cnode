@@ -89,31 +89,4 @@ inline void NormalizeDnsHostnameInPlace(std::string& hostname) noexcept {
     return label_size != 0 && !label_ends_with_hyphen;
 }
 
-[[nodiscard]] inline bool IsIpv4AddressLiteral(
-    std::string_view hostname) noexcept {
-    std::size_t position = 0;
-    for (unsigned int part = 0; part < 4; ++part) {
-        const std::size_t end = hostname.find('.', position);
-        const std::string_view octet = end == std::string_view::npos
-            ? hostname.substr(position)
-            : hostname.substr(position, end - position);
-        if (octet.empty() || octet.size() > 3 ||
-            (octet.size() > 1 && octet.front() == '0')) {
-            return false;
-        }
-
-        unsigned int value = 0;
-        for (const unsigned char ch : octet) {
-            if (ch < '0' || ch > '9') return false;
-            value = value * 10 + static_cast<unsigned int>(ch - '0');
-        }
-        if (value > 255) return false;
-
-        if (part == 3) return end == std::string_view::npos;
-        if (end == std::string_view::npos) return false;
-        position = end + 1;
-    }
-    return false;
-}
-
 }  // namespace acpp::domain

@@ -10,7 +10,7 @@ static_assert(!std::default_initializable<acpp::routing::DispatchPolicy>);
 
 int main() {
     using acpp::app::dispatcher::detail::RequiresRouting;
-    using acpp::app::dispatcher::detail::RuleSelection;
+    using acpp::routing::RouteDecision;
     using acpp::app::dispatcher::detail::SelectionSource;
     using acpp::app::dispatcher::detail::SelectOutbound;
 
@@ -30,7 +30,7 @@ int main() {
     if (RequiresRouting(forced)) return 3;
     const auto forced_selection = SelectOutbound(
         forced,
-        RuleSelection{
+        RouteDecision{
             .outbound_tag = "blocked",
             .matched = true,
             .rule_index = 7,
@@ -45,7 +45,7 @@ int main() {
     if (!RequiresRouting(routed)) return 5;
     const auto rule_selection = SelectOutbound(
         routed,
-        RuleSelection{
+        RouteDecision{
             .outbound_tag = "proxy",
             .matched = true,
             .rule_index = 11,

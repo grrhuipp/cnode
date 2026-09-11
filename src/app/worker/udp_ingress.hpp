@@ -164,6 +164,8 @@ class UdpIngress::ClientSession final
     : public transport::MultiBufferReader,
       public transport::MultiBufferWriter {
 public:
+    transport::CancellationSource& Cancellation() noexcept override;
+
     ClientSession(net::io_context& io_context,
                   ReplyCallback reply_callback,
                   udp::endpoint reply_endpoint,

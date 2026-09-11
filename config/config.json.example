@@ -8,7 +8,7 @@
   },
   "workers": 0,
   "dns": {
-    "servers": ["8.8.8.8", "1.1.1.1"],
+    "servers": ["8.8.8.8", "1.1.1.1:53"],
     "timeout": 5,
     "cacheSize": 10000,
     "minTTL": 60,

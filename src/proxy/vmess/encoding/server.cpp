@@ -280,7 +280,7 @@ void EncodeResponseBodyChunk(EncodeResponseBodyState& state,
     ++state.chunk_count;
     if (pooled) {
         pooled->Produce(static_cast<uint32_t>(output_size));
-        out_mb.push_back(pooled.release());
+        out_mb.push_back(std::move(pooled));
         return;
     }
     if (!buf::AppendSpanToMultiBuffer(
@@ -404,10 +404,10 @@ net::awaitable<void> EncodeResponseBodyBuffers(
     co_await FlushResponseBody(state, stream, std::move(out_mb));
 }
 
-net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
+net::awaitable<void> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
                                            AsyncStream& stream) {
     if (state.eof_sent) {
-        co_return true;
+        co_return;
     }
 
     size_t padding_len = 0;
@@ -418,13 +418,13 @@ net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
 
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
-        co_return false;
+        throw std::bad_alloc();
     }
     uint8_t* eof_buf = out->Tail().data();
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + length_header_size);
     if (enc_len < 0) {
-        co_return false;
+        ThrowVMessWriteError("VMess server EOF encrypt failed");
     }
 
     const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
@@ -434,23 +434,20 @@ net::awaitable<bool> EncodeResponseBodyEOF(EncodeResponseBodyState& state,
                            total_len,
                            eof_buf,
                            encoded_length_size)) {
-        co_return false;
+        ThrowVMessWriteError("VMess server EOF length encrypt failed");
     }
 
-    if (padding_len > 0) {
-        RAND_bytes(eof_buf + encoded_length_size + enc_len, static_cast<int>(padding_len));
+    if (padding_len > 0 &&
+        RAND_bytes(eof_buf + encoded_length_size + enc_len, static_cast<int>(padding_len)) != 1) {
+        ThrowVMessWriteError("VMess server EOF padding failed");
     }
 
     const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
     out->Produce(static_cast<uint32_t>(output_size));
-    buf::MultiBuffer mb{out.release()};
-    try {
-        co_await stream.WriteMultiBuffer(std::move(mb));
-    } catch (...) {
-        co_return false;
-    }
+    buf::MultiBuffer mb{std::move(out)};
+    co_await FlushResponseBody(state, stream, std::move(mb));
     state.eof_sent = true;
-    co_return true;
+    LOG_NET_TRACE("VMess server: response EOF sent bytes={}", output_size);
 }
 
 net::awaitable<bool> DecodeRequestBodyReadFull(DecodeRequestBodyState& state,
@@ -562,20 +559,19 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
         throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
     }
 
-    if (buf::Buffer* pending_body = state.pending_read.TakeFrontIfLen(chunk_len)) {
+    if (auto pending_body = state.pending_read.TakeFrontIfLen(chunk_len)) {
         const size_t data_len = chunk_len - padding_len;
         ssize_t dec_len = state.cipher->Decrypt(
             pending_body->Bytes().data(),
             data_len,
             pending_body->Bytes().data());
         if (dec_len < 0) {
-            buf::Buffer::Free(pending_body);
             state.eof = true;
             throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
         }
         pending_body->end = pending_body->start + static_cast<uint32_t>(dec_len);
         ++state.chunk_count;
-        co_return buf::MultiBuffer{pending_body};
+        co_return buf::MultiBuffer{std::move(pending_body)};
     }
 
     buf::BufferGuard read_crypto_pool;
@@ -613,7 +609,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
         }
         read_crypto_pool->Produce(static_cast<uint32_t>(dec_len));
         ++state.chunk_count;
-        co_return buf::MultiBuffer{read_crypto_pool.release()};
+        co_return buf::MultiBuffer{std::move(read_crypto_pool)};
     }
 
     memory::ByteVector plain_buf;
@@ -640,7 +636,7 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
 
     buf::MultiBuffer out_mb;
     out_mb.reserve((dec_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    out_mb.push_back(out.release());
+    out_mb.push_back(std::move(out));
     if (first_copy < dec_size &&
         !buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(plain + first_copy, dec_size - first_copy),
@@ -1142,6 +1138,11 @@ namespace {
 
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override {
+        return is_udp_ ? transport::EofAction::WaitForPeer : stream_->ReadEofAction();
+    }
+
     RequestBodyReader(VMessRequest& request, AsyncStream& stream)
         : stream_(&stream)
         , is_udp_(request.command == Command::UDP)

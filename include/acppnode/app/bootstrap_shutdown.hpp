@@ -8,6 +8,9 @@
 
 namespace acpp {
 
+// Once runtime execution begins, active Worker state lives until process exit.
+[[noreturn]] void FailRuntime(const char* phase, const char* reason) noexcept;
+
 [[nodiscard]] std::unique_ptr<net::signal_set> InstallShutdownHandler(
     net::io_context& io_context);
 

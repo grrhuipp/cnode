@@ -26,7 +26,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
@@ -81,7 +81,6 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                            ListenerKeys socket_keys) noexcept;
     void StopUdpListening(const std::string& tag,
                           ListenerKeys socket_keys) noexcept;
-    void Shutdown();
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
@@ -139,7 +138,6 @@ struct Worker::RuntimeState {
               *dns_service,
               runtime_config.timeouts.SessionIdleTimeout()))
         , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
-        , router(std::make_unique<app::router::Router>())
         , rule_manager(std::make_unique<rule::Manager>())
         , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
 
@@ -278,7 +276,7 @@ void Worker::RuntimeState::InitRouter(
     Worker& worker,
     const RoutingConfig& routing,
     geo::GeoManager* geo_manager_ref) {
-    router->Configure(routing, geo_manager_ref);
+    router = std::make_unique<app::router::Router>(routing, geo_manager_ref);
     dispatcher->BindRouter(*router);
 
     LOG_DEBUG("Worker[{}]: router initialized, {} rules",
@@ -304,6 +302,16 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
                   worker.id_, binding.tag);
         return false;
+    }
+
+    for (const auto& [tag, slot] : listener_slots) {
+        if (tag != binding.tag && slot.tcp_binding &&
+            slot.tcp_binding->port == binding.port &&
+            slot.tcp_binding->listen.Overlaps(binding.listen)) {
+            LOG_ERROR("Worker[{}]: TCP listener conflict tag={} owner={} port={}",
+                      worker.id_, binding.tag, tag, binding.port);
+            return false;
+        }
     }
 
     const bool replacing = std::ranges::any_of(
@@ -537,21 +545,6 @@ void Worker::ListenerState::StopUdpListening(
     udp_workers.erase(tag);
 }
 
-void Worker::ListenerState::Shutdown() {
-    while (!tcp_listener_tags.empty()) {
-        const std::string tag = tcp_listener_tags.begin()->second;
-        StopListening(tag, CollectTcpListenerKeys(tag));
-    }
-    while (!udp_workers.empty()) {
-        const std::string tag = udp_workers.begin()->first;
-        StopUdpListening(tag, CollectUdpSocketKeys(tag));
-    }
-    while (!udp_socket_tags.empty()) {
-        const std::string tag = udp_socket_tags.begin()->second;
-        StopUdpListening(tag, CollectUdpSocketKeys(tag));
-    }
-}
-
 bool Worker::ListenerState::EnqueueUdpReply(
     const std::string& tag,
     udp::socket* sock,
@@ -646,7 +639,7 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             const auto backoff = MapAsioError(ec) == ErrorCode::RESOURCE_EXHAUSTED
                 ? kAcceptResourceBackoff
                 : kAcceptErrorBackoff;
-            ScheduledSleep sleep(worker.runtime_->io_context);
+            AsyncDelay sleep(worker.runtime_->io_context);
             co_await sleep.WaitFor(
                 std::chrono::duration_cast<std::chrono::milliseconds>(backoff));
             continue;
@@ -747,15 +740,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 
 net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
     co_return runtime_->listener_state->StartListening(*this, binding);
-}
-
-net::awaitable<void> Worker::ShutdownTask() {
-    runtime_->listener_state->Shutdown();
-    runtime_->udp_session_manager->StopAll();
-
-    // Yield once so listener/session cancellation handlers queued above can
-    // run before the main thread stops this Worker io_context.
-    co_await net::post(runtime_->io_context, net::use_awaitable);
 }
 
 bool Worker::RegisterInboundOnWorkerThread(
@@ -985,6 +969,16 @@ bool Worker::ListenerState::StartUdpListening(
         return true;
     }
 #endif
+
+    for (const auto& [tag, slot] : listener_slots) {
+        if (tag != binding.tag && slot.udp_binding &&
+            slot.udp_binding->port == binding.port &&
+            slot.udp_binding->listen.Overlaps(binding.listen)) {
+            LOG_ERROR("Worker[{}]: UDP listener conflict tag={} owner={} port={}",
+                      worker.id_, binding.tag, tag, binding.port);
+            return false;
+        }
+    }
 
     const bool replacing = std::ranges::any_of(
         udp_socket_tags,

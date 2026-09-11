@@ -50,5 +50,16 @@ int main() {
     const acpp::TargetAddress same_mapped("192.0.2.1", 443);
     if (!Require(mapped.SameEndpoint(same_mapped),
                  "canonical IP endpoints must compare equal")) return 9;
+    using namespace std::string_view_literals;
+    for (const auto text : {"127.0.0.1:9"sv, "127.0.0.1\0ignored"sv,
+                            "[::ffff:127.0.0.1]"sv, "::1\0ignored"sv}) {
+        const acpp::TargetAddress target(std::string(text), 443);
+        if (!Require(!target.IsValid() && target.host.empty(),
+                     "invalid host bytes must never acquire a routable target")) return 10;
+    }
+    for (const auto text : {"[example.com]:443", "[127.0.0.1]:443", "[::1]:443junk"}) {
+        if (!Require(!acpp::TargetAddress::Parse(text),
+                     "endpoint brackets must contain exactly an IPv6 literal")) return 11;
+    }
     return 0;
 }

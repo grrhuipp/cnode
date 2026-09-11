@@ -49,7 +49,33 @@ void TestValidSettingsAreNormalized() {
           "explicit minimum idle mismatch");
 }
 
+void TestPreparedPasswordHashes() {
+    auto check_hash = [](std::string_view body, std::string_view expected) {
+        const auto settings = Parse(body);
+        Check(settings.has_value(), "valid AnyTLS credentials rejected");
+        constexpr std::string_view hex = "0123456789abcdef";
+        std::string actual;
+        for (const auto byte : settings->password_hash) {
+            actual += hex[byte >> 4];
+            actual += hex[byte & 0x0f];
+        }
+        Check(actual == expected, "prepared AnyTLS SHA256 vector mismatch");
+    };
+    check_hash(R"({"server":"127.0.0.1","server_port":443,"password":"secret"})",
+               "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
+    check_hash(R"({"address":"127.0.0.1","port":443,"key":"secret"})",
+               "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
+    check_hash(R"({"server":"127.0.0.1","server_port":443,"password":"abc\u0000def"})",
+               "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c");
+}
+
 void TestInvalidSessionSettingsAreRejected() {
+    CheckInvalid(
+        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807})",
+        "steady clock range");
+    CheckInvalid(
+        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":9223372036854775807})",
+        "steady clock range");
     CheckInvalid(
         R"({"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":"30"})",
         "must be an integer");
@@ -74,6 +100,7 @@ void TestInvalidSessionSettingsAreRejected() {
 
 int main() {
     TestValidSettingsAreNormalized();
+    TestPreparedPasswordHashes();
     TestInvalidSessionSettingsAreRejected();
     std::cout << "anytls_outbound_settings_test: ok\n";
     return 0;

@@ -85,7 +85,6 @@ public:
 
     void AddSuffix(const std::string& suffix);
     bool MatchSuffix(std::string_view lower_domain) const;
-    void Clear();
     [[nodiscard]] size_t Size() const { return rule_count_; }
 
 private:
@@ -119,7 +118,6 @@ public:
     void AddRegex(const std::string& pattern);
 
     [[nodiscard]] bool Match(std::string_view domain) const;
-    void Clear();
 
     [[nodiscard]] bool Empty() const {
         return domains_.empty() && suffix_trie_.Size() == 0
@@ -144,7 +142,6 @@ public:
     [[nodiscard]] bool Match(const net::ip::address& ip) const;
     [[nodiscard]] bool MatchIPv4(uint32_t ip) const;
     [[nodiscard]] bool MatchIPv6(const net::ip::address_v6::bytes_type& ip) const;
-    void Clear();
 
     [[nodiscard]] bool Empty() const { return rules_.empty() && rules_v6_.empty(); }
 
@@ -707,16 +704,18 @@ bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
 // ============================================================================
 
 struct Router::Impl {
+    Impl(const RoutingConfig& routing, const ::acpp::geo::GeoManager* geo);
+
     memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
-    RoutingDomainStrategy domain_strategy = RoutingDomainStrategy::AsIs;
-    ::acpp::geo::GeoManager* geo_manager = nullptr;
+    routing::DomainStrategy domain_strategy;
+    const ::acpp::geo::GeoManager* geo_manager;
 };
 
-Router::Router()
-    : impl_(std::make_unique<Impl>()) {}
+Router::Router(const RoutingConfig& config, const ::acpp::geo::GeoManager* geo_manager)
+    : impl_(std::make_unique<const Impl>(config, geo_manager)) {}
 Router::~Router() noexcept = default;
 
-RouteDecision Router::Route(const session::Context& ctx) const {
+routing::RouteDecision Router::Route(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
     // 顺序检查复合规则（AND 语义）
@@ -727,7 +726,7 @@ RouteDecision Router::Route(const session::Context& ctx) const {
         if (rule.Match(ctx, impl_->geo_manager)) {
             LOG_NET_DEBUG("Router: {} matched compound rule -> {}",
                       target, rule.outbound_tag);
-            return RouteDecision{
+            return routing::RouteDecision{
                 .outbound_tag = rule.outbound_tag,
                 .matched = true,
                 .rule_index = rule_index,
@@ -738,21 +737,22 @@ RouteDecision Router::Route(const session::Context& ctx) const {
     // No match is an explicit empty decision. Dispatcher owns the receiver's
     // explicit fallback.
     LOG_NET_DEBUG("Router: {} no matching rule", target);
-    return RouteDecision{
+    return routing::RouteDecision{
         .outbound_tag = {},
         .matched = false,
         .rule_index = 0,
     };
 }
 
-void Router::Configure(
+Router::Impl::Impl(
     const RoutingConfig& routing,
-    ::acpp::geo::GeoManager* geo_manager) {
-    impl_->compound_rules.clear();
-    impl_->domain_strategy = routing.domain_strategy;
-    impl_->geo_manager = geo_manager;
-
+    const ::acpp::geo::GeoManager* geo)
+    : domain_strategy(routing.domain_strategy), geo_manager(geo) {
+    compound_rules.reserve(routing.rules.size());
     for (const auto& rc : routing.rules) {
+        if (rc.outbound_tag.empty()) {
+            throw std::logic_error("routing rule without outbound tag reached runtime");
+        }
         CompoundRoutingRule compound;
         compound.outbound_tag = rc.outbound_tag;
 
@@ -832,11 +832,11 @@ void Router::Configure(
             throw std::logic_error(
                 "routing rule without conditions reached runtime");
         }
-        impl_->compound_rules.push_back(std::move(compound));
+        compound_rules.push_back(std::move(compound));
     }
 }
 
-::acpp::RoutingDomainStrategy Router::DomainStrategy() const noexcept {
+routing::DomainStrategy Router::DomainStrategy() const noexcept {
     return impl_->domain_strategy;
 }
 

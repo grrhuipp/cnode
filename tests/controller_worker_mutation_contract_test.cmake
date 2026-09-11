@@ -3,19 +3,16 @@ if(NOT DEFINED SOURCE_DIR)
 endif()
 
 file(READ
-    "${SOURCE_DIR}/src/service/controller/control.cpp"
+    "${SOURCE_DIR}/src/service/controller/node_runtime.cpp"
     CONTROL_SOURCE)
-file(READ
-    "${SOURCE_DIR}/src/common/awaitable_batch.cpp"
-    BATCH_SOURCE)
 file(READ
     "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp"
     BOOTSTRAP_INBOUNDS_SOURCE)
 
 string(FIND "${CONTROL_SOURCE}"
-    "net::awaitable<void> Controller::Impl::removeInbound" MUTATIONS_BEGIN)
+    "net::awaitable<void> NodeRuntime::RemoveInbound" MUTATIONS_BEGIN)
 string(FIND "${CONTROL_SOURCE}"
-    "Controller::Impl::getTraffic" MUTATIONS_END)
+    "net::awaitable<void> NodeRuntime::UpdateRules" MUTATIONS_END)
 if(MUTATIONS_BEGIN EQUAL -1 OR MUTATIONS_END EQUAL -1 OR
    NOT MUTATIONS_BEGIN LESS MUTATIONS_END)
     message(FATAL_ERROR "could not isolate controller Worker mutations")
@@ -72,14 +69,10 @@ if(FAILURE_CATCH EQUAL -1)
 endif()
 string(SUBSTRING "${MUTATIONS_SOURCE}"
     ${FAILURE_CATCH} -1 FAILURE_HANDLER)
-if(NOT FAILURE_HANDLER MATCHES "removeInbound\\(inbound.tag\\)")
+if(NOT FAILURE_HANDLER MATCHES "RemoveInbound\\(inbound.tag\\)")
     message(FATAL_ERROR
         "exceptional inbound publish failure must remove candidate state from every Worker")
 endif()
 
-if(NOT BATCH_SOURCE MATCHES "not_spawned" OR
-   NOT BATCH_SOURCE MATCHES "state->remaining -= not_spawned" OR
-   NOT BATCH_SOURCE MATCHES "catch \\(\\.\\.\\.\\)")
-    message(FATAL_ERROR
-        "Worker batch must wait for already spawned tasks after a spawn failure")
-endif()
+# Joining after partial launch failure is verified by the allocation-fault
+# cases in cnode_awaitable_batch_test, rather than matching implementation names.

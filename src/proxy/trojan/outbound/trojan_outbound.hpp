@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../credentials.hpp"
+
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
@@ -10,7 +12,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 
@@ -25,12 +26,7 @@ struct TrojanOutboundConfig {
     std::string address;            // 服务器地址
     std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
     uint16_t port = 443;            // 服务器端口
-    std::string password;           // 密码
-
-    // TLS 配置
-    std::string server_name;        // SNI（默认使用 address）
-    bool allow_insecure = false;    // 是否允许不验证证书
-    std::vector<std::string> alpn;  // ALPN 协议列表
+    trojan::PasswordHash password_hash{};
 
     // 传输层配置（保持现有 streamSettings JSON）
     StreamSettings stream_settings;
@@ -39,9 +35,6 @@ struct TrojanOutboundConfig {
     // 连接配置
     std::chrono::seconds timeout{10};
 
-    std::string_view GetServerName() const noexcept {
-        return server_name.empty() ? std::string_view(address) : std::string_view(server_name);
-    }
 };
 
 // ============================================================================
@@ -65,8 +58,7 @@ public:
         ::acpp::transport::Link inbound,
         ::acpp::StatsShard& stats,
         const ::acpp::RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        ::acpp::buf::MultiBuffer& first_payload,
+        ::acpp::buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
@@ -74,7 +66,7 @@ public:
 
 private:
     std::string tag_;
-    ::acpp::TrojanOutboundConfig config_;
+    const ::acpp::TrojanOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
 };
 

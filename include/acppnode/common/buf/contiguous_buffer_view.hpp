@@ -11,8 +11,13 @@ namespace acpp::buf {
 
 // Presents fragmented buffer storage as one contiguous byte span. A single
 // non-empty input buffer remains zero-copy; fragmented input is copied once.
+// This scoped view cannot be copied or moved: its span may refer to owned_.
+// For zero-copy input, the source buffers must outlive the view's use.
 class ContiguousBufferView {
 public:
+    ContiguousBufferView(const ContiguousBufferView&) = delete;
+    ContiguousBufferView& operator=(const ContiguousBufferView&) = delete;
+
     explicit ContiguousBufferView(const MultiBuffer& buffers) {
         const Buffer* single = nullptr;
         size_t buffer_count = 0;

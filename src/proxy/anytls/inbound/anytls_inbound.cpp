@@ -1,13 +1,16 @@
 #include "anytls_inbound.hpp"
+#include "../../../common/awaitable_task_group.hpp"
 
 #include "../anytls_codec.hpp"
+#include "../padding.hpp"
+#include "../payload_queue.hpp"
+#include "../credentials.hpp"
 #include "../../uot/uot.hpp"
 #include "../../../transport/internet/async_write_gate.hpp"
 #include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -15,37 +18,32 @@
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/link_error.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "../validator.hpp"
 
-#include <asio/co_spawn.hpp>
-#include <asio/detached.hpp>
 #include <asio/experimental/channel.hpp>
 #include <algorithm>
 #include <array>
-#include <cstring>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <system_error>
-#include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 namespace acpp::proxy::anytls::inbound {
 
-// 协议核心 codec/validator 位于 acpp::anytls（对应 vmess core=acpp::vmess）。
-// 迁移到 acpp::proxy::anytls::inbound 后，别名让既有的 anytls::* 限定引用、
-// using-directive 让非限定 codec 符号（ParsePaddingScheme/Validator 等）
-// 继续解析到核心命名空间，无需逐处改写。
 namespace anytls = ::acpp::anytls;
 using namespace ::acpp::anytls;
 
 namespace {
 
 constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
-constexpr size_t kSubStreamQueueShrinkItems = 64;
+// Includes both pending headers and dispatched requests. At the per-stream
+// queue limit this bounds queued application data to less than 8 MiB/session.
+constexpr size_t kMaxConcurrentSubstreams = 128;
 
 class AnyTLSOnlineSession {
 public:
@@ -98,159 +96,87 @@ void CopySessionContext(const session::Context& source, session::Context& target
 Handler::Handler(Validator& validator,
                  StatsShard& stats,
                  ConnectionLimiterPtr limiter,
-                 std::string padding_scheme_raw,
-                 std::string padding_scheme_md5)
+                 std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme)
     : validator_(validator)
     , stats_(&stats)
     , limiter_(limiter)
-    , padding_scheme_raw_(std::move(padding_scheme_raw))
-    , padding_scheme_md5_(std::move(padding_scheme_md5)) {}
+    , padding_scheme_(std::move(padding_scheme)) {}
 
 namespace {
 
-std::string ParseSettingsPaddingMd5(std::string_view text) {
-    while (!text.empty()) {
-        const auto line_end = text.find('\n');
-        auto line = line_end == std::string_view::npos ? text : text.substr(0, line_end);
-        if (!line.empty() && line.back() == '\r') {
-            line.remove_suffix(1);
+// A SOCKS target belongs to the logical byte stream, not to a PSH frame.
+// Keep only the bounded address prefix on the coroutine frame; pending owns
+// every byte already read after it and is transferred to TCP relay or UoT.
+net::awaitable<std::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
+    transport::MultiBufferReader& reader, buf::MultiBuffer& pending) {
+    auto ensure = [&](size_t required) -> net::awaitable<bool> {
+        while (pending.byte_size() < required) {
+            auto next = co_await reader.ReadMultiBuffer();
+            if (!buf::HasData(next)) co_return false;
+            next.MoveTo(pending, true);
         }
-        constexpr std::string_view kPrefix = "padding-md5=";
-        if (line.starts_with(kPrefix)) {
-            return std::string(line.substr(kPrefix.size()));
-        }
-        if (line_end == std::string_view::npos) {
-            break;
-        }
-        text.remove_prefix(line_end + 1);
-    }
-    return {};
-}
-
-class MultiBufferByteReader {
-public:
-    MultiBufferByteReader(const buf::MultiBuffer& data, size_t size) noexcept
-        : data_(data), size_(size) {}
-
-    [[nodiscard]] bool Ok() const noexcept { return !error_; }
-
-    [[nodiscard]] uint8_t ReadU8() noexcept {
-        uint8_t out = 0;
-        if (!ReadBytes(std::span<uint8_t>(&out, 1))) {
-            return 0;
-        }
-        return out;
-    }
-
-    [[nodiscard]] uint16_t ReadU16BE() noexcept {
-        std::array<uint8_t, 2> bytes{};
-        if (!ReadBytes(bytes)) {
-            return 0;
-        }
-        return static_cast<uint16_t>(
-            (static_cast<uint16_t>(bytes[0]) << 8) |
-            static_cast<uint16_t>(bytes[1]));
-    }
-
-    [[nodiscard]] std::string ReadString(size_t len) {
-        std::string out(len, '\0');
-        if (len == 0) {
-            return out;
-        }
-        if (!ReadBytes(std::span<uint8_t>(
-                reinterpret_cast<uint8_t*>(out.data()), out.size()))) {
-            return {};
-        }
-        return out;
-    }
-
-    [[nodiscard]] bool ReadBytes(std::span<uint8_t> out) noexcept {
-        if (error_ || pos_ + out.size() > size_) {
-            error_ = true;
-            return false;
-        }
-        size_t skip = pos_;
-        size_t copied = 0;
-        for (const auto* buffer : data_) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto bytes = buffer->Bytes();
-            if (skip >= bytes.size()) {
-                skip -= bytes.size();
-                continue;
-            }
-            const size_t n = std::min(bytes.size() - skip, out.size() - copied);
-            std::memcpy(out.data() + copied, bytes.data() + skip, n);
-            copied += n;
-            if (copied == out.size()) {
-                pos_ += out.size();
-                return true;
-            }
-            skip = 0;
-        }
-        error_ = true;
-        return false;
-    }
-
-private:
-    const buf::MultiBuffer& data_;
-    size_t size_ = 0;
-    size_t pos_ = 0;
-    bool error_ = false;
-};
-
-std::optional<TargetAddress> ParseSocksAddress(const buf::MultiBuffer& data, size_t size) {
-    MultiBufferByteReader reader(data, size);
-    const uint8_t atype = reader.ReadU8();
-    if (atype == 0x01) {
+        co_return true;
+    };
+    std::array<uint8_t, 1 + 1 + 255 + 2> address{};
+    if (!co_await ensure(1)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    (void)pending.CopyPrefixTo(std::span(address).first(1));
+    const uint8_t type = address[0];
+    size_t size = 0;
+    if (type == 1) size = 1 + 4 + 2;
+    else if (type == 4) size = 1 + 16 + 2;
+    else if (type == 3) {
+        if (!co_await ensure(2)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        (void)pending.CopyPrefixTo(std::span(address).first(2));
+        if (address[1] == 0) co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        size = 1 + 1 + address[1] + 2;
+    } else co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (!co_await ensure(size)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    (void)pending.CopyPrefixTo(std::span(address).first(size));
+    const uint16_t port = static_cast<uint16_t>((uint16_t(address[size - 2]) << 8) | address[size - 1]);
+    TargetAddress target;
+    if (type == 1) {
         net::ip::address_v4::bytes_type bytes{};
-        const uint16_t port = [&]() {
-            (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
-            return reader.ReadU16BE();
-        }();
-        if (!reader.Ok()) {
-            return std::nullopt;
-        }
-        return TargetAddress(net::ip::make_address_v4(bytes), port);
-    }
-    if (atype == 0x04) {
+        std::copy_n(address.begin() + 1, bytes.size(), bytes.begin());
+        target = TargetAddress(net::ip::make_address_v4(bytes), port);
+    } else if (type == 4) {
         net::ip::address_v6::bytes_type bytes{};
-        const uint16_t port = [&]() {
-            (void)reader.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
-            return reader.ReadU16BE();
-        }();
-        if (!reader.Ok()) {
-            return std::nullopt;
-        }
-        return TargetAddress(net::ip::make_address_v6(bytes), port);
+        std::copy_n(address.begin() + 1, bytes.size(), bytes.begin());
+        target = TargetAddress(net::ip::make_address_v6(bytes), port);
+    } else {
+        target = TargetAddress(std::string_view(
+            reinterpret_cast<const char*>(address.data() + 2), address[1]), port);
     }
-    if (atype == 0x03) {
-        const uint8_t len = reader.ReadU8();
-        std::string host = reader.ReadString(len);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok() || len == 0) {
-            return std::nullopt;
-        }
-        return TargetAddress(std::string_view(host), port);
-    }
-    return std::nullopt;
+    if (!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target))
+        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    pending.DropPrefixBytes(size);
+    co_return target;
 }
 
 class AnyTLSDemuxSession;
 
 class AnyTLSSubStream final
     : public transport::MultiBufferReader
-    , public transport::MultiBufferWriter
-    , public std::enable_shared_from_this<AnyTLSSubStream> {
+    , public transport::MultiBufferWriter {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    transport::EofAction ReadEofAction() const noexcept override { return transport::EofAction::CloseLink; }
+    bool WriteShutdownClosesLink() const noexcept override { return true; }
+
+    bool RemoteClosed() const noexcept { return remote_closed_; }
+    bool IsClosed() const noexcept { return write_closed_; }
+
+    void CheckWrite() const {
+        if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+        if (write_closed_) throw transport::WriteClosed();
+    }
+
     AnyTLSSubStream(net::io_context& io_context,
-                    std::shared_ptr<AnyTLSDemuxSession> session,
+                    AnyTLSDemuxSession& session,
                     uint32_t sid)
         : io_context_(io_context)
         , input_signal_(io_context, 1)
         , input_space_signal_(io_context, 1)
-        , session_(std::move(session))
+        , session_(session)
         , sid_(sid) {}
 
     ~AnyTLSSubStream() noexcept override {
@@ -267,11 +193,7 @@ public:
     session::Context ctx;
 
     net::awaitable<bool> PushInput(buf::MultiBuffer mb) {
-        const size_t bytes = buf::TotalLen(mb);
-        co_return co_await PushInput(std::move(mb), bytes);
-    }
-
-    net::awaitable<bool> PushInput(buf::MultiBuffer mb, size_t bytes) {
+        const size_t bytes = mb.byte_size();
         if (cancelled_ || input_done_) {
             mb.clear();
             co_return false;
@@ -286,7 +208,7 @@ public:
         }
         while (!cancelled_ &&
                !input_done_ &&
-               queued_bytes_ + bytes > kMaxSubStreamQueuedPayloadBytes) {
+               queued_input_.byte_size() + bytes > kMaxSubStreamQueuedPayloadBytes) {
             auto [ec] = co_await input_space_signal_.async_receive(
                 net::as_tuple(net::use_awaitable));
             if (ec) {
@@ -298,21 +220,17 @@ public:
             mb.clear();
             co_return false;
         }
-        input_queue_.push_back(QueuedInput{std::move(mb), bytes});
-        queued_bytes_ += bytes;
-        if (input_queue_.size() >= kSubStreamQueueShrinkItems) {
-            shrink_queue_on_drain_ = true;
-        }
+        AppendQueuedPayload(queued_input_, std::move(mb));
         WakeInputReader();
         co_return true;
     }
 
-    void CloseInput() {
-        if (input_done_) {
-            return;
-        }
+    void CloseRemote() {
+        remote_closed_ = true;
+        write_closed_ = true;
         input_done_ = true;
         WakeInputReader();
+        WakeInputWriter();
     }
 
     void Cancel() noexcept {
@@ -320,23 +238,19 @@ public:
             return;
         }
         cancelled_ = true;
+        cancellation_.Stop();
         input_done_ = true;
-        input_queue_.clear();
-        queued_bytes_ = 0;
-        shrink_queue_on_drain_ = false;
+        queued_input_.clear();
         WakeInputReader();
         WakeInputWriter();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
-            if (!input_queue_.empty()) {
-                QueuedInput input = std::move(input_queue_.front());
-                queued_bytes_ -= std::min(queued_bytes_, input.bytes);
-                input_queue_.pop_front();
-                ShrinkQueueIfDrained();
+            if (!queued_input_.empty()) {
+                auto input = std::move(queued_input_);
                 WakeInputWriter();
-                co_return std::move(input.payload);
+                co_return input;
             }
             if (input_done_) {
                 co_return buf::MultiBuffer{};
@@ -359,6 +273,8 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
+    transport::CancellationSource cancellation_;
+
     void WakeInputReader() noexcept {
         if (io_context_.stopped()) {
             return;
@@ -373,30 +289,19 @@ private:
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
-    void ShrinkQueueIfDrained() noexcept {
-        if (input_queue_.empty() && shrink_queue_on_drain_) {
-            TryShrinkSequence(input_queue_);
-            shrink_queue_on_drain_ = false;
-        }
-    }
-
     net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     net::experimental::channel<void(IoErrorCode)> input_space_signal_;
-    std::shared_ptr<AnyTLSDemuxSession> session_;
+    AnyTLSDemuxSession& session_; // Run joins all users before destroying the session.
     uint32_t sid_ = 0;
-    struct QueuedInput {
-        buf::MultiBuffer payload;
-        size_t bytes = 0;
-    };
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
-    size_t queued_bytes_ = 0;
-    bool shrink_queue_on_drain_ = false;
+    buf::MultiBuffer queued_input_;
     bool input_done_ = false;
     bool cancelled_ = false;
+    bool write_closed_ = false;
+    bool remote_closed_ = false;
 };
 
-class AnyTLSDemuxSession final : public std::enable_shared_from_this<AnyTLSDemuxSession> {
+class AnyTLSDemuxSession final {
 public:
     AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
@@ -405,18 +310,15 @@ public:
                        const session::Context& base_ctx,
                        StatsShard& stats,
                        const TimeoutsConfig& timeouts,
-                       std::string padding_scheme_raw,
-                       std::string padding_scheme_md5)
+                       std::shared_ptr<const PaddingScheme> padding_scheme)
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
         , policy_(policy)
         , io_context_(io_context)
         , stats_(stats)
         , timeouts_(timeouts)
-        , padding_scheme_raw_(std::move(padding_scheme_raw))
-        , padding_scheme_md5_(std::move(padding_scheme_md5))
-        , write_gate_(io_context)
-        , dispatch_completion_(io_context) {
+        , padding_scheme_(std::move(padding_scheme))
+        , write_gate_(io_context) {
         CopySessionContext(base_ctx, base_ctx_);
     }
 
@@ -435,8 +337,21 @@ public:
         if (!write_lease || cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
+        if (auto sub = FindStream(sid)) {
+            if (cmd == anytls::kCmdFIN && sub->RemoteClosed())
+                co_return std::expected<void, ErrorCode>{};
+            if (cmd == anytls::kCmdSYNACK && sub->IsClosed())
+                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+        }
 
-        co_return co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
+        try {
+            auto result = co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
+            if (!result) CancelAll();
+            co_return result;
+        } catch (...) {
+            CancelAll();
+            throw;
+        }
     }
 
     net::awaitable<std::expected<void, ErrorCode>>
@@ -446,9 +361,18 @@ public:
             mb.clear();
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
+        if (auto sub = FindStream(sid)) sub->CheckWrite();
+        else throw transport::WriteClosed();
 
-        co_return co_await anytls::WriteMultiBufferAsFrameBatch(
-            *stream_, cmd, sid, std::move(mb));
+        try {
+            auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
+                *stream_, cmd, sid, std::move(mb));
+            if (!result) CancelAll();
+            co_return result;
+        } catch (...) {
+            CancelAll();
+            throw;
+        }
     }
 
     net::awaitable<std::expected<void, ErrorCode>>
@@ -471,9 +395,18 @@ public:
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
+        if (auto sub = FindStream(sid)) sub->CheckWrite();
+        else throw transport::WriteClosed();
         const PaddingScheme no_padding;
-        co_return co_await anytls::WriteBuffersAsFramesWithPadding(
-            *stream_, no_padding, 0, cmd, sid, buffers);
+        try {
+            auto result = co_await anytls::WriteBuffersAsFramesWithPadding(
+                *stream_, no_padding, 0, cmd, sid, buffers);
+            if (!result) CancelAll();
+            co_return result;
+        } catch (...) {
+            CancelAll();
+            throw;
+        }
     }
 
     void RemoveStream(uint32_t sid) {
@@ -483,24 +416,12 @@ public:
         }
         it->second->Cancel();
         streams_.erase(it);
-        stream_states_.erase(sid);
     }
 
 private:
-    enum class StreamState {
-        PendingTarget,
-        PendingUotRequest,
-        Started,
-    };
-
-    std::shared_ptr<AnyTLSSubStream> GetOrCreateStream(uint32_t sid) {
-        auto it = streams_.find(sid);
-        if (it != streams_.end()) {
-            return it->second;
-        }
-        auto sub = std::make_shared<AnyTLSSubStream>(io_context_, shared_from_this(), sid);
-        streams_.emplace(sid, sub);
-        return sub;
+    std::shared_ptr<AnyTLSSubStream> FindStream(uint32_t sid) const {
+        const auto it = streams_.find(sid);
+        return it == streams_.end() ? nullptr : it->second;
     }
 
     void ReportStreamFailure(uint32_t sid, ErrorCode error) noexcept {
@@ -530,19 +451,19 @@ private:
         }
     }
 
-    net::awaitable<void> StartDispatch(
-        std::shared_ptr<AnyTLSSubStream> sub,
-        TargetAddress target,
-        buf::MultiBuffer initial_uot_payload,
-        std::optional<proxy::uot::Version> uot_version);
-    void SpawnDispatch(
-        std::shared_ptr<AnyTLSSubStream> sub,
-        TargetAddress target,
-        buf::MultiBuffer initial_uot_payload,
-        std::optional<proxy::uot::Version> uot_version);
-    void CompleteDispatch() noexcept;
-    net::awaitable<void> WaitForDispatches();
-    net::awaitable<RelayResult> FinishRun(RelayResult result);
+    net::awaitable<RelayResult> RejectSession(std::string_view message, ErrorCode error) {
+        (void)co_await WriteFrameSerialized(anytls::kCmdAlert, 0,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+        RelayResult result;
+        result.error = error;
+        co_return result;
+    }
+
+    net::awaitable<ErrorCode> ProcessStream(
+        AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at);
+    net::awaitable<void> RunStream(
+        std::shared_ptr<AnyTLSSubStream> sub, std::chrono::steady_clock::time_point opened_at);
+    net::awaitable<RelayResult> ReadFrames(AwaitableTaskGroup& tasks);
 
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
@@ -551,271 +472,190 @@ private:
     session::Context base_ctx_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
-    std::string padding_scheme_raw_;
-    std::string padding_scheme_md5_;
+    std::shared_ptr<const PaddingScheme> padding_scheme_;
     transport::internet::AsyncWriteGate write_gate_;
-    net::steady_timer dispatch_completion_;
-    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>>
-        streams_;
-    memory::ThreadLocalUnorderedMap<uint32_t, StreamState> stream_states_;
+    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
+    uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
-    bool handshake_done_ = false;
-    size_t active_dispatches_ = 0;
+    std::optional<anytls::SessionVersion> session_version_;
 };
 
 net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-    auto session = session_;
-    if (!session) {
-        mb.clear();
-        throw IoSystemError(
-            io_error::operation_aborted,
-            "AnyTLS substream session unavailable");
-    }
-    auto ok = co_await session->WriteMultiBufferSerialized(anytls::kCmdPSH, sid_, std::move(mb));
-    if (!ok) {
-        throw IoSystemError(make_error_code(std::errc::io_error));
-    }
+    CheckWrite();
+    auto ok = co_await session_.WriteMultiBufferSerialized(anytls::kCmdPSH, sid_, std::move(mb));
+    if (!ok) throw transport::LinkError(ok.error());
 }
 
-net::awaitable<void> AnyTLSSubStream::WriteBuffers(
-    std::span<const net::const_buffer> buffers) {
-    auto session = session_;
-    if (!session) {
-        throw IoSystemError(
-            io_error::operation_aborted,
-            "AnyTLS substream session unavailable");
-    }
-    auto ok = co_await session->WriteBuffersSerialized(anytls::kCmdPSH, sid_, buffers);
-    if (!ok) {
-        throw IoSystemError(make_error_code(std::errc::io_error));
-    }
+net::awaitable<void> AnyTLSSubStream::WriteBuffers(std::span<const net::const_buffer> buffers) {
+    CheckWrite();
+    auto ok = co_await session_.WriteBuffersSerialized(anytls::kCmdPSH, sid_, buffers);
+    if (!ok) throw transport::LinkError(ok.error());
 }
 
 net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
-    auto session = session_;
-    if (session) {
-        (void)co_await session->WriteFrameSerialized(anytls::kCmdFIN, sid_, {});
-    }
+    if (write_closed_) co_return;
+    write_closed_ = true;
+    input_done_ = true;
+    queued_input_.clear();
+    WakeInputReader();
+    WakeInputWriter();
+    if (auto result = co_await session_.WriteFrameSerialized(anytls::kCmdFIN, sid_, {}); !result)
+        throw transport::LinkError(result.error());
 }
 
-net::awaitable<void> AnyTLSDemuxSession::StartDispatch(
-    std::shared_ptr<AnyTLSSubStream> sub,
-    TargetAddress target,
-    buf::MultiBuffer initial_uot_payload,
-    std::optional<proxy::uot::Version> uot_version) {
-    if (!sub) {
-        co_return;
-    }
-
-    session::Context& ctx = sub->ctx;
-    ctx.outbound.original_target = target;
-    ctx.outbound.target = target;
-    ctx.outbound.route_target = target;
-    ctx.content.network = uot_version ? Network::UDP : Network::TCP;
-
-    auto report_predispatch_failure = [&](ErrorCode error) {
-        app::AccessLogSession access_log(ctx);
-        access_log.Fail(error);
-        RemoveStream(sub->Sid());
-    };
-
+net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
+    AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
+    buf::MultiBuffer pending;
+    TargetAddress target;
+    session::Context& ctx = sub.ctx;
     bool is_connect = false;
     std::optional<proxy::uot::PacketReader> uot_reader;
     std::optional<proxy::uot::PacketWriter> uot_writer;
-    try {
+    auto prepare = [&]() -> net::awaitable<ErrorCode> {
+        auto parsed = co_await ReadSocksTarget(sub, pending);
+        if (!parsed) co_return parsed.error();
+        target = std::move(*parsed);
+        const auto uot_version = proxy::uot::VersionFromMagicAddress(target);
+        ctx.outbound.original_target = uot_version ? TargetAddress{} : target;
+        ctx.outbound.target = ctx.outbound.original_target;
+        ctx.outbound.route_target = ctx.outbound.original_target;
+        ctx.content.network = uot_version ? Network::UDP : Network::TCP;
+        if (session_version_ == anytls::SessionVersion::V2) {
+            if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(), {}); !ok)
+                co_return ok.error();
+        }
+
         if (uot_version) {
+            target = {};
             if (*uot_version == proxy::uot::Version::V2) {
-                auto request = co_await proxy::uot::ReadRequest(
-                    *sub, initial_uot_payload);
-                if (!request) {
-                    report_predispatch_failure(request.error());
-                    co_return;
-                }
-                if (!request->destination.IsValid()) {
-                    report_predispatch_failure(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-                    co_return;
-                }
+                auto request = co_await proxy::uot::ReadRequest(sub, pending);
+                if (!request) co_return request.error();
+                if (!request->destination.IsValid()) co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
                 is_connect = request->is_connect;
                 target = std::move(request->destination);
             }
-
-            uot_reader.emplace(
-                *sub, is_connect, target, std::move(initial_uot_payload));
+            uot_reader.emplace(sub, is_connect, target, std::move(pending));
             if (*uot_version == proxy::uot::Version::V1) {
                 auto first_packet = co_await uot_reader->ReadMultiBuffer();
-                if (!buf::HasData(first_packet)) {
-                    report_predispatch_failure(ErrorCode::CONNECTION_CLOSED);
-                    co_return;
-                }
+                if (!buf::HasData(first_packet)) co_return ErrorCode::CONNECTION_CLOSED;
                 for (const buf::Buffer* buffer : first_packet) {
                     if (buffer && buffer->HasUDP()) {
                         target = buffer->UDP();
                         break;
                     }
                 }
-                if (!target.IsValid()) {
-                    report_predispatch_failure(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-                    co_return;
-                }
+                if (!target.IsValid()) co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
                 uot_reader->SetInitialDecoded(std::move(first_packet));
             }
-            uot_writer.emplace(*sub, is_connect, target);
+            uot_writer.emplace(sub, is_connect, target);
         }
-    } catch (const IoSystemError& e) {
-        report_predispatch_failure(MapAsioError(e.code()));
-        co_return;
-    } catch (const std::bad_alloc&) {
-        report_predispatch_failure(ErrorCode::RESOURCE_EXHAUSTED);
-        co_return;
-    } catch (...) {
-        report_predispatch_failure(ErrorCode::INTERNAL);
-        co_return;
-    }
+        ctx.outbound.original_target = target;
+        ctx.outbound.target = target;
+        ctx.outbound.route_target = target;
+        ctx.content.network = uot_version ? Network::UDP : Network::TCP;
+        co_return ErrorCode::OK;
+    };
 
-    ctx.outbound.original_target = target;
-    ctx.outbound.target = target;
-    ctx.outbound.route_target = target;
-    ctx.content.network = uot_version ? Network::UDP : Network::TCP;
-
-    RelayResult result;
-    if (uot_version) {
-        result = co_await dispatcher_.Dispatch(
-            io_context_,
-            policy_,
-            nullptr,
-            transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
-            InitialPayload{},
-            ctx,
-            stats_,
-            timeouts_);
-    } else {
-        result = co_await dispatcher_.Dispatch(
-            io_context_,
-            policy_,
-            nullptr,
-            transport::Link{sub.get(), sub.get()},
-            InitialPayload{},
-            ctx,
-            stats_,
-            timeouts_);
-    }
-    (void)result;
-    RemoveStream(sub->Sid());
-}
-
-void AnyTLSDemuxSession::SpawnDispatch(
-    std::shared_ptr<AnyTLSSubStream> sub,
-    TargetAddress target,
-    buf::MultiBuffer initial_uot_payload,
-    std::optional<proxy::uot::Version> uot_version) {
-    if (!sub) {
-        return;
-    }
-
-    const uint32_t sid = sub->Sid();
-    sub->ctx.conn_id = session::NewID(base_ctx_.worker_id);
-    sub->ctx.worker_id = base_ctx_.worker_id;
-    sub->ctx.inbound.access_source_ref =
-        base_ctx_.inbound.access_source_ref;
-    ++active_dispatches_;
+    bool timed_out = false;
+    ErrorCode prepare_error = ErrorCode::INTERNAL;
+    auto handshake = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+        const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - opened_at);
+        const auto remaining = std::max(std::chrono::milliseconds::zero(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeouts_.HandshakeTimeout()) - elapsed);
+        if (remaining == std::chrono::milliseconds::zero()) {
+            timed_out = true;
+            sub.Cancel();
+            co_return;
+        }
+        // The token lives inside this child: its callback cannot outlive the
+        // task group it borrows. Cancellation covers both reads and SYNACK I/O.
+        auto deadline = TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, [&] {
+            timed_out = true;
+            sub.Cancel();
+            tasks.Cancel();
+        });
+        prepare_error = co_await prepare();
+        // Ready continuations can run before an already-due timer callback.
+        // Do not dispatch a header that completed beyond its absolute budget.
+        if (std::chrono::steady_clock::now() >= opened_at + timeouts_.HandshakeTimeout()) {
+            timed_out = true;
+            sub.Cancel();
+        }
+    };
     try {
-        CopySessionContext(base_ctx_, sub->ctx);
-        sub->ctx.stream_id = sid;
-        sub->ctx.outbound.original_target = target;
-        sub->ctx.outbound.target = target;
-        sub->ctx.outbound.route_target = target;
-        sub->ctx.content.network = uot_version ? Network::UDP : Network::TCP;
-        auto self = shared_from_this();
-        net::co_spawn(
-            io_context_.get_executor(),
-            [self,
-             sub = std::move(sub),
-             target = std::move(target),
-             initial = std::move(initial_uot_payload),
-             uot_version,
-             sid]() mutable -> net::awaitable<void> {
-                auto completion = std::unique_ptr<void, void(*)(void*)>{
-                    self.get(),
-                    [](void* session) {
-                        static_cast<AnyTLSDemuxSession*>(session)->CompleteDispatch();
-                    }};
-                (void)completion;
-                try {
-                    co_await self->StartDispatch(
-                        std::move(sub),
-                        std::move(target),
-                        std::move(initial),
-                        uot_version);
-                } catch (const std::exception& e) {
-                    LOG_NET_DEBUG(
-                        "[AnyTLS] child dispatch failed sid={} error={}",
-                        sid,
-                        e.what());
-                    self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
-                    self->RemoveStream(sid);
-                } catch (...) {
-                    LOG_NET_DEBUG(
-                        "[AnyTLS] child dispatch failed sid={} error=unknown",
-                        sid);
-                    self->ReportStreamFailure(sid, ErrorCode::INTERNAL);
-                    self->RemoveStream(sid);
-                }
-            },
-            net::detached);
+        co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(handshake(tasks)); });
+    } catch (const IoSystemError&) {
+        if (!timed_out) throw;
+    }
+    if (timed_out) co_return ErrorCode::TIMEOUT;
+    if (prepare_error != ErrorCode::OK) co_return prepare_error;
+    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+    // Header preparation is joined and its timer removed before Dispatcher.
+    if (uot_reader) {
+        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+            transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
+            InitialPayload{}, ctx, stats_, timeouts_);
+    } else {
+        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+            transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
+            ctx, stats_, timeouts_);
+    }
+    co_return ErrorCode::OK;
+}
+
+net::awaitable<void> AnyTLSDemuxSession::RunStream(
+    std::shared_ptr<AnyTLSSubStream> sub, std::chrono::steady_clock::time_point opened_at) {
+    ErrorCode error = ErrorCode::OK;
+    try {
+        error = co_await ProcessStream(*sub, opened_at);
+    } catch (const transport::LinkError& failure) {
+        error = failure.code();
+    } catch (const IoSystemError& failure) {
+        error = MapAsioError(failure.code());
+    } catch (const std::bad_alloc&) {
+        error = ErrorCode::RESOURCE_EXHAUSTED;
     } catch (...) {
-        ReportStreamFailure(sid, ErrorCode::RESOURCE_EXHAUSTED);
-        RemoveStream(sid);
-        CompleteDispatch();
+        error = ErrorCode::INTERNAL;
     }
-}
-
-void AnyTLSDemuxSession::CompleteDispatch() noexcept {
-    if (active_dispatches_ == 0) {
-        return;
+    if (error == ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = ErrorCode::OK;
+    if (error != ErrorCode::OK) {
+        // Physical write failure can already have removed the live index.
+        // This task still owns the context needed for its terminal record.
+        {
+            app::AccessLogSession access_log(sub->ctx);
+            access_log.Fail(error);
+        }
     }
-    --active_dispatches_;
-    if (active_dispatches_ == 0) {
-        IoErrorCode ignored;
-        dispatch_completion_.cancel(ignored);
-    }
-}
-
-net::awaitable<void> AnyTLSDemuxSession::WaitForDispatches() {
-    while (active_dispatches_ != 0) {
-        dispatch_completion_.expires_at(net::steady_timer::time_point::max());
-        (void)co_await dispatch_completion_.async_wait(
-            net::as_tuple(net::use_awaitable));
-    }
-}
-
-net::awaitable<RelayResult>
-AnyTLSDemuxSession::FinishRun(RelayResult result) {
-    CancelAll();
-    co_await WaitForDispatches();
-    if (result.error == ErrorCode::CONNECTION_CLOSED) {
-        result.error = ErrorCode::OK;
-    }
-    co_return result;
+    // The request owner closes exactly once on every completion path. A remote
+    // close is already terminal and produces no FIN reply.
+    try { co_await sub->AsyncShutdownWrite(); } catch (...) {}
+    RemoveStream(sub->Sid());
 }
 
 net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
     RelayResult result;
-    auto report_child_creation_failure = [this](
-            uint32_t sid,
-            const TargetAddress& target,
-            Network network,
-            ErrorCode error) {
-        session::Context ctx;
-        CopySessionContext(base_ctx_, ctx);
-        ctx.outbound.original_target = target;
-        ctx.outbound.target = target;
-        ctx.outbound.route_target = target;
-        ctx.content.network = network;
-        app::AccessLogSession access_log(ctx);
-        access_log.Fail(error);
-        RemoveStream(sid);
+    auto read_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+        try {
+            result = co_await ReadFrames(tasks);
+        } catch (...) {
+            CancelAll();
+            throw; // The group records this failure before cancelling siblings.
+        }
+        CancelAll();
+        // Join every logical task, including header preparation and async
+        // cleanup, even when the frame loop returns normally.
+        tasks.Cancel();
     };
+    co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+        [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
+    if (result.error == ErrorCode::CONNECTION_CLOSED) result.error = ErrorCode::OK;
+    co_return result;
+}
 
+net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& tasks) {
+    RelayResult result;
     while (!cancelled_) {
         auto header = co_await anytls::ReadFrameHeader(*stream_);
         if (!header) {
@@ -824,63 +664,100 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         }
 
         if (header->cmd == anytls::kCmdSettings) {
-            std::string client_padding_md5;
-            if (header->length > 0) {
-                auto settings_text = co_await anytls::ReadFrameText(*stream_, header->length);
-                if (!settings_text) {
-                    result.error = settings_text.error();
-                    break;
-                }
-                client_padding_md5 = ParseSettingsPaddingMd5(*settings_text);
-            }
-            if (auto ok = co_await WriteFrameSerialized(
-                    anytls::kCmdServerSettings,
-                    0,
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>("v=2"),
-                        3)); !ok) {
-                result.error = ok.error();
-                break;
-            }
-            if (!padding_scheme_raw_.empty() &&
-                !client_padding_md5.empty() &&
-                client_padding_md5 != padding_scheme_md5_) {
-                if (auto ok = co_await WriteFrameSerialized(
-                        anytls::kCmdUpdatePaddingScheme,
-                        0,
-                        std::span<const uint8_t>(
-                            reinterpret_cast<const uint8_t*>(padding_scheme_raw_.data()),
-                            padding_scheme_raw_.size())); !ok) {
+            if (header->sid != 0 || session_version_)
+                co_return co_await RejectSession("invalid or repeated client settings", ErrorCode::PROTOCOL_INVALID_COMMAND);
+            auto text = co_await anytls::ReadFrameText(*stream_, header->length);
+            if (!text) { result.error = text.error(); break; }
+            auto parsed = anytls::ParsePeerSettings(*text);
+            if (!parsed)
+                co_return co_await RejectSession("invalid client settings", parsed.error());
+            session_version_ = parsed->version; // Publish once before accepting any SYN.
+            if (session_version_ == anytls::SessionVersion::V2) {
+                const std::string settings = "v=" + std::to_string(anytls::kProtocolVersion);
+                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdServerSettings, 0,
+                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(settings.data()), settings.size())); !ok) {
                     result.error = ok.error();
                     break;
                 }
             }
-            handshake_done_ = true;
-            continue;
-        }
-        if (header->cmd == anytls::kCmdWaste ||
-            header->cmd == anytls::kCmdHeartResponse ||
-            header->cmd == anytls::kCmdServerSettings ||
-            header->cmd == anytls::kCmdUpdatePaddingScheme) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
+            if (padding_scheme_ && !parsed->padding_md5.empty() &&
+                parsed->padding_md5 != padding_scheme_->Digest()) {
+                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdUpdatePaddingScheme, 0,
+                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(padding_scheme_->Raw().data()),
+                            padding_scheme_->Raw().size())); !ok) {
+                    result.error = ok.error();
+                    break;
+                }
             }
             continue;
         }
-        if (header->cmd == anytls::kCmdHeartRequest) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
+        if (header->cmd == anytls::kCmdServerSettings || header->cmd == anytls::kCmdUpdatePaddingScheme ||
+            header->cmd == anytls::kCmdSYNACK)
+            co_return co_await RejectSession("server command received from client", ErrorCode::PROTOCOL_INVALID_COMMAND);
+        if (header->cmd == anytls::kCmdHeartRequest || header->cmd == anytls::kCmdHeartResponse) {
+            if (session_version_ != anytls::SessionVersion::V2 || header->sid != 0 || header->length != 0)
+                co_return co_await RejectSession("heartbeat requires negotiated v2", ErrorCode::PROTOCOL_INVALID_COMMAND);
+            if (header->cmd == anytls::kCmdHeartRequest) {
+                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdHeartResponse, 0, {}); !ok) {
+                    result.error = ok.error();
+                    break;
+                }
             }
-            if (auto ok = co_await WriteFrameSerialized(anytls::kCmdHeartResponse, 0, {}); !ok) {
+            continue;
+        }
+        if (header->cmd == anytls::kCmdWaste) {
+            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
             continue;
         }
 
-        if (header->sid == 0) {
+        const uint32_t sid = header->sid;
+        if (header->cmd == anytls::kCmdSYN) {
+            std::string_view rejection;
+            if (!session_version_) rejection = "client did not send its settings";
+            else if (sid <= last_stream_id_) rejection = "stream IDs must increase";
+            else if (header->length != 0) rejection = "SYN must not carry data";
+            if (!rejection.empty())
+                co_return co_await RejectSession(rejection, ErrorCode::PROTOCOL_INVALID_COMMAND);
+            if (streams_.size() >= kMaxConcurrentSubstreams) {
+                last_stream_id_ = sid; // A refused ID is retired, never reusable.
+                stats_.OnError();
+                if (session_version_ == anytls::SessionVersion::V2) {
+                    constexpr std::string_view message = "concurrent stream limit";
+                    auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid,
+                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+                    if (!ok) { result.error = ok.error(); co_return result; }
+                }
+                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdFIN, sid, {}); !ok) {
+                    result.error = ok.error();
+                    co_return result;
+                }
+                continue;
+            }
+            const auto opened_at = std::chrono::steady_clock::now();
+            auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
+            CopySessionContext(base_ctx_, sub->ctx);
+            sub->ctx.stream_id = sid;
+            sub->ctx.content.network = Network::TCP;
+            streams_.emplace(sid, sub);
+            last_stream_id_ = sid; // Commit after the complete stream was inserted.
+            try {
+                tasks.Spawn(RunStream(std::move(sub), opened_at));
+            } catch (const IoSystemError& error) {
+                ReportStreamFailure(sid, MapAsioError(error.code()));
+                throw;
+            } catch (const std::bad_alloc&) {
+                ReportStreamFailure(sid, ErrorCode::RESOURCE_EXHAUSTED);
+                throw;
+            } catch (...) {
+                ReportStreamFailure(sid, ErrorCode::INTERNAL);
+                throw;
+            }
+            continue;
+        }
+        if (sid == 0) {
             if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
@@ -889,48 +766,31 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
             break;
         }
 
-        const uint32_t sid = header->sid;
-        if (header->cmd == anytls::kCmdSYN) {
-            if (!handshake_done_) {
-                static constexpr std::string_view kAlert = "client did not send its settings";
-                (void)co_await WriteFrameSerialized(
-                    anytls::kCmdAlert,
-                    0,
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(kAlert.data()),
-                        kAlert.size()));
-                if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                    result.error = ok.error();
-                    break;
-                }
-                result.error = ErrorCode::PROTOCOL_INVALID_COMMAND;
-                break;
-            }
-            auto sub = GetOrCreateStream(sid);
-            stream_states_[sid] = StreamState::PendingTarget;
+        // The dispatcher can retire this stream during any following await.
+        // Retain the stream itself, never an iterator into the live index.
+        const auto sub = FindStream(sid);
+        if (!sub) {
             if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
             continue;
         }
-
-        auto state_it = stream_states_.find(sid);
-        if (state_it == stream_states_.end()) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
-            }
-            continue;
-        }
-        auto sub = GetOrCreateStream(sid);
 
         if (header->cmd == anytls::kCmdFIN) {
             if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
-            sub->CloseInput();
+            sub->CloseRemote();
+            continue;
+        }
+
+        if (sub->IsClosed()) {
+            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
+                result.error = ok.error();
+                break;
+            }
             continue;
         }
 
@@ -949,62 +809,11 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
             break;
         }
 
-        switch (state_it->second) {
-            case StreamState::PendingTarget: {
-                auto target = ParseSocksAddress(*payload, header->length);
-                payload->clear();
-                if (!target) {
-                    report_child_creation_failure(
-                        sid,
-                        TargetAddress{},
-                        Network::TCP,
-                        ErrorCode::PROTOCOL_INVALID_ADDRESS);
-                    result.error = ErrorCode::PROTOCOL_INVALID_ADDRESS;
-                    co_return co_await FinishRun(std::move(result));
-                }
-                const auto uot_version =
-                    proxy::uot::VersionFromMagicAddress(*target);
-                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid, {}); !ok) {
-                    report_child_creation_failure(
-                        sid,
-                        uot_version ? TargetAddress{} : *target,
-                        uot_version ? Network::UDP : Network::TCP,
-                        ok.error());
-                    result.error = ok.error();
-                    co_return co_await FinishRun(std::move(result));
-                }
-                if (uot_version) {
-                    if (*uot_version == proxy::uot::Version::V2) {
-                        state_it->second = StreamState::PendingUotRequest;
-                        break;
-                    }
-                    state_it->second = StreamState::Started;
-                    SpawnDispatch(
-                        std::move(sub), {}, {}, proxy::uot::Version::V1);
-                    break;
-                }
-                state_it->second = StreamState::Started;
-                SpawnDispatch(
-                    std::move(sub), std::move(*target), {}, std::nullopt);
-                break;
-            }
-            case StreamState::PendingUotRequest: {
-                state_it->second = StreamState::Started;
-                SpawnDispatch(
-                    std::move(sub), {}, std::move(*payload), proxy::uot::Version::V2);
-                break;
-            }
-            case StreamState::Started:
-                if (!co_await sub->PushInput(std::move(*payload), header->length)) {
-                    stream_states_.erase(sid);
-                    RemoveStream(sid);
-                    break;
-                }
-                break;
-        }
+        if (!co_await sub->PushInput(std::move(*payload)))
+            RemoveStream(sid);
     }
 
-    co_return co_await FinishRun(std::move(result));
+    co_return result;
 }
 
 net::awaitable<std::expected<void, ErrorCode>> ReadAuth(
@@ -1116,7 +925,7 @@ Handler::Process(
     // child below replaces this with TCP/UDP and reports independently.
     ctx.content.network = Network::MUX;
 
-    auto demux = std::make_shared<AnyTLSDemuxSession>(
+    AnyTLSDemuxSession demux(
         std::move(stream),
         dispatcher,
         receiver.dispatch_policy,
@@ -1124,9 +933,8 @@ Handler::Process(
         ctx,
         *stats_,
         timeouts,
-        padding_scheme_raw_,
-        padding_scheme_md5_);
-    co_return co_await demux->Run();
+        padding_scheme_);
+    co_return co_await demux.Run();
 }
 
 }  // namespace acpp::proxy::anytls::inbound
@@ -1145,8 +953,7 @@ public:
 class AnyTlsSettings final
     : public acpp::proxyman::inbound::ProtocolSettings {
 public:
-    std::string padding_scheme_raw;
-    std::string padding_scheme_md5;
+    std::shared_ptr<const acpp::anytls::PaddingScheme> padding_scheme;
 };
 
 [[nodiscard]] const AnyTlsSettings* GetAnyTlsSettings(
@@ -1177,14 +984,19 @@ const bool kInboundRegistered = [] {
                 anytls_runtime->validator,
                 stats,
                 limiter,
-                settings->padding_scheme_raw,
-                settings->padding_scheme_md5);
+                settings->padding_scheme);
         };
 
     reg.prepare_settings =
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
+            // The advertised raw scheme must fit in one UpdatePaddingScheme frame.
+            if (config.padding_scheme.size() > acpp::anytls::kMaxFramePayload) {
+                LOG_WARN("AnyTLS inbound '{}': padding scheme exceeds {} bytes",
+                    tag, acpp::anytls::kMaxFramePayload);
+                return std::nullopt;
+            }
             auto settings = std::make_shared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =
@@ -1194,8 +1006,8 @@ const bool kInboundRegistered = [] {
                         "AnyTLS inbound '{}': invalid padding scheme", tag);
                     return std::nullopt;
                 }
-                settings->padding_scheme_raw = std::move(parsed->raw);
-                settings->padding_scheme_md5 = std::move(parsed->md5);
+                settings->padding_scheme =
+                    std::make_shared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
             }
             return settings;
         };

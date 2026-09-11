@@ -1,194 +1,107 @@
 #include "cache_internal.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <iterator>
+#include <type_traits>
+
 namespace acpp::app::dns {
 
 DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
-    : min_ttl_(min_ttl), max_ttl_(max_ttl), capacity_(max_size) {
-    // 精确分配总容量，避免 cacheSize 因分片向上取整而被放大。
-    const size_t base = max_size / kNumShards;
-    size_t remainder = max_size % kNumShards;
-    for (auto& shard : shards_) {
-        shard.max_entries = base + (remainder > 0 ? 1 : 0);
-        if (remainder > 0) {
-            --remainder;
-        }
-        if (shard.max_entries > 0) {
-            shard.cache.reserve(shard.max_entries);
-        }
-    }
+    : capacity_(max_size)
+    , min_ttl_(std::min(min_ttl, max_ttl))
+    , max_ttl_(std::max(min_ttl, max_ttl)) {
+    if (capacity_ > 0) entries_.reserve(capacity_);
 }
 
 std::optional<DnsCacheEntry> DnsCache::Get(std::string_view domain) {
-    const CacheKeyRef cache_key{domain};
-    auto& shard = GetShard(cache_key);
+    const auto found = entries_.find(domain);
+    if (found == entries_.end()) {
+        ++misses_;
+        return std::nullopt;
+    }
+    const auto node = found->second;
     const auto now = steady_clock::now();
-
-    auto it = shard.cache.find(cache_key);
-    if (it == shard.cache.end()) {
-        ++misses_;
-        return std::nullopt;
-    }
-
-    const auto node_it = it->second;
-    const auto& entry = node_it->entry;
-
-    // 检查是否过期
-    if (now >= entry.expire_time) {
-        auto erase_it = it->second;
-        shard.cache.erase(it);
-        shard.lru_list.erase(erase_it);
+    if (now >= node->entry.expire_time) {
+        entries_.erase(found);
+        order_.erase(node);
         ++expired_;
-        --total_entries_;
         ++misses_;
         return std::nullopt;
     }
 
-    // 复制结果；LRU 更新仅在写路径执行，Get 命中保持低成本。
-    DnsCacheEntry result = entry;
-
+    DnsCacheEntry result = node->entry;
+    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+        result.expire_time - now);
+    result.ttl = static_cast<uint32_t>(std::max<int64_t>(remaining.count(), 1));
     ++hits_;
     return result;
 }
 
-void DnsCache::Put(std::string_view domain,
-                   std::span<const net::ip::address> addresses,
-                   uint32_t ttl) {
-    const CacheKeyRef cache_key{domain};
-    auto& shard = GetShard(cache_key);
-    if (shard.max_entries == 0) {
+void DnsCache::Store(std::string_view domain, const DnsResult& result) {
+    if (capacity_ == 0 || (!result.Ok() && result.error != ErrorCode::DNS_NO_RECORD)) {
         return;
     }
 
-    // 限制 TTL 范围
-    ttl = std::max(min_ttl_, std::min(max_ttl_, ttl));
-
+    DnsCacheEntry prepared;
+    prepared.negative = !result.Ok();
+    if (!prepared.negative) {
+        prepared.addresses.assign(result.addresses.begin(), result.addresses.end());
+    }
+    // L2 hits carry a remaining TTL. Applying the minimum again would extend
+    // their lifetime every time an answer is copied into a Worker's L1 cache.
+    prepared.ttl = result.from_cache
+        ? result.ttl
+        : std::clamp(result.ttl, min_ttl_, max_ttl_);
     const auto now = steady_clock::now();
+    prepared.expire_time = now + std::chrono::seconds(prepared.ttl);
 
-    // 检查是否已存在
-    auto it = shard.cache.find(cache_key);
-    if (it != shard.cache.end()) {
-        // 更新现有条目并刷新 LRU 位置
-        auto node_it = it->second;
-        auto& entry = node_it->entry;
-        entry.addresses.assign(addresses.begin(), addresses.end());
-        entry.expire_time = now + std::chrono::seconds(ttl);
-        entry.last_access = now;
-        entry.ttl = ttl;
-        entry.negative = false;
-
-        shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, node_it);
+    const auto existing = entries_.find(domain);
+    if (existing != entries_.end()) {
+        static_assert(std::is_nothrow_move_assignable_v<DnsCacheEntry>);
+        const auto node = existing->second;
+        node->entry = std::move(prepared);
+        order_.splice(order_.begin(), order_, node);
         return;
     }
 
-    // 分片满时淘汰
-    size_t evicted = 0;
-    if (shard.cache.size() >= shard.max_entries) {
-        evicted = shard.Evict();
+    // Stage both owners before eviction. If hash-node allocation fails, remove
+    // the unindexed list node while all old entries and their views are intact.
+    order_.emplace_front(domain, std::move(prepared));
+    const auto node = order_.begin();
+    try {
+        entries_.emplace(std::string_view(node->domain), node);
+    } catch (...) {
+        order_.erase(node);
+        throw;
     }
 
-    // 添加新条目
-    DnsCacheEntry entry;
-    entry.addresses.assign(addresses.begin(), addresses.end());
-    entry.expire_time = now + std::chrono::seconds(ttl);
-    entry.last_access = now;
-    entry.ttl = ttl;
-    entry.negative = false;
-
-    shard.lru_list.emplace_front(domain, std::move(entry));
-    auto node_it = shard.lru_list.begin();
-    shard.cache.emplace(node_it->Key(), node_it);
-
-    // 更新全局计数（新增1个，淘汰evicted个）
-    if (evicted > 0) {
-        total_entries_ -= evicted - 1;
-    } else {
-        ++total_entries_;
-    }
-}
-
-void DnsCache::PutNegative(std::string_view domain,
-                           uint32_t ttl) {
-    const CacheKeyRef cache_key{domain};
-    auto& shard = GetShard(cache_key);
-    if (shard.max_entries == 0) {
-        return;
-    }
-
-    const auto now = steady_clock::now();
-
-    auto it = shard.cache.find(cache_key);
-    if (it != shard.cache.end()) {
-        auto node_it = it->second;
-        auto& entry = node_it->entry;
-        entry.addresses.clear();
-        entry.expire_time = now + std::chrono::seconds(ttl);
-        entry.last_access = now;
-        entry.ttl = ttl;
-        entry.negative = true;
-
-        shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, node_it);
-        return;
-    }
-
-    size_t evicted = 0;
-    if (shard.cache.size() >= shard.max_entries) {
-        evicted = shard.Evict();
-    }
-
-    DnsCacheEntry entry;
-    entry.expire_time = now + std::chrono::seconds(ttl);
-    entry.last_access = now;
-    entry.ttl = ttl;
-    entry.negative = true;
-
-    shard.lru_list.emplace_front(domain, std::move(entry));
-    auto node_it = shard.lru_list.begin();
-    shard.cache.emplace(node_it->Key(), node_it);
-
-    // 更新全局计数
-    if (evicted > 0) {
-        total_entries_ -= evicted - 1;
-    } else {
-        ++total_entries_;
+    if (entries_.size() > capacity_) {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            const auto candidate = it->second;
+            if (now >= candidate->entry.expire_time) {
+                it = entries_.erase(it);
+                order_.erase(candidate);
+            } else {
+                ++it;
+            }
+        }
+        while (entries_.size() > capacity_) {
+            const auto victim = std::prev(order_.end());
+            entries_.erase(std::string_view(victim->domain));
+            order_.erase(victim);
+        }
     }
 }
 
 DnsCacheStats DnsCache::GetStats() const {
-    DnsCacheStats stats;
-    stats.hits = hits_;
-    stats.misses = misses_;
-    stats.expired = expired_;
-    stats.entries = total_entries_;
-    stats.capacity = capacity_;
-
-    return stats;
-}
-
-size_t DnsCache::Shard::Evict() {
-    auto now = steady_clock::now();
-    size_t evicted = 0;
-
-    // 先淘汰过期的
-    for (auto it = cache.begin(); it != cache.end();) {
-        auto node_it = it->second;
-        if (now >= node_it->entry.expire_time) {
-            it = cache.erase(it);
-            lru_list.erase(node_it);
-            ++evicted;
-        } else {
-            ++it;
-        }
-    }
-
-    // 如果还是满了，淘汰 LRU（最后面的）
-    while (cache.size() >= max_entries && !lru_list.empty()) {
-        auto node_it = std::prev(lru_list.end());
-        cache.erase(node_it->Key());
-        lru_list.erase(node_it);
-        ++evicted;
-    }
-
-    return evicted;
+    return DnsCacheStats{
+        .hits = hits_,
+        .misses = misses_,
+        .entries = entries_.size(),
+        .capacity = capacity_,
+        .expired = expired_,
+    };
 }
 
 }  // namespace acpp::app::dns

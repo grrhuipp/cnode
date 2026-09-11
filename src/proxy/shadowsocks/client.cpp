@@ -198,7 +198,7 @@ private:
                 chunk_size +
                 SsAeadCipher::kTagSize;
             out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(out.release());
+            out_mb.push_back(std::move(out));
 
             data += chunk_size;
             remaining -= chunk_size;
@@ -212,6 +212,9 @@ private:
 
 class ResponseBodyReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
+
     ResponseBodyReader(SsAeadCipher read_cipher,
                        uint64_t read_nonce,
                        AsyncStream& stream,
@@ -526,7 +529,7 @@ WriteTCPRequest2022(const TargetAddress& target,
 
     buf::MultiBuffer handshake_mb;
     handshake_mb.reserve(1);
-    handshake_mb.push_back(handshake.release());
+    handshake_mb.push_back(std::move(handshake));
     try {
         co_await stream.WriteMultiBuffer(std::move(handshake_mb));
     } catch (const IoSystemError& e) {
@@ -610,7 +613,7 @@ WriteTCPRequest(const TargetAddress& target,
 
         buf::MultiBuffer handshake_mb;
         handshake_mb.reserve(1);
-        handshake_mb.push_back(out.release());
+        handshake_mb.push_back(std::move(out));
 
         try {
             co_await stream.WriteMultiBuffer(std::move(handshake_mb));
@@ -717,7 +720,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
                     }
                     payload_plain->Produce(payload_len);
-                    pending.push_back(payload_plain.release());
+                    pending.push_back(std::move(payload_plain));
                 } else {
                     memory::ByteVector payload_cipher(payload_cipher_len);
                     if (!co_await ReadFull(stream, payload_cipher.data(), payload_cipher.size())) {

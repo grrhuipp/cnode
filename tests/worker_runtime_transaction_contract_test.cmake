@@ -31,14 +31,10 @@ string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
     "TimeoutScheduler::ForIoContext(*ctx.io_contexts[i])" SCHEDULER_START_POS)
 string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
     "ctx.io_contexts[i]->run()" WORKER_RUN_POS)
-string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
-    "TimeoutScheduler::ReleaseForIoContext(*ctx.io_contexts[i])" SCHEDULER_RELEASE_POS)
 if(SCHEDULER_START_POS EQUAL -1 OR WORKER_RUN_POS EQUAL -1 OR
-   SCHEDULER_RELEASE_POS EQUAL -1 OR
-   NOT SCHEDULER_START_POS LESS WORKER_RUN_POS OR
-   NOT WORKER_RUN_POS LESS SCHEDULER_RELEASE_POS)
+   NOT SCHEDULER_START_POS LESS WORKER_RUN_POS)
     message(FATAL_ERROR
-        "Worker scheduler must start and release inside the owning Worker thread")
+        "Worker scheduler must start inside the owning Worker thread before running its event loop")
 endif()
 
 string(FIND "${BOOTSTRAP_INBOUNDS_SOURCE}"

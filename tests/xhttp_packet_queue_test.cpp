@@ -15,7 +15,7 @@ acpp::buf::MultiBuffer MakePayload(uint8_t value, size_t size = 1) {
         const size_t chunk = std::min<size_t>(size, acpp::buf::Buffer::kSize);
         std::fill_n(buffer->data, chunk, value);
         buffer->Produce(static_cast<uint32_t>(chunk));
-        payload.push_back(buffer.release());
+        payload.push_back(std::move(buffer));
         size -= chunk;
     }
     return payload;

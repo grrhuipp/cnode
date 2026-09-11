@@ -2,6 +2,7 @@
 
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/network.hpp"
 
 #include <charconv>
@@ -130,10 +131,8 @@ private:
     void DetermineType() {
         type = AddressType::Invalid;
         resolved_addr.reset();
-        IoErrorCode ec;
-        auto addr = net::ip::make_address(std::string_view(host.data(), host.size()), ec);
-        if (!ec) {
-            addr = iputil::NormalizeAddress(addr);
+        if (auto literal = iputil::ParseLiteral(host)) {
+            const auto addr = iputil::NormalizeAddress(*literal);
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
                 resolved_addr = addr;
@@ -192,6 +191,10 @@ inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) 
     }
 
     TargetAddress target(host, port);
+    if (addr.front() == '[') {
+        const auto literal = iputil::ParseLiteral(host);
+        if (!literal || !literal->is_v6()) return std::nullopt;
+    }
     if (!target.IsValid()) {
         return std::nullopt;
     }

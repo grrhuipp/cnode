@@ -1,8 +1,10 @@
 #include "cache_internal.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "global_cache.hpp"
+#include "inflight_resolves.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
-#include <asio/experimental/channel.hpp>
 #include <asio/ip/udp.hpp>
 
 #include <algorithm>
@@ -38,20 +40,10 @@ DnsResult MakeCachedResult(const DnsCacheEntry& entry) {
         result.error_msg = "NXDOMAIN (cached)";
     } else {
         result.addresses.assign(entry.addresses.begin(), entry.addresses.end());
-        result.ttl = entry.ttl;
     }
+    result.ttl = entry.ttl;
     result.from_cache = true;
     return result;
-}
-
-void StoreResult(DnsCache& cache,
-                 std::string_view domain,
-                 const DnsResult& result) {
-    if (result.Ok()) {
-        cache.Put(domain, result.addresses, result.ttl);
-    } else if (result.error == ErrorCode::DNS_NO_RECORD) {
-        cache.PutNegative(domain, 60);
-    }
 }
 
 void AppendUniqueAddresses(
@@ -67,66 +59,6 @@ void AppendUniqueAddresses(
 }  // namespace
 
 struct DNS::Impl {
-    struct ResolveKey {
-        memory::ThreadLocalString domain;
-
-        bool operator==(const ResolveKey& other) const noexcept {
-            return domain == other.domain;
-        }
-    };
-
-    struct ResolveKeyHash {
-        using is_transparent = void;
-
-        size_t operator()(const ResolveKey& key) const noexcept {
-            return (*this)(std::string_view(key.domain));
-        }
-
-        size_t operator()(std::string_view domain) const noexcept {
-            return std::hash<std::string_view>{}(domain);
-        }
-    };
-
-    struct ResolveKeyEq {
-        using is_transparent = void;
-
-        bool operator()(const ResolveKey& lhs, const ResolveKey& rhs) const noexcept {
-            return lhs.domain == rhs.domain;
-        }
-
-        bool operator()(const ResolveKey& lhs, std::string_view rhs) const noexcept {
-            return lhs.domain == rhs;
-        }
-
-        bool operator()(std::string_view lhs, const ResolveKey& rhs) const noexcept {
-            return lhs == rhs.domain;
-        }
-    };
-
-    struct ResolveWaiter {
-        explicit ResolveWaiter(net::io_context& io_context)
-            : signal(io_context, 1) {}
-
-        void Notify() noexcept {
-            (void)signal.try_send(IoErrorCode{});
-        }
-
-        net::experimental::channel<void(IoErrorCode)> signal;
-        DnsResult result;
-        bool completed = false;
-    };
-
-    struct InflightResolve {
-        DnsResult result;
-        bool completed = false;
-        memory::ThreadLocalVector<ResolveWaiter*> waiters;
-    };
-
-    struct InflightDeleter {
-        void operator()(InflightResolve* inflight) const noexcept;
-    };
-    using InflightPtr = std::unique_ptr<InflightResolve, InflightDeleter>;
-
     struct ParsedResponse : ResultStatus {
         std::vector<net::ip::address> addresses;
         uint32_t ttl = 60;
@@ -142,6 +74,7 @@ struct DNS::Impl {
     net::awaitable<DnsResult> Resolve(std::string_view domain);
     DnsCacheStats GetCacheStats() const;
 
+    net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
     net::awaitable<DnsResult> QueryServer(
         const net::ip::udp::endpoint& server,
@@ -157,52 +90,44 @@ struct DNS::Impl {
         uint32_t& out_ttl);
 
     net::io_context& io_context;
-    Config config;
+    const Config config;
     DnsCache cache;
-    memory::ThreadLocalVector<net::ip::udp::endpoint> servers;
-    memory::ThreadLocalUnorderedMap<ResolveKey, InflightPtr, ResolveKeyHash, ResolveKeyEq>
-        inflight_resolves;
+    InflightResolves inflight_resolves;
     uint16_t txid_counter = 1;
 };
 
 DNS::Impl::Impl(net::io_context& io_context, const Config& config)
     : io_context(io_context)
     , config(config)
-    , cache(config.cache_size, config.min_ttl, config.max_ttl) {
+    , cache(config.cache_size, config.min_ttl, config.max_ttl)
+    , inflight_resolves(io_context) {
+    if (config.servers.empty()) {
+        throw std::invalid_argument("DNS requires at least one server endpoint");
+    }
+    for (const auto& server : config.servers) {
+        if (server.port() == 0) throw std::invalid_argument("DNS server port must be positive");
+    }
     GlobalDnsCache::Configure(
         config.global_cache_size,
         config.min_ttl,
         config.max_ttl);
 
-    constexpr net::ip::port_type kDnsPort = 53;
-    if (config.servers.empty()) {
-        throw std::invalid_argument("DNS requires at least one server address");
-    }
-    servers.reserve(config.servers.size());
-    for (const auto& server : config.servers) {
-        servers.emplace_back(server, kDnsPort);
-    }
-
     std::random_device rd;
     txid_counter = static_cast<uint16_t>(rd() & 0xFFFF);
 }
 
-void DNS::Impl::InflightDeleter::operator()(InflightResolve* inflight) const noexcept {
-    if (!inflight) {
-        return;
-    }
-    std::destroy_at(inflight);
-    memory::ThreadLocalAllocator<InflightResolve>{}.deallocate(inflight, 1);
-}
-
 net::awaitable<DnsResult> DNS::Impl::Resolve(
     std::string_view domain) {
-    IoErrorCode ec;
-    auto addr = net::ip::make_address(domain, ec);
-    if (!ec) {
+    if (const auto address = iputil::ParseLiteral(domain)) {
         DnsResult result;
         result.addresses.reserve(1);
-        result.addresses.push_back(addr);
+        result.addresses.push_back(*address);
+        co_return result;
+    }
+    if (!acpp::domain::IsValidDnsHostname(
+            domain, acpp::domain::TrailingDotPolicy::Allow)) {
+        DnsResult result;
+        result.error = ErrorCode::INVALID_ARGUMENT;
         co_return result;
     }
 
@@ -211,53 +136,20 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
     }
 
     if (auto cached = GlobalDnsCache::Lookup(domain)) {
-        StoreResult(cache, domain, *cached);
-        co_return *cached;
+        try {
+            cache.Store(domain, *cached);
+        } catch (const std::bad_alloc&) {
+            // Optional L1 warming must not discard an available L2 answer.
+        }
+        co_return std::move(*cached);
     }
 
-    const std::string_view domain_ref(domain);
-    auto existing = inflight_resolves.find(domain_ref);
-    if (existing != inflight_resolves.end()) {
-        auto* inflight = existing->second.get();
-        if (inflight->completed) {
-            co_return inflight->result;
-        }
+    co_return co_await inflight_resolves.Run(domain, [this, domain] {
+        return ResolveUncached(domain);
+    });
+}
 
-        ResolveWaiter waiter(io_context);
-        inflight->waiters.push_back(&waiter);
-
-        (void)co_await waiter.signal.async_receive(
-            net::as_tuple(net::use_awaitable));
-
-        if (waiter.completed) {
-            co_return waiter.result;
-        }
-
-        auto still_inflight = inflight_resolves.find(domain_ref);
-        if (still_inflight != inflight_resolves.end()) {
-            auto& waiters = still_inflight->second->waiters;
-            std::erase(waiters, &waiter);
-        }
-
-        DnsResult cancelled;
-        cancelled.error = ErrorCode::DNS_RESOLVE_FAILED;
-        cancelled.error_msg = "DNS resolve waiter cancelled";
-        co_return cancelled;
-    }
-
-    memory::ThreadLocalAllocator<InflightResolve> alloc;
-    InflightResolve* raw_inflight = alloc.allocate(1);
-    try {
-        std::construct_at(raw_inflight);
-    } catch (...) {
-        alloc.deallocate(raw_inflight, 1);
-        throw;
-    }
-    InflightPtr inflight(raw_inflight);
-    auto* inflight_ptr = inflight.get();
-    ResolveKey key{memory::ThreadLocalString(domain)};
-    inflight_resolves.emplace(key, std::move(inflight));
-
+net::awaitable<DnsResult> DNS::Impl::ResolveUncached(std::string_view domain) {
     DnsResult result;
     try {
         result = co_await DoResolve(domain);
@@ -269,23 +161,15 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
         result.error_msg = "DNS resolve exception";
     }
 
-    StoreResult(cache, domain, result);
-    GlobalDnsCache::PublishResult(domain, result);
-
-    inflight_ptr->completed = true;
-    inflight_ptr->result = result;
-    auto waiters = std::move(inflight_ptr->waiters);
-    if (auto done = inflight_resolves.find(domain_ref); done != inflight_resolves.end()) {
-        inflight_resolves.erase(done);
+    try {
+        cache.Store(domain, result);
+    } catch (const std::bad_alloc&) {
+        // Cache storage is optional; resolution completion is not.
     }
-
-    for (auto* waiter : waiters) {
-        if (!waiter) {
-            continue;
-        }
-        waiter->result = result;
-        waiter->completed = true;
-        waiter->Notify();
+    try {
+        GlobalDnsCache::PublishResult(domain, result);
+    } catch (const std::bad_alloc&) {
+        // A failed snapshot allocation must not strand inflight subscribers.
     }
 
     co_return result;
@@ -297,7 +181,7 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
     last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
     last_result.error_msg = "DNS server unavailable";
 
-    for (const auto& server : servers) {
+    for (const auto& server : config.servers) {
         DnsResult a_result;
         a_result.error = ErrorCode::DNS_RESOLVE_FAILED;
         a_result.error_msg = "DNS A query failed";

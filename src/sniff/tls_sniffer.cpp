@@ -1,4 +1,5 @@
 #include "acppnode/sniff/sniffer.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/constants.hpp"
@@ -115,7 +116,7 @@ std::optional<std::string_view> TlsSniffer::ExtractSNI(
             if (!parsed ||
                 !domain::IsValidDnsHostname(
                     *parsed, domain::TrailingDotPolicy::Forbid) ||
-                domain::IsIpv4AddressLiteral(*parsed)) {
+                iputil::ParseLiteral(*parsed)) {
                 return std::nullopt;
             }
             server_name = *parsed;

@@ -137,7 +137,7 @@ private:
         }
 
         plain->Produce(static_cast<uint32_t>(produced));
-        decoded.push_back(plain.release());
+        decoded.push_back(std::move(plain));
         offset += chunk;
     }
 

@@ -180,7 +180,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     if (*opened > 0) {
         if (plain_buffer) {
             plain_buffer->Produce(static_cast<uint32_t>(*opened));
-            out.push_back(plain_buffer.release());
+            out.push_back(std::move(plain_buffer));
         } else if (!buf::AppendSpanToMultiBuffer(
                        plain.first(*opened),
                        out)) {

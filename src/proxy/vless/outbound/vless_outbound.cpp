@@ -1,4 +1,6 @@
 #include "vless_outbound.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "../vless_codec.hpp"
 #include "../vless_encryption.hpp"
@@ -22,7 +24,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
-#include "../validator.hpp"
+#include "../credentials.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
@@ -46,57 +48,6 @@ using ::acpp::vless::VlessBufferedReader;
 using ::acpp::vless::WriteVlessBytes;
 
 constexpr size_t kUdpFrameQueueShrinkItems = 64;
-
-net::awaitable<bool> WriteVlessTcpInitial(
-    transport::MultiBufferWriter& writer,
-    std::span<const uint8_t> header,
-    buf::MultiBuffer& first_payload,
-    std::span<const uint8_t> initial_payload) {
-    std::array<net::const_buffer, 2 + buf::MultiBuffer::kInlineCapacity> stack_buffers{};
-    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-    const bool use_spill = first_payload.size() > buf::MultiBuffer::kInlineCapacity;
-    if (use_spill) {
-        spill_buffers.reserve(2 + first_payload.size());
-    }
-    size_t stack_count = 0;
-
-    auto append = [&](net::const_buffer buffer) {
-        if (buffer.size() == 0) {
-            return;
-        }
-        if (use_spill) {
-            spill_buffers.push_back(buffer);
-            return;
-        }
-        stack_buffers[stack_count++] = buffer;
-    };
-
-    append(net::const_buffer(header.data(), header.size()));
-    for (const buf::Buffer* buffer : first_payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        append(net::const_buffer(bytes.data(), bytes.size()));
-    }
-    if (!initial_payload.empty()) {
-        append(net::const_buffer(initial_payload.data(), initial_payload.size()));
-    }
-
-    const auto buffers = use_spill
-        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
-        : std::span<const net::const_buffer>(stack_buffers.data(), stack_count);
-    if (buffers.empty()) {
-        co_return true;
-    }
-
-    try {
-        co_await writer.WriteBuffers(buffers);
-    } catch (...) {
-        co_return false;
-    }
-    co_return true;
-}
 
 class VlessOutboundEndpoint final
     : public transport::MultiBufferReader
@@ -238,6 +189,11 @@ public:
 
     void Cancel() noexcept {
         control_.Cancel();
+    }
+
+    transport::CancellationSource& Cancellation() noexcept override { return control_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override {
+        return is_udp_ ? transport::EofAction::WaitForPeer : reader_.ReadEofAction();
     }
 
     void SetAbortiveClose(bool enable = true) noexcept {
@@ -533,6 +489,8 @@ public:
         control_.Cancel();
     }
 
+    transport::CancellationSource& Cancellation() noexcept override { return control_.Cancellation(); }
+
     void SetAbortiveClose(bool enable = true) noexcept {
         control_.SetAbortiveClose(enable);
     }
@@ -611,53 +569,10 @@ proxy::vless::outbound::Handler::Handler(std::string tag,
                                           ::acpp::app::dns::DNS& dns_service)
     : tag_(std::move(tag))
     , config_(config)
-    , dns_service_(dns_service) {
-    config_.literal_address = ParseLiteralAddress(config_.address);
-    config_.flow = ::acpp::vless::NormalizeFlow(config_.flow);
-    if (auto uuid_bytes = ::acpp::vless::ParseUuidBytes(config_.uuid)) {
-        config_.uuid_bytes = *uuid_bytes;
-        const bool flow_ok =
-            config_.flow.empty() || ::acpp::vless::IsVisionFlow(config_.flow);
-        bool encryption_ok = true;
-        if (!::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
-            auto parsed = ::acpp::vless::ParseVlessClientEncryption(
-                config_.encryption);
-            if (parsed) {
-                encryption_ =
-                    std::make_shared<::acpp::vless::VlessEncryptionConfig>(
-                        std::move(*parsed.config));
-                encryption_tickets_ = std::make_unique<
-                    ::acpp::vless::VlessEncryptionClientTicketCache>();
-            } else {
-                encryption_ok = false;
-                LOG_ERROR("VLESS outbound '{}': invalid encryption '{}': {}",
-                          tag_,
-                          config_.encryption,
-                          ::acpp::vless::VlessEncryptionParseErrorMessage(
-                              parsed.error));
-            }
-        }
-        config_valid_ = flow_ok && encryption_ok;
-    }
-    if (!config_valid_) {
-        if (::acpp::vless::IsNoVlessEncryption(config_.encryption)) {
-            LOG_ERROR("VLESS outbound '{}': invalid UUID or unsupported flow '{}'",
-                      tag_, config_.flow);
-        } else {
-            LOG_ERROR("VLESS outbound '{}': invalid UUID, unsupported flow '{}', or invalid encryption",
-                      tag_, config_.flow);
-        }
-    }
-
-    NormalizeOutboundStreamSettings(
-        config_.stream_settings,
-        OutboundStreamDefaults{
-            .require_tls = false,
-            .fallback_server_name = config_.address,
-            .allow_insecure = false,
-            .alpn = {},
-        });
-}
+    , dns_service_(dns_service)
+    , encryption_tickets_(config_.encryption
+          ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>()
+          : nullptr) {}
 
 proxy::vless::outbound::Handler::~Handler() = default;
 
@@ -670,14 +585,13 @@ proxy::vless::outbound::Handler::Process(
     transport::Link inbound,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    std::span<const uint8_t> initial_payload,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!config_valid_) {
+    if (!config_.flow.empty() && ctx.content.network != Network::TCP) {
         co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
@@ -731,18 +645,7 @@ proxy::vless::outbound::Handler::Process(
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     const bool is_udp = ctx.content.network == Network::UDP;
-    const bool use_vision =
-        !is_udp &&
-        ctx.content.network == Network::TCP &&
-        ::acpp::vless::IsVisionFlow(config_.flow);
-    if (!config_.flow.empty() && !use_vision) {
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-    if (use_vision &&
-        (!config_.stream_settings.IsTlsLike() ||
-         config_.stream_settings.network_mode != NetworkMode::Tcp)) {
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
+    const bool use_vision = !config_.flow.empty();
     const bool use_xudp = is_udp && config_.packet_xudp;
     const bool use_packet_addr = is_udp && config_.packet_addr;
     TargetAddress request_target = use_packet_addr
@@ -770,13 +673,13 @@ proxy::vless::outbound::Handler::Process(
     std::optional<::acpp::vless::VlessEncryptionWriter> encrypted_writer;
     std::optional<VlessBufferedReader> encrypted_plain_reader;
 
-    if (encryption_) {
+    if (config_.encryption) {
         try {
             auto runtime =
                 co_await ::acpp::vless::RunVlessEncryptionClientHandshake(
                     protocol_reader,
                     *protocol_writer,
-                    *encryption_,
+                    *config_.encryption,
                     encryption_tickets_.get());
             if (!runtime) {
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -813,43 +716,12 @@ proxy::vless::outbound::Handler::Process(
         }
     }
 
-    bool prewrote_tcp_payload = false;
-    uint64_t prewritten_bytes = 0;
-    const size_t first_payload_size = buf::TotalLen(first_payload);
-    const size_t initial_payload_size = initial_payload.size();
-    const bool can_batch_tcp_initial =
-        !is_udp &&
-        !use_vision &&
-        !encryption_ &&
-        (first_payload_size > 0 || initial_payload_size > 0);
-    if (can_batch_tcp_initial) {
-        const bool ok = co_await WriteVlessTcpInitial(
-            *active_writer,
-            std::span<const uint8_t>(header.data(), header_len),
-            first_payload,
-            initial_payload);
-        if (!ok) {
-            co_return fail_abortive(outbound_protocol_deadline.Expired()
-                ? ErrorCode::TIMEOUT
-                : ErrorCode::SOCKET_WRITE_FAILED);
-        }
-        first_payload.clear();
-        prewrote_tcp_payload = true;
-        prewritten_bytes = first_payload_size + initial_payload_size;
-        if (prewritten_bytes > 0) {
-            stats.AddBytesOut(prewritten_bytes);
-            ctx.traffic.bytes_up = prewritten_bytes;
-        }
-    } else {
-        try {
-            co_await WriteVlessBytes(
-                *active_writer,
-                std::span<const uint8_t>(header.data(), header_len));
-        } catch (...) {
-            co_return fail_abortive(outbound_protocol_deadline.Expired()
-                ? ErrorCode::TIMEOUT
-                : ErrorCode::SOCKET_WRITE_FAILED);
-        }
+    try {
+        co_await WriteVlessBytes(*active_writer,
+            std::span<const uint8_t>(header.data(), header_len));
+    } catch (...) {
+        co_return fail_abortive(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     stream->SetIdleTimeout(relay_idle_timeout);
@@ -863,34 +735,14 @@ proxy::vless::outbound::Handler::Process(
             *active_reader,
             *active_writer,
             target);
-        if (first_payload_size > 0) {
-            if (inbound.control) {
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    target_endpoint, ctx, stats, first_payload, relay_config);
-            }
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, target_endpoint,
-                ctx, stats, first_payload, relay_config);
-        }
-        if (!initial_payload.empty()) {
-            if (inbound.control) {
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    target_endpoint, ctx, stats, initial_payload, relay_config);
-            }
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, target_endpoint,
-                ctx, stats, initial_payload, relay_config);
-        }
         if (inbound.control) {
             co_return co_await DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, relay_config);
+                target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer,
-            target_endpoint, ctx, stats, relay_config);
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
     VlessOutboundEndpoint target_endpoint(
@@ -902,39 +754,14 @@ proxy::vless::outbound::Handler::Process(
         use_packet_addr,
         use_vision,
         config_.uuid_bytes);
-    if (buf::HasData(first_payload)) {
-        if (inbound.control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, first_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, first_payload, relay_config);
-    }
-    if (!prewrote_tcp_payload && !initial_payload.empty()) {
-        if (inbound.control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, initial_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, initial_payload, relay_config);
-    }
-    RelayResult result;
     if (inbound.control) {
-        result = co_await DoRelayLink(
+        co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer, *inbound.control,
-            target_endpoint, ctx, stats, relay_config);
-    } else {
-        result = co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
-            target_endpoint, ctx, stats, relay_config);
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
-    result.bytes_up += prewritten_bytes;
-    ctx.traffic.bytes_up = result.bytes_up;
-    co_return result;
+    co_return co_await DoRelayLink(
+        io_context, *inbound.reader, *inbound.writer,
+        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
 }  // namespace acpp
@@ -973,6 +800,8 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::VlessOutboundConfig vless_config;
+        std::string uuid;
+        std::string encryption;
 
         const auto& s = cfg.settings;
         std::string packet_encoding;
@@ -993,19 +822,19 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     users_p && users_p->is_array() && !users_p->as_array().empty() &&
                     users_p->as_array()[0].is_object()) {
                 const auto& user = users_p->as_array()[0].as_object();
-                vless_config.uuid = json_string(user, "id");
-                if (vless_config.uuid.empty()) {
-                    vless_config.uuid = json_string(user, "uuid");
+                uuid = json_string(user, "id");
+                if (uuid.empty()) {
+                    uuid = json_string(user, "uuid");
                 }
-                vless_config.encryption = json_string(user, "encryption");
+                encryption = json_string(user, "encryption");
                 vless_config.flow = json_string(user, "flow");
                 const std::string user_packet_encoding = json_packet_encoding(user);
                 if (!user_packet_encoding.empty()) {
                     packet_encoding = user_packet_encoding;
                 }
             }
-            if (vless_config.encryption.empty()) {
-                vless_config.encryption = json_string(s, "encryption");
+            if (encryption.empty()) {
+                encryption = json_string(s, "encryption");
             }
         } else {
             vless_config.address = json_string(s, "server");
@@ -1020,11 +849,11 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (port.Valid()) {
                 vless_config.port = port.value;
             }
-            vless_config.uuid = json_string(s, "uuid");
-            if (vless_config.uuid.empty()) {
-                vless_config.uuid = json_string(s, "id");
+            uuid = json_string(s, "uuid");
+            if (uuid.empty()) {
+                uuid = json_string(s, "id");
             }
-            vless_config.encryption = json_string(s, "encryption");
+            encryption = json_string(s, "encryption");
             vless_config.flow = json_string(s, "flow");
             packet_encoding = json_packet_encoding(s);
         }
@@ -1032,17 +861,19 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             packet_encoding = json_packet_encoding(s);
         }
 
-        if (!acpp::vless::IsNoVlessEncryption(vless_config.encryption)) {
+        if (!acpp::vless::IsNoVlessEncryption(encryption)) {
             auto parsed = acpp::vless::ParseVlessClientEncryption(
-                vless_config.encryption);
+                encryption);
             if (!parsed) {
                 LOG_WARN("VLESS outbound '{}': invalid encryption '{}': {}",
                          cfg.tag,
-                         vless_config.encryption,
+                         encryption,
                          acpp::vless::VlessEncryptionParseErrorMessage(
                              parsed.error));
                 return std::nullopt;
             }
+            vless_config.encryption = std::make_shared<const acpp::vless::VlessEncryptionConfig>(
+                std::move(*parsed.config));
         }
 
         packet_encoding = lower_ascii(std::move(packet_encoding));
@@ -1071,10 +902,9 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        vless_config.stream_settings = cfg.stream_settings;
         vless_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        acpp::NormalizeOutboundStreamSettings(
-            vless_config.stream_settings,
+        vless_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
+            cfg.stream_settings,
             acpp::OutboundStreamDefaults{
                 .require_tls = false,
                 .fallback_server_name = vless_config.address,
@@ -1082,10 +912,21 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .alpn = {},
             });
 
-        if (vless_config.address.empty() ||
-            vless_config.uuid.empty() ||
-            vless_config.port == 0 ||
-            !acpp::vless::ParseUuidBytes(vless_config.uuid)) {
+        const auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
+        if (vless_config.address.empty() || vless_config.port == 0 || !uuid_bytes) {
+            return std::nullopt;
+        }
+        vless_config.uuid_bytes = *uuid_bytes;
+        vless_config.literal_address = acpp::iputil::ParseLiteral(vless_config.address);
+        if (!vless_config.literal_address && !acpp::domain::IsValidDnsHostname(
+                vless_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
+            LOG_ERROR("vless outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
+            return std::nullopt;
+        }
+        if (!vless_config.flow.empty() &&
+            (!vless_config.stream_settings.IsTlsLike() ||
+             vless_config.stream_settings.network_mode != acpp::NetworkMode::Tcp)) {
+            LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS or Reality", cfg.tag);
             return std::nullopt;
         }
 

@@ -1,4 +1,5 @@
 #include "vless_inbound.hpp"
+#include "../credentials.hpp"
 #include "../../mux/inbound/mux_inbound.hpp"
 
 #include "../vless_codec.hpp"
@@ -74,10 +75,13 @@ private:
 
 class VlessPendingReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+
     VlessPendingReader(transport::MultiBufferReader& src,
                        std::span<const uint8_t> first_packet)
         : src_(src) {
-        (void)buf::AppendSpanToMultiBuffer(first_packet, pending_);
+        if (!buf::AppendSpanToMultiBuffer(first_packet, pending_)) throw std::bad_alloc();
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -95,6 +99,8 @@ private:
 
 class VlessUdpReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+
     VlessUdpReader(transport::MultiBufferReader& src,
                    TargetAddress target,
                    std::span<const uint8_t> first_packet,
@@ -565,7 +571,7 @@ proxy::vless::inbound::Handler::Process(
 
     InitialPayload first_packet;
     if (!leftover.empty()) {
-        first_packet.assign(leftover.begin(), leftover.end());
+        first_packet.assign(leftover);
     }
 
     if (use_vision) {

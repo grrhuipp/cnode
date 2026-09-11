@@ -75,6 +75,21 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
     cfg.APIHost   = jstr(j, "APIHost");
     cfg.Key       = jstr(j, "Key");
 
+    if (const auto* timeout = j.if_contains("RequestTimeout")) {
+        uint64_t seconds = 0;
+        if (timeout->is_int64() && timeout->as_int64() > 0) {
+            seconds = static_cast<uint64_t>(timeout->as_int64());
+        } else if (timeout->is_uint64()) {
+            seconds = timeout->as_uint64();
+        }
+        if (seconds == 0 || seconds > defaults::kMaxPanelRequestTimeout) {
+            throw std::invalid_argument(std::format(
+                "Panel RequestTimeout must be an integer between 1 and {} seconds",
+                defaults::kMaxPanelRequestTimeout));
+        }
+        cfg.RequestTimeout = std::chrono::seconds(static_cast<int64_t>(seconds));
+    }
+
     const auto raw_node_type =
         jstr(j, "NodeType", std::string(constants::panel::kDefaultNodeType));
     cfg.NodeType = naming::NormalizePanelNodeProtocol(raw_node_type);
@@ -119,6 +134,12 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
 }
 
 bool PanelConfig::Validate() const {
+    if (RequestTimeout <= std::chrono::seconds::zero() ||
+        RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
+        LOG_ERROR("Panel {} RequestTimeout must be between 1 and {} seconds",
+                  Name, defaults::kMaxPanelRequestTimeout);
+        return false;
+    }
     if (Name.empty()) {
         LOG_ERROR("Panel name is required");
         return false;

@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
+#include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/ip_utils.hpp"
@@ -230,43 +231,6 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
 
 }  // namespace
 
-std::optional<net::ip::address> ParseLiteralAddress(std::string_view address) {
-    IoErrorCode ec;
-    auto parsed = net::ip::make_address(address, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-    return parsed;
-}
-
-void NormalizeOutboundStreamSettings(
-    StreamSettings& settings,
-    const OutboundStreamDefaults& defaults) {
-    if (settings.network.empty()) {
-        settings.network = std::string(constants::protocol::kTcp);
-    }
-    if (settings.security.empty()) {
-        settings.security = std::string(constants::protocol::kNone);
-    }
-    if (defaults.require_tls) {
-        settings.security = std::string(constants::protocol::kTls);
-    }
-
-    settings.RecomputeModes();
-    if (settings.IsTls()) {
-        if (settings.tls.server_name.empty() && !defaults.fallback_server_name.empty()) {
-            settings.tls.server_name = std::string(defaults.fallback_server_name);
-        }
-        if (defaults.allow_insecure) {
-            settings.tls.allow_insecure = true;
-        }
-        if (settings.tls.alpn.empty() && !defaults.alpn.empty()) {
-            settings.tls.alpn.assign(defaults.alpn.begin(), defaults.alpn.end());
-        }
-    }
-    settings.RecomputeModes();
-}
-
 std::string_view ResolveOutboundTlsServerName(
     const StreamSettings& settings,
     std::string_view fallback_server_name) {
@@ -323,7 +287,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
             options,
             allow_xhttp_download);
     }
-    if (auto literal = ParseLiteralAddress(options.address)) {
+    if (auto literal = iputil::ParseLiteral(options.address)) {
         append_single(*literal);
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),

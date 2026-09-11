@@ -266,6 +266,7 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         if (downlink_) {
             downlink_->Cancel();
         }
@@ -275,6 +276,7 @@ public:
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -288,6 +290,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -478,12 +481,14 @@ public:
     }
 
     void Cancel() noexcept override {
+        NotifyCancellation();
         if (downlink_) {
             downlink_->Cancel();
         }
     }
 
     void Close() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }
@@ -495,6 +500,7 @@ public:
     }
 
     void CloseAbortive() override {
+        NotifyClosed();
         if (closed_) {
             return;
         }

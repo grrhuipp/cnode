@@ -1,36 +1,22 @@
 #include "controller_impl.hpp"
-#include "../../common/awaitable_batch.hpp"
-#include "node_transition.hpp"
+#include "../../common/monitor_loop.hpp"
+#include "node_transaction.hpp"
+#include "node_runtime.hpp"
 #include "panel_schedule.hpp"
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/worker.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <format>
 #include <stdexcept>
 
 namespace acpp {
 
-namespace {
-
-std::string ResolvePanelName(api::API* panel,
-                             const std::map<api::API*, PanelConfig>& panel_configs) {
-    const auto client_info = panel->Describe();
-    auto cfg_it = panel_configs.find(panel);
-    if (cfg_it != panel_configs.end() && !cfg_it->second.Name.empty()) {
-        return cfg_it->second.Name;
-    }
-    return client_info.APIHost;
-}
-
-}  // namespace
-
 Controller::Controller(net::io_context& io_context,
-                       std::vector<std::unique_ptr<Worker>>& workers,
+                       const std::vector<std::unique_ptr<Worker>>& workers,
                        const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
     : impl_(std::make_shared<Impl>(io_context, workers, limiters)) {}
 
@@ -45,154 +31,110 @@ void Controller::Start() {
     impl_->Start();
 }
 
-net::awaitable<void> Controller::Stop() {
-    co_await impl_->Stop();
-}
-
 std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
     return impl_->GetNodeStats();
 }
 
 Controller::Impl::Impl(net::io_context& io_context,
-                       std::vector<std::unique_ptr<Worker>>& workers,
+                       const std::vector<std::unique_ptr<Worker>>& workers,
                        const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
     : io_context_(io_context)
-    , monitor_completion_(io_context)
     , workers_(workers)
     , limiters_(limiters) {}
 
+Controller::Impl::PanelRuntime::PanelRuntime(
+    std::unique_ptr<api::API> api, const PanelConfig& source)
+    : client(std::move(api)), config(source) {
+    if (!client || config.Name.empty() || config.NodeIDs.Values().size() != 1) {
+        throw std::invalid_argument("panel runtime requires a client, a name and one node ID");
+    }
+}
+
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
                                 const PanelConfig& panel_config) {
-    auto* p = panel.get();
-    panels_.push_back(std::move(panel));
-    panel_configs_[p] = panel_config;
-    panel_nodes_.push_back(p);
-    panel_states_[p] = PanelState::Connecting;
+    // Construct the complete entity before publishing it to the owner.
+    panels_.push_back(std::make_unique<PanelRuntime>(std::move(panel), panel_config));
 }
 
 void Controller::Impl::Start() {
-    if (running_) {
-        return;
+    enum class LoopKind { Sync, Status };
+    for (auto& entry : panels_) {
+        auto* panel = entry.get();
+        for (const auto kind : {LoopKind::Sync, LoopKind::Status}) {
+            auto& slot = kind == LoopKind::Sync ? panel->sync_loop : panel->status_loop;
+            if (!slot.expired()) continue;
+            const auto name = std::format("{}/{} {}",
+                panel->config.Name, panel->config.NodeIDs.Front(),
+                kind == LoopKind::Sync ? "sync" : "status");
+            auto self = shared_from_this();
+            auto loop = std::make_shared<monitor_detail::MonitorLoop>(
+                io_context_.get_executor(), name,
+                [self, panel, kind] {
+                    return kind == LoopKind::Sync
+                        ? self->panelSyncLoop(*panel) : self->panelStatusLoop(*panel);
+                },
+                [self, panel, kind](std::string_view loop_name, std::exception_ptr failure) {
+                    if (kind == LoopKind::Sync) {
+                        panel->state = PanelState::Unavailable;
+                    }
+                    if (!failure) {
+                        LOG_WARN("Panel {} monitor: stopped", loop_name);
+                        return;
+                    }
+                    try {
+                        std::rethrow_exception(failure);
+                    } catch (const std::exception& error) {
+                        LOG_ERROR("Panel {} monitor: failed | {}", loop_name, error.what());
+                    } catch (...) {
+                        LOG_ERROR("Panel {} monitor: failed | unknown exception", loop_name);
+                    }
+                });
+            slot = loop;
+            loop->Start();
+        }
     }
-    running_ = true;
-    const uint64_t generation = ++monitor_generation_;
-    monitor_completion_.expires_at(net::steady_timer::time_point::max());
-    monitors_active_ = true;
-    net::co_spawn(
-        io_context_.get_executor(),
-        runPanelMonitorsOwned(shared_from_this(), generation),
-        net::detached);
-}
-
-net::awaitable<void> Controller::Impl::Stop() {
-    running_ = false;
-    ++monitor_generation_;
-    for (const auto& panel : panels_) {
-        panel->CancelPending();
-    }
-    monitor_timers_.CancelAll();
-    if (monitors_active_) {
-        (void)co_await monitor_completion_.async_wait(
-            net::as_tuple(net::use_awaitable));
-    }
-    co_return;
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
     std::vector<NodeStatsInfo> result;
-    result.reserve(committed_nodes_.size());
-    for (const auto& [panel, state] : committed_nodes_) {
-        const auto& cfg = state.config;
-        const auto client_info = panel->Describe();
-        const int node_id = client_info.NodeID;
-        const auto panel_cfg = panel_configs_.find(panel);
-        const std::string panel_name =
-            (panel_cfg != panel_configs_.end() && !panel_cfg->second.Name.empty())
-                ? panel_cfg->second.Name
-                : client_info.APIHost;
+    result.reserve(panels_.size());
+    for (const auto& panel : panels_) {
+        if (!panel->node.committed) continue;
+        const auto& state = *panel->node.committed;
 
         NodeStatsInfo info;
-        info.panel_name  = panel_name;
-        info.node_id     = node_id;
-        info.network     = cfg.TransportProtocol;
-        info.port        = cfg.Port;
-        std::string ukey = naming::BuildPanelNodeStatsKey(info.panel_name, node_id);
-        if (auto it = node_stats_.find(ukey); it != node_stats_.end()) {
-            info.total_users  = it->second.user_count;
-            info.online_users = it->second.online_count;
-            info.bytes_up     = it->second.bytes_up;
-            info.bytes_down   = it->second.bytes_down;
-        }
-        result.push_back(info);
+        info.panel_name  = panel->config.Name;
+        info.node_id     = panel->config.NodeIDs.Front();
+        info.network    = state.config.TransportProtocol;
+        info.port       = state.config.Port;
+        info.total_users  = state.users.size();
+        info.online_users = panel->stats.online_count;
+        info.bytes_up     = panel->stats.bytes_up;
+        info.bytes_down   = panel->stats.bytes_down;
+        result.push_back(std::move(info));
     }
     return result;
 }
 
-net::awaitable<void> Controller::Impl::runPanelMonitors(uint64_t generation) {
-    if (panel_nodes_.empty()) {
-        co_return;
-    }
-
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(panel_nodes_.size());
-    for (api::API* panel : panel_nodes_) {
-        tasks.push_back(panelMonitor(panel, generation));
-    }
-    try {
-        co_await RunAwaitableBatch(
-            io_context_.get_executor(), std::move(tasks));
-    } catch (const std::exception& e) {
-        LOG_ERROR("panel monitors failed: {}", e.what());
-    } catch (...) {
-        LOG_ERROR("panel monitors failed with unknown exception");
-    }
-    co_return;
-}
-
-net::awaitable<void> Controller::Impl::runPanelMonitorsOwned(
-    std::shared_ptr<Impl> self,
-    uint64_t generation) {
-    try {
-        co_await self->runPanelMonitors(generation);
-    } catch (const std::exception& e) {
-        LOG_ERROR("panel monitor owner failed: {}", e.what());
-    } catch (...) {
-        LOG_ERROR("panel monitor owner failed with unknown exception");
-    }
-    self->monitors_active_ = false;
-    IoErrorCode ignored;
-    self->monitor_completion_.cancel(ignored);
-}
-
-net::awaitable<void> Controller::Impl::panelMonitor(
-    api::API* panel,
-    uint64_t generation) {
+net::awaitable<void> Controller::Impl::panelSyncLoop(
+    PanelRuntime& panel) {
     using Clock = std::chrono::steady_clock;
-    const auto client_info = panel->Describe();
-    const std::string panel_name = ResolvePanelName(panel, panel_configs_);
+    const int node_id = panel.config.NodeIDs.Front();
+    const auto& panel_name = panel.config.Name;
     auto next_pull = Clock::now();
     // Match v2node reporting semantics: the first traffic/online snapshot
     // needs one complete push interval to accumulate meaningful activity.
     auto next_push = Clock::time_point::max();
-    auto next_status = next_pull;
     net::steady_timer timer(io_context_);
-    CancelableTimerRegistry::Registration timer_registration(
-        monitor_timers_, timer);
-    LOG_CONSOLE("Panel {}/{} status: connecting | {} | {}",
-                panel_name,
-                client_info.NodeID,
-                client_info.NodeType,
-                client_info.APIHost);
 
     const auto interval = [&](bool pull) {
-        if (const auto state = committed_nodes_.find(panel);
-            state != committed_nodes_.end()) {
+        if (panel.node.committed) {
             return pull
                 ? controller::PanelInterval(
-                      state->second.config.PullInterval,
+                      panel.node.committed->config.PullInterval,
                       defaults::kPanelPullInterval)
                 : controller::PanelInterval(
-                      state->second.config.PushInterval,
+                      panel.node.committed->config.PushInterval,
                       defaults::kPanelPushInterval);
         }
         return std::chrono::seconds(
@@ -200,29 +142,26 @@ net::awaitable<void> Controller::Impl::panelMonitor(
                  : defaults::kPanelPushInterval);
     };
 
-    while (running_ && generation == monitor_generation_) {
+    for (;;) {
         auto now = Clock::now();
         if (now >= next_pull) {
             try {
                 co_await nodeInfoMonitor(panel);
             } catch (const std::exception& e) {
-                panel_states_[panel] = PanelState::Unavailable;
+                panel.state = PanelState::Unavailable;
                 LOG_WARN("Panel {}/{} sync: unavailable | pull | {}",
                          panel_name,
-                         client_info.NodeID,
+                         node_id,
                          e.what());
             } catch (...) {
-                panel_states_[panel] = PanelState::Unavailable;
+                panel.state = PanelState::Unavailable;
                 LOG_WARN("Panel {}/{} sync: unavailable | pull | unknown error",
                          panel_name,
-                         client_info.NodeID);
-            }
-            if (!running_ || generation != monitor_generation_) {
-                break;
+                         node_id);
             }
             now = Clock::now();
             next_pull = now + interval(true);
-            if (committed_nodes_.contains(panel)) {
+            if (panel.node.committed && panel.node.phase == controller::NodeRuntimePhase::Ready) {
                 const auto scheduled_push = now + interval(false);
                 if (next_push == Clock::time_point::max()) {
                     next_push = scheduled_push;
@@ -235,82 +174,75 @@ net::awaitable<void> Controller::Impl::panelMonitor(
         }
 
         now = Clock::now();
-        if (running_ && generation == monitor_generation_ && now >= next_push) {
-            if (const auto state = committed_nodes_.find(panel);
-                state != committed_nodes_.end()) {
-                const auto& config = state->second.config;
-                const std::string protocol =
-                    naming::ResolveProtocolOrDefault(config.NodeType);
-                const std::string tag = naming::BuildPanelNodeTag(
-                    panel_name,
-                    protocol,
-                    config.Port);
+        if (now >= next_push) {
+            if (panel.node.committed && panel.node.phase == controller::NodeRuntimePhase::Ready) {
+                const std::string& tag = panel.node.committed->tag;
                 try {
                     co_await userInfoMonitor(panel, tag);
                 } catch (const std::exception& e) {
                     LOG_WARN("Panel {}/{} report: unavailable | {}",
                              panel_name,
-                             client_info.NodeID,
+                             node_id,
                              e.what());
                 } catch (...) {
                     LOG_WARN("Panel {}/{} report: unavailable | unknown error",
                              panel_name,
-                             client_info.NodeID);
+                             node_id);
                 }
             }
             next_push = Clock::now() + interval(false);
         }
 
-        now = Clock::now();
-        if (running_ && generation == monitor_generation_ && now >= next_status) {
-            logPanelStatus(panel);
-            next_status = now + std::chrono::seconds(
-                defaults::kPanelStatusLogInterval);
-        }
-
-        if (!running_ || generation != monitor_generation_) {
-            break;
-        }
-        timer.expires_at(std::min({next_pull, next_push, next_status}));
-        (void)co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+        timer.expires_at(std::min(next_pull, next_push));
+        co_await timer.async_wait(net::use_awaitable);
     }
-    co_return;
 }
 
-net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
-    const auto client_info = panel->Describe();
-    const int node_id = client_info.NodeID;
-    const std::string panel_name = ResolvePanelName(panel, panel_configs_);
-    std::string stats_key = naming::BuildPanelNodeStatsKey(panel_name, node_id);
+net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel) const {
+    using Clock = std::chrono::steady_clock;
+    constexpr auto interval = std::chrono::seconds(defaults::kPanelStatusLogInterval);
+    auto next_status = Clock::now();
+    net::steady_timer timer(io_context_);
+    for (;;) {
+        // Read the last committed state on the controller executor. No snapshot
+        // reference crosses the wait, and no network request delays this loop.
+        logPanelStatus(panel);
+        next_status += interval;
+        const auto now = Clock::now();
+        if (next_status <= now) {
+            // Keep the fixed cadence without emitting a burst for missed ticks.
+            next_status += interval * ((now - next_status) / interval + 1);
+        }
+        timer.expires_at(next_status);
+        co_await timer.async_wait(net::use_awaitable);
+    }
+}
+
+net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
+    const int node_id = panel.config.NodeIDs.Front();
+    const auto& panel_name = panel.config.Name;
+
+    controller::NodeRuntime runtime(io_context_, workers_, limiters_, panel.config);
 
     // One pull attempt is made for each scheduler invocation.
     {
         try {
-            auto config_result = co_await panel->GetNodeInfo();
+            // Cleanup depends only on retained local snapshots, so a failing or
+            // unavailable panel cannot indefinitely retain orphan resources.
+            co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
+            auto config_result = co_await panel.client->GetNodeInfo();
             if (config_result.missing) {
-                auto state_it = committed_nodes_.find(panel);
-                const bool removed = state_it != committed_nodes_.end();
-                if (state_it != committed_nodes_.end()) {
-                    std::string old_protocol =
-                        naming::ResolveProtocolOrDefault(state_it->second.config.NodeType);
-                    std::string old_tag = naming::BuildPanelNodeTag(
-                        panel_name, old_protocol, state_it->second.config.Port);
-
-                    co_await removeInbound(old_tag);
-                    co_await removeOutbound(old_tag);
-                    clearUsers(old_tag, old_protocol);
-                    co_await UpdateRule(old_tag, {});
-                    committed_nodes_.erase(state_it);
-                    node_stats_.erase(stats_key);
-
+                const bool removed = panel.node.committed || panel.node.HasPendingCleanup();
+                const auto previous = panel.node.committed;
+                co_await controller::RemoveNode(runtime, panel.node);
+                panel.stats = {};
+                if (removed) {
                     LOG_CONSOLE("Panel {}/{} config: removed | inbound {}",
-                                panel_name, node_id, old_tag);
+                        panel_name, node_id, previous ? previous->tag : "uncommitted");
                 }
-                panel_states_[panel] = PanelState::Missing;
+                panel.state = PanelState::Missing;
                 LOG_CONSOLE("Panel {}/{} sync: missing | {}",
-                            panel_name,
-                            node_id,
-                            removed ? "removed" : "unchanged");
+                    panel_name, node_id, removed ? "removed" : "unchanged");
                 co_return;
             }
 
@@ -323,29 +255,17 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
             const std::string protocol =
                 naming::ResolveProtocolOrDefault(fetched_config.NodeType);
             const std::string tag = naming::BuildPanelNodeTag(
-                panel_name, protocol, fetched_config.Port);
+                panel_name, node_id, protocol, fetched_config.Port);
 
-            std::optional<CommittedNodeState> old_state;
-            if (const auto committed = committed_nodes_.find(panel);
-                committed != committed_nodes_.end()) {
-                old_state = committed->second;
-            }
+            const auto old_state = panel.node.committed;
             const api::NodeInfo* old_config =
                 old_state ? &old_state->config : nullptr;
-            const bool old_started = old_state && old_state->inbound_started;
+            const bool old_started = panel.node.phase == controller::NodeRuntimePhase::Ready;
             const auto transition = controller::PlanNodeTransition(
                 old_config,
                 old_started,
                 fetched_config);
             const bool transitioning = transition.Transitioning();
-
-            std::string old_protocol;
-            std::string old_tag;
-            if (old_config != nullptr) {
-                old_protocol = naming::ResolveProtocolOrDefault(old_config->NodeType);
-                old_tag = naming::BuildPanelNodeTag(
-                    panel_name, old_protocol, old_config->Port);
-            }
 
             if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
                 || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
@@ -354,7 +274,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                             panel_name, node_id);
             }
 
-            auto rules_result = co_await panel->GetNodeRule();
+            auto rules_result = co_await panel.client->GetNodeRule();
             std::optional<std::vector<api::DetectRule>> next_rules;
             if (!rules_result.Ok()) {
                 if (transitioning) {
@@ -378,7 +298,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 next_rules = std::move(rules_result.rules);
             }
 
-            auto users_result = co_await panel->GetUserList();
+            auto users_result = co_await panel.client->GetUserList();
             std::optional<std::vector<api::UserInfo>> next_users;
             if (!users_result.Ok()) {
                 if (transitioning) {
@@ -402,264 +322,74 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(api::API* panel) {
                 next_users = std::move(users_result.users);
             }
 
-            auto [stats_it, stats_inserted] = node_stats_.try_emplace(stats_key);
-            (void)stats_inserted;
-            NodeStats& committed_stats = stats_it->second;
+            if (transitioning && (!next_users || !next_rules)) {
+                throw std::runtime_error("candidate node has no complete user and rule snapshot");
+            }
+            auto candidate = std::make_shared<controller::NodeSnapshot>();
+            candidate->config = fetched_config;
+            candidate->protocol = protocol;
+            candidate->tag = tag;
+            candidate->users = next_users ? std::move(*next_users) : old_state->users;
+            candidate->rules = next_rules ? std::move(*next_rules) : old_state->rules;
 
-            if (!transitioning) {
-                CommittedNodeState next_state = *old_state;
-                next_state.config = fetched_config;
-                std::optional<proxyman::inbound::UserSet> next_user_set;
-                std::optional<proxyman::inbound::UserSet> previous_user_set;
-                if (next_users) {
-                    next_user_set = BuildUsersForInbound(
-                        protocol, tag, fetched_config, *next_users);
-                    previous_user_set = BuildUsersForInbound(
-                        protocol, tag, old_state->config, old_state->users);
-                    if (!next_user_set || !previous_user_set) {
-                        throw std::runtime_error("failed to build panel user snapshot");
-                    }
-                    next_state.users = *next_users;
+            controller::PreparedNodeChange change;
+            change.next = std::move(candidate);
+            change.replace_users = next_users.has_value();
+            change.replace_rules = next_rules.has_value();
+            if (change.replace_users) {
+                auto users = BuildUsersForInbound(protocol, tag, change.next->config, change.next->users);
+                if (!users) throw std::runtime_error("failed to build candidate user snapshot");
+                change.users = std::move(*users);
+            }
+            if (old_state && (transitioning || change.replace_users)) {
+                change.previous_users = BuildUsersForInbound(
+                    old_state->protocol, old_state->tag, old_state->config, old_state->users);
+                if (!change.previous_users) {
+                    throw std::runtime_error("failed to build rollback user snapshot");
                 }
-
-                bool rules_attempted = false;
-                bool users_attempted = false;
-                std::exception_ptr refresh_failure;
-                try {
-                    if (next_rules) {
-                        rules_attempted = true;
-                        co_await UpdateRule(tag, *next_rules);
-                        next_state.rules = *next_rules;
-                    }
-                    if (next_user_set) {
-                        users_attempted = true;
-                        proxyman::inbound::UserStore::ApplyUsers(
-                            tag, *next_user_set);
-                    }
-                    committed_nodes_.insert_or_assign(panel, std::move(next_state));
-                } catch (...) {
-                    refresh_failure = std::current_exception();
+            }
+            // Candidate data and authentication payloads are complete before
+            // entering the transaction's first runtime mutation.
+            // The initial local cleanup finished before this panel pull. With
+            // no pending cleanup, ApplyNodeChange records {old, next} before
+            // its first suspension. Admission and reservation are therefore
+            // one uninterrupted step on the controller executor, covering all
+            // Workers without sharing their live listener state.
+            if (panel.node.HasPendingCleanup()) {
+                throw std::logic_error("node admission requires completed local cleanup");
+            }
+            for (const auto& other : panels_) {
+                if (other.get() != &panel && other->node.ReservesPort(fetched_config.Port) &&
+                    other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
+                    throw std::runtime_error(std::format(
+                        "panel listener endpoint conflict owner={}/{} port={}",
+                        other->config.Name, other->config.NodeIDs.Front(), fetched_config.Port));
                 }
-                if (refresh_failure) {
-                    if (users_attempted) {
-                        try {
-                            proxyman::inbound::UserStore::ApplyUsers(
-                                tag, *previous_user_set);
-                        } catch (...) {
-                            LOG_ERROR("Panel {}/{} sync: rollback incomplete | users",
-                                      panel_name, node_id);
-                        }
-                    }
-                    if (rules_attempted) {
-                        try {
-                            co_await UpdateRule(tag, old_state->rules);
-                        } catch (...) {
-                            LOG_ERROR("Panel {}/{} sync: rollback incomplete | rules",
-                                      panel_name, node_id);
-                        }
-                    }
-                    std::rethrow_exception(refresh_failure);
-                }
-                if (next_users) {
-                    committed_stats.user_count = next_users->size();
-                }
-            } else {
-                if (!next_users || !next_rules) {
-                    throw std::runtime_error(
-                        "candidate node has no complete user and rule snapshot");
-                }
-
-                auto candidate_user_set = BuildUsersForInbound(
-                    protocol, tag, fetched_config, *next_users);
-                if (!candidate_user_set) {
-                    throw std::runtime_error("failed to build candidate user snapshot");
-                }
-
-                std::optional<proxyman::inbound::UserSet> rollback_user_set;
-                if (old_config != nullptr) {
-                    rollback_user_set = BuildUsersForInbound(
-                        old_protocol, old_tag, *old_config, old_state->users);
-                    if (!rollback_user_set) {
-                        throw std::runtime_error(
-                            "failed to build rollback user snapshot");
-                    }
-                }
-
-                bool candidate_users_applied = false;
-                bool candidate_outbound_attempted = false;
-                bool candidate_inbound_attempted = false;
-                bool candidate_rules_attempted = false;
-                bool old_inbound_retirement_attempted = false;
-                bool old_outbound_retirement_attempted = false;
-                bool old_users_cleared = false;
-                bool old_rules_retirement_attempted = false;
-
-                auto rollback = [&]() -> net::awaitable<bool> {
-                    bool restored = true;
-                    if (candidate_inbound_attempted) {
-                        try {
-                            co_await removeInbound(tag);
-                        } catch (...) {
-                            restored = false;
-                        }
-                    }
-                    if (candidate_rules_attempted && old_tag != tag) {
-                        try {
-                            co_await UpdateRule(tag, {});
-                        } catch (...) {
-                            restored = false;
-                        }
-                    }
-                    if (candidate_outbound_attempted && old_tag != tag) {
-                        try {
-                            co_await removeOutbound(tag);
-                        } catch (...) {
-                            restored = false;
-                        }
-                    }
-                    if (candidate_users_applied && old_tag != tag) {
-                        try {
-                            clearUsers(tag, protocol);
-                        } catch (...) {
-                            restored = false;
-                        }
-                    }
-
-                    if (old_config != nullptr) {
-                        if ((old_tag == tag && candidate_users_applied)
-                            || old_users_cleared) {
-                            try {
-                                proxyman::inbound::UserStore::ApplyUsers(
-                                    old_tag, *rollback_user_set);
-                            } catch (...) {
-                                restored = false;
-                            }
-                        }
-                        if ((old_tag == tag && candidate_outbound_attempted)
-                            || old_outbound_retirement_attempted) {
-                            try {
-                                if (!co_await addOutbound(panel, *old_config, old_tag)) {
-                                    restored = false;
-                                }
-                            } catch (...) {
-                                restored = false;
-                            }
-                        }
-                        if ((old_tag == tag && candidate_rules_attempted)
-                            || old_rules_retirement_attempted) {
-                            try {
-                                co_await UpdateRule(old_tag, old_state->rules);
-                            } catch (...) {
-                                restored = false;
-                            }
-                        }
-                        if (old_started
-                            && ((old_tag == tag && candidate_inbound_attempted)
-                                || old_inbound_retirement_attempted)) {
-                            try {
-                                if (!co_await addInbound(panel, *old_config)) {
-                                    restored = false;
-                                }
-                            } catch (...) {
-                                restored = false;
-                            }
-                        }
-                    }
-                    co_return restored;
-                };
-
-                std::exception_ptr transition_failure;
-                try {
-                    if (transition.DestructiveSwap()) {
-                        old_inbound_retirement_attempted = true;
-                        co_await removeInbound(old_tag);
-                    }
-
-                    candidate_users_applied = true;
-                    proxyman::inbound::UserStore::ApplyUsers(tag, *candidate_user_set);
-
-                    candidate_outbound_attempted = true;
-                    if (!co_await addOutbound(panel, fetched_config, tag)) {
-                        throw std::runtime_error("candidate outbound creation failed");
-                    }
-
-                    candidate_inbound_attempted = true;
-                    if (!co_await addInbound(panel, fetched_config)) {
-                        throw std::runtime_error("candidate inbound creation failed");
-                    }
-
-                    if (old_config != nullptr && old_tag != tag) {
-                        if (transition.RetireOldInboundBeforeCommit()) {
-                            old_inbound_retirement_attempted = true;
-                            co_await removeInbound(old_tag);
-                        }
-                        old_outbound_retirement_attempted = true;
-                        co_await removeOutbound(old_tag);
-                        old_users_cleared = true;
-                        clearUsers(old_tag, old_protocol);
-                        old_rules_retirement_attempted = true;
-                        co_await UpdateRule(old_tag, {});
-                    }
-
-                    candidate_rules_attempted = true;
-                    co_await UpdateRule(tag, *next_rules);
-
-                    CommittedNodeState next_state{
-                        .config = fetched_config,
-                        .users = *next_users,
-                        .rules = *next_rules,
-                        .inbound_started = true,
-                    };
-                    committed_nodes_.insert_or_assign(panel, std::move(next_state));
-                    committed_stats.user_count = next_users->size();
-                } catch (...) {
-                    transition_failure = std::current_exception();
-                }
-                if (transition_failure) {
-                    const bool restored = co_await rollback();
-                    if (!restored) {
-                        LOG_ERROR("Panel {}/{} sync: rollback incomplete | transition",
-                                  panel_name, node_id);
-                    }
-                    std::rethrow_exception(transition_failure);
-                }
-
+            }
+            co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
+            if (transitioning) {
                 LOG_CONSOLE("Panel {}/{} config: ready | {} | replaced {}",
-                            panel_name, node_id, tag,
-                            old_config != nullptr ? "yes" : "no");
+                    panel_name, node_id, tag, old_state ? "yes" : "no");
             }
-
-            auto committed = committed_nodes_.find(panel);
-            if (committed == committed_nodes_.end()) {
-                throw std::runtime_error("panel sync completed without committed node state");
-            }
-            panel_states_[panel] = rules_result.Ok() && users_result.Ok()
-                ? PanelState::Ready
-                : PanelState::Degraded;
-
-            co_return;
-
+            panel.state = rules_result.Ok() && users_result.Ok()
+                ? PanelState::Ready : PanelState::Degraded;
         } catch (const std::exception& e) {
-            if (!running_) {
-                co_return;
-            }
-            panel_states_[panel] = PanelState::Unavailable;
+            panel.state = PanelState::Unavailable;
             LOG_ERROR("Panel {}/{} sync: unavailable | pull | {}",
-                      panel_name, node_id, e.what());
+                panel_name, node_id, e.what());
+            if (panel.node.HasPendingCleanup()) {
+                LOG_ERROR("Panel {}/{} sync: recovery required | pending runtime cleanup",
+                    panel_name, node_id);
+            }
         }
     }
 }
 
-void Controller::Impl::logPanelStatus(api::API* panel) const {
-    const auto client_info = panel->Describe();
-    const int node_id = client_info.NodeID;
-    const std::string panel_name = ResolvePanelName(panel, panel_configs_);
-    const auto state_it = panel_states_.find(panel);
-    const PanelState state = state_it != panel_states_.end()
-        ? state_it->second
-        : PanelState::Connecting;
+void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
+    const int node_id = panel.config.NodeIDs.Front();
+    const auto& panel_name = panel.config.Name;
     const std::string_view state_text = [&]() -> std::string_view {
-        switch (state) {
+        switch (panel.state) {
             case PanelState::Connecting: return "connecting";
             case PanelState::Ready: return "ready";
             case PanelState::Degraded: return "degraded";
@@ -668,20 +398,29 @@ void Controller::Impl::logPanelStatus(api::API* panel) const {
         }
         return "unavailable";
     }();
+    const std::string_view runtime_text = [&]() -> std::string_view {
+        switch (panel.node.phase) {
+            case controller::NodeRuntimePhase::Stopped: return "stopped";
+            case controller::NodeRuntimePhase::Ready: return "ready";
+            case controller::NodeRuntimePhase::Updating: return "updating";
+            case controller::NodeRuntimePhase::RecoveryRequired: return "recovery required";
+        }
+        return "recovery required";
+    }();
 
-    const auto committed = committed_nodes_.find(panel);
-    if (committed == committed_nodes_.end()) {
+    if (!panel.node.committed) {
         LOG_CONSOLE(
-            "Panel {}/{} status: {} | inbound stopped | {} | {}",
+            "Panel {}/{} status: {} | inbound {} | {} | {}",
             panel_name,
             node_id,
             state_text,
-            client_info.NodeType,
-            client_info.APIHost);
+            runtime_text,
+            panel.config.NodeType,
+            panel.config.APIHost);
         return;
     }
 
-    const auto& committed_state = committed->second;
+    const auto& committed_state = *panel.node.committed;
     const std::string protocol =
         naming::ResolveProtocolOrDefault(committed_state.config.NodeType);
     const auto pull_interval = controller::PanelInterval(
@@ -696,7 +435,7 @@ void Controller::Impl::logPanelStatus(api::API* panel) const {
         panel_name,
         node_id,
         state_text,
-        committed_state.inbound_started ? "ready" : "stopped",
+        runtime_text,
         protocol,
         committed_state.config.Port,
         committed_state.users.size(),

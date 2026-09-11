@@ -11,14 +11,18 @@
 
 namespace acpp::naming {
 
+inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
+
 [[nodiscard]] inline std::string BuildProtocolPortTag(std::string_view protocol, uint16_t port) {
     return std::format("{}-{}", protocol, port);
 }
 
 [[nodiscard]] inline std::string BuildPanelNodeTag(std::string_view panel_name,
+                                                   int node_id,
                                                    std::string_view protocol,
                                                    uint16_t port) {
-    return std::format("{}-{}-{}", panel_name, protocol, port);
+    return std::format("{}{}/{}/{}/{}", kPanelNodeTagPrefix,
+                       panel_name, node_id, protocol, port);
 }
 
 [[nodiscard]] inline std::string BuildPanelNodeStatsKey(std::string_view panel_name, int node_id) {

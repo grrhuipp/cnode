@@ -12,6 +12,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -296,11 +297,11 @@ public:
 
     MultiBuffer() noexcept = default;
 
-    explicit MultiBuffer(Buffer* buffer) noexcept {
+    explicit MultiBuffer(BufferGuard buffer) noexcept {
         if (buffer) {
-            inline_buffers_[0] = buffer;
-            size_ = 1;
             total_bytes_ = buffer->Len();
+            inline_buffers_[0] = buffer.release();
+            size_ = 1;
         }
     }
 
@@ -348,29 +349,42 @@ public:
     }
 
     void reserve(size_t n) {
-        if (n <= kInlineCapacity) {
+        if (!using_spill_) {
+            if (n > kInlineCapacity) EnsureSpill(n);
             return;
         }
-        EnsureSpill();
+        if (n <= spill_.capacity() - spill_start_) return;
+        if (spill_start_ != 0) {
+            spill_.erase(spill_.begin(), spill_.begin() +
+                static_cast<std::ptrdiff_t>(spill_start_));
+            spill_start_ = 0;
+        }
         spill_.reserve(n);
     }
 
-    void push_back(Buffer* buffer) {
+    // Consumes the guard even on failure. A failed insertion releases that
+    // buffer and leaves the container's data and accounting unchanged.
+    void push_back(BufferGuard buffer) {
         if (!buffer) {
             return;
         }
-        total_bytes_ += buffer->Len();
+        const size_t bytes = buffer->Len();
+        if (bytes > std::numeric_limits<size_t>::max() - total_bytes_)
+            throw std::length_error("MultiBuffer byte size overflow");
         if (!using_spill_ && size_ < kInlineCapacity) {
-            inline_buffers_[size_++] = buffer;
+            inline_buffers_[size_++] = buffer.release();
+            total_bytes_ += bytes;
             return;
         }
         EnsureSpill();
-        spill_.push_back(buffer);
+        spill_.push_back(buffer.get());
+        (void)buffer.release();
+        total_bytes_ += bytes;
     }
 
-    [[nodiscard]] Buffer* pop_front() noexcept {
+    [[nodiscard]] BufferGuard pop_front() noexcept {
         if (empty()) {
-            return nullptr;
+            return {};
         }
 
         if (using_spill_) {
@@ -380,7 +394,7 @@ public:
             }
             spill_[spill_start_++] = nullptr;
             CompactConsumedSpill();
-            return out;
+            return BufferGuard{out};
         }
 
         Buffer* out = inline_buffers_[0];
@@ -391,7 +405,7 @@ public:
             inline_buffers_[i - 1] = inline_buffers_[i];
         }
         inline_buffers_[--size_] = nullptr;
-        return out;
+        return BufferGuard{out};
     }
 
     // 释放并移除最前面的 n 个 Buffer，单次搬移（O(size) 而非 n 次 pop_front 的
@@ -502,63 +516,61 @@ public:
     }
 
     [[nodiscard]] bool MovePrefixTo(MultiBuffer& dst, size_t bytes) {
-        if (std::addressof(dst) == this) {
+        if (std::addressof(dst) == this || bytes > total_bytes_) {
             return false;
         }
+        if (bytes == 0) return true;
 
+        // Prepare the only possible split and all destination pointer slots
+        // before releasing a source slot or changing either buffer's cursors.
         size_t remaining = bytes;
-        size_t drained = 0;
-        for (Buffer*& buffer : *this) {
-            if (remaining == 0) {
-                break;
-            }
-            if (!buffer || buffer->IsEmpty()) {
-                ++drained;
-                continue;
-            }
-
-            const size_t len = buffer->Len();
-            if (len <= remaining) {
-                remaining -= len;
-                dst.push_back(ReleaseSlot(buffer));
-                ++drained;
-                continue;
-            }
-
-            if (Buffer* tail = dst.back();
-                tail && !tail->HasUDP() && remaining <= Buffer::kSize) {
-                if (tail->Available() < remaining && tail->start > 0) {
-                    tail->CompactToFront();
-                }
-                if (tail->Available() >= remaining) {
-                    const auto prefix = buffer->Bytes().first(remaining);
-                    std::memcpy(tail->Tail().data(), prefix.data(), remaining);
-                    tail->Produce(static_cast<uint32_t>(remaining));
-                    dst.RecordTailProduced(remaining);
-                    buffer->Advance(static_cast<uint32_t>(remaining));
-                    total_bytes_ -= std::min(total_bytes_, remaining);
-                    remaining = 0;
-                    break;
-                }
-            }
-
-            BufferGuard out{Buffer::New()};
-            if (!out || out->Available() < remaining) {
-                drop_front(drained);
-                return false;
-            }
-            const auto prefix = buffer->Bytes().first(remaining);
-            std::memcpy(out->Tail().data(), prefix.data(), remaining);
-            out->Produce(static_cast<uint32_t>(remaining));
-            dst.push_back(out.release());
-            buffer->Advance(static_cast<uint32_t>(remaining));
-            total_bytes_ -= std::min(total_bytes_, remaining);
-            remaining = 0;
-            break;
+        size_t whole_buffers = 0;
+        Buffer* tail = dst.back();
+        Buffer* split_source = nullptr;
+        for (Buffer* buffer : *this) {
+            if (!buffer || buffer->IsEmpty()) continue;
+            if (buffer->Len() > remaining) { split_source = buffer; break; }
+            remaining -= buffer->Len();
+            ++whole_buffers;
+            tail = buffer;
+            if (remaining == 0) break;
         }
+        const bool coalesce = split_source && tail && !tail->HasUDP() &&
+            tail->Available() + tail->start >= remaining;
+        BufferGuard split;
+        if (split_source && !coalesce) {
+            split = BufferGuard{Buffer::New()};
+            if (!split) return false;
+            std::memcpy(split->Tail().data(), split_source->Bytes().data(), remaining);
+            split->Produce(static_cast<uint32_t>(remaining));
+        }
+        try { dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes); }
+        catch (const std::bad_alloc&) { return false; }
 
+        size_t drained = 0;
+        size_t transferred = 0;
+        for (Buffer*& buffer : *this) {
+            if (transferred == whole_buffers) break;
+            if (buffer && !buffer->IsEmpty()) {
+                dst.push_back(ReleaseSlot(buffer));
+                ++transferred;
+            }
+            ++drained;
+        }
+        if (split_source) {
+            if (coalesce) {
+                if (tail->Available() < remaining) tail->CompactToFront();
+                std::memcpy(tail->Tail().data(), split_source->Bytes().data(), remaining);
+                tail->Produce(static_cast<uint32_t>(remaining));
+                dst.RecordTailProduced(remaining);
+            } else {
+                dst.push_back(std::move(split));
+            }
+            split_source->Advance(static_cast<uint32_t>(remaining));
+            total_bytes_ -= remaining;
+        }
         drop_front(drained);
-        return remaining == 0;
+        return true;
     }
 
     [[nodiscard]] std::span<const uint8_t> PrefixSpan(size_t len) const noexcept {
@@ -605,7 +617,7 @@ public:
         return copied;
     }
 
-    [[nodiscard]] Buffer* TakeFrontIfLen(size_t len) noexcept {
+    [[nodiscard]] BufferGuard TakeFrontIfLen(size_t len) noexcept {
         while (!empty()) {
             Buffer* buffer = *begin();
             if (!buffer || buffer->IsEmpty()) {
@@ -613,34 +625,11 @@ public:
                 continue;
             }
             if (buffer->Len() != len) {
-                return nullptr;
+                return {};
             }
             return pop_front();
         }
-        return nullptr;
-    }
-
-    Buffer** insert(Buffer** pos, Buffer* buffer) {
-        if (!buffer) {
-            return pos;
-        }
-
-        const size_t index = static_cast<size_t>(pos - begin());
-        total_bytes_ += buffer->Len();
-        if (!using_spill_ && size_ < kInlineCapacity) {
-            for (size_t i = size_; i > index; --i) {
-                inline_buffers_[i] = inline_buffers_[i - 1];
-            }
-            inline_buffers_[index] = buffer;
-            ++size_;
-            return inline_buffers_ + index;
-        }
-
-        EnsureSpill();
-        auto it = spill_.insert(
-            spill_.begin() + static_cast<std::ptrdiff_t>(spill_start_ + index),
-            buffer);
-        return spill_.data() + static_cast<size_t>(it - spill_.begin());
+        return {};
     }
 
     void clear() noexcept {
@@ -661,25 +650,26 @@ public:
         total_bytes_ += bytes;
     }
 
-    [[nodiscard]] Buffer* ReleaseSlot(Buffer*& slot) noexcept {
+    [[nodiscard]] BufferGuard ReleaseSlot(Buffer*& slot) noexcept {
         Buffer* buffer = slot;
         if (!buffer) {
-            return nullptr;
+            return {};
         }
         const size_t len = buffer->Len();
         total_bytes_ = len >= total_bytes_ ? 0 : total_bytes_ - len;
         slot = nullptr;
-        return buffer;
+        return BufferGuard{buffer};
     }
 
     void FreeSlot(Buffer*& slot) noexcept {
-        Buffer::Free(ReleaseSlot(slot));
+        (void)ReleaseSlot(slot);
     }
 
     void MoveTo(MultiBuffer& dst, bool clear_udp = false) {
         if (std::addressof(dst) == this) {
             return;
         }
+        dst.ReserveAdditional(size(), total_bytes_);
         for (Buffer*& buffer : *this) {
             if (!buffer || buffer->IsEmpty()) {
                 FreeSlot(buffer);
@@ -711,6 +701,13 @@ public:
     }
 
 private:
+    void ReserveAdditional(size_t buffers, size_t bytes) {
+        if (buffers > std::numeric_limits<size_t>::max() - size() ||
+            bytes > std::numeric_limits<size_t>::max() - total_bytes_)
+            throw std::length_error("MultiBuffer size overflow");
+        reserve(size() + buffers);
+    }
+
     void ReleaseOwnedBuffers() noexcept {
         if (using_spill_) {
             for (size_t i = spill_start_; i < spill_.size(); ++i) {
@@ -725,11 +722,11 @@ private:
         }
     }
 
-    void EnsureSpill() {
+    void EnsureSpill(size_t capacity = kInlineCapacity * 2) {
         if (using_spill_) {
             return;
         }
-        spill_.reserve(kInlineCapacity * 2);
+        spill_.reserve(std::max(capacity, kInlineCapacity * 2));
         for (size_t i = 0; i < size_; ++i) {
             spill_.push_back(inline_buffers_[i]);
             inline_buffers_[i] = nullptr;
@@ -850,37 +847,40 @@ struct UdpDatagramInfo {
 [[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
                                                   MultiBuffer& out_mb,
                                                   bool coalesce_tail = true) {
-    size_t offset = 0;
+    if (data.empty()) return true;
+    if (data.size() > std::numeric_limits<size_t>::max() - out_mb.byte_size())
+        throw std::length_error("MultiBuffer byte size overflow");
 
-    if (coalesce_tail) {
-        Buffer* tail = out_mb.back();
-        // UDP endpoint marks packet boundaries; only coalesce plain stream buffers.
-        if (tail && !tail->HasUDP() && tail->Available() > 0) {
-            const size_t chunk = std::min(
-                data.size(),
-                static_cast<size_t>(tail->Available()));
-            if (chunk > 0) {
-                std::memcpy(tail->Tail().data(), data.data(), chunk);
-                tail->Produce(static_cast<uint32_t>(chunk));
-                out_mb.RecordTailProduced(chunk);
-                offset += chunk;
-            }
+    Buffer* tail = coalesce_tail ? out_mb.back() : nullptr;
+    const size_t tail_bytes = tail && !tail->HasUDP()
+        ? std::min(data.size(), static_cast<size_t>(tail->Available())) : 0;
+
+    // Build only the new suffix. Existing buffers and tail bytes remain
+    // untouched until every data block and pointer slot is available.
+    MultiBuffer suffix;
+    try {
+        size_t offset = tail_bytes;
+        while (offset < data.size()) {
+            BufferGuard buffer{Buffer::New()};
+            if (!buffer) return false;
+            const size_t chunk = std::min(data.size() - offset,
+                                          static_cast<size_t>(Buffer::kSize));
+            std::memcpy(buffer->Tail().data(), data.data() + offset, chunk);
+            buffer->Produce(static_cast<uint32_t>(chunk));
+            suffix.push_back(std::move(buffer));
+            offset += chunk;
         }
+        out_mb.reserve(out_mb.size() + suffix.size());
+    } catch (const std::bad_alloc&) {
+        return false;
     }
 
-    while (offset < data.size()) {
-        BufferGuard out{Buffer::New()};
-        if (!out) {
-            return false;
-        }
-        const size_t chunk = std::min(
-            data.size() - offset,
-            static_cast<size_t>(out->Available()));
-        std::memcpy(out->Tail().data(), data.data() + offset, chunk);
-        out->Produce(static_cast<uint32_t>(chunk));
-        out_mb.push_back(out.release());
-        offset += chunk;
+    if (tail_bytes != 0) {
+        std::memmove(tail->Tail().data(), data.data(), tail_bytes);
+        tail->Produce(static_cast<uint32_t>(tail_bytes));
+        out_mb.RecordTailProduced(tail_bytes);
     }
+    suffix.MoveTo(out_mb);
     return true;
 }
 

@@ -22,7 +22,7 @@ if(CONFIGURED_POSITION EQUAL -1 OR NOT READY_POSITION EQUAL -1)
 endif()
 
 foreach(REQUIRED_STATUS
-        [=[status: connecting]=]
+        [=[case PanelState::Connecting: return "connecting"]=]
         [=[sync: missing]=]
         [=[sync: unavailable | pull]=]
         [=[case PanelState::Ready: return "ready"]=]

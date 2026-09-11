@@ -292,15 +292,6 @@ inline void CollectBurst() noexcept {
 #endif
 }
 
-inline void MarkThreadPoolThread() noexcept {}
-
-class ThreadScope final {
-public:
-    ThreadScope() noexcept = default;
-    ThreadScope(const ThreadScope&) = delete;
-    ThreadScope& operator=(const ThreadScope&) = delete;
-};
-
 template <class T>
 class ThreadLocalAllocator {
 public:

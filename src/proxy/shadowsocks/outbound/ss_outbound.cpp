@@ -1,4 +1,6 @@
 #include "ss_outbound.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "ss_outbound_uot.hpp"
 #include "../client.hpp"
 #include "../ss_udp.hpp"
@@ -9,6 +11,7 @@
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/udp_session.hpp"
+#include "acppnode/app/udp_channel.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "acppnode/infra/log.hpp"
@@ -16,8 +19,6 @@
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
-
-#include <asio/experimental/channel.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -81,8 +82,7 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        stream_.ShutdownWrite();
-        co_return;
+        co_await stream_.AsyncShutdownWrite();
     }
 
     void SetIdleTimeout(std::chrono::seconds timeout) {
@@ -125,6 +125,9 @@ public:
         stream_.Cancel();
     }
 
+    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return stream_.ReadEofAction(); }
+
     void SetAbortiveClose(bool enable = true) noexcept {
         stream_.SetAbortiveClose(enable);
     }
@@ -143,238 +146,82 @@ class ShadowsocksUdpOutboundEndpoint final
     , public transport::MultiBufferWriter {
 public:
     ShadowsocksUdpOutboundEndpoint(net::io_context& io_context,
-                                   std::shared_ptr<UDPSession> session,
-                                   TargetAddress server,
-                                   const ss::SsCipherInfo& cipher_info,
-                                   const ss::KeyBytes& master_key,
-                                   std::span<const ss::KeyBytes> psk_chain)
-        : io_context_(io_context)
-        , session_(std::move(session))
-        , server_(std::move(server))
-        , cipher_info_(cipher_info)
-        , master_key_(master_key)
-        , psk_chain_(psk_chain)
-        , signal_(io_context, 1)
-        , read_timer_(io_context)
-        , phase_timer_(io_context) {
+                                  std::shared_ptr<UDPSession> session,
+                                  TargetAddress server,
+                                  const ss::SsCipherInfo& cipher_info,
+                                  const ss::KeyBytes& master_key,
+                                  std::span<const ss::KeyBytes> psk_chain)
+        : channel_(io_context, std::move(session)), server_(std::move(server)),
+          cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
         if (ss::Is2022Cipher(cipher_info_)) {
             ss2022_state_.emplace();
             if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_)) {
-                ss2022_state_.reset();
+                throw IoSystemError(io_error::fault, "Shadowsocks 2022 UDP session initialization failed");
             }
         }
-    }
-
-    [[nodiscard]] bool Start() {
-        callback_id_ = session_->RegisterCallback(
-            PacketCallback{[this](UDPPacketView pkt) { OnPacket(pkt); }});
-        return callback_id_ != 0;
-    }
-
-    ~ShadowsocksUdpOutboundEndpoint() noexcept override {
-        Stop();
-    }
-
-    void Stop() noexcept {
-        try {
-            if (callback_id_ != 0) {
-                session_->UnregisterCallback(callback_id_);
-                callback_id_ = 0;
-            }
-        } catch (...) {
-        }
-        Cancel();
-    }
-
-    net::awaitable<void> StopAndDrain() {
-        Stop();
-        co_await net::post(io_context_.get_executor(), net::use_awaitable);
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
-            if (!replies_.empty()) {
-                QueuedReply reply = std::move(replies_.front());
-                queued_bytes_ -= std::min(queued_bytes_, reply.bytes);
-                replies_.pop_front();
-                co_return std::move(reply.payload);
-            }
-            if (closed_) {
-                co_return buf::MultiBuffer{};
-            }
-
-            auto [ec] = co_await signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            (void)ec;
+            auto packet = co_await channel_.ReadMultiBuffer();
+            if (!buf::HasData(packet)) co_return buf::MultiBuffer{};
+            const buf::ContiguousBufferView view(packet);
+            const auto bytes = view.Bytes();
+            auto decoded = ss2022_state_
+                ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
+                : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
+                    cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
+            if (!decoded || !buf::HasData(decoded->payload)) continue;
+            for (auto* buffer : decoded->payload) buffer->SetUDP(decoded->target);
+            co_return std::move(decoded->payload);
         }
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (closed_) {
-            mb.clear();
-            throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
+        const auto datagram = buf::InspectUdpDatagram(payload);
+        if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
+        if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid()) {
+            throw IoSystemError(io_error::invalid_argument, "Shadowsocks UDP requires one datagram target");
         }
-        const auto datagram = buf::InspectUdpDatagram(mb);
-        if (datagram.status == buf::UdpDatagramStatus::Empty) {
-            co_return;
-        }
-        if (!datagram.Valid() || !datagram.target ||
-            !datagram.target->IsValid()) {
-            throw IoSystemError(
-                io_error::invalid_argument,
-                "Shadowsocks UDP datagram contains missing or mixed endpoints");
-        }
-
-        const TargetAddress target = *datagram.target;
-        const buf::ContiguousBufferView payload(mb);
-        const auto bytes = payload.Bytes();
-        const size_t encoded_len = EncodedPacketSize(target, bytes);
+        const buf::ContiguousBufferView view(payload);
+        const auto bytes = view.Bytes();
+        const size_t encoded_len = EncodedPacketSize(*datagram.target, bytes);
         if (encoded_len == 0) {
-            throw IoSystemError(
-                io_error::message_size,
-                "invalid Shadowsocks UDP datagram size or target");
+            throw IoSystemError(io_error::message_size, "invalid Shadowsocks UDP datagram size or target");
         }
-
-        ErrorCode send_result = ErrorCode::OK;
+        buf::MultiBuffer packet;
         if (encoded_len <= buf::Buffer::kSize) {
             buf::BufferGuard encoded{buf::Buffer::New()};
-            if (!encoded) {
-                throw std::bad_alloc();
+            if (!encoded) throw std::bad_alloc();
+            if (EncodePacketTo(*datagram.target, bytes, encoded->Tail().data(), encoded->Available()) != encoded_len) {
+                throw IoSystemError(io_error::fault, "Shadowsocks UDP encoding failed");
             }
-            const size_t written = EncodePacketTo(
-                target, bytes, encoded->Tail().data(), encoded->Available());
-            if (written != encoded_len) {
-                throw IoSystemError(
-                    io_error::fault, "Shadowsocks UDP packet encoding failed");
-            }
-            encoded->Produce(static_cast<uint32_t>(written));
-            send_result = co_await session_->SendTo(
-                server_, encoded->Bytes().data(), encoded->Len(), callback_id_);
+            encoded->Produce(static_cast<uint32_t>(encoded_len));
+            packet.push_back(std::move(encoded));
         } else {
             memory::ByteVector scratch(encoded_len);
-            const size_t written = EncodePacketTo(
-                target, bytes, scratch.data(), scratch.size());
-            if (written != encoded_len) {
-                throw IoSystemError(
-                    io_error::fault, "Shadowsocks UDP packet encoding failed");
+            if (EncodePacketTo(*datagram.target, bytes, scratch.data(), scratch.size()) != encoded_len) {
+                throw IoSystemError(io_error::fault, "Shadowsocks UDP encoding failed");
             }
-            send_result = co_await session_->SendTo(
-                server_, scratch.data(), scratch.size(), callback_id_);
+            if (!buf::AppendSpanToMultiBuffer(scratch, packet)) throw std::bad_alloc();
         }
-        if (send_result != ErrorCode::OK) {
-            throw IoSystemError(
-                io_error::fault, std::string(ErrorCodeToString(send_result)));
-        }
-        mb.clear();
-        co_return;
+        for (auto* buffer : packet) buffer->SetUDP(server_);
+        co_await channel_.WriteMultiBuffer(std::move(packet));
     }
 
-    net::awaitable<void> WriteBuffers(
-        std::span<const net::const_buffer> buffers) override {
-        if (closed_) {
-            throw IoSystemError(io_error::operation_aborted, "Shadowsocks UDP endpoint closed");
-        }
-        for (const auto& buffer : buffers) {
-            if (buffer.size() > 0) {
-                throw IoSystemError(
-                    io_error::invalid_argument,
-                    "Shadowsocks UDP scatter write requires a target");
-            }
-        }
-        co_return;
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        Cancel();
-        co_return;
-    }
-
-    void SetIdleTimeout(std::chrono::seconds) {}
-
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        read_timeout_ = false;
-        IoErrorCode ignored;
-        read_timer_.cancel(ignored);
-        if (timeout.count() <= 0 || closed_) {
-            return;
-        }
-        read_timer_.expires_after(timeout);
-        read_timer_.async_wait([this](const IoErrorCode& ec) {
-            if (!ec && !closed_) {
-                read_timeout_ = true;
-                Cancel();
-            }
-        });
-    }
-
-    void SetWriteTimeout(std::chrono::seconds) {}
-
-    bool ConsumeIdleTimeout() noexcept { return false; }
-
-    bool ConsumeReadTimeout() noexcept {
-        const bool timed_out = read_timeout_;
-        read_timeout_ = false;
-        return timed_out;
-    }
-
-    bool ConsumeWriteTimeout() noexcept { return false; }
-
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        phase_timeout_ = false;
-        ++phase_generation_;
-        IoErrorCode ignored;
-        phase_timer_.cancel(ignored);
-        if (timeout.count() <= 0 || closed_) {
-            phase_timeout_ = true;
-            Cancel();
-            return PhaseDeadlineHandle(
-                &phase_flags_, kPhaseExpired, &phase_generation_, phase_generation_);
-        }
-
-        const uint32_t captured = phase_generation_;
-        phase_timer_.expires_after(timeout);
-        phase_timer_.async_wait([this, captured](const IoErrorCode& ec) {
-            if (!ec && !closed_ && phase_generation_ == captured) {
-                phase_timeout_ = true;
-                phase_flags_ |= kPhaseExpired;
-                Cancel();
-            }
-        });
-        return PhaseDeadlineHandle(
-            &phase_flags_, kPhaseExpired, &phase_generation_, captured);
-    }
-
-    void ClearPhaseDeadline() {
-        ++phase_generation_;
-        phase_flags_ = 0;
-        phase_timeout_ = false;
-        IoErrorCode ignored;
-        phase_timer_.cancel(ignored);
-    }
-
-    bool ConsumePhaseDeadline() noexcept {
-        const bool timed_out = phase_timeout_;
-        phase_timeout_ = false;
-        phase_flags_ = 0;
-        return timed_out;
-    }
-
-    void Cancel() noexcept {
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        IoErrorCode ignored;
-        read_timer_.cancel(ignored);
-        phase_timer_.cancel(ignored);
-        if (!io_context_.stopped()) {
-            (void)signal_.try_send(io_error::operation_aborted);
-        }
-    }
-
-    void SetAbortiveClose(bool = true) noexcept {
-        Cancel();
-    }
+    net::awaitable<void> AsyncShutdownWrite() override { co_await channel_.AsyncShutdownWrite(); }
+    bool ForwardHalfCloseOnPeerEof() const noexcept { return true; }
+    void Cancel() noexcept { channel_.Cancel(); }
+    transport::CancellationSource& Cancellation() noexcept override { return channel_.Cancellation(); }
+    void SetIdleTimeout(std::chrono::seconds timeout) { channel_.SetIdleTimeout(timeout); }
+    void SetReadTimeout(std::chrono::seconds timeout) { channel_.SetReadTimeout(timeout); }
+    void SetWriteTimeout(std::chrono::seconds timeout) { channel_.SetWriteTimeout(timeout); }
+    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) { return channel_.StartPhaseDeadline(timeout); }
+    void ClearPhaseDeadline() { channel_.ClearPhaseDeadline(); }
+    bool ConsumeIdleTimeout() noexcept { return channel_.ConsumeIdleTimeout(); }
+    bool ConsumeReadTimeout() noexcept { return channel_.ConsumeReadTimeout(); }
+    bool ConsumeWriteTimeout() noexcept { return channel_.ConsumeWriteTimeout(); }
+    bool ConsumePhaseDeadline() noexcept { return channel_.ConsumePhaseDeadline(); }
 
 private:
     [[nodiscard]] size_t EncodedPacketSize(
@@ -428,82 +275,13 @@ private:
             output_size);
     }
 
-    void OnPacket(UDPPacketView pkt) {
-        if (closed_) {
-            return;
-        }
-
-        std::optional<ss::SsUdpDecodeResult> decoded;
-        if (ss2022_state_) {
-            decoded = ss::Decode2022UdpResponsePacket(
-                pkt.data.data(), pkt.data.size(), *ss2022_state_);
-        } else {
-            decoded = ss::DecodeUdpPacketWithKey(
-                pkt.data.data(), pkt.data.size(), master_key_.span(),
-                cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
-        }
-        if (!decoded || !buf::HasData(decoded->payload)) {
-            return;
-        }
-
-        const size_t payload_size = buf::TotalLen(decoded->payload);
-        if (queued_bytes_ + payload_size > 512 * 1024) {
-            decoded->payload.clear();
-            return;
-        }
-
-        for (buf::Buffer* buffer : decoded->payload) {
-            if (buffer && !buffer->IsEmpty()) {
-                buffer->SetUDP(decoded->target);
-            }
-        }
-        queued_bytes_ += payload_size;
-        replies_.push_back(QueuedReply{std::move(decoded->payload), payload_size});
-        if (io_context_.stopped()) {
-            return;
-        }
-        (void)signal_.try_send(IoErrorCode{});
-    }
-
-    net::io_context& io_context_;
-    std::shared_ptr<UDPSession> session_;
-    TargetAddress server_;
-    ss::SsCipherInfo cipher_info_;
-    ss::KeyBytes master_key_;
-    std::span<const ss::KeyBytes> psk_chain_;
+    UDPChannel channel_;
+    const TargetAddress server_;
+    const ss::SsCipherInfo cipher_info_;
+    const ss::KeyBytes master_key_;
+    const std::span<const ss::KeyBytes> psk_chain_;
     std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
-    uint64_t callback_id_ = 0;
-    net::experimental::channel<void(IoErrorCode)> signal_;
-    struct QueuedReply {
-        buf::MultiBuffer payload;
-        size_t bytes = 0;
-    };
-    memory::ThreadLocalDeque<QueuedReply> replies_;
-    size_t queued_bytes_ = 0;
-    bool closed_ = false;
-    bool read_timeout_ = false;
-    bool phase_timeout_ = false;
-    static constexpr uint8_t kPhaseExpired = 0x01;
-    uint8_t phase_flags_ = 0;
-    uint32_t phase_generation_ = 0;
-    net::steady_timer read_timer_;
-    net::steady_timer phase_timer_;
 };
-
-std::vector<std::string_view> SplitPasswordChain(std::string_view password) {
-    std::vector<std::string_view> parts;
-    size_t start = 0;
-    while (start <= password.size()) {
-        const size_t pos = password.find(':', start);
-        const size_t end = pos == std::string_view::npos ? password.size() : pos;
-        parts.push_back(password.substr(start, end - start));
-        if (pos == std::string_view::npos) {
-            break;
-        }
-        start = pos + 1;
-    }
-    return parts;
-}
 
 TargetAddress MakeServerTarget(const SsOutboundConfig& config) {
     if (config.literal_address) {
@@ -530,8 +308,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     transport::Link inbound,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    std::span<const uint8_t> initial_payload,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
@@ -545,9 +322,6 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         if (!udp_session_manager_) {
             LOG_CONN_WARN(ctx, "[SsOutbound] UDP session manager not available");
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
-        }
-        if (master_key_.empty()) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
         }
 
         auto server = MakeServerTarget(config_);
@@ -587,33 +361,19 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             io_context,
             std::move(udp_session),
             std::move(server),
-            cipher_info_,
-            master_key_,
-            psk_chain_);
-        if (!target_endpoint.Start()) {
-            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            credentials_.Cipher(),
+            credentials_.MasterKey(),
+            credentials_.PskChain());
+        target_endpoint.SetIdleTimeout(relay_idle_timeout);
+        target_endpoint.SetWriteTimeout(relay_write_timeout);
+        if (inbound.control) {
+            co_return co_await DoRelayLink(
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                target_endpoint, ctx, stats, relay_config);
         }
-
-        RelayResult result;
-        std::exception_ptr relay_error;
-        try {
-            if (inbound.control) {
-                result = co_await DoRelayLink(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    target_endpoint, ctx, stats, relay_config);
-            } else {
-                result = co_await DoRelayLink(
-                    io_context, *inbound.reader, *inbound.writer,
-                    target_endpoint, ctx, stats, relay_config);
-            }
-        } catch (...) {
-            relay_error = std::current_exception();
-        }
-        co_await target_endpoint.StopAndDrain();
-        if (relay_error) {
-            std::rethrow_exception(relay_error);
-        }
-        co_return result;
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer,
+            target_endpoint, ctx, stats, relay_config);
     }
 
     const TargetAddress protocol_target = use_uot
@@ -629,11 +389,11 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         .address = config_.address,
         .literal_address = config_.literal_address,
         .port = config_.port,
-        .stream_settings = &stream_settings_,
+        .stream_settings = &config_.stream_settings,
         .timeout = config_.timeout,
         .send_through = config_.send_through,
         .inbound_local_addr = inbound_local_addr,
-        .tls_server_name = ResolveOutboundTlsServerName(stream_settings_, config_.address),
+        .tls_server_name = ResolveOutboundTlsServerName(config_.stream_settings, config_.address),
         .ws_host = config_.address,
     });
     if (!transport_target) {
@@ -662,7 +422,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     auto request_writer_result = co_await ss::WriteTCPRequest(
-        protocol_target, cipher_info_, master_key_, psk_chain_, *stream);
+        protocol_target, credentials_.Cipher(), credentials_.MasterKey(), credentials_.PskChain(), *stream);
     if (!request_writer_result) {
         stream->Cancel();
         co_return std::unexpected(outbound_protocol_deadline.Expired()
@@ -679,8 +439,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     ShadowsocksOutboundEndpoint target_endpoint(
         std::move(request_writer),
-        cipher_info_,
-        master_key_,
+        credentials_.Cipher(),
+        credentials_.MasterKey(),
         request_session.request_salt,
         *stream);
 
@@ -697,34 +457,14 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     }
 
     auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
-        if (buf::HasData(first_payload)) {
-            if (inbound.control) {
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    endpoint, ctx, stats, first_payload, relay_config);
-            }
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, endpoint,
-                ctx, stats, first_payload, relay_config);
-        }
-        if (!initial_payload.empty()) {
-            if (inbound.control) {
-                co_return co_await DoRelayLinkWithFirstPacket(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                    endpoint, ctx, stats, initial_payload, relay_config);
-            }
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, endpoint,
-                ctx, stats, initial_payload, relay_config);
-        }
         if (inbound.control) {
             co_return co_await DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                endpoint, ctx, stats, relay_config);
+                endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer,
-            endpoint, ctx, stats, relay_config);
+            endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
 
     if (use_uot) {
@@ -737,51 +477,14 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
 proxy::shadowsocks::outbound::Handler::Handler(std::string tag,
                                                const SsOutboundConfig& config,
+                                               const Credentials& credentials,
                                                ::acpp::app::dns::DNS& dns_service,
                                                ::acpp::UDPSessionManager* udp_session_manager)
     : tag_(std::move(tag))
     , config_(config)
+    , credentials_(credentials)
     , dns_service_(dns_service)
-    , udp_session_manager_(udp_session_manager) {
-    config_.literal_address = ParseLiteralAddress(config_.address);
-
-    auto info = ss::ParseCipherMethod(config_.method);
-    if (info) {
-        cipher_info_ = *info;
-    } else {
-        LOG_WARN("[SsOutbound] Unknown cipher '{}', fallback to {}",
-                 config_.method,
-                 acpp::constants::protocol::kAes256Gcm);
-        cipher_info_ = ss::SsCipherInfo{ss::SsCipherType::AES_256_GCM, 32, 32};
-    }
-
-    if (ss::Is2022Cipher(cipher_info_)) {
-        const auto parts = SplitPasswordChain(config_.password);
-        psk_chain_.reserve(parts.size());
-        for (const auto part : parts) {
-            auto key = ss::Decode2022Psk(part, cipher_info_.key_size);
-            if (!key.empty()) {
-                psk_chain_.push_back(key);
-            }
-        }
-        if (!psk_chain_.empty()) {
-            master_key_ = psk_chain_.back();
-        } else {
-            LOG_WARN("[SsOutbound] invalid SS2022 password/key for '{}'", tag_);
-        }
-    } else {
-        master_key_ = ss::DeriveKey(config_.password, cipher_info_.key_size);
-    }
-    stream_settings_ = config_.stream_settings;
-    NormalizeOutboundStreamSettings(
-        stream_settings_,
-        OutboundStreamDefaults{
-            .require_tls = false,
-            .fallback_server_name = config_.address,
-            .allow_insecure = false,
-            .alpn = {},
-        });
-}
+    , udp_session_manager_(udp_session_manager) {}
 
 }  // namespace acpp
 
@@ -800,6 +503,8 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             return {};
         };
+        std::string password;
+        std::string method(acpp::constants::protocol::kAes256Gcm);
         auto read_ss_server = [&](const acpp::json::object& obj,
                                   acpp::SsOutboundConfig& config) {
             config.address = json_string(obj, "address");
@@ -814,12 +519,15 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (port.Valid()) {
                 config.port = port.value;
             }
-            config.password = json_string(obj, "password");
-            if (config.password.empty()) {
-                config.password = json_string(obj, "key");
+            password = json_string(obj, "password");
+            if (password.empty()) {
+                password = json_string(obj, "key");
             }
-            if (const auto method = json_string(obj, "method"); !method.empty()) {
-                config.method = method;
+            if (const auto* source_method = obj.if_contains("method")) {
+                if (!source_method->is_string() || source_method->as_string().empty()) {
+                    return false;
+                }
+                method = std::string(source_method->as_string());
             }
             auto uot_version =
                 acpp::proxy::shadowsocks::outbound::ParseUotVersion(obj);
@@ -848,10 +556,9 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 return std::nullopt;
             }
         }
-        ss_config.stream_settings = cfg.stream_settings;
         ss_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        acpp::NormalizeOutboundStreamSettings(
-            ss_config.stream_settings,
+        ss_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
+            cfg.stream_settings,
             acpp::OutboundStreamDefaults{
                 .require_tls = false,
                 .fallback_server_name = ss_config.address,
@@ -859,12 +566,23 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .alpn = {},
             });
 
-        if (ss_config.address.empty() || ss_config.password.empty() ||
-            ss_config.port == 0) {
+        if (ss_config.address.empty() || ss_config.port == 0) {
+            return std::nullopt;
+        }
+        auto credentials = acpp::proxy::shadowsocks::outbound::Credentials::Prepare(
+            method, password);
+        if (!credentials) {
+            LOG_ERROR("Shadowsocks outbound '{}': invalid cipher, password or identity chain", cfg.tag);
+            return std::nullopt;
+        }
+        ss_config.literal_address = acpp::iputil::ParseLiteral(ss_config.address);
+        if (!ss_config.literal_address && !acpp::domain::IsValidDnsHostname(
+                ss_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
+            LOG_ERROR("shadowsocks outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
         return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [ss_config = std::move(ss_config)](
+            [ss_config = std::move(ss_config), credentials = std::move(*credentials)](
                 std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
@@ -873,7 +591,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = ss_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
-                    std::string(tag), runtime_config, dns_service, udp_mgr);
+                    std::string(tag), runtime_config, credentials, dns_service, udp_mgr);
             }};
     }), true);
 }  // namespace

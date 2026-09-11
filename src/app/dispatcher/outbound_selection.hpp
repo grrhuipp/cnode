@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/features/routing/dispatch_policy.hpp"
+#include "acppnode/features/routing/router.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -13,12 +14,6 @@ enum class SelectionSource : uint8_t {
     Forced,
     Rule,
     Fallback,
-};
-
-struct RuleSelection {
-    std::string_view outbound_tag;
-    bool matched = false;
-    uint32_t rule_index = 0;
 };
 
 struct OutboundSelection {
@@ -34,7 +29,7 @@ struct OutboundSelection {
 
 [[nodiscard]] inline OutboundSelection SelectOutbound(
     const routing::OutboundSelectionPolicy& policy,
-    const RuleSelection& rule = {}) noexcept {
+    const routing::RouteDecision& rule = {}) noexcept {
     if (const auto* forced = std::get_if<routing::ForceOutbound>(&policy)) {
         return OutboundSelection{
             .outbound_tag = forced->outbound_tag,

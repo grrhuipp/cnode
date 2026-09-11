@@ -374,7 +374,7 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
                 return {};
             }
             payload->Produce(static_cast<uint32_t>(written));
-            return buf::MultiBuffer{payload.release()};
+            return buf::MultiBuffer{std::move(payload)};
         }
 
         memory::ByteVector scratch(encoded_len);
@@ -432,7 +432,7 @@ buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
             return {};
         }
         payload->Produce(static_cast<uint32_t>(written));
-        return buf::MultiBuffer{payload.release()};
+        return buf::MultiBuffer{std::move(payload)};
     }
 
     memory::ByteVector scratch(encoded_len);

@@ -73,7 +73,7 @@ public:
 
     // in-place 编码请求，避免热路径分配
     static size_t EncodeRequestTo(
-        const std::string& password,
+        std::span<const char, 56> password_hash,
         TrojanCommand cmd,
         const TargetAddress& target,
         uint8_t* output,

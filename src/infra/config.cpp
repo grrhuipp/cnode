@@ -1,4 +1,5 @@
 #include "acppnode/infra/config.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_port.hpp"
@@ -118,27 +119,27 @@ namespace {
     return value;
 }
 
-[[nodiscard]] RoutingDomainStrategy RequireRoutingDomainStrategy(
+[[nodiscard]] routing::DomainStrategy RequireRoutingDomainStrategy(
     std::string value) {
     const std::string original = value;
     value = RequireRoutingSelector(
         std::move(value), "domainStrategy", true);
     if (value == "asis") {
-        return RoutingDomainStrategy::AsIs;
+        return routing::DomainStrategy::AsIs;
     }
     if (value == "ipifnonmatch") {
-        return RoutingDomainStrategy::IPIfNonMatch;
+        return routing::DomainStrategy::IPIfNonMatch;
     }
     if (value == "ipondemand") {
-        return RoutingDomainStrategy::IPOnDemand;
+        return routing::DomainStrategy::IPOnDemand;
     }
     throw std::invalid_argument(std::format(
         "routing domainStrategy contains unsupported value '{}'", original));
 }
 
-[[nodiscard]] RoutingDomainStrategy ParseRoutingDomainStrategy(
+[[nodiscard]] routing::DomainStrategy ParseRoutingDomainStrategy(
     const json::object& object) {
-    std::optional<RoutingDomainStrategy> parsed;
+    std::optional<routing::DomainStrategy> parsed;
     std::string_view first_key;
     for (const std::string_view key : {"domainStrategy", "domain_strategy"}) {
         const auto* value = object.if_contains(key);
@@ -160,7 +161,7 @@ namespace {
             first_key = key;
         }
     }
-    return parsed.value_or(RoutingDomainStrategy::AsIs);
+    return parsed.value_or(routing::DomainStrategy::AsIs);
 }
 
 // 从 object 中取 string，不存在则返回默认值
@@ -494,30 +495,61 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 // ============================================================================
 DnsConfig::DnsConfig()
     : servers{
-        net::ip::make_address("8.8.8.8"),
-        net::ip::make_address("1.1.1.1"),
+        {net::ip::address_v4({8, 8, 8, 8}), 53},
+        {net::ip::address_v4({1, 1, 1, 1}), 53},
     } {}
+
+namespace {
+
+udp::endpoint ParseDnsServer(std::string_view text) {
+    // Endpoint syntax and default ports belong to configuration normalization.
+    std::string_view host = text;
+    std::string_view port_text;
+    bool explicit_port = false;
+    if (text.starts_with('[')) {
+        host = {};
+        const auto end = text.find(']');
+        if (end != std::string_view::npos && text.substr(end + 1).starts_with(':')) {
+            host = text.substr(1, end - 1);
+            port_text = text.substr(end + 2);
+            explicit_port = true;
+        }
+    } else if (const auto colon = text.find(':'); colon != std::string_view::npos &&
+               text.find(':', colon + 1) == std::string_view::npos) {
+        host = text.substr(0, colon);
+        port_text = text.substr(colon + 1);
+        explicit_port = true;
+    }
+    uint32_t port = 53;
+    bool valid_port = !explicit_port;
+    if (explicit_port && !port_text.empty()) {
+        const auto [end, parsed] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
+        valid_port = parsed == std::errc{} && end == port_text.data() + port_text.size() &&
+            port > 0 && port <= std::numeric_limits<uint16_t>::max();
+    }
+    if (const auto address = iputil::ParseLiteral(host);
+        valid_port && address && (!text.starts_with('[') || address->is_v6())) {
+        return {*address, static_cast<uint16_t>(port)};
+    }
+    throw std::invalid_argument(std::format(
+        "dns server '{}' must be an IP, IPv4:port or [IPv6]:port with port 1..65535", text));
+}
+
+}  // namespace
 
 DnsConfig DnsConfig::FromJson(const json::object& j) {
     DnsConfig cfg;
     if (const auto* servers = j.if_contains("servers")) {
         if (!servers->is_array()) {
-            throw std::invalid_argument("dns servers must be an array of IP addresses");
+            throw std::invalid_argument("dns servers must be an array of IP endpoint strings");
         }
         cfg.servers.clear();
         cfg.servers.reserve(servers->as_array().size());
         for (const auto& server : servers->as_array()) {
             if (!server.is_string()) {
-                throw std::invalid_argument("dns server must be an IP address string");
+                throw std::invalid_argument("dns server must be an IP endpoint string");
             }
-            const auto text = server.as_string();
-            IoErrorCode error;
-            auto address = net::ip::make_address(text, error);
-            if (error) {
-                throw std::invalid_argument(std::format(
-                    "dns server '{}' is not a valid IP address", text));
-            }
-            cfg.servers.push_back(std::move(address));
+            cfg.servers.push_back(ParseDnsServer(server.as_string()));
         }
     }
     cfg.timeout    = juint32(j, {"timeout"}, cfg.timeout);
@@ -899,6 +931,10 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     if (!address) {
         throw std::invalid_argument("xhttp download address is required");
     }
+    if (!iputil::ParseLiteral(*address) && !domain::IsValidDnsHostname(
+            *address, domain::TrailingDotPolicy::Allow)) {
+        throw std::invalid_argument("xhttp download address must be an IP literal or DNS hostname");
+    }
     settings->address = std::move(*address);
 
     std::optional<uint16_t> port;
@@ -1128,58 +1164,6 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
-std::string XHttpConfig::NormalizedPath() const {
-    std::string normalized = path.empty()
-        ? std::string(constants::binding::kRootPath)
-        : path;
-    const size_t query_pos = normalized.find('?');
-    if (query_pos != std::string::npos) {
-        normalized.erase(query_pos);
-    }
-    if (normalized.empty() || normalized.front() != '/') {
-        normalized.insert(normalized.begin(), '/');
-    }
-    if (normalized.back() != '/') {
-        normalized.push_back('/');
-    }
-    return normalized;
-}
-
-bool XHttpConfig::IsStreamOne() const noexcept {
-    return mode == "stream-one";
-}
-
-bool XHttpConfig::AcceptsStreamOne() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "stream-one" ||
-           mode == "stream-up";
-}
-
-bool XHttpConfig::AcceptsPacketUp() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "packet-up";
-}
-
-bool XHttpConfig::AcceptsStreamUp() const noexcept {
-    return mode.empty() ||
-           mode == "auto" ||
-           mode == "stream-up";
-}
-
-std::string GrpcConfig::RequestPath() const {
-    if (!service_name.empty() && service_name.front() == '/') {
-        return service_name;
-    }
-    std::string path;
-    path.reserve(service_name.size() + 10);
-    path.push_back('/');
-    path.append(service_name);
-    path.append(multi_mode ? "/TunMulti" : "/Tun");
-    return path;
-}
-
 StreamSettings StreamSettings::FromJson(
     const json::object& j, StreamEndpointRole role) {
     StreamSettings cfg;
@@ -1347,93 +1331,7 @@ StreamSettings StreamSettings::FromJson(
         cfg.xhttp = XHttpConfig::FromJson(*xhttp);
     }
 
-    cfg.RecomputeModes();
-    return cfg;
-}
-
-void StreamSettings::RecomputeModes() noexcept {
-    // 仅初始化/配置更新时调用，热路径不再做字符串比较
-    network = lower_ascii_copy(std::move(network));
-    security = lower_ascii_copy(std::move(security));
-
-    if (network.empty() ||
-        network == constants::protocol::kTcp ||
-        network == constants::protocol::kRaw) {
-        network_mode = NetworkMode::Tcp;
-    } else if (network == constants::protocol::kWs ||
-               network == constants::protocol::kWebSocket) {
-        network_mode = NetworkMode::Ws;
-    } else if (network == constants::protocol::kHttpUpgrade ||
-               network == "httpupgrade") {
-        network_mode = NetworkMode::HttpUpgrade;
-        network = std::string(constants::protocol::kHttpUpgrade);
-    } else if (network == constants::protocol::kGrpc) {
-        network_mode = NetworkMode::Grpc;
-    } else if (network == constants::protocol::kHttp || network == "h2") {
-        http.force_http2 = http.force_http2 || (network == "h2");
-        network_mode = NetworkMode::Http;
-    } else if (network == constants::protocol::kXHttp || network == "splithttp") {
-        network_mode = NetworkMode::XHttp;
-    } else {
-        network_mode = NetworkMode::Unsupported;
-    }
-
-    if (security.empty() || security == constants::protocol::kNone) {
-        security_mode = SecurityMode::None;
-    } else if (security == constants::protocol::kTls) {
-        security_mode = SecurityMode::Tls;
-    } else if (security == constants::protocol::kReality) {
-        security_mode = SecurityMode::Reality;
-        tls.min_version = TlsVersion::V1_3;
-        tls.max_version = TlsVersion::V1_3;
-    } else {
-        security_mode = SecurityMode::Unsupported;
-    }
-
-    flags = kFlagNone;
-    if (network_mode == NetworkMode::Ws) {
-        flags |= kFlagWs;
-    }
-    if (network_mode == NetworkMode::HttpUpgrade) {
-        flags |= kFlagHttpUpgrade;
-    }
-    if (network_mode == NetworkMode::Grpc) {
-        flags |= kFlagGrpc;
-        network = std::string(constants::protocol::kGrpc);
-    }
-    if (network_mode == NetworkMode::Http) {
-        flags |= kFlagHttp;
-        network = http.force_http2 ? "h2" : std::string(constants::protocol::kHttp);
-    }
-    if (network_mode == NetworkMode::XHttp) {
-        flags |= kFlagXHttp;
-        network = std::string(constants::protocol::kXHttp);
-    }
-    if (security_mode == SecurityMode::Tls) {
-        flags |= kFlagTls;
-    }
-    if (security_mode == SecurityMode::Reality) {
-        flags |= kFlagReality;
-    }
-
-    const bool tls_like_for_alpn = IsTls();
-    const bool http_should_default_h2 =
-        network_mode == NetworkMode::Http &&
-        (http.force_http2 ||
-         (tls_like_for_alpn && tls.alpn.empty()));
-    const bool xhttp_should_default_h2 =
-        network_mode == NetworkMode::XHttp &&
-        security_mode != SecurityMode::Reality &&
-        (xhttp.AcceptsStreamOne() || tls_like_for_alpn) &&
-        tls.alpn.empty();
-    if ((network_mode == NetworkMode::Grpc && tls_like_for_alpn) ||
-        http_should_default_h2 ||
-        xhttp_should_default_h2) {
-        auto has_h2 = std::ranges::find(tls.alpn, "h2") != tls.alpn.end();
-        if (!has_h2) {
-            tls.alpn.insert(tls.alpn.begin(), "h2");
-        }
-    }
+    return NormalizeStreamSettings(cfg);
 }
 
 // ============================================================================

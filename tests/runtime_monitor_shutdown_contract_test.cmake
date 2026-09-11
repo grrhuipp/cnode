@@ -26,8 +26,7 @@ endif()
 
 foreach(REQUIRED_MONITOR
         "class RuntimeMonitor"
-        "net::awaitable<void> Stop();"
-        "std::shared_ptr<Impl> impl_;")
+        "std::unique_ptr<Impl> impl_;")
     string(FIND "${MONITOR_HEADER}" "${REQUIRED_MONITOR}" REQUIRED_POSITION)
     if(REQUIRED_POSITION EQUAL -1)
         message(FATAL_ERROR
@@ -35,23 +34,17 @@ foreach(REQUIRED_MONITOR
     endif()
 endforeach()
 
-foreach(REQUIRED_IMPLEMENTATION
-        "RunOwned(shared_from_this())"
-        "state.timers.CancelAll()"
-        "co_await completion.async_wait")
-    string(FIND "${MONITOR_SOURCE}"
-        "${REQUIRED_IMPLEMENTATION}" REQUIRED_POSITION)
-    if(REQUIRED_POSITION EQUAL -1)
-        message(FATAL_ERROR
-            "RuntimeMonitor ownership is missing '${REQUIRED_IMPLEMENTATION}'")
-    endif()
-endforeach()
+if(MONITOR_HEADER MATCHES "bootstrap_runtime.hpp|awaitable|Stop[(]" OR
+   MONITOR_SOURCE MATCHES "RuntimeMonitorState|CancelableTimerRegistry|RuntimeMonitor::Stop")
+    message(FATAL_ERROR
+        "monitor must not restore unused stop state or expose full runtime dependencies")
+endif()
 
 string(REGEX MATCHALL "RunAwaitableBatch" BATCH_CALLS "${MONITOR_SOURCE}")
 list(LENGTH BATCH_CALLS BATCH_CALL_COUNT)
-if(BATCH_CALL_COUNT LESS 3)
+if(NOT BATCH_CALL_COUNT EQUAL 2)
     message(FATAL_ERROR
-        "Worker sampling, heap collection, and monitor loops must share the batch primitive")
+        "only finite Worker sampling and heap collection may use the batch primitive; monitor loops complete independently")
 endif()
 
 string(FIND "${SHUTDOWN_SOURCE}" "std::_Exit(EXIT_SUCCESS)" FORCE_EXIT)
@@ -69,7 +62,13 @@ if(SHUTDOWN_SOURCE MATCHES "monitor.Stop\\(\\)" OR
 endif()
 
 if(RUNTIME_SOURCE MATCHES "run_for\\(" OR
-   RUNTIME_SOURCE MATCHES "milliseconds\\(100\\)")
+   RUNTIME_SOURCE MATCHES "milliseconds\\(100\\)|ShutdownTask|workers.clear|ReleaseForIoContext|->stop\\(")
     message(FATAL_ERROR
-        "runtime shutdown must not depend on a fixed drain window")
+        "process-lifetime runtime must not partially tear down active Worker state")
+endif()
+
+if(NOT RUNTIME_HEADER MATCHES "noreturn" OR
+   NOT SHUTDOWN_SOURCE MATCHES "std::_Exit[(]EXIT_FAILURE[)]" OR
+   NOT RUNTIME_SOURCE MATCHES "FailRuntime")
+    message(FATAL_ERROR "runtime failure must terminate with failure status without unwinding its owners")
 endif()

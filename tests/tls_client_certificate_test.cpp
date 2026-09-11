@@ -171,6 +171,22 @@ int main() {
         return 9;
     }
 
+    using namespace std::string_view_literals;
+    for (const auto identity : {"127.0.0.1:9"sv, "[::1]"sv, "bad..example"sv,
+                               "fe80::1%invalid"sv, "127.0.0.1\0ignored"sv}) {
+        SSL* client = SSL_new(context->Native());
+        const bool rejected = client && !acpp::ConfigureTlsServerIdentity(client, identity);
+        SSL_free(client);
+        if (!Require(rejected, "invalid TLS identity must be rejected before SNI or SAN setup")) return 30;
+    }
+    for (const auto identity : {"2001:db8::1", "fe80::1%3", "::ffff:192.0.2.1"}) {
+        SSL* client = SSL_new(context->Native());
+        const bool configured = client && acpp::ConfigureTlsServerIdentity(client, identity) &&
+            SSL_get_servername(client, TLSEXT_NAMETYPE_host_name) == nullptr;
+        SSL_free(client);
+        if (!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")) return 31;
+    }
+
     auto ip_material = certificates.GetOrCreate("192.0.2.1");
     SSL* ip_client = SSL_new(context->Native());
     if (!Require(ip_material.cert != nullptr && ip_material.key != nullptr &&

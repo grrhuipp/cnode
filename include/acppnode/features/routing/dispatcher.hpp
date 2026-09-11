@@ -3,7 +3,6 @@
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/app/relay_types.hpp"
-#include "acppnode/app/udp_types.hpp"
 #include "acppnode/features/routing/dispatch_policy.hpp"
 #include "acppnode/transport/link.hpp"
 

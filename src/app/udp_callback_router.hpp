@@ -73,7 +73,7 @@ public:
     UdpCallbackRouter& operator=(const UdpCallbackRouter&) = delete;
 
     [[nodiscard]] uint64_t Register(PacketCallback callback);
-    [[nodiscard]] bool Unregister(uint64_t callback_id);
+    [[nodiscard]] bool Unregister(uint64_t callback_id) noexcept;
 
     [[nodiscard]] std::pair<ErrorCode, MappingLease> BeginTargetSend(
         const UdpEndpointKey& target,

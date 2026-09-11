@@ -79,7 +79,6 @@ constexpr std::string_view IoBackendName() noexcept {
 // ============================================================================
 int RunFromCommandLine(int argc, char* argv[]) {
     memory::ConfigureProcessAllocator();
-    [[maybe_unused]] memory::ThreadScope main_thread_allocator_scope;
 
     const CommandLineOptions cli = ParseCommandLine(argc, argv);
     if (cli.action == CommandLineAction::Help) {
@@ -145,7 +144,6 @@ int RunFromCommandLine(int argc, char* argv[]) {
         std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;
     }
-    return 0;
 }
 
 }  // namespace acpp

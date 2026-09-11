@@ -1,4 +1,6 @@
 #include "vmess_outbound.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "../encoding/client.hpp"
 #include "../udp_datagram.hpp"
 #include "acppnode/app/relay.hpp"
@@ -119,6 +121,11 @@ public:
         stream_.Cancel();
     }
 
+    transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override {
+        return is_udp_ ? transport::EofAction::WaitForPeer : stream_.ReadEofAction();
+    }
+
     void SetAbortiveClose(bool enable = true) noexcept {
         stream_.SetAbortiveClose(enable);
     }
@@ -138,25 +145,12 @@ private:
 
 proxy::vmess::outbound::Handler::Handler(std::string tag,
                                          const VMessOutboundConfig& config,
+                                         const ::acpp::vmess::MemoryAccount& user,
                                          ::acpp::app::dns::DNS& dns_service)
     : tag_(std::move(tag))
     , config_(config)
+    , user_(user)
     , dns_service_(dns_service) {
-    config_.literal_address = ParseLiteralAddress(config_.address);
-
-    user_ = ::acpp::vmess::MemoryAccount::FromUUID(config_.uuid);
-    if (!user_) {
-        LOG_ERROR("VMess outbound '{}': invalid UUID", tag_);
-    }
-
-    NormalizeOutboundStreamSettings(
-        config_.stream_settings,
-        OutboundStreamDefaults{
-            .require_tls = false,
-            .fallback_server_name = config_.address,
-            .allow_insecure = false,
-            .alpn = {},
-        });
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
               tag_, config_.address, config_.port,
               config_.stream_settings.network,
@@ -172,17 +166,12 @@ proxy::vmess::outbound::Handler::Process(
     transport::Link inbound,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    std::span<const uint8_t> initial_payload,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!user_) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
-    }
-
     const auto& target = ctx.outbound.target;
 
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
@@ -233,7 +222,7 @@ proxy::vmess::outbound::Handler::Process(
 
     const bool is_udp = ctx.content.network == Network::UDP;
     ::acpp::vmess::encoding::ClientSession vmess_session(
-        *user_,
+        user_,
         target,
         config_.security,
         is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
@@ -258,34 +247,14 @@ proxy::vmess::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
-    if (buf::HasData(first_payload)) {
-        if (inbound.control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, first_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, first_payload, relay_config);
-    }
-    if (!initial_payload.empty()) {
-        if (inbound.control) {
-            co_return co_await DoRelayLinkWithFirstPacket(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, initial_payload, relay_config);
-        }
-        co_return co_await DoRelayLinkWithFirstPacket(
-            io_context, *inbound.reader, *inbound.writer, target_endpoint,
-            ctx, stats, initial_payload, relay_config);
-    }
     if (inbound.control) {
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer, *inbound.control,
-            target_endpoint, ctx, stats, relay_config);
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
     co_return co_await DoRelayLink(
         io_context, *inbound.reader, *inbound.writer,
-        target_endpoint, ctx, stats, relay_config);
+        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
 }  // namespace
@@ -349,6 +318,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         };
 
         acpp::VMessOutboundConfig vmess_config;
+        std::string uuid;
 
         bool parsed_xray = false;
         if (const auto* vnext_p = s.if_contains("vnext");
@@ -370,9 +340,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 if (port.Valid()) {
                     vmess_config.port = port.value;
                 }
-                vmess_config.uuid = json_string(user, "id");
-                if (vmess_config.uuid.empty()) {
-                    vmess_config.uuid = json_string(user, "uuid");
+                uuid = json_string(user, "id");
+                if (uuid.empty()) {
+                    uuid = json_string(user, "uuid");
                 }
                 if (!has_supported_alter_id(user)) {
                     return std::nullopt;
@@ -399,9 +369,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             if (port.Valid()) {
                 vmess_config.port = port.value;
             }
-            vmess_config.uuid = json_string(s, "uuid");
-            if (vmess_config.uuid.empty()) {
-                vmess_config.uuid = json_string(s, "id");
+            uuid = json_string(s, "uuid");
+            if (uuid.empty()) {
+                uuid = json_string(s, "id");
             }
             if (!has_supported_alter_id(s)) {
                 return std::nullopt;
@@ -413,10 +383,9 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             vmess_config.security = *parsed_security;
         }
 
-        vmess_config.stream_settings = cfg.stream_settings;
         vmess_config.send_through = cfg.send_through.value_or(acpp::OutboundBind{});
-        acpp::NormalizeOutboundStreamSettings(
-            vmess_config.stream_settings,
+        vmess_config.stream_settings = acpp::NormalizeOutboundStreamSettings(
+            cfg.stream_settings,
             acpp::OutboundStreamDefaults{
                 .require_tls = false,
                 .fallback_server_name = vmess_config.address,
@@ -424,13 +393,23 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .alpn = {},
             });
 
-        if (vmess_config.address.empty() || vmess_config.uuid.empty() ||
-            vmess_config.port == 0) {
+        if (vmess_config.address.empty() || vmess_config.port == 0) {
             return std::nullopt;  // 配置不完整
+        }
+        auto user = acpp::vmess::MemoryAccount::FromUUID(uuid);
+        if (!user) {
+            LOG_ERROR("VMess outbound '{}': invalid UUID", cfg.tag);
+            return std::nullopt;
+        }
+        vmess_config.literal_address = acpp::iputil::ParseLiteral(vmess_config.address);
+        if (!vmess_config.literal_address && !acpp::domain::IsValidDnsHostname(
+                vmess_config.address, acpp::domain::TrailingDotPolicy::Allow)) {
+            LOG_ERROR("vmess outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
+            return std::nullopt;
         }
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [vmess_config = std::move(vmess_config)](
+            [vmess_config = std::move(vmess_config), user = std::move(*user)](
                 std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
@@ -439,7 +418,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 auto runtime_config = vmess_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
-                    std::string(tag), runtime_config, dns);
+                    std::string(tag), runtime_config, user, dns);
             }};
     }), true);
 }  // namespace

@@ -22,8 +22,7 @@ struct InboundBuild {
     ProxyProtocolMode   proxy_protocol = ProxyProtocolMode::Auto;
 };
 
-[[nodiscard]] InboundBuild InboundBuilder(const std::string& panel_name,
-                                          const PanelConfig* panel_config,
+[[nodiscard]] InboundBuild InboundBuilder(const PanelConfig& panel_config,
                                           const api::NodeInfo& node_config);
 
 }  // namespace acpp::controller

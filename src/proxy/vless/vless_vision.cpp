@@ -87,7 +87,7 @@ void AppendBytesToMultiBuffer(buf::MultiBuffer& out, std::span<const uint8_t> da
         const size_t n = std::min<size_t>(data.size(), b->Available());
         std::memcpy(b->Tail().data(), data.data(), n);
         b->Produce(static_cast<uint32_t>(n));
-        out.push_back(b.release());
+        out.push_back(std::move(b));
         data = data.subspan(n);
     }
 }
@@ -301,7 +301,7 @@ bool VisionWriter::AppendVisionFrameBuffers(
     pos += 2;
     header->Produce(static_cast<uint32_t>(pos));
     out.emplace_back(header->Bytes().data(), header->Bytes().size());
-    header_owner.push_back(header.release());
+    header_owner.push_back(std::move(header));
 
     if (!content.empty()) {
         out.emplace_back(content.data(), content.size());

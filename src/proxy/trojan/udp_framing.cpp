@@ -121,7 +121,7 @@ net::awaitable<void> WriteUdpDatagram(
     }
     header->Produce(static_cast<uint32_t>(header_size));
 
-    buf::MultiBuffer framed{header.release()};
+    buf::MultiBuffer framed{std::move(header)};
     payload.MoveTo(framed, true);
     co_await writer.WriteMultiBuffer(std::move(framed));
 }

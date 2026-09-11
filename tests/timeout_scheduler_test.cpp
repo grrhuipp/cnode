@@ -1,18 +1,294 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/transport/internet/async_delay.hpp"
 
 #include <asio/co_spawn.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/post.hpp>
 #include <asio/use_future.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+namespace {
+
+thread_local bool reject_allocations = false;
+thread_local std::size_t rejected_allocations = 0;
+
+static_assert(noexcept(std::declval<acpp::TimeoutScheduler&>().Cancel(
+    std::declval<acpp::TimeoutToken&>())));
+static_assert(std::is_nothrow_move_assignable_v<acpp::TimeoutToken>);
+
+}  // namespace
+
+void* operator new(std::size_t size) {
+    if (reject_allocations) {
+        ++rejected_allocations;
+        throw std::bad_alloc();
+    }
+    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
+    throw std::bad_alloc();
+}
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try { return ::operator new(size); } catch (...) { return nullptr; }
+}
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
+
+namespace {
+
+bool TestCancellationAllocation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool cancelled_ran = false;
+    bool survivor_ran = false;
+    bool cancel_threw = false;
+    auto cancelled = scheduler.ScheduleAfter(1ms, [&] { cancelled_ran = true; });
+    auto survivor = scheduler.ScheduleAfter(10ms, [&] { survivor_ran = true; });
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    try {
+        scheduler.Cancel(cancelled);
+    } catch (const std::bad_alloc&) {
+        cancel_threw = true;
+    }
+    timeout_allocation_test::reject_asio_allocations = false;
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("cancel: threw=%d allocations=%zu cancelled=%d survivor=%d\n",
+        cancel_threw, allocations, cancelled_ran, survivor_ran);
+    return !cancel_threw && allocations == 0 && !cancelled_ran && survivor_ran;
+}
+
+bool TestDestructionAllocation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool survivor_ran = false;
+    auto abandoned = scheduler.ScheduleAfter(1ms, [] {});
+    auto survivor = scheduler.ScheduleAfter(10ms, [&] { survivor_ran = true; });
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    { auto retiring = std::move(abandoned); }
+    timeout_allocation_test::reject_asio_allocations = false;
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("destruction: allocations=%zu survivor=%d\n", allocations, survivor_ran);
+    return allocations == 0 && survivor_ran;
+}
+
+bool TestEarlierDeadlineAllocation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool survivor_ran = false;
+    bool earlier_ran = false;
+    bool schedule_threw = false;
+    auto survivor = scheduler.ScheduleAfter(20ms, [&] { survivor_ran = true; });
+    acpp::TimeoutToken earlier;
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    try {
+        earlier = scheduler.ScheduleAfter(1ms, [&] { earlier_ran = true; });
+    } catch (const std::bad_alloc&) {
+        schedule_threw = true;
+    }
+    timeout_allocation_test::reject_asio_allocations = false;
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("earlier: threw=%d allocations=%zu earlier=%d survivor=%d\n",
+        schedule_threw, allocations, earlier_ran, survivor_ran);
+    return !schedule_threw && allocations == 0 && earlier_ran && survivor_ran;
+}
+
+bool TestFailedInitialWait() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool failed_ran = false;
+    bool recovery_ran = false;
+    bool failed = false;
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    try {
+        auto token = scheduler.ScheduleAfter(1ms, [&] { failed_ran = true; });
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    timeout_allocation_test::reject_asio_allocations = false;
+    auto recovery = scheduler.ScheduleAfter(1ms, [&] { recovery_ran = true; });
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("initial wait: failed=%d allocations=%zu failed_callback=%d recovery=%d\n",
+        failed, allocations, failed_ran, recovery_ran);
+    return failed && allocations > 0 && !failed_ran && recovery_ran;
+}
+
+bool TestCancellationStormWithoutAllocation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool cancelled_ran = false;
+    bool survivor_ran = false;
+    auto keeper = scheduler.ScheduleAfter(1ms, [&] { survivor_ran = true; });
+    std::vector<acpp::TimeoutToken> tokens;
+    tokens.reserve(4096);
+    for (std::size_t i = 0; i < 4096; ++i) {
+        tokens.push_back(scheduler.ScheduleAfter(1h, [&] { cancelled_ran = true; }));
+    }
+    const auto before = rejected_allocations;
+    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+    reject_allocations = true;
+    timeout_allocation_test::reject_asio_allocations = true;
+    for (auto& token : tokens) scheduler.Cancel(token);
+    timeout_allocation_test::reject_asio_allocations = false;
+    reject_allocations = false;
+    io.run_for(100ms);
+    const auto allocations = rejected_allocations - before;
+    const auto asio_allocations = timeout_allocation_test::rejected_asio_allocations - asio_before;
+    std::printf("cancellation storm: allocations=%zu asio_allocations=%zu cancelled=%d survivor=%d\n",
+        allocations, asio_allocations, cancelled_ran, survivor_ran);
+    return allocations == 0 && asio_allocations == 0 && !cancelled_ran && survivor_ran;
+}
+
+bool TestPreemptAndReplacePendingWait() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    auto initial = scheduler.ScheduleAfter(1h, [] {});
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    bool replacement_ran = false;
+    // Repeatedly cancel the last event and replace it before the cancelled
+    // operation is delivered. No second underlying wait may be allocated.
+    timeout_allocation_test::reject_asio_allocations = true;
+    for (std::size_t i = 0; i < 200; ++i) {
+        scheduler.Cancel(initial);
+        initial = scheduler.ScheduleAfter(1h, [] {});
+    }
+    auto replacement = scheduler.ScheduleAfter(1ms, [&] { replacement_ran = true; });
+    timeout_allocation_test::reject_asio_allocations = false;
+    io.run_for(30ms);
+    scheduler.Cancel(initial);
+    io.restart();
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("pending replacement: allocations=%zu callback=%d\n", allocations, replacement_ran);
+    return allocations == 0 && replacement_ran && io.stopped();
+}
+
+bool TestSleepCancellationAllocation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    acpp::AsyncDelay sleep(io);
+    bool survivor_ran = false;
+    auto future = acpp::net::co_spawn(io, sleep.WaitFor(1h), acpp::net::use_future);
+    io.poll();
+    auto survivor = scheduler.ScheduleAfter(1ms, [&] { survivor_ran = true; });
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    const auto ordinary_before = rejected_allocations;
+    reject_allocations = true;
+    timeout_allocation_test::reject_asio_allocations = true;
+    sleep.Cancel();
+    timeout_allocation_test::reject_asio_allocations = false;
+    reject_allocations = false;
+    io.run_for(100ms);
+    const bool completed = future.wait_for(0ms) == std::future_status::ready;
+    if (completed) future.get();
+    scheduler.Cancel(survivor);
+    io.restart();
+    io.run_for(100ms);
+    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
+    std::printf("sleep cancellation: asio_allocations=%zu allocations=%zu completed=%d survivor=%d\n",
+        allocations, rejected_allocations - ordinary_before, completed, survivor_ran);
+    return allocations == 0 && rejected_allocations == ordinary_before && completed && survivor_ran;
+}
+
+bool TestDelayParentCancellationAndReuse() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    acpp::AsyncDelay delay(io);
+    acpp::net::cancellation_signal cancellation;
+    auto future = acpp::net::co_spawn(io, delay.WaitFor(1h),
+        acpp::net::bind_cancellation_slot(cancellation.slot(), acpp::net::use_future));
+    io.poll();
+    cancellation.emit(acpp::net::cancellation_type::terminal);
+    io.run_for(100ms);
+    if (future.wait_for(0ms) != std::future_status::ready) return false;
+    try {
+        future.get();
+    } catch (const acpp::IoSystemError& error) {
+        if (error.code() != acpp::io_error::operation_aborted) return false;
+    }
+    io.restart();
+    auto reused = acpp::net::co_spawn(io, delay.WaitFor(1ms), acpp::net::use_future);
+    io.run_for(100ms);
+    if (reused.wait_for(0ms) != std::future_status::ready) return false;
+    reused.get();
+    std::printf("parent cancellation: completed=1 reused=1\n");
+    return true;
+}
+
+bool TestMaximumDelayWait() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    acpp::AsyncDelay delay(io);
+    auto future = acpp::net::co_spawn(io,
+        delay.WaitFor(std::chrono::milliseconds::max()), acpp::net::use_future);
+    io.run_for(10ms);
+    const bool pending = future.wait_for(0ms) != std::future_status::ready;
+    delay.Cancel();
+    io.restart();
+    io.run_for(100ms);
+    if (future.wait_for(0ms) != std::future_status::ready) return false;
+    future.get();
+    std::printf("maximum delay wait: pending_before_cancel=%d\n", pending);
+    return pending;
+}
+
+bool TestMaximumDelay() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool maximum_ran = false;
+    bool immediate_ran = false;
+    auto maximum = scheduler.ScheduleAfter(std::chrono::milliseconds::max(),
+        [&] { maximum_ran = true; });
+    auto immediate = scheduler.ScheduleAfter(-1ms, [&] { immediate_ran = true; });
+    io.run_for(10ms);
+    scheduler.Cancel(maximum);
+    io.restart();
+    io.run_for(100ms);
+    std::printf("maximum delay: maximum=%d immediate=%d\n", maximum_ran, immediate_ran);
+    return !maximum_ran && immediate_ran;
+}
+
+}  // namespace
 
 int main() {
     using namespace std::chrono_literals;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    bool allocation_checks_passed = TestCancellationAllocation();
+    allocation_checks_passed = TestDestructionAllocation() && allocation_checks_passed;
+    allocation_checks_passed = TestEarlierDeadlineAllocation() && allocation_checks_passed;
+    allocation_checks_passed = TestFailedInitialWait() && allocation_checks_passed;
+    allocation_checks_passed = TestCancellationStormWithoutAllocation() && allocation_checks_passed;
+    allocation_checks_passed = TestPreemptAndReplacePendingWait() && allocation_checks_passed;
+    allocation_checks_passed = TestSleepCancellationAllocation() && allocation_checks_passed;
+    allocation_checks_passed = TestDelayParentCancellationAndReuse() && allocation_checks_passed;
+    allocation_checks_passed = TestMaximumDelayWait() && allocation_checks_passed;
+    allocation_checks_passed = TestMaximumDelay() && allocation_checks_passed;
+    if (!allocation_checks_passed) return 110;
 
     std::optional<acpp::net::io_context> recycled_io_context;
     for (size_t iteration = 0; iteration < 4; ++iteration) {
@@ -234,7 +510,7 @@ int main() {
     acpp::net::io_context sleep_io_context;
     auto& sleep_scheduler =
         acpp::TimeoutScheduler::ForIoContext(sleep_io_context);
-    acpp::ScheduledSleep repeated_cancel_sleep(sleep_io_context);
+    acpp::AsyncDelay repeated_cancel_sleep(sleep_io_context);
     bool second_wait_started = false;
     bool second_wait_completed = false;
     bool second_wait_completed_before_probe = false;
@@ -304,7 +580,7 @@ int main() {
         acpp::TimeoutScheduler::ForIoContext(concurrent_sleep_io_context);
     bool concurrent_wait_rejected = false;
     {
-        acpp::ScheduledSleep single_wait_sleep(concurrent_sleep_io_context);
+        acpp::AsyncDelay single_wait_sleep(concurrent_sleep_io_context);
         auto first_wait = acpp::net::co_spawn(
             concurrent_sleep_io_context,
             [&]() -> acpp::net::awaitable<void> {

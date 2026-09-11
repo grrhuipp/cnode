@@ -241,7 +241,7 @@ net::awaitable<void> WriteUdpDatagram(
             buffer->ClearUDP();
         }
     }
-    buf::MultiBuffer framed{header.release()};
+    buf::MultiBuffer framed{std::move(header)};
     payload.MoveTo(framed, true);
     co_await writer.WriteMultiBuffer(std::move(framed));
 }

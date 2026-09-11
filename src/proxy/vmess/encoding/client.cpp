@@ -176,7 +176,7 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
 
         const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
         out->Produce(static_cast<uint32_t>(output_size));
-        buf::MultiBuffer mb{out.release()};
+        buf::MultiBuffer mb{std::move(out)};
         try {
             co_await stream.WriteMultiBuffer(std::move(mb));
         } catch (...) {
@@ -285,7 +285,7 @@ void EncodeRequestBodyBytes(EncodeRequestBodyState& state,
         const size_t output_size =
             encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
         out->Produce(static_cast<uint32_t>(output_size));
-        out_mb.push_back(out.release());
+        out_mb.push_back(std::move(out));
 
         offset += chunk_size;
     }
@@ -398,13 +398,13 @@ net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
 
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
-        co_return;
+        throw std::bad_alloc();
     }
     uint8_t* eof_buf = out->Tail().data();
     const size_t length_header_size = state.length_cipher ? state.length_cipher->Overhead() + 2 : 2;
     ssize_t enc_len = state.cipher->Encrypt(nullptr, 0, eof_buf + length_header_size);
     if (enc_len < 0) {
-        co_return;
+        ThrowVMessWriteError("VMess client EOF encrypt failed");
     }
 
     const uint16_t total_len = static_cast<uint16_t>(enc_len + padding_len);
@@ -414,22 +414,20 @@ net::awaitable<void> EncodeRequestBodyEOF(EncodeRequestBodyState& state,
                            total_len,
                            eof_buf,
                            encoded_length_size)) {
-        co_return;
+        ThrowVMessWriteError("VMess client EOF length encrypt failed");
     }
 
-    if (padding_len > 0) {
-        RAND_bytes(eof_buf + encoded_length_size + enc_len, static_cast<int>(padding_len));
+    if (padding_len > 0 &&
+        RAND_bytes(eof_buf + encoded_length_size + enc_len, static_cast<int>(padding_len)) != 1) {
+        ThrowVMessWriteError("VMess client EOF padding failed");
     }
 
     const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
     out->Produce(static_cast<uint32_t>(output_size));
-    buf::MultiBuffer mb{out.release()};
-    try {
-        co_await stream.WriteMultiBuffer(std::move(mb));
-    } catch (...) {
-        co_return;
-    }
+    buf::MultiBuffer mb{std::move(out)};
+    co_await stream.WriteMultiBuffer(std::move(mb));
     state.eof_sent = true;
+    LOG_NET_TRACE("VMess client: request EOF sent bytes={}", output_size);
 }
 
 net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& state,
@@ -536,7 +534,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
             throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
         }
         crypto_pool->Produce(static_cast<uint32_t>(dec_len));
-        co_return buf::MultiBuffer{crypto_pool.release()};
+        co_return buf::MultiBuffer{std::move(crypto_pool)};
     }
 
     memory::ByteVector plain_buf;
@@ -563,7 +561,7 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
 
     buf::MultiBuffer out_mb;
     out_mb.reserve((dec_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    out_mb.push_back(out.release());
+    out_mb.push_back(std::move(out));
     if (first_copy < dec_size &&
         !buf::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(plain + first_copy, dec_size - first_copy),

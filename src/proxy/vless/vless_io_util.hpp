@@ -13,6 +13,9 @@ namespace acpp::vless {
 
 class VlessBufferedReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+
     explicit VlessBufferedReader(transport::MultiBufferReader& src) noexcept
         : src_(src) {}
 
@@ -51,13 +54,7 @@ private:
     buf::MultiBuffer pending_;
 
     void AppendToPending(buf::MultiBuffer mb) {
-        for (buf::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            pending_.push_back(mb.ReleaseSlot(buffer));
-        }
-        mb.clear();
+        mb.MoveTo(pending_);
     }
 };
 

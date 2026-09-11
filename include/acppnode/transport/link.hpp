@@ -2,8 +2,11 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/transport/link_error.hpp"
+#include "acppnode/transport/cancellation.hpp"
 
 #include <cstdint>
+#include <exception>
 #include <new>
 #include <span>
 #include <utility>
@@ -14,11 +17,26 @@ class AsyncStream;
 
 namespace acpp::transport {
 
+enum class EofAction : uint8_t {
+    WaitForPeer,
+    ShutdownPeerWrite,
+    CloseLink,
+};
+
+// A clean write-side end, detected before starting a write. The read side may
+// still contain previously received bytes, which relay must finish draining.
+class WriteClosed final : public std::exception {
+public:
+    const char* what() const noexcept override { return "link write side is closed"; }
+};
+
 class MultiBufferReader {
 public:
     virtual ~MultiBufferReader() noexcept = default;
 
     virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() = 0;
+    virtual CancellationSource& Cancellation() noexcept = 0;
+    virtual EofAction ReadEofAction() const noexcept { return EofAction::WaitForPeer; }
 };
 
 class MultiBufferWriter {
@@ -43,6 +61,7 @@ public:
         co_await WriteMultiBuffer(std::move(payload));
     }
     virtual net::awaitable<void> AsyncShutdownWrite() { co_return; }
+    virtual bool WriteShutdownClosesLink() const noexcept { return false; }
 };
 
 struct Link {

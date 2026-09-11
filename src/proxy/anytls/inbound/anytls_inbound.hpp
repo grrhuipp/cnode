@@ -2,7 +2,7 @@
 
 #include "acppnode/proxy/inbound.hpp"
 
-#include <string>
+#include <memory>
 
 namespace acpp {
 struct StatsShard;
@@ -10,6 +10,7 @@ struct StatsShard;
 
 namespace acpp::anytls {
 class Validator;
+class PaddingScheme;
 }  // namespace acpp::anytls
 
 namespace acpp::proxy::anytls::inbound {
@@ -28,8 +29,7 @@ public:
     Handler(::acpp::anytls::Validator& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
-            std::string padding_scheme_raw = {},
-            std::string padding_scheme_md5 = {});
+            std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme = {});
 
     net::awaitable<RelayResult> Process(
         std::unique_ptr<AsyncStream> stream,
@@ -44,8 +44,7 @@ private:
     ::acpp::anytls::Validator& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
-    std::string padding_scheme_raw_;
-    std::string padding_scheme_md5_;
+    std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme_;
 };
 
 }  // namespace acpp::proxy::anytls::inbound

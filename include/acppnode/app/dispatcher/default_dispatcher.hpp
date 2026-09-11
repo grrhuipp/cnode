@@ -1,12 +1,6 @@
 #pragma once
 
 #include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/app/relay_types.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/initial_payload.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -16,9 +10,9 @@ namespace acpp {
 
 class Outbound;
 
-namespace app::router {
+namespace routing {
 class Router;
-}  // namespace app::router
+}  // namespace routing
 
 namespace features::outbound {
 class Manager;
@@ -37,6 +31,10 @@ class DNS;
 
 namespace app::dispatcher {
 
+namespace detail {
+struct OutboundSelection;
+}
+
 // ============================================================================
 // DefaultDispatcher - app/dispatcher implementation
 //
@@ -48,7 +46,7 @@ class DefaultDispatcher final : public routing::Dispatcher {
 public:
     DefaultDispatcher() = default;
 
-    void BindRouter(app::router::Router& router) noexcept;
+    void BindRouter(const routing::Router& router) noexcept;
     void BindOutboundManager(features::outbound::Manager& outbound_manager) noexcept;
     void BindRequestPolicy(features::policy::RequestPolicy& request_policy) noexcept;
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
@@ -71,18 +69,6 @@ private:
         ErrorCode error;
     };
 
-    enum class RouteSource : uint8_t {
-        Forced,
-        Rule,
-        Fallback,
-    };
-
-    struct RouteSelection {
-        std::string_view outbound_tag;
-        RouteSource source;
-        uint32_t rule_index;
-    };
-
     net::awaitable<RelayResult> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
@@ -95,17 +81,17 @@ private:
         uint32_t pressure_idle_timeout);
     [[nodiscard]] std::shared_ptr<Outbound> ResolveOutboundHandler(
         std::string_view tag) const noexcept;
-    [[nodiscard]] RouteSelection SelectRoute(
+    [[nodiscard]] detail::OutboundSelection SelectRoute(
         session::Context& ctx,
-        const routing::DispatchPolicy& policy) const noexcept;
+        const routing::DispatchPolicy& policy) const;
     [[nodiscard]] RouteResult FinishRoute(
         session::Context& ctx,
-        const RouteSelection& selection) const noexcept;
+        const detail::OutboundSelection& selection) const;
     [[nodiscard]] net::awaitable<RouteResult> RouteAsync(
         session::Context& ctx,
         const routing::DispatchPolicy& policy);
 
-    app::router::Router* router_ = nullptr;
+    const routing::Router* router_ = nullptr;
     features::outbound::Manager* outbound_manager_ = nullptr;
     features::policy::RequestPolicy* request_policy_ = nullptr;
     app::SessionTrackingState* session_tracking_ = nullptr;

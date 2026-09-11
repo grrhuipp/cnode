@@ -95,7 +95,6 @@ struct UdpCallbackRouter::Impl {
             return false;
         }
 
-        bool removed_reverse_key = false;
         for (const auto& [target, state] : it->second.sent_targets) {
             (void)state;
             auto reverse_it = target_to_callbacks.find(target);
@@ -105,28 +104,22 @@ struct UdpCallbackRouter::Impl {
             auto& callbacks = reverse_it->second;
             if (callbacks.Remove(callback_id) && callbacks.Empty()) {
                 target_to_callbacks.erase(reverse_it);
-                removed_reverse_key = true;
             }
         }
         target_mapping_count -= std::min(
             target_mapping_count, it->second.sent_targets.size());
         registered_callbacks.erase(it);
-        MaybeShrinkHashContainer(registered_callbacks, 16);
-        if (removed_reverse_key) {
-            MaybeShrinkHashContainer(target_to_callbacks, 16);
-        }
         return true;
     }
 
     void ClearNow() noexcept {
         registered_callbacks.clear();
         target_to_callbacks.clear();
-        deferred_unregistrations.clear();
+        deferred_removals_pending = false;
         target_mapping_count = 0;
         clear_pending = false;
         MaybeShrinkHashContainer(registered_callbacks, 16);
         MaybeShrinkHashContainer(target_to_callbacks, 16);
-        TryShrinkSequence(deferred_unregistrations);
     }
 
     void FlushDeferredMutations() noexcept {
@@ -137,10 +130,14 @@ struct UdpCallbackRouter::Impl {
             ClearNow();
             return;
         }
-        for (uint64_t callback_id : deferred_unregistrations) {
-            (void)EraseCallback(callback_id);
+        if (!deferred_removals_pending) return;
+        for (auto it = registered_callbacks.begin(); it != registered_callbacks.end();) {
+            const auto callback_id = it->first;
+            const bool remove = it->second.pending_removal;
+            ++it;
+            if (remove) (void)EraseCallback(callback_id);
         }
-        deferred_unregistrations.clear();
+        deferred_removals_pending = false;
     }
 
     void RefreshTarget(
@@ -163,7 +160,7 @@ struct UdpCallbackRouter::Impl {
         UdpEndpointKey,
         CallbackIdList,
         UdpEndpointKeyHash> target_to_callbacks;
-    memory::ThreadLocalVector<uint64_t> deferred_unregistrations;
+    bool deferred_removals_pending = false;
     size_t target_mapping_count = 0;
     uint64_t next_callback_id = 1;
     uint64_t next_generation = 1;
@@ -231,7 +228,7 @@ uint64_t UdpCallbackRouter::Register(PacketCallback callback) {
     return callback_id;
 }
 
-bool UdpCallbackRouter::Unregister(uint64_t callback_id) {
+bool UdpCallbackRouter::Unregister(uint64_t callback_id) noexcept {
     auto it = impl_->registered_callbacks.find(callback_id);
     if (it == impl_->registered_callbacks.end()) {
         return false;
@@ -243,7 +240,7 @@ bool UdpCallbackRouter::Unregister(uint64_t callback_id) {
         return true;
     }
 
-    impl_->deferred_unregistrations.push_back(callback_id);
+    impl_->deferred_removals_pending = true;
     it->second.pending_removal = true;
     return true;
 }
@@ -363,7 +360,6 @@ void UdpCallbackRouter::Prune(steady_clock::time_point now) {
     impl_->next_target_prune_at = now + Impl::kTargetPruneInterval;
     const auto cutoff = now - Impl::kTargetMappingTtl;
 
-    bool removed_reverse_key = false;
     for (auto& [callback_id, entry] : impl_->registered_callbacks) {
         bool pruned_entry_targets = false;
         for (auto it = entry.sent_targets.begin();
@@ -378,7 +374,6 @@ void UdpCallbackRouter::Prune(steady_clock::time_point now) {
                 auto& callbacks = reverse_it->second;
                 if (callbacks.Remove(callback_id) && callbacks.Empty()) {
                     impl_->target_to_callbacks.erase(reverse_it);
-                    removed_reverse_key = true;
                 }
             }
             it = entry.sent_targets.erase(it);
@@ -390,9 +385,10 @@ void UdpCallbackRouter::Prune(steady_clock::time_point now) {
             MaybeShrinkHashContainer(entry.sent_targets, 16);
         }
     }
-    if (removed_reverse_key) {
-        MaybeShrinkHashContainer(impl_->target_to_callbacks, 16);
-    }
+    // Rehashing may allocate. Keep capacity maintenance on the periodic
+    // path, never in registration teardown or callback mutation draining.
+    MaybeShrinkHashContainer(impl_->registered_callbacks, 16);
+    MaybeShrinkHashContainer(impl_->target_to_callbacks, 16);
 }
 
 bool UdpCallbackRouter::Dispatch(

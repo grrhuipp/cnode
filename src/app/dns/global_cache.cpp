@@ -10,7 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace acpp::app::dns {
 
@@ -37,12 +39,6 @@ using EntryMap =
 
 struct ShardSnapshot {
     EntryMap entries;
-    uint64_t generation = 0;
-};
-
-struct PreparedUpdate {
-    std::string domain;
-    Entry entry;
 };
 
 std::atomic<std::shared_ptr<const Settings>>& GlobalSettings() {
@@ -169,40 +165,11 @@ void TrimShard(ShardSnapshot& snapshot, const Settings& settings, size_t shard_i
     }
 }
 
-std::optional<PreparedUpdate> PrepareUpdate(
-    const GlobalDnsCacheUpdate& update,
-    const Settings& settings,
-    time_point now) {
-    auto domain = ::acpp::domain::CanonicalDnsHostname(update.domain);
-    if (domain.empty()) {
-        return std::nullopt;
-    }
-
-    Entry entry;
-    entry.addresses = update.addresses;
-    entry.error_msg = update.error_msg;
-    entry.ttl = ClampTtl(update.ttl, settings);
-    entry.expire_time = now + std::chrono::seconds(entry.ttl);
-    entry.negative = update.negative;
-
-    if (!entry.negative && entry.addresses.empty()) {
-        return std::nullopt;
-    }
-
-    return PreparedUpdate{
-        .domain = std::move(domain),
-        .entry = std::move(entry),
-    };
-}
-
 void PublishShard(
     size_t shard_index,
-    std::span<const PreparedUpdate* const> updates,
+    const std::string& domain,
+    const Entry& entry,
     const Settings& settings) {
-    if (updates.empty() || ShardCapacity(settings, shard_index) == 0) {
-        return;
-    }
-
     auto& shard = GlobalShards()[shard_index];
     for (;;) {
         auto current = shard.load(std::memory_order_acquire);
@@ -210,14 +177,8 @@ void PublishShard(
             ? std::make_shared<ShardSnapshot>(*current)
             : std::make_shared<ShardSnapshot>();
 
-        for (const auto* update : updates) {
-            if (!update) {
-                continue;
-            }
-            next->entries[update->domain] = update->entry;
-        }
+        next->entries.insert_or_assign(domain, entry);
         TrimShard(*next, settings, shard_index);
-        next->generation = current ? current->generation + 1 : 1;
 
         std::shared_ptr<const ShardSnapshot> published = std::move(next);
         if (shard.compare_exchange_weak(
@@ -311,45 +272,23 @@ void GlobalDnsCache::PublishResult(std::string_view domain, const DnsResult& res
         return;
     }
 
-    GlobalDnsCacheUpdate update;
-    update.domain.assign(domain);
-    update.addresses = result.addresses;
-    update.error_msg = result.error_msg;
-    update.ttl = result.ttl;
-    update.negative = !result.Ok();
-    PublishBatch(std::span<const GlobalDnsCacheUpdate>(&update, 1));
-}
-
-void GlobalDnsCache::PublishBatch(std::span<const GlobalDnsCacheUpdate> updates) {
     auto settings = LoadSettings();
-    if (!settings || settings->max_entries == 0 || updates.empty()) {
+    if (!settings || settings->max_entries == 0) {
         return;
     }
 
-    const auto now = steady_clock::now();
-    std::vector<PreparedUpdate> prepared;
-    prepared.reserve(updates.size());
-    std::array<std::vector<const PreparedUpdate*>, kNumShards> grouped;
-
-    for (const auto& update : updates) {
-        auto item = PrepareUpdate(update, *settings, now);
-        if (!item) {
-            continue;
-        }
-        const size_t shard_index = ShardIndex(item->domain, *settings);
-        prepared.push_back(std::move(*item));
-        grouped[shard_index].push_back(&prepared.back());
+    auto canonical = ::acpp::domain::CanonicalDnsHostname(domain);
+    if (canonical.empty()) {
+        return;
     }
 
-    for (size_t i = 0; i < ActiveShardCount(*settings); ++i) {
-        if (grouped[i].empty()) {
-            continue;
-        }
-        PublishShard(
-            i,
-            std::span<const PreparedUpdate* const>(grouped[i].data(), grouped[i].size()),
-            *settings);
-    }
+    Entry entry;
+    entry.addresses = result.addresses;
+    entry.error_msg = result.error_msg;
+    entry.ttl = ClampTtl(result.ttl, *settings);
+    entry.expire_time = steady_clock::now() + std::chrono::seconds(entry.ttl);
+    entry.negative = !result.Ok();
+    PublishShard(ShardIndex(canonical, *settings), canonical, entry, *settings);
 }
 
 DnsCacheStats GlobalDnsCache::GetStats() {

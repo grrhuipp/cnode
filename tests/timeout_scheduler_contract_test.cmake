@@ -22,16 +22,6 @@ if(NOT SCHEDULER_HEADER MATCHES "TimeoutScheduler[*] owner_" OR
 endif()
 
 if(NOT SCHEDULER_SOURCE MATCHES
-       "if [(]waiting_[)]" OR
-   NOT SCHEDULER_SOURCE MATCHES
-       "ScheduledSleep does not support concurrent WaitFor calls" OR
-   NOT SCHEDULER_SOURCE MATCHES
-       "catch [(]...[)][\r\n ]*[{][\r\n ]*waiting_ = false;[\r\n ]*scheduler_[.]Cancel[(]token_[)]")
-    message(FATAL_ERROR
-        "ScheduledSleep must reject concurrent waiters and roll back failed waits")
-endif()
-
-if(NOT SCHEDULER_SOURCE MATCHES
        "void ClearThreadCache[(][)] noexcept" OR
    NOT SCHEDULER_SOURCE MATCHES
        "tl_cached_scheduler == &scheduler_" OR
@@ -64,17 +54,17 @@ endif()
 math(EXPR COMPACT_LENGTH "${COMPACT_END} - ${COMPACT_BEGIN}")
 string(SUBSTRING "${SCHEDULER_SOURCE}"
     ${COMPACT_BEGIN} ${COMPACT_LENGTH} COMPACT_SOURCE)
-if(NOT COMPACT_SOURCE MATCHES "try [{]" OR
-   NOT COMPACT_SOURCE MATCHES "catch [(]...[)]" OR
-   NOT COMPACT_SOURCE MATCHES "deadline_heap.swap[(]compacted[)]")
+if(COMPACT_SOURCE MATCHES "compacted.reserve" OR
+   NOT COMPACT_SOURCE MATCHES "std::erase_if[(]deadline_heap" OR
+   NOT COMPACT_SOURCE MATCHES "std::make_heap[(]deadline_heap.begin[(][)]")
     message(FATAL_ERROR
-        "timeout heap compaction must be transactional and non-throwing")
+        "timeout heap compaction must reclaim trivial entries in place without allocating")
 endif()
 
 string(FIND "${SCHEDULER_SOURCE}"
     "void TimeoutScheduler::Cancel" CANCEL_BEGIN)
 string(FIND "${SCHEDULER_SOURCE}"
-    "ScheduledSleep::ScheduledSleep" CANCEL_END)
+    "}  // namespace acpp" CANCEL_END)
 if(CANCEL_BEGIN EQUAL -1 OR CANCEL_END EQUAL -1 OR
    NOT CANCEL_BEGIN LESS CANCEL_END)
     message(FATAL_ERROR "could not isolate timeout cancellation")

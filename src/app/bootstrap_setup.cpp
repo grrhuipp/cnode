@@ -1,4 +1,5 @@
 #include "acppnode/app/bootstrap_setup.hpp"
+#include "startup_inbounds.hpp"
 
 #include "acppnode/app/bootstrap_inbounds.hpp"
 #include "acppnode/app/bootstrap_panels.hpp"
@@ -6,7 +7,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/static_inbound_runtime.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/infra/log.hpp"
@@ -143,13 +144,17 @@ uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
         : 0;
 }
 
-WorkerRuntimeConfig MakeWorkerRuntimeConfig(const Config& config) {
+WorkerRuntimeConfig MakeWorkerRuntimeConfig(
+    const Config& config, const std::vector<PreparedStartupInbound>& inbounds) {
     WorkerRuntimeConfig runtime_config;
     runtime_config.dns = MakeDnsServiceConfig(config);
     runtime_config.timeouts = config.GetTimeouts();
     runtime_config.limits = config.GetLimits();
     runtime_config.routing = config.GetRouting();
-    runtime_config.static_inbounds = BuildStaticInboundRuntimeEntries(config.GetStaticInbounds());
+    runtime_config.static_inbounds.reserve(inbounds.size());
+    for (const auto& inbound : inbounds) {
+        runtime_config.static_inbounds.push_back(inbound.runtime);
+    }
     runtime_config.outbounds = config.GetPreparedOutbounds();
     runtime_config.workers = config.GetWorkers();
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
@@ -183,25 +188,37 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     const Config& config,
     bool test_mode) {
     BootstrapEnvironment env;
+    const bool enable_test_mode =
+        test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
+    const auto inbounds = PrepareStartupInbounds(config.GetStaticInbounds(), enable_test_mode);
     env.main_ctx = std::make_unique<net::io_context>();
     env.panel_dns_service = std::make_unique<app::dns::DNS>(
         *env.main_ctx, MakeDnsServiceConfig(config));
     env.geo_manager = CreateGeoManager(config);
     env.stats = std::make_unique<ShardedStats>(config.GetWorkers());
     env.connection_limiters = CreateConnectionLimiters(config);
-    const WorkerRuntimeConfig worker_runtime_config = MakeWorkerRuntimeConfig(config);
+    const WorkerRuntimeConfig worker_runtime_config = MakeWorkerRuntimeConfig(config, inbounds);
     env.worker_pool = CreateWorkerPool(worker_runtime_config, *env.stats, env.geo_manager.get());
     env.controller = std::make_unique<Controller>(
         *env.main_ctx, env.worker_pool.workers, env.connection_limiters);
 
     SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
-    const bool enable_test_mode =
-        test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
+    // Every source and protocol payload is prepared before one RCU publication.
+    // These borrowed references stay in this synchronous cold-path call.
+    std::vector<proxyman::inbound::UserStore::UserUpdate> user_updates;
+    user_updates.reserve(inbounds.size());
+    for (const auto& inbound : inbounds) {
+        user_updates.push_back({inbound.runtime.tag, inbound.users});
+    }
+    proxyman::inbound::UserStore::ApplyUsers(user_updates);
+    if (enable_test_mode) {
+        LOG_CONSOLE("test_mode enabled port={} uuid={}",
+                    constants::test::kTestPort, constants::test::kTestVmessUuid);
+    }
     env.inbound_startup = QueueInboundStartup(
         worker_runtime_config.static_inbounds,
         env.worker_pool.workers,
-        env.connection_limiters,
-        enable_test_mode);
+        env.connection_limiters);
 
     env.enable_controller = !config.GetPanels().empty();
     return env;
@@ -214,7 +231,6 @@ RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {
         env.worker_pool.workers,
         *env.controller,
         env.worker_pool.io_contexts,
-        env.worker_pool.work_guards,
         env.inbound_startup,
         env.enable_controller,
     };

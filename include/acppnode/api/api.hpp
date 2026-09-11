@@ -6,6 +6,7 @@
 #include "acppnode/common/rule_types.hpp"
 #include "acppnode/core/constants.hpp"
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@ struct Config {
     std::string Name;
     std::string APIHost;
     std::string Key;
+    std::chrono::seconds RequestTimeout{defaults::kPanelRequestTimeout};
     int NodeID = 0;
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
 };
@@ -95,13 +97,6 @@ struct NodeStatus {
 
 using DetectRule = ::acpp::rule::DetectRule;
 using DetectResult = ::acpp::rule::DetectResult;
-
-struct ClientInfo {
-    std::string APIHost;
-    int NodeID = 0;
-    std::string Key;
-    std::string NodeType;
-};
 
 }  // namespace api
 
@@ -195,8 +190,6 @@ class API {
 public:
     virtual ~API() noexcept = default;
 
-    virtual void CancelPending() noexcept = 0;
-
     virtual net::awaitable<NodeInfoFetchResult>
     GetNodeInfo() = 0;
 
@@ -211,8 +204,6 @@ public:
 
     virtual net::awaitable<bool>
     ReportUserTraffic(const std::vector<api::UserTraffic>& data) = 0;
-
-    virtual ClientInfo Describe() const = 0;
 
     virtual net::awaitable<RuleListFetchResult>
     GetNodeRule() = 0;

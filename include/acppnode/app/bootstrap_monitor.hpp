@@ -1,10 +1,10 @@
 #pragma once
 
-#include "acppnode/app/bootstrap_runtime.hpp"
-
 #include <memory>
 
 namespace acpp {
+
+struct RuntimeContext;
 
 class RuntimeMonitor {
 public:
@@ -17,11 +17,10 @@ public:
     RuntimeMonitor& operator=(RuntimeMonitor&&) = delete;
 
     void Start();
-    net::awaitable<void> Stop();
 
 private:
     struct Impl;
-    std::shared_ptr<Impl> impl_;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp

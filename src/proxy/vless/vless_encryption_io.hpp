@@ -17,6 +17,9 @@ namespace acpp::vless {
 
 class VlessEncryptionReader final : public transport::MultiBufferReader {
 public:
+    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
+
     [[nodiscard]] static std::optional<VlessEncryptionReader> Create(
         transport::MultiBufferReader& src,
         std::span<const uint8_t> read_context,

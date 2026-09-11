@@ -1,9 +1,7 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
-#include "../shadowsocks_protocol.hpp"
+#include "ss_outbound_credentials.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 
@@ -14,7 +12,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 class UDPSession;
@@ -36,8 +33,6 @@ struct SsOutboundConfig {
     std::string            address;
     std::optional<net::ip::address> literal_address;
     uint16_t               port    = 8388;
-    std::string            password;
-    std::string            method  = std::string(constants::protocol::kAes256Gcm);
     StreamSettings         stream_settings;
     OutboundBind           send_through;
     std::chrono::seconds   timeout{10};
@@ -54,6 +49,7 @@ class Handler final : public ::acpp::Outbound {
 public:
     Handler(std::string tag,
             const ::acpp::SsOutboundConfig& config,
+            const Credentials& credentials,
             ::acpp::app::dns::DNS& dns_service,
             ::acpp::UDPSessionManager* udp_session_manager);
 
@@ -67,8 +63,7 @@ public:
         ::acpp::transport::Link inbound,
         ::acpp::StatsShard& stats,
         const ::acpp::RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        ::acpp::buf::MultiBuffer& first_payload,
+        ::acpp::buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
@@ -76,13 +71,10 @@ public:
 
 private:
     std::string tag_;
-    ::acpp::SsOutboundConfig config_;
+    const ::acpp::SsOutboundConfig config_;
+    const Credentials credentials_;
     ::acpp::app::dns::DNS& dns_service_;
     ::acpp::UDPSessionManager* udp_session_manager_ = nullptr;
-    ::acpp::ss::SsCipherInfo cipher_info_;
-    ::acpp::ss::KeyBytes master_key_;
-    std::vector<::acpp::ss::KeyBytes> psk_chain_;
-    ::acpp::StreamSettings stream_settings_;
 };
 
 }  // namespace proxy::shadowsocks::outbound

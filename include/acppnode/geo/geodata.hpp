@@ -33,8 +33,6 @@ public:
 
     GeoManager(const GeoManager&) = delete;
     GeoManager& operator=(const GeoManager&) = delete;
-    GeoManager(GeoManager&&) noexcept;
-    GeoManager& operator=(GeoManager&&) noexcept;
 
     // 初始化
     bool Init(const std::filesystem::path& geoip_path,
@@ -44,9 +42,6 @@ public:
     // 预加载完成后会自动启用无锁查询
     void PreloadTags(const std::vector<std::string>& geoip_tags,
                      const std::vector<std::string>& geosite_tags);
-
-    bool MatchGeoIP(std::string_view tag, const net::ip::address& ip) const;
-    bool MatchGeoSite(std::string_view tag, std::string_view domain) const;
 
     // Cold path: resolve route geo tags to immutable loaded datasets. Hot path
     // can then skip tag normalization and hash lookups.

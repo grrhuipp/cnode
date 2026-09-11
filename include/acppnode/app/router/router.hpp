@@ -1,8 +1,8 @@
 #pragma once
 
-#include <cstdint>
+#include "acppnode/features/routing/router.hpp"
+
 #include <memory>
-#include <string_view>
 
 namespace acpp::geo {
 class GeoManager;
@@ -10,40 +10,27 @@ class GeoManager;
 
 namespace acpp {
 struct RoutingConfig;
-enum class RoutingDomainStrategy : uint8_t;
-namespace session {
-struct Context;
-}  // namespace session
 }  // namespace acpp
 
 namespace acpp::app::router {
 
-struct RouteDecision {
-    std::string_view outbound_tag;
-    bool matched = false;
-    uint32_t rule_index = 0;
-};
-
-class Router {
+class Router final : public routing::Router {
 public:
-    Router();
-    ~Router() noexcept;
+    // Build on the owning Worker before binding to Dispatcher. Failed builds
+    // never publish partial matchers, and a published Router cannot be changed.
+    Router(const RoutingConfig& config, const ::acpp::geo::GeoManager* geo_manager);
+    ~Router() noexcept override;
     Router(const Router&) = delete;
     Router& operator=(const Router&) = delete;
 
-    // Cold path: build immutable routing matchers from normalized runtime config.
-    void Configure(
-        const RoutingConfig& routing,
-        ::acpp::geo::GeoManager* geo_manager);
-
     // Hot path: return a tag only when a normalized routing rule matches.
-    [[nodiscard]] RouteDecision Route(const session::Context& ctx) const;
+    [[nodiscard]] routing::RouteDecision Route(const session::Context& ctx) const override;
 
-    [[nodiscard]] ::acpp::RoutingDomainStrategy DomainStrategy() const noexcept;
+    [[nodiscard]] routing::DomainStrategy DomainStrategy() const noexcept override;
 
 private:
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::unique_ptr<const Impl> impl_;
 };
 
 }  // namespace acpp::app::router

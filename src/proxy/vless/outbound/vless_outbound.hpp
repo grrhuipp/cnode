@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/core/constants.hpp"
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
@@ -29,9 +28,8 @@ struct VlessOutboundConfig {
     std::string address;
     std::optional<net::ip::address> literal_address;
     uint16_t port = 443;
-    std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
-    std::string encryption = std::string(constants::protocol::kNone);
+    std::shared_ptr<const vless::VlessEncryptionConfig> encryption;
     std::string flow;
     bool packet_xudp = true;
     bool packet_addr = false;
@@ -59,8 +57,7 @@ public:
         ::acpp::transport::Link inbound,
         ::acpp::StatsShard& stats,
         const ::acpp::RelayConfig& relay_config,
-        std::span<const uint8_t> initial_payload,
-        ::acpp::buf::MultiBuffer& first_payload,
+        ::acpp::buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
@@ -68,12 +65,10 @@ public:
 
 private:
     std::string tag_;
-    ::acpp::VlessOutboundConfig config_;
+    const ::acpp::VlessOutboundConfig config_;
     ::acpp::app::dns::DNS& dns_service_;
-    std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> encryption_;
     std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
         encryption_tickets_;
-    bool config_valid_ = false;
 };
 
 }  // namespace proxy::vless::outbound

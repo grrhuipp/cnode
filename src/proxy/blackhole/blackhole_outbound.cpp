@@ -39,8 +39,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     transport::Link inbound,
     StatsShard& /*stats*/,
     const RelayConfig& /*relay_config*/,
-    std::span<const uint8_t> /*initial_payload*/,
-    buf::MultiBuffer& first_payload,
+    buf::MultiBuffer first_payload,
     std::chrono::seconds /*relay_idle_timeout*/,
     std::chrono::seconds /*relay_write_timeout*/) {
     first_payload.clear();

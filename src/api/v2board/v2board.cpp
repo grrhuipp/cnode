@@ -1,11 +1,13 @@
 #include "acppnode/api/panel_factory.hpp"
+#include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/infra/json.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
 #include "http_response.hpp"
+#include "request_task.hpp"
 #include "node_info_json.hpp"
 #include "online_report.hpp"
 #include "user_list_json.hpp"
@@ -16,8 +18,7 @@
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
 #include <asio/write.hpp>
-#include <asio/steady_timer.hpp>
-#include <algorithm>
+#include <asio/cancel_after.hpp>
 #include <cctype>
 #include <charconv>
 #include <format>
@@ -59,9 +60,6 @@ public:
     APIClient(net::io_context& io_context, const ::acpp::api::Config& config,
               ::acpp::app::dns::DNS& dns_service);
     ~APIClient() override;
-
-    ::acpp::api::ClientInfo Describe() const override;
-    void CancelPending() noexcept override;
 
     net::awaitable<NodeInfoFetchResult>
     GetNodeInfo() override;
@@ -253,33 +251,6 @@ net::awaitable<void> WriteHttpRequest(Stream& stream, const std::string& request
     co_await net::async_write(stream, net::buffer(request), net::use_awaitable);
 }
 
-class ActiveSocketRegistration {
-public:
-    using Socket = tcp::socket::lowest_layer_type;
-
-    ActiveSocketRegistration(
-        std::vector<Socket*>& sockets,
-        Socket& socket)
-        : sockets_(sockets)
-        , socket_(&socket) {
-        sockets_.push_back(socket_);
-    }
-
-    ~ActiveSocketRegistration() {
-        const auto entry = std::ranges::find(sockets_, socket_);
-        if (entry != sockets_.end()) {
-            sockets_.erase(entry);
-        }
-    }
-
-    ActiveSocketRegistration(const ActiveSocketRegistration&) = delete;
-    ActiveSocketRegistration& operator=(const ActiveSocketRegistration&) = delete;
-
-private:
-    std::vector<Socket*>& sockets_;
-    Socket* socket_;
-};
-
 }  // namespace
 
 // ============================================================================
@@ -293,7 +264,6 @@ struct APIClient::Impl {
          const ::acpp::api::Config& config,
          ::acpp::app::dns::DNS& dns_service);
 
-    [[nodiscard]] ::acpp::api::ClientInfo Describe() const;
     [[nodiscard]] std::string ApiNodeType() const;
 
     net::ssl::context* GetOrCreateHttpsContext();
@@ -310,6 +280,12 @@ struct APIClient::Impl {
                 const std::optional<json::value>& body,
                 const std::string& if_none_match = "");
 
+    net::awaitable<HttpResponse>
+    HttpExchange(HttpMethod method,
+                 const std::string& path,
+                 const std::optional<json::value>& body,
+                 const std::string& if_none_match);
+
     net::awaitable<NodeInfoFetchResult> GetNodeInfo();
     net::awaitable<UserListFetchResult> GetUserList();
     net::awaitable<bool> ReportNodeStatus(const ::acpp::api::NodeStatus& node_status);
@@ -317,7 +293,6 @@ struct APIClient::Impl {
     net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
     net::awaitable<RuleListFetchResult> GetNodeRule();
     net::awaitable<bool> ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results);
-    void CancelPending() noexcept;
     void Debug();
 
     net::io_context& io_context_;
@@ -331,8 +306,6 @@ struct APIClient::Impl {
     std::optional<::acpp::api::NodeInfo> cached_config_;
     std::vector<::acpp::api::DetectRule> cached_route_rules_;
     std::unique_ptr<net::ssl::context> https_context_;
-    std::vector<ActiveSocketRegistration::Socket*> active_sockets_;
-    uint64_t cancel_epoch_ = 0;
     bool debug_enabled_ = false;
 };
 
@@ -343,21 +316,17 @@ APIClient::Impl::Impl(net::io_context& io_context,
     , config_(config)
     , dns_service_(dns_service) {
 
+    if (config_.RequestTimeout <= std::chrono::seconds::zero() ||
+        config_.RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
+        throw std::invalid_argument("API RequestTimeout is outside the supported range");
+    }
+
     auto parts = ParseUrl(config.APIHost);
     if (!parts) {
         throw std::invalid_argument(std::format(
             "V2Board[{}]: invalid API host: {}", config.Name, config.APIHost));
     }
     url_parts_ = std::move(*parts);
-}
-
-::acpp::api::ClientInfo APIClient::Impl::Describe() const {
-    return ::acpp::api::ClientInfo{
-        .APIHost = config_.APIHost,
-        .NodeID = config_.NodeID,
-        .Key = config_.Key,
-        .NodeType = config_.NodeType,
-    };
 }
 
 std::string APIClient::Impl::ApiNodeType() const {
@@ -433,10 +402,13 @@ static std::optional<UrlParts> ParseUrl(const std::string& url) {
         parts.port = parts.use_ssl ? 443 : 80;
     }
 
-    IoErrorCode ec;
-    auto literal = net::ip::make_address(parts.host, ec);
-    if (!ec) {
-        parts.literal_address = literal;
+    parts.literal_address = iputil::ParseLiteral(parts.host);
+    if (authority.front() == '[') {
+        if (!parts.literal_address || !parts.literal_address->is_v6()) return std::nullopt;
+    } else if (parts.host.find(':') != std::string::npos ||
+               (!parts.literal_address && !domain::IsValidDnsHostname(
+                   parts.host, domain::TrailingDotPolicy::Allow))) {
+        return std::nullopt;
     }
 
     // 移除末尾斜杠
@@ -478,213 +450,191 @@ net::ssl::context* APIClient::Impl::GetOrCreateHttpsContext() {
 
 net::awaitable<HttpResponse>
 APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
+                           const std::optional<json::value>& body,
+                           const std::string& if_none_match) {
+    co_return co_await http::RunRequest(
+        HttpExchange(method, path, body, if_none_match), config_.RequestTimeout);
+}
+
+net::awaitable<HttpResponse>
+APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
                           const std::optional<json::value>& body,
                           const std::string& if_none_match) {
 
     HttpResponse result;
-    const uint64_t request_epoch = cancel_epoch_;
-    const auto cancelled = [&]() noexcept {
-        return request_epoch != cancel_epoch_;
-    };
 
-    try {
-        if (url_parts_.host.empty() || url_parts_.port == 0) {
-            result.status = -1;
-            result.body = "invalid API host";
-            co_return result;
-        }
-
-        // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
-        std::vector<tcp::endpoint> endpoints;
-        const uint16_t port = url_parts_.port;
-
-        if (url_parts_.literal_address) {
-            endpoints.emplace_back(*url_parts_.literal_address, port);
-        } else {
-            auto dns_result = co_await dns_service_.Resolve(url_parts_.host);
-            if (cancelled()) {
-                result.status = -1;
-                result.body = "request cancelled";
-                co_return result;
-            }
-            if (!dns_result.Ok() || dns_result.addresses.empty()) {
-                result.status = 0;
-                result.body = "DNS resolve failed for " + url_parts_.host;
-                co_return result;
-            }
-            endpoints.reserve(dns_result.addresses.size());
-            for (const auto& address : dns_result.addresses) {
-                endpoints.emplace_back(address, port);
-            }
-        }
-
-        if (endpoints.empty()) {
-            result.status = 0;
-            result.body = "DNS resolve failed";
-            co_return result;
-        }
-
-        // 构建完整路径（所有请求都在 URL 参数中传 token）
-        std::string full_path = url_parts_.path_prefix + path;
-        if (full_path.find('?') != std::string::npos) {
-            full_path += "&token=" + config_.Key;
-        } else {
-            full_path += "?token=" + config_.Key;
-        }
-
-        std::string body_text;
-        if (body.has_value()) {
-            body_text = json::serialize(*body);
-        }
-
-        std::string request;
-        request.reserve(512 + body_text.size());
-        request += MethodName(method);
-        request += ' ';
-        request += full_path.empty() ? "/" : full_path;
-        request += " HTTP/1.1\r\nHost: ";
-        request += iputil::FormatHttpHostHeader(url_parts_.host, port, url_parts_.use_ssl);
-        request += "\r\nUser-Agent: acppnode/1.0\r\nAuthorization: Bearer ";
-        request += config_.Key;
-        request += "\r\nX-API-Key: ";
-        request += config_.Key;
-        request += "\r\nAccept: application/json\r\nConnection: close\r\n";
-        if (!if_none_match.empty()) {
-            request += "If-None-Match: ";
-            request += if_none_match;
-            request += "\r\n";
-        }
-        if (body.has_value()) {
-            request += "Content-Type: application/json\r\nContent-Length: ";
-            request += std::to_string(body_text.size());
-            request += "\r\n";
-        }
-        request += "\r\n";
-        request += body_text;
-
-        if (debug_enabled_) {
-            LOG_DEBUG("V2Board[{}]: {} {}", config_.Name, MethodName(method), path);
-        }
-
-        if (url_parts_.use_ssl) {
-            // HTTPS
-            auto ssl_ctx = GetOrCreateHttpsContext();
-            if (!ssl_ctx) {
-                result.status = -1;
-                result.body = "SSL context init failed";
-                co_return result;
-            }
-
-            std::string last_error;
-            for (const auto& endpoint : endpoints) {
-                if (cancelled()) {
-                    result.status = -1;
-                    result.body = "request cancelled";
-                    co_return result;
-                }
-                try {
-                    ssl::stream<tcp::socket> stream(io_context_, *ssl_ctx);
-                    ActiveSocketRegistration socket_registration(
-                        active_sockets_, stream.lowest_layer());
-                    if (url_parts_.literal_address) {
-                        auto* verify_param = SSL_get0_param(stream.native_handle());
-                        if (!verify_param ||
-                            X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
-                            result.status = -1;
-                            result.body = "SSL IP verify param error";
-                            co_return result;
-                        }
-                    } else {
-                        stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
-
-                        if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
-                            result.status = -1;
-                            result.body = "SSL SNI error";
-                            co_return result;
-                        }
-                    }
-
-                    co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
-                    co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
-
-                    co_await WriteHttpRequest(stream, request);
-                    result = co_await http::ReadResponse(stream);
-                    if (debug_enabled_) {
-                        LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
-                                  config_.Name, MethodName(method), path, result.status);
-                    }
-
-                    IoErrorCode ec;
-                    co_await stream.async_shutdown(net::redirect_error(net::use_awaitable, ec));
-                    co_return result;
-                } catch (const std::exception& e) {
-                    if (cancelled()) {
-                        result.status = -1;
-                        result.body = "request cancelled";
-                        co_return result;
-                    }
-                    last_error = e.what();
-                    LOG_DEBUG("V2Board[{}]: HTTPS endpoint {} failed: {}",
-                              config_.Name,
-                              iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
-                              last_error);
-                }
-            }
-            result.status = -1;
-            result.body = last_error.empty() ? "HTTPS connect failed" : last_error;
-
-        } else {
-            // HTTP
-            std::string last_error;
-            for (const auto& endpoint : endpoints) {
-                if (cancelled()) {
-                    result.status = -1;
-                    result.body = "request cancelled";
-                    co_return result;
-                }
-                try {
-                    tcp::socket stream(io_context_);
-                    ActiveSocketRegistration socket_registration(
-                        active_sockets_, stream);
-
-                    co_await stream.async_connect(endpoint, net::use_awaitable);
-
-                    co_await WriteHttpRequest(stream, request);
-                    result = co_await http::ReadResponse(stream);
-                    if (debug_enabled_) {
-                        LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
-                                  config_.Name, MethodName(method), path, result.status);
-                    }
-
-                    IoErrorCode ec;
-                    stream.shutdown(tcp::socket::shutdown_both, ec);
-                    stream.close(ec);
-                    co_return result;
-                } catch (const std::exception& e) {
-                    if (cancelled()) {
-                        result.status = -1;
-                        result.body = "request cancelled";
-                        co_return result;
-                    }
-                    last_error = e.what();
-                    LOG_DEBUG("V2Board[{}]: HTTP endpoint {} failed: {}",
-                              config_.Name,
-                              iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
-                              last_error);
-                }
-            }
-            result.status = -1;
-            result.body = last_error.empty() ? "HTTP connect failed" : last_error;
-        }
-
-        co_return result;
-
-    } catch (const std::exception& e) {
-        LOG_DEBUG("V2Board[{}]: HTTP error: {}", config_.Name, e.what());
+    if (url_parts_.host.empty() || url_parts_.port == 0) {
         result.status = -1;
-        result.body = e.what();
+        result.body = "invalid API host";
         co_return result;
     }
+
+    // 面板同步是冷路径；保留完整候选地址，避免双栈环境只尝试第一个解析结果。
+    std::vector<tcp::endpoint> endpoints;
+    const uint16_t port = url_parts_.port;
+
+    if (url_parts_.literal_address) {
+        endpoints.emplace_back(*url_parts_.literal_address, port);
+    } else {
+        auto dns_result = co_await dns_service_.Resolve(url_parts_.host);
+        if (!dns_result.Ok() || dns_result.addresses.empty()) {
+            result.status = 0;
+            result.body = "DNS resolve failed for " + url_parts_.host;
+            co_return result;
+        }
+        endpoints.reserve(dns_result.addresses.size());
+        for (const auto& address : dns_result.addresses) {
+            endpoints.emplace_back(address, port);
+        }
+    }
+
+    if (endpoints.empty()) {
+        result.status = 0;
+        result.body = "DNS resolve failed";
+        co_return result;
+    }
+
+    // 构建完整路径（所有请求都在 URL 参数中传 token）
+    std::string full_path = url_parts_.path_prefix + path;
+    if (full_path.find('?') != std::string::npos) {
+        full_path += "&token=" + config_.Key;
+    } else {
+        full_path += "?token=" + config_.Key;
+    }
+
+    std::string body_text;
+    if (body.has_value()) {
+        body_text = json::serialize(*body);
+    }
+
+    std::string request;
+    request.reserve(512 + body_text.size());
+    request += MethodName(method);
+    request += ' ';
+    request += full_path.empty() ? "/" : full_path;
+    request += " HTTP/1.1\r\nHost: ";
+    request += iputil::FormatHttpHostHeader(url_parts_.host, port, url_parts_.use_ssl);
+    request += "\r\nUser-Agent: acppnode/1.0\r\nAuthorization: Bearer ";
+    request += config_.Key;
+    request += "\r\nX-API-Key: ";
+    request += config_.Key;
+    request += "\r\nAccept: application/json\r\nConnection: close\r\n";
+    if (!if_none_match.empty()) {
+        request += "If-None-Match: ";
+        request += if_none_match;
+        request += "\r\n";
+    }
+    if (body.has_value()) {
+        request += "Content-Type: application/json\r\nContent-Length: ";
+        request += std::to_string(body_text.size());
+        request += "\r\n";
+    }
+    request += "\r\n";
+    request += body_text;
+
+    if (debug_enabled_) {
+        LOG_DEBUG("V2Board[{}]: {} {}", config_.Name, MethodName(method), path);
+    }
+
+    if (url_parts_.use_ssl) {
+        // HTTPS
+        auto ssl_ctx = GetOrCreateHttpsContext();
+        if (!ssl_ctx) {
+            result.status = -1;
+            result.body = "SSL context init failed";
+            co_return result;
+        }
+
+        std::string last_error;
+        for (const auto& endpoint : endpoints) {
+            ssl::stream<tcp::socket> stream(io_context_, *ssl_ctx);
+            try {
+                if (url_parts_.literal_address) {
+                    auto* verify_param = SSL_get0_param(stream.native_handle());
+                    if (!verify_param ||
+                        X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
+                        result.status = -1;
+                        result.body = "SSL IP verify param error";
+                        co_return result;
+                    }
+                } else {
+                    stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
+
+                    if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
+                        result.status = -1;
+                        result.body = "SSL SNI error";
+                        co_return result;
+                    }
+                }
+
+                co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
+                co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+            } catch (const std::exception& e) {
+                last_error = e.what();
+                LOG_DEBUG("V2Board[{}]: HTTPS endpoint {} failed: {}",
+                          config_.Name,
+                          iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
+                          last_error);
+                continue;
+            }
+
+            // Only connection setup may try another address. Once HTTP
+            // transmission starts, a failure cannot prove the peer did not
+            // apply the request (in particular, an additive traffic POST).
+            co_await WriteHttpRequest(stream, request);
+            result = co_await http::ReadResponse(stream);
+            if (debug_enabled_) {
+                LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
+                          config_.Name, MethodName(method), path, result.status);
+            }
+
+            // The HTTP response is complete. TLS close_notify is best effort
+            // and must neither stall indefinitely nor invalidate that response.
+            try {
+                IoErrorCode ec;
+                co_await stream.async_shutdown(net::cancel_after(std::chrono::seconds(1),
+                    net::redirect_error(net::use_awaitable, ec)));
+            } catch (const std::exception&) {
+            }
+            co_return result;
+        }
+        result.status = -1;
+        result.body = last_error.empty() ? "HTTPS connect failed" : last_error;
+
+    } else {
+        // HTTP
+        std::string last_error;
+        for (const auto& endpoint : endpoints) {
+            tcp::socket stream(io_context_);
+            try {
+                co_await stream.async_connect(endpoint, net::use_awaitable);
+            } catch (const std::exception& e) {
+                last_error = e.what();
+                LOG_DEBUG("V2Board[{}]: HTTP endpoint {} failed: {}",
+                          config_.Name,
+                          iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
+                          last_error);
+                continue;
+            }
+
+            co_await WriteHttpRequest(stream, request);
+            result = co_await http::ReadResponse(stream);
+            if (debug_enabled_) {
+                LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
+                          config_.Name, MethodName(method), path, result.status);
+            }
+
+            IoErrorCode ec;
+            stream.shutdown(tcp::socket::shutdown_both, ec);
+            stream.close(ec);
+            co_return result;
+        }
+        result.status = -1;
+        result.body = last_error.empty() ? "HTTP connect failed" : last_error;
+    }
+
+    co_return result;
+
 }
 
 net::awaitable<NodeInfoFetchResult>
@@ -874,15 +824,6 @@ APIClient::Impl::GetNodeRule() {
     co_return RuleListFetchResult::Success(cached_route_rules_);
 }
 
-void APIClient::Impl::CancelPending() noexcept {
-    ++cancel_epoch_;
-    for (ActiveSocketRegistration::Socket* socket : active_sockets_) {
-        IoErrorCode ignored;
-        socket->cancel(ignored);
-        socket->close(ignored);
-    }
-}
-
 net::awaitable<bool>
 APIClient::Impl::ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results) {
     (void)detect_results;
@@ -900,13 +841,6 @@ APIClient::APIClient(net::io_context& io_context,
 
 APIClient::~APIClient() = default;
 
-::acpp::api::ClientInfo APIClient::Describe() const {
-    return impl_->Describe();
-}
-
-void APIClient::CancelPending() noexcept {
-    impl_->CancelPending();
-}
 
 net::awaitable<NodeInfoFetchResult>
 APIClient::GetNodeInfo() {
