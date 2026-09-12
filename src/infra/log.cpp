@@ -125,6 +125,20 @@ std::string FormatRecord(const LogRecord& record) {
         return std::format("{} {}", timestamp, message);
     }
     if (record.connection) {
+        if (record.connection->user_id > 0) {
+            const auto inbound_tag = record.connection->inbound_tag.empty()
+                ? std::string{"unknown"}
+                : SingleLine(record.connection->inbound_tag);
+            return std::format(
+                "{} [{}] [{}] {}: inbound={} user={} {}",
+                timestamp,
+                LevelName(record.level),
+                record.connection->conn_id,
+                ComponentName(record.source_file),
+                inbound_tag,
+                record.connection->user_id,
+                message);
+        }
         return std::format(
             "{} [{}] [{}] {}: {}",
             timestamp,

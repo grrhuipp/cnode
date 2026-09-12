@@ -22,7 +22,7 @@ async def run_case(binary, output, mode):
     certificates = Path(__file__).resolve().parent / 'fixtures/anytls-pool'
     capacity = mode.startswith('capacity')
     version = 1 if mode == 'capacity-v1' else 2
-    config = {'workers': 1, 'log': {'disableUpload': True, 'logDir': str(output / 'logs')},
+    config = {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')},
               'timeouts': {'handshake': 3 if capacity else 1, 'connIdle': 3, 'uplinkOnly': 2, 'downlinkOnly': 2},
               'panels': [{'Name': 'handshake-budget', 'Type': 'V2board',
                           'APIHost': f'http://127.0.0.1:{panel.sockets[0].getsockname()[1]}',

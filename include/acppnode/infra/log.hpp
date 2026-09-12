@@ -7,6 +7,7 @@
 #include <source_location>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace acpp {
 
@@ -21,6 +22,8 @@ enum class LogLevel {
 
 struct ConnectionLogContext {
     uint64_t conn_id{0};
+    std::string inbound_tag;
+    int64_t user_id{0};
 };
 
 // Xray-compatible local logging:
@@ -64,11 +67,25 @@ public:
         const Context& context,
         std::string message,
         std::source_location location = std::source_location::current()) {
+        ConnectionLogContext log_context{
+            .conn_id = context.conn_id,
+        };
+        if constexpr (requires {
+                          std::string(context.inbound.tag);
+                          static_cast<int64_t>(context.inbound.user_id);
+                      }) {
+            const auto user_id =
+                static_cast<int64_t>(context.inbound.user_id);
+            if (user_id > 0) {
+                // The backend is asynchronous, so own the tag instead of
+                // retaining a view into a replaceable runtime snapshot.
+                log_context.inbound_tag = std::string(context.inbound.tag);
+                log_context.user_id = user_id;
+            }
+        }
         WriteConnection(
             level,
-            ConnectionLogContext{
-                .conn_id = context.conn_id,
-            },
+            std::move(log_context),
             std::move(message),
             location);
     }

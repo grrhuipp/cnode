@@ -4,7 +4,7 @@
     "access": "/var/log/cnode/access.log",
     "error": "/var/log/cnode/error.log",
     "logDir": "/var/log/cnode",
-    "disableUpload": false
+    "enable": false
   },
   "workers": 0,
   "dns": {

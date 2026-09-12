@@ -224,7 +224,7 @@ async def run_case(binary, output, minimum, mode='complete', timeouts=None):
         reserved.bind(('127.0.0.1', 0))
         inbound_port = reserved.getsockname()[1]
     configs = {
-        'config.json': {'workers': 1, 'log': {'disableUpload': True, 'logDir': (output / 'logs').as_posix()}},
+        'config.json': {'workers': 1, 'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'pool-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
                           'port': inbound_port, 'routingEnabled': True,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],

@@ -28,7 +28,9 @@ cnode Worker
 5. 面板身份复用现有 `panels` 配置，不在日志配置中重复填写。
 6. 面板 `Key` 不进入日志事件、不进入待发送批次、不发送给日志服务。
 7. ClickHouse 用于明细、聚合和用户画像，不替代现有面板流量上报链路。
-8. `log.disableUpload` 默认为 `false`；设为 `true` 时不上报结构化日志且不启动上报线程，本地文本日志继续正常写入。无论该开关取值如何，上报器都不创建磁盘 spool。
+8. `log.enable` 默认为 `false`，默认不上报结构化日志且不启动上报线程；只有显式设为 `true` 才开启上报。本地文本日志继续正常写入。无论该开关取值如何，上报器都不创建磁盘 spool。
+
+原 `log.disableUpload` 字段已移除，旧配置会在加载时明确报错。迁移时，`disableUpload: true` 改为 `enable: false`，`disableUpload: false` 改为 `enable: true`；省略开关时按新默认值关闭上传。
 
 ## 2. cnode 到日志服务走什么
 

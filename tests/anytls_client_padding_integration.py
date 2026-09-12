@@ -63,7 +63,7 @@ async def scenario(args, name, output, result, resources):
     ports = {'a': available_port(), 'b': available_port()}
     config = {'workers': 1, 'timeouts': {'handshake': 5, 'connIdle': 15, 'write': 5,
               'uplinkOnly': 10, 'downlinkOnly': 10},
-              'log': {'disableUpload': True, 'logDir': (output / 'logs').as_posix()}}
+              'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}}
     inbounds = [{'tag': f'client-{key}', 'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
                  'routingEnabled': True, 'settings': {'clients': [{'id': str(USER)}]}} for key, port in ports.items()]
     outbounds = [{'tag': f'peer-{key}', 'protocol': 'anytls', 'settings': {

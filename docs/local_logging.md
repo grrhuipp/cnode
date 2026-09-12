@@ -17,17 +17,25 @@ cnode 本地日志对齐 xray-core 的两类日志语义：
 YYYY/MM/DD HH:MM:SS [Level] component: message
 ```
 
-带连接上下文：
+带连接上下文、尚未认证用户：
 
 ```text
 YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: message
 ```
 
+认证成功且用户 ID 为正数时，连接日志同时携带入站标签和用户 ID：
+
+```text
+YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: inbound=tag user=id message
+```
+
+日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出用户身份字段。
+
 示例：
 
 ```text
-2026/07/19 20:42:06 [Info] [4294967338] app/dispatcher/default_dispatcher: taking detour [direct] for tcp:example.com:443
-2026/07/19 20:42:06 [Warning] [4294967338] proxy/freedom/freedom_outbound: dial failed tcp:example.com:443: connection refused
+2026/07/19 20:42:06 [Debug] [4294967338] proxy/freedom/freedom_outbound: inbound=vless-in user=123 DIAL_FAILED 192.0.2.10 -> example.com:443 via direct: connection refused
+2026/07/19 20:42:06 [Warning] [4294967338] app/dispatcher/default_dispatcher: inbound=vless-in user=123 OUTBOUND_PROCESS_FAILED 192.0.2.10 -> example.com:443 via direct: OUTBOUND_CONNECTION_FAILED
 2026/07/19 20:42:07 [Error] infra/access_log_reporter: pending batch rejected events=1000 bytes=81920
 ```
 
@@ -39,6 +47,8 @@ YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: message
 - `Error`：影响进程能力、控制面或全局资源的故障。
 
 `LOG_TRACE` 至 `LOG_ERROR` 写普通 error 日志；`LOG_CONN_*` 写带 context ID 的 error 日志；尚未建立 session 的网络诊断使用 `LOG_NET_*`，同样进入 error logger。
+
+Freedom 的 TCP / UDP 拨号失败细节使用 `Debug`；Dispatcher 统一输出请求最终失败的 `Warning`，避免同一次失败在两个层级重复告警。
 
 ## 3. access 格式
 

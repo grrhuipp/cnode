@@ -67,7 +67,7 @@ async def inbound_case(binary, output, mode):
     fixture = IdentityFixture(available_port())
     panel = await asyncio.start_server(fixture.panel, '127.0.0.1', 0)
     peer = await asyncio.start_server(fixture.peer, '127.0.0.1', 0)
-    config = {'workers': 1, 'log': {'disableUpload': True, 'logDir': str(output / 'logs')},
+    config = {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')},
               'panels': [{'Name': 'negotiation-test', 'Type': 'V2board',
                           'APIHost': f'http://127.0.0.1:{panel.sockets[0].getsockname()[1]}',
                           'Key': 'local-test-key', 'NodeIDs': [1], 'NodeType': 'anytls',
@@ -227,7 +227,7 @@ async def outbound_case(binary, output, mode):
     server = await asyncio.start_server(peer.handle, '127.0.0.1', 0, ssl=tls)
     port = available_port()
     configs = {
-        'config.json': {'workers': 1, 'log': {'disableUpload': True, 'logDir': str(output / 'logs')}},
+        'config.json': {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')}},
         'inbounds.json': [{'tag': 'negotiation-in', 'protocol': 'vless', 'listen': '127.0.0.1',
                           'port': port, 'routingEnabled': True,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],

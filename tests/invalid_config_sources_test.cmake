@@ -97,28 +97,28 @@ function(expect_outbound_credentials case_name protocol credentials accepted)
         set(sidecar "[{\"tag\":\"credential-test\",\"protocol\":\"${protocol}\",\"settings\":${settings}${stream_settings}}]")
         if(accepted)
             expect_started("${case_name}_${format}"
-                [=[{"workers":2,"log":{"disableUpload":true}}]=] "outbounds.json" "${sidecar}")
+                [=[{"workers":2,"log":{"enable":false}}]=] "outbounds.json" "${sidecar}")
         else()
             expect_rejected("${case_name}_${format}"
-                [=[{"workers":2,"log":{"disableUpload":true}}]=] "outbounds.json" "${sidecar}"
+                [=[{"workers":2,"log":{"enable":false}}]=] "outbounds.json" "${sidecar}"
                 "outbound 'credential-test' protocol '${protocol}' is unsupported or invalid")
         endif()
     endforeach()
 endfunction()
 
-function(expect_log_upload_state case_name disable_upload_value expect_enabled)
+function(expect_log_upload_state case_name enable_value expect_enabled)
     set(case_dir "${TEST_ROOT}/${case_name}")
     file(REMOVE_RECURSE "${case_dir}")
     file(MAKE_DIRECTORY "${case_dir}")
     file(TO_CMAKE_PATH "${case_dir}/logs" log_dir)
-    if("${disable_upload_value}" STREQUAL "")
-        set(disable_upload_json "")
+    if("${enable_value}" STREQUAL "")
+        set(enable_json "")
     else()
-        set(disable_upload_json
-            ",\"disableUpload\":${disable_upload_value}")
+        set(enable_json
+            ",\"enable\":${enable_value}")
     endif()
     file(WRITE "${case_dir}/config.json"
-        "{\"workers\":1,\"log\":{\"logDir\":\"${log_dir}\"${disable_upload_json}}}")
+        "{\"workers\":1,\"log\":{\"logDir\":\"${log_dir}\"${enable_json}}}")
 
     execute_process(
         COMMAND "${CNODE_EXE}" --config-dir "${case_dir}"
@@ -151,7 +151,7 @@ function(expect_log_upload_state case_name disable_upload_value expect_enabled)
     if(expect_enabled)
         if(NOT "${reporter_log}" MATCHES "access-log reporter ready")
             message(FATAL_ERROR
-                "${case_name}: default centralized log upload did not start the reporter")
+                "${case_name}: enabled centralized log upload did not start the reporter")
         endif()
     elseif(NOT "${reporter_log}" MATCHES
            "centralized access-log upload disabled by configuration")
@@ -217,11 +217,18 @@ expect_rejected(conflicting_log_compression
     "gzip and compress must match")
 expect_started(equal_log_compression_aliases
     [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
-expect_rejected(non_boolean_disable_log_upload
-    [=[{"log":{"disableUpload":"true"}}]=] "" ""
-    "disableUpload must be a boolean")
-expect_log_upload_state(default_log_upload "" TRUE)
-expect_log_upload_state(disabled_log_upload true FALSE)
+expect_rejected(non_boolean_enable_log_upload
+    [=[{"log":{"enable":"true"}}]=] "" ""
+    "enable must be a boolean")
+expect_rejected(removed_disable_log_upload
+    [=[{"log":{"disableUpload":true}}]=] "" ""
+    "log.disableUpload is removed; use log.enable")
+expect_rejected(conflicting_old_log_upload_switch
+    [=[{"log":{"enable":true,"disableUpload":false}}]=] "" ""
+    "log.disableUpload is removed; use log.enable")
+expect_log_upload_state(default_log_upload "" FALSE)
+expect_log_upload_state(disabled_log_upload false FALSE)
+expect_log_upload_state(enabled_log_upload true TRUE)
 expect_rejected(non_string_log_level
     [=[{"log":{"loglevel":123}}]=] "" ""
     "loglevel must be a string")
@@ -391,7 +398,7 @@ foreach(endpoint IN ITEMS "127.0.0.1:0" "127.0.0.1:65536" "127.0.0.1:-1"
         "{\"dns\":{\"servers\":[\"${endpoint}\"]}}" "" "" "dns server")
 endforeach()
 expect_started(dns_mixed_endpoints
-    [=[{"workers":1,"log":{"disableUpload":true},"dns":{"servers":["127.0.0.1","::1","127.0.0.1:1","127.0.0.1:65535","[::1]:5353"]}}]=] "" "")
+    [=[{"workers":1,"log":{"enable":false},"dns":{"servers":["127.0.0.1","::1","127.0.0.1:1","127.0.0.1:65535","[::1]:5353"]}}]=] "" "")
 expect_rejected(dns_endpoint_embedded_nul
     [=[{"dns":{"servers":["127.0.0.1\u0000ignored"]}}]=] "" "" "dns server")
 expect_rejected(overflow_panel_api_port
@@ -816,19 +823,19 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/cert.pem" AUT
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/key.pem" AUTH_PADDING_KEY)
 set(AUTH_PADDING_TLS "\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"certificates\":[{\"certificateFile\":\"${AUTH_PADDING_CERT}\",\"keyFile\":\"${AUTH_PADDING_KEY}\"}]}}")
 expect_rejected(invalid_anytls_auth_range_text
-    [=[{"workers":1,"log":{"disableUpload":true}}]=] "inbounds.json"
+    [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"auth-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":\"stop=2\\n0=65534-65537\\n1=64-65\"},${AUTH_PADDING_TLS}}]"
     "static inbound 'auth-padding' has invalid protocol settings")
 expect_rejected(invalid_anytls_auth_segments_array
-    [=[{"workers":1,"log":{"disableUpload":true}}]=] "inbounds.json"
+    [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"auth-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":[\"stop=2\",\"0=c,45-45\",\"1=64-65\"]},${AUTH_PADDING_TLS}}]"
     "static inbound 'auth-padding' has invalid protocol settings")
 expect_rejected(invalid_anytls_frame_size_text
-    [=[{"workers":1,"log":{"disableUpload":true}}]=] "inbounds.json"
+    [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"frame-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":\"stop=2\\n1=65536-65536\"},${AUTH_PADDING_TLS}}]"
     "static inbound 'frame-padding' has invalid protocol settings")
 expect_rejected(invalid_anytls_frame_range_array
-    [=[{"workers":1,"log":{"disableUpload":true}}]=] "inbounds.json"
+    [=[{"workers":1,"log":{"enable":false}}]=] "inbounds.json"
     "[{\"tag\":\"frame-padding\",\"protocol\":\"anytls\",\"listen\":\"127.0.0.1\",\"port\":12006,\"settings\":{\"password\":\"fixture\",\"paddingScheme\":[\"stop=2\",\"1=65534-65537\"]},${AUTH_PADDING_TLS}}]"
     "static inbound 'frame-padding' has invalid protocol settings")
 expect_rejected(unsupported_inbound "{}" "inbounds.json"
@@ -869,267 +876,267 @@ file(REMOVE_RECURSE "${TEST_ROOT}")
 
 # Pure IP literals must not inherit platform endpoint or C-string parsing.
 expect_rejected("ip_literal_panel_ListenIP_0"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1:9"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1:9"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_panel_SendIP_0"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1:9"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1:9"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_listen_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[inbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","listen":"127.0.0.1:9","port":43189,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=]
     [=[listen]=])
 expect_rejected("ip_literal_bind_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"freedom","sendThrough":"127.0.0.1:9"}]]=]
     [=[sendThrough]=])
 expect_rejected("ip_literal_route_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[routing.json]=]
     [=[{"rules":[{"type":"field","ip":["127.0.0.1:9/24"],"outboundTag":"direct"}]}]=]
     [=[invalid IP network]=])
 expect_rejected("ip_literal_outbound_vmess_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_0"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_1"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1\u0000ignored"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1\u0000ignored"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_panel_SendIP_1"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1\u0000ignored"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1\u0000ignored"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_listen_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[inbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","listen":"127.0.0.1\u0000ignored","port":43189,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=]
     [=[listen]=])
 expect_rejected("ip_literal_bind_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"freedom","sendThrough":"127.0.0.1\u0000ignored"}]]=]
     [=[sendThrough]=])
 expect_rejected("ip_literal_route_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[routing.json]=]
     [=[{"rules":[{"type":"field","ip":["127.0.0.1\u0000ignored/24"],"outboundTag":"direct"}]}]=]
     [=[invalid IP network]=])
 expect_rejected("ip_literal_outbound_vmess_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_1"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_2"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"[::1]"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"[::1]"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_panel_SendIP_2"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"[::1]"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"[::1]"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_listen_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[inbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","listen":"[::1]","port":43189,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=]
     [=[listen]=])
 expect_rejected("ip_literal_bind_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"freedom","sendThrough":"[::1]"}]]=]
     [=[sendThrough]=])
 expect_rejected("ip_literal_route_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[routing.json]=]
     [=[{"rules":[{"type":"field","ip":["[::1]/24"],"outboundTag":"direct"}]}]=]
     [=[invalid IP network]=])
 expect_rejected("ip_literal_outbound_vmess_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_2"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_3"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1 "}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1 "}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_panel_SendIP_3"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1 "}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"127.0.0.1 "}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_listen_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[inbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","listen":"127.0.0.1 ","port":43189,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=]
     [=[listen]=])
 expect_rejected("ip_literal_bind_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"freedom","sendThrough":"127.0.0.1 "}]]=]
     [=[sendThrough]=])
 expect_rejected("ip_literal_route_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[routing.json]=]
     [=[{"rules":[{"type":"field","ip":["127.0.0.1 /24"],"outboundTag":"direct"}]}]=]
     [=[invalid IP network]=])
 expect_rejected("ip_literal_outbound_vmess_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_3"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_4"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"fe80::1%invalid"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"fe80::1%invalid"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_panel_SendIP_4"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"fe80::1%invalid"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","SendIP":"fe80::1%invalid"}]}]=]
     [=[]=]
     [=[]=])
 expect_rejected("ip_literal_listen_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[inbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","listen":"fe80::1%invalid","port":43189,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}}]]=]
     [=[listen]=])
 expect_rejected("ip_literal_bind_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"freedom","sendThrough":"fe80::1%invalid"}]]=]
     [=[sendThrough]=])
 expect_rejected("ip_literal_route_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[routing.json]=]
     [=[{"rules":[{"type":"field","ip":["fe80::1%invalid/24"],"outboundTag":"direct"}]}]=]
     [=[invalid IP network]=])
 expect_rejected("ip_literal_outbound_vmess_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"vless","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_4"
-    [=[{"workers":2,"log":{"disableUpload":true}}]=]
+    [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
     [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_url_0"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1\u0000ignored","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1\u0000ignored","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     [=[]=]
     [=[]=]
     [=[invalid API host]=])
 expect_rejected("ip_literal_url_1"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://[127.0.0.1]:80","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://[127.0.0.1]:80","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     [=[]=]
     [=[]=]
     [=[invalid API host]=])
 expect_rejected("ip_literal_url_2"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://[example.com]:80","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://[example.com]:80","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     [=[]=]
     [=[]=]
     [=[invalid API host]=])
 expect_rejected("ip_literal_url_3"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://::1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://::1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     [=[]=]
     [=[]=]
     [=[invalid API host]=])
 expect_rejected("ip_literal_url_4"
-    [=[{"workers":2,"log":{"disableUpload":true},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://bad..example","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
+    [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://bad..example","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]
     [=[]=]
     [=[]=]
     [=[invalid API host]=])

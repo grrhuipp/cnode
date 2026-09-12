@@ -127,7 +127,7 @@ async def run_case(binary, output, protocol, prefix_size):
                                       'tlsSettings': {'serverName': 'localhost', 'allowInsecure': True}}
     configs = {
         'config.json': {'workers': 1, 'timeouts': {'downlinkOnly': 3},
-                        'log': {'disableUpload': True, 'logDir': (output / 'logs').as_posix()}},
+                        'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'initial-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
                            'port': inbound_port, 'routingEnabled': True, 'sniffing': {'enabled': False},
                            'settings': {'clients': [{'id': str(USER)}]}}],

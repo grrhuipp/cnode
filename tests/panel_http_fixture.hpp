@@ -77,7 +77,7 @@ public:
         std::filesystem::create_directories(root);
         std::ofstream config(root / "config.json", std::ios::binary);
         config << R"({"workers":)" << (CollisionMode() ? 2 : 1)
-               << R"(,"log":{"disableUpload":true,"logDir":")"
+               << R"(,"log":{"enable":false,"logDir":")"
                << (root / "logs").generic_string()
                << R"("},"dns":{"servers":["127.77.0.1:)" << dns_.local_endpoint().port()
                << R"("],"timeout":2,"cacheSize":32,"minTTL":1,"maxTTL":60},"panels":[{"Name":"replay-panel","Type":"V2board","APIHost":"http://panel-replay.test:)"

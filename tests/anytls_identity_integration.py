@@ -53,7 +53,7 @@ async def run_case(binary, output, mode):
     panel = await asyncio.start_server(fixture.panel, '127.0.0.1', 0)
     peer = await asyncio.start_server(fixture.peer, '127.0.0.1', 0)
     certificates = Path(__file__).resolve().parent / 'fixtures/anytls-pool'
-    config = {'workers': 1, 'log': {'disableUpload': True, 'logDir': str(output / 'logs')},
+    config = {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')},
               'timeouts': {'connIdle': 10, 'uplinkOnly': 3, 'downlinkOnly': 3},
               'panels': [{'Name': 'identity-test', 'Type': 'V2board',
                           'APIHost': f'http://127.0.0.1:{panel.sockets[0].getsockname()[1]}',

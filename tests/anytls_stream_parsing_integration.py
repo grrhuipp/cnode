@@ -45,7 +45,7 @@ async def run_case(binary, output, mode):
     udp_transport, udp = await asyncio.get_running_loop().create_datagram_endpoint(
         UdpPeer, local_addr=('127.0.0.1', 0))
     certificates = Path(__file__).resolve().parent / 'fixtures/anytls-pool'
-    config = {'workers': 1, 'log': {'disableUpload': True, 'logDir': str(output / 'logs')},
+    config = {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')},
               'timeouts': {'connIdle': 10, 'uplinkOnly': 2, 'downlinkOnly': 2},
               'panels': [{'Name': 'parsing-test', 'Type': 'V2board',
                           'APIHost': f'http://127.0.0.1:{panel.sockets[0].getsockname()[1]}',

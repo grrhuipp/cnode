@@ -40,7 +40,7 @@ bool WriteConfig(const fs::path& root,
 
     std::ofstream main_config(root / "config.json", std::ios::binary);
     main_config
-        << R"({"log":{"disableUpload":true,"logDir":")" << (root / "logs").generic_string() << R"("},"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5},"panels":[{"Name":"shutdown-panel","Type":"V2board","APIHost":"http://127.0.0.1:)"
+        << R"({"log":{"enable":false,"logDir":")" << (root / "logs").generic_string() << R"("},"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5},"panels":[{"Name":"shutdown-panel","Type":"V2board","APIHost":"http://127.0.0.1:)"
         << panel_port
         << R"(","Key":"shutdown-key","NodeIDs":[1],"NodeType":"vmess","ListenIP":"auto","SendIP":"auto"}]})"
         << '\n';
@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
         available.close();
         {
             std::ofstream config(root / "config.json", std::ios::binary);
-            config << R"({"workers":2,"log":{"disableUpload":true,"logDir":")"
+            config << R"({"workers":2,"log":{"enable":false,"logDir":")"
                    << (root / "logs").generic_string() << R"("}})";
             if (!config) return 15;
             if (!test_implicit) {

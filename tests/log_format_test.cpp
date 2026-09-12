@@ -39,6 +39,14 @@ void CheckTimestamp(std::string_view line) {
            "timestamp time format");
 }
 
+struct SessionLogContext {
+    struct {
+        std::string_view tag;
+        int64_t user_id = 0;
+    } inbound;
+    uint64_t conn_id = 0;
+};
+
 }  // namespace
 
 int main() {
@@ -59,6 +67,26 @@ int main() {
             acpp::LogLevel::INFO,
             acpp::ConnectionLogContext{.conn_id = 42},
             "dialing tcp:example.com:443");
+        acpp::Log::WriteConnection(
+            acpp::LogLevel::WARN,
+            SessionLogContext{
+                .inbound = {
+                    .tag = "jx-ss-shadowsocks-50006",
+                    .user_id = 502345929,
+                },
+                .conn_id = 43,
+            },
+            "OUTBOUND_PROCESS_FAILED target=www.sina.com.cn:8080");
+        acpp::Log::WriteConnection(
+            acpp::LogLevel::WARN,
+            SessionLogContext{
+                .inbound = {
+                    .tag = "jx-ss-shadowsocks-50006",
+                    .user_id = 0,
+                },
+                .conn_id = 44,
+            },
+            "AUTHENTICATION_FAILED");
         acpp::Log::WriteAccess(
             "from 192.0.2.10:52000 accepted tcp:example.com:443 "
             "[vless-in -> direct] email: user@example.com");
@@ -77,6 +105,27 @@ int main() {
         CheckTimestamp(connection);
         Expect(connection.find(" [Info] [42] ") != std::string::npos,
                "Xray connection context missing");
+
+        const auto& authenticated =
+            FindLine(error_lines, "OUTBOUND_PROCESS_FAILED");
+        CheckTimestamp(authenticated);
+        Expect(authenticated.find(" [Warning] [43] ") != std::string::npos,
+               "authenticated connection context missing");
+        Expect(authenticated.find(
+                   ": inbound=jx-ss-shadowsocks-50006 user=502345929 "
+                   "OUTBOUND_PROCESS_FAILED") != std::string::npos,
+               "authenticated connection identity missing");
+
+        const auto& unauthenticated =
+            FindLine(error_lines, "AUTHENTICATION_FAILED");
+        CheckTimestamp(unauthenticated);
+        Expect(unauthenticated.find(" [Warning] [44] ") != std::string::npos,
+               "pre-authentication connection format changed");
+        Expect(unauthenticated.find(": AUTHENTICATION_FAILED") !=
+                   std::string::npos,
+               "pre-authentication message format changed");
+        Expect(unauthenticated.find(" user=") == std::string::npos,
+               "pre-authentication log exposed an invalid user id");
 
         const auto access_lines = ReadLines(directory / "access.log");
         Expect(access_lines.size() == 1, "access logger wrote diagnostics");

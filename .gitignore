@@ -7,6 +7,7 @@ cmake-build-*/
 # IDE
 .vscode/
 .claude/
+.codex/
 .codegraph/
 .idea/
 *.user
@@ -48,3 +49,6 @@ perf.data.txt
 
 # clangd index cache
 .cache/
+
+# Python test caches
+__pycache__/
