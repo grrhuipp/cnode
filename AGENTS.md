@@ -460,6 +460,6 @@ cnode 应满足：
 
 ## 部署约束
 
-- 部署脚本 `scripts/cnode.sh` 不带参数时只更新二进制。
+- 部署脚本 `scripts/cnode.sh` 不带参数时更新二进制及 `geoip.dat`、`geosite.dat`；geodata 必须先下载到临时目录，下载失败保留旧文件，内容变化后重启原本运行中的服务以加载新规则。更新模式不得改写既有 panel 或 sidecar 配置。
 - `scripts/cnode.sh -debug_file true` 可额外下载对应的 `.debug` 符号文件。
 - VPS 或线上环境优先拉取发布产物进行诊断，不默认在目标机上临时编译。

@@ -18,7 +18,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
 - 默认按多 Worker 运行，每个 Worker 持有自己的事件循环和热路径资源。
-- 部署脚本 `scripts/cnode.sh` 不带参数时只更新默认线上二进制；`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
+- 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 架构总览
 

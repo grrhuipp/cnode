@@ -2,7 +2,7 @@
 
 # cnode 一键部署脚本
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
-# 每次执行添加/覆盖一个 panel 到同一个 cnode 实例；已有 config.json 不会被覆盖，
+# 无参数时更新二进制和 geodata；部署模式添加/覆盖一个 panel，已有 config.json 不会被覆盖，
 # 指定 URL 的 sidecar 文件会覆盖下载。
 
 ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v variant debug_file"
@@ -23,7 +23,7 @@ CONFIG_JSON="$CONFIG_DIR/config.json"
 usage() {
     echo "用法: bash <(curl -sL ...) [选项]"
     echo ""
-    echo "不带参数时：仅更新 cnode 二进制（默认 cnode-latest release）"
+    echo "不带参数时：更新 cnode 二进制（默认 cnode-latest release）和 geoip/geosite 数据"
     echo ""
     echo "必填选项:"
     for opt in $REQUIRED_OPTIONS; do
@@ -275,6 +275,48 @@ install_cnode() {
 }
 
 # ============================================================================
+# geodata 更新（下载完成后替换；失败时保留旧文件）
+# ============================================================================
+
+update_geodata() {
+    GEODATA_UPDATED=0
+    install_dependency curl curl || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
+    GEO_TMP_DIR=$(mktemp -d "$CONFIG_DIR/.geodata.XXXXXX") || return 1
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+        "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" \
+        -o "$GEO_TMP_DIR/geoip.dat" \
+        || ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+        "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" \
+        -o "$GEO_TMP_DIR/geosite.dat" \
+        || [ ! -s "$GEO_TMP_DIR/geoip.dat" ] || [ ! -s "$GEO_TMP_DIR/geosite.dat" ]; then
+        rm -f "$GEO_TMP_DIR/geoip.dat" "$GEO_TMP_DIR/geosite.dat"
+        rmdir "$GEO_TMP_DIR"
+        echo "geodata 下载失败或文件为空，保留现有数据。"
+        return 1
+    fi
+
+    for GEO_FILE in geoip.dat geosite.dat; do
+        if cmp -s "$GEO_TMP_DIR/$GEO_FILE" "$CONFIG_DIR/$GEO_FILE"; then
+            rm -f "$GEO_TMP_DIR/$GEO_FILE"
+            echo "$GEO_FILE 已是最新数据"
+        else
+            if ! chmod 0644 "$GEO_TMP_DIR/$GEO_FILE" \
+                || ! mv -f "$GEO_TMP_DIR/$GEO_FILE" "$CONFIG_DIR/$GEO_FILE"; then
+                rm -f "$GEO_TMP_DIR/geoip.dat" "$GEO_TMP_DIR/geosite.dat"
+                rmdir "$GEO_TMP_DIR"
+                echo "$GEO_FILE 替换失败。"
+                return 1
+            fi
+            GEODATA_UPDATED=1
+            echo "已更新: $GEO_FILE"
+        fi
+    done
+    rmdir "$GEO_TMP_DIR"
+}
+
+# ============================================================================
 # systemd 服务
 # ============================================================================
 
@@ -358,11 +400,6 @@ EOF
         curl -sfL "$route_url" -o "$CONFIG_DIR/routing.json" || echo "警告: routing.json 下载失败"
     fi
 
-    # 每次更新 geo 数据
-    curl -sfL "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" \
-        -o "$CONFIG_DIR/geoip.dat" || echo "警告: geoip.dat 下载失败"
-    curl -sfL "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" \
-        -o "$CONFIG_DIR/geosite.dat" || echo "警告: geosite.dat 下载失败"
 }
 
 # ============================================================================
@@ -462,18 +499,6 @@ add_panel_json() {
 # ============================================================================
 
 main() {
-    if [ $# -eq 0 ]; then
-        WAS_ACTIVE=0
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            WAS_ACTIVE=1
-        fi
-        install_cnode
-        if [ "$WAS_ACTIVE" -eq 1 ]; then
-            systemctl start "$SERVICE_NAME"
-        fi
-        exit 0
-    fi
-
     parse_options "$@"
 
     if ! has_deploy_options; then
@@ -481,9 +506,14 @@ main() {
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
             WAS_ACTIVE=1
         fi
+        update_geodata || exit 1
         install_cnode
         if [ "$WAS_ACTIVE" -eq 1 ]; then
-            systemctl start "$SERVICE_NAME"
+            if [ "$GEODATA_UPDATED" -eq 1 ]; then
+                systemctl restart "$SERVICE_NAME" || exit 1
+            else
+                systemctl start "$SERVICE_NAME" || exit 1
+            fi
         fi
         exit 0
     fi
@@ -496,6 +526,7 @@ main() {
         fi
     done
 
+    update_geodata || exit 1
     install_cnode
     install_service
     init_config
