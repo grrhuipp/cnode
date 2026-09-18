@@ -152,7 +152,6 @@ bool Run(int operation, Fault fault, size_t threshold) {
     Stream stream;
     stream.fault = fault;
     stream.threshold = threshold;
-    buf::TrimThreadBufferRecycle(true);
     if (live != 0) std::abort();
     tracking = true;
     bool returned = false;
@@ -177,7 +176,6 @@ bool Run(int operation, Fault fault, size_t threshold) {
     const bool exceptional = fault == Fault::Memory || fault == Fault::Link || fault == Fault::Unexpected || fault == Fault::NonStandard;
     bool passed = returned && !stream.closed && (exceptional ? observed == fault : observed == Fault::None && code == expected);
     passed &= fault == Fault::None || (stream.failures == 1 && stream.transferred == threshold);
-    buf::TrimThreadBufferRecycle(true);
     passed &= live == 0;
     tracking = false;
     if (!passed) std::printf("op=%d fault=%s after=%zu returned=%s observed=%s live=%zu: FAIL\n",

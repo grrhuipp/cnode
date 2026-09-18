@@ -269,7 +269,6 @@ public:
     net::awaitable<size_t> AsyncRead(net::mutable_buffer output) override {
         while (wire_->offset == wire_->input.size() && !wire_->closed && !wire_->read_eof) {
             if (wire_->queue && wire_->responded && !wire_->queue->snapshot) {
-                buf::TrimThreadBufferRecycle(true);
                 wire_->queue->queued_blocks = buffer_count;
                 wire_->queue->snapshot = true;
             }
@@ -297,7 +296,6 @@ public:
         std::memcpy(output.data(), wire_->input.data() + wire_->offset, count);
         wire_->offset += count;
         if (wire_->queue && wire_->queue->mode == 7 && count == 4096) {
-            memory::CollectCurrentThread(true);
             fail_allocation_bytes = 128;
             fail_next_allocation = true;
         }
@@ -364,7 +362,6 @@ public:
             if (wire_->io_fault_mode >= 3 || (wire_->queue && wire_->queue->mode < 13)) {
                 while (wire_->offset < wire_->input.size() && !wire_->closed) {
                     if (wire_->queue && wire_->queue->mode == 5 && wire_->input.size() - wire_->offset == 7) {
-                        buf::TrimThreadBufferRecycle(true);
                         // Eight queued blocks plus the one-byte pending frame.
                         wire_->queue->queued_blocks = buffer_count ? buffer_count - 1 : 0;
                         wire_->queue->snapshot = true;
@@ -701,7 +698,6 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
-    buf::TrimThreadBufferRecycle(true);
     buffer_count = buffer_peak = failed_allocation_size = 0;
     fail_allocation_bytes = 0;
     const auto failures_before = allocation_failures;
@@ -735,7 +731,6 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io.poll();
     bool passed = !exception && (mode == 6 || mode >= 13 ? !done : done);
     if (mode >= 13) {
-        buf::TrimThreadBufferRecycle(true);
         passed &= queue.consumer_started && queue.pending_consumer == 1 && buffer_count == 24;
         // Eight consumer blocks, eight queued blocks, eight in the waiting frame.
         queue.queued_blocks = buffer_count >= 16 ? buffer_count - 16 : 0;
@@ -771,7 +766,6 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io.restart();
     io.run_for(100ms);
     for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    buf::TrimThreadBufferRecycle(true);
     passed &= buffer_count == 0;
     track_buffers = false;
     std::printf("outbound-queue mode=%d seed=%u fragments=%zu bytes=%zu queued-blocks=%zu capacity-bytes=%zu peak-blocks=%zu bounded=%d received=%zu datagrams=%zu code=%s allocation-size=%zu completed-ms=%lld heart-responses=%zu pending-consumer=%d released=%d: %s\n",

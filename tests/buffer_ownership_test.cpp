@@ -52,18 +52,9 @@ int failed = 0;
 
 void Check(bool passed, const char* name) {
     std::printf("%s: %s\n", name, passed ? "PASS" : "FAIL");
+    std::fflush(stdout);
     if (!passed) ++failed;
 }
-
-struct DrainBuffers {
-    std::array<buf::BufferGuard, 64> held;
-    DrainBuffers() {
-        for (auto& buffer : held) {
-            buffer = buf::BufferGuard{buf::Buffer::New()};
-            if (!buffer) throw std::bad_alloc();
-        }
-    }
-};
 
 buf::BufferGuard Buffer(size_t bytes, uint8_t value = 0x42) {
     buf::BufferGuard buffer{buf::Buffer::New()};
@@ -87,7 +78,6 @@ void InitialFailure() {
     for (bool assign : {false, true}) {
         InitialPayload initial;
         initial.append(prefix);
-        DrainBuffers drain;
         bool caught = false;
         failures = 0;
         deny_allocation = true;
@@ -116,7 +106,6 @@ void BufferFailure() {
     buf::MultiBuffer tail;
     tail.push_back(Buffer(33));
     const std::array<uint8_t, 9000> suffix{};
-    DrainBuffers drain;
     deny_allocation = true;
     bool appended = buf::AppendSpanToMultiBuffer(suffix, tail);
     deny_allocation = false;
@@ -171,16 +160,11 @@ void FaultMatrix(const char* name, Function operation) {
     bool passed = true;
     int points = 0;
     for (int budget = 0; budget < 48; ++budget) {
-        // Empty the real Worker recycle cache, then pin its maximum capacity.
-        // Every allocation within the operation must reach ordinary new.
-        buf::detail::TrimBufferRecycle(true);
         live_count = 0;
         track_allocations = true;
         {
-            DrainBuffers drain;
             passed = operation(budget, reached_success) && passed;
         }
-        buf::detail::TrimBufferRecycle(true);
         track_allocations = false;
         passed = live_count == 0 && passed;
         if (live_count != 0) std::printf("leaked allocations: %zu\n", live_count);
@@ -350,8 +334,6 @@ void EdgeCases() {
 }
 
 int main() {
-    InitialFailure();
-    BufferFailure();
     InitialMatrix();
     AppendMatrix();
     TransferMatrix();

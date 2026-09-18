@@ -6,8 +6,6 @@
 #include "acppnode/app/worker.hpp"
 #include "acppnode/core/constants.hpp"
 
-#include <asio/use_future.hpp>
-
 #include <format>
 #include <stdexcept>
 #include <utility>
@@ -86,10 +84,8 @@ InboundStartup QueueInboundStartup(
             throw std::runtime_error("worker has no matching connection limiter");
         }
         auto* limiter = connection_limiters[worker->Id()].get();
-        startup.worker_results.push_back(net::co_spawn(
-            worker->GetExecutor(),
-            SetupWorkerInbounds(*worker, startup.entries, limiter),
-            net::use_future));
+        startup.worker_results.push_back(worker->PostForFuture(
+            SetupWorkerInbounds(*worker, startup.entries, limiter)));
     }
     return startup;
 }

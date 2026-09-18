@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/ip_address.hpp"
@@ -18,7 +19,7 @@ namespace acpp {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    std::string host;                // 域名；IP 目标只保留 resolved_addr
+    memory::ThreadLocalString host;  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址

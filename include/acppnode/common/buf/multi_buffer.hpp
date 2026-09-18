@@ -14,29 +14,16 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace acpp::buf {
 
 struct Buffer;
 
-namespace detail {
-// Worker-local 8KB Buffer 回收缓存的两个原语（定义在 Buffer 之后，需要完整类型）。
-// 严格 thread_local = 单 Worker 私有，绝不跨 Worker 共享，符合 AGENTS 对
-// “thread-local allocator / buffer provider” 的约束。
-[[nodiscard]] inline void* BufferRecyclePop() noexcept;
-[[nodiscard]] inline bool  BufferRecyclePush(void* raw) noexcept;
-}  // namespace detail
-
 // ============================================================================
-// Buffer - relay/MultiBuffer 固定 8KB 数据块（对应 Xray buf.Buffer）
+// Buffer - relay/MultiBuffer 固定 8KB 数据块
 //
-// 设计原则：
-//   - relay 数据面固定 8KB，与 Xray 保持一致，消除转发循环里的多档大小选择
-//   - 所有 release/诊断构建都使用 system allocator
-//   - 握手、小对象和短 scratch 不占用 relay Buffer，走 allocator 的合适尺寸桶
-//   - start/end 游标：Advance() 消费数据无需 memmove，Produce() 记录写入量
-//   - New()/Free() 直接走 allocator 原语，避免每次分配都把整块 8KB 清零
+// 数据面固定 8KB。New/Free 直接走 PMR，不缓存空闲块。
+// start/end 游标：Advance() 消费无需 memmove，Produce() 记录写入量。
 // ============================================================================
 struct Buffer {
     static constexpr uint32_t kSize = 8192;
@@ -101,15 +88,12 @@ struct Buffer {
     [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
     [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
     [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
-    // 从 Worker-local 回收缓存或 allocator 获取；仅初始化游标，payload 保持
-    // 未初始化以避免热路径无谓 memset。命中回收缓存时省去 8KB 全局分配。
+    // 从 Worker-local PMR 取得固定 8KB 块。只初始化游标，payload 保持
+    // 未初始化，避免热路径无谓 memset。
     [[nodiscard]] static Buffer* New() noexcept {
-        void* raw = detail::BufferRecyclePop();
+        void* raw = memory::AllocatePmr(sizeof(Buffer), alignof(Buffer));
         if (!raw) {
-            raw = memory::AllocateRaw(sizeof(Buffer), alignof(Buffer));
-            if (!raw) {
-                return nullptr;
-            }
+            return nullptr;
         }
         auto* b = ::new (raw) Buffer;
         b->start = 0;
@@ -118,133 +102,16 @@ struct Buffer {
         return b;
     }
 
-    // 归还。Buffer 含非平凡成员（udp_），先析构；裸内存优先回收到 Worker-local
-    // 缓存，缓存满才真正还给 allocator。
+    // 归还。Buffer 含非平凡成员（udp_），先析构再交回同一套 PMR。
     static void Free(Buffer* b) noexcept {
         if (!b) {
             return;
         }
         memory::OnBufferFree();
         b->~Buffer();
-        if (!detail::BufferRecyclePush(b)) {
-            memory::DeallocateRaw(b, sizeof(Buffer), alignof(Buffer));
-        }
+        memory::DeallocatePmr(b, sizeof(Buffer), alignof(Buffer));
     }
 };
-
-namespace detail {
-
-// 每 Worker 的 8KB 块回收缓存初始保留 16 块（128KB），遇到真实满载压力
-// 后最多增长到 32 块（256KB）。单 io_context 单线程时这是纯 Worker-local
-// 状态，不需要锁，也不会把空闲 RSS 一开始就抬高到最大值。
-inline constexpr size_t kBufferRecycleInitialCap = 16;
-inline constexpr size_t kBufferRecycleMaxCap = 32;
-
-struct BufferRecycleCache {
-    void* slots[kBufferRecycleMaxCap];
-    size_t count = 0;
-    size_t capacity = kBufferRecycleInitialCap;
-#ifdef CNODE_MEMORY_STATS
-    uint64_t high_water = 0;
-    uint64_t pop_hits = 0;
-    uint64_t pop_misses = 0;
-    uint64_t push_hits = 0;
-    uint64_t push_drops = 0;
-    uint64_t trim_frees = 0;
-#endif
-
-    BufferRecycleCache() noexcept = default;
-    BufferRecycleCache(const BufferRecycleCache&) = delete;
-    BufferRecycleCache& operator=(const BufferRecycleCache&) = delete;
-
-    ~BufferRecycleCache() {
-        // Worker 线程退出时把缓存的裸块还给 allocator，不泄漏。
-        while (count > 0) {
-            memory::DeallocateRaw(slots[--count], sizeof(Buffer), alignof(Buffer));
-        }
-    }
-};
-
-inline BufferRecycleCache& TlsBufferRecycle() noexcept {
-    thread_local BufferRecycleCache cache;
-    return cache;
-}
-
-[[nodiscard]] inline void* BufferRecyclePop() noexcept {
-    auto& cache = TlsBufferRecycle();
-    if (cache.count == 0) {
-#ifdef CNODE_MEMORY_STATS
-        ++cache.pop_misses;
-#endif
-        return nullptr;
-    }
-#ifdef CNODE_MEMORY_STATS
-    ++cache.pop_hits;
-#endif
-    return cache.slots[--cache.count];
-}
-
-[[nodiscard]] inline bool BufferRecyclePush(void* raw) noexcept {
-    auto& cache = TlsBufferRecycle();
-    if (cache.count >= cache.capacity && cache.capacity < kBufferRecycleMaxCap) {
-        cache.capacity = std::min(cache.capacity * 2, kBufferRecycleMaxCap);
-    }
-    if (cache.count >= cache.capacity) {
-#ifdef CNODE_MEMORY_STATS
-        ++cache.push_drops;
-#endif
-        return false;
-    }
-    cache.slots[cache.count++] = raw;
-#ifdef CNODE_MEMORY_STATS
-    ++cache.push_hits;
-    cache.high_water = std::max<uint64_t>(
-        cache.high_water,
-        static_cast<uint64_t>(cache.count));
-#endif
-    return true;
-}
-
-inline void TrimBufferRecycle(bool force) noexcept {
-    auto& cache = TlsBufferRecycle();
-    const size_t target = force ? 0 : kBufferRecycleInitialCap;
-    while (cache.count > target) {
-        memory::DeallocateRaw(cache.slots[--cache.count], sizeof(Buffer), alignof(Buffer));
-#ifdef CNODE_MEMORY_STATS
-        ++cache.trim_frees;
-#endif
-    }
-    if (cache.capacity > kBufferRecycleInitialCap &&
-        cache.count <= kBufferRecycleInitialCap) {
-        cache.capacity = kBufferRecycleInitialCap;
-    }
-}
-
-[[nodiscard]] inline memory::BufferRecycleStats SnapshotBufferRecycleStats() noexcept {
-    auto& cache = TlsBufferRecycle();
-    memory::BufferRecycleStats stats;
-    stats.cache_depth = cache.count;
-    stats.cache_capacity = cache.capacity;
-#ifdef CNODE_MEMORY_STATS
-    stats.cache_high_water = cache.high_water;
-    stats.pop_hits = cache.pop_hits;
-    stats.pop_misses = cache.pop_misses;
-    stats.push_hits = cache.push_hits;
-    stats.push_drops = cache.push_drops;
-    stats.trim_frees = cache.trim_frees;
-#endif
-    return stats;
-}
-
-}  // namespace detail
-
-[[nodiscard]] inline memory::BufferRecycleStats SnapshotThreadBufferRecycleStats() noexcept {
-    return detail::SnapshotBufferRecycleStats();
-}
-
-inline void TrimThreadBufferRecycle(bool force) noexcept {
-    detail::TrimBufferRecycle(force);
-}
 
 // RAII 守卫：离开作用域时自动释放单个 Buffer
 struct BufferGuard {
@@ -778,7 +645,7 @@ private:
     size_t total_bytes_ = 0;
     bool using_spill_ = false;
     size_t spill_start_ = 0;
-    std::vector<Buffer*> spill_;
+    memory::ThreadLocalVector<Buffer*> spill_;
 };
 
 // 计算 MultiBuffer 中所有 Buffer 的有效字节总数

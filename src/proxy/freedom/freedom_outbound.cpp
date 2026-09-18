@@ -71,7 +71,7 @@ std::optional<DomainStrategy> ParseConfiguredDomainStrategy(
     const json::object& settings) {
     DomainStrategy parsed = DomainStrategy::AsIs;
     bool present = false;
-    for (const std::string_view key : {"domainStrategy", "domain_strategy"}) {
+    for (const std::string_view key : {"domainStrategy"}) {
         const auto* value = settings.if_contains(key);
         if (!value || !value->is_string()) {
             if (value) return std::nullopt;

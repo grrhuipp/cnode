@@ -837,19 +837,15 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 encryption = json_string(s, "encryption");
             }
         } else {
-            vless_config.address = json_string(s, "server");
-            if (vless_config.address.empty()) {
-                vless_config.address = json_string(s, "address");
-            }
-            const auto port = acpp::ReadJsonPort(
-                s, {"server_port", "port"});
+            vless_config.address = json_string(s, "address");
+            const auto port = acpp::ReadJsonPort(s, {"port"});
             if (port.Invalid()) {
                 return std::nullopt;
             }
             if (port.Valid()) {
                 vless_config.port = port.value;
             }
-            uuid = json_string(s, "uuid");
+            uuid = json_string(s, "id");
             if (uuid.empty()) {
                 uuid = json_string(s, "id");
             }

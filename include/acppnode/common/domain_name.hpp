@@ -40,7 +40,8 @@ enum class TrailingDotPolicy {
     return true;
 }
 
-inline void NormalizeDnsHostnameInPlace(std::string& hostname) noexcept {
+template <class String>
+inline void NormalizeDnsHostnameInPlace(String& hostname) noexcept {
     if (!hostname.empty() && hostname.back() == '.') {
         hostname.pop_back();
     }

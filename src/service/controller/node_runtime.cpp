@@ -45,10 +45,8 @@ net::awaitable<void> NodeRuntime::RemoveInbound(const std::string& tag) {
         [tag](Worker& worker, size_t) {
             return [](Worker* current, std::string current_tag)
                        -> net::awaitable<void> {
-                co_await net::co_spawn(
-                    current->GetExecutor(),
-                    current->UnregisterListenerTask(std::move(current_tag)),
-                    net::use_awaitable);
+                co_await current->PostTask(
+                    current->UnregisterListenerTask(std::move(current_tag)));
             }(&worker, tag);
         });
 }
@@ -59,10 +57,8 @@ net::awaitable<void> NodeRuntime::RemoveOutbound(const std::string& tag) {
         [tag](Worker& worker, size_t) {
             return [](Worker* current, std::string current_tag)
                        -> net::awaitable<void> {
-                co_await net::co_spawn(
-                    current->GetExecutor(),
-                    current->RemoveOutboundTask(std::move(current_tag)),
-                    net::use_awaitable);
+                co_await current->PostTask(
+                    current->RemoveOutboundTask(std::move(current_tag)));
             }(&worker, tag);
         });
 }
@@ -78,10 +74,8 @@ net::awaitable<bool> NodeRuntime::AddOutbound(const std::string& tag) {
             return [](Worker* current,
                       proxyman::outbound::PreparedOutboundConfig config)
                        -> net::awaitable<void> {
-                co_await net::co_spawn(
-                    current->GetExecutor(),
-                    current->AddOutboundTask(std::move(config)),
-                    net::use_awaitable);
+                co_await current->PostTask(
+                    current->AddOutboundTask(std::move(config)));
             }(&worker, *prepared);
         });
     co_return true;
@@ -134,13 +128,11 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
                           proxyman::inbound::BuildRequest request,
                           proxyman::inbound::ReceiverSettings current_receiver,
                           uint8_t* result) -> net::awaitable<void> {
-                    *result = co_await net::co_spawn(
-                        current->GetExecutor(),
+                    *result = co_await current->PostTask(
                         current->RegisterInboundTask(
                             current_limiter,
                             std::move(request),
-                            std::move(current_receiver)),
-                        net::use_awaitable);
+                            std::move(current_receiver)));
                 }(&worker,
                   limiter,
                   inbound.handler_request,
@@ -165,20 +157,16 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
                           ConnectionLimiterPtr current_limiter,
                           proxyman::inbound::BuildRequest request,
                           WorkerBindResult* result) -> net::awaitable<void> {
-                    result->tcp = co_await net::co_spawn(
-                        current->GetExecutor(),
-                        current->AddListenerTask(binding),
-                        net::use_awaitable);
+                    result->tcp = co_await current->PostTask(
+                        current->AddListenerTask(binding));
                     if (!result->tcp) {
                         co_return;
                     }
-                    result->udp = co_await net::co_spawn(
-                        current->GetExecutor(),
+                    result->udp = co_await current->PostTask(
                         current->AddUdpListenerTask(
                             std::move(binding),
                             current_limiter,
-                            std::move(request)),
-                        net::use_awaitable);
+                            std::move(request)));
                 }(&worker,
                   inbound.binding,
                   limiter,
@@ -230,11 +218,9 @@ net::awaitable<void> NodeRuntime::UpdateRules(
             [](Worker* current,
                std::string current_tag,
                std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
-                co_await net::co_spawn(
-                    current->GetExecutor(),
+                co_await current->PostTask(
                     current->UpdateRuleTask(
-                        std::move(current_tag), std::move(rules)),
-                    net::use_awaitable);
+                        std::move(current_tag), std::move(rules)));
             }(worker.get(), tag, new_rule_list));
     }
     co_await RunAwaitableBatch(

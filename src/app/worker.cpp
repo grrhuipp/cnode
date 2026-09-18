@@ -28,6 +28,7 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/app/router/router.hpp"
+#include "acppnode/common/defaults.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/proxy/inbound.hpp"
@@ -118,6 +119,8 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
                            uint32_t worker_id);
 };
 
+// Worker-local capability owner. Constructs, starts and holds every live
+// inbound/outbound/dns/udp/router/dispatcher instance for this Worker.
 struct Worker::RuntimeState {
     RuntimeState(net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
@@ -157,6 +160,7 @@ struct Worker::RuntimeState {
         runtime_snapshot.store(std::move(snapshot), std::memory_order_release);
     }
 
+    void Start(Worker& worker);
     void InitOutbounds(Worker& worker,
                        const std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds);
     void InitRouter(Worker& worker,
@@ -214,40 +218,42 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
                geo::GeoManager* geo_manager)
     : id_(id)
     , runtime_(std::make_unique<RuntimeState>(
-          io_context, runtime_config, stats, geo_manager)) {}
+          io_context, runtime_config, stats, geo_manager))
+    , mailbox_(std::make_unique<WorkerMailbox>(
+          runtime_->io_context,
+          runtime_config.mailbox_capacity == 0
+              ? defaults::kWorkerMailboxCapacity
+              : runtime_config.mailbox_capacity)) {}
 
 Worker::~Worker() = default;
 
-net::io_context::executor_type Worker::GetExecutor() {
-    return runtime_->io_context.get_executor();
-}
-
 net::awaitable<void> Worker::StartRuntimeTask() {
-    if (runtime_->started) {
-        co_return;
-    }
-
-    runtime_->dispatcher->BindRequestPolicy(*runtime_->rule_manager);
-    runtime_->dispatcher->BindSessionTracking(*runtime_->session_tracking);
-    runtime_->dispatcher->BindDnsService(*runtime_->dns_service);
-    runtime_->dispatcher->BindRequestLoadState(runtime_->request_load);
-    const auto runtime_snapshot = runtime_->Snapshot();
-    runtime_->InitOutbounds(*this, runtime_snapshot->outbounds);
-    runtime_->dispatcher->BindOutboundManager(*runtime_->outbound_manager);
-    runtime_->InitRouter(
-        *this,
-        runtime_snapshot->routing,
-        runtime_->geo_manager);
-    runtime_->udp_session_manager->StartCleanup();
-    runtime_->started = true;
-    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
-              id_, runtime_snapshot->timeouts.SessionIdleTimeout().count());
+    runtime_->Start(*this);
     co_return;
 }
 
 // ============================================================================
 // 初始化
 // ============================================================================
+
+void Worker::RuntimeState::Start(Worker& worker) {
+    if (started) {
+        return;
+    }
+
+    dispatcher->BindRequestPolicy(*rule_manager);
+    dispatcher->BindSessionTracking(*session_tracking);
+    dispatcher->BindDnsService(*dns_service);
+    dispatcher->BindRequestLoadState(request_load);
+    const auto config = Snapshot();
+    InitOutbounds(worker, config->outbounds);
+    dispatcher->BindOutboundManager(*outbound_manager);
+    InitRouter(worker, config->routing, geo_manager);
+    udp_session_manager->StartCleanup();
+    started = true;
+    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
+              worker.id_, config->timeouts.SessionIdleTimeout().count());
+}
 
 void Worker::RuntimeState::InitOutbounds(
     Worker& worker,
@@ -915,8 +921,6 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
     stats.dns_entries    = dns_stats.entries;
 
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
-    stats.buffer_recycle      = buf::SnapshotThreadBufferRecycleStats();
-    stats.small_alloc_cache   = memory::SnapshotThreadSmallAllocCacheStats();
     return stats;
 }
 

@@ -38,22 +38,14 @@ int main() {
     Check(zero.has_value() && zero->has_value() && **zero == 0,
           "explicit zero window was lost");
 
-    auto maximum = Parse(R"({"initial_window_size":2147483647})");
+    auto maximum = Parse(R"({"initialWindowSize":2147483647})");
     Check(maximum.has_value() && **maximum == acpp::kHttp2MaxInitialWindow,
           "maximum window mismatch");
-
-    auto equal_aliases = Parse(
-        R"({"initialWindowSize":65535,"initial_window_size":65535})");
-    Check(equal_aliases.has_value() && **equal_aliases == 65535,
-          "equal window aliases were rejected");
 
     CheckInvalid(R"({"initialWindowSize":"65535"})", "must be an integer");
     CheckInvalid(R"({"initialWindowSize":-1})", "between 0 and");
     CheckInvalid(R"({"initialWindowSize":2147483648})", "between 0 and");
     CheckInvalid(R"({"initialWindowSize":1.5})", "must be an integer");
-    CheckInvalid(
-        R"({"initialWindowSize":65535,"initial_window_size":65536})",
-        "must match");
 
     const auto zero_setting =
         acpp::transport::internet::EncodeInitialWindowSetting(0);

@@ -15,7 +15,6 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_stats.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -74,10 +73,8 @@ CollectWorkerRuntimeStats(const MonitorContext& ctx) {
         tasks.push_back(
             [](Worker* worker,
                Worker::RuntimeStatsSnapshot& out) -> net::awaitable<void> {
-                out = co_await net::co_spawn(
-                    worker->GetExecutor(),
-                    worker->CollectRuntimeStatsTask(),
-                    net::use_awaitable);
+                out = co_await worker->PostTask(
+                    worker->CollectRuntimeStatsTask());
             }(ctx.workers[i].get(), snapshots[i])
         );
     }
@@ -87,30 +84,13 @@ CollectWorkerRuntimeStats(const MonitorContext& ctx) {
 }
 
 net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx, bool force) {
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(ctx.workers.size());
-    for (const auto& worker : ctx.workers) {
-        tasks.push_back(
-            [](Worker* worker, bool force) -> net::awaitable<void> {
-                co_await net::co_spawn(
-                    worker->GetExecutor(),
-                    [](bool force_collection) -> net::awaitable<void> {
-                        memory::CollectCurrentThread(force_collection);
-                        buf::TrimThreadBufferRecycle(force_collection);
-                        co_return;
-                    }(force),
-                    net::use_awaitable);
-            }(worker.get(), force)
-        );
-    }
-    co_await RunAwaitableBatch(
-        ctx.main_ctx.get_executor(), std::move(tasks));
-
+    (void)ctx;
     if (force) {
         memory::CollectBurst();
     } else {
         memory::CollectSteady();
     }
+    co_return;
 }
 
 StatsSnapshot AggregateWorkerStats(
@@ -281,52 +261,6 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                   runtime_mem.tcp_streams_peak,
                   runtime_mem.tls_streams_live,
                   runtime_mem.tls_streams_peak);
-
-        memory::BufferRecycleStats buffer_recycle;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            const auto& stats = worker_snapshot.memory.buffer_recycle;
-            buffer_recycle.cache_depth += stats.cache_depth;
-            buffer_recycle.cache_capacity += stats.cache_capacity;
-            buffer_recycle.cache_high_water += stats.cache_high_water;
-            buffer_recycle.pop_hits += stats.pop_hits;
-            buffer_recycle.pop_misses += stats.pop_misses;
-            buffer_recycle.push_hits += stats.push_hits;
-            buffer_recycle.push_drops += stats.push_drops;
-            buffer_recycle.trim_frees += stats.trim_frees;
-        }
-        LOG_DEBUG(
-            "runtime.buffer_recycle depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={} trim={}",
-            buffer_recycle.cache_depth,
-            buffer_recycle.cache_capacity,
-            buffer_recycle.cache_high_water,
-            buffer_recycle.pop_hits,
-            buffer_recycle.pop_misses,
-            buffer_recycle.push_hits,
-            buffer_recycle.push_drops,
-            buffer_recycle.trim_frees);
-
-        memory::SmallAllocCacheStats small_alloc_cache;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            const auto& stats = worker_snapshot.memory.small_alloc_cache;
-            small_alloc_cache.cache_depth += stats.cache_depth;
-            small_alloc_cache.cache_capacity += stats.cache_capacity;
-            small_alloc_cache.cache_high_water += stats.cache_high_water;
-            small_alloc_cache.pop_hits += stats.pop_hits;
-            small_alloc_cache.pop_misses += stats.pop_misses;
-            small_alloc_cache.push_hits += stats.push_hits;
-            small_alloc_cache.push_drops += stats.push_drops;
-            small_alloc_cache.trim_frees += stats.trim_frees;
-        }
-        LOG_DEBUG(
-            "runtime.small_alloc_cache depth={}/{} high={} pop_hit={} pop_miss={} push={} drop={} trim={}",
-            small_alloc_cache.cache_depth,
-            small_alloc_cache.cache_capacity,
-            small_alloc_cache.cache_high_water,
-            small_alloc_cache.pop_hits,
-            small_alloc_cache.pop_misses,
-            small_alloc_cache.push_hits,
-            small_alloc_cache.push_drops,
-            small_alloc_cache.trim_frees);
 #endif
 
         auto node_stats = ctx.controller.GetNodeStats();

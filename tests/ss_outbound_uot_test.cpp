@@ -42,36 +42,25 @@ void TestValidFormsAreNormalized() {
               *default_version == SsUotVersion::V2,
           "boolean UoT did not default to v2");
 
-    auto v1 = Parse(R"({"uot":true,"uot_version":1})");
+    auto v1 = Parse(R"({"uot":true,"uotVersion":1})");
     Check(v1.has_value() && *v1 == SsUotVersion::V1,
           "boolean UoT v1 mismatch");
 
     auto object = Parse(
-        R"({"udp_over_tcp":{"enabled":true,"version":2}})");
+        R"({"uot":{"enabled":true,"version":2}})");
     Check(object.has_value() && *object == SsUotVersion::V2,
           "object UoT v2 mismatch");
-
-    auto equal_aliases = Parse(
-        R"({"uot":true,"udp_over_tcp":{"enabled":true,"version":2}})");
-    Check(equal_aliases.has_value() && *equal_aliases == SsUotVersion::V2,
-          "equivalent UoT aliases were rejected");
 }
 
 void TestInvalidFormsAreRejected() {
     CheckInvalid(R"({"uot":true,"uotVersion":3})", "must be 1 or 2");
     CheckInvalid(R"({"uot":"true"})", "must be a boolean or object");
     CheckInvalid(
-        R"({"udp_over_tcp":{"enabled":true,"version":3}})",
+        R"({"uot":{"enabled":true,"version":3}})",
         "must be 1 or 2");
     CheckInvalid(
-        R"({"udp_over_tcp":{"enabled":1,"version":2}})",
+        R"({"uot":{"enabled":1,"version":2}})",
         "enabled must be a boolean");
-    CheckInvalid(
-        R"({"uot":false,"udp_over_tcp":true})",
-        "must describe the same state");
-    CheckInvalid(
-        R"({"uot":true,"uotVersion":1,"uot_version":2})",
-        "must match");
     CheckInvalid(R"({"uotVersion":2})", "requires uot");
     CheckInvalid(R"({"uot":1})", "must be a boolean or object");
     CheckInvalid(

@@ -29,7 +29,7 @@ void CheckInvalid(std::string_view body, std::string_view cause) {
 
 void TestValidSettingsAreNormalized() {
     auto defaults = Parse(
-        R"({"server":"127.0.0.1","server_port":443,"password":"secret"})");
+        R"({"address":"127.0.0.1","port":443,"password":"secret"})");
     Check(defaults.has_value(), "default AnyTLS settings were rejected");
     Check(defaults->idle_session_check_interval.count() == 30,
           "default check interval mismatch");
@@ -39,7 +39,7 @@ void TestValidSettingsAreNormalized() {
     Check(defaults->literal_address.has_value(), "literal address was not cached");
 
     auto explicit_values = Parse(
-        R"({"address":"example.com","port":8443,"key":"secret","idleSessionCheckInterval":10,"idle_session_check_interval":10,"idleSessionTimeout":20,"minIdleSession":2})");
+        R"({"address":"example.com","port":8443,"password":"secret","idleSessionCheckInterval":10,"idleSessionTimeout":20,"minIdleSession":2})");
     Check(explicit_values.has_value(), "valid explicit AnyTLS settings were rejected");
     Check(explicit_values->idle_session_check_interval.count() == 10,
           "explicit check interval mismatch");
@@ -61,39 +61,34 @@ void TestPreparedPasswordHashes() {
         }
         Check(actual == expected, "prepared AnyTLS SHA256 vector mismatch");
     };
-    check_hash(R"({"server":"127.0.0.1","server_port":443,"password":"secret"})",
+    check_hash(R"({"address":"127.0.0.1","port":443,"password":"secret"})",
                "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
-    check_hash(R"({"address":"127.0.0.1","port":443,"key":"secret"})",
-               "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
-    check_hash(R"({"server":"127.0.0.1","server_port":443,"password":"abc\u0000def"})",
+    check_hash(R"({"address":"127.0.0.1","port":443,"password":"abc\u0000def"})",
                "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c");
 }
 
 void TestInvalidSessionSettingsAreRejected() {
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807})",
+        R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807})",
         "steady clock range");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":9223372036854775807})",
+        R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":9223372036854775807})",
         "steady clock range");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":"30"})",
+        R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":"30"})",
         "must be an integer");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":0})",
+        R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":0})",
         "must be positive");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":18446744073709551615})",
+        R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":18446744073709551615})",
         "exceeds the seconds range");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","minIdleSession":-1})",
+        R"({"address":"example.com","port":443,"password":"secret","minIdleSession":-1})",
         "must not be negative");
     CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","minIdleSession":"1"})",
+        R"({"address":"example.com","port":443,"password":"secret","minIdleSession":"1"})",
         "must be an integer");
-    CheckInvalid(
-        R"({"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":60,"idle_session_timeout":61})",
-        "must match");
 }
 
 }  // namespace

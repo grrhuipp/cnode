@@ -1,5 +1,6 @@
 #include "app/dns/inflight_resolves.hpp"
 #include "app/dns/global_cache.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -190,7 +191,7 @@ void* operator new(std::size_t size) {
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    if (fail_worker_size && size == fail_worker_size) {
+    if (fail_worker_size && size >= fail_worker_size) {
         fail_worker_size = 0;
         ++injected_failures;
         return nullptr;
@@ -202,6 +203,7 @@ void operator delete(void* pointer, const std::nothrow_t&) noexcept {
 }
 
 int main() {
+    acpp::memory::ConfigureProcessAllocator();
     try {
         TestCompletion(Failure::None);
         TestCompletion(Failure::Query);

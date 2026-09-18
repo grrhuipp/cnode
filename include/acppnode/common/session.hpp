@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/clock.hpp"
 #include "acppnode/common/target_address.hpp"
@@ -38,32 +39,32 @@ enum class DnsResultState : uint8_t {
 // 字符串视图指向冷路径监听配置；用户邮箱使用 Worker 本地短生命周期存储。
 struct Inbound {
     net::ip::address source_addr;
-    std::string source_ip;
+    memory::ThreadLocalString source_ip;
     uint16_t source_port = 0;
     // Physical socket peer is retained separately from an effective client
     // address supplied by a trusted PROXY protocol or HTTP transport header.
-    std::string peer_ip;
+    memory::ThreadLocalString peer_ip;
     uint16_t peer_port = 0;
-    std::string client_ip_source = "socket";
+    memory::ThreadLocalString client_ip_source = "socket";
     bool client_ip_trusted = true;
     std::optional<tcp::endpoint> local_endpoint;
     std::string_view tag;
     std::string_view protocol;
     const std::vector<std::string>* tags = nullptr;
     int64_t user_id = 0;
-    std::string user_email;
+    memory::ThreadLocalString user_email;
     // Opaque reference into the process-level immutable access-log source
     // registry. Panel fields stay in the control plane and never enter the
     // Worker hot-path Context.
     uint32_t access_source_ref = 0;
     std::string_view transport;
     std::string_view security;
-    std::string tls_sni;
-    std::string tls_alpn;
-    std::string tls_version;
-    std::string tls_fingerprint;
-    std::string http_host;
-    std::string transport_route_id;
+    memory::ThreadLocalString tls_sni;
+    memory::ThreadLocalString tls_alpn;
+    memory::ThreadLocalString tls_version;
+    memory::ThreadLocalString tls_fingerprint;
+    memory::ThreadLocalString http_host;
+    memory::ThreadLocalString transport_route_id;
     uint64_t transport_handshake_ms = 0;
     int64_t transport_ready_at_unix_us = 0;
     // Worker-local raw wire prefix retained only until protocol admission
@@ -88,22 +89,22 @@ struct Outbound {
     // remote field this is meaningful for direct and proxy next-hop sockets.
     std::optional<net::ip::address> connected_local_addr;
     uint16_t connected_local_port = 0;
-    std::string route_rule;
+    memory::ThreadLocalString route_rule;
     uint64_t dns_latency_ms = 0;
     uint32_t dns_answer_count = 0;
     uint64_t dial_ms = 0;
     uint32_t dial_attempt_count = 0;
     std::vector<net::ip::address> dial_addresses;
     int32_t os_error_code = 0;
-    std::string failure_detail_code;
+    memory::ThreadLocalString failure_detail_code;
     std::string_view tag;
 };
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
     Network network = Network::TCP;
-    std::string protocol;
-    std::string sniff_domain;
+    memory::ThreadLocalString protocol;
+    memory::ThreadLocalString sniff_domain;
     uint64_t speed_limit = 0;
     session::DnsResultState dns_result = session::DnsResultState::None;
     bool multiple_targets = false;
@@ -133,7 +134,7 @@ struct Context {
 
     Inbound inbound;
     Outbound outbound;
-    std::vector<Outbound> outbounds;
+    memory::ThreadLocalVector<Outbound> outbounds;
     Content content;
     Traffic traffic;
     std::optional<Sockopt> sockopt;

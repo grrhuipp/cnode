@@ -7,6 +7,7 @@ namespace defaults {
 
 // 运行线程
 constexpr uint32_t kMaxWorkers = 1024;
+constexpr uint32_t kWorkerMailboxCapacity = 256;
 
 // 资源限制
 constexpr uint32_t kMaxConnections = 0;            // 最大并发连接数（0=不限制）

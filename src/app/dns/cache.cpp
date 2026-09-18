@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iterator>
-#include <type_traits>
+#include <memory>
 
 namespace acpp::app::dns {
 
@@ -58,9 +58,9 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
 
     const auto existing = entries_.find(domain);
     if (existing != entries_.end()) {
-        static_assert(std::is_nothrow_move_assignable_v<DnsCacheEntry>);
         const auto node = existing->second;
-        node->entry = std::move(prepared);
+        std::destroy_at(&node->entry);
+        std::construct_at(&node->entry, std::move(prepared));
         order_.splice(order_.begin(), order_, node);
         return;
     }

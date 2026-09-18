@@ -9,7 +9,7 @@ std::expected<std::optional<uint32_t>, std::string>
 ParseHttp2InitialWindow(const json::object& source) {
     auto parsed = ParseAliasedJsonUint64(
         source,
-        {"initialWindowSize", "initial_window_size"},
+        {"initialWindowSize"},
         kHttp2MaxInitialWindow);
     if (!parsed) {
         return std::unexpected(std::move(parsed.error()));

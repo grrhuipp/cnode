@@ -94,9 +94,8 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
     Settings result;
 
     result.address = ReadString(source, "address");
-    if (result.address.empty()) result.address = ReadString(source, "server");
 
-    const auto port = ReadJsonPort(source, {"server_port", "port"});
+    const auto port = ReadJsonPort(source, {"port"});
     if (port.Invalid()) {
         return std::unexpected("AnyTLS server port must be between 1 and 65535");
     }
@@ -107,7 +106,7 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     auto check_interval = ReadPositiveSeconds(
         source,
-        {"idleSessionCheckInterval", "idle_session_check_interval"},
+        {"idleSessionCheckInterval"},
         result.idle_session_check_interval);
     if (!check_interval) {
         return std::unexpected(std::move(check_interval.error()));
@@ -116,13 +115,13 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     auto idle_timeout = ReadPositiveSeconds(
         source,
-        {"idleSessionTimeout", "idle_session_timeout"},
+        {"idleSessionTimeout"},
         result.idle_session_timeout);
     if (!idle_timeout) return std::unexpected(std::move(idle_timeout.error()));
     result.idle_session_timeout = *idle_timeout;
 
     auto min_idle = ReadAliasedUnsigned(
-        source, {"minIdleSession", "min_idle_session"});
+        source, {"minIdleSession"});
     if (!min_idle) return std::unexpected(std::move(min_idle.error()));
     if (min_idle->value) {
         if (*min_idle->value > std::numeric_limits<size_t>::max()) {

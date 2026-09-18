@@ -4,6 +4,7 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 #include "acppnode/app/static_inbound_prepared_config.hpp"
+#include "acppnode/common/defaults.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 
 #include <cstdint>
@@ -21,6 +22,7 @@ struct WorkerRuntimeConfig {
     std::vector<StaticInboundRuntimeEntry> static_inbounds;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
     uint32_t workers = 0;
+    uint32_t mailbox_capacity = defaults::kWorkerMailboxCapacity;
     uint32_t pressure_threshold = 1;
     uint32_t pressure_idle_timeout = 0;
 };

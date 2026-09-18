@@ -17,7 +17,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
-- 默认按多 Worker 运行，每个 Worker 持有自己的事件循环和热路径资源。
+- 默认按多 Worker 运行；每个 Worker 同构，各自拥有全部监听和热路径资源。进程只共享启动后只读的快照、有界日志队列和控制面。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 架构总览
@@ -51,6 +51,8 @@ main
   -> OutboundHandler(Freedom / VMess / VLESS / Trojan / Shadowsocks / AnyTLS / Blackhole)
   -> Relay(TCP / UDP / Mux)
 ```
+
+每个 Worker 独立绑定同一组端口（`SO_REUSEPORT`），连接不跨线程迁移。跨线程控制面经有界 mailbox 投递；用户认证、DNS L2 和 Geo 以不可变 snapshot 共享，不共享 live handler、会话或 allocator。
 
 这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 

@@ -27,8 +27,7 @@ Controller::Impl::getTraffic(const std::string& tag) {
         tasks.push_back(
             [](Worker* w, const std::string& t,
                TrafficSnapshot& out) -> net::awaitable<void> {
-                out = co_await net::co_spawn(
-                    w->GetExecutor(), w->GetTrafficTask(t), net::use_awaitable);
+                out = co_await w->PostTask(w->GetTrafficTask(t));
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
@@ -71,9 +70,7 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
         tasks.push_back(
             [](Worker* w, const std::string& t,
                std::vector<OnlineDevice>& out) -> net::awaitable<void> {
-                out = co_await net::co_spawn(
-                    w->GetExecutor(), w->GetOnlineDeviceTask(t),
-                    net::use_awaitable);
+                out = co_await w->PostTask(w->GetOnlineDeviceTask(t));
             }(workers_[i].get(), tag, per_worker[i])
         );
     }
@@ -103,9 +100,7 @@ Controller::Impl::GetDetectResult(const std::string& tag) {
         tasks.push_back(
             [](Worker* w, const std::string& t,
                std::vector<api::DetectResult>& out) -> net::awaitable<void> {
-                out = co_await net::co_spawn(
-                    w->GetExecutor(), w->GetDetectResultTask(t),
-                    net::use_awaitable);
+                out = co_await w->PostTask(w->GetDetectResultTask(t));
             }(workers_[i].get(), tag, per_worker[i])
         );
     }

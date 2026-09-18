@@ -37,7 +37,7 @@ std::string AddressString(const net::ip::address& address) {
 }
 
 std::string TargetHostString(const TargetAddress& target) {
-    if (!target.host.empty()) return target.host;
+    if (!target.host.empty()) return std::string(target.host);
     return target.resolved_addr ? AddressString(*target.resolved_addr) : std::string{};
 }
 
@@ -194,7 +194,7 @@ accesslog::Event BuildAccessLogEvent(
             (event.ended_at_unix_us - event.started_at_unix_us) / 1000);
     }
 
-    event.user_email = ctx.inbound.user_email;
+    event.user_email = std::string(ctx.inbound.user_email);
     event.inbound_tag.assign(ctx.inbound.tag);
     event.outbound_tag.assign(ctx.outbound.tag);
     event.protocol.assign(ctx.inbound.protocol);
@@ -202,22 +202,22 @@ accesslog::Event BuildAccessLogEvent(
 
     event.source_ip = ctx.inbound.source_ip.empty()
         ? AddressString(ctx.inbound.source_addr)
-        : ctx.inbound.source_ip;
+        : std::string(ctx.inbound.source_ip);
     event.source_port = ctx.inbound.source_port;
     if (ctx.inbound.local_endpoint) {
         event.inbound_port = ctx.inbound.local_endpoint->port();
         event.inbound_ip = AddressString(ctx.inbound.local_endpoint->address());
     }
-    event.peer_ip = ctx.inbound.peer_ip;
+    event.peer_ip = std::string(ctx.inbound.peer_ip);
     event.peer_port = ctx.inbound.peer_port;
-    event.client_ip_source = ctx.inbound.client_ip_source;
+    event.client_ip_source = std::string(ctx.inbound.client_ip_source);
     event.client_ip_trusted = ctx.inbound.client_ip_trusted;
 
     if (!ctx.content.multiple_targets) {
         const TargetAddress& target = ctx.outbound.target;
         event.target_host = target.host.empty() && target.resolved_addr
             ? AddressString(*target.resolved_addr)
-            : target.host;
+            : std::string(target.host);
         event.target_port = target.port;
     }
 
@@ -257,28 +257,28 @@ accesslog::Event BuildAccessLogEvent(
     }
     event.close_side = close_side;
     event.dns_state = static_cast<uint8_t>(ctx.content.dns_result);
-    event.sniff_protocol = ctx.content.protocol;
-    event.sniff_domain = ctx.content.sniff_domain;
+    event.sniff_protocol = std::string(ctx.content.protocol);
+    event.sniff_domain = std::string(ctx.content.sniff_domain);
     event.inbound_transport.assign(ctx.inbound.transport);
     event.inbound_security.assign(ctx.inbound.security);
     event.failure_stage = FailureStage(error_code);
     event.failure_detail_code = ctx.outbound.failure_detail_code.empty()
         ? event.error_reason
-        : ctx.outbound.failure_detail_code;
+        : std::string(ctx.outbound.failure_detail_code);
     event.os_error_code = ctx.outbound.os_error_code;
-    event.tls_sni = ctx.inbound.tls_sni;
-    event.tls_alpn = ctx.inbound.tls_alpn;
-    event.tls_version = ctx.inbound.tls_version;
-    event.tls_fingerprint = ctx.inbound.tls_fingerprint;
-    event.http_host = ctx.inbound.http_host;
-    event.transport_route_id = ctx.inbound.transport_route_id;
+    event.tls_sni = std::string(ctx.inbound.tls_sni);
+    event.tls_alpn = std::string(ctx.inbound.tls_alpn);
+    event.tls_version = std::string(ctx.inbound.tls_version);
+    event.tls_fingerprint = std::string(ctx.inbound.tls_fingerprint);
+    event.http_host = std::string(ctx.inbound.http_host);
+    event.transport_route_id = std::string(ctx.inbound.transport_route_id);
     event.original_target_host = TargetHostString(ctx.outbound.original_target);
     event.original_target_port = ctx.outbound.original_target.port;
     event.route_target_host = TargetHostString(ctx.outbound.route_target);
     event.route_target_port = ctx.outbound.route_target.port;
     event.final_target_host = TargetHostString(ctx.outbound.target);
     event.final_target_port = ctx.outbound.target.port;
-    event.route_rule = ctx.outbound.route_rule;
+    event.route_rule = std::string(ctx.outbound.route_rule);
     event.dns_latency_ms = ctx.outbound.dns_latency_ms;
     event.dns_answer_count = ctx.outbound.dns_answer_count;
     event.dial_attempt_count = ctx.outbound.dial_attempt_count;

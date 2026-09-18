@@ -277,7 +277,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return {};
         };
         auto has_supported_alter_id = [](const acpp::json::object& obj) {
-            for (const std::string_view key : {"alterId", "alter_id"}) {
+            for (const std::string_view key : {"alterId"}) {
                 const auto* value = obj.if_contains(key);
                 if (!value) continue;
                 if (value->is_int64() && value->as_int64() == 0) continue;
@@ -330,9 +330,6 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     users_p->as_array()[0].is_object()) {
                 const auto& user = users_p->as_array()[0].as_object();
                 vmess_config.address = json_string(server, "address");
-                if (vmess_config.address.empty()) {
-                    vmess_config.address = json_string(server, "server");
-                }
                 const auto port = acpp::ReadJsonPort(server, {"port"});
                 if (port.Invalid()) {
                     return std::nullopt;
@@ -341,9 +338,6 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     vmess_config.port = port.value;
                 }
                 uuid = json_string(user, "id");
-                if (uuid.empty()) {
-                    uuid = json_string(user, "uuid");
-                }
                 if (!has_supported_alter_id(user)) {
                     return std::nullopt;
                 }
@@ -357,22 +351,15 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         }
 
         if (!parsed_xray) {
-            vmess_config.address = json_string(s, "server");
-            if (vmess_config.address.empty()) {
-                vmess_config.address = json_string(s, "address");
-            }
-            const auto port = acpp::ReadJsonPort(
-                s, {"server_port", "port"});
+            vmess_config.address = json_string(s, "address");
+            const auto port = acpp::ReadJsonPort(s, {"port"});
             if (port.Invalid()) {
                 return std::nullopt;
             }
             if (port.Valid()) {
                 vmess_config.port = port.value;
             }
-            uuid = json_string(s, "uuid");
-            if (uuid.empty()) {
-                uuid = json_string(s, "id");
-            }
+            uuid = json_string(s, "id");
             if (!has_supported_alter_id(s)) {
                 return std::nullopt;
             }

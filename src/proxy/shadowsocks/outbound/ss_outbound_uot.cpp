@@ -33,7 +33,7 @@ std::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
     const json::object& source) {
     std::optional<SsUotVersion> result;
     std::string_view first_key;
-    for (const std::string_view key : {"uotVersion", "uot_version"}) {
+    for (const std::string_view key : {"uotVersion"}) {
         const auto* value = source.if_contains(key);
         if (!value) continue;
         auto parsed = ParseVersionValue(*value, key);
@@ -110,30 +110,14 @@ ParseUotVersion(const json::object& source) {
         return std::unexpected(std::move(top_level_version.error()));
     }
 
-    const auto* udp_over_tcp = source.if_contains("udp_over_tcp");
     const auto* uot = source.if_contains("uot");
-    if (!udp_over_tcp && !uot) {
+    if (!uot) {
         if (*top_level_version) {
-            return std::unexpected("UoT version requires uot or udp_over_tcp");
+            return std::unexpected("UoT version requires uot");
         }
         return std::optional<SsUotVersion>{};
     }
-
-    std::optional<SsUotVersion> result;
-    bool parsed_one = false;
-    for (const auto& entry : {
-             std::pair<std::string_view, const json::value*>{"udp_over_tcp", udp_over_tcp},
-             std::pair<std::string_view, const json::value*>{"uot", uot}}) {
-        if (!entry.second) continue;
-        auto parsed = ParseActivation(*entry.second, entry.first, *top_level_version);
-        if (!parsed) return std::unexpected(std::move(parsed.error()));
-        if (parsed_one && result != *parsed) {
-            return std::unexpected("uot and udp_over_tcp must describe the same state");
-        }
-        result = *parsed;
-        parsed_one = true;
-    }
-    return result;
+    return ParseActivation(*uot, "uot", *top_level_version);
 }
 
 }  // namespace acpp::proxy::shadowsocks::outbound

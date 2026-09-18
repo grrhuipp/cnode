@@ -29,7 +29,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     }
 
     auto stream_settings = ParseAliasedJsonObject(
-        j, {"streamSettings", "stream_settings"});
+        j, {"streamSettings"});
     if (!stream_settings) {
         throw std::invalid_argument(std::move(stream_settings.error()));
     }
@@ -39,9 +39,6 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     }
 
     const json::value* send_through = j.if_contains("sendThrough");
-    if (!send_through) {
-        send_through = j.if_contains("send_through");
-    }
     if (send_through) {
         if (!send_through->is_string()) {
             throw std::invalid_argument("outbound sendThrough must be a string");

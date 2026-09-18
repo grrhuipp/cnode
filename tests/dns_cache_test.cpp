@@ -1,4 +1,5 @@
 #include "app/dns/cache_internal.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <array>
 #include <iostream>
@@ -45,7 +46,6 @@ void TestFailedInsertion(bool negative) {
     for (int allocation = 0; allocation < 20; ++allocation) {
         DnsCache cache(1, 10, 600);
         cache.Store(domains[0], old_answer);
-        acpp::memory::CollectCurrentThread(true);
         bool rejected = false;
         {
             FailAllocation fault(allocation);
@@ -128,7 +128,6 @@ void TestFailedReplacement() {
     const auto original = Answer("192.0.2.1");
     const auto replacement = Answer("192.0.2.2", 400);
     cache.Store("same.example", original);
-    acpp::memory::CollectCurrentThread(true);
     bool failed = false;
     {
         FailAllocation fault(0);
@@ -160,6 +159,7 @@ void operator delete(void* pointer, const std::nothrow_t&) noexcept {
 }
 
 int main() {
+    acpp::memory::ConfigureProcessAllocator();
     try {
         TestFailedInsertion(false);
         TestFailedInsertion(true);

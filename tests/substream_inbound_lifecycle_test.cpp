@@ -779,7 +779,6 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     bool returned = false;
     int active_at_return = -1;
     std::exception_ptr failure;
-    buf::TrimThreadBufferRecycle(true);
     Check(buffer_allocation_count == 0, "buffer accounting must start empty");
     track_buffers = true;
     peak_buffer_allocations = 0;
@@ -810,7 +809,6 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     stream.record_payload_buffers = mode == 1;
     stream.wake.cancel();
     io.poll();
-    buf::TrimThreadBufferRecycle(true);
     const size_t queued_blocks = buffer_allocation_count;
     const bool bounded = queued_blocks <= (expected.size() + 4095) / 4096;
     Check(stream.offset == stream.input.size() && stream.pending_reads == 1,
@@ -824,7 +822,6 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
         expected.push_back(expected[0]);
     }
     if (mode == 8) {
-        memory::CollectCurrentThread(true);
         std::array<uint8_t, 4096> added{};
         Frame(stream.input, 2, 1, added);
         stream.fail_queue_reserve = true;
@@ -855,7 +852,6 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     Check(returned && active_at_return == 0 && stream.destroyed &&
           stream.pending_reads == 0 && stream.pending_writes == 0,
           "queue storage must not outlive its joined session");
-    buf::TrimThreadBufferRecycle(true);
     Check(buffer_allocation_count == 0, "all queued and in-flight Buffer allocations must be released");
     track_buffers = false;
     std::cout << "queue-" << names[mode] << " seed=" << seed << " fragments=" << fragments << " queued-blocks=" << queued_blocks

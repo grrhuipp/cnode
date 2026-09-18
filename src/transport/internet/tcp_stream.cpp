@@ -140,7 +140,7 @@ struct TcpStream::Impl {
 // ============================================================================
 
 void* TcpStream::operator new(std::size_t size) {
-    if (void* p = memory::AllocateRaw(size, alignof(TcpStream))) {
+    if (void* p = memory::AllocatePmr(size, alignof(TcpStream))) {
         memory::OnAsyncStreamNew();
         return p;
     }
@@ -149,12 +149,12 @@ void* TcpStream::operator new(std::size_t size) {
 
 void TcpStream::operator delete(void* p) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocateRaw(p, sizeof(TcpStream), alignof(TcpStream));
+    memory::DeallocatePmr(p, sizeof(TcpStream), alignof(TcpStream));
 }
 
 void TcpStream::operator delete(void* p, std::size_t size) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocateRaw(p, size, alignof(TcpStream));
+    memory::DeallocatePmr(p, size, alignof(TcpStream));
 }
 
 TcpStream::TcpStream(tcp::socket socket)
