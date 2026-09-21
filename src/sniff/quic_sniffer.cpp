@@ -168,11 +168,13 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
 
 SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     SniffResult result;
-    if (data.empty()) return result;
+    if (data.empty()) {
+        return result;
+    }
 
     std::vector<uint8_t> packet(data.begin(), data.end());
     std::vector<uint8_t> crypto;
-    crypto.resize(0);
+    bool decrypted_initial = false;
 
     size_t offset = 0;
     while (offset < packet.size()) {
@@ -214,6 +216,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         }
         const size_t hdr_len = cursor;
         if (remaining.size() < hdr_len + static_cast<size_t>(packet_len)) {
+            result.need_more = decrypted_initial;
             return result;
         }
         const size_t next_offset = offset + hdr_len + static_cast<size_t>(packet_len);
@@ -264,7 +267,10 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             ext_hdr_len, static_cast<size_t>(packet_len) - static_cast<size_t>(pn_len));
         const auto aad = remaining.first(ext_hdr_len);
         std::vector<uint8_t> decrypted;
-        if (!AesGcmDecrypt(key, nonce, aad, ciphertext, decrypted)) return result;
+        if (!AesGcmDecrypt(key, nonce, aad, ciphertext, decrypted)) {
+            return result;
+        }
+        decrypted_initial = true;
 
         size_t frame = 0;
         while (frame < decrypted.size()) {
@@ -345,6 +351,10 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             return result;
         }
         offset = next_offset;
+    }
+    if (decrypted_initial) {
+        result.need_more = true;
+        result.protocol = constants::protocol::kQuic;
     }
     return result;
 }

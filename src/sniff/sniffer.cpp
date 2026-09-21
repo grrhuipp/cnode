@@ -23,11 +23,7 @@ SniffResult Sniff(std::span<const uint8_t> data) {
 
 SniffResult Sniff(std::span<const uint8_t> data, Network network) {
     if (network == Network::UDP) {
-        QuicSniffer quic;
-        if (auto result = quic.Sniff(data); result.success) {
-            return result;
-        }
-        return SniffResult{};
+        return QuicSniffer{}.Sniff(data);
     }
 
     TlsSniffer tls;

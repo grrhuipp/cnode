@@ -16,8 +16,9 @@ bool Require(bool condition, const char* message) {
 int main() {
     acpp::QuicSniffer sniffer;
     const std::array<uint8_t, 8> empty_udp{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
-    if (!Require(!sniffer.Sniff(empty_udp).success,
-                 "random UDP payload must not sniff as QUIC")) {
+    const auto random = sniffer.Sniff(empty_udp);
+    if (!Require(!random.success && !random.need_more,
+                 "random UDP payload must not sniff as QUIC or wait for more")) {
         return 1;
     }
 

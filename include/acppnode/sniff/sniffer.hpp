@@ -15,10 +15,10 @@ namespace acpp {
 // ============================================================================
 struct SniffResult {
     bool success = false;           // 是否嗅探成功
+    bool need_more = false;         // 已识别协议，但还要更多字节（对齐 xray ErrProtoNeedMoreData）
     std::string_view protocol;      // 协议类型："tls", "http", "quic"（常量视图）
     std::string domain;             // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
-
 };
 
 // ============================================================================

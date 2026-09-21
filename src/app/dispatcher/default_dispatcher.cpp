@@ -21,7 +21,11 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 
 #include <algorithm>
+#include <asio/experimental/awaitable_operators.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
+#include <chrono>
 #include <limits>
 #include <new>
 #include <string>
@@ -36,15 +40,26 @@ public:
     explicit CachedMultiBufferReader(transport::MultiBufferReader& inner) noexcept
         : inner_(inner) {}
 
-    net::awaitable<void> Cache() {
-        if (!cached_) {
-            cache_ = co_await inner_.ReadMultiBuffer();
-            cached_ = true;
+    void Preload(buf::MultiBuffer payload) {
+        if (payload.empty()) {
+            return;
         }
-        co_return;
+        payload.MoveTo(cache_);
+        cached_ = true;
     }
 
-    [[nodiscard]] buf::MultiBuffer& Cached() noexcept { return cache_; }
+    net::awaitable<bool> CacheMore() {
+        auto payload = co_await inner_.ReadMultiBuffer();
+        if (payload.empty()) {
+            co_return false;
+        }
+        payload.MoveTo(cache_);
+        cached_ = true;
+        co_return true;
+    }
+
+    [[nodiscard]] const buf::MultiBuffer& Cached() const noexcept { return cache_; }
+    [[nodiscard]] size_t CachedBytes() const noexcept { return buf::TotalLen(cache_); }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (cached_) {
@@ -348,76 +363,126 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     buf::MultiBuffer outbound_first_payload;
     std::optional<CachedMultiBufferReader> cached_reader;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
-        static constexpr size_t kSniffMaxBytes = 65535;
-        std::span<const uint8_t> sniff_data;
+        using net::experimental::awaitable_operators::operator||;
+        static constexpr size_t kSniffMaxBytes = 32767;
+        static constexpr auto kTcpSniffWindow = std::chrono::milliseconds(200);
+        static constexpr auto kUdpSniffWindow = std::chrono::seconds(3);
+        const auto sniff_window = ctx.content.network == Network::UDP
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(kUdpSniffWindow)
+            : kTcpSniffWindow;
         memory::ByteVector sniff_scratch;
 
-        auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb) {
+        auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
             const size_t total = buf::TotalLen(mb);
             if (total == 0) {
-                return;
+                return std::span<const uint8_t>{};
             }
             const size_t want = std::min(total, kSniffMaxBytes);
             if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
-                sniff_data = direct;
-                return;
+                return direct;
             }
             sniff_scratch.resize(want);
             const size_t copied = mb.CopyPrefixTo(
                 std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
-            if (copied > 0) {
-                sniff_data = std::span<const uint8_t>(sniff_scratch.data(), copied);
-            }
+            return copied == 0
+                ? std::span<const uint8_t>{}
+                : std::span<const uint8_t>(sniff_scratch.data(), copied);
         };
 
-        if (!first_packet.empty()) {
-            if (first_packet.IsContiguous()) {
-                sniff_data = first_packet.span();
-                if (sniff_data.size() > kSniffMaxBytes) {
-                    sniff_data = sniff_data.first(kSniffMaxBytes);
-                }
-            } else {
-                const size_t want = std::min(first_packet.size(), kSniffMaxBytes);
-                if (auto direct = first_packet.PrefixSpan(want); !direct.empty()) {
-                    sniff_data = direct;
-                } else {
-                    sniff_scratch.resize(want);
-                    const size_t got = first_packet.CopyPrefixTo(
-                        sniff_scratch.data(), sniff_scratch.size());
-                    if (got > 0) {
-                        sniff_data = std::span<const uint8_t>(sniff_scratch.data(), got);
-                    }
-                }
+        auto sniff_cached = [&]() {
+            const auto sniff_data = copy_cached_bytes(cached_reader->Cached());
+            if (sniff_data.empty()) {
+                return SniffResult{};
             }
-        } else if (inbound_reader) {
-            try {
-                if (inbound_control) {
-                    inbound_control->SetReadTimeout(timeouts.ReadTimeout());
-                }
+            return Sniff(sniff_data, ctx.content.network);
+        };
+
+        try {
+            if (inbound_reader) {
                 cached_reader.emplace(*inbound_reader);
-                co_await cached_reader->Cache();
-                sniff_from_multibuffer(cached_reader->Cached());
                 inbound_reader = &*cached_reader;
                 inbound_link.reader = inbound_reader;
-            } catch (const std::bad_alloc&) {
-                throw;
-            } catch (const transport::LinkError& e) {
-                stats.OnError();
-                co_return MakeRelayError(e.code());
-            } catch (const IoSystemError& e) {
-                stats.OnError();
-                co_return MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
-                    ? ErrorCode::TIMEOUT
-                    : MapAsioError(e.code()));
-            } catch (...) {
-                stats.OnError();
-                co_return MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
-            }
-        }
+                if (!first_packet.empty()) {
+                    cached_reader->Preload(first_packet.MoveToMultiBuffer());
+                } else {
+                    if (inbound_control) {
+                        inbound_control->SetReadTimeout(timeouts.ReadTimeout());
+                    }
+                    (void)co_await cached_reader->CacheMore();
+                }
 
-        if (!sniff_data.empty()) {
-            ApplySniffOverride(
-                ctx, policy.sniffing, Sniff(sniff_data, ctx.content.network));
+                const auto sniff_started = std::chrono::steady_clock::now();
+                int no_clue_attempts = 0;
+                for (;;) {
+                    const auto sniffed = sniff_cached();
+                    if (sniffed.success) {
+                        ApplySniffOverride(ctx, policy.sniffing, sniffed);
+                        break;
+                    }
+                    if (!sniffed.need_more) {
+                        ++no_clue_attempts;
+                        if (no_clue_attempts >= 2) {
+                            break;
+                        }
+                    }
+                    if (cached_reader->CachedBytes() >= kSniffMaxBytes) {
+                        break;
+                    }
+                    const auto remaining = sniff_window -
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - sniff_started);
+                    if (remaining <= std::chrono::milliseconds::zero()) {
+                        break;
+                    }
+                    const auto bytes_before = cached_reader->CachedBytes();
+                    net::steady_timer timer(io_context);
+                    timer.expires_after(remaining);
+                    try {
+                        co_await (cached_reader->CacheMore() ||
+                                  timer.async_wait(net::use_awaitable));
+                    } catch (...) {
+                        break;
+                    }
+                    if (cached_reader->CachedBytes() <= bytes_before) {
+                        break;
+                    }
+                }
+            } else if (!first_packet.empty()) {
+                const auto sniff_data = first_packet.IsContiguous()
+                    ? first_packet.span()
+                    : std::span<const uint8_t>{};
+                memory::ByteVector leftover;
+                std::span<const uint8_t> view = sniff_data;
+                if (view.empty()) {
+                    const size_t want =
+                        std::min(first_packet.size(), kSniffMaxBytes);
+                    leftover.resize(want);
+                    const size_t got = first_packet.CopyPrefixTo(
+                        leftover.data(), leftover.size());
+                    if (got > 0) {
+                        view = std::span<const uint8_t>(leftover.data(), got);
+                    }
+                } else if (view.size() > kSniffMaxBytes) {
+                    view = view.first(kSniffMaxBytes);
+                }
+                if (!view.empty()) {
+                    ApplySniffOverride(
+                        ctx, policy.sniffing, Sniff(view, ctx.content.network));
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const transport::LinkError& e) {
+            stats.OnError();
+            co_return MakeRelayError(e.code());
+        } catch (const IoSystemError& e) {
+            stats.OnError();
+            co_return MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
+                ? ErrorCode::TIMEOUT
+                : MapAsioError(e.code()));
+        } catch (...) {
+            stats.OnError();
+            co_return MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
         }
     }
 
