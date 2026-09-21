@@ -16,7 +16,7 @@ namespace acpp {
 struct SniffConfig {
     bool enabled = true;
     bool metadata_only = false;
-    bool route_only = false;
+    bool route_only = true;
     std::vector<std::string> dest_override = {
         std::string(constants::protocol::kTls),
         std::string(constants::protocol::kHttp),

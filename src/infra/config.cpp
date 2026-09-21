@@ -1528,7 +1528,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     if (const auto* sniffing = optional_object(j, {"sniffing"})) {
         cfg.sniffing.enabled = jbool(*sniffing, {"enabled"}, true);
         cfg.sniffing.metadata_only = jbool(*sniffing, {"metadataOnly"}, false);
-        cfg.sniffing.route_only = jbool(*sniffing, {"routeOnly"}, false);
+        cfg.sniffing.route_only = jbool(*sniffing, {"routeOnly"}, true);
         cfg.sniffing.dest_override =
             jstr_array(*sniffing, {"destOverride"});
         cfg.sniffing.domains_excluded =
