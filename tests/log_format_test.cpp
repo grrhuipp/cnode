@@ -66,7 +66,7 @@ int main() {
             "quoted=\"value\" newline=first\nsecond");
         acpp::Log::WriteConnection(
             acpp::LogLevel::INFO,
-            acpp::ConnectionLogContext{.conn_id = 42},
+            acpp::ConnectionLogContext{.conn_id = 42, .inbound_tag = {}, .user_id = 0},
             "dialing tcp:example.com:443");
         acpp::Log::WriteConnection(
             acpp::LogLevel::WARN,
@@ -90,7 +90,10 @@ int main() {
             "invalid user");
         acpp::Log::WriteConnection(
             acpp::LogLevel::WARN,
-            acpp::ConnectionLogContext{.conn_id = (1ull << 32) | 7},
+            acpp::ConnectionLogContext{
+                .conn_id = (1ull << 32) | 7,
+                .inbound_tag = {},
+                .user_id = 0},
             "failed to dial example.com:443 > connection refused");
         acpp::Log::WriteAccess(
             "from tcp:192.0.2.10:52000 accepted tcp:example.com:443 "

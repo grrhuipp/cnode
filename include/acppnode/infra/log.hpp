@@ -69,6 +69,8 @@ public:
         std::source_location location = std::source_location::current()) {
         ConnectionLogContext log_context{
             .conn_id = context.conn_id,
+            .inbound_tag = {},
+            .user_id = 0,
         };
         if constexpr (requires {
                           std::string(context.inbound.tag);
