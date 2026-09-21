@@ -768,6 +768,8 @@ private:
                     access_file_ << FormatRecord(record) << '\n';
                 }
                 break;
+            case LogChannel::Console:
+                break;
         }
     }
 

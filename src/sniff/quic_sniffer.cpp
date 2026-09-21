@@ -89,8 +89,9 @@ bool HkdfExpandLabel(std::span<const uint8_t> secret,
                      std::span<uint8_t> out) {
     std::array<uint8_t, 2 + 1 + 6 + 16 + 1> info_buf{};
     const auto label_size = static_cast<uint8_t>(6 + label.size());
-    if (label.size() > 16 ||
-        2 + 1 + label_size + 1 > info_buf.size()) {
+    const size_t info_bytes =
+        static_cast<size_t>(2) + 1 + static_cast<size_t>(label_size) + 1;
+    if (label.size() > 16 || info_bytes > info_buf.size()) {
         return false;
     }
     info_buf[0] = static_cast<uint8_t>((out.size() >> 8) & 0xff);

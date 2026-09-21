@@ -119,6 +119,7 @@ std::optional<BuildRequest> PrepareBuildRequest(
     BuildRequest request{
         .tag = std::string(tag),
         .protocol = std::string(protocol),
+        .settings = {},
     };
     if (it->second.prepare_settings) {
         auto settings = it->second.prepare_settings(tag, config);
