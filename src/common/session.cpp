@@ -52,7 +52,8 @@ std::string FormatXrayAccessLog(const session::Context& ctx) {
         : ctx.outbound.tag;
 
     std::string access = std::format(
-        "from {} accepted {}:{} [{} -> {}]",
+        "from {}:{} accepted {}:{} [{} -> {}]",
+        net_str,
         src,
         net_str,
         iputil::FormatEndpointForLog(target_host, t.port),

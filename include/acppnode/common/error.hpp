@@ -205,6 +205,24 @@ constexpr std::string_view ErrorCodeToString(ErrorCode code) {
     }
 }
 
+// Local error logs use xray-style lowercase reasons, not the stable code name.
+[[nodiscard]]
+inline std::string ErrorCodeToLogReason(ErrorCode code) {
+    const auto raw = ErrorCodeToString(code);
+    std::string reason;
+    reason.reserve(raw.size());
+    for (const char ch : raw) {
+        if (ch == '_') {
+            reason.push_back(' ');
+        } else if (ch >= 'A' && ch <= 'Z') {
+            reason.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            reason.push_back(ch);
+        }
+    }
+    return reason;
+}
+
 // 错误消息统一格式化
 [[nodiscard]]
 inline std::string ErrorMessage(ErrorCode code, std::string_view message = {}) {

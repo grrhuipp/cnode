@@ -44,28 +44,14 @@ SniffResult TlsSniffer::Sniff(std::span<const uint8_t> data) {
     return result;
 }
 
-std::optional<std::string_view> TlsSniffer::ParseClientHello(
+std::optional<std::string_view> TlsSniffer::ParseHandshake(
     std::span<const uint8_t> data) {
-    if (data.size() < 5 || data[0] != tls::kContentTypeHandshake) {
+    if (data.size() < 4 || data[0] != tls::kHandshakeClientHello) {
         return std::nullopt;
     }
-
-    const uint16_t record_version = tls::ReadU16(data, 1);
-    if ((record_version < tls::kTls10 || record_version > tls::kTls13) &&
-        record_version != 0x0300) {
-        return std::nullopt;
-    }
-
-    const uint16_t record_size = tls::ReadU16(data, 3);
-    if (record_size > data.size() - 5) return std::nullopt;
-    const auto record = data.subspan(5, record_size);
-    if (record.size() < 4 || record[0] != tls::kHandshakeClientHello) {
-        return std::nullopt;
-    }
-
-    const uint32_t handshake_size = tls::ReadU24(record, 1);
-    if (handshake_size > record.size() - 4) return std::nullopt;
-    const auto body = record.subspan(4, handshake_size);
+    const uint32_t handshake_size = tls::ReadU24(data, 1);
+    if (handshake_size > data.size() - 4) return std::nullopt;
+    const auto body = data.subspan(4, handshake_size);
     if (body.size() < 2 + 32 + 1) return std::nullopt;
 
     size_t position = 2 + 32;
@@ -92,8 +78,25 @@ std::optional<std::string_view> TlsSniffer::ParseClientHello(
     if (body.size() - position < 2) return std::nullopt;
     const uint16_t extensions_size = tls::ReadU16(body, position);
     position += 2;
-    if (extensions_size != body.size() - position) return std::nullopt;
+    if (extensions_size > body.size() - position) return std::nullopt;
     return ExtractSNI(body.subspan(position, extensions_size));
+}
+
+std::optional<std::string_view> TlsSniffer::ParseClientHello(
+    std::span<const uint8_t> data) {
+    if (data.size() < 5 || data[0] != tls::kContentTypeHandshake) {
+        return std::nullopt;
+    }
+
+    const uint16_t record_version = tls::ReadU16(data, 1);
+    if ((record_version < tls::kTls10 || record_version > tls::kTls13) &&
+        record_version != 0x0300) {
+        return std::nullopt;
+    }
+
+    const uint16_t record_size = tls::ReadU16(data, 3);
+    if (record_size > data.size() - 5) return std::nullopt;
+    return ParseHandshake(data.subspan(5, record_size));
 }
 
 std::optional<std::string_view> TlsSniffer::ExtractSNI(

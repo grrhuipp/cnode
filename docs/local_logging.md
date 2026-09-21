@@ -29,13 +29,13 @@ YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: message
 YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: inbound=tag user=id message
 ```
 
-日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出用户身份字段。
+`component` 对齐 xray-core 包路径，例如 `app/dispatcher`、`proxy/freedom`、`transport/internet/tcp`。`conn_id` 只输出 Worker 本地 32 位序号。日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出用户身份字段。失败消息保留 `source -> target via outbound` 和原因。
 
 示例：
 
 ```text
-2026/07/19 20:42:06 [Debug] [4294967338] proxy/freedom/freedom_outbound: inbound=vless-in user=123 DIAL_FAILED 192.0.2.10 -> example.com:443 via direct: connection refused
-2026/07/19 20:42:06 [Warning] [4294967338] app/dispatcher/default_dispatcher: inbound=vless-in user=123 OUTBOUND_PROCESS_FAILED 192.0.2.10 -> example.com:443 via direct: OUTBOUND_CONNECTION_FAILED
+2026/07/19 20:42:06 [Debug] [10] proxy/freedom: inbound=vless-in user=123 failed to dial 192.0.2.10 -> example.com:443 via direct > connection refused
+2026/07/19 20:42:06 [Warning] [10] app/dispatcher: inbound=vless-in user=123 failed to process outbound traffic 192.0.2.10 -> example.com:443 via direct > outbound connection failed
 2026/07/19 20:42:07 [Error] infra/access_log_reporter: pending batch rejected events=1000 bytes=81920
 ```
 
@@ -55,13 +55,13 @@ Freedom 的 TCP / UDP 拨号失败细节使用 `Debug`；Dispatcher 统一输出
 access 对齐 xray-core `AccessMessage`：
 
 ```text
-YYYY/MM/DD HH:MM:SS from source accepted network:target [inbound -> outbound] email: user
+YYYY/MM/DD HH:MM:SS from network:source accepted network:target [inbound -> outbound] email: user
 ```
 
 示例：
 
 ```text
-2026/07/19 20:42:06 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] email: user@example.com
+2026/07/19 20:42:06 from tcp:192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] email: user@example.com
 ```
 
 access 记录不带 `[Info]`，也不写组件、源码行或 Worker。它只表达访问事实，使用 `LOG_ACCESS` 写入。认证失败、拨号失败和 relay 异常进入 error logger；强类型终态结果由集中日志 `AccessLogSession` 上报，避免在本地 access 中创造第二套终态口径。
@@ -70,7 +70,7 @@ access 记录不带 `[Info]`，也不写组件、源码行或 Worker。它只表
 
 - error logger 写入 `error_YYYY-MM-DD.log`。
 - access logger 写入 `access_YYYY-MM-DD.log`。
-- 控制台使用 error 的文本格式。
+- 控制台使用相同的时间与级别，但不写 component：`YYYY/MM/DD HH:MM:SS [Level] message`。
 - Worker 和协议热路径只做级别判断、消息构造和非阻塞入队。
 - 后台 writer 负责落盘、刷新、按日轮转、gzip 和保留期清理。
 - 队列满时不阻塞 Worker，丢弃数量写入 error logger。

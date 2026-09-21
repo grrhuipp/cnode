@@ -26,5 +26,11 @@ int main() {
     config.RefreshHotPathFields();
     if (!Require(config.domains_excluded.front() == "blocked.example",
                  "cold-path sniff config must publish canonical exclusions")) return 5;
+    config.dest_override = {"quic"};
+    config.RefreshHotPathFields();
+    if (!Require(config.MatchesDestOverride("quic"),
+                 "quic destOverride must be recognized")) return 6;
+    if (!Require(!config.MatchesDestOverride("tls"),
+                 "unlisted destOverride protocols must not match")) return 7;
     return 0;
 }

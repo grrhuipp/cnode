@@ -408,20 +408,20 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                 case ProxyProtocolReadStatus::TimedOut:
                     LOG_CONN_WARN(
                         ctx,
-                        "PROXY_PROTOCOL_TIMEOUT client={}",
+                        "failed to read PROXY protocol client={} > i/o timeout",
                         ctx.inbound.source_ip);
                     break;
                 case ProxyProtocolReadStatus::Truncated:
-                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_TRUNCATED");
+                    LOG_CONN_WARN(ctx, "failed to read PROXY protocol > truncated header");
                     break;
                 case ProxyProtocolReadStatus::TooLarge:
                     LOG_CONN_WARN(
                         ctx,
-                        "PROXY_PROTOCOL_TOO_LARGE limit={}B",
+                        "failed to read PROXY protocol > header too large limit={}B",
                         2048);
                     break;
                 case ProxyProtocolReadStatus::Invalid:
-                    LOG_CONN_WARN(ctx, "PROXY_PROTOCOL_INVALID");
+                    LOG_CONN_WARN(ctx, "failed to read PROXY protocol > invalid header");
                     break;
                 case ProxyProtocolReadStatus::Ok:
                     break;
@@ -436,7 +436,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             proxy_read.result.status != ProxyProtocolParseStatus::Success) {
             LOG_CONN_WARN(
                 ctx,
-                "PROXY_PROTOCOL_REQUIRED_MISSING client={}",
+                "failed to read PROXY protocol client={} > required header missing",
                 ctx.inbound.source_ip);
             stats.OnError();
             access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);

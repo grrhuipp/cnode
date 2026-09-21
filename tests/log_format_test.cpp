@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,7 +77,7 @@ int main() {
                 },
                 .conn_id = 43,
             },
-            "OUTBOUND_PROCESS_FAILED target=www.sina.com.cn:8080");
+            "failed to process outbound traffic 192.0.2.10 -> www.sina.com.cn:8080 via direct > connection refused");
         acpp::Log::WriteConnection(
             acpp::LogLevel::WARN,
             SessionLogContext{
@@ -86,10 +87,21 @@ int main() {
                 },
                 .conn_id = 44,
             },
-            "AUTHENTICATION_FAILED");
+            "invalid user");
+        acpp::Log::WriteConnection(
+            acpp::LogLevel::WARN,
+            acpp::ConnectionLogContext{.conn_id = (1ull << 32) | 7},
+            "failed to dial example.com:443 > connection refused");
         acpp::Log::WriteAccess(
-            "from 192.0.2.10:52000 accepted tcp:example.com:443 "
+            "from tcp:192.0.2.10:52000 accepted tcp:example.com:443 "
             "[vless-in -> direct] email: user@example.com");
+
+        std::ostringstream console;
+        auto* previous = std::cout.rdbuf(console.rdbuf());
+        acpp::Log::WriteConsole(
+            acpp::LogLevel::INFO, "Panel jx/1 status: ready");
+        std::cout.rdbuf(previous);
+
         acpp::Log::Shutdown();
 
         const auto error_lines = ReadLines(directory / "error.log");
@@ -107,31 +119,46 @@ int main() {
                "Xray connection context missing");
 
         const auto& authenticated =
-            FindLine(error_lines, "OUTBOUND_PROCESS_FAILED");
+            FindLine(error_lines, "failed to process outbound traffic");
         CheckTimestamp(authenticated);
         Expect(authenticated.find(" [Warning] [43] ") != std::string::npos,
                "authenticated connection context missing");
         Expect(authenticated.find(
                    ": inbound=jx-ss-shadowsocks-50006 user=502345929 "
-                   "OUTBOUND_PROCESS_FAILED") != std::string::npos,
-               "authenticated connection identity missing");
+                   "failed to process outbound traffic 192.0.2.10 -> "
+                   "www.sina.com.cn:8080 via direct > connection refused") !=
+                   std::string::npos,
+               "authenticated connection identity or route fields missing");
 
         const auto& unauthenticated =
-            FindLine(error_lines, "AUTHENTICATION_FAILED");
+            FindLine(error_lines, "invalid user");
         CheckTimestamp(unauthenticated);
         Expect(unauthenticated.find(" [Warning] [44] ") != std::string::npos,
                "pre-authentication connection format changed");
-        Expect(unauthenticated.find(": AUTHENTICATION_FAILED") !=
-                   std::string::npos,
+        Expect(unauthenticated.find(": invalid user") != std::string::npos,
                "pre-authentication message format changed");
         Expect(unauthenticated.find(" user=") == std::string::npos,
                "pre-authentication log exposed an invalid user id");
+
+        const auto& packed =
+            FindLine(error_lines, "failed to dial example.com:443");
+        Expect(packed.find(" [Warning] [7] ") != std::string::npos,
+               "connection id must log the short session sequence");
+        Expect(packed.find("[4294967303]") == std::string::npos,
+               "connection id must not log the packed worker-local value");
+
+        const auto console_text = console.str();
+        Expect(console_text.find("[Info] Panel jx/1 status: ready") !=
+                   std::string::npos,
+               "console log missing panel status");
+        Expect(console_text.find("log_format_test") == std::string::npos,
+               "console log must not include source component");
 
         const auto access_lines = ReadLines(directory / "access.log");
         Expect(access_lines.size() == 1, "access logger wrote diagnostics");
         CheckTimestamp(access_lines.front());
         Expect(access_lines.front().find(
-                   " from 192.0.2.10:52000 accepted tcp:example.com:443 "
+                   " from tcp:192.0.2.10:52000 accepted tcp:example.com:443 "
                    "[vless-in -> direct] email: user@example.com") !=
                std::string::npos,
                "Xray access format mismatch");

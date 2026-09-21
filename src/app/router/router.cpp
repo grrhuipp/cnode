@@ -167,6 +167,16 @@ private:
     bool index_built_ = false;
 };
 
+[[nodiscard]] std::string_view RoutingDomain(const session::Context& ctx) noexcept {
+    if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.IsDomain()) {
+        return ctx.outbound.route_target.host;
+    }
+    if (ctx.outbound.target.IsDomain()) {
+        return ctx.outbound.target.host;
+    }
+    return {};
+}
+
 class DomainCondition {
 public:
     explicit DomainCondition(DomainMatcher matcher)
@@ -175,9 +185,9 @@ public:
     [[nodiscard]] bool Match(
         const session::Context& ctx,
         const ::acpp::geo::GeoManager* /*geo*/) const {
-        const auto& target = ctx.outbound.target;
-        if (!target.IsDomain()) return false;
-        return matcher_.Match(target.host);
+        const auto domain = RoutingDomain(ctx);
+        if (domain.empty()) return false;
+        return matcher_.Match(domain);
     }
 
 private:
@@ -364,6 +374,7 @@ private:
     static constexpr uint8_t kProtocolTls = 1u << 0;
     static constexpr uint8_t kProtocolHttp = 1u << 1;
     static constexpr uint8_t kProtocolBittorrent = 1u << 2;
+    static constexpr uint8_t kProtocolQuic = 1u << 3;
 
     [[nodiscard]] bool MatchNetwork(const session::Context& ctx) const noexcept {
         const uint8_t bit = (ctx.content.network == Network::UDP) ? kNetworkUdp : kNetworkTcp;
@@ -418,6 +429,9 @@ private:
         }
         if (protocol == constants::protocol::kBitTorrent) {
             return kProtocolBittorrent;
+        }
+        if (protocol == constants::protocol::kQuic) {
+            return kProtocolQuic;
         }
         return 0;
     }
@@ -847,10 +861,10 @@ routing::DomainStrategy Router::DomainStrategy() const noexcept {
 bool GeoSiteCondition::Match(
     const session::Context& ctx,
     const ::acpp::geo::GeoManager* geo) const {
-    const auto& target = ctx.outbound.target;
-    if (!geo || !target.IsDomain()) return false;
+    const auto domain = RoutingDomain(ctx);
+    if (!geo || domain.empty()) return false;
     for (const auto& handle : handles_) {
-        if (geo->MatchGeoSite(handle, target.host)) return true;
+        if (geo->MatchGeoSite(handle, domain)) return true;
     }
     return false;
 }

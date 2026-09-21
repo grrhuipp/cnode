@@ -238,13 +238,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             // Dispatcher owns the terminal warning for a failed outbound
             // Process call. Keep the lower-level cause available at debug
             // level without emitting a second warning for the same session.
-            LOG_CONN_DEBUG(ctx, "UDP_DIAL_FAILED {} -> {} via {}: {}",
+            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} -> {} via {} > {}",
                            ctx.inbound.source_ip, ctx.outbound.target,
                            ctx.outbound.tag, e.what());
             co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
         }
         if (!session_result) {
-            LOG_CONN_DEBUG(ctx, "UDP_DIAL_FAILED {} -> {} via {}",
+            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} -> {} via {}",
                            ctx.inbound.source_ip, ctx.outbound.target,
                            ctx.outbound.tag);
             co_return std::unexpected(session_result.error());
@@ -340,7 +340,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!dial_result.Ok()) {
         // Dispatcher logs the stable terminal ErrorCode at warning level.
         // Preserve the transport-specific cause for debug diagnostics only.
-        LOG_CONN_DEBUG(ctx, "DIAL_FAILED {} -> {} via {}: {}",
+        LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} via {} > {}",
                        ctx.inbound.source_ip, ctx.outbound.target,
                        ctx.outbound.tag, dial_result.error_msg);
         co_return std::unexpected(dial_result.error);

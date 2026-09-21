@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -31,7 +32,8 @@ using namespace std::chrono_literals;
 
 enum class LogChannel {
     Error,
-    Access
+    Access,
+    Console
 };
 
 struct LogRecord {
@@ -86,28 +88,120 @@ std::string FormatLogTimestamp(int64_t timestamp_us) {
     return std::string(buffer, written);
 }
 
-std::string ComponentName(std::string_view file) {
-    const auto src = file.rfind("src");
-    const auto include = file.rfind("include");
-    const auto begin = src != std::string_view::npos
-        ? src + 4
-        : include != std::string_view::npos ? include + 8 : 0;
-    auto component = file.substr(begin);
-    while (!component.empty() &&
-           (component.front() == '/' || component.front() == '\\')) {
-        component.remove_prefix(1);
+size_t FindPathSegment(std::string_view file, std::string_view name) {
+    size_t pos = file.rfind(name);
+    while (pos != std::string_view::npos) {
+        const bool left_ok =
+            pos == 0 || file[pos - 1] == '/' || file[pos - 1] == '\\';
+        const auto end = pos + name.size();
+        const bool right_ok =
+            end == file.size() || file[end] == '/' || file[end] == '\\';
+        if (left_ok && right_ok) {
+            return pos;
+        }
+        if (pos == 0) {
+            break;
+        }
+        pos = file.rfind(name, pos - 1);
     }
-    const auto extension = component.rfind('.');
+    return std::string_view::npos;
+}
+
+std::string_view AfterMarker(std::string_view file, std::string_view name) {
+    const auto pos = FindPathSegment(file, name);
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    auto rest = file.substr(pos + name.size());
+    while (!rest.empty() && (rest.front() == '/' || rest.front() == '\\')) {
+        rest.remove_prefix(1);
+    }
+    return rest;
+}
+
+std::string_view TransportInternetComponent(std::string_view relative) {
+    constexpr std::string_view kPrefix = "transport/internet/";
+    if (!relative.starts_with(kPrefix)) {
+        return {};
+    }
+    const auto leaf = relative.substr(kPrefix.size());
+    if (leaf.starts_with("tcp")) {
+        return "transport/internet/tcp";
+    }
+    if (leaf.starts_with("udp")) {
+        return "transport/internet/udp";
+    }
+    if (leaf.starts_with("tls") || leaf.starts_with("ssl")) {
+        return "transport/internet/tls";
+    }
+    if (leaf.starts_with("reality")) {
+        return "transport/internet/reality";
+    }
+    if (leaf.starts_with("ws") || leaf.find("websocket") != std::string_view::npos) {
+        return "transport/internet/websocket";
+    }
+    if (leaf.starts_with("grpc")) {
+        return "transport/internet/grpc";
+    }
+    if (leaf.starts_with("xhttp")) {
+        return "transport/internet/xhttp";
+    }
+    if (leaf.find("httpupgrade") != std::string_view::npos ||
+        leaf.find("http_upgrade") != std::string_view::npos) {
+        return "transport/internet/httpupgrade";
+    }
+    return "transport/internet";
+}
+
+std::string ComponentName(std::string_view file) {
+    auto relative = AfterMarker(file, "src");
+    if (relative.empty()) {
+        relative = AfterMarker(file, "include");
+    }
+    if (relative.empty()) {
+        relative = file;
+    }
+    if (relative.starts_with("acppnode") &&
+        (relative.size() == 8 || relative[8] == '/' || relative[8] == '\\')) {
+        relative.remove_prefix(8);
+        while (!relative.empty() &&
+               (relative.front() == '/' || relative.front() == '\\')) {
+            relative.remove_prefix(1);
+        }
+    }
+
+    const auto extension = relative.rfind('.');
     if (extension != std::string_view::npos) {
-        component = component.substr(0, extension);
+        relative = relative.substr(0, extension);
     }
 
     std::string normalized;
-    normalized.reserve(component.size());
-    for (const char ch : component) {
+    normalized.reserve(relative.size());
+    for (const char ch : relative) {
         normalized.push_back(ch == '\\' ? '/' : ch);
     }
-    return normalized.empty() ? "cnode" : normalized;
+    if (normalized.empty()) {
+        return "cnode";
+    }
+
+    if (const auto transport = TransportInternetComponent(normalized);
+        !transport.empty()) {
+        return std::string(transport);
+    }
+
+    size_t parts = 1;
+    for (const char ch : normalized) {
+        if (ch == '/') {
+            ++parts;
+        }
+    }
+    if (parts >= 3) {
+        const auto slash = normalized.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            normalized.resize(slash);
+        }
+    }
+    return normalized;
 }
 
 std::string SingleLine(std::string_view message) {
@@ -124,6 +218,10 @@ std::string FormatRecord(const LogRecord& record) {
     if (record.channel == LogChannel::Access) {
         return std::format("{} {}", timestamp, message);
     }
+    if (record.channel == LogChannel::Console) {
+        return std::format(
+            "{} [{}] {}", timestamp, LevelName(record.level), message);
+    }
     if (record.connection) {
         if (record.connection->user_id > 0) {
             const auto inbound_tag = record.connection->inbound_tag.empty()
@@ -133,7 +231,7 @@ std::string FormatRecord(const LogRecord& record) {
                 "{} [{}] [{}] {}: inbound={} user={} {}",
                 timestamp,
                 LevelName(record.level),
-                record.connection->conn_id,
+                static_cast<std::uint32_t>(record.connection->conn_id),
                 ComponentName(record.source_file),
                 inbound_tag,
                 record.connection->user_id,
@@ -143,7 +241,7 @@ std::string FormatRecord(const LogRecord& record) {
             "{} [{}] [{}] {}: {}",
             timestamp,
             LevelName(record.level),
-            record.connection->conn_id,
+            static_cast<std::uint32_t>(record.connection->conn_id),
             ComponentName(record.source_file),
             message);
     }
@@ -889,18 +987,18 @@ void Log::WriteAccess(std::string message) {
 
 void Log::WriteConsole(LogLevel level,
                        std::string message,
-                       std::source_location location) {
+                       [[maybe_unused]] std::source_location location) {
     std::lock_guard lock(g_console_mutex);
     if (message.empty()) {
         std::cout << std::endl;
         return;
     }
     LogRecord record{
-        .channel = LogChannel::Error,
+        .channel = LogChannel::Console,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
-        .source_file = location.file_name(),
+        .source_file = {},
         .connection = std::nullopt,
     };
     std::cout << FormatRecord(record) << std::endl;

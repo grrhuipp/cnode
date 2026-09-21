@@ -77,8 +77,6 @@ public:
             const auto user_id =
                 static_cast<int64_t>(context.inbound.user_id);
             if (user_id > 0) {
-                // The backend is asynchronous, so own the tag instead of
-                // retaining a view into a replaceable runtime snapshot.
                 log_context.inbound_tag = std::string(context.inbound.tag);
                 log_context.user_id = user_id;
             }

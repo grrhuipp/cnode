@@ -15,12 +15,15 @@ namespace acpp {
 // ============================================================================
 struct SniffConfig {
     bool enabled = true;
+    bool metadata_only = false;
+    bool route_only = false;
     std::vector<std::string> dest_override = {
         std::string(constants::protocol::kTls),
         std::string(constants::protocol::kHttp),
+        std::string(constants::protocol::kQuic),
     };
     std::vector<std::string> domains_excluded;
-    uint8_t dest_override_mask = kOverrideTls | kOverrideHttp;
+    uint8_t dest_override_mask = kOverrideTls | kOverrideHttp | kOverrideQuic;
 
     // 冷路径在配置进入 Worker 前刷新；请求期只做协议名 -> bit 判断。
     void RefreshHotPathFields() {
@@ -70,12 +73,16 @@ struct SniffConfig {
         if (!domains_excluded.empty()) {
             result += " excluded=" + std::to_string(domains_excluded.size()) + " domains";
         }
+        if (metadata_only) result += " metadataOnly";
+        if (route_only) result += " routeOnly";
         return result;
     }
 
 private:
     static constexpr uint8_t kOverrideTls = 1u << 0;
     static constexpr uint8_t kOverrideHttp = 1u << 1;
+    static constexpr uint8_t kOverrideQuic = 1u << 2;
+    static constexpr uint8_t kOverrideBitTorrent = 1u << 3;
 
     [[nodiscard]] static constexpr uint8_t OverrideBit(std::string_view protocol) noexcept {
         if (protocol == constants::protocol::kTls) {
@@ -83,6 +90,12 @@ private:
         }
         if (protocol == constants::protocol::kHttp) {
             return kOverrideHttp;
+        }
+        if (protocol == constants::protocol::kQuic) {
+            return kOverrideQuic;
+        }
+        if (protocol == constants::protocol::kBitTorrent) {
+            return kOverrideBitTorrent;
         }
         return 0;
     }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/common/network.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -25,10 +27,17 @@ struct SniffResult {
 class TlsSniffer {
 public:
     SniffResult Sniff(std::span<const uint8_t> data);
+    // QUIC CRYPTO 里是裸 handshake，没有 TLS record 头。
+    std::optional<std::string_view> ParseHandshake(std::span<const uint8_t> data);
 
 private:
     std::optional<std::string_view> ParseClientHello(std::span<const uint8_t> data);
     std::optional<std::string_view> ExtractSNI(std::span<const uint8_t> extensions);
+};
+
+class QuicSniffer {
+public:
+    SniffResult Sniff(std::span<const uint8_t> data);
 };
 
 // ============================================================================
@@ -55,9 +64,8 @@ public:
     SniffResult Sniff(std::span<const uint8_t> data);
 };
 
-// ============================================================================
-// 复合嗅探：依次尝试 TLS → HTTP → BitTorrent，零堆分配
-// ============================================================================
+// TCP：TLS → HTTP → BitTorrent。UDP：QUIC。
 [[nodiscard]] SniffResult Sniff(std::span<const uint8_t> data);
+[[nodiscard]] SniffResult Sniff(std::span<const uint8_t> data, Network network);
 
 }  // namespace acpp

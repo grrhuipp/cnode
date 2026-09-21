@@ -46,6 +46,7 @@ inline constexpr std::string_view kNone = "none";
 inline constexpr std::string_view kHttp = "http";
 inline constexpr std::string_view kHttps = "https";
 inline constexpr std::string_view kBitTorrent = "bittorrent";
+inline constexpr std::string_view kQuic = "quic";
 inline constexpr std::string_view kAsIs = "AsIs";
 inline constexpr std::string_view kIPIfNonMatch = "IPIfNonMatch";
 inline constexpr std::string_view kIPOnDemand = "IPOnDemand";

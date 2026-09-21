@@ -21,7 +21,9 @@ StaticInboundConfig MakeTestInboundConfig() {
     // The ordinary StreamSettings default is already normalized TCP/none.
     source.sniffing.enabled = true;
     source.sniffing.dest_override = {
-        std::string(constants::protocol::kTls), std::string(constants::protocol::kHttp)};
+        std::string(constants::protocol::kTls),
+        std::string(constants::protocol::kHttp),
+        std::string(constants::protocol::kQuic)};
     source.static_users.clients.push_back(StaticUser{
         .id = std::string(constants::test::kTestVmessUuid),
         .password = {}, .email = "test@example.com", .flow = {}});

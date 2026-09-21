@@ -328,6 +328,9 @@ expect_rejected(inbound_tls_ca "{}" "inbounds.json"
 expect_rejected(inbound_allow_insecure "{}" "inbounds.json"
     [=[[{"tag":"bad-inbound-insecure","protocol":"vless","listen":"127.0.0.1","port":43192,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     "inbound tls allowInsecure is not supported")
+expect_rejected(sniffing_fakedns "{}" "inbounds.json"
+    [=[[{"tag":"bad-fakedns-sniff","protocol":"vless","listen":"127.0.0.1","port":43193,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"sniffing":{"enabled":true,"destOverride":["fakedns"]}}]]=]
+    "sniffing destOverride fakedns is not supported")
 expect_started(equal_tls_ca_aliases
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"same.pem","ca_file":"same.pem"}}}]]=])

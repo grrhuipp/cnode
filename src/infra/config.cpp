@@ -1527,10 +1527,29 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     // Xray sniffing 配置
     if (const auto* sniffing = optional_object(j, {"sniffing"})) {
         cfg.sniffing.enabled = jbool(*sniffing, {"enabled"}, true);
+        cfg.sniffing.metadata_only = jbool(*sniffing, {"metadataOnly"}, false);
+        cfg.sniffing.route_only = jbool(*sniffing, {"routeOnly"}, false);
         cfg.sniffing.dest_override =
             jstr_array(*sniffing, {"destOverride"});
         cfg.sniffing.domains_excluded =
             jstr_array(*sniffing, {"domainsExcluded"});
+        for (auto& protocol : cfg.sniffing.dest_override) {
+            for (char& ch : protocol) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            if (protocol == "fakedns" || protocol == "fakedns+others") {
+                throw std::invalid_argument(
+                    "sniffing destOverride fakedns is not supported");
+            }
+            if (protocol != constants::protocol::kTls &&
+                protocol != constants::protocol::kHttp &&
+                protocol != constants::protocol::kQuic &&
+                protocol != constants::protocol::kBitTorrent) {
+                throw std::invalid_argument(std::format(
+                    "sniffing destOverride contains unsupported value '{}'",
+                    protocol));
+            }
+        }
     }
 
     cfg.routing_enabled = jbool(

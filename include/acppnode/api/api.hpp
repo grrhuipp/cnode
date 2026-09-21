@@ -71,6 +71,7 @@ struct NodeInfo {
     std::vector<std::string> DestOverride = {
         std::string(constants::protocol::kTls),
         std::string(constants::protocol::kHttp),
+        std::string(constants::protocol::kQuic),
     };
     int PullInterval = defaults::kPanelPullInterval;
     int PushInterval = defaults::kPanelPushInterval;

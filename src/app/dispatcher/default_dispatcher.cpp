@@ -31,6 +31,75 @@ namespace acpp::app::dispatcher {
 
 namespace {
 
+class CachedMultiBufferReader final : public transport::MultiBufferReader {
+public:
+    explicit CachedMultiBufferReader(transport::MultiBufferReader& inner) noexcept
+        : inner_(inner) {}
+
+    net::awaitable<void> Cache() {
+        if (!cached_) {
+            cache_ = co_await inner_.ReadMultiBuffer();
+            cached_ = true;
+        }
+        co_return;
+    }
+
+    [[nodiscard]] buf::MultiBuffer& Cached() noexcept { return cache_; }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (cached_) {
+            cached_ = false;
+            co_return std::move(cache_);
+        }
+        co_return co_await inner_.ReadMultiBuffer();
+    }
+
+    transport::CancellationSource& Cancellation() noexcept override {
+        return inner_.Cancellation();
+    }
+
+    transport::EofAction ReadEofAction() const noexcept override {
+        return inner_.ReadEofAction();
+    }
+
+private:
+    transport::MultiBufferReader& inner_;
+    buf::MultiBuffer cache_;
+    bool cached_ = false;
+};
+
+void ApplySniffOverride(
+    session::Context& ctx,
+    const SniffConfig& sniffing,
+    const SniffResult& result) {
+    if (!result.success) {
+        return;
+    }
+    ctx.content.protocol.assign(result.protocol.data(), result.protocol.size());
+    ctx.content.sniff_domain.assign(result.domain.data(), result.domain.size());
+    if (result.domain.empty()) {
+        return;
+    }
+    const std::string_view sniff_domain(result.domain.data(), result.domain.size());
+    LOG_CONN_DEBUG(ctx, "[Session] Sniff: proto={} domain={}",
+                   result.protocol, sniff_domain);
+    if (sniffing.IsDomainExcluded(sniff_domain) ||
+        !sniffing.MatchesDestOverride(result.protocol)) {
+        return;
+    }
+    const uint16_t final_port = result.port > 0
+        ? result.port
+        : ctx.outbound.original_target.port;
+    TargetAddress sniffed(sniff_domain, final_port);
+    if (!sniffed.IsValid()) {
+        return;
+    }
+    ctx.outbound.route_target = sniffed;
+    if (!sniffing.route_only) {
+        ctx.outbound.target = std::move(sniffed);
+    }
+}
+
 [[nodiscard]] RelayResult MakeRelayError(ErrorCode error) noexcept {
     RelayResult result;
     result.error = error;
@@ -215,21 +284,21 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (const std::bad_alloc&) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
-        LOG_CONN_WARN(ctx, "dispatcher request exhausted memory");
+        LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory");
     } catch (const IoSystemError& e) {
         stats.OnError();
         result = MakeRelayError(MapAsioError(e.code()));
         ctx.outbound.os_error_code = e.code().value();
         ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
-        LOG_CONN_WARN(ctx, "dispatcher request I/O exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (const std::exception& e) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_WARN(ctx, "dispatcher request exception: {}", e.what());
+        LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (...) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_WARN(ctx, "dispatcher request exception: unknown");
+        LOG_CONN_WARN(ctx, "failed to process outbound traffic > unknown error");
     }
     if (result.error == ErrorCode::CANCELLED && cancellation_reason != ErrorCode::OK) {
         result.error = cancellation_reason;
@@ -277,15 +346,14 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
 
     buf::MultiBuffer outbound_first_payload;
-    size_t outbound_first_payload_size = 0;
-    if (policy.sniffing.enabled) {
-        // 嗅探只需首部若干字节即可解析 TLS ClientHello SNI / HTTP Host；
-        // 首包很大（例如客户端把大块 body pipeline 进首包）时无需整包拷贝。
-        static constexpr size_t kSniffMaxBytes = 4096;
+    std::optional<CachedMultiBufferReader> cached_reader;
+    if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
+        static constexpr size_t kSniffMaxBytes = 65535;
         std::span<const uint8_t> sniff_data;
         memory::ByteVector sniff_scratch;
 
-        auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb, size_t total) {
+        auto sniff_from_multibuffer = [&](const buf::MultiBuffer& mb) {
+            const size_t total = buf::TotalLen(mb);
             if (total == 0) {
                 return;
             }
@@ -321,20 +389,16 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                     }
                 }
             }
-        } else if (ctx.content.network == Network::TCP && inbound_reader) {
+        } else if (inbound_reader) {
             try {
                 if (inbound_control) {
                     inbound_control->SetReadTimeout(timeouts.ReadTimeout());
                 }
-                outbound_first_payload = co_await inbound_reader->ReadMultiBuffer();
-                outbound_first_payload_size = buf::TotalLen(outbound_first_payload);
-                if (outbound_first_payload_size > 0) {
-                    LOG_CONN_DEBUG(ctx, "[Session] Sniff prefetch payload={}B",
-                                   outbound_first_payload_size);
-                    sniff_from_multibuffer(
-                        outbound_first_payload,
-                        outbound_first_payload_size);
-                }
+                cached_reader.emplace(*inbound_reader);
+                co_await cached_reader->Cache();
+                sniff_from_multibuffer(cached_reader->Cached());
+                inbound_reader = &*cached_reader;
+                inbound_link.reader = inbound_reader;
             } catch (const std::bad_alloc&) {
                 throw;
             } catch (const transport::LinkError& e) {
@@ -352,45 +416,21 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         }
 
         if (!sniff_data.empty()) {
-            auto result = Sniff(sniff_data);
-
-            if (result.success && !result.domain.empty()) {
-                const std::string_view sniff_domain(result.domain.data(), result.domain.size());
-                LOG_CONN_DEBUG(ctx, "[Session] Sniff: proto={} domain={}",
-                               result.protocol, sniff_domain);
-
-                const bool excluded =
-                    policy.sniffing.IsDomainExcluded(sniff_domain);
-
-                if (policy.sniffing.MatchesDestOverride(result.protocol) && !excluded) {
-                    const uint16_t final_port = result.port > 0
-                        ? result.port
-                        : ctx.outbound.original_target.port;
-                    TargetAddress final_target(sniff_domain, final_port);
-                    if (final_target.IsValid()) {
-                        ctx.outbound.target = std::move(final_target);
-                        ctx.outbound.route_target = ctx.outbound.target;
-                    }
-                }
-            }
-
-            if (result.success) {
-                ctx.content.protocol.assign(result.protocol.data(), result.protocol.size());
-                ctx.content.sniff_domain.assign(result.domain.data(), result.domain.size());
-            }
+            ApplySniffOverride(
+                ctx, policy.sniffing, Sniff(sniff_data, ctx.content.network));
         }
-    }  // Release sniff-only scratch before DNS, outbound handshake and relay.
+    }
 
     RouteResult dispatch = co_await RouteAsync(ctx, policy);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
-            LOG_CONN_WARN(ctx, "RULE_REJECT user={} target={}",
+            LOG_CONN_WARN(ctx, "destination rejected user={} target={}",
                               ctx.inbound.user_email, ctx.outbound.target);
             stats.OnError();
             co_return MakeRelayError(ErrorCode::BLOCKED);
         }
-        LOG_CONN_WARN(ctx, "OUTBOUND_HANDLER_NOT_FOUND {} -> {} via {}",
+        LOG_CONN_WARN(ctx, "failed to find outbound handler {} -> {} via {}",
                           ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag);
         stats.OnError();
         co_return MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
@@ -427,7 +467,7 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     relay_cfg.downlink_only = timeouts.DownlinkOnlyTimeout();
     relay_cfg.speed_limit   = ctx.content.speed_limit;
 
-    if (outbound_first_payload_size == 0 && !first_packet.empty()) {
+    if (outbound_first_payload.empty() && !first_packet.empty()) {
         outbound_first_payload = first_packet.MoveToMultiBuffer();
     }
     const size_t relay_payload_size = buf::TotalLen(outbound_first_payload);
@@ -453,9 +493,9 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
         if (process_error == ErrorCode::OK) {
             process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        LOG_CONN_WARN(ctx, "OUTBOUND_PROCESS_FAILED {} -> {} via {}: {}",
+        LOG_CONN_WARN(ctx, "failed to process outbound traffic {} -> {} via {} > {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, ErrorCodeToString(process_error));
+                          ctx.outbound.tag, ErrorCodeToLogReason(process_error));
         stats.OnError();
         co_return MakeRelayError(process_error);
     }

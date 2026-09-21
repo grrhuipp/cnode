@@ -5,7 +5,6 @@
 
 namespace acpp {
 
-// ============================================================================
 SniffResult BittorrentSniffer::Sniff(std::span<const uint8_t> data) {
     SniffResult result;
     static constexpr std::string_view kHandshake = "BitTorrent protocol";
@@ -18,10 +17,19 @@ SniffResult BittorrentSniffer::Sniff(std::span<const uint8_t> data) {
     return result;
 }
 
-// ============================================================================
-// 复合嗅探：依次尝试 TLS → HTTP → BitTorrent，栈上构造，零堆分配
-// ============================================================================
 SniffResult Sniff(std::span<const uint8_t> data) {
+    return Sniff(data, Network::TCP);
+}
+
+SniffResult Sniff(std::span<const uint8_t> data, Network network) {
+    if (network == Network::UDP) {
+        QuicSniffer quic;
+        if (auto result = quic.Sniff(data); result.success) {
+            return result;
+        }
+        return SniffResult{};
+    }
+
     TlsSniffer tls;
     if (auto result = tls.Sniff(data); result.success) {
         return result;

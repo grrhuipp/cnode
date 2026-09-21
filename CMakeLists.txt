@@ -406,6 +406,7 @@ set(CNODE_SOURCES
     src/sniff/sniffer.cpp
     src/sniff/tls_sniffer.cpp
     src/sniff/http_sniffer.cpp
+    src/sniff/quic_sniffer.cpp
 
     # Common - Mux
     src/common/mux/mux_codec.cpp
@@ -742,6 +743,30 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_http_sniffer_test
         COMMAND cnode_http_sniffer_test)
+
+    add_executable(cnode_quic_sniffer_test
+        tests/quic_sniffer_test.cpp
+        src/sniff/quic_sniffer.cpp
+        src/sniff/tls_sniffer.cpp
+        src/sniff/sniffer.cpp
+        src/sniff/http_sniffer.cpp
+        src/transport/internet/tls_server_name.cpp
+    )
+    target_include_directories(cnode_quic_sniffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_quic_sniffer_test PRIVATE asio::asio crypto)
+    if(WIN32)
+        target_link_libraries(cnode_quic_sniffer_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_quic_sniffer_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_quic_sniffer_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+    )
+    add_test(
+        NAME cnode_quic_sniffer_test
+        COMMAND cnode_quic_sniffer_test)
 
     add_executable(cnode_sniff_config_test
         tests/sniff_config_test.cpp
@@ -2178,12 +2203,13 @@ if(CNODE_BUILD_TESTS)
         src/sniff/sniffer.cpp
         src/sniff/tls_sniffer.cpp
         src/sniff/http_sniffer.cpp
+        src/sniff/quic_sniffer.cpp
         src/common/error.cpp
         src/common/session.cpp
         src/infra/log.cpp)
     target_include_directories(cnode_dispatcher_cancellation_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
-    target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE asio::asio Threads::Threads cnode_zlib)
+    target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
     if(WIN32)
         target_link_libraries(cnode_dispatcher_cancellation_test PRIVATE ws2_32)
         target_compile_definitions(cnode_dispatcher_cancellation_test PRIVATE _WIN32_WINNT=0x0A00)
