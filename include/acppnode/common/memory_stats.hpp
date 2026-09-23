@@ -19,6 +19,22 @@ struct RuntimeMemoryStats {
     uint64_t tls_streams_peak = 0;
 };
 
+#ifdef CNODE_TEST_BUFFER_STATS
+namespace detail {
+inline thread_local uint64_t test_buffers_live = 0;
+inline thread_local uint64_t test_buffers_peak = 0;
+}
+inline void OnBufferNew() noexcept {
+    ++detail::test_buffers_live;
+    if (detail::test_buffers_live > detail::test_buffers_peak)
+        detail::test_buffers_peak = detail::test_buffers_live;
+}
+inline void OnBufferFree() noexcept { --detail::test_buffers_live; }
+#else
+inline void OnBufferNew() noexcept {}
+inline void OnBufferFree() noexcept {}
+#endif
+
 #ifdef CNODE_MEMORY_STATS
 
 namespace detail {
@@ -39,12 +55,8 @@ inline void BumpPeak(std::atomic<uint64_t>& peak, uint64_t value) noexcept {
 }
 }  // namespace detail
 
-// Buffer allocation is the relay hot path. Keep these hooks zero-cost in
-// production; stream counters below are enough to separate live stream cost
-// from allocator/OpenSSL retention without adding per-packet atomics.
-inline void OnBufferNew() noexcept {}
-inline void OnBufferFree() noexcept {}
-
+// Buffer allocation remains zero-cost in production; only the targeted test
+// enables thread-local Buffer counters.
 inline void OnAsyncStreamNew() noexcept {
     const auto live = detail::g_async_streams_live.fetch_add(1, std::memory_order_relaxed) + 1;
     detail::BumpPeak(detail::g_async_streams_peak, live);
@@ -87,8 +99,6 @@ inline RuntimeMemoryStats SnapshotRuntimeMemoryStats() noexcept {
 
 #else
 
-inline void OnBufferNew() noexcept {}
-inline void OnBufferFree() noexcept {}
 inline void OnAsyncStreamNew() noexcept {}
 inline void OnAsyncStreamFree() noexcept {}
 inline void OnTcpStreamNew() noexcept {}

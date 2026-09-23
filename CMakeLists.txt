@@ -1414,6 +1414,7 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_anytls_outbound_lifecycle_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/outbound)
+    target_compile_definitions(cnode_anytls_outbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
     target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib crypto)
     if(WIN32)

@@ -3,6 +3,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/session.hpp"
+#include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
@@ -22,37 +23,21 @@
 
 namespace {
 thread_local bool fail_next_allocation = false;
+thread_local bool fail_next_pmr_allocation = false;
 thread_local size_t allocation_failures = 0;
-thread_local bool track_buffers = false;
-thread_local std::array<void*, 4096> buffer_allocations{};
-thread_local size_t buffer_count = 0;
-thread_local size_t buffer_peak = 0;
 thread_local size_t failed_allocation_size = 0;
 thread_local size_t fail_allocation_bytes = 0;
 static_assert(alignof(acpp::buf::Buffer) <= alignof(std::max_align_t));
 }
 void* operator new(std::size_t size) {
-    if (fail_next_allocation && (fail_allocation_bytes == 0 || size == fail_allocation_bytes)) {
+    if (fail_next_allocation) {
         fail_next_allocation = false;
-        fail_allocation_bytes = 0;
         ++allocation_failures; failed_allocation_size = size; throw std::bad_alloc();
     }
-    if (auto* result = std::malloc(size ? size : 1)) {
-        if (track_buffers && size == sizeof(acpp::buf::Buffer)) {
-            if (buffer_count == buffer_allocations.size()) std::abort();
-            buffer_allocations[buffer_count++] = result;
-            buffer_peak = std::max(buffer_peak, buffer_count);
-        }
-        return result;
-    }
+    if (auto* result = std::malloc(size ? size : 1)) return result;
     throw std::bad_alloc();
 }
-void operator delete(void* value) noexcept {
-    for (size_t i = 0; i < buffer_count; ++i) {
-        if (buffer_allocations[i] == value) { buffer_allocations[i] = buffer_allocations[--buffer_count]; break; }
-    }
-    std::free(value);
-}
+void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
     try { return ::operator new(size); } catch (...) { return nullptr; }
@@ -62,6 +47,33 @@ void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator d
 namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
+
+class FailingPmrResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingPmrResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+
+private:
+    void* do_allocate(size_t size, size_t alignment) override {
+        if (fail_next_pmr_allocation && size == fail_allocation_bytes) {
+            fail_next_pmr_allocation = false;
+            fail_allocation_bytes = 0;
+            ++allocation_failures;
+            failed_allocation_size = size;
+            throw std::bad_alloc();
+        }
+        return upstream_->allocate(size, alignment);
+    }
+    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        upstream_->deallocate(pointer, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    std::pmr::memory_resource* upstream_;
+};
+
+size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
+size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
 
 struct QueueScenario {
     int mode = 0;
@@ -269,7 +281,7 @@ public:
     net::awaitable<size_t> AsyncRead(net::mutable_buffer output) override {
         while (wire_->offset == wire_->input.size() && !wire_->closed && !wire_->read_eof) {
             if (wire_->queue && wire_->responded && !wire_->queue->snapshot) {
-                wire_->queue->queued_blocks = buffer_count;
+                wire_->queue->queued_blocks = BufferCount();
                 wire_->queue->snapshot = true;
             }
             wire_->wake.expires_at(net::steady_timer::time_point::max());
@@ -297,7 +309,7 @@ public:
         wire_->offset += count;
         if (wire_->queue && wire_->queue->mode == 7 && count == 4096) {
             fail_allocation_bytes = 128;
-            fail_next_allocation = true;
+            fail_next_pmr_allocation = true;
         }
         if (wire_->fail_on_header && count == 7) {
             wire_->fail_on_header = false;
@@ -363,7 +375,7 @@ public:
                 while (wire_->offset < wire_->input.size() && !wire_->closed) {
                     if (wire_->queue && wire_->queue->mode == 5 && wire_->input.size() - wire_->offset == 7) {
                         // Eight queued blocks plus the one-byte pending frame.
-                        wire_->queue->queued_blocks = buffer_count ? buffer_count - 1 : 0;
+                        wire_->queue->queued_blocks = BufferCount() ? BufferCount() - 1 : 0;
                         wire_->queue->snapshot = true;
                         break;
                     }
@@ -698,10 +710,10 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
-    buffer_count = buffer_peak = failed_allocation_size = 0;
+    memory::detail::test_buffers_peak = BufferCount();
+    failed_allocation_size = 0;
     fail_allocation_bytes = 0;
     const auto failures_before = allocation_failures;
-    track_buffers = true;
     Client client;
     TimeoutToken request_timeout;
     if (mode == 15) request_timeout = TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, [&client] {
@@ -731,9 +743,9 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io.poll();
     bool passed = !exception && (mode == 6 || mode >= 13 ? !done : done);
     if (mode >= 13) {
-        passed &= queue.consumer_started && queue.pending_consumer == 1 && buffer_count == 24;
+        passed &= queue.consumer_started && queue.pending_consumer == 1 && BufferCount() == 24;
         // Eight consumer blocks, eight queued blocks, eight in the waiting frame.
-        queue.queued_blocks = buffer_count >= 16 ? buffer_count - 16 : 0;
+        queue.queued_blocks = BufferCount() >= 16 ? BufferCount() - 16 : 0;
         queue.snapshot = true;
         if (mode == 13) {
             queue.consumer_released = true;
@@ -758,7 +770,7 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     if (mode == 15) passed &= completed_ms >= 900 && completed_ms < 1500;
     if (mode == 13) passed &= dialed[0]->heart_responses == 1;
     if (mode == 10 || mode == 11) passed &= queue.datagram_sizes == std::vector<size_t>{9000, 19999};
-    const bool bounded = queue.queued_blocks <= 16 && buffer_peak <= 24;
+    const bool bounded = queue.queued_blocks <= 16 && BufferPeak() <= 24;
     if (mode != 7 && mode != 12) passed &= queue.snapshot;
     if (mode == 0) passed &= baseline || queue.queued_blocks == 1;
     if (!baseline) passed &= bounded;
@@ -766,13 +778,12 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io.restart();
     io.run_for(100ms);
     for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    passed &= buffer_count == 0;
-    track_buffers = false;
+    passed &= BufferCount() == 0;
     std::printf("outbound-queue mode=%d seed=%u fragments=%zu bytes=%zu queued-blocks=%zu capacity-bytes=%zu peak-blocks=%zu bounded=%d received=%zu datagrams=%zu code=%s allocation-size=%zu completed-ms=%lld heart-responses=%zu pending-consumer=%d released=%d: %s\n",
         mode, seed, queue.fragments.size(), bytes, queue.queued_blocks, queue.queued_blocks * buf::Buffer::kSize,
-        buffer_peak, bounded, queue.received.size(), queue.datagram_sizes.size(), ErrorCodeToString(observed).data(), failed_allocation_size,
+        BufferPeak(), bounded, queue.received.size(), queue.datagram_sizes.size(), ErrorCodeToString(observed).data(), failed_allocation_size,
         static_cast<long long>(completed_ms), dialed[0]->heart_responses, queue.pending_consumer,
-        buffer_count == 0, passed ? "PASS" : "FAIL");
+        BufferCount() == 0, passed ? "PASS" : "FAIL");
     dialed.clear();
     queue_scenario = nullptr;
     return passed;
@@ -944,6 +955,12 @@ bool Run(int mode) {
 }
 
 int main(int argc, char** argv) {
+    FailingPmrResource resource(std::pmr::get_default_resource());
+    auto* original = std::pmr::set_default_resource(&resource);
+    struct RestoreResource {
+        std::pmr::memory_resource* original;
+        ~RestoreResource() { std::pmr::set_default_resource(original); }
+    } restore{original};
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--client-padding")
             return RunClientPadding() ? 0 : 1;
@@ -973,6 +990,7 @@ int main(int argc, char** argv) {
         return passed ? 0 : 1;
     } catch (const std::exception& error) {
         fail_next_allocation = false;
+        fail_next_pmr_allocation = false;
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
         return 1;
     }
