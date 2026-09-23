@@ -36,31 +36,9 @@ if(MUTATION_BATCH_CALL_COUNT LESS 5)
 endif()
 
 string(FIND "${MUTATIONS_SOURCE}" "HasProxy" PROTOCOL_CHECK)
-string(FIND "${MUTATIONS_SOURCE}" "RegisterSource" SOURCE_REGISTRATION)
-if(PROTOCOL_CHECK EQUAL -1 OR SOURCE_REGISTRATION EQUAL -1 OR
-   NOT PROTOCOL_CHECK LESS SOURCE_REGISTRATION)
+if(PROTOCOL_CHECK EQUAL -1)
     message(FATAL_ERROR
-        "unsupported protocols must be rejected before access-log source registration")
-endif()
-
-string(FIND "${MUTATIONS_SOURCE}"
-       "centralized access-log source registration failed"
-       SOURCE_REGISTRATION_FAILURE)
-if(SOURCE_REGISTRATION_FAILURE EQUAL -1)
-    message(FATAL_ERROR
-        "panel inbounds must not publish without a centralized access-log source")
-endif()
-string(SUBSTRING "${MUTATIONS_SOURCE}"
-    ${SOURCE_REGISTRATION_FAILURE} 300 SOURCE_REGISTRATION_FAILURE_HANDLER)
-if(NOT SOURCE_REGISTRATION_FAILURE_HANDLER MATCHES "co_return false;")
-    message(FATAL_ERROR
-        "panel inbounds must not publish without a centralized access-log source")
-endif()
-
-if(NOT BOOTSTRAP_INBOUNDS_SOURCE MATCHES
-       "std::move[(]outbound_policy[)],\r?\n[ \t]*0[)]")
-    message(FATAL_ERROR
-        "custom/static inbounds must explicitly disable centralized access logging")
+        "unsupported protocols must be rejected before inbound publication")
 endif()
 
 string(FIND "${MUTATIONS_SOURCE}" "catch (...)" FAILURE_CATCH)

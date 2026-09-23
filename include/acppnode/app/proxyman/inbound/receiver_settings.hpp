@@ -30,7 +30,6 @@ struct ReceiverSettings {
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto; // PROXY Protocol 处理模式
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
     ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
-    uint32_t         access_source_ref = 0;    // 集中访问日志来源，0 表示不集中上报。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
         return has_route_inbound_tags ? &inbound_tags : nullptr;
@@ -45,8 +44,7 @@ struct ReceiverSettings {
     SniffConfig sniff_config,
     ConnectionLimiter* limiter,
     ProxyProtocolMode proxy_protocol,
-    routing::OutboundSelectionPolicy outbound_policy,
-    uint32_t access_source_ref = 0) {
+    routing::OutboundSelectionPolicy outbound_policy) {
     sniff_config.RefreshHotPathFields();
     const bool has_route_inbound_tags =
         !inbound_tags.empty() &&
@@ -63,7 +61,6 @@ struct ReceiverSettings {
         .proxy_protocol = proxy_protocol,
         .has_route_inbound_tags = has_route_inbound_tags,
         .limiter = limiter,
-        .access_source_ref = access_source_ref,
     };
 }
 

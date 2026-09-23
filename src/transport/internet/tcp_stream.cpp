@@ -93,7 +93,7 @@ enum Flag : uint8_t {
     kPhaseDeadlineTimedOut  = 1u << 7,
 };
 
-struct TcpStream::Impl {
+struct TcpStream::Impl : memory::ThreadAllocated {
     explicit Impl(tcp::socket socket)
         : socket(std::move(socket))
         , timeout_scheduler(&TimeoutScheduler::ForIoContext(SocketIoContext(this->socket))) {}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/relay_types.hpp"
@@ -36,7 +37,7 @@ class Dispatcher;
 //   - VMessInbound: Process 解析 AEAD 头后提交 session::Context 给 dispatcher
 //   - TrojanInbound: Process 解析 SHA224+目标后提交 session::Context 给 dispatcher
 // ============================================================================
-class Inbound {
+class Inbound : public memory::ThreadAllocated {
 public:
     virtual ~Inbound() noexcept = default;
 

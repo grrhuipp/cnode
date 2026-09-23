@@ -2,7 +2,6 @@
 #include "acppnode/app/bootstrap_cli.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/infra/access_log_reporter.hpp"
 #include "acppnode/app/bootstrap_setup.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
 #include "acppnode/service/controller/controller.hpp"
@@ -117,7 +116,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=system",
+    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
                 config.GetWorkers(), IoBackendName());
 
     if (!config.Validate()) {
@@ -126,19 +125,10 @@ int RunFromCommandLine(int argc, char* argv[]) {
         return 1;
     }
 
-    if (config.GetLog().enable_upload) {
-        if (!accesslog::Reporter::Instance().Initialize()) {
-            LOG_ERROR("Failed to initialize centralized access-log reporter");
-        }
-    } else {
-        LOG_INFO("centralized access-log upload disabled by configuration");
-    }
-
     try {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
         RunApplicationRuntime(MakeRuntimeContext(env));
     } catch (const std::exception& e) {
-        accesslog::Reporter::Instance().Shutdown();
         Log::Shutdown();
         std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;

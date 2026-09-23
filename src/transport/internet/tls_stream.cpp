@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/transport/internet/openssl_thread_pool.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "tls_client_context.hpp"
 #include "reality_tls.hpp"
@@ -79,7 +80,7 @@ std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
         SSL_CTX_free(ctx);
         return nullptr;
     }
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ctx);
 
     // 加载证书
     if (SSL_CTX_use_certificate_chain_file(ctx, config.cert_file.c_str()) <= 0) {
@@ -189,7 +190,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& co
         SSL_CTX_free(ctx);
         return nullptr;
     }
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ctx);
 
     SSL_CTX_use_certificate(ctx, default_material.cert);
     SSL_CTX_use_PrivateKey(ctx, default_material.key);
@@ -361,13 +362,13 @@ SSL* NewSsl(SSL_CTX* ctx) {
     if (!ssl) {
         throw std::runtime_error("Failed to create SSL object");
     }
-    SSL_set_mode(ssl, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ssl);
     return ssl;
 }
 
 }  // namespace
 
-struct TlsStream::Impl {
+struct TlsStream::Impl : memory::ThreadAllocated {
     using SslStream = net::ssl::stream<TlsTcpLayer>;
 
     Impl(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx)

@@ -1,4 +1,5 @@
 #include "acppnode/transport/internet/outbound_target_builder.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/ip_address.hpp"
 
 #include "acppnode/app/dns/dns.hpp"
@@ -225,7 +226,7 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
     }
 
     target.xhttp_download_target =
-        std::make_shared<OutboundTransportTarget>(std::move(*download_target));
+        memory::AllocateShared<OutboundTransportTarget>(std::move(*download_target));
     co_return target;
 }
 

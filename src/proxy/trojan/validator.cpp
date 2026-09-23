@@ -1,11 +1,12 @@
 #include "validator.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 
 namespace acpp::trojan {
 
-struct Validator::Impl {
+struct Validator::Impl : memory::ThreadAllocated {
     UserOnlineTracker stats;
 };
 

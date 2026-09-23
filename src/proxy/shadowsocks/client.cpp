@@ -94,7 +94,9 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
     return pos;
 }
 
-class RequestBodyWriter final : public transport::MultiBufferWriter {
+class RequestBodyWriter final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferWriter {
 public:
     RequestBodyWriter(SsAeadCipher write_cipher,
                       uint64_t write_nonce,
@@ -210,7 +212,9 @@ private:
     AsyncStream* stream_ = nullptr;
 };
 
-class ResponseBodyReader final : public transport::MultiBufferReader {
+class ResponseBodyReader final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
@@ -358,9 +362,7 @@ private:
         if (raw_pending_offset_ >= raw_pending_.size()) {
             raw_pending_.clear();
             raw_pending_offset_ = 0;
-            if (raw_pending_.capacity() > buf::Buffer::kSize * 8) {
-                memory::ByteVector{}.swap(raw_pending_);
-            }
+            ReleaseIdleBuffer(raw_pending_);
             return;
         }
         const size_t remaining = raw_pending_.size() - raw_pending_offset_;

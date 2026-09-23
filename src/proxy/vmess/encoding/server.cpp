@@ -1136,7 +1136,9 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
 namespace {
 
-class RequestBodyReader final : public transport::MultiBufferReader {
+class RequestBodyReader final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override {
@@ -1181,7 +1183,9 @@ private:
     TargetAddress udp_target_;
 };
 
-class ResponseBodyWriter final : public transport::MultiBufferWriter {
+class ResponseBodyWriter final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const VMessRequest& request, AsyncStream& stream)
         : stream_(&stream)

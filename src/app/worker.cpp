@@ -801,7 +801,7 @@ void Worker::AddOutboundOnWorkerThread(
         *runtime_->dns_service, runtime_->udp_session_manager.get(),
         current_snapshot->timeouts.DialTimeout());
 
-    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    auto next_snapshot = memory::AllocateShared<WorkerRuntimeConfig>(*current_snapshot);
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == config.tag; });
     next_snapshot->outbounds.push_back(std::move(config));
@@ -826,7 +826,7 @@ net::awaitable<void> Worker::AddOutboundTask(
 
 void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
     auto current_snapshot = runtime_->Snapshot();
-    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    auto next_snapshot = memory::AllocateShared<WorkerRuntimeConfig>(*current_snapshot);
     std::erase_if(next_snapshot->outbounds,
                   [&](const auto& outbound) { return outbound.tag == tag; });
 
@@ -842,7 +842,7 @@ net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
 void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
     auto current_snapshot = runtime_->Snapshot();
     const std::string owned_tag(tag);
-    auto next_snapshot = std::make_shared<WorkerRuntimeConfig>(*current_snapshot);
+    auto next_snapshot = memory::AllocateShared<WorkerRuntimeConfig>(*current_snapshot);
     RemoveInboundRuntimeFromSnapshot(*next_snapshot, tag);
 
     auto tcp_listener_keys =

@@ -485,10 +485,6 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 
     cfg.rotate_daily = jbool(j, {"rotateDaily"}, cfg.rotate_daily);
     cfg.gzip = jbool(j, {"gzip"}, cfg.gzip);
-    if (j.if_contains("disableUpload")) {
-        throw std::invalid_argument("log.disableUpload is removed; use log.enable");
-    }
-    cfg.enable_upload = jbool(j, {"enable"}, cfg.enable_upload);
     return cfg;
 }
 

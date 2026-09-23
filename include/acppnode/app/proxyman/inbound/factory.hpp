@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/common/online_device.hpp"
@@ -36,7 +37,7 @@ struct DatagramHandlerBuildResult {
 // ============================================================================
 // ProtocolRuntime - 每个 Worker 的协议私有可变状态
 // ============================================================================
-class ProtocolRuntime {
+class ProtocolRuntime : public memory::ThreadAllocated {
 public:
     virtual ~ProtocolRuntime() noexcept = default;
 

@@ -334,10 +334,10 @@ proxy::shadowsocks::inbound::Handler::Process(
     result.user_email = profile.email;
     result.speed_limit = profile.speed_limit;
     if (decoded->ss2022_session) {
-        result.response = std::make_shared<ShadowsocksUdpResponseContext>(
+        result.response = memory::AllocateShared<ShadowsocksUdpResponseContext>(
             std::move(decoded->ss2022_session));
     } else {
-        result.response = std::make_shared<ShadowsocksUdpResponseContext>(
+        result.response = memory::AllocateShared<ShadowsocksUdpResponseContext>(
             ToSsKey(user.derived_key),
             cipher_info_);
     }
@@ -567,7 +567,7 @@ const bool kSsInboundRegistered = [] {
                 LOG_WARN("Inbound '{}': unknown SS cipher '{}'", tag, method);
                 return std::nullopt;
             }
-            auto settings = std::make_shared<ShadowsocksSettings>();
+            auto settings = acpp::memory::AllocateShared<ShadowsocksSettings>();
             settings->cipher = *cipher;
             settings->identity_password = config.identity_password;
             return settings;

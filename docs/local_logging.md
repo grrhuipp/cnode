@@ -36,7 +36,6 @@ YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: inbound=tag user=id message
 ```text
 2026/07/19 20:42:06 [Debug] [10] proxy/freedom: inbound=vless-in user=123 failed to dial 192.0.2.10 -> example.com:443 via direct > connection refused
 2026/07/19 20:42:06 [Warning] [10] app/dispatcher: inbound=vless-in user=123 failed to process outbound traffic 192.0.2.10 -> example.com:443 via direct > outbound connection failed
-2026/07/19 20:42:07 [Error] infra/access_log_reporter: pending batch rejected events=1000 bytes=81920
 ```
 
 级别口径：

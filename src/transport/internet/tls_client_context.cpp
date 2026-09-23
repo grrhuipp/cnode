@@ -3,6 +3,7 @@
 #include "acppnode/common/ip_address.hpp"
 
 #include "tls_client_context.hpp"
+#include "acppnode/transport/internet/openssl_thread_pool.hpp"
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/infra/log.hpp"
@@ -96,7 +97,7 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
         SSL_CTX_free(ctx);
         return nullptr;
     }
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ctx);
 
     if (config.cert_file.empty() != config.key_file.empty()) {
         LOG_ERROR("TLS client certificate and private key must be configured together");

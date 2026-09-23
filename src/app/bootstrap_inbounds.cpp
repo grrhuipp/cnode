@@ -42,8 +42,7 @@ net::awaitable<void> SetupWorkerInbounds(
             inbound.sniffing,
             connection_limiter,
             ProxyProtocolMode::Auto,
-            std::move(outbound_policy),
-            0);  // Custom/static inbounds never enter centralized access logs.
+            std::move(outbound_policy));
 
         if (!co_await worker.RegisterInboundTask(
                 connection_limiter,

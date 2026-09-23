@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/proxy/inbound.hpp"
@@ -139,7 +140,7 @@ public:
     void CleanupAllClientSessions() noexcept;
 
     [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
-        return std::make_shared<udp::socket>(io_context);
+        return memory::AllocateShared<udp::socket>(io_context);
     }
     // A socket key belongs to one receive loop. Duplicate attachment is
     // rejected instead of cancelling and replacing the live socket.

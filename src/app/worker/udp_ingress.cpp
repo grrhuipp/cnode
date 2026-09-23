@@ -1,7 +1,6 @@
 #include "udp_ingress.hpp"
 
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/read_prefix_capture.hpp"
@@ -372,42 +371,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         .payload = datagram.payload,
     });
     if (!decoded) {
-        if (datagram.receiver->access_source_ref != 0) {
-            session::Context rejected_ctx;
-            rejected_ctx.conn_id = session::NewID(datagram.worker_id);
-            rejected_ctx.worker_id = datagram.worker_id;
-            rejected_ctx.runtime_generation = datagram.runtime_generation;
-            rejected_ctx.config_generation = datagram.config_generation;
-            rejected_ctx.inbound.tag = datagram.receiver->inbound_tag.empty()
-                ? std::string_view(impl_->tag)
-                : std::string_view(datagram.receiver->inbound_tag);
-            rejected_ctx.inbound.tags = datagram.receiver->RouteInboundTags();
-            rejected_ctx.inbound.source_ip = client_ip;
-            rejected_ctx.inbound.source_addr = normalized_client_addr;
-            rejected_ctx.inbound.source_port = datagram.client_endpoint.port();
-            rejected_ctx.inbound.peer_ip = client_ip;
-            rejected_ctx.inbound.peer_port = datagram.client_endpoint.port();
-            rejected_ctx.inbound.access_source_ref =
-                datagram.receiver->access_source_ref;
-            rejected_ctx.inbound.protocol = datagram.receiver->protocol;
-            rejected_ctx.inbound.transport = "udp";
-            rejected_ctx.inbound.security = datagram.receiver->stream_settings.security;
-            rejected_ctx.inbound.read_prefix_capture =
-                std::make_shared<ReadPrefixCapture>();
-            rejected_ctx.inbound.read_prefix_capture->Append(datagram.payload);
-            rejected_ctx.content.network = Network::UDP;
-
-            IoErrorCode local_ec;
-            const auto local_ep = datagram.sock->local_endpoint(local_ec);
-            if (!local_ec && !local_ep.address().is_unspecified()) {
-                rejected_ctx.inbound.local_endpoint = tcp::endpoint(
-                    iputil::NormalizeAddress(local_ep.address()),
-                    local_ep.port());
-            }
-
-            app::AccessLogSession access_log(rejected_ctx);
-            access_log.Fail(decoded.error());
-        }
         return;
     }
 
@@ -439,10 +402,10 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             return;
         }
 
-        auto receiver = std::make_shared<proxyman::inbound::ReceiverSettings>(
+        auto receiver = memory::AllocateShared<proxyman::inbound::ReceiverSettings>(
             *datagram.receiver);
 
-        auto ctx = std::make_shared<session::Context>();
+        auto ctx = memory::AllocateShared<session::Context>();
         ctx->conn_id = session::NewID(datagram.worker_id);
         ctx->worker_id = datagram.worker_id;
         ctx->runtime_generation = datagram.runtime_generation;
@@ -467,7 +430,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx->outbound.target = decoded->target;
         ctx->inbound.user_id = decoded->user_id;
         ctx->inbound.user_email = decoded->user_email;
-        ctx->inbound.access_source_ref = receiver->access_source_ref;
         ctx->inbound.protocol = receiver->protocol;
         ctx->inbound.transport = "udp";
         ctx->inbound.security = receiver->stream_settings.security;
@@ -540,26 +502,18 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                     } catch (const std::exception& e) {
                         LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: {}",
                                   worker_id, e.what());
-                        app::AccessLogSession access_log(*ctx);
-                        access_log.Fail(ErrorCode::INTERNAL);
                     } catch (...) {
                         LOG_ERROR("Worker[{}]: UDP dispatcher coroutine failed: unknown",
                                   worker_id);
-                        app::AccessLogSession access_log(*ctx);
-                        access_log.Fail(ErrorCode::INTERNAL);
                     }
                     client_session->Close();
                     co_return;
                 },
                 net::detached);
         } catch (const std::bad_alloc&) {
-            app::AccessLogSession access_log(*ctx);
-            access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
             client_session->Close();
             return;
         } catch (...) {
-            app::AccessLogSession access_log(*ctx);
-            access_log.Fail(ErrorCode::INTERNAL);
             client_session->Close();
             return;
         }
@@ -725,7 +679,7 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     udp::endpoint reply_endpoint,
     InboundDatagramOwner session_owner,
     std::chrono::steady_clock::time_point now) {
-    auto session = std::make_shared<ClientSession>(
+    auto session = memory::AllocateShared<ClientSession>(
         io_context,
         std::move(reply_callback),
         std::move(reply_endpoint),

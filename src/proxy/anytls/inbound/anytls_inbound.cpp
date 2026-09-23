@@ -7,7 +7,6 @@
 #include "../credentials.hpp"
 #include "../../uot/uot.hpp"
 #include "../../../transport/internet/async_write_gate.hpp"
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -424,15 +423,6 @@ private:
         return it == streams_.end() ? nullptr : it->second;
     }
 
-    void ReportStreamFailure(uint32_t sid, ErrorCode error) noexcept {
-        auto it = streams_.find(sid);
-        if (it == streams_.end() || !it->second) {
-            return;
-        }
-        app::AccessLogSession access_log(it->second->ctx);
-        access_log.Fail(error);
-    }
-
     void CancelAll() noexcept {
         if (cancelled_) {
             return;
@@ -620,14 +610,6 @@ net::awaitable<void> AnyTLSDemuxSession::RunStream(
         error = ErrorCode::INTERNAL;
     }
     if (error == ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = ErrorCode::OK;
-    if (error != ErrorCode::OK) {
-        // Physical write failure can already have removed the live index.
-        // This task still owns the context needed for its terminal record.
-        {
-            app::AccessLogSession access_log(sub->ctx);
-            access_log.Fail(error);
-        }
-    }
     // The request owner closes exactly once on every completion path. A remote
     // close is already terminal and produces no FIN reply.
     try { co_await sub->AsyncShutdownWrite(); } catch (...) {}
@@ -737,24 +719,13 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                 continue;
             }
             const auto opened_at = std::chrono::steady_clock::now();
-            auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
+            auto sub = memory::AllocateShared<AnyTLSSubStream>(io_context_, *this, sid);
             CopySessionContext(base_ctx_, sub->ctx);
             sub->ctx.stream_id = sid;
             sub->ctx.content.network = Network::TCP;
             streams_.emplace(sid, sub);
             last_stream_id_ = sid; // Commit after the complete stream was inserted.
-            try {
-                tasks.Spawn(RunStream(std::move(sub), opened_at));
-            } catch (const IoSystemError& error) {
-                ReportStreamFailure(sid, MapAsioError(error.code()));
-                throw;
-            } catch (const std::bad_alloc&) {
-                ReportStreamFailure(sid, ErrorCode::RESOURCE_EXHAUSTED);
-                throw;
-            } catch (...) {
-                ReportStreamFailure(sid, ErrorCode::INTERNAL);
-                throw;
-            }
+            tasks.Spawn(RunStream(std::move(sub), opened_at));
             continue;
         }
         if (sid == 0) {
@@ -997,7 +968,7 @@ const bool kInboundRegistered = [] {
                     tag, acpp::anytls::kMaxFramePayload);
                 return std::nullopt;
             }
-            auto settings = std::make_shared<AnyTlsSettings>();
+            auto settings = acpp::memory::AllocateShared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =
                     acpp::anytls::ParsePaddingScheme(config.padding_scheme);
@@ -1007,7 +978,7 @@ const bool kInboundRegistered = [] {
                     return std::nullopt;
                 }
                 settings->padding_scheme =
-                    std::make_shared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
+                    acpp::memory::AllocateShared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
             }
             return settings;
         };

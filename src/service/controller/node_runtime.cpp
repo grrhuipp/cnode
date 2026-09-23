@@ -7,7 +7,6 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/worker.hpp"
-#include "acppnode/infra/access_log_reporter.hpp"
 #include "acppnode/infra/log.hpp"
 
 #include <algorithm>
@@ -93,18 +92,6 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
         co_return false;
     }
 
-    const uint32_t access_source_ref = accesslog::Reporter::Instance().RegisterSource({
-        .panel_name = panel_name,
-        .panel_api_host = config_.APIHost,
-        .node_type = inbound.protocol,
-        .node_id = static_cast<uint64_t>(node_id),
-    });
-    if (access_source_ref == 0) {
-        LOG_ERROR("Node {}/{}: centralized access-log source registration failed api={}",
-                  panel_name, node_id, config_.APIHost);
-        co_return false;
-    }
-
     std::exception_ptr publish_failure;
     try {
         std::vector<uint8_t> registered(workers_.size(), 0);
@@ -121,8 +108,7 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
                     inbound.sniff,
                     limiter,
                     inbound.proxy_protocol,
-                    routing::RouteWithFallback(inbound.tag),
-                    access_source_ref);
+                    routing::RouteWithFallback(inbound.tag));
                 return [](Worker* current,
                           ConnectionLimiterPtr current_limiter,
                           proxyman::inbound::BuildRequest request,

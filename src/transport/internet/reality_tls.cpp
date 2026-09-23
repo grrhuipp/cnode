@@ -7,8 +7,10 @@
 #include "acppnode/transport/internet/tls_server_name.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
+#include "acppnode/transport/internet/openssl_thread_pool.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/unsafe.hpp"
 
 #include <openssl/aead.h>
@@ -321,7 +323,7 @@ struct RealityClientState {
         LOG_ERROR("REALITY client publicKey is empty");
         return {};
     }
-    auto state = std::make_shared<RealityClientState>();
+    auto state = memory::AllocateShared<RealityClientState>();
     state->server_public = *config.public_key;
     state->short_id = config.short_id;
     return state;
@@ -620,7 +622,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return {};
     }
 
-    auto state = std::make_shared<RealityServerState>();
+    auto state = memory::AllocateShared<RealityServerState>();
     state->private_key = *config.private_key;
     state->server_names = config.server_names;
     state->max_time_diff_ms = config.max_time_diff;
@@ -676,7 +678,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ctx);
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(ctx, 1);
 
@@ -716,7 +718,7 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+    LimitSslReadBuffer(ctx);
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
 

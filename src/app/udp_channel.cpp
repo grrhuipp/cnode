@@ -224,7 +224,7 @@ struct UDPChannel::State : std::enable_shared_from_this<State> {
 };
 
 UDPChannel::UDPChannel(net::io_context& io_context, std::shared_ptr<UDPSession> session)
-    : state_(std::make_shared<State>(io_context, std::move(session))) {
+    : state_(memory::AllocateShared<State>(io_context, std::move(session))) {
     state_->callback_id = state_->session->RegisterCallback(
         [weak = std::weak_ptr<State>(state_)](UDPPacketView packet) {
             if (auto state = weak.lock()) return state->Receive(packet);

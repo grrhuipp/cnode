@@ -154,7 +154,7 @@ struct UDPSession::Impl {
 UDPSession::UDPSession(net::io_context& io_context,
                        const std::string& session_id,
                        ::acpp::app::dns::DNS& dns_service)
-    : impl_(std::make_shared<Impl>(io_context, session_id, dns_service)) {
+    : impl_(memory::AllocateShared<Impl>(io_context, session_id, dns_service)) {
 }
 
 UDPSession::~UDPSession() {

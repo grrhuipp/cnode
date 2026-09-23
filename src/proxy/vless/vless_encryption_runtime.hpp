@@ -28,7 +28,7 @@ struct VlessEncryptionRuntime {
     VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
 };
 
-struct VlessEncryptionClientTicketCache {
+struct VlessEncryptionClientTicketCache : memory::ThreadAllocated {
     memory::ByteVector pfs_key;
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
     std::chrono::steady_clock::time_point expires_at{};

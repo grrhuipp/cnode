@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/app/relay_types.hpp"
@@ -28,7 +29,7 @@ using OutboundProcessResult = std::expected<RelayResult, ErrorCode>;
 // ============================================================================
 // Outbound - 出站接口
 // ============================================================================
-class Outbound {
+class Outbound : public memory::ThreadAllocated {
 public:
     virtual ~Outbound() noexcept = default;
 

@@ -65,8 +65,7 @@ private:
 // ============================================================================
 class AsyncStream : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
-    // Stream 对象是每连接常驻热路径状态。所有 AsyncStream 派生类的
-    // std::make_unique 分配都会走 system allocator，并记录流对象分配统计。
+    // 流对象在所属 Worker 线程创建和销毁，分配走该线程的 PMR 池。
     [[nodiscard]] static void* operator new(std::size_t size);
     [[nodiscard]] static void* operator new(std::size_t size, std::align_val_t alignment);
     static void operator delete(void* ptr) noexcept;

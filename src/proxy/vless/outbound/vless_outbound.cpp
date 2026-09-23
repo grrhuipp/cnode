@@ -323,9 +323,7 @@ private:
         if (pending_offset_ >= pending_.size()) {
             pending_.clear();
             pending_offset_ = 0;
-            if (pending_.capacity() > buf::Buffer::kSize * 2) {
-                TryShrinkSequence(pending_);
-            }
+            ReleaseIdleBuffer(pending_);
             return;
         }
         const size_t remaining = pending_.size() - pending_offset_;
@@ -868,7 +866,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                              parsed.error));
                 return std::nullopt;
             }
-            vless_config.encryption = std::make_shared<const acpp::vless::VlessEncryptionConfig>(
+            vless_config.encryption = acpp::memory::AllocateShared<const acpp::vless::VlessEncryptionConfig>(
                 std::move(*parsed.config));
         }
 

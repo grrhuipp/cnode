@@ -117,7 +117,9 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
     return result;
 }
 
-class RequestBodyReader final : public transport::MultiBufferReader {
+class RequestBodyReader final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
@@ -254,9 +256,7 @@ private:
         if (pending_offset_ >= pending_.size()) {
             pending_.clear();
             pending_offset_ = 0;
-            if (pending_.capacity() > buf::Buffer::kSize * 8) {
-                memory::ByteVector{}.swap(pending_);
-            }
+            ReleaseIdleBuffer(pending_);
             return;
         }
         const size_t remaining = pending_.size() - pending_offset_;
@@ -269,7 +269,9 @@ private:
     }
 };
 
-class ResponseBodyWriter final : public transport::MultiBufferWriter {
+class ResponseBodyWriter final
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
                        const SsCipherInfo& cipher_info,

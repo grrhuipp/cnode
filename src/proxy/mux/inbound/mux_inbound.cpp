@@ -5,7 +5,6 @@
 #include "xudp_packet_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/container_util.hpp"
@@ -305,7 +304,8 @@ struct ClientReadQueueState {
 };
 
 class TcpSubState final
-    : public transport::MultiBufferReader
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
@@ -617,7 +617,8 @@ private:
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
 
 class UdpSubState final
-    : public transport::MultiBufferReader
+    : public memory::ThreadAllocated
+    , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
@@ -915,11 +916,6 @@ private:
 
 using UdpSubInfo = std::unique_ptr<UdpSubState>;
 using MuxSubInfo = std::variant<TcpSubInfo, UdpSubInfo>;
-
-void ReportDispatchAdmissionFailure(session::Context& ctx) noexcept {
-    app::AccessLogSession access_log(ctx);
-    access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
-}
 
 net::awaitable<void> RunTcpSubDispatch(
     net::io_context& io_context,
@@ -1423,7 +1419,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                     timeouts,
                                     SubLoopLease{reply_queue}));
                         } catch (...) {
-                            ReportDispatchAdmissionFailure(sub_ptr->ctx);
                             sub_ptr->Cancel();
                             sub_ptr->MarkDispatchDone();
                             result.error = ErrorCode::RESOURCE_EXHAUSTED;
@@ -1495,7 +1490,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                                     timeouts,
                                     SubLoopLease{reply_queue}));
                         } catch (...) {
-                            ReportDispatchAdmissionFailure(sub_ptr->ctx);
                             sub_ptr->Cancel();
                             sub_ptr->MarkDispatchDone();
                             result.error = ErrorCode::RESOURCE_EXHAUSTED;

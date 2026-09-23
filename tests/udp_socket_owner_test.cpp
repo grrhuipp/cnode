@@ -1,5 +1,4 @@
 #include "worker/udp_ingress.hpp"
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "udp_receive_buffer.hpp"
 
@@ -617,16 +616,3 @@ int main() {
 
     return 0;
 }
-// This ownership-focused target compiles UdpIngress without the production
-// reporter graph. Keep the access-log boundary inert here; its admission and
-// UDP failure contracts are covered by their dedicated tests.
-namespace acpp::app {
-
-AccessLogSession::AccessLogSession(session::Context& ctx) noexcept
-    : ctx_(&ctx) {}
-
-AccessLogSession::~AccessLogSession() noexcept = default;
-
-void AccessLogSession::Fail(ErrorCode) noexcept {}
-
-}  // namespace acpp::app

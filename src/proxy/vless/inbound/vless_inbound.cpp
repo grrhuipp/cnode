@@ -657,7 +657,7 @@ const bool kVlessInboundRegistered = [] {
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
-            auto settings = std::make_shared<VlessSettings>();
+            auto settings = acpp::memory::AllocateShared<VlessSettings>();
             if (!acpp::vless::IsNoVlessEncryption(config.vless_decryption)) {
                 auto parsed = acpp::vless::ParseVlessServerDecryption(
                     config.vless_decryption);
@@ -670,7 +670,7 @@ const bool kVlessInboundRegistered = [] {
                     return std::nullopt;
                 }
                 settings->decryption =
-                    std::make_shared<acpp::vless::VlessEncryptionConfig>(
+                    acpp::memory::AllocateShared<acpp::vless::VlessEncryptionConfig>(
                         std::move(*parsed.config));
             }
             return settings;

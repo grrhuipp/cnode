@@ -1,6 +1,5 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "anytls_codec.hpp"
@@ -15,10 +14,6 @@
 namespace {
 using namespace acpp;
 struct State { int fault = 0; int active = 0; bool destroyed = false; };
-std::array<ErrorCode, 4> recorded;
-size_t records = 0;
-int observations_after_release = 0;
-State* observed_state = nullptr;
 
 void Raise(int fault) {
     switch (fault) {
@@ -96,28 +91,11 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(AsyncStream&, s
     throw std::logic_error("unexpected proxy protocol"); co_return ProxyProtocolReadResult{};
 }
 }
-namespace acpp::app {
-AccessLogSession::AccessLogSession(session::Context& ctx) noexcept : ctx_(&ctx) {}
-AccessLogSession::~AccessLogSession() noexcept {
-    if (!suppressed_) {
-        if (records == recorded.size()) std::terminate();
-        recorded[records++] = error_code_;
-        if (observed_state->destroyed && observed_state->active == 0) ++observations_after_release;
-    }
-}
-void AccessLogSession::Complete(const RelayResult& result) noexcept { error_code_ = result.error; }
-void AccessLogSession::Fail(ErrorCode error) noexcept { error_code_ = error; }
-void AccessLogSession::Suppress() noexcept { suppressed_ = true; }
-}
-
 int main() {
     size_t passed = 0, total = 0;
     for (bool logical : {false, true}) for (bool codec : {false, true}) for (int fault = 0; fault < 8; ++fault) {
         net::io_context io;
         State state{.fault = fault};
-        observed_state = &state;
-        records = 0;
-        observations_after_release = 0;
         proxyman::inbound::ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
         receiver.inbound_tag = "test";
         receiver.protocol = "fixture";
@@ -141,16 +119,11 @@ int main() {
             catch (const std::exception& error) { std::printf("fixture parent failure: %s\n", error.what()); }
             catch (...) { std::printf("fixture parent failure: unknown\n"); }
         }
-        const ErrorCode expected = fault == 0 ? ErrorCode::OK : fault == 1 ? ErrorCode::RESOURCE_EXHAUSTED
-            : fault == 2 ? ErrorCode::BLOCKED : fault == 3 ? ErrorCode::CANCELLED
-            : fault == 4 ? ErrorCode::TIMEOUT : fault == 5 ? ErrorCode::SOCKET_CLOSED : ErrorCode::INTERNAL;
-        const bool ok = returned && !failure && state.destroyed && records == 1 &&
-            recorded[0] == expected && observations_after_release == 1;
+        const bool ok = returned && !failure && state.destroyed;
         ++total;
         passed += ok;
-        std::printf("inbound logical=%d codec=%d fault=%d recorded=%s expected=%s released=%d records=%zu observed=%d returned=%d: %s\n",
-            logical, codec, fault, ErrorCodeToString(records ? recorded[0] : ErrorCode::INTERNAL).data(),
-            ErrorCodeToString(expected).data(), state.destroyed, records, observations_after_release, returned, ok ? "PASS" : "FAIL");
+        std::printf("inbound logical=%d codec=%d fault=%d released=%d returned=%d: %s\n",
+            logical, codec, fault, state.destroyed, returned, ok ? "PASS" : "FAIL");
     }
     std::printf("inbound cases=%zu passed=%zu failed=%zu\n", total, passed, total - passed);
     return passed == total ? 0 : 1;

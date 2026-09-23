@@ -27,7 +27,6 @@ struct LogConfig {
     uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）
     bool rotate_daily = true;                         // 按本地日期切割日志
     bool gzip = true;                                 // 历史日志 gzip 压缩
-    bool enable_upload = false;                       // 默认关闭结构化集中日志上传，true 时开启
 
     static LogConfig FromJson(const json::object& j);
 };

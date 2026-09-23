@@ -106,60 +106,6 @@ function(expect_outbound_credentials case_name protocol credentials accepted)
     endforeach()
 endfunction()
 
-function(expect_log_upload_state case_name enable_value expect_enabled)
-    set(case_dir "${TEST_ROOT}/${case_name}")
-    file(REMOVE_RECURSE "${case_dir}")
-    file(MAKE_DIRECTORY "${case_dir}")
-    file(TO_CMAKE_PATH "${case_dir}/logs" log_dir)
-    if("${enable_value}" STREQUAL "")
-        set(enable_json "")
-    else()
-        set(enable_json
-            ",\"enable\":${enable_value}")
-    endif()
-    file(WRITE "${case_dir}/config.json"
-        "{\"workers\":1,\"log\":{\"logDir\":\"${log_dir}\"${enable_json}}}")
-
-    execute_process(
-        COMMAND "${CNODE_EXE}" --config-dir "${case_dir}"
-        RESULT_VARIABLE result
-        OUTPUT_VARIABLE stdout
-        ERROR_VARIABLE stderr
-        TIMEOUT 1)
-
-    if("${result}" MATCHES "^[0-9]+$")
-        message(FATAL_ERROR
-            "${case_name}: valid config exited before startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
-    endif()
-    if(NOT "${stdout}" MATCHES "server started")
-        message(FATAL_ERROR
-            "${case_name}: valid config did not reach startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
-    endif()
-
-    set(access_spool "${log_dir}/access-spool")
-    set(error_spool "${log_dir}/error-spool")
-    if(IS_DIRECTORY "${access_spool}" OR IS_DIRECTORY "${error_spool}")
-        message(FATAL_ERROR
-            "${case_name}: centralized log upload must not create spool directories")
-    endif()
-    set(reporter_log "")
-    file(GLOB error_logs "${log_dir}/error_*.log")
-    foreach(error_log IN LISTS error_logs)
-        file(READ "${error_log}" error_log_content)
-        string(APPEND reporter_log "${error_log_content}")
-    endforeach()
-    if(expect_enabled)
-        if(NOT "${reporter_log}" MATCHES "access-log reporter ready")
-            message(FATAL_ERROR
-                "${case_name}: enabled centralized log upload did not start the reporter")
-        endif()
-    elseif(NOT "${reporter_log}" MATCHES
-           "centralized access-log upload disabled by configuration")
-        message(FATAL_ERROR
-            "${case_name}: disabled centralized log upload did not report its state")
-    endif()
-endfunction()
-
 expect_rejected(malformed_main "{" "" "")
 expect_rejected(malformed_inbounds "{}" "inbounds.json" "{")
 expect_rejected(malformed_outbounds "{}" "outbounds.json" "{")
@@ -217,18 +163,6 @@ expect_rejected(conflicting_log_compression
     "gzip and compress must match")
 expect_started(equal_log_compression_aliases
     [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
-expect_rejected(non_boolean_enable_log_upload
-    [=[{"log":{"enable":"true"}}]=] "" ""
-    "enable must be a boolean")
-expect_rejected(removed_disable_log_upload
-    [=[{"log":{"disableUpload":true}}]=] "" ""
-    "log.disableUpload is removed; use log.enable")
-expect_rejected(conflicting_old_log_upload_switch
-    [=[{"log":{"enable":true,"disableUpload":false}}]=] "" ""
-    "log.disableUpload is removed; use log.enable")
-expect_log_upload_state(default_log_upload "" FALSE)
-expect_log_upload_state(disabled_log_upload false FALSE)
-expect_log_upload_state(enabled_log_upload true TRUE)
 expect_rejected(non_string_log_level
     [=[{"log":{"loglevel":123}}]=] "" ""
     "loglevel must be a string")

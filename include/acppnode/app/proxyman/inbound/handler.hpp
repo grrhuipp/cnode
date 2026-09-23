@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
@@ -23,7 +24,9 @@ namespace acpp::proxyman::inbound {
 // receiver settings 和 proxy.Inbound 实例。Worker 仍拥有
 // SO_REUSEPORT socket，但不再分散持有 receiver settings 与协议对象。
 // ============================================================================
-class Handler final : public std::enable_shared_from_this<Handler> {
+class Handler final
+    : public memory::ThreadAllocated
+    , public std::enable_shared_from_this<Handler> {
 public:
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy);
 

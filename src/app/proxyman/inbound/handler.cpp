@@ -1,7 +1,6 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/common/ip_address.hpp"
 
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/request_load_state.hpp"
 
 #include "acppnode/app/rate_limiter.hpp"
@@ -285,19 +284,16 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    ctx.inbound.access_source_ref = listener.access_source_ref;
     ctx.inbound.protocol = listener.protocol;
     PrepareInboundLogMetadata(ctx, listener);
-    app::AccessLogSession access_log(ctx);
 
-    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    ctx.inbound.read_prefix_capture = memory::AllocateShared<ReadPrefixCapture>();
     if (stream) {
         stream->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
     }
 
     if (!stream) {
         stats.OnError();
-        access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
@@ -306,7 +302,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (logical) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
-        access_log.Fail(ErrorCode::BLOCKED);
         co_return;
     }
 
@@ -318,7 +313,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -328,7 +322,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit->MarkIPAccepted();
@@ -344,7 +337,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
 
     if (!proxy_) {
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
         co_return;
     }
     try {
@@ -356,24 +348,18 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             ctx,
             timeouts,
             request_load.PressureIdleTimeout());
-        access_log.Complete(relay_result);
-    } catch (const transport::LinkError& e) {
+    } catch (const transport::LinkError&) {
         stats.OnError();
-        access_log.Fail(e.code());
     } catch (const std::bad_alloc&) {
         stats.OnError();
-        access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (const IoSystemError& e) {
+    } catch (const IoSystemError&) {
         stats.OnError();
-        access_log.Fail(MapAsioError(e.code()));
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: {}", e.what());
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
         LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: unknown");
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
     }
 }
 
@@ -388,14 +374,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    ctx.inbound.access_source_ref = listener.access_source_ref;
     ctx.inbound.protocol = listener.protocol;
     PrepareInboundLogMetadata(ctx, listener);
-    app::AccessLogSession access_log(ctx);
 
     if (!raw_conn) {
         stats.OnError();
-        access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
@@ -427,7 +410,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                     break;
             }
             stats.OnError();
-            access_log.Fail(ProxyProtocolError(proxy_read.status));
             raw_conn->CloseAbortive();
             co_return;
         }
@@ -439,7 +421,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                 "failed to read PROXY protocol client={} > required header missing",
                 ctx.inbound.source_ip);
             stats.OnError();
-            access_log.Fail(ErrorCode::PROTOCOL_DECODE_FAILED);
             raw_conn->CloseAbortive();
             co_return;
         }
@@ -447,7 +428,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
-    ctx.inbound.read_prefix_capture = std::make_shared<ReadPrefixCapture>();
+    ctx.inbound.read_prefix_capture = memory::AllocateShared<ReadPrefixCapture>();
     raw_conn->SetReadPrefixCapture(ctx.inbound.read_prefix_capture);
 
     if (listener.limiter &&
@@ -455,7 +436,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
-        access_log.Fail(ErrorCode::BLOCKED);
         co_return;
     }
 
@@ -467,7 +447,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
@@ -482,14 +461,14 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                    listener.stream_settings.network);
 
     const int64_t transport_started_at_us = NowMicros();
-    auto transport_metadata = std::make_shared<InboundTransportMetadata>();
+    auto transport_metadata = memory::AllocateShared<InboundTransportMetadata>();
     transport_metadata->real_ip_header =
         std::string(RealIpHeader(listener.stream_settings));
     std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler;
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
         listener.stream_settings.IsXHttp()) {
-        logical_stream_handler = std::make_shared<LogicalTransportStreamSink>(
+        logical_stream_handler = memory::AllocateShared<LogicalTransportStreamSink>(
             shared_from_this(),
             io_context,
             dispatcher,
@@ -528,7 +507,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                        listener.stream_settings.security,
                        listener.stream_settings.network);
         stats.OnError();
-        access_log.Fail(build_result.error());
         co_return;
     }
     auto stream = std::move(*build_result);
@@ -536,7 +514,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_DEBUG(ctx, "[Session] Transport consumed connection ({}/{})",
                        listener.stream_settings.security,
                        listener.stream_settings.network);
-        access_log.Suppress();
         co_return;
     }
 
@@ -555,7 +532,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                            ctx.inbound.source_ip, ctx.inbound.source_port,
                            ConnectionLimiter::RejectReasonToString(reject));
             stats.OnError();
-            access_log.Fail(ErrorCode::CONNECTION_LIMITED);
             co_return;
         }
         connection_limit->MarkIPAccepted();
@@ -567,7 +543,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     if (!proxy_) {
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
         co_return;
     }
     try {
@@ -579,24 +554,18 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             ctx,
             timeouts,
             request_load.PressureIdleTimeout());
-        access_log.Complete(relay_result);
-    } catch (const transport::LinkError& e) {
+    } catch (const transport::LinkError&) {
         stats.OnError();
-        access_log.Fail(e.code());
     } catch (const std::bad_alloc&) {
         stats.OnError();
-        access_log.Fail(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (const IoSystemError& e) {
+    } catch (const IoSystemError&) {
         stats.OnError();
-        access_log.Fail(MapAsioError(e.code()));
     } catch (const std::exception& e) {
         LOG_CONN_WARN(ctx, "[Session] inbound process exception: {}", e.what());
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
     } catch (...) {
         LOG_CONN_WARN(ctx, "[Session] inbound process exception: unknown");
         stats.OnError();
-        access_log.Fail(ErrorCode::INTERNAL);
     }
 }
 

@@ -53,10 +53,6 @@ struct Inbound {
     const std::vector<std::string>* tags = nullptr;
     int64_t user_id = 0;
     memory::ThreadLocalString user_email;
-    // Opaque reference into the process-level immutable access-log source
-    // registry. Panel fields stay in the control plane and never enter the
-    // Worker hot-path Context.
-    uint32_t access_source_ref = 0;
     std::string_view transport;
     std::string_view security;
     memory::ThreadLocalString tls_sni;
@@ -148,10 +144,6 @@ struct Context {
     uint64_t runtime_generation = 1;
     uint64_t config_generation = 1;
     uint64_t auth_ms = 0;
-
-    // Worker-local idempotency bit shared by the inbound fallback guard and
-    // Dispatcher terminal-event guard.
-    bool access_event_submitted = false;
 
     Context() {
         accept_time_us = NowMicros();

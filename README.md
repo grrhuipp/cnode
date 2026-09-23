@@ -6,7 +6,6 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 
 - `README.md` 面向使用者和贡献者，说明项目定位、运行架构、配置入口、关键语义和代码组织。
 - `AGENTS.md` 面向代码修改和自动化协作者，记录必须遵守的职责边界、禁止项、审查清单和硬性删除规则。
-- [`docs/centralized_access_logging.md`](docs/centralized_access_logging.md) 记录集中访问日志、面板节点身份、上报协议和 ClickHouse 存储设计。
 - [`docs/local_logging.md`](docs/local_logging.md) 规定对齐 xray-core 的 error/access 文本格式、通道和级别口径。
 
 如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
@@ -196,7 +195,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - AnyTLS outbound 的 `idleSessionCheckInterval`（默认 30 秒）驱动各 Worker 的周期检查，`idleSessionTimeout`（默认 60 秒）决定空闲到期时间；`minIdleSession`（默认 0）保留该 Worker 最近归还的已建立空闲会话。占用中的会话不参与空闲淘汰，handler 退役时关闭其会话并取消检查。
 - AnyTLS 出站请求使用统一的 relay 空闲、写入和半关闭超时；持续接收数据不会延长半关闭的绝对截止时间。取消受阻写入会关闭物理会话；成功请求归还前清除请求超时，空闲连接的寿命随后由会话池控制。
 - Freedom 和 Shadowsocks 原生 UDP 出站使用同一套请求级端点和 relay；写入超时包含域名解析等待，取消一个请求不关闭其他请求共享的 UDP socket。上行半关闭后，在 `timeouts.downlinkOnly` 指定的时间内继续接收回包。每个请求最多排队 256 个原始回包、合计 512 KiB，超限会结束该请求并保留资源不足错误；流量只在成功发送后计入。
-- 本地日志对齐 xray-core：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。结构化集中日志的待发送批次只保存在有界进程内存，不创建 `access-spool` / `error-spool` 目录；`log.enable` 默认是 `false`，默认关闭集中上传，显式设为 `true` 开启；该开关不影响本地 access/error 文件日志。
+- 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。

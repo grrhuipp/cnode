@@ -1,5 +1,6 @@
 #include "ss_udp.hpp"
 #include "shadowsocks_crypto.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -456,7 +457,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::span<const uint8_t, 8> client_session_id,
     Parsed2022Body parsed) {
 
-    auto state = std::make_shared<Ss2022UdpSessionState>();
+    auto state = memory::AllocateShared<Ss2022UdpSessionState>();
     state->cipher_info = cipher_info;
     if (!state->key.assign(user.derived_key.span())) {
         return std::nullopt;

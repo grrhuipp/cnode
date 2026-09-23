@@ -14,7 +14,7 @@
 namespace acpp {
 namespace vmess {
 
-struct TimedUserValidator::Impl {
+struct TimedUserValidator::Impl : memory::ThreadAllocated {
     struct SessionKey {
         std::array<uint8_t, 16> user{};
         std::array<uint8_t, 16> key{};

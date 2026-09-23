@@ -37,7 +37,7 @@ inline ErrorCode SessionExceptionError(const std::exception_ptr& failure) noexce
 // completion. Retirement requests cancellation; it cannot destroy those roots
 // while they are cleaning up. Neither roots nor timers borrow the Handler.
 template<class Session>
-class SessionPool {
+class SessionPool : public memory::ThreadAllocated {
     using Clock = std::chrono::steady_clock;
     struct State;
 
@@ -89,7 +89,7 @@ public:
 
     SessionPool(net::io_context& io_context, Clock::duration check_interval,
                 Clock::duration idle_timeout, size_t minimum_idle, std::string tag)
-        : state_(std::make_shared<State>(io_context, check_interval, idle_timeout,
+        : state_(memory::AllocateShared<State>(io_context, check_interval, idle_timeout,
                                          minimum_idle, std::move(tag))) {}
     SessionPool(const SessionPool&) = delete;
     SessionPool& operator=(const SessionPool&) = delete;

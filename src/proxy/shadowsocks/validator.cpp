@@ -1,10 +1,11 @@
 #include "validator.hpp"
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/sharded_user_stats.hpp"
 
 namespace acpp::ss {
 
-struct Validator::Impl {
+struct Validator::Impl : memory::ThreadAllocated {
     UserOnlineTracker stats;
 };
 

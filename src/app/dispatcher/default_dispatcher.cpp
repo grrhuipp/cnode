@@ -3,7 +3,6 @@
 #include "outbound_selection.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/request_load_state.hpp"
@@ -248,7 +247,6 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     const uint32_t pressure_idle_timeout = request_load_
         ? request_load_->PressureIdleTimeout()
         : 0;
-    app::AccessLogSession access_log(ctx);
     const int64_t auth_completed_at_us = NowMicros();
     const int64_t auth_started_at_us = ctx.inbound.transport_ready_at_unix_us > 0
         ? ctx.inbound.transport_ready_at_unix_us
@@ -319,7 +317,6 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         result.error = cancellation_reason;
         ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
     }
-    access_log.Complete(result);
     co_return result;
 }
 

@@ -1,4 +1,3 @@
-#include "acppnode/app/access_log_session.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
@@ -17,19 +16,6 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
-
-// The real Dispatcher, DNS and relay run below. Only the external log sink is
-// replaced, so terminal accounting can be inspected without an upload service.
-namespace acpp::app {
-size_t completions = 0;
-RelayResult last_result;
-AccessLogSession::AccessLogSession(session::Context& ctx) noexcept : ctx_(&ctx) {}
-AccessLogSession::~AccessLogSession() noexcept = default;
-void AccessLogSession::Complete(const RelayResult& result) noexcept {
-    ++completions;
-    last_result = result;
-}
-}
 
 namespace {
 using namespace acpp;
@@ -212,7 +198,6 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
             else reader->Cancellation().Stop(reason);
         });
     }
-    const size_t before_logs = app::completions;
     auto request = dispatcher.Dispatch(io, policy, controlled ? std::move(stream) : nullptr,
         controlled ? transport::Link{} : transport::Link{reader, reader, nullptr},
         InitialPayload{}, ctx, stats, timeouts);
@@ -226,8 +211,8 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         io.run_for(1s);
     }
     bool passed = completed_in_budget && done && !failure && load.ActiveConnections() == 0 &&
-        source_state.active == 0 && outbound.state.active == 0 && app::completions == before_logs + 1 &&
-        app::last_result.error == result.error && (!controlled || source_state.destroyed);
+        source_state.active == 0 && outbound.state.active == 0 &&
+        (!controlled || source_state.destroyed);
     auto expected = reason;
     if (which == Case::Success || which == Case::RelaySuccess) expected = ErrorCode::OK;
     if (which == Case::RelayFailure) expected = ErrorCode::RELAY_READ_FAILED;
@@ -247,7 +232,6 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         // No callback may retain its completed task group or stack context.
         reader->Cancellation().CancelPending();
         reader->Cancellation().Stop();
-        passed &= app::completions == before_logs + 1;
     }
     std::printf("case=%d controlled=%d reason=%s result=%s timely=%d triggered=%d lookups=%d committed=%d joined=%d: %s\n",
         int(which), controlled, ErrorCodeToString(reason).data(), ErrorCodeToString(result.error).data(),
@@ -280,7 +264,6 @@ bool SiblingIsolation(bool controlled) {
     TimeoutsConfig timeouts;
     bool first_done = false, second_done = false, first_joined = false, failed = false;
     RelayResult result_a, result_b;
-    const auto logs_before = app::completions;
     const auto link_a = controlled ? transport::Link{} : transport::Link{first.get(), first.get(), nullptr};
     const auto link_b = controlled ? transport::Link{} : transport::Link{second.get(), second.get(), nullptr};
     net::co_spawn(io, dispatcher.Dispatch(io, policy_a, controlled ? std::move(first) : nullptr,
@@ -308,7 +291,7 @@ bool SiblingIsolation(bool controlled) {
         result_a.error == ErrorCode::RESOURCE_EXHAUSTED && result_b.error == ErrorCode::OK &&
         manager.handler->state.cancelled == 1 && manager.handler->state.committed == 0 &&
         manager.second->state.cancelled == 0 && manager.second->state.committed == 1 &&
-        manager.second->state.active == 0 && load.ActiveConnections() == 0 && app::completions == logs_before + 2;
+        manager.second->state.active == 0 && load.ActiveConnections() == 0;
     std::printf("sibling isolation controlled=%d first=%s second=%s joined=%d: %s\n", controlled,
         ErrorCodeToString(result_a.error).data(), ErrorCodeToString(result_b.error).data(), first_joined,
         passed ? "PASS" : "FAIL");

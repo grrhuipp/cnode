@@ -1224,7 +1224,7 @@ struct XHttpRequestMeta {
     if (sessions.size() >= kXHttpMaxPacketSessions) {
         return nullptr;
     }
-    auto session = std::make_shared<XHttpPacketUpSession>(io_context);
+    auto session = memory::AllocateShared<XHttpPacketUpSession>(io_context);
     detail::XHttpPacketSessionKey stored_key{
         .owner = &io_context,
         .session_id = {},
@@ -3294,7 +3294,7 @@ private:
         if (streams_.size() >= kHttp2MaxConcurrentStreams) {
             co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
         }
-        auto sub = std::make_shared<Http2ServerSubStreamState>(
+        auto sub = memory::AllocateShared<Http2ServerSubStreamState>(
             io_context_, shared_from_this(), stream_id, payload_codec_);
         streams_.emplace(stream_id, sub);
 
@@ -4056,7 +4056,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     uint64_t conn_id,
     std::optional<HttpConfig> http_config = std::nullopt,
     std::optional<XHttpConfig> xhttp_config = std::nullopt) {
-    auto session = std::make_shared<Http2ServerSession>(
+    auto session = memory::AllocateShared<Http2ServerSession>(
         io_context, std::move(stream), std::move(stream_handler), payload_codec,
         std::move(response_headers), conn_id, std::move(http_config), std::move(xhttp_config));
     auto settings = transport::internet::EncodeInitialWindowSetting(initial_window);

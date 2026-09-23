@@ -233,7 +233,7 @@ struct Handler::ClientSession {
     }
 
     std::shared_ptr<LogicalStream> RegisterLogicalStream(uint32_t sid) {
-        auto logical = std::make_shared<LogicalStream>(io_context_);
+        auto logical = memory::AllocateShared<LogicalStream>(io_context_);
         logical_streams[sid] = logical;
         return logical;
     }
@@ -440,7 +440,7 @@ struct Handler::ClientSession {
                             }
                             if (auto parsed = ParsePaddingScheme(*text)) {
                                 padding_state_->scheme =
-                                    std::make_shared<const PaddingScheme>(std::move(*parsed));
+                                    memory::AllocateShared<const PaddingScheme>(std::move(*parsed));
                             }
                         }
                         break;
@@ -595,7 +595,7 @@ Handler::Handler(std::string tag,
     , stream_settings_(std::move(stream_settings))
     , dial_timeout_(dial_timeout)
     , dns_service_(dns_service)
-    , padding_(std::make_shared<PaddingState>())
+    , padding_(memory::AllocateShared<PaddingState>())
     , pool_(std::make_unique<SessionPool<ClientSession>>(
           io_context, settings_.idle_session_check_interval,
           settings_.idle_session_timeout, settings_.min_idle_sessions, tag_)) {}
@@ -671,7 +671,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             new_stream->Cancel();
             co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
-        session = std::make_shared<ClientSession>(io_context, std::move(new_stream),
+        session = memory::AllocateShared<ClientSession>(io_context, std::move(new_stream),
             padding_, std::move(opening_scheme));
         transport_lease = pool_->Adopt(session);
     } else if (session->stream) {
