@@ -216,7 +216,7 @@ proxy::vmess::outbound::Handler::Process(
         ctx.outbound.connected_local_addr = local_ep->address();
         ctx.outbound.connected_local_port = local_ep->port();
     }
-    LOG_ACCESS(FormatXrayAccessLog(ctx));
+    LOG_ACCESS(FormatAccessLog(ctx));
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
     PhaseDeadlineHandle outbound_protocol_deadline =

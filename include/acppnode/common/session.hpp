@@ -159,6 +159,6 @@ struct Context {
 
 }  // namespace session
 
-std::string FormatXrayAccessLog(const session::Context& ctx);
+std::string FormatAccessLog(const session::Context& ctx);
 
 }  // namespace acpp

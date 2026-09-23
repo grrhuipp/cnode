@@ -17,7 +17,7 @@ ID NewID(uint32_t worker_id) noexcept {
 
 }  // namespace session
 
-std::string FormatXrayAccessLog(const session::Context& ctx) {
+std::string FormatAccessLog(const session::Context& ctx) {
     std::string src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
     if (src_host.empty()) {
@@ -52,18 +52,27 @@ std::string FormatXrayAccessLog(const session::Context& ctx) {
         : ctx.outbound.tag;
 
     std::string access = std::format(
-        "from {}:{} accepted {}:{} [{} -> {}]",
-        net_str,
+        "from {} accepted {}:{} [{}",
         src,
         net_str,
         iputil::FormatEndpointForLog(target_host, t.port),
-        in_tag,
-        out_tag);
-    if (!ctx.inbound.user_email.empty()) {
-        access.append(" email: ");
+        in_tag);
+    if (in_tag != out_tag) {
+        access.append(" -> ");
+        access.append(out_tag);
+    }
+    access.push_back(']');
+    if (ctx.inbound.user_id > 0) {
+        access.append(std::format(" user:{}", ctx.inbound.user_id));
+    } else if (!ctx.inbound.user_email.empty()) {
+        access.append(" user:");
         access.append(ctx.inbound.user_email);
-    } else if (ctx.inbound.user_id > 0) {
-        access.append(std::format(" email: {}", ctx.inbound.user_id));
+    }
+    if (ctx.outbound.connected_local_addr &&
+        !ctx.outbound.connected_local_addr->is_unspecified()) {
+        access.append(" sendThrough:");
+        access.append(iputil::NormalizeAddressString(
+            *ctx.outbound.connected_local_addr));
     }
     return access;
 }

@@ -51,19 +51,13 @@ Freedom 的 TCP / UDP 拨号失败细节使用 `Debug`；Dispatcher 统一输出
 
 ## 3. access 格式
 
-access 对齐 xray-core `AccessMessage`：
+access 以简短的 `from source accepted network:target` 记录访问事实；入站、出口标签相同时只写一次。用户有数字 ID 时优先写 `user:id`，否则写 `user:email`；连接建立后若能取得出站 socket 的实际本地 IP，则写 `sendThrough:IP`，它不是配置中的网段，也不是远端地址。没有已连接的出站 socket 时不伪造该字段。
 
 ```text
-YYYY/MM/DD HH:MM:SS from network:source accepted network:target [inbound -> outbound] email: user
+2026/07/19 20:42:06 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> ipv6_first] user:714443 sendThrough:2602:2b5:20:111::abcd
 ```
 
-示例：
-
-```text
-2026/07/19 20:42:06 from tcp:192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] email: user@example.com
-```
-
-access 记录不带 `[Info]`，也不写组件、源码行或 Worker。它只表达访问事实，使用 `LOG_ACCESS` 写入。认证失败、拨号失败和 relay 异常进入 error logger；强类型终态结果由集中日志 `AccessLogSession` 上报，避免在本地 access 中创造第二套终态口径。
+access 不带 `[Info]`，也不写组件、源码行或 Worker。使用 `LOG_ACCESS` 写入；认证失败、拨号失败和 relay 异常进入 error logger。
 
 ## 4. 文件和后端
 

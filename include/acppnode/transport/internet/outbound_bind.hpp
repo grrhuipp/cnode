@@ -23,8 +23,7 @@ public:
     enum class ChoicePolicy : uint8_t { Random, SourceHash };
 
     struct Selection {
-        std::optional<net::ip::address> address;
-        bool unavailable = false; // Same-family entries exist, but none is usable.
+        std::optional<net::ip::address> address; // Empty only when no same-family entry exists.
     };
 
     OutboundBind() = default;
@@ -41,12 +40,6 @@ public:
     [[nodiscard]] static std::optional<OutboundBind> Parse(std::string_view value);
     [[nodiscard]] static std::optional<OutboundBind> ParseCandidates(
         std::span<const std::string_view> entries, ChoicePolicy policy);
-    // Deterministic local-interface fixture for tests; production uses the OS snapshot.
-    [[nodiscard]] static std::optional<OutboundBind> ParseCandidates(
-        std::span<const std::string_view> entries,
-        std::span<const net::ip::address> local_addresses,
-        ChoicePolicy policy);
-
     [[nodiscard]] Selection Select(
         const net::ip::address& remote,
         std::string_view inbound_source_ip,
@@ -55,7 +48,8 @@ public:
 private:
     struct Entry {
         bool is_v6 = false;
-        std::vector<net::ip::address> local_addresses;
+        net::ip::address network_or_ip;
+        uint8_t prefix_length = 0;
     };
 
     Mode mode_ = Mode::None;

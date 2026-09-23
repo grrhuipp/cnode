@@ -127,11 +127,11 @@ async def run_case(binary, root, addresses, strategy, succeeds, *, domain=False)
 
 async def main(binary, root):
     binary, root = binary.resolve(), root.resolve()
-    await run_case(binary, root / "ordered-hash", ["192.0.2.3", "127.0.0.1/32"], "hash", True)
+    await run_case(binary, root / "ordered-hash", ["127.0.0.1/32", "192.0.2.3"], "hash", True)
     await run_case(binary, root / "ordered-random", ["127.0.0.1/32"], "random", True)
-    await run_case(binary, root / "same-family-unavailable", ["192.0.2.3"], "hash", False)
+    await run_case(binary, root / "strict-first-ip", ["192.0.2.3", "127.0.0.1/32"], "hash", False)
     await run_case(binary, root / "no-same-family", ["2001:db8:ffff::/64"], "hash", True)
-    await run_case(binary, root / "dns-v6-unavailable-v4-default",
+    await run_case(binary, root / "dns-v6-bind-failed-v4-default",
                    ["2001:db8:ffff::/64"], "hash", True, domain=True)
     await run_case(binary, root / "dns-v6-refused-v4-default",
                    ["::1"], "hash", True, domain=True)

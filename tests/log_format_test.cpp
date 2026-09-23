@@ -96,8 +96,8 @@ int main() {
                 .user_id = 0},
             "failed to dial example.com:443 > connection refused");
         acpp::Log::WriteAccess(
-            "from tcp:192.0.2.10:52000 accepted tcp:example.com:443 "
-            "[vless-in -> direct] email: user@example.com");
+            "from 192.0.2.10:52000 accepted tcp:example.com:443 "
+            "[vless-in -> direct] user:123 sendThrough:2602:2b5:20:111::abcd");
 
         std::ostringstream console;
         auto* previous = std::cout.rdbuf(console.rdbuf());
@@ -161,12 +161,12 @@ int main() {
         Expect(access_lines.size() == 1, "access logger wrote diagnostics");
         CheckTimestamp(access_lines.front());
         Expect(access_lines.front().find(
-                   " from tcp:192.0.2.10:52000 accepted tcp:example.com:443 "
-                   "[vless-in -> direct] email: user@example.com") !=
+                   " from 192.0.2.10:52000 accepted tcp:example.com:443 "
+                   "[vless-in -> direct] user:123 sendThrough:2602:2b5:20:111::abcd") !=
                std::string::npos,
-               "Xray access format mismatch");
+               "access format mismatch");
         Expect(access_lines.front().find("[Info]") == std::string::npos,
-               "Xray access records must not have severity");
+               "access records must not have severity");
     } catch (const std::exception& error) {
         acpp::Log::Shutdown();
         std::filesystem::remove_all(directory);

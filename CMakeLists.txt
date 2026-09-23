@@ -1915,6 +1915,19 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_log_format_test
         COMMAND cnode_log_format_test)
 
+    add_executable(cnode_session_access_log_test
+        tests/session_access_log_test.cpp
+        src/common/session.cpp
+    )
+    target_include_directories(cnode_session_access_log_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(cnode_session_access_log_test PRIVATE asio::asio Threads::Threads)
+    if(WIN32)
+        target_link_libraries(cnode_session_access_log_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME cnode_session_access_log_test COMMAND cnode_session_access_log_test)
+
     add_test(
         NAME cnode_tcp_read_buffer_contract_test
         COMMAND ${CMAKE_COMMAND}

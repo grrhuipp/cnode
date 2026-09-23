@@ -335,9 +335,6 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 net::ip::address_v4::any());
             const auto selected = config_.send_through.Select(
                 remote, ctx.inbound.source_ip, ctx.inbound.source_port);
-            if (selected.unavailable) {
-                co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
-            }
             bind_addr = selected.address.value_or(remote.is_v6()
                 ? net::ip::address(net::ip::address_v6::any())
                 : net::ip::address(net::ip::address_v4::any()));
@@ -429,7 +426,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         ctx.outbound.connected_local_addr = local_ep->address();
         ctx.outbound.connected_local_port = local_ep->port();
     }
-    LOG_ACCESS(FormatXrayAccessLog(ctx));
+    LOG_ACCESS(FormatAccessLog(ctx));
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
     PhaseDeadlineHandle outbound_protocol_deadline =

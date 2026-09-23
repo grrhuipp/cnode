@@ -8,81 +8,14 @@
 #include <asio/ip/network_v6.hpp>
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <chrono>
-#include <cstring>
 #include <functional>
-#include <ranges>
 #include <string>
 #include <thread>
 
-#ifdef _WIN32
-#include <iphlpapi.h>
-#else
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#endif
-
 namespace acpp {
 namespace {
-
-std::vector<net::ip::address> LocalInterfaceAddresses() {
-    std::vector<net::ip::address> addresses;
-    auto append = [&](const sockaddr* sock) {
-        if (!sock) return;
-        if (sock->sa_family == AF_INET) {
-            net::ip::address_v4::bytes_type bytes{};
-            std::memcpy(bytes.data(),
-                        &reinterpret_cast<const sockaddr_in*>(sock)->sin_addr,
-                        bytes.size());
-            addresses.emplace_back(net::ip::address_v4(bytes));
-        } else if (sock->sa_family == AF_INET6) {
-            const auto* addr = reinterpret_cast<const sockaddr_in6*>(sock);
-            net::ip::address_v6::bytes_type bytes{};
-            std::memcpy(bytes.data(), &addr->sin6_addr, bytes.size());
-            addresses.emplace_back(iputil::NormalizeAddress(
-                net::ip::address_v6(bytes, addr->sin6_scope_id)));
-        }
-    };
-#ifdef _WIN32
-    ULONG length = 16 * 1024;
-    std::vector<unsigned char> buffer(length);
-    ULONG result = ERROR_BUFFER_OVERFLOW;
-    for (int attempt = 0; attempt < 3 && result == ERROR_BUFFER_OVERFLOW; ++attempt) {
-        result = GetAdaptersAddresses(
-            AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                           GAA_FLAG_SKIP_DNS_SERVER,
-            nullptr, reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data()), &length);
-        if (result == ERROR_BUFFER_OVERFLOW) buffer.resize(length);
-    }
-    if (result == NO_ERROR) {
-        for (auto* adapter = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-             adapter; adapter = adapter->Next) {
-            if (adapter->OperStatus != IfOperStatusUp) continue;
-            for (auto* item = adapter->FirstUnicastAddress; item; item = item->Next) {
-                if (item->DadState == IpDadStatePreferred) {
-                    append(item->Address.lpSockaddr);
-                }
-            }
-        }
-    }
-#else
-    ifaddrs* interfaces = nullptr;
-    if (getifaddrs(&interfaces) == 0) {
-        for (auto* item = interfaces; item; item = item->ifa_next) {
-            if ((item->ifa_flags & IFF_UP) != 0) append(item->ifa_addr);
-        }
-        freeifaddrs(interfaces);
-    }
-#endif
-    std::ranges::sort(addresses, [](const auto& a, const auto& b) {
-        return a.to_string() < b.to_string();
-    });
-    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
-    return addresses;
-}
 
 uint64_t SourceHash(std::string_view ip, uint16_t port) noexcept {
     uint64_t value = 14695981039346656037ull;
@@ -95,6 +28,13 @@ uint64_t SourceHash(std::string_view ip, uint16_t port) noexcept {
         value = (value ^ byte) * 1099511628211ull;
     }
     return value;
+}
+
+uint64_t MixHash(uint64_t value) noexcept {
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
 }
 
 uint64_t RandomIndex() noexcept {
@@ -118,21 +58,13 @@ OutboundBind OutboundBind::Auto() noexcept {
 
 std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
     OutboundBind bind;
-    if (value.empty()) {
-        return bind;
-    }
-    if (value == constants::binding::kAuto) {
-        return Auto();
-    }
+    if (value.empty()) return bind;
+    if (value == constants::binding::kAuto) return Auto();
 
     auto address = iputil::ParseLiteral(value);
-    if (!address) {
-        return std::nullopt;
-    }
+    if (!address) return std::nullopt;
     *address = iputil::NormalizeAddress(*address);
-    if (address->is_unspecified()) {
-        return bind;
-    }
+    if (address->is_unspecified()) return bind;
     bind.mode_ = Mode::Explicit;
     bind.explicit_address_ = std::move(*address);
     return bind;
@@ -140,14 +72,6 @@ std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
 
 std::optional<OutboundBind> OutboundBind::ParseCandidates(
     std::span<const std::string_view> entries, ChoicePolicy policy) {
-    const auto local_addresses = LocalInterfaceAddresses();
-    return ParseCandidates(entries, local_addresses, policy);
-}
-
-std::optional<OutboundBind> OutboundBind::ParseCandidates(
-    std::span<const std::string_view> entries,
-    std::span<const net::ip::address> local_addresses,
-    ChoicePolicy policy) {
     if (entries.empty()) return std::nullopt;
     OutboundBind bind;
     bind.mode_ = Mode::Ordered;
@@ -157,46 +81,29 @@ std::optional<OutboundBind> OutboundBind::ParseCandidates(
     for (const auto text : entries) {
         if (text.empty() || text.contains('\0')) return std::nullopt;
         Entry entry;
-        if (const auto slash = text.find('/'); slash != std::string_view::npos) {
-            auto address = iputil::ParseLiteral(text.substr(0, slash));
-            if (!address) return std::nullopt;
-            *address = iputil::NormalizeAddress(*address);
-            unsigned int prefix = 0;
+        const auto slash = text.find('/');
+        auto address = iputil::ParseLiteral(text.substr(0, slash));
+        if (!address) return std::nullopt;
+        *address = iputil::NormalizeAddress(*address);
+        if (address->is_unspecified() && slash == std::string_view::npos) return std::nullopt;
+        entry.is_v6 = address->is_v6();
+        const unsigned int max_prefix = entry.is_v6 ? 128 : 32;
+        unsigned int prefix = max_prefix;
+        if (slash != std::string_view::npos) {
             const auto length = text.substr(slash + 1);
             if (length.empty()) return std::nullopt;
-            auto [end, error] = std::from_chars(
+            const auto [end, error] = std::from_chars(
                 length.data(), length.data() + length.size(), prefix);
             if (error != std::errc{} || end != length.data() + length.size() ||
-                prefix > (address->is_v6() ? 128u : 32u)) return std::nullopt;
-            entry.is_v6 = address->is_v6();
-            for (const auto& local : local_addresses) {
-                if (local.is_v6() != entry.is_v6 || local.is_unspecified()) continue;
-                if (entry.is_v6 && address->to_v6().scope_id() != 0 &&
-                    local.to_v6().scope_id() != address->to_v6().scope_id()) continue;
-                if (entry.is_v6 ?
-                    net::ip::network_v6(local.to_v6(), static_cast<unsigned short>(prefix)).network().to_bytes() ==
-                        net::ip::network_v6(address->to_v6(), static_cast<unsigned short>(prefix)).network().to_bytes() :
-                    net::ip::network_v4(local.to_v4(), static_cast<unsigned short>(prefix)).network() ==
-                        net::ip::network_v4(address->to_v4(), static_cast<unsigned short>(prefix)).network()) {
-                    entry.local_addresses.push_back(local);
-                }
-            }
-        } else {
-            auto address = iputil::ParseLiteral(text);
-            if (!address) return std::nullopt;
-            *address = iputil::NormalizeAddress(*address);
-            if (address->is_unspecified()) return std::nullopt;
-            entry.is_v6 = address->is_v6();
-            if (std::ranges::find(local_addresses, *address) != local_addresses.end()) {
-                entry.local_addresses.push_back(*address);
-            }
+                prefix > max_prefix) return std::nullopt;
         }
-        std::ranges::sort(entry.local_addresses, [](const auto& a, const auto& b) {
-            return a.to_string() < b.to_string();
-        });
-        entry.local_addresses.erase(
-            std::unique(entry.local_addresses.begin(), entry.local_addresses.end()),
-            entry.local_addresses.end());
+        entry.prefix_length = static_cast<uint8_t>(prefix);
+        entry.network_or_ip = slash == std::string_view::npos ? *address :
+            entry.is_v6
+                ? net::ip::address(net::ip::network_v6(
+                    address->to_v6(), static_cast<unsigned short>(prefix)).network())
+                : net::ip::address(net::ip::network_v4(
+                    address->to_v4(), static_cast<unsigned short>(prefix)).network());
         prepared.push_back(std::move(entry));
     }
     bind.entries_ = std::make_shared<const std::vector<Entry>>(std::move(prepared));
@@ -210,19 +117,36 @@ OutboundBind::Selection OutboundBind::Select(
     if (mode_ == Mode::Explicit) return {.address = explicit_address_};
     if (mode_ != Mode::Ordered) return {};
 
-    bool has_same_family = false;
     for (const auto& entry : *entries_) {
         if (entry.is_v6 != remote.is_v6()) continue;
-        has_same_family = true;
-        if (entry.local_addresses.empty()) continue;
-        const size_t index = static_cast<size_t>(
-            (policy_ == ChoicePolicy::Random
-                ? RandomIndex()
-                : SourceHash(inbound_source_ip, inbound_source_port)) %
-            entry.local_addresses.size());
-        return {.address = entry.local_addresses[index]};
+        if (entry.prefix_length == (entry.is_v6 ? 128 : 32)) {
+            return {.address = entry.network_or_ip};
+        }
+        const uint64_t key = policy_ == ChoicePolicy::Random
+            ? RandomIndex() : SourceHash(inbound_source_ip, inbound_source_port);
+        if (!entry.is_v6) {
+            const auto prefix = entry.prefix_length;
+            const uint32_t mask = prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+            const uint32_t ip = (entry.network_or_ip.to_v4().to_uint() & mask) |
+                (static_cast<uint32_t>(key) & ~mask);
+            return {.address = net::ip::address_v4(ip)};
+        }
+        auto bytes = entry.network_or_ip.to_v6().to_bytes();
+        const uint64_t high = key;
+        const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : MixHash(key);
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            const unsigned bits = entry.prefix_length > i * 8
+                ? std::min<unsigned>(8, entry.prefix_length - static_cast<unsigned>(i * 8))
+                : 0;
+            const uint8_t mask = bits == 0 ? 0 : static_cast<uint8_t>(0xffu << (8 - bits));
+            const uint64_t word = i < 8 ? high : low;
+            const unsigned shift = static_cast<unsigned>(i < 8 ? (7 - i) * 8 : (15 - i) * 8);
+            const auto suffix = static_cast<uint8_t>(word >> shift);
+            bytes[i] = (bytes[i] & mask) | (suffix & static_cast<uint8_t>(~mask));
+        }
+        return {.address = net::ip::address_v6(bytes)};
     }
-    return {.unavailable = has_same_family};
+    return {};
 }
 
 }  // namespace acpp

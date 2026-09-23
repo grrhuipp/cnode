@@ -299,10 +299,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             ? (remote_addr.is_v6() ? selected_v6.address : selected_v4.address)
             : DetermineLocalAddress(inbound_local_addr, remote_addr);
     };
-    auto unavailable = [&](const net::ip::address& remote_addr) {
-        return ordered_bind &&
-            (remote_addr.is_v6() ? selected_v6.unavailable : selected_v4.unavailable);
-    };
     auto set_single_candidate = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;
         candidate.endpoint = tcp::endpoint(remote_addr, target.port);
@@ -312,9 +308,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     if (target.IsIP() && target.resolved_addr) {
         ctx.content.dns_result = session::DnsResultState::None;
-        if (unavailable(*target.resolved_addr)) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
-        }
         set_single_candidate(*target.resolved_addr);
     } else {
         auto remote_addrs = co_await ResolveTargets(ctx);
@@ -324,7 +317,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         transport_target.candidates.reserve(remote_addrs->size());
         for (const auto& remote_addr : *remote_addrs) {
-            if (unavailable(remote_addr)) continue;
             transport_target.candidates.push_back(OutboundDialCandidate{
                 .endpoint = tcp::endpoint(remote_addr, target.port),
                 .bind_local = selected_bind(remote_addr),
@@ -394,7 +386,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             ctx.outbound.connected_local_port = local_ep->port();
         }
     }
-    LOG_ACCESS(FormatXrayAccessLog(ctx));
+    LOG_ACCESS(FormatAccessLog(ctx));
 
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
@@ -427,9 +419,6 @@ Handler::AcquireUdpSession(session::Context& ctx) {
         if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
             const auto selected = settings_.send_through.Select(
                 bind_addr_storage, ctx.inbound.source_ip, ctx.inbound.source_port);
-            if (selected.unavailable) {
-                return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
-            }
             if (selected.address) bind_addr_storage = *selected.address;
         }
         session_id_storage = MakeUdpSessionId(bind_addr_storage);

@@ -289,34 +289,28 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         options.ws_host.empty() ? options.address : options.ws_host,
         options.port);
 
-    auto append_single = [&](const net::ip::address& remote_addr) -> bool {
+    auto append_single = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;
         candidate.endpoint = tcp::endpoint(remote_addr, options.port);
         if (bind.GetMode() == OutboundBind::Mode::Ordered) {
             const auto& selected = remote_addr.is_v6() ? ordered_v6 : ordered_v4;
-            if (selected.unavailable) return false;
             candidate.bind_local = selected.address;
         } else {
             candidate.bind_local = SelectBindAddress(
                 bind, options.inbound_local_addr, remote_addr);
         }
         target.single_candidate = std::move(candidate);
-        return true;
     };
 
     if (options.literal_address) {
-        if (!append_single(*options.literal_address)) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
-        }
+        append_single(*options.literal_address);
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,
             allow_xhttp_download);
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
-        if (!append_single(*literal)) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
-        }
+        append_single(*literal);
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,
@@ -334,7 +328,6 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         target.candidates.reserve(dns_result.addresses.size());
         for (const bool ipv6 : {bind.PrefersIPv6(), !bind.PrefersIPv6()}) {
             const auto& selected = ipv6 ? ordered_v6 : ordered_v4;
-            if (selected.unavailable) continue;
             for (const auto& addr : dns_result.addresses) {
                 if (addr.is_v6() != ipv6) continue;
                 target.candidates.push_back(OutboundDialCandidate{
@@ -342,9 +335,6 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
                     .bind_local = selected.address,
                 });
             }
-        }
-        if (target.candidates.empty()) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
         }
         if (target.candidates.size() == 1) {
             target.single_candidate = std::move(target.candidates.front());

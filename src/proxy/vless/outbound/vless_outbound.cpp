@@ -631,7 +631,7 @@ proxy::vless::outbound::Handler::Process(
         ctx.outbound.connected_local_addr = local_ep->address();
         ctx.outbound.connected_local_port = local_ep->port();
     }
-    LOG_ACCESS(FormatXrayAccessLog(ctx));
+    LOG_ACCESS(FormatAccessLog(ctx));
 
     auto fail_abortive = [&](ErrorCode error) {
         if (stream) {

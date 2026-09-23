@@ -636,9 +636,8 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             const auto local = physical.stream->LocalEndpoint();
             if (!remote || !local) return false;
             const auto& selected = remote->address().is_v6() ? selected_v6 : selected_v4;
-            return !selected.unavailable &&
-                (!selected.address ||
-                 iputil::NormalizeAddress(local->address()) == *selected.address);
+            return !selected.address ||
+                iputil::NormalizeAddress(local->address()) == *selected.address;
         })
         : pool_->Acquire();
     std::shared_ptr<ClientSession> session = transport_lease.Get();
@@ -680,7 +679,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
         auto new_stream = std::move(dial_result.stream);
         new_stream->SetStreamLabel("out");
-        LOG_ACCESS(FormatXrayAccessLog(ctx));
+        if (auto local_ep = new_stream->LocalEndpoint();
+            local_ep && !local_ep->address().is_unspecified()) {
+            ctx.outbound.connected_local_addr = local_ep->address();
+            ctx.outbound.connected_local_port = local_ep->port();
+        }
+        LOG_ACCESS(FormatAccessLog(ctx));
 
         new_stream->SetIdleTimeout(timeouts.HandshakeTimeout());
         auto deadline = new_stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
