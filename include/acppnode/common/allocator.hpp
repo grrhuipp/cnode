@@ -51,9 +51,7 @@ inline constexpr bool kAllocatorCollects = true;
 
 inline constexpr int kGlibcArenaMax = 2;
 inline constexpr int kGlibcTrimThreshold = 64 * 1024;
-// Keep AWS-LC's 17 KiB BIO rings at full capacity, but return their pages
-// when an idle TLS connection releases them instead of retaining heap holes.
-inline constexpr int kGlibcMmapThreshold = 17 * 1024;
+inline constexpr int kGlibcMmapThreshold = 64 * 1024;
 inline constexpr std::size_t kThreadPoolChunkBytes = 64 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 32 * 1024;
 inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
