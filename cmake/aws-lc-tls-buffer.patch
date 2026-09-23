@@ -1,8 +1,8 @@
 diff --git a/ssl/ssl_buffer.cc b/ssl/ssl_buffer.cc
-index ed1255a08..ca6df63d6 100644
+index ed1255a08..4b421aa1e 100644
 --- a/ssl/ssl_buffer.cc
 +++ b/ssl/ssl_buffer.cc
-@@ -15,6 +15,34 @@
+@@ -15,6 +15,36 @@
  #include "../crypto/internal.h"
  #include "internal.h"
  
@@ -11,6 +11,8 @@ index ed1255a08..ca6df63d6 100644
 +static void *(*g_cnode_tls_buffer_alloc)(size_t) = nullptr;
 +static void (*g_cnode_tls_buffer_free)(void *) = nullptr;
 +
++extern "C" void cnode_set_tls_buffer_allocator(
++    void *(*alloc_fn)(size_t), void (*free_fn)(void *));
 +extern "C" void cnode_set_tls_buffer_allocator(
 +    void *(*alloc_fn)(size_t), void (*free_fn)(void *)) {
 +  g_cnode_tls_buffer_alloc = alloc_fn;
@@ -37,7 +39,7 @@ index ed1255a08..ca6df63d6 100644
  
  BSSL_NAMESPACE_BEGIN
  
-@@ -37,7 +65,7 @@ static OPENSSL_INLINE size_t compute_buffer_offset(size_t header_len,
+@@ -37,7 +67,7 @@ static OPENSSL_INLINE size_t compute_buffer_offset(size_t header_len,
  
  void SSLBuffer::Clear() {
    if (buf_allocated_) {
@@ -46,7 +48,7 @@ index ed1255a08..ca6df63d6 100644
    }
    buf_ = nullptr;
    buf_allocated_ = false;
-@@ -77,7 +105,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
+@@ -77,7 +107,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
      // sensitive data, we allocate with malloc rather than |OPENSSL_malloc| and
      // avoid zeroing on free.
      buf_size_ = compute_buffer_size(new_cap);
@@ -55,7 +57,7 @@ index ed1255a08..ca6df63d6 100644
      if (new_buf == NULL) {
        OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
        return false;
-@@ -92,7 +120,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
+@@ -92,7 +122,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
    OPENSSL_memmove(new_buf + new_offset, buf_ + offset_, size_);
  
    if (buf_allocated_) {
@@ -64,7 +66,7 @@ index ed1255a08..ca6df63d6 100644
    }
  
    buf_ = new_buf;
-@@ -276,7 +304,7 @@ bool SSLBuffer::DoDeserializationV1(CBS &cbs) {
+@@ -276,7 +306,7 @@ bool SSLBuffer::DoDeserializationV1(CBS &cbs) {
        return false;
      }
      buf_allocated_ = true;
@@ -73,7 +75,7 @@ index ed1255a08..ca6df63d6 100644
      if (buf_ == NULL) {
        OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
        return false;
-@@ -339,7 +367,7 @@ bool SSLBuffer::DoDeserializationV2(CBS &cbs) {
+@@ -339,7 +369,7 @@ bool SSLBuffer::DoDeserializationV2(CBS &cbs) {
    if (buf_allocated) {
      buf_allocated_ = true;
      buf_size_ = compute_buffer_size(buf_cap);
