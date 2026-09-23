@@ -26,6 +26,7 @@
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/app/router/router.hpp"
 #include "acppnode/common/defaults.hpp"
@@ -940,6 +941,7 @@ Worker::CollectRuntimeStatsTask() const {
 }
 
 net::awaitable<void> Worker::CollectHeapTask(bool force) {
+    TlsStream::CollectIdleBuffersForCurrentThread();
     if (force) {
         memory::CollectBurst();
     } else {

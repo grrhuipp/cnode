@@ -371,17 +371,49 @@ SSL* NewSsl(SSL_CTX* ctx) {
 struct TlsStream::Impl : memory::ThreadAllocated {
     using SslStream = net::ssl::stream<TlsTcpLayer>;
 
+    static Impl*& CurrentThreadHead() noexcept {
+        static thread_local Impl* head = nullptr;
+        return head;
+    }
+
     Impl(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx)
         : stream(TlsTcpLayer(std::move(inner)), NewSsl(ctx)) {
+        next = CurrentThreadHead();
+        if (next) next->prev = this;
+        CurrentThreadHead() = this;
         memory::OnTlsStreamNew();
     }
 
     ~Impl() {
+        if (prev) prev->next = next;
+        else CurrentThreadHead() = next;
+        if (next) next->prev = prev;
         memory::OnTlsStreamFree();
     }
 
+    void Touch() noexcept { last_activity = std::chrono::steady_clock::now(); }
+
     SslStream stream;
+    Impl* prev = nullptr;
+    Impl* next = nullptr;
+    std::chrono::steady_clock::time_point last_activity =
+        std::chrono::steady_clock::now();
+    bool handshake_complete = false;
 };
+
+void TlsStream::CollectIdleBuffersForCurrentThread() noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    for (Impl* current = Impl::CurrentThreadHead(); current; current = current->next) {
+        if (!current->handshake_complete ||
+            now - current->last_activity < std::chrono::seconds(2)) {
+            continue;
+        }
+        SSL* ssl = current->stream.native_handle();
+        if (ssl && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
+            ReleaseIdleSslBioPair(ssl);
+        }
+    }
+}
 
 TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx, bool is_server)
     : impl_(std::make_unique<Impl>(std::move(inner), ctx))
@@ -465,6 +497,8 @@ net::awaitable<bool> TlsStream::Handshake() {
     }
 
     handshake_done_ = true;
+    impl_->handshake_complete = true;
+    impl_->Touch();
     co_return true;
 }
 
@@ -523,10 +557,7 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
         ThrowTlsReadError("TLS handshake failed during read");
     }
 
-    SSL* ssl = NativeSsl();
-    if (ssl && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
-        ReleaseIdleSslBioPair(ssl);
-    }
+    impl_->Touch();
     auto [ec, n] = co_await impl_->stream.async_read_some(
         buf, net::as_tuple(net::use_awaitable));
     if (ec) {
@@ -545,6 +576,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
         ThrowTlsReadError("TLS handshake failed during read");
     }
 
+    impl_->Touch();
     SSL* ssl = NativeSsl();
     if (!ssl) {
         co_return buf::MultiBuffer{};
@@ -553,9 +585,6 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
     // OpenSSL 已有解密/待处理记录时必须直接 SSL_read；否则先等待
     // 底层 TCP 可读，避免给每条空闲 TLS 连接预留 8KB payload Buffer。
     if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
-        // Preserve the 17 KiB BIO capacities, but do not retain their empty
-        // backing storage while this connection waits for socket readability.
-        ReleaseIdleSslBioPair(ssl);
         TcpStream* tcp = BaseTcpStream();
         if (!tcp) {
             co_return buf::MultiBuffer{};
@@ -597,6 +626,7 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
         ThrowTlsWriteError("TLS handshake failed during write");
     }
 
+    impl_->Touch();
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buf, net::as_tuple(net::use_awaitable));
     if (ec) {
@@ -614,6 +644,7 @@ net::awaitable<void> TlsStream::WriteBuffers(
         co_return;
     }
 
+    impl_->Touch();
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buffers, net::as_tuple(net::use_awaitable));
     (void)n;
@@ -630,6 +661,7 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
         co_return;
     }
 
+    impl_->Touch();
     ConstBufferSpanBuilder<8> out;
     out.AppendMultiBuffer(mb);
     if (!out.empty()) {
@@ -660,6 +692,7 @@ void TlsStream::ShutdownWrite() {
 net::awaitable<void> TlsStream::AsyncShutdownWrite() {
     if (impl_ && handshake_done_ && !shutdown_initiated_) {
         shutdown_initiated_ = true;
+        impl_->Touch();
         LOG_NET_DEBUG("TLS: sending close_notify");
         auto [ec] = co_await impl_->stream.async_shutdown(
             net::as_tuple(net::use_awaitable));

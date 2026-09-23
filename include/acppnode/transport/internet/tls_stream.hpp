@@ -71,6 +71,9 @@ public:
 
     ~TlsStream() override;
 
+    // Cold Worker-local sweep; no per-connection timer or cross-thread state.
+    static void CollectIdleBuffersForCurrentThread() noexcept;
+
     // 禁止拷贝
     TlsStream(const TlsStream&) = delete;
     TlsStream& operator=(const TlsStream&) = delete;
