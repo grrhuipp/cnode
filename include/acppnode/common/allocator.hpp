@@ -45,12 +45,9 @@ inline void DisableTransparentHugePages() noexcept {
 #endif
 }
 
-inline constexpr bool kAllocatorCollects =
-#if defined(__GLIBC__)
-    true;
-#else
-    false;
-#endif
+// Every platform must periodically purge idle Worker-local mappings, even
+// when a Worker stops allocating after its last connection closes.
+inline constexpr bool kAllocatorCollects = true;
 
 inline constexpr int kGlibcArenaMax = 2;
 inline constexpr int kGlibcTrimThreshold = 64 * 1024;
@@ -118,7 +115,10 @@ public:
     ReturningThreadPool(const ReturningThreadPool&) = delete;
     ReturningThreadPool& operator=(const ReturningThreadPool&) = delete;
 
-    void Purge() noexcept { PurgeExpired(); }
+    void Purge() noexcept {
+        next_purge_ = {};
+        PurgeExpired();
+    }
 
     ~ReturningThreadPool() override {
         Chunk* chunk = all_;
@@ -145,6 +145,19 @@ public:
         if (class_index >= classes_.size()) {
             return AllocateDirect(bytes, alignment);
         }
+        // These mappings contain one allocation and are released directly;
+        // looking for reusable chunks would scan every live connection.
+        if (stride >= 4096) {
+            Chunk* chunk = MapChunk(stride, class_index, alignment);
+            if (!chunk) {
+                return nullptr;
+            }
+            void* result = Carve(*chunk, stride, alignment);
+            if (!result) {
+                ReleaseChunk(*chunk);
+            }
+            return result;
+        }
         Class& cls = classes_[class_index];
         if (cls.current && CanCarve(*cls.current, stride, alignment)) {
             return Carve(*cls.current, stride, alignment);
@@ -153,7 +166,7 @@ public:
             cls.current = idle;
             return Carve(*idle, stride, alignment);
         }
-        Chunk* chunk = MapChunk(stride, class_index);
+        Chunk* chunk = MapChunk(stride, class_index, alignment);
         if (!chunk) {
             return nullptr;
         }
@@ -271,6 +284,11 @@ private:
         for (Chunk* chunk = all_; chunk; chunk = chunk->all_next) {
             if (chunk->idle && !chunk->direct &&
                 chunk->class_index == class_index && chunk->stride == stride) {
+                if (std::chrono::steady_clock::now() - chunk->idle_at >=
+                    kThreadPoolPurgeDelay) {
+                    ReleaseChunk(*chunk);
+                    return nullptr;
+                }
                 return chunk;
             }
         }
@@ -297,6 +315,11 @@ private:
     [[nodiscard]] void* AllocateDirect(
         std::size_t bytes, std::size_t alignment) noexcept {
         const std::size_t lead = Lead(alignment);
+        if (alignment > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) ||
+            lead > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) - alignment ||
+            bytes > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) - alignment - lead) {
+            return nullptr;
+        }
         const std::size_t usable = sizeof(Chunk) + alignment + lead + bytes;
         Chunk* chunk = MapRegion(usable, bytes, 0, true);
         if (!chunk) {
@@ -333,6 +356,10 @@ private:
 
     void PurgeExpired() noexcept {
         const auto now = std::chrono::steady_clock::now();
+        if (now < next_purge_) {
+            return;
+        }
+        next_purge_ = now + kThreadPoolPurgeDelay;
         Chunk* chunk = all_;
         while (chunk) {
             Chunk* next = chunk->all_next;
@@ -344,10 +371,15 @@ private:
         }
     }
 
-    [[nodiscard]] Chunk* MapChunk(std::size_t stride, std::size_t class_index) noexcept {
+    [[nodiscard]] Chunk* MapChunk(
+        std::size_t stride, std::size_t class_index, std::size_t alignment) noexcept {
         const bool alone = stride >= 4096;
+        if (alone && (alignment > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) ||
+                      stride > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) - alignment)) {
+            return nullptr;
+        }
         const std::size_t usable = alone
-            ? sizeof(Chunk) + stride + 64
+            ? sizeof(Chunk) + stride + alignment
             : kThreadPoolChunkBytes;
         return MapRegion(usable, stride, class_index, alone);
     }
@@ -358,6 +390,9 @@ private:
         std::size_t class_index,
         bool direct) noexcept {
         const std::size_t page = 4096;
+        if (usable > std::numeric_limits<std::size_t>::max() - (page - 1)) {
+            return nullptr;
+        }
         const std::size_t map_bytes = RoundUp(usable, page);
         void* mapped = OsMap(map_bytes);
         if (!mapped) {
@@ -431,6 +466,7 @@ private:
 
     std::array<Class, 10> classes_{};
     Chunk* all_ = nullptr;
+    std::chrono::steady_clock::time_point next_purge_{};
 };
 
 [[nodiscard]] inline ReturningThreadPool& ThreadPool() noexcept {
@@ -451,6 +487,10 @@ private:
     const size_t prefix = sizeof(BlockPrefix);
     const size_t link = sizeof(void*);
     const size_t align = std::max(alignment, alignof(BlockPrefix));
+    if (align > std::numeric_limits<size_t>::max() - prefix - link ||
+        size > std::numeric_limits<size_t>::max() - prefix - link - align) {
+        return nullptr;
+    }
     const size_t bytes = prefix + align + link + size;
     void* raw = ThreadPool().Allocate(bytes, align);
     if (!raw) {
@@ -577,6 +617,7 @@ inline void CollectSteady() noexcept {
 }
 
 inline void CollectBurst() noexcept {
+    ThreadPool().Purge();
 #if defined(__GLIBC__)
     (void)::malloc_trim(0);
 #endif

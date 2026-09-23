@@ -1,5 +1,6 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/app/request_load_state.hpp"
+#include "acppnode/common/session.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "anytls_codec.hpp"

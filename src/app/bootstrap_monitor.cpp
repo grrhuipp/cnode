@@ -84,13 +84,21 @@ CollectWorkerRuntimeStats(const MonitorContext& ctx) {
 }
 
 net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx, bool force) {
-    (void)ctx;
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(ctx.workers.size());
+    for (const auto& worker : ctx.workers) {
+        tasks.push_back(
+            [](Worker* owner, bool burst) -> net::awaitable<void> {
+                co_await owner->PostTask(owner->CollectHeapTask(burst));
+            }(worker.get(), force));
+    }
+    co_await RunAwaitableBatch(ctx.main_ctx.get_executor(), std::move(tasks));
+    // The control thread may also hold short-lived PMR allocations.
     if (force) {
         memory::CollectBurst();
     } else {
         memory::CollectSteady();
     }
-    co_return;
 }
 
 StatsSnapshot AggregateWorkerStats(

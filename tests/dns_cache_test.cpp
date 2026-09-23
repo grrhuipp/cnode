@@ -12,6 +12,23 @@ namespace {
 
 thread_local int fail_after = -1;
 
+class FailingResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+private:
+    void* do_allocate(size_t size, size_t alignment) override {
+        if (fail_after >= 0 && fail_after-- == 0) throw std::bad_alloc();
+        return upstream_->allocate(size, alignment);
+    }
+    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        upstream_->deallocate(pointer, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    std::pmr::memory_resource* upstream_;
+};
+
 class FailAllocation {
 public:
     explicit FailAllocation(int after) noexcept { fail_after = after; }
@@ -143,23 +160,11 @@ void TestFailedReplacement() {
 
 }  // namespace
 
-// Target the Worker allocator's raw allocation boundary without changing
-// production code or failing allocations made by test diagnostics.
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    if (fail_after >= 0 && fail_after-- == 0) return nullptr;
-    try {
-        return ::operator new(size);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-void operator delete(void* pointer, const std::nothrow_t&) noexcept {
-    ::operator delete(pointer);
-}
-
 int main() {
     acpp::memory::ConfigureProcessAllocator();
+    FailingResource resource(std::pmr::get_default_resource());
+    auto* original = std::pmr::set_default_resource(&resource);
+    bool passed = true;
     try {
         TestFailedInsertion(false);
         TestFailedInsertion(true);
@@ -167,7 +172,8 @@ int main() {
         TestCapacityAndResults();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        passed = false;
     }
-    return 0;
+    std::pmr::set_default_resource(original);
+    return passed ? 0 : 1;
 }

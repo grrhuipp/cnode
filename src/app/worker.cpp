@@ -934,6 +934,15 @@ Worker::CollectRuntimeStatsTask() const {
     co_return snapshot;
 }
 
+net::awaitable<void> Worker::CollectHeapTask(bool force) {
+    if (force) {
+        memory::CollectBurst();
+    } else {
+        memory::CollectSteady();
+    }
+    co_return;
+}
+
 // ============================================================================
 // UDP 监听（SO_REUSEPORT，与 TCP acceptor 同端口）
 //

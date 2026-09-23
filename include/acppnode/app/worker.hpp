@@ -130,6 +130,7 @@ public:
     using RuntimeStatsSnapshot = WorkerRuntimeStatsSnapshot;
 
     net::awaitable<RuntimeStatsSnapshot> CollectRuntimeStatsTask() const;
+    net::awaitable<void> CollectHeapTask(bool force);
 
 private:
     struct ListenerSlot;

@@ -27,6 +27,27 @@ thread_local size_t fail_size = 0;
 thread_local size_t fail_worker_size = 0;
 thread_local size_t injected_failures = 0;
 
+class FailingResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+private:
+    void* do_allocate(size_t size, size_t alignment) override {
+        if (fail_worker_size && size >= fail_worker_size) {
+            fail_worker_size = 0;
+            ++injected_failures;
+            throw std::bad_alloc();
+        }
+        return upstream_->allocate(size, alignment);
+    }
+    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        upstream_->deallocate(pointer, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    std::pmr::memory_resource* upstream_;
+};
+
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -190,20 +211,11 @@ void* operator new(std::size_t size) {
 }
 void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    if (fail_worker_size && size >= fail_worker_size) {
-        fail_worker_size = 0;
-        ++injected_failures;
-        return nullptr;
-    }
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* pointer, const std::nothrow_t&) noexcept {
-    ::operator delete(pointer);
-}
-
 int main() {
     acpp::memory::ConfigureProcessAllocator();
+    FailingResource resource(std::pmr::get_default_resource());
+    auto* original = std::pmr::set_default_resource(&resource);
+    bool passed = true;
     try {
         TestCompletion(Failure::None);
         TestCompletion(Failure::Query);
@@ -214,7 +226,8 @@ int main() {
         fail_size = 0;
         fail_worker_size = 0;
         std::cerr << error.what() << '\n';
-        return 1;
+        passed = false;
     }
-    return 0;
+    std::pmr::set_default_resource(original);
+    return passed ? 0 : 1;
 }

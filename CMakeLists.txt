@@ -1731,7 +1731,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${concurrentqueue_SOURCE_DIR}
     )
-    target_link_libraries(cnode_dns_inflight_test PRIVATE asio::asio Threads::Threads cnode_zlib)
+    target_link_libraries(cnode_dns_inflight_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
     if(WIN32)
         target_link_libraries(cnode_dns_inflight_test PRIVATE ws2_32)
         target_compile_definitions(cnode_dns_inflight_test PRIVATE _WIN32_WINNT=0x0A00)
@@ -1750,7 +1750,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
-    target_link_libraries(cnode_dns_cache_test PRIVATE asio::asio Threads::Threads)
+    target_link_libraries(cnode_dns_cache_test PRIVATE asio::asio Threads::Threads ssl crypto)
     if(WIN32)
         target_link_libraries(cnode_dns_cache_test PRIVATE ws2_32)
         target_compile_definitions(cnode_dns_cache_test PRIVATE _WIN32_WINNT=0x0A00)
@@ -2005,6 +2005,14 @@ if(CNODE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_buffer_ownership_test COMMAND cnode_buffer_ownership_test)
+
+    add_executable(cnode_thread_pool_test tests/thread_pool_test.cpp)
+    target_include_directories(cnode_thread_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cnode_thread_pool_test PRIVATE Threads::Threads)
+    target_compile_options(cnode_thread_pool_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_thread_pool_test COMMAND cnode_thread_pool_test)
 
     add_executable(cnode_relay_initial_payload_test
         tests/relay_initial_payload_test.cpp
