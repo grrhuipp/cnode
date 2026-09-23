@@ -89,7 +89,85 @@ bool RunFragmented() {
         return false;
     pool.Deallocate(aligned, 16, 32);
     pool.Deallocate(held, 1, 32);
+
+    // A slot carved with alignment 32 has 992 usable bytes in a 1024-byte
+    // class. Reusing it at alignment 16 must not inflate it to 1008 bytes.
+    void* short_slot = pool.Allocate(481, 32);
+    void* pinned_slot = pool.Allocate(600, 16);
+    if (!short_slot || !pinned_slot) return false;
+    std::memset(pinned_slot, 0x6b, 600);
+    pool.Deallocate(short_slot, 481, 32);
+    void* reused = pool.Allocate(665, 16);
+    if (reused != short_slot) return false;
+    pool.Deallocate(reused, 665, 16);
+    void* longer = pool.Allocate(1005, 16);
+    if (!longer || longer == short_slot) return false;
+    std::memset(longer, 0xa7, 1005);
+    for (std::size_t i = 0; i < 600; ++i)
+        if (static_cast<const std::uint8_t*>(pinned_slot)[i] != 0x6b) return false;
+    pool.Deallocate(longer, 1005, 16);
+    pool.Deallocate(pinned_slot, 600, 16);
     return true;
+}
+
+bool RunMixed() {
+    acpp::memory::ReturningThreadPool pool;
+    struct Slot {
+        void* ptr = nullptr;
+        std::size_t bytes = 0;
+        std::size_t alignment = 0;
+        std::uint8_t pattern = 0;
+    };
+    std::array<Slot, 256> slots{};
+    std::uint32_t state = 0xb35dff21u;
+    const auto next = [&state] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    const auto intact = [](const Slot& slot) {
+        const auto* bytes = static_cast<const std::uint8_t*>(slot.ptr);
+        for (std::size_t i = 0; i < slot.bytes; ++i)
+            if (bytes[i] != slot.pattern) return false;
+        return true;
+    };
+    for (int step = 0; step < 100000; ++step) {
+        Slot& slot = slots[next() % slots.size()];
+        if (slot.ptr) {
+            if (!intact(slot)) {
+                std::fprintf(stderr, "mixed mismatch step=%d slot=%zu ptr=%p bytes=%zu align=%zu\n",
+                             step, static_cast<std::size_t>(&slot - slots.data()),
+                             slot.ptr, slot.bytes, slot.alignment);
+                return false;
+            }
+            pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
+            slot.ptr = nullptr;
+        } else {
+            slot.bytes = 8 + next() % 2000;
+            slot.alignment = std::size_t{1} << (3 + next() % 5);
+            slot.pattern = static_cast<std::uint8_t>(next());
+            slot.ptr = pool.Allocate(slot.bytes, slot.alignment);
+            if (!slot.ptr || reinterpret_cast<std::uintptr_t>(slot.ptr) % slot.alignment)
+                return false;
+            std::memset(slot.ptr, slot.pattern, slot.bytes);
+        }
+        if (step % 97 == 0) {
+            for (const Slot& live : slots) {
+                if (live.ptr && !intact(live)) {
+                    std::fprintf(stderr, "mixed sweep mismatch step=%d slot=%zu ptr=%p bytes=%zu align=%zu\n",
+                                 step, static_cast<std::size_t>(&live - slots.data()),
+                                 live.ptr, live.bytes, live.alignment);
+                    return false;
+                }
+            }
+        }
+    }
+    for (const Slot& slot : slots) {
+        if (slot.ptr && !intact(slot)) return false;
+        pool.Deallocate(slot.ptr, slot.bytes, slot.alignment);
+    }
+    return pool.GetFootprint().direct_bytes == 0;
 }
 
 bool RunPmr() {
@@ -107,9 +185,9 @@ bool RunPmr() {
 
 int main() {
     bool worker = false;
-    std::thread thread([&worker] { worker = RunPool() && RunFragmented() && RunPmr(); });
+    std::thread thread([&worker] { worker = RunPool() && RunFragmented() && RunMixed() && RunPmr(); });
     thread.join();
-    const bool main_thread = RunPool() && RunFragmented() && RunPmr();
+    const bool main_thread = RunPool() && RunFragmented() && RunMixed() && RunPmr();
     std::printf("pool same-thread direct/reuse/alignment/purge: %s\n",
                 worker && main_thread ? "PASS" : "FAIL");
     return worker && main_thread ? 0 : 1;

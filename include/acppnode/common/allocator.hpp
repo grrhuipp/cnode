@@ -191,8 +191,9 @@ public:
         if (!pointer) {
             return;
         }
-        auto* chunk = *reinterpret_cast<Chunk**>(
-            static_cast<std::byte*>(pointer) - sizeof(void*));
+        auto* header = reinterpret_cast<SlotHeader*>(
+            static_cast<std::byte*>(pointer) - sizeof(SlotHeader));
+        auto* chunk = header->chunk;
         if (!chunk || chunk->magic != kChunkMagic ||
             chunk->map_base == nullptr || chunk->live == 0) {
             return;
@@ -215,18 +216,18 @@ public:
             }
             return;
         }
-        // Only a caller with the original size/alignment can certify the
-        // capacity of this slot. The raw pointer-only API simply lets it die
-        // with its chunk rather than risking an out-of-bounds reuse.
-        if (chunk->direct || alignment == 0 ||
-            (alignment & (alignment - 1)) != 0 ||
-            Lead(alignment) >= chunk->stride ||
-            bytes > chunk->stride - Lead(alignment) ||
-            chunk->stride - Lead(alignment) < sizeof(FreeNode)) {
+        // Capacity belongs to the physical slot, not to the last request's
+        // alignment. Recomputing it after reuse could enlarge a shorter slot
+        // and overwrite the next live allocation.
+        if (chunk->direct || header->capacity < sizeof(FreeNode) ||
+            bytes > header->capacity ||
+            (alignment != 0 &&
+             ((alignment & (alignment - 1)) != 0 ||
+              address % alignment != 0))) {
             return;
         }
         auto* node = static_cast<FreeNode*>(pointer);
-        node->capacity = chunk->stride - Lead(alignment);
+        node->capacity = header->capacity;
         node->next = chunk->free_head;
         chunk->free_head = node;
         if (!chunk->in_recyclable) {
@@ -266,6 +267,12 @@ private:
 
     static constexpr std::uint32_t kChunkMagic = 0xC0DEC0DEu;
 
+    struct Chunk;
+    struct SlotHeader {
+        std::size_t capacity = 0;
+        Chunk* chunk = nullptr;
+    };
+
     struct Chunk {
         std::uint32_t magic = kChunkMagic;
         Chunk* all_next = nullptr;
@@ -292,7 +299,7 @@ private:
     };
 
     [[nodiscard]] static std::size_t Lead(std::size_t alignment) noexcept {
-        return RoundUp(sizeof(void*), alignment);
+        return RoundUp(sizeof(SlotHeader), alignment);
     }
 
     [[nodiscard]] static std::size_t Stride(
@@ -363,7 +370,9 @@ private:
             return nullptr;
         }
         auto* user = reinterpret_cast<std::byte*>(start) + Lead(alignment);
-        *reinterpret_cast<Chunk**>(user - sizeof(void*)) = &chunk;
+        auto* header = reinterpret_cast<SlotHeader*>(user - sizeof(SlotHeader));
+        header->capacity = stride - Lead(alignment);
+        header->chunk = &chunk;
         chunk.bump = reinterpret_cast<std::byte*>(start + stride);
         if (chunk.live == 0) {
             MarkUsed(chunk);
@@ -393,7 +402,9 @@ private:
             ReleaseChunk(*chunk);
             return nullptr;
         }
-        *reinterpret_cast<Chunk**>(user - sizeof(void*)) = chunk;
+        auto* header = reinterpret_cast<SlotHeader*>(user - sizeof(SlotHeader));
+        header->capacity = bytes;
+        header->chunk = chunk;
         chunk->bump = user + bytes;
         ++chunk->live;
         return user;
