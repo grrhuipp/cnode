@@ -23,6 +23,10 @@
 #include <fstream>
 #include <vector>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -218,6 +222,9 @@ net::awaitable<void> RuntimeSamplingLoop(
 net::awaitable<void> RuntimeStatsOutputLoop(
     const MonitorContext& ctx) {
     net::steady_timer timer(ctx.main_ctx);
+#ifdef __GLIBC__
+    auto last_glibc_sample = std::chrono::steady_clock::time_point{};
+#endif
     while (true) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
@@ -281,6 +288,22 @@ net::awaitable<void> RuntimeStatsOutputLoop(
             dns_l2_stats.capacity,
             total_udp_sessions,
             user_stats.TotalUsers());
+
+#ifdef __GLIBC__
+        const auto heap_now = std::chrono::steady_clock::now();
+        if (last_glibc_sample.time_since_epoch().count() == 0 ||
+            heap_now - last_glibc_sample >= std::chrono::minutes(5)) {
+            const auto heap = ::mallinfo2();
+            LOG_INFO("runtime.glibc arena={}MB used={}MB free={}MB mmap={}MB mmap_chunks={} top_free={}MB",
+                     heap.arena / (1024 * 1024),
+                     heap.uordblks / (1024 * 1024),
+                     heap.fordblks / (1024 * 1024),
+                     heap.hblkhd / (1024 * 1024),
+                     heap.hblks,
+                     heap.keepcost / (1024 * 1024));
+            last_glibc_sample = heap_now;
+        }
+#endif
 
 #ifdef CNODE_MEMORY_STATS
         const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
