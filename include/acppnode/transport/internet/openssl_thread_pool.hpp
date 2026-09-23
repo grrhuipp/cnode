@@ -2,7 +2,15 @@
 
 #include <openssl/ssl.h>
 
+extern "C" int cnode_release_empty_bio_pair_buffers(BIO* bio);
+
 namespace acpp {
+
+inline void ReleaseIdleSslBioPair(SSL* ssl) noexcept {
+    if (ssl) {
+        (void)cnode_release_empty_bio_pair_buffers(SSL_get_rbio(ssl));
+    }
+}
 
 inline void LimitSslReadBuffer(SSL_CTX* ctx) noexcept {
     if (!ctx) {

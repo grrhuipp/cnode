@@ -168,6 +168,7 @@ FetchContent_MakeAvailable(aws_lc)
 include(cmake/patch_aws_lc_reality.cmake)
 cnode_patch_aws_lc_reality("${aws_lc_SOURCE_DIR}")
 cnode_patch_aws_lc_tls_buffer("${aws_lc_SOURCE_DIR}")
+cnode_patch_aws_lc_bio_idle("${aws_lc_SOURCE_DIR}")
 message(STATUS "Using AWS-LC via FetchContent")
 
 FetchContent_Declare(
@@ -2014,6 +2015,13 @@ if(CNODE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_thread_pool_test COMMAND cnode_thread_pool_test)
+
+    add_executable(cnode_tls_bio_idle_test tests/tls_bio_idle_test.cpp)
+    target_link_libraries(cnode_tls_bio_idle_test PRIVATE crypto)
+    target_compile_options(cnode_tls_bio_idle_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_tls_bio_idle_test COMMAND cnode_tls_bio_idle_test)
 
     add_executable(cnode_relay_initial_payload_test
         tests/relay_initial_payload_test.cpp

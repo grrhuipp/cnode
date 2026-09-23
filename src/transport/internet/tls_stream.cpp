@@ -549,6 +549,9 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
     // OpenSSL 已有解密/待处理记录时必须直接 SSL_read；否则先等待
     // 底层 TCP 可读，避免给每条空闲 TLS 连接预留 8KB payload Buffer。
     if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
+        // Preserve the 17 KiB BIO capacities, but do not retain their empty
+        // backing storage while this connection waits for socket readability.
+        ReleaseIdleSslBioPair(ssl);
         TcpStream* tcp = BaseTcpStream();
         if (!tcp) {
             co_return buf::MultiBuffer{};

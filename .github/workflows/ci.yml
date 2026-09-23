@@ -105,12 +105,12 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
       - name: Build
-        run: cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test --parallel $(nproc)
+        run: cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test --parallel $(nproc)
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
-      - name: Test Worker thread pool
-        run: ctest --test-dir "$BUILD_DIR" -R '^cnode_thread_pool_test$' --output-on-failure
+      - name: Test Worker pool and idle TLS BIO
+        run: ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle)_test$' --output-on-failure
 
       - name: Show compiler cache stats
         if: always()
@@ -196,8 +196,8 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_ID=${{ env.BUILD_ID }}
-          cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test --parallel $(nproc)
-          ctest --test-dir "$BUILD_DIR" -R '^cnode_thread_pool_test$' --output-on-failure
+          cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test --parallel $(nproc)
+          ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle)_test$' --output-on-failure
           "$BUILD_DIR/cnode" -v
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
