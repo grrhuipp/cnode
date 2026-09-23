@@ -262,13 +262,14 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         }
         const auto user_stats = proxyman::inbound::UserStore::GetStats();
         LOG_INFO(
-            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
+            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
             total_conns,
             mem_mb,
             pool_mapped_bytes / (1024 * 1024),
             pool_direct_bytes / (1024 * 1024),
             pool_idle_bytes / 1024,
             pool_chunks,
+            memory::CrossThreadFreeCount(),
             acpp::FormatBytes(snapshot.bytes_in),
             acpp::FormatBytes(snapshot.bytes_out),
             FormatRate(snapshot.bytes_in_rate),

@@ -38,6 +38,7 @@ inline void OnBufferFree() noexcept {}
 #ifdef CNODE_MEMORY_STATS
 
 namespace detail {
+inline std::atomic<uint64_t> g_cross_thread_frees{0};
 inline std::atomic<uint64_t> g_async_streams_live{0};
 inline std::atomic<uint64_t> g_async_streams_peak{0};
 inline std::atomic<uint64_t> g_tcp_streams_live{0};
@@ -57,6 +58,12 @@ inline void BumpPeak(std::atomic<uint64_t>& peak, uint64_t value) noexcept {
 
 // Buffer allocation remains zero-cost in production; only the targeted test
 // enables thread-local Buffer counters.
+inline void OnCrossThreadFree() noexcept {
+    detail::g_cross_thread_frees.fetch_add(1, std::memory_order_relaxed);
+}
+inline uint64_t CrossThreadFreeCount() noexcept {
+    return detail::g_cross_thread_frees.load(std::memory_order_relaxed);
+}
 inline void OnAsyncStreamNew() noexcept {
     const auto live = detail::g_async_streams_live.fetch_add(1, std::memory_order_relaxed) + 1;
     detail::BumpPeak(detail::g_async_streams_peak, live);
@@ -99,6 +106,8 @@ inline RuntimeMemoryStats SnapshotRuntimeMemoryStats() noexcept {
 
 #else
 
+inline void OnCrossThreadFree() noexcept {}
+inline uint64_t CrossThreadFreeCount() noexcept { return 0; }
 inline void OnAsyncStreamNew() noexcept {}
 inline void OnAsyncStreamFree() noexcept {}
 inline void OnTcpStreamNew() noexcept {}

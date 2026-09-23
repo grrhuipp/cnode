@@ -555,6 +555,9 @@ inline void DeallocatePmr(
     void* raw = *reinterpret_cast<void**>(static_cast<std::byte*>(p) - sizeof(void*));
     auto* header = static_cast<BlockPrefix*>(raw);
     if (header->owner != std::this_thread::get_id()) {
+        // This violates Worker ownership; freeing on the wrong pool would
+        // corrupt both threads, so record the rejected release for diagnosis.
+        OnCrossThreadFree();
         return;
     }
     header->~BlockPrefix();

@@ -39,8 +39,12 @@ bool RunPool() {
         std::memset(block, 0xa5, 256);
     }
     for (auto* block : concurrent) pool.Deallocate(block);
+    if (pool.GetFootprint().idle_bytes == 0 || pool.GetFootprint().direct_bytes != 0)
+        return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
     pool.Purge();
+    if (pool.GetFootprint().mapped_bytes != 0 || pool.GetFootprint().chunks != 0)
+        return false;
     void* block = pool.Allocate(8192, 8192);
     if (!block || reinterpret_cast<std::uintptr_t>(block) % 8192 != 0)
         return false;
