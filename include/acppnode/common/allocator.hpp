@@ -146,9 +146,6 @@ public:
             return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
-        if (void* recycled = TakeFree(cls, stride)) {
-            return recycled;
-        }
         if (cls.current && CanCarve(*cls.current, stride, alignment)) {
             return Carve(*cls.current, stride, alignment);
         }
@@ -170,34 +167,26 @@ public:
         }
         auto* chunk = *reinterpret_cast<Chunk**>(
             static_cast<std::byte*>(pointer) - sizeof(void*));
-        if (!chunk || chunk->map_base == nullptr || chunk->live == 0) {
-            std::terminate();
-        }
-        --chunk->live;
-        if (chunk->live == 0) {
-            if (chunk->direct) {
-                ReleaseChunk(*chunk);
-            } else {
-                UnlinkRecyclable(*chunk);
-                chunk->free_head = nullptr;
-                chunk->bump = reinterpret_cast<std::byte*>(chunk) + sizeof(Chunk);
-                MarkIdle(*chunk);
-                PurgeExpired();
-            }
+        if (!chunk || chunk->magic != kChunkMagic ||
+            chunk->map_base == nullptr || chunk->live == 0) {
             return;
         }
-        auto* node = static_cast<FreeNode*>(pointer);
-        node->next = chunk->free_head;
-        chunk->free_head = node;
-        if (!chunk->in_recyclable) {
-            chunk->in_recyclable = true;
-            chunk->rec_prev = nullptr;
-            chunk->rec_next = classes_[chunk->class_index].recyclable;
-            if (chunk->rec_next) {
-                chunk->rec_next->rec_prev = chunk;
-            }
-            classes_[chunk->class_index].recyclable = chunk;
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        const auto base = reinterpret_cast<std::uintptr_t>(chunk->map_base);
+        if (address < base || address >= base + chunk->map_bytes) {
+            return;
         }
+        --chunk->live;
+        if (chunk->live != 0) {
+            return;
+        }
+        if (chunk->direct) {
+            ReleaseChunk(*chunk);
+            return;
+        }
+        chunk->bump = static_cast<std::byte*>(chunk->map_base) + sizeof(Chunk);
+        MarkIdle(*chunk);
+        PurgeExpired();
     }
 
 protected:
@@ -223,7 +212,10 @@ private:
         FreeNode* next = nullptr;
     };
 
+    static constexpr std::uint32_t kChunkMagic = 0xC0DEC0DEu;
+
     struct Chunk {
+        std::uint32_t magic = kChunkMagic;
         Chunk* all_next = nullptr;
         Chunk* all_prev = nullptr;
         Chunk* rec_next = nullptr;
@@ -281,27 +273,6 @@ private:
                 chunk->class_index == class_index && chunk->stride == stride) {
                 return chunk;
             }
-        }
-        return nullptr;
-    }
-
-    [[nodiscard]] void* TakeFree(Class& cls, std::size_t stride) noexcept {
-        Chunk* chunk = cls.recyclable;
-        while (chunk) {
-            Chunk* next = chunk->rec_next;
-            if (chunk->free_head && chunk->stride == stride) {
-                FreeNode* node = chunk->free_head;
-                chunk->free_head = node->next;
-                if (chunk->live == 0) {
-                    MarkUsed(*chunk);
-                }
-                ++chunk->live;
-                if (!chunk->free_head) {
-                    UnlinkRecyclable(*chunk);
-                }
-                return node;
-            }
-            chunk = next;
         }
         return nullptr;
     }
@@ -374,7 +345,11 @@ private:
     }
 
     [[nodiscard]] Chunk* MapChunk(std::size_t stride, std::size_t class_index) noexcept {
-        return MapRegion(kThreadPoolChunkBytes, stride, class_index, false);
+        const bool alone = stride >= 4096;
+        const std::size_t usable = alone
+            ? sizeof(Chunk) + stride + 64
+            : kThreadPoolChunkBytes;
+        return MapRegion(usable, stride, class_index, alone);
     }
 
     [[nodiscard]] Chunk* MapRegion(
@@ -389,6 +364,7 @@ private:
             return nullptr;
         }
         auto* chunk = new (mapped) Chunk;
+        chunk->magic = kChunkMagic;
         chunk->map_base = mapped;
         chunk->map_bytes = map_bytes;
         chunk->stride = stride;
@@ -508,7 +484,7 @@ inline void DeallocatePmr(
     void* raw = *reinterpret_cast<void**>(static_cast<std::byte*>(p) - sizeof(void*));
     auto* header = static_cast<BlockPrefix*>(raw);
     if (header->owner != std::this_thread::get_id()) {
-        std::terminate();
+        return;
     }
     header->~BlockPrefix();
     ThreadPool().Deallocate(raw);
