@@ -49,6 +49,11 @@ bool RunPool() {
     if (!block || reinterpret_cast<std::uintptr_t>(block) % 8192 != 0)
         return false;
     pool.Deallocate(block);
+    block = pool.Allocate(6000, 16);
+    if (!block || pool.GetFootprint().direct_bytes > 2 * 4096)
+        return false;
+    std::memset(block, 0xa5, 6000);
+    pool.Deallocate(block);
     return pool.Allocate(std::numeric_limits<std::size_t>::max(), 16) == nullptr &&
            pool.Allocate(8192, 3) == nullptr;
 }

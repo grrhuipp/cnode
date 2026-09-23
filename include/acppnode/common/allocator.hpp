@@ -51,7 +51,9 @@ inline constexpr bool kAllocatorCollects = true;
 
 inline constexpr int kGlibcArenaMax = 2;
 inline constexpr int kGlibcTrimThreshold = 64 * 1024;
-inline constexpr int kGlibcMmapThreshold = 64 * 1024;
+// Keep AWS-LC's 17 KiB BIO rings at full capacity, but return their pages
+// when an idle TLS connection releases them instead of retaining heap holes.
+inline constexpr int kGlibcMmapThreshold = 17 * 1024;
 inline constexpr std::size_t kThreadPoolChunkBytes = 64 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 32 * 1024;
 inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
@@ -154,18 +156,10 @@ public:
         if (class_index >= classes_.size()) {
             return AllocateDirect(bytes, alignment);
         }
-        // These mappings contain one allocation and are released directly;
-        // looking for reusable chunks would scan every live connection.
+        // Large objects each own one mapping. Map their actual size rather
+        // than a rounded-up class, and unmap it at the end of this lifetime.
         if (stride >= 4096) {
-            Chunk* chunk = MapChunk(stride, class_index, alignment);
-            if (!chunk) {
-                return nullptr;
-            }
-            void* result = Carve(*chunk, stride, alignment);
-            if (!result) {
-                ReleaseChunk(*chunk);
-            }
-            return result;
+            return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
         if (void* reused = TakeFree(cls, bytes, alignment)) {
@@ -178,7 +172,7 @@ public:
             cls.current = idle;
             return Carve(*idle, stride, alignment);
         }
-        Chunk* chunk = MapChunk(stride, class_index, alignment);
+        Chunk* chunk = MapChunk(stride, class_index);
         if (!chunk) {
             return nullptr;
         }
@@ -445,16 +439,8 @@ private:
     }
 
     [[nodiscard]] Chunk* MapChunk(
-        std::size_t stride, std::size_t class_index, std::size_t alignment) noexcept {
-        const bool alone = stride >= 4096;
-        if (alone && (alignment > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) ||
-                      stride > std::numeric_limits<std::size_t>::max() - sizeof(Chunk) - alignment)) {
-            return nullptr;
-        }
-        const std::size_t usable = alone
-            ? sizeof(Chunk) + stride + alignment
-            : kThreadPoolChunkBytes;
-        return MapRegion(usable, stride, class_index, alone);
+        std::size_t stride, std::size_t class_index) noexcept {
+        return MapRegion(kThreadPoolChunkBytes, stride, class_index, false);
     }
 
     [[nodiscard]] Chunk* MapRegion(
