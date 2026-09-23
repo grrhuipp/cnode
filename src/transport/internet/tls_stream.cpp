@@ -523,6 +523,10 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
         ThrowTlsReadError("TLS handshake failed during read");
     }
 
+    SSL* ssl = NativeSsl();
+    if (ssl && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
+        ReleaseIdleSslBioPair(ssl);
+    }
     auto [ec, n] = co_await impl_->stream.async_read_some(
         buf, net::as_tuple(net::use_awaitable));
     if (ec) {
