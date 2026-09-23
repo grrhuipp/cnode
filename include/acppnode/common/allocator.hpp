@@ -547,9 +547,24 @@ inline std::pmr::memory_resource& ThreadMemoryResource() noexcept {
     return ThreadPool();
 }
 
+extern "C" void cnode_set_tls_buffer_allocator(
+    void* (*alloc_fn)(std::size_t),
+    void (*free_fn)(void*));
+
+inline void* AllocateTlsReadWriteBuffer(std::size_t size) {
+    return AllocatePmr(size);
+}
+
+inline void FreeTlsReadWriteBuffer(void* pointer) {
+    DeallocatePmr(pointer);
+}
+
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
     ConfigureProcessGlibc();
+    cnode_set_tls_buffer_allocator(
+        &AllocateTlsReadWriteBuffer,
+        &FreeTlsReadWriteBuffer);
     static ThreadPoolFacade default_resource;
     std::pmr::set_default_resource(&default_resource);
 }

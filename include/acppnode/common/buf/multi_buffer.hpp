@@ -513,6 +513,20 @@ public:
         total_bytes_ = 0;
     }
 
+    // Drop retained blocks and spill capacity once the queue has no payload.
+    void ReleaseIfIdle() noexcept {
+        if (total_bytes_ != 0) {
+            return;
+        }
+        clear();
+        if (using_spill_) {
+            memory::ThreadLocalVector<Buffer*> empty;
+            spill_.swap(empty);
+            using_spill_ = false;
+            spill_start_ = 0;
+        }
+    }
+
     void RecordTailProduced(size_t bytes) noexcept {
         total_bytes_ += bytes;
     }

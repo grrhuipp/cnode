@@ -248,9 +248,11 @@ public:
         while (!cancelled_) {
             if (!queued_input_.empty()) {
                 auto input = std::move(queued_input_);
+                queued_input_.ReleaseIfIdle();
                 WakeInputWriter();
                 co_return input;
             }
+            queued_input_.ReleaseIfIdle();
             if (input_done_) {
                 co_return buf::MultiBuffer{};
             }

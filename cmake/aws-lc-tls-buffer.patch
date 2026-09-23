@@ -1,0 +1,84 @@
+diff --git a/ssl/ssl_buffer.cc b/ssl/ssl_buffer.cc
+index ed1255a08..ca6df63d6 100644
+--- a/ssl/ssl_buffer.cc
++++ b/ssl/ssl_buffer.cc
+@@ -15,6 +15,34 @@
+ #include "../crypto/internal.h"
+ #include "internal.h"
+ 
++// cnode_set_tls_buffer_allocator: connection read/write buffers only.
++// SSL_CTX and the session cache stay on the system allocator.
++static void *(*g_cnode_tls_buffer_alloc)(size_t) = nullptr;
++static void (*g_cnode_tls_buffer_free)(void *) = nullptr;
++
++extern "C" void cnode_set_tls_buffer_allocator(
++    void *(*alloc_fn)(size_t), void (*free_fn)(void *)) {
++  g_cnode_tls_buffer_alloc = alloc_fn;
++  g_cnode_tls_buffer_free = free_fn;
++}
++
++static uint8_t *CnodeTlsBufferAlloc(size_t size) {
++  if (g_cnode_tls_buffer_alloc != nullptr) {
++    return static_cast<uint8_t *>(g_cnode_tls_buffer_alloc(size));
++  }
++  return static_cast<uint8_t *>(malloc(size));
++}
++
++static void CnodeTlsBufferFree(void *ptr) {
++  if (ptr == nullptr) {
++    return;
++  }
++  if (g_cnode_tls_buffer_free != nullptr) {
++    g_cnode_tls_buffer_free(ptr);
++    return;
++  }
++  free(ptr);
++}
+ 
+ BSSL_NAMESPACE_BEGIN
+ 
+@@ -37,7 +65,7 @@ static OPENSSL_INLINE size_t compute_buffer_offset(size_t header_len,
+ 
+ void SSLBuffer::Clear() {
+   if (buf_allocated_) {
+-    free(buf_);  // Allocated with malloc().
++    CnodeTlsBufferFree(buf_);
+   }
+   buf_ = nullptr;
+   buf_allocated_ = false;
+@@ -77,7 +105,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
+     // sensitive data, we allocate with malloc rather than |OPENSSL_malloc| and
+     // avoid zeroing on free.
+     buf_size_ = compute_buffer_size(new_cap);
+-    new_buf = (uint8_t *)malloc(buf_size_);
++    new_buf = CnodeTlsBufferAlloc(buf_size_);
+     if (new_buf == NULL) {
+       OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
+       return false;
+@@ -92,7 +120,7 @@ bool SSLBuffer::EnsureCap(size_t header_len, size_t new_cap) {
+   OPENSSL_memmove(new_buf + new_offset, buf_ + offset_, size_);
+ 
+   if (buf_allocated_) {
+-    free(buf_);  // Allocated with malloc().
++    CnodeTlsBufferFree(buf_);
+   }
+ 
+   buf_ = new_buf;
+@@ -276,7 +304,7 @@ bool SSLBuffer::DoDeserializationV1(CBS &cbs) {
+       return false;
+     }
+     buf_allocated_ = true;
+-    buf_ = (uint8_t *)malloc(CBS_len(&buf));
++    buf_ = CnodeTlsBufferAlloc(CBS_len(&buf));
+     if (buf_ == NULL) {
+       OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
+       return false;
+@@ -339,7 +367,7 @@ bool SSLBuffer::DoDeserializationV2(CBS &cbs) {
+   if (buf_allocated) {
+     buf_allocated_ = true;
+     buf_size_ = compute_buffer_size(buf_cap);
+-    buf_ = (uint8_t *)malloc(buf_size_);
++    buf_ = CnodeTlsBufferAlloc(buf_size_);
+     if (buf_ == NULL) {
+       Clear();
+       OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);

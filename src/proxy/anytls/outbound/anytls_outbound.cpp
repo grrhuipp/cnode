@@ -147,9 +147,11 @@ struct Handler::ClientSession {
             }
             if (!queued_payload_.empty()) {
                 auto payload = std::move(queued_payload_);
+                queued_payload_.ReleaseIfIdle();
                 WakePayloadWriter();
                 co_return payload;
             }
+            queued_payload_.ReleaseIfIdle();
             co_return std::unexpected(error_);
         }
 

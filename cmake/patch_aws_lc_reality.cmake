@@ -29,6 +29,38 @@ function(cnode_patch_aws_lc_reality aws_lc_source_dir)
     message(STATUS "Applied AWS-LC REALITY signature algorithm patch")
 endfunction()
 
+function(cnode_patch_aws_lc_tls_buffer aws_lc_source_dir)
+    set(marker "cnode_set_tls_buffer_allocator")
+    set(source "${aws_lc_source_dir}/ssl/ssl_buffer.cc")
+    set(patch_file "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/aws-lc-tls-buffer.patch")
+
+    if(NOT EXISTS "${source}")
+        message(FATAL_ERROR "AWS-LC ssl_buffer.cc not found at ${source}")
+    endif()
+
+    file(READ "${source}" source_text)
+    if(source_text MATCHES "${marker}")
+        message(STATUS "AWS-LC TLS buffer allocator patch already applied")
+        return()
+    endif()
+
+    find_package(Git REQUIRED)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${patch_file}"
+        WORKING_DIRECTORY "${aws_lc_source_dir}"
+        RESULT_VARIABLE patch_result
+        OUTPUT_VARIABLE patch_stdout
+        ERROR_VARIABLE patch_stderr
+    )
+    if(NOT patch_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply AWS-LC TLS buffer allocator patch\n"
+            "${patch_stdout}\n${patch_stderr}")
+    endif()
+    message(STATUS "Applied AWS-LC TLS buffer allocator patch")
+endfunction()
+
 if(DEFINED AWS_LC_SOURCE_DIR)
     cnode_patch_aws_lc_reality("${AWS_LC_SOURCE_DIR}")
+    cnode_patch_aws_lc_tls_buffer("${AWS_LC_SOURCE_DIR}")
 endif()

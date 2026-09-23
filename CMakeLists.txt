@@ -173,6 +173,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(aws_lc)
 include(cmake/patch_aws_lc_reality.cmake)
 cnode_patch_aws_lc_reality("${aws_lc_SOURCE_DIR}")
+cnode_patch_aws_lc_tls_buffer("${aws_lc_SOURCE_DIR}")
 message(STATUS "Using AWS-LC via FetchContent")
 
 FetchContent_Declare(
