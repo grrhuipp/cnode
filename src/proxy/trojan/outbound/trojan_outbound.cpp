@@ -180,8 +180,10 @@ proxy::trojan::outbound::Handler::Process(
         .port = config_.port,
         .stream_settings = &config_.stream_settings,
         .timeout = config_.timeout,
-        .send_through = config_.send_through,
+        .send_through = &config_.send_through,
         .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
         .tls_server_name = ResolveOutboundTlsServerName(
             config_.stream_settings, config_.address),
         .ws_host = config_.address,

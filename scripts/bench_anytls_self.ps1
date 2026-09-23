@@ -140,8 +140,7 @@ Write-Utf8NoBom (Join-Path $CnodeDir "inbounds.json") @"
       "decryption": "none"
     },
     "streamSettings": { "network": "tcp", "security": "none" },
-    "sniffing": { "enabled": false },
-    "routingEnabled": true
+    "sniffing": { "enabled": false }
   },
   {
     "tag": "server-anytls-in",
@@ -156,8 +155,7 @@ Write-Utf8NoBom (Join-Path $CnodeDir "inbounds.json") @"
       "security": "tls",
       "tlsSettings": { "serverName": "localhost" }
     },
-    "sniffing": { "enabled": false },
-    "routingEnabled": true
+    "sniffing": { "enabled": false }
   }
 ]
 "@

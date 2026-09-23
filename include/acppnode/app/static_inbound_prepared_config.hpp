@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "acppnode/features/routing/dispatch_policy.hpp"
 #include "acppnode/proxy/sniff_config.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/transport/internet/inbound_listen.hpp"
@@ -19,7 +20,7 @@ struct StaticInboundRuntimeEntry {
     InboundListen listen;
     StreamSettings stream_settings;
     SniffConfig sniffing;
-    bool routing_enabled = false;
+    routing::OutboundSelectionPolicy outbound_policy;
     proxyman::inbound::BuildRequest build_request;
 };
 

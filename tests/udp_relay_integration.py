@@ -138,7 +138,7 @@ async def run_case(binary, output, protocol, mode):
                         'dns': {'servers': [dns_server], 'timeout': 10},
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'udp-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
-                           'port': inbound_port, 'routingEnabled': True,
+                           'port': inbound_port,
                            'settings': {'clients': [{'id': str(USER)}]}}],
         'outbounds.json': [outbound],
         'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'udp-out'}]},

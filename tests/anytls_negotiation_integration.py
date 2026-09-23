@@ -229,7 +229,7 @@ async def outbound_case(binary, output, mode):
     configs = {
         'config.json': {'workers': 1, 'log': {'enable': False, 'logDir': str(output / 'logs')}},
         'inbounds.json': [{'tag': 'negotiation-in', 'protocol': 'vless', 'listen': '127.0.0.1',
-                          'port': port, 'routingEnabled': True,
+                          'port': port,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],
         'outbounds.json': [{'tag': 'negotiation-out', 'protocol': 'anytls',
                            'settings': {'server': '127.0.0.1', 'server_port': server.sockets[0].getsockname()[1],

@@ -213,8 +213,10 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
             .port = download.port,
             .stream_settings = &download.stream_settings,
             .timeout = options.timeout,
-            .send_through = download.send_through,
+            .send_through = &download.send_through,
             .inbound_local_addr = options.inbound_local_addr,
+            .inbound_source_ip = options.inbound_source_ip,
+            .inbound_source_port = options.inbound_source_port,
             .tls_server_name = ResolveOutboundTlsServerName(
                 download.stream_settings,
                 download.address),
@@ -251,7 +253,18 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
-    const auto& bind = options.send_through;
+    const OutboundBind unbound;
+    const auto& bind = options.send_through ? *options.send_through : unbound;
+    const auto ordered_v4 = bind.GetMode() == OutboundBind::Mode::Ordered
+        ? (options.ordered_bind_v4 ? *options.ordered_bind_v4
+            : bind.Select(net::ip::address_v4::any(),
+                          options.inbound_source_ip, options.inbound_source_port))
+        : OutboundBind::Selection{};
+    const auto ordered_v6 = bind.GetMode() == OutboundBind::Mode::Ordered
+        ? (options.ordered_bind_v6 ? *options.ordered_bind_v6
+            : bind.Select(net::ip::address_v6::any(),
+                          options.inbound_source_ip, options.inbound_source_port))
+        : OutboundBind::Selection{};
 
     OutboundTransportTarget target;
     switch (bind.GetMode()) {
@@ -264,6 +277,9 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         case OutboundBind::Mode::Explicit:
             target.bind_mode = OutboundTransportTarget::BindMode::Explicit;
             break;
+        case OutboundBind::Mode::Ordered:
+            target.bind_mode = OutboundTransportTarget::BindMode::Ordered;
+            break;
     }
     target.timeout = options.timeout;
     target.stream_settings = options.stream_settings;
@@ -273,23 +289,34 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         options.ws_host.empty() ? options.address : options.ws_host,
         options.port);
 
-    auto append_single = [&](const net::ip::address& remote_addr) {
+    auto append_single = [&](const net::ip::address& remote_addr) -> bool {
         OutboundDialCandidate candidate;
         candidate.endpoint = tcp::endpoint(remote_addr, options.port);
-        candidate.bind_local =
-            SelectBindAddress(bind, options.inbound_local_addr, remote_addr);
+        if (bind.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto& selected = remote_addr.is_v6() ? ordered_v6 : ordered_v4;
+            if (selected.unavailable) return false;
+            candidate.bind_local = selected.address;
+        } else {
+            candidate.bind_local = SelectBindAddress(
+                bind, options.inbound_local_addr, remote_addr);
+        }
         target.single_candidate = std::move(candidate);
+        return true;
     };
 
     if (options.literal_address) {
-        append_single(*options.literal_address);
+        if (!append_single(*options.literal_address)) {
+            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+        }
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,
             allow_xhttp_download);
     }
     if (auto literal = iputil::ParseLiteral(options.address)) {
-        append_single(*literal);
+        if (!append_single(*literal)) {
+            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+        }
         co_return co_await AttachXHttpDownloadTarget(
             std::move(target),
             options,
@@ -300,9 +327,33 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
     }
 
     auto dns_result = co_await options.dns_service->Resolve(options.address);
-    if (!dns_result.Ok()) {
+    if (!dns_result.Ok() || dns_result.addresses.empty()) {
         co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
+    if (bind.GetMode() == OutboundBind::Mode::Ordered) {
+        target.candidates.reserve(dns_result.addresses.size());
+        for (const bool ipv6 : {bind.PrefersIPv6(), !bind.PrefersIPv6()}) {
+            const auto& selected = ipv6 ? ordered_v6 : ordered_v4;
+            if (selected.unavailable) continue;
+            for (const auto& addr : dns_result.addresses) {
+                if (addr.is_v6() != ipv6) continue;
+                target.candidates.push_back(OutboundDialCandidate{
+                    .endpoint = tcp::endpoint(addr, options.port),
+                    .bind_local = selected.address,
+                });
+            }
+        }
+        if (target.candidates.empty()) {
+            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+        }
+        if (target.candidates.size() == 1) {
+            target.single_candidate = std::move(target.candidates.front());
+            target.candidates.clear();
+        }
+        co_return co_await AttachXHttpDownloadTarget(
+            std::move(target), options, allow_xhttp_download);
+    }
+
     const bool wants_v6 = WantsIPv6(bind, options.inbound_local_addr);
     const bool has_v4 = std::ranges::any_of(
         dns_result.addresses,

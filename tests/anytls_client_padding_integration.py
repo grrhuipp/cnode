@@ -65,7 +65,7 @@ async def scenario(args, name, output, result, resources):
               'uplinkOnly': 10, 'downlinkOnly': 10},
               'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}}
     inbounds = [{'tag': f'client-{key}', 'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
-                 'routingEnabled': True, 'settings': {'clients': [{'id': str(USER)}]}} for key, port in ports.items()]
+                 'settings': {'clients': [{'id': str(USER)}]}} for key, port in ports.items()]
     outbounds = [{'tag': f'peer-{key}', 'protocol': 'anytls', 'settings': {
         'server': '127.0.0.1', 'server_port': peer_port, 'password': f'secret-{key}', 'minIdleSession': 1},
         'streamSettings': tls_settings()} for key, peer_port in [('a', peer_a), ('b', peer_b)]]

@@ -191,14 +191,20 @@ endif()
 
 file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp"
      STATIC_INBOUND_BOOTSTRAP_SOURCE)
+if(NOT STATIC_INBOUND_BOOTSTRAP_SOURCE MATCHES "inbound.outbound_policy")
+    message(FATAL_ERROR
+        "static inbound bootstrap must pass the prepared outbound policy to receivers")
+endif()
+file(READ "${SOURCE_DIR}/src/app/startup_inbounds.cpp"
+     STATIC_INBOUND_PREPARATION_SOURCE)
 foreach(STATIC_INBOUND_POLICY_TOKEN IN ITEMS
-        "routing_enabled"
+        "source.outbound_tag"
         "RouteWithFallback"
         "ForceOutbound")
-    if(NOT STATIC_INBOUND_BOOTSTRAP_SOURCE MATCHES
+    if(NOT STATIC_INBOUND_PREPARATION_SOURCE MATCHES
            "${STATIC_INBOUND_POLICY_TOKEN}")
         message(FATAL_ERROR
-            "static inbound bootstrap must map routingEnabled=false to ForceOutbound and true to RouteWithFallback")
+            "static inbound preparation must map outboundTag to a forced policy, otherwise route with fallback")
     endif()
 endforeach()
 

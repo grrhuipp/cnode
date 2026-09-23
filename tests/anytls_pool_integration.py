@@ -226,7 +226,7 @@ async def run_case(binary, output, minimum, mode='complete', timeouts=None):
     configs = {
         'config.json': {'workers': 1, 'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'pool-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
-                          'port': inbound_port, 'routingEnabled': True,
+                          'port': inbound_port,
                           'settings': {'clients': [{'id': str(uuid.UUID(bytes=USER_ID))}]}}],
         'outbounds.json': [{'tag': 'pool-out', 'protocol': 'anytls',
                            'settings': {'server': '127.0.0.1', 'server_port': peer_port, 'password': 'secret',

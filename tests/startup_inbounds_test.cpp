@@ -3,6 +3,7 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/features/routing/dispatch_policy.hpp"
 #include "acppnode/proxy/inbound.hpp"
 
 #include <iostream>
@@ -75,5 +76,15 @@ int main() {
     if (!Rejected({Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false) ||
         user_builds != 2 || UserStore::VmessUsers("static-owner").users != old) return 3;
     if (!PrepareStartupInbounds({}, false).empty() || PrepareStartupInbounds({}, true).size() != 1) return 4;
+
+    auto forced = Source("forced", 12001);
+    forced.outbound_tag = "custom-out";
+    const auto policies = PrepareStartupInbounds({Source("routed", 12002), forced}, false);
+    if (policies.size() != 2 ||
+        !std::holds_alternative<routing::RouteWithFallback>(policies[0].runtime.outbound_policy) ||
+        std::get<routing::RouteWithFallback>(policies[0].runtime.outbound_policy).outbound_tag != "direct" ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[1].runtime.outbound_policy) ||
+        std::get<routing::ForceOutbound>(policies[1].runtime.outbound_policy).outbound_tag != "custom-out") return 5;
+
     std::cout << "startup sources share validation and preparation without user publication\n";
 }

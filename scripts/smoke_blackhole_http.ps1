@@ -49,8 +49,7 @@ Write-Utf8NoBom (Join-Path $CnodeDir "inbounds.json") @"
       "clients": [{ "id": "$BenchUuid", "email": "bench@example.com" }],
       "decryption": "none"
     },
-    "streamSettings": { "network": "tcp", "security": "none" },
-    "routingEnabled": true
+    "streamSettings": { "network": "tcp", "security": "none" }
   }
 ]
 "@

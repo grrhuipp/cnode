@@ -36,6 +36,7 @@ struct Session {
     const std::thread::id owner = std::this_thread::get_id();
     bool closed = false;
     size_t active_streams = 0;
+    int source_key = 0;
     size_t close_count = 0;
     Clock::time_point closed_at{};
     acpp::net::cancellation_signal cancellation;
@@ -117,6 +118,37 @@ void TestMinimumIdleAndBusyLease() {
     }
     Check(third->closed, "abandoned checkout or pool retirement leaked a session");
     io.restart();
+    io.run();
+}
+
+void TestSourceBoundCheckout() {
+    acpp::net::io_context io;
+    auto first = std::make_shared<Session>();
+    auto second = std::make_shared<Session>();
+    first->source_key = 1;
+    second->source_key = 2;
+    {
+        Pool pool(io, 1s, 1s, 2, "source-bound");
+        auto a = pool.Adopt(first);
+        auto b = pool.Adopt(second);
+        a.Reuse();
+        b.Reuse();
+        auto selected = pool.AcquireIf([](const Session& physical) {
+            return physical.source_key == 1;
+        });
+        Check(selected.Get() == first,
+              "source-bound checkout reused a physical session from another source");
+        auto missing = pool.AcquireIf([](const Session& physical) {
+            return physical.source_key == 3;
+        });
+        Check(!missing.Get(), "source-bound checkout invented a matching session");
+        auto other = pool.AcquireIf([](const Session& physical) {
+            return physical.source_key == 2;
+        });
+        Check(other.Get() == second, "rejected idle session was discarded");
+        selected.Reuse();
+        other.Reuse();
+    }
     io.run();
 }
 
@@ -263,6 +295,7 @@ int main() {
     try {
         TestPeriodicCheckWithoutRequests();
         TestMinimumIdleAndBusyLease();
+        TestSourceBoundCheckout();
         TestCheckoutFailureAndTimerGeneration();
         TestRetirementWithOutstandingLease();
         TestLargeIntervalDoesNotWrap();

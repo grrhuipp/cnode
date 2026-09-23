@@ -50,8 +50,8 @@ bool Config::Validate() const {
         return false;
     }
 
-    const auto semantic = ValidateOutboundRoutingSemantics(
-        prepared_outbounds_, routing_.rules);
+    const auto semantic = ValidateOutboundSelectionSemantics(
+        prepared_outbounds_, routing_.rules, static_inbounds_);
     switch (semantic.error) {
         case ConfigSemanticError::None:
             break;
@@ -74,6 +74,13 @@ bool Config::Validate() const {
             return false;
         case ConfigSemanticError::UnknownRouteOutboundTag:
             LOG_ERROR("Routing rule at index {} references unknown outbound '{}'",
+                      semantic.index, semantic.tag);
+            return false;
+        case ConfigSemanticError::EmptyStaticInboundOutboundTag:
+            LOG_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
+            return false;
+        case ConfigSemanticError::UnknownStaticInboundOutboundTag:
+            LOG_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
                       semantic.index, semantic.tag);
             return false;
     }

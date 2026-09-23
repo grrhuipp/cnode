@@ -95,16 +95,21 @@ public:
     SessionPool& operator=(const SessionPool&) = delete;
     ~SessionPool() noexcept { state_->Retire(); }
 
-    [[nodiscard]] Lease Acquire() {
+    template<class Accept>
+    [[nodiscard]] Lease AcquireIf(Accept&& accept) {
         state_->CheckActive();
         state_->Prune();
         for (auto it = state_->entries.rbegin(); it != state_->entries.rend(); ++it) {
-            if (it->idle_since && it->session->Available()) {
+            if (it->idle_since && it->session->Available() && accept(*it->session)) {
                 it->idle_since.reset();
                 return Lease(state_, it->session);
             }
         }
         return {};
+    }
+
+    [[nodiscard]] Lease Acquire() {
+        return AcquireIf([](const Session&) { return true; });
     }
 
     [[nodiscard]] Lease Adopt(std::shared_ptr<Session> session) {

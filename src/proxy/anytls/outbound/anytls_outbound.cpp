@@ -11,6 +11,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/ip_utils.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -619,7 +620,27 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto transport_lease = pool_->Acquire();
+    const bool ordered_bind = settings_.send_through.GetMode() == OutboundBind::Mode::Ordered;
+    const auto selected_v4 = ordered_bind
+        ? settings_.send_through.Select(net::ip::address_v4::any(),
+            ctx.inbound.source_ip, ctx.inbound.source_port)
+        : OutboundBind::Selection{};
+    const auto selected_v6 = ordered_bind
+        ? settings_.send_through.Select(net::ip::address_v6::any(),
+            ctx.inbound.source_ip, ctx.inbound.source_port)
+        : OutboundBind::Selection{};
+    auto transport_lease = ordered_bind
+        ? pool_->AcquireIf([&](const ClientSession& physical) {
+            if (!physical.stream) return false;
+            const auto remote = physical.stream->RemoteEndpoint();
+            const auto local = physical.stream->LocalEndpoint();
+            if (!remote || !local) return false;
+            const auto& selected = remote->address().is_v6() ? selected_v6 : selected_v4;
+            return !selected.unavailable &&
+                (!selected.address ||
+                 iputil::NormalizeAddress(local->address()) == *selected.address);
+        })
+        : pool_->Acquire();
     std::shared_ptr<ClientSession> session = transport_lease.Get();
 
     if (!session) {
@@ -630,8 +651,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             .port = settings_.port,
             .stream_settings = &stream_settings_,
             .timeout = dial_timeout_,
-            .send_through = settings_.send_through,
+            .send_through = &settings_.send_through,
             .inbound_local_addr = inbound_local_addr,
+            .inbound_source_ip = ctx.inbound.source_ip,
+            .inbound_source_port = ctx.inbound.source_port,
+            .ordered_bind_v4 = ordered_bind
+                ? std::optional{selected_v4} : std::nullopt,
+            .ordered_bind_v6 = ordered_bind
+                ? std::optional{selected_v6} : std::nullopt,
             .tls_server_name = ResolveOutboundTlsServerName(
                 stream_settings_, settings_.address),
             .ws_host = settings_.address,

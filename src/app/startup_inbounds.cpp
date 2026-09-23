@@ -32,19 +32,24 @@ StaticInboundConfig MakeTestInboundConfig() {
 
 PreparedStartupInbound PrepareInbound(
     const StaticInboundConfig& source) {
-    StaticInboundRuntimeEntry entry;
-    entry.protocol = source.protocol;
-    entry.tag = source.tags.empty()
-        ? naming::BuildProtocolPortTag(entry.protocol, source.port)
+    const auto tag = source.tags.empty()
+        ? naming::BuildProtocolPortTag(source.protocol, source.port)
         : source.tags.front();
-    entry.all_tags = source.tags.empty()
-        ? std::vector<std::string>{entry.tag}
-        : source.tags;
-    entry.port = source.port;
-    entry.listen = source.listen;
-    entry.stream_settings = source.stream_settings;
-    entry.sniffing = source.sniffing;
-    entry.routing_enabled = source.routing_enabled;
+    StaticInboundRuntimeEntry entry{
+        .protocol = source.protocol,
+        .tag = tag,
+        .all_tags = source.tags.empty()
+            ? std::vector<std::string>{tag}
+            : source.tags,
+        .port = source.port,
+        .listen = source.listen,
+        .stream_settings = source.stream_settings,
+        .sniffing = source.sniffing,
+        .outbound_policy = source.outbound_tag
+            ? routing::OutboundSelectionPolicy{routing::ForceOutbound(*source.outbound_tag)}
+            : routing::OutboundSelectionPolicy{routing::RouteWithFallback(
+                std::string(constants::protocol::kDirect))},
+    };
 
     if (!proxyman::inbound::HasProxy(entry.protocol)) {
         throw std::invalid_argument(

@@ -31,6 +31,7 @@ struct OutboundTransportTarget {
         None = 0,
         Auto,
         Explicit,
+        Ordered,
     };
 
     std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配

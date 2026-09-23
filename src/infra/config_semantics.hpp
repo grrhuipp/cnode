@@ -20,6 +20,8 @@ enum class ConfigSemanticError {
     DuplicateOutboundTag,
     EmptyRouteOutboundTag,
     UnknownRouteOutboundTag,
+    EmptyStaticInboundOutboundTag,
+    UnknownStaticInboundOutboundTag,
 };
 
 struct ConfigSemanticValidation {
@@ -59,9 +61,10 @@ struct StaticInboundSemanticValidation {
     [[nodiscard]] std::string Message() const;
 };
 
-[[nodiscard]] ConfigSemanticValidation ValidateOutboundRoutingSemantics(
+[[nodiscard]] ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
-    std::span<const RouteRuleConfig> rules);
+    std::span<const RouteRuleConfig> rules,
+    std::span<const StaticInboundConfig> inbounds);
 
 // A routing sidecar may outlive one or more removed outbounds. Those stale
 // rules are unusable, but must not prevent the rest of the node from starting.

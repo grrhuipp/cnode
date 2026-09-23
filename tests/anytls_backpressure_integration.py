@@ -169,7 +169,7 @@ async def run_case(binary, output, udp, action):
         'config.json': {'workers': 1, 'log': {'enable': False, 'logDir': (output / 'logs').as_posix()},
                         'timeouts': {'handshake': 5, 'connIdle': 1 if action == 'timeout' else 10, 'write': 10}},
         'inbounds.json': [{'tag': 'pressure-in', 'protocol': 'vless', 'listen': '127.0.0.1',
-                          'port': inbound_port, 'routingEnabled': True,
+                          'port': inbound_port,
                           'settings': {'clients': [{'id': str(USER)}]}}],
         'outbounds.json': [{'tag': 'pressure-out', 'protocol': 'anytls',
                            'settings': {'server': '127.0.0.1', 'server_port': peer_port, 'password': 'secret',

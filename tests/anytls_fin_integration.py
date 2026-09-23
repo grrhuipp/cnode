@@ -174,7 +174,7 @@ def configure(output, inbound, outbound):
         'config.json': {'workers': 1, 'timeouts': {'handshake': 5, 'connIdle': 15,
                         'write': 5, 'uplinkOnly': 10, 'downlinkOnly': 10},
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
-        'inbounds.json': [dict(inbound, tag='fin-in', routingEnabled=True)],
+        'inbounds.json': [dict(inbound, tag='fin-in')],
         'outbounds.json': [dict(outbound, tag='fin-out')],
         'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['fin-in'], 'outboundTag': 'fin-out'}]},
     }

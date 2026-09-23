@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -72,7 +73,7 @@ struct StaticInboundConfig {
     StaticUserConfig static_users;
     StreamSettings stream_settings;
     SniffConfig sniffing;
-    bool routing_enabled = false;
+    std::optional<std::string> outbound_tag;
 
     static StaticInboundConfig FromJson(const json::object& j);
 };

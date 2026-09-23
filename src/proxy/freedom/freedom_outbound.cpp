@@ -10,6 +10,7 @@
 #include "acppnode/app/udp_channel.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/outbound_bind_config.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -179,6 +180,8 @@ OutboundTransportTarget::BindMode ToTransportBindMode(OutboundBind::Mode mode) {
             return OutboundTransportTarget::BindMode::Auto;
         case OutboundBind::Mode::Explicit:
             return OutboundTransportTarget::BindMode::Explicit;
+        case OutboundBind::Mode::Ordered:
+            return OutboundTransportTarget::BindMode::Ordered;
     }
     return OutboundTransportTarget::BindMode::None;
 }
@@ -281,15 +284,37 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 
+    const bool ordered_bind = settings_.send_through.GetMode() == OutboundBind::Mode::Ordered;
+    const auto selected_v4 = ordered_bind
+        ? settings_.send_through.Select(net::ip::address_v4::any(),
+            ctx.inbound.source_ip, ctx.inbound.source_port)
+        : OutboundBind::Selection{};
+    const auto selected_v6 = ordered_bind
+        ? settings_.send_through.Select(net::ip::address_v6::any(),
+            ctx.inbound.source_ip, ctx.inbound.source_port)
+        : OutboundBind::Selection{};
+    auto selected_bind = [&](const net::ip::address& remote_addr)
+        -> std::optional<net::ip::address> {
+        return ordered_bind
+            ? (remote_addr.is_v6() ? selected_v6.address : selected_v4.address)
+            : DetermineLocalAddress(inbound_local_addr, remote_addr);
+    };
+    auto unavailable = [&](const net::ip::address& remote_addr) {
+        return ordered_bind &&
+            (remote_addr.is_v6() ? selected_v6.unavailable : selected_v4.unavailable);
+    };
     auto set_single_candidate = [&](const net::ip::address& remote_addr) {
         OutboundDialCandidate candidate;
         candidate.endpoint = tcp::endpoint(remote_addr, target.port);
-        candidate.bind_local = DetermineLocalAddress(inbound_local_addr, remote_addr);
+        candidate.bind_local = selected_bind(remote_addr);
         transport_target.single_candidate = std::move(candidate);
     };
 
     if (target.IsIP() && target.resolved_addr) {
         ctx.content.dns_result = session::DnsResultState::None;
+        if (unavailable(*target.resolved_addr)) {
+            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+        }
         set_single_candidate(*target.resolved_addr);
     } else {
         auto remote_addrs = co_await ResolveTargets(ctx);
@@ -297,16 +322,20 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             co_return std::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
         }
 
-        if (remote_addrs->size() == 1) {
-            set_single_candidate(remote_addrs->front());
-        } else {
-            transport_target.candidates.reserve(remote_addrs->size());
-            for (const auto& remote_addr : *remote_addrs) {
-                OutboundDialCandidate candidate;
-                candidate.endpoint = tcp::endpoint(remote_addr, target.port);
-                candidate.bind_local = DetermineLocalAddress(inbound_local_addr, remote_addr);
-                transport_target.candidates.push_back(std::move(candidate));
-            }
+        transport_target.candidates.reserve(remote_addrs->size());
+        for (const auto& remote_addr : *remote_addrs) {
+            if (unavailable(remote_addr)) continue;
+            transport_target.candidates.push_back(OutboundDialCandidate{
+                .endpoint = tcp::endpoint(remote_addr, target.port),
+                .bind_local = selected_bind(remote_addr),
+            });
+        }
+        if (transport_target.candidates.empty()) {
+            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+        }
+        if (transport_target.candidates.size() == 1) {
+            transport_target.single_candidate = std::move(transport_target.candidates.front());
+            transport_target.candidates.clear();
         }
     }
 
@@ -395,6 +424,14 @@ Handler::AcquireUdpSession(session::Context& ctx) {
         session_id = &*explicit_udp_session_id_;
     } else {
         bind_addr_storage = SelectUdpBindAddress(settings_, ctx);
+        if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto selected = settings_.send_through.Select(
+                bind_addr_storage, ctx.inbound.source_ip, ctx.inbound.source_port);
+            if (selected.unavailable) {
+                return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+            }
+            if (selected.address) bind_addr_storage = *selected.address;
+        }
         session_id_storage = MakeUdpSessionId(bind_addr_storage);
         bind_addr = &bind_addr_storage;
         session_id = &session_id_storage;
@@ -529,19 +566,17 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         acpp::proxy::freedom::outbound::FreedomSettings settings;
 
         settings.send_through = acpp::OutboundBind::Auto();
-        const acpp::json::value* nested_send_through = s.if_contains("sendThrough");
-        if (!nested_send_through) {
-            nested_send_through = s.if_contains("send_through");
-        }
+        if (s.contains("send_through")) return std::nullopt;
+        const auto* nested_send_through = s.if_contains("sendThrough");
+        const auto* nested_strategy = s.if_contains("sendThroughStrategy");
+        if (nested_strategy && !nested_send_through) return std::nullopt;
         if (nested_send_through) {
-            if (!nested_send_through->is_string()) {
+            try {
+                settings.send_through = acpp::infra::ParseOutboundBindConfig(
+                    *nested_send_through, nested_strategy);
+            } catch (const std::invalid_argument&) {
                 return std::nullopt;
             }
-            auto parsed = acpp::OutboundBind::Parse(nested_send_through->as_string());
-            if (!parsed) {
-                return std::nullopt;
-            }
-            settings.send_through = std::move(*parsed);
         }
         const auto domain_strategy =
             acpp::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);

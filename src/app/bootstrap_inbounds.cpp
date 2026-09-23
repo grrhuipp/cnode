@@ -4,7 +4,6 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/worker.hpp"
-#include "acppnode/core/constants.hpp"
 
 #include <format>
 #include <stdexcept>
@@ -26,14 +25,6 @@ net::awaitable<void> SetupWorkerInbounds(
                 "static inbound startup failed worker={} tag={} port={} stage={}",
                 worker.Id(), inbound.tag, inbound.port, stage));
         };
-        auto outbound_policy = [&]() -> routing::OutboundSelectionPolicy {
-            if (inbound.routing_enabled) {
-                return routing::RouteWithFallback(
-                    std::string(constants::protocol::kDirect));
-            }
-            return routing::ForceOutbound(
-                std::string(constants::protocol::kDirect));
-        }();
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
             inbound.all_tags,
@@ -42,7 +33,7 @@ net::awaitable<void> SetupWorkerInbounds(
             inbound.sniffing,
             connection_limiter,
             ProxyProtocolMode::Auto,
-            std::move(outbound_policy));
+            inbound.outbound_policy);
 
         if (!co_await worker.RegisterInboundTask(
                 connection_limiter,

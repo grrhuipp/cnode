@@ -75,7 +75,7 @@ jobs:
           apk add --no-cache \
             build-base binutils ccache cmake ninja git curl \
             zip unzip tar pkgconf linux-headers musl-dev \
-            perl nasm
+            perl nasm python3
 
       - uses: actions/checkout@v6.0.3
 
@@ -105,12 +105,12 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
       - name: Build
-        run: cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test --parallel $(nproc)
+        run: cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test cnode_outbound_bind_test cnode_config_semantics_test cnode_startup_inbounds_test --parallel $(nproc)
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
-      - name: Test Worker pool and idle TLS BIO
-        run: ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle)_test$' --output-on-failure
+      - name: Test Worker pool, TLS BIO, and outbound selection
+        run: ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle|outbound_bind|config_semantics|startup_inbounds|static_inbound_outbound_integration|outbound_bind_integration)_test$' --output-on-failure
 
       - name: Show compiler cache stats
         if: always()
@@ -196,8 +196,8 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_ID=${{ env.BUILD_ID }}
-          cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test --parallel $(nproc)
-          ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle)_test$' --output-on-failure
+          cmake --build "$BUILD_DIR" --target cnode cnode_thread_pool_test cnode_tls_bio_idle_test cnode_outbound_bind_test cnode_config_semantics_test cnode_startup_inbounds_test --parallel $(nproc)
+          ctest --test-dir "$BUILD_DIR" -R '^cnode_(thread_pool|tls_bio_idle|outbound_bind|config_semantics|startup_inbounds|static_inbound_outbound_integration|outbound_bind_integration)_test$' --output-on-failure
           "$BUILD_DIR/cnode" -v
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache

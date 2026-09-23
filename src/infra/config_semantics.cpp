@@ -12,9 +12,10 @@
 
 namespace acpp {
 
-ConfigSemanticValidation ValidateOutboundRoutingSemantics(
+ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
-    std::span<const RouteRuleConfig> rules) {
+    std::span<const RouteRuleConfig> rules,
+    std::span<const StaticInboundConfig> inbounds) {
     if (outbounds.empty()) {
         return {.error = ConfigSemanticError::NoOutbounds, .index = 0, .tag = {}};
     }
@@ -54,6 +55,25 @@ ConfigSemanticValidation ValidateOutboundRoutingSemantics(
         if (!tags.contains(tag)) {
             return {
                 .error = ConfigSemanticError::UnknownRouteOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < inbounds.size(); ++i) {
+        if (!inbounds[i].outbound_tag) continue;
+        const std::string_view tag = *inbounds[i].outbound_tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyStaticInboundOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+        if (!tags.contains(tag)) {
+            return {
+                .error = ConfigSemanticError::UnknownStaticInboundOutboundTag,
                 .index = i,
                 .tag = tag,
             };

@@ -119,8 +119,7 @@ function Run-CnodeBlackhole {
       "clients": [{ "id": "$BenchUuid", "email": "bench@example.com" }],
       "decryption": "none"
     },
-    "streamSettings": { "network": "tcp", "security": "none" },
-    "routingEnabled": true
+    "streamSettings": { "network": "tcp", "security": "none" }
   }
 ]
 "@

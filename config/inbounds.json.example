@@ -19,8 +19,7 @@
     "sniffing": {
       "enabled": true,
       "destOverride": ["http", "tls"]
-    },
-    "routingEnabled": true
+    }
   },
   {
     "tag": "static-vless-reality",
@@ -49,8 +48,7 @@
     "sniffing": {
       "enabled": true,
       "destOverride": ["http", "tls"]
-    },
-    "routingEnabled": true
+    }
   },
   {
     "tag": "static-trojan",
@@ -74,7 +72,7 @@
         "keyFile": "/etc/cnode/certs/privkey.pem"
       }
     },
-    "routingEnabled": false
+    "outboundTag": "ipv6-first"
   },
   {
     "tag": "static-ss",
@@ -89,8 +87,7 @@
     "streamSettings": {
       "network": "tcp",
       "security": "none"
-    },
-    "routingEnabled": true
+    }
   },
   {
     "tag": "static-anytls",
@@ -118,7 +115,6 @@
         "certFile": "/etc/cnode/certs/fullchain.pem",
         "keyFile": "/etc/cnode/certs/privkey.pem"
       }
-    },
-    "routingEnabled": true
+    }
   }
 ]

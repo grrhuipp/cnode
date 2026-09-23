@@ -496,7 +496,7 @@ target_link_options(cnode PRIVATE
 
 # 平台链接库
 if(WIN32)
-    target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi crypt32)
+    target_link_libraries(cnode PRIVATE ws2_32 mswsock psapi crypt32 iphlpapi)
 elseif(UNIX AND NOT APPLE)
     # glibc 需要显式链接 dl/rt，musl 已内置（find_library 自动区分）
     find_library(LIBDL dl)
@@ -1405,6 +1405,7 @@ if(CNODE_BUILD_TESTS)
         src/app/dns/global_cache.cpp
         src/transport/async_stream.cpp
         src/transport/internet/outbound_target_builder.cpp
+        src/transport/internet/outbound_bind.cpp
         src/transport/internet/stream_settings.cpp
         src/transport/internet/tcp_stream.cpp
         src/transport/internet/proxy_protocol.cpp
@@ -1420,7 +1421,7 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib crypto)
     if(WIN32)
-        target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE ws2_32)
+        target_link_libraries(cnode_anytls_outbound_lifecycle_test PRIVATE ws2_32 iphlpapi)
         target_compile_definitions(cnode_anytls_outbound_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
     endif()
     target_compile_options(cnode_anytls_outbound_lifecycle_test PRIVATE
@@ -1517,7 +1518,7 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
     )
     if(WIN32)
-        target_link_libraries(cnode_inbound_tls_policy_test PRIVATE ws2_32)
+        target_link_libraries(cnode_inbound_tls_policy_test PRIVATE ws2_32 iphlpapi)
         target_compile_definitions(
             cnode_inbound_tls_policy_test PRIVATE _WIN32_WINNT=0x0A00)
     endif()
@@ -1824,6 +1825,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_outbound_bind_test
         tests/outbound_bind_test.cpp
         src/transport/internet/outbound_bind.cpp
+        src/infra/json.cpp
     )
     target_include_directories(cnode_outbound_bind_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1833,7 +1835,7 @@ if(CNODE_BUILD_TESTS)
         Threads::Threads
     )
     if(WIN32)
-        target_link_libraries(cnode_outbound_bind_test PRIVATE ws2_32)
+        target_link_libraries(cnode_outbound_bind_test PRIVATE ws2_32 iphlpapi)
         target_compile_definitions(
             cnode_outbound_bind_test PRIVATE _WIN32_WINNT=0x0A00)
     endif()
@@ -2678,6 +2680,24 @@ if(CNODE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_startup_inbounds_test COMMAND cnode_startup_inbounds_test)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME cnode_static_inbound_outbound_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/static_inbound_outbound_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/static_inbound_outbound_integration_test)
+        set_tests_properties(cnode_static_inbound_outbound_integration_test PROPERTIES TIMEOUT 40)
+        add_test(
+            NAME cnode_outbound_bind_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/outbound_bind_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/outbound_bind_integration_test)
+        set_tests_properties(cnode_outbound_bind_integration_test PROPERTIES TIMEOUT 95)
+    endif()
 
     add_executable(cnode_stream_settings_test
         tests/stream_settings_test.cpp

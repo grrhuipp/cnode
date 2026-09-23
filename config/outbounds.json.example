@@ -9,6 +9,13 @@
     "sendThrough": "auto"
   },
   {
+    "tag": "ipv6-first",
+    "protocol": "freedom",
+    "settings": { "domainStrategy": "UseIPv6v4" },
+    "sendThrough": ["2001:db8:1234::/64"],
+    "sendThroughStrategy": "hash"
+  },
+  {
     "tag": "blackhole",
     "protocol": "blackhole",
     "settings": {

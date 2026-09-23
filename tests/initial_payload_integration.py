@@ -129,7 +129,7 @@ async def run_case(binary, output, protocol, prefix_size):
         'config.json': {'workers': 1, 'timeouts': {'downlinkOnly': 3},
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'initial-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
-                           'port': inbound_port, 'routingEnabled': True, 'sniffing': {'enabled': False},
+                           'port': inbound_port, 'sniffing': {'enabled': False},
                            'settings': {'clients': [{'id': str(USER)}]}}],
         'outbounds.json': [outbound],
         'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['initial-probe'], 'outboundTag': 'initial-out'}]},

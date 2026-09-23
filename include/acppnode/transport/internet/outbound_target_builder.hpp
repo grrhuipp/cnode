@@ -25,8 +25,12 @@ struct OutboundTargetOptions {
     uint16_t port = 0;
     const StreamSettings* stream_settings = nullptr;
     std::chrono::seconds timeout{defaults::kDialTimeout};
-    OutboundBind send_through;
+    const OutboundBind* send_through = nullptr; // Borrowed from the outbound handler.
     const tcp::endpoint* inbound_local_addr = nullptr;
+    std::string_view inbound_source_ip;
+    uint16_t inbound_source_port = 0;
+    std::optional<OutboundBind::Selection> ordered_bind_v4;
+    std::optional<OutboundBind::Selection> ordered_bind_v6;
     std::string_view tls_server_name;
     std::string_view ws_host;
 };

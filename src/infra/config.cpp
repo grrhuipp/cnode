@@ -3,6 +3,7 @@
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_port.hpp"
+#include "acppnode/infra/outbound_bind_config.hpp"
 #include "acppnode/infra/log.hpp"
 #include "http2_initial_window.hpp"
 #include "json_bool.hpp"
@@ -954,32 +955,19 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     if (!port) throw std::invalid_argument("xhttp download port is required");
     settings->port = *port;
 
-    std::optional<std::string> send_through;
-    std::string_view bind_key;
-    for (const std::string_view key : {"sendThrough"}) {
-        const auto* value = j.if_contains(key);
-        if (!value) continue;
-        if (!value->is_string()) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} must be a string", key));
-        }
-        const std::string parsed(value->as_string());
-        if (send_through && *send_through != parsed) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} and {} must match", bind_key, key));
-        }
-        if (!send_through) {
-            send_through = parsed;
-            bind_key = key;
-        }
+    if (j.contains("send_through") || j.contains("send_through_strategy")) {
+        throw std::invalid_argument("xhttp download binding must use sendThrough/sendThroughStrategy");
     }
-    auto parsed_bind = OutboundBind::Parse(send_through.value_or(""));
-    if (!parsed_bind) {
-        throw std::invalid_argument(std::format(
-            "xhttp download sendThrough '{}' must be auto, wildcard, or an IP address",
-            send_through.value_or("")));
+    const auto* send_through = j.if_contains("sendThrough");
+    const auto* strategy = j.if_contains("sendThroughStrategy");
+    if (strategy && !send_through) {
+        throw std::invalid_argument(
+            "xhttp download sendThroughStrategy requires sendThrough");
     }
-    settings->send_through = std::move(*parsed_bind);
+    if (send_through) {
+        settings->send_through = infra::ParseOutboundBindConfig(
+            *send_through, strategy);
+    }
 
     settings->stream_settings = StreamSettings::FromJson(
         j, StreamEndpointRole::Outbound);
@@ -1548,8 +1536,21 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         }
     }
 
-    cfg.routing_enabled = jbool(
-        j, {"routingEnabled"}, cfg.routing_enabled);
+    if (j.contains("routingEnabled") || j.contains("routing_enabled")) {
+        throw std::invalid_argument(
+            "static inbound routingEnabled is removed; use outboundTag to force an outbound");
+    }
+    if (j.contains("outbound_tag") || j.contains("outbound")) {
+        throw std::invalid_argument(
+            "static inbound outbound selection must use outboundTag");
+    }
+    if (j.contains("outboundTag")) {
+        cfg.outbound_tag = jstr(j, "outboundTag");
+        if (cfg.outbound_tag->empty()) {
+            throw std::invalid_argument(
+                "static inbound outboundTag must not be empty");
+        }
+    }
 
     return cfg;
 }

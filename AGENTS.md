@@ -34,7 +34,7 @@
 - 公开配置用可 designated-initialize 的普通聚合。能用字段表达的，不要加 factory 或 builder。
 - 每个 receiver 必须在冷路径明确选择强制出口，或带显式 fallback 的路由。策略不可默认构造，空 tag 不得进入热路径。
 - Router 只返回真实规则命中。强制出口和入站显式 fallback 由分发层编排。不存在 Worker 全局默认出口，也不得伪装成规则命中。
-- 未启用 routing 的静态 inbound 使用强制直连，即使规则可命中也不得进入 Router。
+- 静态 inbound 指定强制出口时不得进入 Router；未指定时参与路由，未命中使用显式 fallback。
 
 ## 分层
 

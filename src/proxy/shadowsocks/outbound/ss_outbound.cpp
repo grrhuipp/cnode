@@ -329,7 +329,19 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
 
-        const auto bind_addr = SelectUdpBindAddress(config_);
+        auto bind_addr = SelectUdpBindAddress(config_);
+        if (config_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto remote = config_.literal_address.value_or(
+                net::ip::address_v4::any());
+            const auto selected = config_.send_through.Select(
+                remote, ctx.inbound.source_ip, ctx.inbound.source_port);
+            if (selected.unavailable) {
+                co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+            }
+            bind_addr = selected.address.value_or(remote.is_v6()
+                ? net::ip::address(net::ip::address_v6::any())
+                : net::ip::address(net::ip::address_v4::any()));
+        }
         char conn_id_buf[std::numeric_limits<decltype(ctx.conn_id)>::digits10 + 1]{};
         const auto [conn_id_end, conn_id_ec] =
             std::to_chars(conn_id_buf, conn_id_buf + sizeof(conn_id_buf), ctx.conn_id);
@@ -391,8 +403,10 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         .port = config_.port,
         .stream_settings = &config_.stream_settings,
         .timeout = config_.timeout,
-        .send_through = config_.send_through,
+        .send_through = &config_.send_through,
         .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
         .tls_server_name = ResolveOutboundTlsServerName(config_.stream_settings, config_.address),
         .ws_host = config_.address,
     });

@@ -197,8 +197,9 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - Freedom 和 Shadowsocks 原生 UDP 出站使用同一套请求级端点和 relay；写入超时包含域名解析等待，取消一个请求不关闭其他请求共享的 UDP socket。上行半关闭后，在 `timeouts.downlinkOnly` 指定的时间内继续接收回包。每个请求最多排队 256 个原始回包、合计 512 KiB，超限会结束该请求并保留资源不足错误；流量只在成功发送后计入。
 - 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
+- 静态 outbound 的顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组；数组只匹配配置加载时本机已分配且与目标同地址族的 IP，不生成网段内新地址。本机地址变更需重新加载配置。CIDR 命中多个地址时由 `sendThroughStrategy` 选择：默认 `hash`（入站源 IP＋源端口），也可设 `random`。每个目标地址族仅选定一个源 IP：绑定或连接失败不更换同族源 IP；若有同族配置但全部不可用，不回退系统默认源 IP；只有完全没有同族配置才由系统选择。`settings.domainStrategy: "UseIPv6v4"` 下 IPv6 目标失败仍可尝试 IPv4 目标，IPv4 单独选源 IP；若目标已由路由预先解析为单个 IP，则不会重新查询另一地址族。UDP 域名逐包解析，建立 socket 前无法获知每包最终地址族；数组绑定依据请求初始目标地址族。原有字符串 `sendThrough` 行为不变。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
-- 静态 inbound 默认不参与 routing，固定走内置 `direct`；只有配置 `"routingEnabled": true` 时才参与 routing，未命中仍回落 `direct`。静态 inbound 不使用 `outbound` 或 `outboundTag` 选择出口。
+- 静态 inbound 未指定 `outboundTag` 时参与 routing，未命中回落内置 `direct`；指定 `"outboundTag": "出口标签"` 时强制使用该出口，不经过分流（即使规则可命中）。标签必须指向已配置或内置的静态 outbound；不存在或为空会拒绝启动。旧字段 `routingEnabled` 已移除，原先设置 `false` 的入站如需保持直连，请改为 `"outboundTag": "direct"`。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
 - AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.users` 和 `settings.paddingScheme` 配置。
@@ -220,7 +221,7 @@ DNS service 不是全局共享对象。每个 Worker 持有绑定自身 `io_cont
 
 `dns.servers` 中每项可以是裸 IPv4/IPv6（默认 UDP 53），或指定端口的 `127.0.0.1:5353`、`[::1]:5353`。IPv6 带端口时必须使用方括号，端口为 1–65535 的十进制整数；只接受 IP，不使用域名解析 DNS 服务器。配置加载时完成地址与端口拆分并发布完整 endpoint，各 Worker 直接按列表顺序使用；解析、默认值和平台字符串兼容不进入查询路径。
 
-IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式，IPv6 可使用数字 scope ID（如 `fe80::1%3`），不接受 `%eth0` 等接口名。单独的 host、listen、sendThrough 等字段不接受端口、方括号、空白或 NUL 后缀。方括号仅用于支持 endpoint 或 URL 的入口，且括号内必须是 IPv6；出站服务器字段也可以使用合法 DNS 主机名。旧版在部分平台上接受的地址简写或多余后缀不再兼容。
+IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式，IPv6 可使用数字 scope ID（如 `fe80::1%3`），不接受 `%eth0` 等接口名。`sendThrough` 数组项也可使用规范 CIDR。单独的 host、listen、sendThrough 等字段不接受端口、方括号、空白或 NUL 后缀。方括号仅用于支持 endpoint 或 URL 的入口，且括号内必须是 IPv6；出站服务器字段也可以使用合法 DNS 主机名。旧版在部分平台上接受的地址简写或多余后缀不再兼容。
 
 回调型连接超时由每个 Worker 的 TimeoutScheduler 汇聚到一个在途定时等待。取消事件不会重新分配等待或影响其他事件，取消索引在原存储中整理。限速、Mux 背压和 accept 退避的协程休眠由 AsyncDelay 直接等待可取消定时器，不再通过调度回调和通知 channel 中转；只有所属 Worker 能操作这些对象，销毁前必须收束在途协程。
 

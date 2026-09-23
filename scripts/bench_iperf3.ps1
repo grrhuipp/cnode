@@ -288,8 +288,7 @@ function New-CnodeInboundJson([string]$Protocol, [int]$ListenPort) {
     "port": $ListenPort,
     "settings": { $Settings },
     "streamSettings": { "network": "tcp", "security": "none" },
-    "sniffing": { "enabled": false },
-    "routingEnabled": true
+    "sniffing": { "enabled": false }
   }
 ]
 "@

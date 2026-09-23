@@ -1,7 +1,7 @@
 #include "acppnode/infra/outbound_source_config.hpp"
 #include "acppnode/infra/json_object.hpp"
+#include "acppnode/infra/outbound_bind_config.hpp"
 
-#include <format>
 #include <stdexcept>
 #include <utility>
 
@@ -38,18 +38,16 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
             **stream_settings, StreamEndpointRole::Outbound);
     }
 
-    const json::value* send_through = j.if_contains("sendThrough");
+    if (j.contains("send_through") || j.contains("send_through_strategy")) {
+        throw std::invalid_argument("outbound binding must use camelCase sendThrough/sendThroughStrategy");
+    }
+    const auto* send_through = j.if_contains("sendThrough");
+    const auto* strategy = j.if_contains("sendThroughStrategy");
+    if (strategy && !send_through) {
+        throw std::invalid_argument("sendThroughStrategy requires sendThrough");
+    }
     if (send_through) {
-        if (!send_through->is_string()) {
-            throw std::invalid_argument("outbound sendThrough must be a string");
-        }
-        const auto text = send_through->as_string();
-        cfg.send_through = OutboundBind::Parse(text);
-        if (!cfg.send_through) {
-            throw std::invalid_argument(std::format(
-                "outbound sendThrough '{}' must be auto, wildcard, or an IP address",
-                text));
-        }
+        cfg.send_through = ParseOutboundBindConfig(*send_through, strategy);
     }
 
     return cfg;
