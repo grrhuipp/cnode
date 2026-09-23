@@ -168,6 +168,9 @@ public:
             return result;
         }
         Class& cls = classes_[class_index];
+        if (void* reused = TakeFree(cls, bytes, alignment)) {
+            return reused;
+        }
         if (cls.current && CanCarve(*cls.current, stride, alignment)) {
             return Carve(*cls.current, stride, alignment);
         }
@@ -183,7 +186,8 @@ public:
         return Carve(*chunk, stride, alignment);
     }
 
-    void Deallocate(void* pointer) noexcept {
+    void Deallocate(void* pointer, std::size_t bytes = 0,
+                    std::size_t alignment = 0) noexcept {
         if (!pointer) {
             return;
         }
@@ -199,16 +203,41 @@ public:
             return;
         }
         --chunk->live;
-        if (chunk->live != 0) {
+        if (chunk->live == 0) {
+            if (chunk->direct) {
+                ReleaseChunk(*chunk);
+            } else {
+                UnlinkRecyclable(*chunk);
+                chunk->free_head = nullptr;
+                chunk->bump = static_cast<std::byte*>(chunk->map_base) + sizeof(Chunk);
+                MarkIdle(*chunk);
+                PurgeExpired();
+            }
             return;
         }
-        if (chunk->direct) {
-            ReleaseChunk(*chunk);
+        // Only a caller with the original size/alignment can certify the
+        // capacity of this slot. The raw pointer-only API simply lets it die
+        // with its chunk rather than risking an out-of-bounds reuse.
+        if (chunk->direct || alignment == 0 ||
+            (alignment & (alignment - 1)) != 0 ||
+            Lead(alignment) >= chunk->stride ||
+            bytes > chunk->stride - Lead(alignment) ||
+            chunk->stride - Lead(alignment) < sizeof(FreeNode)) {
             return;
         }
-        chunk->bump = static_cast<std::byte*>(chunk->map_base) + sizeof(Chunk);
-        MarkIdle(*chunk);
-        PurgeExpired();
+        auto* node = static_cast<FreeNode*>(pointer);
+        node->capacity = chunk->stride - Lead(alignment);
+        node->next = chunk->free_head;
+        chunk->free_head = node;
+        if (!chunk->in_recyclable) {
+            chunk->in_recyclable = true;
+            chunk->rec_prev = nullptr;
+            chunk->rec_next = classes_[chunk->class_index].recyclable;
+            if (chunk->rec_next) {
+                chunk->rec_next->rec_prev = chunk;
+            }
+            classes_[chunk->class_index].recyclable = chunk;
+        }
     }
 
 protected:
@@ -220,8 +249,8 @@ protected:
         return pointer;
     }
 
-    void do_deallocate(void* pointer, std::size_t, std::size_t) override {
-        Deallocate(pointer);
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override {
+        Deallocate(pointer, bytes, alignment);
     }
 
     [[nodiscard]] bool do_is_equal(
@@ -232,6 +261,7 @@ protected:
 private:
     struct FreeNode {
         FreeNode* next = nullptr;
+        std::size_t capacity = 0;
     };
 
     static constexpr std::uint32_t kChunkMagic = 0xC0DEC0DEu;
@@ -299,6 +329,27 @@ private:
                     return nullptr;
                 }
                 return chunk;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] void* TakeFree(
+        Class& cls, std::size_t bytes, std::size_t alignment) noexcept {
+        for (Chunk* chunk = cls.recyclable; chunk; chunk = chunk->rec_next) {
+            FreeNode** link = &chunk->free_head;
+            while (*link) {
+                FreeNode* node = *link;
+                if (node->capacity >= bytes &&
+                    reinterpret_cast<std::uintptr_t>(node) % alignment == 0) {
+                    *link = node->next;
+                    if (!chunk->free_head) {
+                        UnlinkRecyclable(*chunk);
+                    }
+                    ++chunk->live;
+                    return node;
+                }
+                link = &node->next;
             }
         }
         return nullptr;
@@ -532,7 +583,7 @@ inline thread_local size_t rejected_pmr_allocations = 0;
     void* candidate = base + prefix + link;
     std::size_t space = bytes - prefix - link;
     if (!std::align(alignment, size, candidate, space)) {
-        ThreadPool().Deallocate(raw);
+        ThreadPool().Deallocate(raw, bytes, align);
         return nullptr;
     }
 
@@ -560,8 +611,10 @@ inline void DeallocatePmr(
         OnCrossThreadFree();
         return;
     }
+    const auto bytes = header->bytes;
+    const auto alignment = header->alignment;
     header->~BlockPrefix();
-    ThreadPool().Deallocate(raw);
+    ThreadPool().Deallocate(raw, bytes, alignment);
 }
 
 // 只用于在当前线程创建、并在同一线程销毁的对象。
