@@ -921,6 +921,11 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
     stats.dns_entries    = dns_stats.entries;
 
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
+    const auto pool = memory::ThreadPool().GetFootprint();
+    stats.pool_mapped_bytes = pool.mapped_bytes;
+    stats.pool_direct_bytes = pool.direct_bytes;
+    stats.pool_idle_bytes = pool.idle_bytes;
+    stats.pool_chunks = pool.chunks;
     return stats;
 }
 

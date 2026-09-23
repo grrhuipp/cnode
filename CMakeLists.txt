@@ -1309,6 +1309,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/anytls/inbound
         ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/mux/inbound)
+    target_compile_definitions(cnode_substream_inbound_lifecycle_test PRIVATE CNODE_TEST_BUFFER_STATS)
     target_link_libraries(cnode_substream_inbound_lifecycle_test PRIVATE
         asio::asio Threads::Threads cnode_zlib crypto)
     if(WIN32)
@@ -2025,6 +2026,7 @@ if(CNODE_BUILD_TESTS)
         src/infra/log.cpp)
     target_include_directories(cnode_relay_initial_payload_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
+    target_compile_definitions(cnode_relay_initial_payload_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
     target_link_libraries(cnode_relay_initial_payload_test PRIVATE asio::asio Threads::Threads cnode_zlib)
     if(WIN32)
         target_link_libraries(cnode_relay_initial_payload_test PRIVATE ws2_32)

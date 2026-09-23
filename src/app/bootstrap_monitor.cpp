@@ -137,8 +137,8 @@ net::awaitable<void> RuntimeSamplingLoop(
             constexpr uint64_t kChurnForceCollectConnections = 2048;
             constexpr uint32_t kChurnForceCollectMinConns = 512;
             constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
-            constexpr uint32_t kSteadyCollectMinConns = 512;
             constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
+            constexpr auto kIdleCollectInterval = std::chrono::seconds(1);
 
             uint32_t total_conns = 0;
             for (const auto& worker_snapshot : worker_snapshots) {
@@ -171,22 +171,31 @@ net::awaitable<void> RuntimeSamplingLoop(
                 churn_since_force >= kChurnForceCollectConnections &&
                 (last_force_collect_at.time_since_epoch().count() == 0 ||
                  now - last_force_collect_at >= kChurnForceCollectCooldown);
+            const auto steady_interval = total_conns == 0
+                ? kIdleCollectInterval : kSteadyCollectInterval;
             const bool steady_collect_due =
-                total_conns >= kSteadyCollectMinConns &&
-                (last_steady_collect_at.time_since_epoch().count() == 0 ||
-                 now - last_steady_collect_at >= kSteadyCollectInterval);
+                last_steady_collect_at.time_since_epoch().count() == 0 ||
+                now - last_steady_collect_at >= steady_interval;
 
             if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
                 const char* reason =
                     churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
                 LOG_INFO("mem-collect force reason={} conn={} churn={}",
                          reason, total_conns, churn_since_force);
-                co_await CollectWorkerHeaps(ctx, true);
+                try {
+                    co_await CollectWorkerHeaps(ctx, true);
+                } catch (const std::exception& error) {
+                    LOG_WARN("Worker heap collection skipped: {}", error.what());
+                }
                 last_force_collect_at = now;
                 last_steady_collect_at = now;
                 last_force_collect_total_connections = aggregate_stats.connections_total;
             } else if (steady_collect_due) {
-                co_await CollectWorkerHeaps(ctx, false);
+                try {
+                    co_await CollectWorkerHeaps(ctx, false);
+                } catch (const std::exception& error) {
+                    LOG_WARN("Worker heap collection skipped: {}", error.what());
+                }
                 last_steady_collect_at = now;
             }
 
@@ -240,14 +249,26 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         const double mem_mb = static_cast<double>(ReadResidentMemoryBytes()) / (1024.0 * 1024.0);
 
         size_t total_udp_sessions = 0;
+        size_t pool_mapped_bytes = 0;
+        size_t pool_direct_bytes = 0;
+        size_t pool_idle_bytes = 0;
+        size_t pool_chunks = 0;
         for (const auto& worker_snapshot : worker_snapshots) {
             total_udp_sessions += worker_snapshot.memory.udp_sessions;
+            pool_mapped_bytes += worker_snapshot.memory.pool_mapped_bytes;
+            pool_direct_bytes += worker_snapshot.memory.pool_direct_bytes;
+            pool_idle_bytes += worker_snapshot.memory.pool_idle_bytes;
+            pool_chunks += worker_snapshot.memory.pool_chunks;
         }
         const auto user_stats = proxyman::inbound::UserStore::GetStats();
         LOG_INFO(
-            "runtime conn={} mem={:.1f}MB traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
+            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
             total_conns,
             mem_mb,
+            pool_mapped_bytes / (1024 * 1024),
+            pool_direct_bytes / (1024 * 1024),
+            pool_idle_bytes / 1024,
+            pool_chunks,
             acpp::FormatBytes(snapshot.bytes_in),
             acpp::FormatBytes(snapshot.bytes_out),
             FormatRate(snapshot.bytes_in_rate),

@@ -8,6 +8,7 @@
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/memory_stats.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/infra/config_types.hpp"
@@ -28,36 +29,18 @@
 
 namespace {
 thread_local bool fail_next_allocation = false;
+thread_local bool fail_next_pmr_allocation = false;
 thread_local int allocation_failures = 0;
-thread_local bool track_buffers = false;
-thread_local std::array<void*, 4096> buffer_allocations{};
-thread_local size_t buffer_allocation_count = 0;
-thread_local size_t peak_buffer_allocations = 0;
 thread_local size_t failed_allocation_size = 0;
 }
 void* operator new(std::size_t size) {
     if (std::exchange(fail_next_allocation, false)) {
         ++allocation_failures; failed_allocation_size = size; throw std::bad_alloc();
     }
-    if (auto* result = std::malloc(size ? size : 1)) {
-        if (track_buffers && size == sizeof(acpp::buf::Buffer)) {
-            if (buffer_allocation_count == buffer_allocations.size()) std::abort();
-            buffer_allocations[buffer_allocation_count++] = result;
-            peak_buffer_allocations = std::max(peak_buffer_allocations, buffer_allocation_count);
-        }
-        return result;
-    }
+    if (auto* result = std::malloc(size ? size : 1)) return result;
     throw std::bad_alloc();
 }
-void operator delete(void* value) noexcept {
-    for (size_t i = 0; i < buffer_allocation_count; ++i) {
-        if (buffer_allocations[i] == value) {
-            buffer_allocations[i] = buffer_allocations[--buffer_allocation_count];
-            break;
-        }
-    }
-    std::free(value);
-}
+void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
 void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
     try { return ::operator new(size); } catch (...) { return nullptr; }
@@ -67,6 +50,31 @@ void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator d
 namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
+
+class FailingPmrResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingPmrResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+private:
+    void* do_allocate(size_t size, size_t alignment) override {
+        if (fail_next_pmr_allocation && size == 128) {
+            fail_next_pmr_allocation = false;
+            ++allocation_failures;
+            failed_allocation_size = size;
+            throw std::bad_alloc();
+        }
+        return upstream_->allocate(size, alignment);
+    }
+    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        upstream_->deallocate(pointer, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    std::pmr::memory_resource* upstream_;
+};
+
+size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
+size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
 
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -126,7 +134,7 @@ public:
         state_.offset += count;
         if (state_.fail_queue_reserve && count == 4096) {
             state_.fail_queue_reserve = false;
-            fail_next_allocation = true;
+            fail_next_pmr_allocation = true;
         }
         if (state_.stall_payload && count == 7 && static_cast<const uint8_t*>(output.data())[0] == 2) {
             state_.stall_payload = false;
@@ -749,9 +757,8 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     bool returned = false;
     int active_at_return = -1;
     std::exception_ptr failure;
-    Check(buffer_allocation_count == 0, "buffer accounting must start empty");
-    track_buffers = true;
-    peak_buffer_allocations = 0;
+    Check(BufferCount() == 0, "buffer accounting must start empty");
+    memory::detail::test_buffers_peak = 0;
     net::co_spawn(io, handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, RelayResult) {
@@ -779,7 +786,7 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     stream.record_payload_buffers = mode == 1;
     stream.wake.cancel();
     io.poll();
-    const size_t queued_blocks = buffer_allocation_count;
+    const size_t queued_blocks = BufferCount();
     const bool bounded = queued_blocks <= (expected.size() + 4095) / 4096;
     Check(stream.offset == stream.input.size() && stream.pending_reads == 1,
           "queue must accept the full payload budget independent of frame fragmentation");
@@ -822,12 +829,11 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     Check(returned && active_at_return == 0 && stream.destroyed &&
           stream.pending_reads == 0 && stream.pending_writes == 0,
           "queue storage must not outlive its joined session");
-    Check(buffer_allocation_count == 0, "all queued and in-flight Buffer allocations must be released");
-    track_buffers = false;
+    Check(BufferCount() == 0, "all queued and in-flight Buffer allocations must be released");
     std::cout << "queue-" << names[mode] << " seed=" << seed << " fragments=" << fragments << " queued-blocks=" << queued_blocks
               << " capacity-bytes=" << queued_blocks * buf::Buffer::kSize << " bounded=" << bounded
-              << " peak-blocks=" << peak_buffer_allocations << " released=1\n";
-    if (!baseline) Check(bounded && peak_buffer_allocations <= 24,
+              << " peak-blocks=" << BufferPeak() << " released=1\n";
+    if (!baseline) Check(bounded && BufferPeak() <= 24,
         "queue and current physical frame must stay within their combined Buffer capacity budget");
 }
 
@@ -863,6 +869,12 @@ void TestPeerSettings() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    FailingPmrResource resource(std::pmr::get_default_resource());
+    auto* original = std::pmr::set_default_resource(&resource);
+    struct RestoreResource {
+        std::pmr::memory_resource* original;
+        ~RestoreResource() { std::pmr::set_default_resource(original); }
+    } restore{original};
     try {
         const bool baseline = argc == 2 && std::string_view(argv[1]) == "--observe-baseline";
         if (argc == 2 && std::string_view(argv[1]) == "--identity-baseline") {

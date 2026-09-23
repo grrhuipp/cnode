@@ -15,23 +15,6 @@
 #include <vector>
 
 namespace {
-thread_local bool reject_allocations = false;
-thread_local size_t rejected_allocations = 0;
-}
-
-void* operator new(std::size_t size) {
-    if (reject_allocations) { ++rejected_allocations; throw std::bad_alloc(); }
-    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
-    throw std::bad_alloc();
-}
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
-
-namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
 
@@ -399,16 +382,16 @@ bool TestInitialPayloadAllocation() {
     bytes.fill(0x33);
     InitialPayload initial;
     initial.assign(bytes);
-    const auto before = rejected_allocations;
+    const auto before = memory::rejected_pmr_allocations;
     bool failed = false;
-    reject_allocations = true;
+    memory::reject_next_pmr_allocation = true;
     try { auto payload = initial.MoveToMultiBuffer(); }
     catch (const std::bad_alloc&) { failed = true; }
-    reject_allocations = false;
+    memory::reject_next_pmr_allocation = false;
     const bool retained = initial.size() == bytes.size() &&
         std::equal(initial.span().begin(), initial.span().end(), bytes.begin(), bytes.end());
     auto recovered = initial.MoveToMultiBuffer();
-    const bool passed = failed && retained && rejected_allocations > before &&
+    const bool passed = failed && retained && memory::rejected_pmr_allocations > before &&
         initial.empty() && buf::TotalLen(recovered) == bytes.size();
     std::printf("initial allocation: failed=%d retained=%d recovered=%zu passed=%d\n",
         failed, retained, buf::TotalLen(recovered), passed);

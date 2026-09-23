@@ -111,6 +111,13 @@ inline void OsUnmap(void* address, std::size_t bytes) noexcept {
 
 class ReturningThreadPool final : public std::pmr::memory_resource {
 public:
+    struct Footprint {
+        std::size_t mapped_bytes = 0;
+        std::size_t direct_bytes = 0;
+        std::size_t idle_bytes = 0;
+        std::size_t chunks = 0;
+    };
+
     ReturningThreadPool() = default;
     ReturningThreadPool(const ReturningThreadPool&) = delete;
     ReturningThreadPool& operator=(const ReturningThreadPool&) = delete;
@@ -119,6 +126,8 @@ public:
         next_purge_ = {};
         PurgeExpired();
     }
+
+    [[nodiscard]] Footprint GetFootprint() const noexcept { return footprint_; }
 
     ~ReturningThreadPool() override {
         Chunk* chunk = all_;
@@ -344,6 +353,7 @@ private:
             return;
         }
         chunk.idle = true;
+        footprint_.idle_bytes += chunk.map_bytes;
         chunk.idle_at = std::chrono::steady_clock::now();
     }
 
@@ -352,6 +362,7 @@ private:
             return;
         }
         chunk.idle = false;
+        footprint_.idle_bytes -= chunk.map_bytes;
     }
 
     void PurgeExpired() noexcept {
@@ -407,6 +418,9 @@ private:
         chunk->direct = direct;
         chunk->bump = static_cast<std::byte*>(mapped) + sizeof(Chunk);
         chunk->end = static_cast<std::byte*>(mapped) + map_bytes;
+        footprint_.mapped_bytes += map_bytes;
+        footprint_.direct_bytes += direct ? map_bytes : 0;
+        ++footprint_.chunks;
         LinkAll(*chunk);
         return chunk;
     }
@@ -418,6 +432,10 @@ private:
         }
         UnlinkRecyclable(chunk);
         UnlinkAll(chunk);
+        footprint_.mapped_bytes -= chunk.map_bytes;
+        footprint_.direct_bytes -= chunk.direct ? chunk.map_bytes : 0;
+        footprint_.idle_bytes -= chunk.idle ? chunk.map_bytes : 0;
+        --footprint_.chunks;
         void* mapped = chunk.map_base;
         const std::size_t bytes = chunk.map_bytes;
         chunk.~Chunk();
@@ -466,6 +484,7 @@ private:
 
     std::array<Class, 10> classes_{};
     Chunk* all_ = nullptr;
+    Footprint footprint_{};
     std::chrono::steady_clock::time_point next_purge_{};
 };
 
@@ -474,9 +493,21 @@ private:
     return pool;
 }
 
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+inline thread_local bool reject_next_pmr_allocation = false;
+inline thread_local size_t rejected_pmr_allocations = 0;
+#endif
+
 [[nodiscard]] inline void* AllocatePmr(
     size_t size,
     size_t alignment = alignof(std::max_align_t)) noexcept {
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    if (reject_next_pmr_allocation) {
+        reject_next_pmr_allocation = false;
+        ++rejected_pmr_allocations;
+        return nullptr;
+    }
+#endif
     if (size == 0) {
         size = 1;
     }

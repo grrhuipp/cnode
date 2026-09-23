@@ -75,7 +75,7 @@ function(require_step needle output_name)
     set(${output_name} ${step_position} PARENT_SCOPE)
 endfunction()
 
-require_step("std::make_shared<WorkerRuntimeConfig>" SNAPSHOT_POS)
+require_step("memory::AllocateShared<WorkerRuntimeConfig>" SNAPSHOT_POS)
 require_step("CollectTcpListenerKeys" TCP_PREPARE_POS)
 require_step("CollectUdpSocketKeys" UDP_PREPARE_POS)
 require_step("inbound_manager->RemoveHandler" MANAGER_COMMIT_POS)
