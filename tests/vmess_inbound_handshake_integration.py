@@ -18,7 +18,7 @@ def inbound_settings():
 
 def vmess_outbound(port):
     return {'protocol': 'vmess', 'settings': {
-        'server': '127.0.0.1', 'server_port': port, 'uuid': str(USER)}}
+        'address': '127.0.0.1', 'port': port, 'id': str(USER)}}
 
 
 def vless_inbound(port):
