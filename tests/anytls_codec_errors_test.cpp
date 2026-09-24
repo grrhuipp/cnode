@@ -147,6 +147,30 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
     }
 }
 
+bool RunDeferredBatch() {
+    net::io_context io;
+    Stream stream;
+    if (live != 0) std::abort();
+    tracking = true;
+    auto pending = anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
+    const bool idle_before_await = stream.transferred == 0;
+    bool returned = false;
+    ErrorCode code = ErrorCode::INTERNAL;
+    net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, std::expected<void, ErrorCode> result) {
+        returned = error == nullptr;
+        code = Result(result);
+    });
+    const bool idle_before_run = stream.transferred == 0;
+    io.run();
+    const bool passed = idle_before_await && idle_before_run && returned &&
+        code == ErrorCode::OK && stream.transferred == anytls::kFrameHeaderSize + 1 && live == 0;
+    tracking = false;
+    if (!passed) std::printf("deferred batch: FAIL (idle=%d/%d returned=%s code=%s transferred=%zu live=%zu)\n",
+        idle_before_await, idle_before_run, returned ? "true" : "false",
+        ErrorCodeToString(code).data(), stream.transferred, live);
+    return passed;
+}
+
 bool Run(int operation, Fault fault, size_t threshold) {
     net::io_context io;
     Stream stream;
@@ -186,6 +210,7 @@ bool Run(int operation, Fault fault, size_t threshold) {
 
 int main() {
     size_t passed = 0, total = 0;
+    passed += RunDeferredBatch(); ++total;
     for (int operation = 0; operation < 18; ++operation) {
         passed += Run(operation, Fault::None, 0); ++total;
         for (int fault = 1; fault < 8; ++fault) {

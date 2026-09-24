@@ -192,8 +192,7 @@ WriteMultiBufferAsFrameBatch(AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              buf::MultiBuffer mb) {
-    co_return co_await WriteMultiBufferAsFrameBatchImpl(
-        stream, cmd, sid, std::move(mb));
+    return WriteMultiBufferAsFrameBatchImpl(stream, cmd, sid, std::move(mb));
 }
 
 std::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {

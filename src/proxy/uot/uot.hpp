@@ -116,7 +116,7 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        co_await writer_.WriteMultiBuffer(std::move(mb));
+        return writer_.WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
