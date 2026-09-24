@@ -196,6 +196,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - AnyTLS 出站请求使用统一的 relay 空闲、写入和半关闭超时；持续接收数据不会延长半关闭的绝对截止时间。取消受阻写入会关闭物理会话；成功请求归还前清除请求超时，空闲连接的寿命随后由会话池控制。
 - Freedom 和 Shadowsocks 原生 UDP 出站使用同一套请求级端点和 relay；写入超时包含域名解析等待，取消一个请求不关闭其他请求共享的 UDP socket。上行半关闭后，在 `timeouts.downlinkOnly` 指定的时间内继续接收回包。每个请求最多排队 256 个原始回包、合计 512 KiB，超限会结束该请求并保留资源不足错误；流量只在成功发送后计入。
 - 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
+- WS 入站默认使用 `X-Forwarded-For` 的首个 IP 作为客户端地址；缺失或无效时保留 TCP 对端。`streamSettings.wsSettings.realIpHeader` 可指定其他头，设为 `""` 可关闭该行为。此头可被伪造：仅应通过可信代理访问源站，且代理必须覆盖客户端传入的同名头；当前程序不自行校验代理来源。通过 HTTP 头无法恢复客户端源端口，日志记为 `:0`。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
 - 静态 outbound 的顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组；数组按顺序选首个同地址族条目：单个 IP 直接用，CIDR 从网段中生成一个地址；不检查接口地址或本地路由。CIDR 地址由 `sendThroughStrategy` 选择：默认 `hash`（入站源 IP＋源端口），也可设 `random`。每个目标地址族仅选定一个源 IP：绑定或连接失败不更换同族源 IP，也不回退系统默认源 IP；只有完全没有同族条目才由系统选择。`settings.domainStrategy: "UseIPv6v4"` 下 IPv6 目标失败仍可尝试 IPv4 目标，IPv4 单独选源 IP；若目标已由路由预先解析为单个 IP，则不会重新查询另一地址族。UDP 域名逐包解析，建立 socket 前无法获知每包最终地址族；数组绑定依据请求初始目标地址族。原有字符串 `sendThrough` 行为不变。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。

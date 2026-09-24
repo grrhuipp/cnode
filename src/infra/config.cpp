@@ -836,7 +836,7 @@ WsConfig WsConfig::FromJson(const json::object& j) {
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     require_http_request_target(cfg.path, "ws path");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, {"realIpHeader"}, "");
+    cfg.real_ip_header = jstr(j, {"realIpHeader"}, cfg.real_ip_header);
     require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
 }

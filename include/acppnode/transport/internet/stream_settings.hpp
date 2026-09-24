@@ -64,10 +64,10 @@ struct WsConfig {
     std::string path = std::string(constants::binding::kRootPath);
     transport::internet::HttpHeaders headers;
 
-    // 若非空，从该 HTTP header 提取真实客户端 IP（覆盖 TCP 层地址）。
-    // 典型值："CF-Connecting-IP"、"X-Real-IP"、"X-Forwarded-For"。
-    // 留空则禁用（不信任任何 header）。
-    std::string real_ip_header;
+    // 默认从 X-Forwarded-For 的首个 IP 提取客户端地址（覆盖 TCP 对端）。
+    // 只在源站限制为可信代理且代理覆盖客户端自带 header 时可信。
+    // 显式设为空字符串可禁用；也可选择其他 HTTP header。
+    std::string real_ip_header = "X-Forwarded-For";
 
     static WsConfig FromJson(const json::object& j);
 };
