@@ -2025,7 +2025,7 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_thread_pool_test tests/thread_pool_test.cpp)
     target_include_directories(cnode_thread_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(cnode_thread_pool_test PRIVATE Threads::Threads)
+    target_link_libraries(cnode_thread_pool_test PRIVATE asio::asio Threads::Threads)
     target_compile_options(cnode_thread_pool_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
