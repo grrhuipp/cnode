@@ -257,10 +257,6 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
             (auth_completed_at_us - auth_started_at_us) / 1000,
             std::numeric_limits<uint32_t>::max()));
     }
-    // Authentication and request parsing have succeeded. Raw wire bytes are
-    // retained only for pre-dispatch transport/protocol/security failures.
-    ctx.inbound.read_prefix_capture.reset();
-
     RelayResult result;
     ErrorCode cancellation_reason = ErrorCode::OK;
     try {

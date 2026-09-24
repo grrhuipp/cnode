@@ -16,8 +16,6 @@
 
 namespace acpp {
 
-class ReadPrefixCapture;
-
 namespace session {
 
 struct Context;
@@ -63,9 +61,6 @@ struct Inbound {
     memory::ThreadLocalString transport_route_id;
     uint64_t transport_handshake_ms = 0;
     int64_t transport_ready_at_unix_us = 0;
-    // Worker-local raw wire prefix retained only until protocol admission
-    // succeeds. Error reporting copies it into an owning event value.
-    std::shared_ptr<ReadPrefixCapture> read_prefix_capture;
 };
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

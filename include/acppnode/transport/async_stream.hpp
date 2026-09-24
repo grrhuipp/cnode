@@ -20,7 +20,6 @@ namespace acpp {
 
 class TcpStream;  // 前置声明
 class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
-class ReadPrefixCapture;
 
 class PhaseDeadlineHandle {
 public:
@@ -240,10 +239,6 @@ public:
 
     [[nodiscard]] std::optional<tcp::endpoint> LocalEndpoint() const;
     [[nodiscard]] std::optional<tcp::endpoint> RemoteEndpoint() const;
-
-    // Installs a Worker-local raw inbound prefix capture on the underlying TCP
-    // stream, including transport handshakes such as TLS and WebSocket.
-    void SetReadPrefixCapture(std::shared_ptr<ReadPrefixCapture> capture);
 
 protected:
     void NotifyCancellation() noexcept { Cancellation().CancelPending(); }

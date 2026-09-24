@@ -2,6 +2,7 @@
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
+#include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "anytls_codec.hpp"
 
@@ -14,6 +15,19 @@
 
 namespace {
 using namespace acpp;
+
+// The admission and transport paths must not install or retain raw read bytes.
+template <typename T>
+concept HasReadPrefixCapture = requires(T& value) { value.read_prefix_capture; };
+template <typename T>
+concept HasReadPrefixCaptureSetter = requires(T& value) { value.SetReadPrefixCapture(nullptr); };
+template <typename T>
+concept HasReadPrefixCaptureHook = requires(T& value) { value.CaptureReadPrefix({}); };
+static_assert(!HasReadPrefixCapture<session::Inbound>);
+static_assert(!HasReadPrefixCaptureSetter<AsyncStream>);
+static_assert(!HasReadPrefixCaptureSetter<TcpStream>);
+static_assert(!HasReadPrefixCaptureHook<TcpStream>);
+
 struct State { int fault = 0; int active = 0; bool destroyed = false; };
 
 void Raise(int fault) {
