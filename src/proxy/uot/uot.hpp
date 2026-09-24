@@ -112,7 +112,7 @@ public:
         , writer_(underlying, is_connect, std::move(destination)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        co_return co_await reader_.ReadMultiBuffer();
+        return reader_.ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -121,7 +121,7 @@ public:
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        co_await writer_.WriteBuffers(buffers);
+        return writer_.WriteBuffers(buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {

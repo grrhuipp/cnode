@@ -3,8 +3,11 @@
 #include "shadowsocks_protocol.hpp"
 
 #include <asio/co_spawn.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/this_coro.hpp>
 #include <asio/use_future.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -114,6 +117,75 @@ private:
     std::vector<size_t> fragments_;
     size_t offset_ = 0;
     size_t fragment_index_ = 0;
+};
+
+class FramedEndpointDouble final
+    : public transport::MultiBufferReader
+    , public transport::MultiBufferWriter {
+public:
+    explicit FramedEndpointDouble(std::vector<uint8_t> input = {},
+                                  std::vector<size_t> fragments = {})
+        : reader_(std::move(input), std::move(fragments)) {}
+
+    transport::CancellationSource& Cancellation() noexcept override {
+        return reader_.Cancellation();
+    }
+
+    void Cancel() noexcept { ++cancel_calls; }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        ++read_calls;
+        co_return co_await reader_.ReadMultiBuffer();
+    }
+
+    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer) override {
+        co_return;
+    }
+
+    net::awaitable<void> WriteBuffers(
+        std::span<const net::const_buffer> buffers) override {
+        ++write_calls;
+        descriptor_address = buffers.data();
+        descriptors.assign(buffers.begin(), buffers.end());
+        std::vector<uint8_t> before;
+        for (const auto& buffer : buffers) {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            before.insert(before.end(), data, data + buffer.size());
+        }
+        if (suspend_write) {
+            auto executor = co_await net::this_coro::executor;
+            net::steady_timer timer(executor);
+            timer.expires_after(std::chrono::milliseconds(1));
+            co_await timer.async_wait(net::use_awaitable);
+            resumed = true;
+            Check(buffers.data() == descriptor_address &&
+                  std::equal(buffers.begin(), buffers.end(), descriptors.begin(),
+                      [](const net::const_buffer& left, const net::const_buffer& right) {
+                          return left.data() == right.data() && left.size() == right.size();
+                      }), "UoT write buffer descriptors changed across suspension");
+            std::vector<uint8_t> after;
+            for (const auto& buffer : buffers) {
+                const auto* data = static_cast<const uint8_t*>(buffer.data());
+                after.insert(after.end(), data, data + buffer.size());
+            }
+            Check(after == before, "UoT write buffer bytes changed across suspension");
+        }
+        if (throw_on_write) {
+            throw std::runtime_error("synthetic write failure");
+        }
+        bytes.insert(bytes.end(), before.begin(), before.end());
+    }
+
+    FragmentReader reader_;
+    std::vector<uint8_t> bytes;
+    std::vector<net::const_buffer> descriptors;
+    const net::const_buffer* descriptor_address = nullptr;
+    size_t read_calls = 0;
+    size_t write_calls = 0;
+    size_t cancel_calls = 0;
+    bool suspend_write = false;
+    bool resumed = false;
+    bool throw_on_write = false;
 };
 
 template <typename Factory>
@@ -232,6 +304,69 @@ void TestLargeConnectPacketRoundTrip() {
     });
 }
 
+void TestFramedEndpointWriteAndRead() {
+    const TargetAddress target("1.1.1.1", 53);
+    FramedEndpointDouble underlying;
+    underlying.suspend_write = true;
+    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    auto pending_write = endpoint.WriteMultiBuffer(MakePacket("framed", target));
+    Check(underlying.write_calls == 0 && underlying.bytes.empty(),
+          "UoT framed write started before its awaitable was awaited");
+    Run([&]() -> net::awaitable<void> {
+        co_await std::move(pending_write);
+    });
+    Check(underlying.write_calls == 1 && underlying.resumed,
+          "UoT underlying WriteBuffers did not suspend and resume");
+    Check(underlying.bytes == std::vector<uint8_t>({0, 6, 'f', 'r', 'a', 'm', 'e', 'd'}),
+          "UoT framed endpoint wrote incorrect frame header or payload");
+
+    const std::array<uint8_t, 4> borrowed_payload{'n', 'e', 'x', 't'};
+    const std::array<net::const_buffer, 1> borrowed_buffers{net::buffer(borrowed_payload)};
+    underlying.resumed = false;
+    auto pending_buffers = endpoint.WriteBuffers(borrowed_buffers);
+    Check(underlying.write_calls == 1,
+          "UoT framed WriteBuffers started before its awaitable was awaited");
+    Run([&]() -> net::awaitable<void> {
+        co_await std::move(pending_buffers);
+    });
+    Check(underlying.write_calls == 2 && underlying.resumed &&
+          underlying.bytes == std::vector<uint8_t>(
+              {0, 6, 'f', 'r', 'a', 'm', 'e', 'd', 0, 4, 'n', 'e', 'x', 't'}),
+          "UoT framed WriteBuffers did not preserve the borrowed payload across suspension");
+    endpoint.Cancel();
+    Check(underlying.cancel_calls == 1, "UoT framed endpoint did not forward cancellation");
+
+    FramedEndpointDouble encoded(underlying.bytes, {1, 1, 2, 1, 3});
+    proxy::uot::FramedEndpoint read_endpoint(encoded, true, target);
+    auto pending_read = read_endpoint.ReadMultiBuffer();
+    Check(encoded.read_calls == 0,
+          "UoT framed read started before its awaitable was awaited");
+    Run([&]() -> net::awaitable<void> {
+        auto packet = co_await std::move(pending_read);
+        Check(Flatten(packet) == std::vector<uint8_t>({'f','r','a','m','e','d'}),
+              "UoT framed endpoint failed to read a fragmented frame");
+        auto next = co_await read_endpoint.ReadMultiBuffer();
+        Check(Flatten(next) == std::vector<uint8_t>({'n','e','x','t'}),
+              "UoT framed WriteBuffers payload failed to round-trip");
+    });
+}
+
+void TestFramedEndpointWriteException() {
+    const TargetAddress target("1.1.1.1", 53);
+    FramedEndpointDouble underlying;
+    underlying.throw_on_write = true;
+    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    bool propagated = false;
+    try {
+        Run([&]() -> net::awaitable<void> {
+            co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
+        });
+    } catch (const std::runtime_error& error) {
+        propagated = std::string_view(error.what()) == "synthetic write failure";
+    }
+    Check(propagated, "UoT framed endpoint swallowed the underlying write exception");
+}
+
 void TestNonConnectRequestAndPackets() {
     const TargetAddress initial("dns.example", 53);
     const TargetAddress second("8.8.8.8", 5353);
@@ -283,6 +418,8 @@ int main() {
     TestConnectPacketRoundTrip();
     TestLargeConnectPacketRoundTrip();
     TestNonConnectRequestAndPackets();
+    TestFramedEndpointWriteAndRead();
+    TestFramedEndpointWriteException();
     std::cout << "uot_ss2022_test: ok\n";
     return 0;
 }
