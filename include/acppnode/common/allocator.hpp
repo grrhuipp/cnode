@@ -154,9 +154,10 @@ public:
         if (class_index >= classes_.size()) {
             return AllocateDirect(bytes, alignment);
         }
-        // Large objects each own one mapping. Map their actual size rather
-        // than a rounded-up class, and unmap it at the end of this lifetime.
-        if (stride >= 4096) {
+        // Buffer::New's 8 KiB PMR request has a 16 KiB stride. Reuse the
+        // existing Worker-local chunk for that hot class; other large
+        // requests retain their actual-size, lifetime-bound mappings.
+        if (stride >= 4096 && stride != 16384) {
             return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
