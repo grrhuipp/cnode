@@ -260,35 +260,11 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     RelayResult result;
     ErrorCode cancellation_reason = ErrorCode::OK;
     try {
-        AwaitableTaskGroup* request_group = nullptr;
-        auto request = [&]() -> net::awaitable<void> {
-            struct CancellationContext {
-                AwaitableTaskGroup& group;
-                ErrorCode& reason;
-            } cancellation{*request_group, cancellation_reason};
-            const auto cancel = [](void* raw, transport::Cancellation event) noexcept {
-                auto& state = *static_cast<CancellationContext*>(raw);
-                state.reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
-                state.group.Cancel();
-            };
-            auto* reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
-            std::optional<transport::CancellationSubscription> subscription;
-            if (reader) subscription.emplace(reader->Cancellation(), cancel, &cancellation);
-            if (cancellation_reason != ErrorCode::OK) {
-                stats.OnError();
-                result = MakeRelayError(cancellation_reason);
-                co_return;
-            }
-            result = co_await DispatchPreparedLink(
-                io_context, policy, std::move(inbound), inbound_link,
-                std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout);
-            // The subscription ends inside the child, while its group is
-            // still owned. A successful relay result remains authoritative:
-            // normal relay cleanup also cancels/closes its input transport.
-        };
         co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
-            request_group = &group;
-            group.Spawn(request());
+            group.Spawn(DispatchPreparedLink(
+                io_context, policy, std::move(inbound), inbound_link,
+                std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout,
+                result, group, cancellation_reason));
         });
     } catch (const std::bad_alloc&) {
         stats.OnError();
@@ -316,7 +292,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     co_return result;
 }
 
-net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
+net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
@@ -325,12 +301,36 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
+    uint32_t pressure_idle_timeout,
+    RelayResult& result,
+    AwaitableTaskGroup& request_group,
+    ErrorCode& cancellation_reason) {
+
+    struct CancellationContext {
+        AwaitableTaskGroup& group;
+        ErrorCode& reason;
+    } cancellation{request_group, cancellation_reason};
+    const auto cancel = [](void* raw, transport::Cancellation event) noexcept {
+        auto& state = *static_cast<CancellationContext*>(raw);
+        state.reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
+        state.group.Cancel();
+    };
+    auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
+    std::optional<transport::CancellationSubscription> subscription;
+    if (cancellation_reader) {
+        subscription.emplace(cancellation_reader->Cancellation(), cancel, &cancellation);
+    }
+    if (cancellation_reason != ErrorCode::OK) {
+        stats.OnError();
+        result = MakeRelayError(cancellation_reason);
+        co_return;
+    }
 
     const bool has_protocol_link = inbound_link.Valid();
     if (!inbound && !has_protocol_link) {
         stats.OnError();
-        co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return;
     }
     AsyncStream* inbound_endpoint = inbound.get();
     transport::MultiBufferReader* inbound_reader =
@@ -347,7 +347,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
     if (!ctx.outbound.target.IsValid()) {
         stats.OnError();
         LOG_CONN_DEBUG(ctx, "[Session] Reject invalid outbound target");
-        co_return MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return;
     }
 
     LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
@@ -467,15 +468,18 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             throw;
         } catch (const transport::LinkError& e) {
             stats.OnError();
-            co_return MakeRelayError(e.code());
+            result = MakeRelayError(e.code());
+            co_return;
         } catch (const IoSystemError& e) {
             stats.OnError();
-            co_return MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
+            result = MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
                 ? ErrorCode::TIMEOUT
                 : MapAsioError(e.code()));
+            co_return;
         } catch (...) {
             stats.OnError();
-            co_return MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+            result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+            co_return;
         }
     }
 
@@ -486,12 +490,14 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
             LOG_CONN_WARN(ctx, "destination rejected user={} target={}",
                               ctx.inbound.user_email, ctx.outbound.target);
             stats.OnError();
-            co_return MakeRelayError(ErrorCode::BLOCKED);
+            result = MakeRelayError(ErrorCode::BLOCKED);
+            co_return;
         }
         LOG_CONN_WARN(ctx, "failed to find outbound handler {} -> {} via {}",
                           ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag);
         stats.OnError();
-        co_return MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
+        result = MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
+        co_return;
     }
 
     // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> outbound.Process -> relay。
@@ -555,7 +561,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, ErrorCodeToLogReason(process_error));
         stats.OnError();
-        co_return MakeRelayError(process_error);
+        result = MakeRelayError(process_error);
+        co_return;
     }
     RelayResult relay_result = std::move(*outbound_process);
 
@@ -570,7 +577,8 @@ net::awaitable<RelayResult> DefaultDispatcher::DispatchPreparedLink(
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        ctx.outbound.target);
     }
-    co_return relay_result;
+    result = std::move(relay_result);
+    co_return;
 }
 
 DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(

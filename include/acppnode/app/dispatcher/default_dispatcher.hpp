@@ -29,6 +29,8 @@ class DNS;
 }  // namespace dns
 }  // namespace app
 
+class AwaitableTaskGroup;
+
 namespace app::dispatcher {
 
 namespace detail {
@@ -69,7 +71,7 @@ private:
         ErrorCode error;
     };
 
-    net::awaitable<RelayResult> DispatchPreparedLink(
+    net::awaitable<void> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
@@ -78,7 +80,10 @@ private:
         session::Context& ctx,
         StatsShard& stats,
         const TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout);
+        uint32_t pressure_idle_timeout,
+        RelayResult& result,
+        AwaitableTaskGroup& request_group,
+        ErrorCode& cancellation_reason);
     [[nodiscard]] std::shared_ptr<Outbound> ResolveOutboundHandler(
         std::string_view tag) const noexcept;
     [[nodiscard]] detail::OutboundSelection SelectRoute(

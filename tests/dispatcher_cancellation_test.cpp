@@ -30,6 +30,7 @@ buf::MultiBuffer Payload(size_t size) {
 
 struct State {
     bool block = false;
+    bool return_cancelled = false;
     bool allocation_failure = false;
     ErrorCode read_error = ErrorCode::OK;
     size_t payload_size = 0;
@@ -39,6 +40,7 @@ struct State {
     int committed = 0;
     int cancelled = 0;
     bool destroyed = false;
+    bool notify_closed_on_destroy = false;
     bool closed = false;
     bool cleanup_has_owner = false;
     app::RequestLoadState* load = nullptr;
@@ -63,7 +65,10 @@ net::awaitable<void> Wait(State& state) {
 class Stream final : public AsyncStream {
 public:
     explicit Stream(State& state) : state_(state) {}
-    ~Stream() override { state_.destroyed = true; }
+    ~Stream() override {
+        state_.destroyed = true;
+        if (state_.notify_closed_on_destroy) NotifyClosed();
+    }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer) override { co_return 0; }
     net::awaitable<size_t> AsyncWrite(net::const_buffer data) override {
         state_.written += data.size();
@@ -99,6 +104,11 @@ public:
         ++state.entered;
         if (state.block) co_await Wait(state);
         ++state.committed;
+        if (state.return_cancelled) {
+            RelayResult result;
+            result.error = ErrorCode::CANCELLED;
+            co_return result;
+        }
         if (!relay) co_return RelayResult{};
         Stream target(target_state);
         if (inbound.control) co_return co_await DoRelayLink(io, *inbound.reader,
@@ -129,7 +139,7 @@ public:
 };
 
 enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
-                  Success, RelaySuccess, RelayFailure, SniffMemory, SniffLinkError };
+                  Success, RelaySuccess, RelayFailure, RelayCancelled, SniffMemory, SniffLinkError };
 
 bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     net::io_context io;
@@ -140,6 +150,8 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     source_state.allocation_failure = which == Case::SniffMemory;
     source_state.read_error = which == Case::SniffLinkError ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::OK;
     source_state.payload_size = 7;
+    source_state.notify_closed_on_destroy = controlled &&
+        (which == Case::RelayFailure || which == Case::RelayCancelled);
     auto stream = std::make_unique<Stream>(source_state);
     auto* reader = stream.get();
     Manager manager;
@@ -148,6 +160,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     outbound.state.load = &load;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
     outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
+    outbound.state.return_cancelled = which == Case::RelayCancelled;
     outbound.target_state.payload_size = 13;
     if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::RELAY_READ_FAILED;
     app::dispatcher::DefaultDispatcher dispatcher;
@@ -216,8 +229,15 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     auto expected = reason;
     if (which == Case::Success || which == Case::RelaySuccess) expected = ErrorCode::OK;
     if (which == Case::RelayFailure) expected = ErrorCode::RELAY_READ_FAILED;
+    if (which == Case::RelayCancelled) expected = ErrorCode::CANCELLED;
     if (which == Case::SniffMemory || which == Case::SniffLinkError) expected = ErrorCode::RESOURCE_EXHAUSTED;
     passed &= result.error == expected;
+    if (controlled && which == Case::RelayFailure) {
+        passed &= ctx.outbound.failure_detail_code == ErrorCodeToString(ErrorCode::RELAY_READ_FAILED);
+    }
+    if (controlled && which == Case::RelayCancelled) {
+        passed &= ctx.outbound.failure_detail_code.empty();
+    }
     if (which == Case::PreStopped || which == Case::Sniff || which == Case::RoutingDns ||
         which == Case::SniffMemory || which == Case::SniffLinkError) passed &= manager.lookups == 0 && outbound.state.entered == 0;
     if (source_state.block || outbound.state.block) {
@@ -306,6 +326,7 @@ int main() {
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake, Case::RoutingDns,
                 Case::Parent, Case::Pending, Case::Success, Case::RelaySuccess, Case::RelayFailure,
                 Case::SniffMemory, Case::SniffLinkError}) passed &= Run(which, controlled);
+            if (controlled) passed &= Run(Case::RelayCancelled, true);
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake})
                 passed &= Run(which, controlled, ErrorCode::RESOURCE_EXHAUSTED);
             passed &= SiblingIsolation(controlled);
