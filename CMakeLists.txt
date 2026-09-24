@@ -2704,6 +2704,13 @@ if(CNODE_BUILD_TESTS)
                 --output ${CMAKE_CURRENT_BINARY_DIR}/static_inbound_outbound_integration_test)
         set_tests_properties(cnode_static_inbound_outbound_integration_test PROPERTIES TIMEOUT 40)
         add_test(
+            NAME cnode_vmess_inbound_handshake_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/vmess_inbound_handshake_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/vmess_inbound_handshake_integration_test)
+        set_tests_properties(cnode_vmess_inbound_handshake_integration_test PROPERTIES TIMEOUT 45)
+        add_test(
             NAME cnode_outbound_bind_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/outbound_bind_integration.py

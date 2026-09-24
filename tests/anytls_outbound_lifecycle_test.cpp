@@ -715,6 +715,9 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     fail_allocation_bytes = 0;
     const auto failures_before = allocation_failures;
     Client client;
+    auto control_wire = std::make_shared<Wire>(io);
+    Stream control(control_wire);
+    const bool use_control = mode == 0 || mode == 10 || mode == 11;
     TimeoutToken request_timeout;
     if (mode == 15) request_timeout = TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, [&client] {
         client.source.Stop(ErrorCode::RELAY_TIMEOUT);
@@ -733,7 +736,7 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     std::exception_ptr exception;
     net::cancellation_signal cancellation;
     net::co_spawn(io, handler->Process(io, nullptr, ctx, timeouts,
-        {&client, &client, nullptr}, stats, config, {}, 10s, 10s),
+        {&client, &client, use_control ? &control : nullptr}, stats, config, {}, 10s, 10s),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, OutboundProcessResult result) {
             done = true; exception = failure;
             completed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -807,6 +810,8 @@ bool RunIoFault(int mode, int kind) {
     respond_on_auth = false;
     io_fault_mode = mode;
     io_fault_kind = kind;
+    auto control_wire = std::make_shared<Wire>(io);
+    Stream control(control_wire);
     auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
         ctx.content.network = first && mode == 4 ? Network::UDP : Network::TCP;
@@ -824,7 +829,8 @@ bool RunIoFault(int mode, int kind) {
             payload.push_back(std::move(block));
         }
         co_return co_await handler->Process(io, nullptr, ctx, timeouts,
-            {&client, &client, nullptr}, stats, config, std::move(payload), 10s, 10s);
+            {&client, &client, first && mode == 4 ? &control : nullptr},
+            stats, config, std::move(payload), 10s, 10s);
     };
     // Relay owns payload failures and retains its generic write-phase category
     // for unknown exceptions; the codec must not invent a socket error.

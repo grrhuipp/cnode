@@ -914,13 +914,13 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     RelayResult result;
     auto* inbound_control = inbound.control;
-    auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
+    auto relay_endpoint = [&](auto& endpoint) {
         if (inbound_control) {
-            co_return co_await DoRelayLink(
+            return DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer, *inbound_control,
                 endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
-        co_return co_await DoRelayLink(
+        return DoRelayLink(
             io_context, *inbound.reader, *inbound.writer,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };

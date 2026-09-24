@@ -405,9 +405,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
 
 net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options) {
-    co_return co_await BuildOutboundTransportTargetInternal(
-        std::move(options),
-        true);
+    return BuildOutboundTransportTargetInternal(std::move(options), true);
 }
 
 }  // namespace acpp

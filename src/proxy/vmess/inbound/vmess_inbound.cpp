@@ -128,36 +128,30 @@ proxy::vmess::inbound::Handler::Process(
     }
     uint8_t* handshake_buf = handshake_guard->Tail().data();
     const size_t handshake_capacity = handshake_guard->Available();
-    auto read_handshake = [&]() -> net::awaitable<std::expected<size_t, ErrorCode>> {
-        size_t n = 0;
-        try {
-            n = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
-        } catch (const IoSystemError&) {
-            if (stream->ConsumePhaseDeadline()) {
-                LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
-                                  ctx.inbound.tag, ctx.inbound.source_ip);
-                co_return std::unexpected(ErrorCode::TIMEOUT);
-            }
-            LOG_CONN_WARN(ctx, "[VMess][{}] handshake read failed from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
-        }
-        if (n == 0 && stream->ConsumePhaseDeadline()) {
+    size_t total_read = 0;
+    try {
+        total_read = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
+    } catch (const IoSystemError&) {
+        if (stream->ConsumePhaseDeadline()) {
             LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return fail(ErrorCode::TIMEOUT);
         }
-        if (n == 0 && stream->ConsumeIdleTimeout()) {
-            LOG_CONN_WARN(ctx, "[VMess][{}] handshake idle timeout from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
-        }
-        if (n == 0) co_return std::unexpected(ErrorCode::SOCKET_EOF);
-        co_return n;
-    };
-    auto read_result = co_await read_handshake();
-    if (!read_result) co_return fail(read_result.error());
-    const size_t total_read = *read_result;
+        LOG_CONN_WARN(ctx, "[VMess][{}] handshake read failed from {}",
+                          ctx.inbound.tag, ctx.inbound.source_ip);
+        co_return fail(ErrorCode::SOCKET_READ_FAILED);
+    }
+    if (total_read == 0 && stream->ConsumePhaseDeadline()) {
+        LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
+                          ctx.inbound.tag, ctx.inbound.source_ip);
+        co_return fail(ErrorCode::TIMEOUT);
+    }
+    if (total_read == 0 && stream->ConsumeIdleTimeout()) {
+        LOG_CONN_WARN(ctx, "[VMess][{}] handshake idle timeout from {}",
+                          ctx.inbound.tag, ctx.inbound.source_ip);
+        co_return fail(ErrorCode::TIMEOUT);
+    }
+    if (total_read == 0) co_return fail(ErrorCode::SOCKET_EOF);
 
     LOG_CONN_TRACE(ctx,
                    "[VMess][{}] handshake bytes={} prefix={}",
