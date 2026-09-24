@@ -14,6 +14,7 @@ on:
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
+      - 'tests/**'
   pull_request:
     paths:
       - '.github/workflows/ci.yml'
@@ -25,6 +26,7 @@ on:
       - 'src/**/*.cpp'
       - 'src/**/*.hpp'
       - 'include/**/*.hpp'
+      - 'tests/**'
 
 concurrency:
   group: ci-${{ github.ref }}
