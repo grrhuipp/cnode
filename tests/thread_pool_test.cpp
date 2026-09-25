@@ -260,6 +260,69 @@ bool RunBufferIntegration() {
     return pool.GetFootprint().mapped_bytes == 0 && pool.GetFootprint().chunks == 0;
 }
 
+bool RunIdleAccounting() {
+    using acpp::memory::kThreadPoolChunkBytes;
+    using acpp::memory::kThreadPoolPurgeDelay;
+
+    // A pool with no idle chunks can become idle later and must still return
+    // that chunk after its original idle delay.
+    {
+        acpp::memory::ReturningThreadPool pool;
+        void* block = pool.Allocate(128, 16);
+        if (!block || pool.GetFootprint().idle_bytes != 0) return false;
+        pool.Deallocate(block, 128, 16);
+        if (pool.GetFootprint().idle_bytes != kThreadPoolChunkBytes) return false;
+        std::this_thread::sleep_for(kThreadPoolPurgeDelay + std::chrono::milliseconds(5));
+        // Exercise the automatic Allocate path without Purge() resetting the
+        // deadline. A different class cannot consume the old idle chunk.
+        void* next = pool.Allocate(8192, 16);
+        if (!next || pool.GetFootprint().chunks != 1 ||
+            pool.GetFootprint().idle_bytes != 0) return false;
+        pool.Deallocate(next, 8192, 16);
+        std::this_thread::sleep_for(kThreadPoolPurgeDelay + std::chrono::milliseconds(5));
+        pool.Purge();
+        if (pool.GetFootprint().mapped_bytes != 0 || pool.GetFootprint().idle_bytes != 0)
+            return false;
+    }
+
+    // Purging an expired idle chunk must not release a different live chunk.
+    {
+        acpp::memory::ReturningThreadPool pool;
+        void* idle = pool.Allocate(128, 16);
+        void* live = pool.Allocate(8192, 16);
+        if (!idle || !live || pool.GetFootprint().chunks != 2) return false;
+        std::memset(live, 0xa5, 8192);
+        pool.Deallocate(idle, 128, 16);
+        std::this_thread::sleep_for(kThreadPoolPurgeDelay + std::chrono::milliseconds(5));
+        pool.Purge();
+        const auto footprint = pool.GetFootprint();
+        if (footprint.chunks != 1 || footprint.mapped_bytes != kThreadPoolChunkBytes ||
+            footprint.idle_bytes != 0 || footprint.direct_bytes != 0)
+            return false;
+        for (std::size_t i = 0; i < 8192; ++i)
+            if (static_cast<const std::uint8_t*>(live)[i] != 0xa5) return false;
+        pool.Deallocate(live, 8192, 16);
+    }
+
+    // Reusing the final idle chunk removes it from idle accounting; returning
+    // its last live allocation adds it back exactly once.
+    {
+        acpp::memory::ReturningThreadPool pool;
+        void* block = pool.Allocate(128, 16);
+        if (!block) return false;
+        pool.Deallocate(block, 128, 16);
+        if (pool.GetFootprint().idle_bytes != kThreadPoolChunkBytes) return false;
+        void* reused = pool.Allocate(128, 16);
+        auto footprint = pool.GetFootprint();
+        if (!reused || footprint.chunks != 1 || footprint.idle_bytes != 0) return false;
+        pool.Deallocate(reused, 128, 16);
+        footprint = pool.GetFootprint();
+        if (footprint.chunks != 1 || footprint.idle_bytes != kThreadPoolChunkBytes)
+            return false;
+    }
+    return true;
+}
+
 bool RunPmr() {
     for (auto alignment : {std::size_t{8}, std::size_t{64}, std::size_t{4096}}) {
         void* block = acpp::memory::AllocatePmr(8192, alignment);
@@ -275,9 +338,9 @@ bool RunPmr() {
 
 int main() {
     bool worker = false;
-    std::thread thread([&worker] { worker = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunBufferIntegration() && RunPmr(); });
+    std::thread thread([&worker] { worker = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunBufferIntegration() && RunIdleAccounting() && RunPmr(); });
     thread.join();
-    const bool main_thread = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunBufferIntegration() && RunPmr();
+    const bool main_thread = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunBufferIntegration() && RunIdleAccounting() && RunPmr();
     std::printf("pool same-thread direct/reuse/alignment/purge/Buffer: %s\n",
                 worker && main_thread ? "PASS" : "FAIL");
     return worker && main_thread ? 0 : 1;

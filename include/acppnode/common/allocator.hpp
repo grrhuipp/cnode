@@ -320,6 +320,9 @@ private:
     }
 
     [[nodiscard]] Chunk* FindIdle(std::size_t class_index, std::size_t stride) noexcept {
+        if (footprint_.idle_bytes == 0) {
+            return nullptr;
+        }
         for (Chunk* chunk = all_; chunk; chunk = chunk->all_next) {
             if (chunk->idle && !chunk->direct &&
                 chunk->class_index == class_index && chunk->stride == stride) {
@@ -421,6 +424,9 @@ private:
     }
 
     void PurgeExpired() noexcept {
+        if (footprint_.idle_bytes == 0) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now < next_purge_) {
             return;
