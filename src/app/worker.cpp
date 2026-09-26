@@ -23,6 +23,7 @@
 #include "acppnode/app/proxyman/outbound/manager.hpp"
 #include "acppnode/app/session_tracking.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "acppnode/app/udp_session.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -126,6 +127,7 @@ struct Worker::RuntimeState {
     RuntimeState(net::io_context& io_context,
                  const WorkerRuntimeConfig& runtime_config,
                  StatsShard& stats_ref,
+                 app::dns::DNSWorker& dns_worker,
                  geo::GeoManager* geo_manager_ref)
         : io_context(io_context)
         , runtime_snapshot(std::make_shared<WorkerRuntimeConfig>(runtime_config))
@@ -136,7 +138,7 @@ struct Worker::RuntimeState {
         , listener_state(std::make_unique<ListenerState>())
         , inbound_manager(std::make_unique<proxyman::inbound::Manager>(stats))
         , session_tracking(std::make_unique<app::SessionTrackingState>())
-        , dns_service(std::make_unique<app::dns::DNS>(io_context, runtime_config.dns))
+        , dns_service(std::make_unique<app::dns::DNS>(dns_worker))
         , udp_session_manager(std::make_unique<UDPSessionManager>(
               io_context,
               *dns_service,
@@ -216,10 +218,11 @@ void RemoveInboundRuntimeFromSnapshot(WorkerRuntimeConfig& snapshot, std::string
 
 Worker::Worker(uint32_t id, net::io_context& io_context,
                const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
+               app::dns::DNSWorker& dns_worker,
                geo::GeoManager* geo_manager)
     : id_(id)
     , runtime_(std::make_unique<RuntimeState>(
-          io_context, runtime_config, stats, geo_manager))
+          io_context, runtime_config, stats, dns_worker, geo_manager))
     , mailbox_(std::make_unique<WorkerMailbox>(
           runtime_->io_context,
           runtime_config.mailbox_capacity == 0
@@ -295,15 +298,8 @@ void Worker::RuntimeState::InitRouter(
 // ============================================================================
 
 bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& binding) {
-#ifdef _WIN32
-    // Windows has no SO_REUSEPORT-equivalent listener distribution.  Keep the
-    // accepted socket on its owning Worker instead of exporting Worker pointers
-    // and native handles across io_context boundaries.
-    if (worker.Id() != 0) {
-        return true;
-    }
-#endif
-
+    // Windows uses SO_REUSEADDR as an explicitly accepted degradation of
+    // SO_REUSEPORT: every Worker still owns its own listener and connections.
     auto inbound_handler = worker.runtime_->inbound_manager->GetHandler(binding.tag);
     if (!inbound_handler) {
         LOG_ERROR("Worker[{}]: TCP listener tag={} has no inbound handler",
@@ -389,6 +385,10 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         }
 
         candidate_acceptor->set_option(net::socket_base::reuse_address(true), ec);
+        if (ec) {
+            if (fail_candidate("set SO_REUSEADDR", ec.message())) continue;
+            break;
+        }
 
 #ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡。
@@ -449,8 +449,13 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
                       AcceptLoop(worker, listener_key, binding.tag, acceptor, &listener_slot),
                       [](std::exception_ptr) {});
 
+#ifdef _WIN32
+        LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
+                  worker.id_, listener_key, binding.tag, binding.protocol);
+#else
         LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, listener_key, binding.tag, binding.protocol);
+#endif
     }
     return true;
 }
@@ -918,9 +923,7 @@ Worker::GetDetectResultTask(std::string tag) {
 Worker::MemoryStats Worker::GetMemoryStats() const {
     MemoryStats stats;
 
-    auto dns_stats       = runtime_->dns_service->GetCacheStats();
-    stats.dns_entries    = dns_stats.entries;
-
+    // DNS cache lives on the dedicated DNS Worker, not this data Worker.
     stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
     const auto pool = memory::ThreadPool().GetFootprint();
     stats.pool_mapped_bytes = pool.mapped_bytes;
@@ -934,7 +937,6 @@ net::awaitable<Worker::RuntimeStatsSnapshot>
 Worker::CollectRuntimeStatsTask() const {
     RuntimeStatsSnapshot snapshot;
     snapshot.memory = GetMemoryStats();
-    snapshot.dns_cache = runtime_->dns_service->GetCacheStats();
     snapshot.stats = runtime_->stats.Snapshot();
     snapshot.active_connections = runtime_->request_load.ActiveConnections();
     co_return snapshot;
@@ -982,14 +984,7 @@ bool Worker::ListenerState::StartUdpListening(
     Worker& worker,
     const PortBinding& binding,
     std::unique_ptr<Inbound> handler) {
-#ifdef _WIN32
-    // TCP follows the same ownership rule above.  A UDP socket and its client
-    // session table stay on the Worker that bound the socket.
-    if (worker.Id() != 0) {
-        return true;
-    }
-#endif
-
+    // TCP and UDP listeners both remain local to the Worker that bound them.
     for (const auto& [tag, slot] : listener_slots) {
         if (tag != binding.tag && slot.udp_binding &&
             slot.udp_binding->port == binding.port &&
@@ -1060,6 +1055,10 @@ bool Worker::ListenerState::StartUdpListening(
         }
 
         candidate_sock->set_option(net::socket_base::reuse_address(true), ec);
+        if (ec) {
+            if (fail_candidate("set SO_REUSEADDR", ec.message())) continue;
+            break;
+        }
 
 #ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡。
@@ -1125,8 +1124,13 @@ bool Worker::ListenerState::StartUdpListening(
                           std::move(bound_sock), &listener_slot),
                       [](std::exception_ptr) {});
 
+#ifdef _WIN32
+        LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
+                  worker.id_, socket_key, binding.tag, binding.protocol);
+#else
         LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, socket_key, binding.tag, binding.protocol);
+#endif
     }
     return true;
 }

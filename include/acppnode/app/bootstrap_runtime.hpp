@@ -9,6 +9,7 @@ namespace acpp {
 class Controller;
 class ShardedStats;
 class Worker;
+namespace app::dns { class DNSWorker; }
 struct InboundStartup;
 }
 
@@ -21,6 +22,7 @@ struct RuntimeContext {
     Controller& controller;
     const std::vector<std::unique_ptr<net::io_context>>& io_contexts;
     InboundStartup& inbound_startup;
+    app::dns::DNSWorker& dns_worker;
     bool enable_controller = false;
 };
 

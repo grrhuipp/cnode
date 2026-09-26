@@ -116,8 +116,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
+#ifdef _WIN32
+    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEADDR allocator=thread-local",
+                config.GetWorkers(), IoBackendName());
+#else
     LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
                 config.GetWorkers(), IoBackendName());
+#endif
 
     if (!config.Validate()) {
         std::cerr << "Invalid configuration\n";

@@ -34,54 +34,6 @@ namespace acpp::app::dispatcher {
 
 namespace {
 
-class CachedMultiBufferReader final : public transport::MultiBufferReader {
-public:
-    explicit CachedMultiBufferReader(transport::MultiBufferReader& inner) noexcept
-        : inner_(inner) {}
-
-    void Preload(buf::MultiBuffer payload) {
-        if (payload.empty()) {
-            return;
-        }
-        payload.MoveTo(cache_);
-        cached_ = true;
-    }
-
-    net::awaitable<bool> CacheMore() {
-        auto payload = co_await inner_.ReadMultiBuffer();
-        if (payload.empty()) {
-            co_return false;
-        }
-        payload.MoveTo(cache_);
-        cached_ = true;
-        co_return true;
-    }
-
-    [[nodiscard]] const buf::MultiBuffer& Cached() const noexcept { return cache_; }
-    [[nodiscard]] size_t CachedBytes() const noexcept { return buf::TotalLen(cache_); }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (cached_) {
-            cached_ = false;
-            co_return std::move(cache_);
-        }
-        co_return co_await inner_.ReadMultiBuffer();
-    }
-
-    transport::CancellationSource& Cancellation() noexcept override {
-        return inner_.Cancellation();
-    }
-
-    transport::EofAction ReadEofAction() const noexcept override {
-        return inner_.ReadEofAction();
-    }
-
-private:
-    transport::MultiBufferReader& inner_;
-    buf::MultiBuffer cache_;
-    bool cached_ = false;
-};
-
 void ApplySniffOverride(
     session::Context& ctx,
     const SniffConfig& sniffing,
@@ -355,10 +307,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                    ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
 
     buf::MultiBuffer outbound_first_payload;
-    std::optional<CachedMultiBufferReader> cached_reader;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
         using net::experimental::awaitable_operators::operator||;
-        static constexpr size_t kSniffMaxBytes = 32767;
+        static constexpr size_t kSniffMaxBytes = 4096;
+        buf::MultiBuffer sniff_payload;
         static constexpr auto kTcpSniffWindow = std::chrono::milliseconds(200);
         static constexpr auto kUdpSniffWindow = std::chrono::seconds(3);
         const auto sniff_window = ctx.content.network == Network::UDP
@@ -384,7 +336,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         };
 
         auto sniff_cached = [&]() {
-            const auto sniff_data = copy_cached_bytes(cached_reader->Cached());
+            const auto sniff_data = copy_cached_bytes(sniff_payload);
             if (sniff_data.empty()) {
                 return SniffResult{};
             }
@@ -393,16 +345,21 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 
         try {
             if (inbound_reader) {
-                cached_reader.emplace(*inbound_reader);
-                inbound_reader = &*cached_reader;
-                inbound_link.reader = inbound_reader;
+                auto cache_more = [&]() -> net::awaitable<bool> {
+                    auto payload = co_await inbound_reader->ReadMultiBuffer();
+                    if (payload.empty()) {
+                        co_return false;
+                    }
+                    payload.MoveTo(sniff_payload);
+                    co_return true;
+                };
                 if (!first_packet.empty()) {
-                    cached_reader->Preload(first_packet.MoveToMultiBuffer());
+                    sniff_payload = first_packet.MoveToMultiBuffer();
                 } else {
                     if (inbound_control) {
                         inbound_control->SetReadTimeout(timeouts.ReadTimeout());
                     }
-                    (void)co_await cached_reader->CacheMore();
+                    (void)co_await cache_more();
                 }
 
                 const auto sniff_started = std::chrono::steady_clock::now();
@@ -419,7 +376,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                             break;
                         }
                     }
-                    if (cached_reader->CachedBytes() >= kSniffMaxBytes) {
+                    if (buf::TotalLen(sniff_payload) >= kSniffMaxBytes) {
                         break;
                     }
                     const auto remaining = sniff_window -
@@ -428,19 +385,20 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                     if (remaining <= std::chrono::milliseconds::zero()) {
                         break;
                     }
-                    const auto bytes_before = cached_reader->CachedBytes();
+                    const auto bytes_before = buf::TotalLen(sniff_payload);
                     net::steady_timer timer(io_context);
                     timer.expires_after(remaining);
                     try {
-                        co_await (cached_reader->CacheMore() ||
+                        co_await (cache_more() ||
                                   timer.async_wait(net::use_awaitable));
                     } catch (...) {
                         break;
                     }
-                    if (cached_reader->CachedBytes() <= bytes_before) {
+                    if (buf::TotalLen(sniff_payload) <= bytes_before) {
                         break;
                     }
                 }
+                outbound_first_payload = std::move(sniff_payload);
             } else if (!first_packet.empty()) {
                 const auto sniff_data = first_packet.IsContiguous()
                     ? first_packet.span()

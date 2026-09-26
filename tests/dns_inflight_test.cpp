@@ -1,4 +1,5 @@
 #include "app/dns/inflight_resolves.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "app/dns/global_cache.hpp"
 #include "acppnode/common/allocator.hpp"
 
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <new>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 
@@ -164,6 +166,121 @@ void TestSubscriberCancellation() {
             "the cancelled subscriber must observe cancellation");
 }
 
+void TestDNSWorker() {
+    acpp::app::dns::Config config;
+    config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
+    config.global_cache_size = 0;
+    net::io_context main_context;
+    auto main_guard = net::make_work_guard(main_context);
+    acpp::app::dns::DNSWorker worker(main_context, config, 8);
+    net::io_context first_io;
+    net::io_context second_io;
+    acpp::app::dns::DNS first(worker);
+    acpp::app::dns::DNS second(worker);
+    std::array<DnsResult, 2> answers;
+    std::array<std::exception_ptr, 2> failures;
+    size_t completed = 0;
+    auto finish = [&] {
+        net::post(main_context, [&] {
+            if (++completed == 2) main_guard.reset();
+        });
+    };
+    net::co_spawn(first_io, first.Resolve("192.0.2.1"),
+                  [&](std::exception_ptr error, DnsResult result) {
+                      failures[0] = error;
+                      answers[0] = std::move(result);
+                      finish();
+                  });
+    net::co_spawn(second_io, second.Resolve("192.0.2.2"),
+                  [&](std::exception_ptr error, DnsResult result) {
+                      failures[1] = error;
+                      answers[1] = std::move(result);
+                      finish();
+                  });
+    std::thread first_thread([&] { first_io.run(); });
+    std::thread second_thread([&] { second_io.run(); });
+    main_context.run();
+    first_thread.join();
+    second_thread.join();
+    Require(!failures[0] && !failures[1] && answers[0].Ok() && answers[1].Ok() &&
+                answers[0].addresses[0] == net::ip::make_address("192.0.2.1") &&
+                answers[1].addresses[0] == net::ip::make_address("192.0.2.2"),
+            "multiple caller executors must receive owned answers from one DNS Worker");
+}
+
+void TestDNSWorkerCancellation() {
+    net::io_context caller;
+    net::ip::udp::socket sink(caller, {net::ip::address_v4::loopback(), 0});
+    acpp::app::dns::Config config;
+    config.servers = {sink.local_endpoint()};
+    config.timeout_sec = 2;
+    config.global_cache_size = 0;
+    acpp::app::dns::DNSWorker worker(caller, config, 8);
+    acpp::app::dns::DNS client(worker);
+    net::cancellation_signal signal;
+    bool completed = false;
+    net::co_spawn(caller, client.Resolve("cancel-dns-worker.example"),
+        net::bind_cancellation_slot(signal.slot(),
+            [&](std::exception_ptr, DnsResult) { completed = true; }));
+    net::steady_timer timer(caller, 50ms);
+    timer.async_wait([&](const acpp::IoErrorCode& ec) {
+        if (!ec) signal.emit(net::cancellation_type::terminal);
+    });
+    caller.run_for(1s);
+    Require(completed, "cancellation must stop waiting for the main control Worker's DNS service");
+}
+
+void TestDNSWorkerCapacity() {
+    net::io_context main_context;
+    net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
+    acpp::app::dns::Config config;
+    config.servers = {sink.local_endpoint()};
+    config.timeout_sec = 2;
+    config.global_cache_size = 0;
+    acpp::app::dns::DNSWorker worker(main_context, config, 1);
+    acpp::app::dns::DNS client(worker);
+    net::cancellation_signal cancel;
+    bool owner_done = false;
+    bool rejected = false;
+    std::exception_ptr failure;
+    net::steady_timer watchdog(main_context, 1s);
+    watchdog.async_wait([&](const acpp::IoErrorCode& error) {
+        if (!error) {
+            cancel.emit(net::cancellation_type::terminal);
+            sink.cancel();
+        }
+    });
+    net::co_spawn(main_context, client.Resolve("capacity.example"),
+        net::bind_cancellation_slot(cancel.slot(),
+            [&](std::exception_ptr, DnsResult) { owner_done = true; }));
+    // Receiving the first upstream packet proves the only mailbox slot is held.
+    std::array<uint8_t, 512> query{};
+    net::ip::udp::endpoint sender;
+    sink.async_receive_from(net::buffer(query), sender,
+        [&](const acpp::IoErrorCode& error, size_t) {
+            if (error) return;
+            net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+                [&](std::exception_ptr error, DnsResult result) {
+                    failure = error;
+                    rejected = result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+                    cancel.emit(net::cancellation_type::terminal);
+                    watchdog.cancel();
+                });
+        });
+    main_context.run();
+    Require(owner_done && !failure && rejected,
+            "a full DNS mailbox must reject rather than queue another query");
+
+    main_context.restart();
+    bool recovered = false;
+    net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+        [&](std::exception_ptr error, DnsResult result) {
+            recovered = !error && result.Ok();
+        });
+    main_context.run();
+    Require(recovered, "cancellation must release the DNS mailbox slot");
+}
+
 void TestL1WarmFailure() {
     net::io_context io;
     acpp::app::dns::Config config;
@@ -222,6 +339,9 @@ int main() {
         TestCompletion(Failure::ResultCopy);
         TestSubscriberCancellation();
         TestL1WarmFailure();
+        TestDNSWorker();
+        TestDNSWorkerCancellation();
+        TestDNSWorkerCapacity();
     } catch (const std::exception& error) {
         fail_size = 0;
         fail_worker_size = 0;

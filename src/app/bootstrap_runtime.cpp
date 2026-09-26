@@ -52,7 +52,11 @@ namespace acpp {
         }
 
         LOG_CONSOLE("");
+#ifdef _WIN32
+        LOG_CONSOLE("server started workers={} accept=SO_REUSEADDR", ctx.workers.size());
+#else
         LOG_CONSOLE("server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
+#endif
         LOG_CONSOLE("shutdown shortcut=Ctrl+C");
 
         if (ctx.enable_controller) {

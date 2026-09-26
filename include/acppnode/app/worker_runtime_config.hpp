@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/app/dns/config.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 #include "acppnode/app/static_inbound_prepared_config.hpp"
@@ -15,7 +14,6 @@ namespace acpp {
 struct WorkerRuntimeConfig {
     uint64_t runtime_generation = 1;
     uint64_t config_generation = 1;
-    ::acpp::app::dns::Config dns;
     TimeoutsConfig timeouts;
     LimitsConfig limits;
     RoutingConfig routing;

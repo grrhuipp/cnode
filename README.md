@@ -16,7 +16,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
-- 默认按多 Worker 运行；每个 Worker 同构，各自拥有全部监听和热路径资源。进程只共享启动后只读的快照、有界日志队列和控制面。
+- 默认按多数据 Worker 运行；各数据 Worker 同构，分别拥有监听和转发资源。Linux 使用 `SO_REUSEPORT`；Windows 使用 `SO_REUSEADDR` 作为允许的降级，不保证相同的连接分布。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 架构总览
@@ -51,7 +51,7 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个 Worker 独立绑定同一组端口（`SO_REUSEPORT`），连接不跨线程迁移。跨线程控制面经有界 mailbox 投递；用户认证、DNS L2 和 Geo 以不可变 snapshot 共享，不共享 live handler、会话或 allocator。
+每个数据 Worker 独立绑定同一组端口（Linux `SO_REUSEPORT`，Windows 降级为 `SO_REUSEADDR`），连接不跨线程迁移。面板与数据 Worker 经有界入口访问主控线程上的 DNSWorker；其他跨线程控制面经有界 mailbox 投递，不共享 live handler、会话或 allocator。
 
 这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
@@ -81,11 +81,11 @@ api/* panel users
 DNS 缓存链路：
 
 ```text
-Worker DNS service
-  -> Worker-local L1 cache
-  -> GlobalDnsCache sharded immutable RCU snapshot
+数据 Worker / panel DNS 客户端
+  -> 主控 Worker 上 DNSWorker 的有界 mailbox
+  -> 主控线程独占的缓存 / 同域在途查询
   -> upstream DNS query
-  -> publish DNS result snapshot
+  -> 按值返回解析结果
 ```
 
 ## 职责速览
@@ -218,15 +218,15 @@ AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界�
 
 `--test` 仍提供 `test-vmess-10086` 入站；未配置面板和静态入站时也会启用该默认测试入站。它与普通静态入站使用相同的准备流程，同名标签或重叠监听会在 Worker 创建之前报错，不能通过追加测试入站覆盖已有配置。
 
-DNS service 不是全局共享对象。每个 Worker 持有绑定自身 `io_context` 的 DNS service、inflight resolve 表、UDP socket、timeout scheduler 和 L1 cache。进程级 `GlobalDnsCache` 只保存 DNS 结果的不可变分片快照，热路径只做 atomic load 和只读查询。
+生产环境只有一个主控 Worker，与主线程合并。面板、监控和 DNSWorker 共用主线程的 `io_context`；DNSWorker 不创建额外线程，独占 DNS service、缓存、在途查询、UDP socket 和 DNS 超时状态。数据 Worker 和面板持有 DNS 客户端，域名按值经有界 mailbox 投递，结果按值返回；数据 Worker 不持有 DNS live 状态。
 
-`dns.servers` 中每项可以是裸 IPv4/IPv6（默认 UDP 53），或指定端口的 `127.0.0.1:5353`、`[::1]:5353`。IPv6 带端口时必须使用方括号，端口为 1–65535 的十进制整数；只接受 IP，不使用域名解析 DNS 服务器。配置加载时完成地址与端口拆分并发布完整 endpoint，各 Worker 直接按列表顺序使用；解析、默认值和平台字符串兼容不进入查询路径。
+`dns.servers` 中每项可以是裸 IPv4/IPv6（默认 UDP 53），或指定端口的 `127.0.0.1:5353`、`[::1]:5353`。IPv6 带端口时必须使用方括号，端口为 1–65535 的十进制整数；只接受 IP，不使用域名解析 DNS 服务器。配置加载时完成地址与端口拆分并发布完整 endpoint，主控线程上的 DNSWorker 按列表顺序使用；解析、默认值和平台字符串兼容不进入查询路径。
 
 IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式，IPv6 可使用数字 scope ID（如 `fe80::1%3`），不接受 `%eth0` 等接口名。`sendThrough` 数组项也可使用规范 CIDR。单独的 host、listen、sendThrough 等字段不接受端口、方括号、空白或 NUL 后缀。方括号仅用于支持 endpoint 或 URL 的入口，且括号内必须是 IPv6；出站服务器字段也可以使用合法 DNS 主机名。旧版在部分平台上接受的地址简写或多余后缀不再兼容。
 
 回调型连接超时由每个 Worker 的 TimeoutScheduler 汇聚到一个在途定时等待。取消事件不会重新分配等待或影响其他事件，取消索引在原存储中整理。限速、Mux 背压和 accept 退避的协程休眠由 AsyncDelay 直接等待可取消定时器，不再通过调度回调和通知 channel 中转；只有所属 Worker 能操作这些对象，销毁前必须收束在途协程。
 
-同一 Worker 的并发同域查询共享一次解析和完成信号，每个调用者独立取得结果。等待者取消不会取消其他请求；缓存写入分配失败也不会丢失已经取得的答案。L1 在完整构建新条目后才淘汰旧条目，从 L2 回填时保留剩余 TTL。
+DNSWorker 将多个调用者的并发同域查询合并为一次解析，每个调用者独立取得结果。缓存写入分配失败不会丢失已经取得的答案；缓存在完整构建新条目后才淘汰旧条目。
 
 Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
 

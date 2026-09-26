@@ -12,6 +12,7 @@
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_stats.hpp"
@@ -41,6 +42,7 @@ struct MonitorContext {
     ShardedStats& stats;
     const std::vector<std::unique_ptr<Worker>>& workers;
     Controller& controller;
+    app::dns::DNSWorker& dns_worker;
 };
 
 size_t ReadResidentMemoryBytes() {
@@ -229,24 +231,11 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
 
-        ::acpp::app::dns::DnsCacheStats dns_l1_stats;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            dns_l1_stats.hits    += worker_snapshot.dns_cache.hits;
-            dns_l1_stats.misses  += worker_snapshot.dns_cache.misses;
-            dns_l1_stats.entries += worker_snapshot.dns_cache.entries;
-            dns_l1_stats.capacity += worker_snapshot.dns_cache.capacity;
-            dns_l1_stats.expired += worker_snapshot.dns_cache.expired;
-        }
-        const auto dns_l2_stats = app::dns::DNS::GetGlobalCacheStats();
-
-        double dns_hit_rate = 0.0;
-        uint64_t dns_total = dns_l1_stats.hits + dns_l1_stats.misses;
-        if (dns_total > 0) {
-            const uint64_t l2_hits_for_workers =
-                std::min(dns_l2_stats.hits, dns_l1_stats.misses);
-            dns_hit_rate = 100.0 * static_cast<double>(dns_l1_stats.hits + l2_hits_for_workers)
-                                 / static_cast<double>(dns_total);
-        }
+        const auto dns_stats = co_await ctx.dns_worker.GetCacheStats();
+        const uint64_t dns_total = dns_stats.hits + dns_stats.misses;
+        const double dns_hit_rate = dns_total > 0
+            ? 100.0 * static_cast<double>(dns_stats.hits) / static_cast<double>(dns_total)
+            : 0.0;
 
         uint32_t total_conns = 0;
         for (const auto& worker_snapshot : worker_snapshots) {
@@ -269,7 +258,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         }
         const auto user_stats = proxyman::inbound::UserStore::GetStats();
         LOG_INFO(
-            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_l1={}/{} dns_l2={}/{} udp_sessions={} users={}",
+            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sessions={} users={}",
             total_conns,
             mem_mb,
             pool_mapped_bytes / (1024 * 1024),
@@ -282,10 +271,8 @@ net::awaitable<void> RuntimeStatsOutputLoop(
             FormatRate(snapshot.bytes_in_rate),
             FormatRate(snapshot.bytes_out_rate),
             dns_hit_rate,
-            dns_l1_stats.entries,
-            dns_l1_stats.capacity,
-            dns_l2_stats.entries,
-            dns_l2_stats.capacity,
+            dns_stats.entries,
+            dns_stats.capacity,
             total_udp_sessions,
             user_stats.TotalUsers());
 
@@ -371,7 +358,8 @@ struct RuntimeMonitor::Impl {
     explicit Impl(const RuntimeContext& runtime_context) {
         const MonitorContext ctx{
             runtime_context.main_ctx, runtime_context.stats,
-            runtime_context.workers, runtime_context.controller};
+            runtime_context.workers, runtime_context.controller,
+            runtime_context.dns_worker};
         loops = {
             std::make_shared<monitor_detail::MonitorLoop>(
                 ctx.main_ctx.get_executor(), "sampling",

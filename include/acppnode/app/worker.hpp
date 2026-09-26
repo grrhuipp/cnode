@@ -23,6 +23,9 @@ struct PreparedOutboundConfig;
 namespace geo {
 class GeoManager;
 }
+namespace app::dns {
+class DNSWorker;
+}
 namespace app {
 struct UserTraffic;
 struct UserTrafficSnapshot;
@@ -50,6 +53,7 @@ class Worker {
 public:
     Worker(uint32_t id, net::io_context& io_context,
            const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
+           app::dns::DNSWorker& dns_worker,
            geo::GeoManager* geo_manager = nullptr);
     ~Worker();
 

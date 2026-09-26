@@ -5,6 +5,7 @@
 #include "acppnode/app/bootstrap_panels.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
@@ -29,28 +30,12 @@ BootstrapEnvironment& BootstrapEnvironment::operator=(BootstrapEnvironment&&) no
 
 namespace {
 
-size_t ComputeWorkerDnsCacheSize(size_t global_cache_size, uint32_t workers) {
-    if (global_cache_size == 0) {
-        return 0;
-    }
-
-    constexpr size_t kMinWorkerCacheSize = 256;
-    constexpr size_t kMaxWorkerCacheSize = 1024;
-    const size_t per_worker =
-        (global_cache_size + std::max<uint32_t>(workers, 1) - 1) /
-        std::max<uint32_t>(workers, 1);
-    return std::min(
-        global_cache_size,
-        std::clamp(per_worker, kMinWorkerCacheSize, kMaxWorkerCacheSize));
-}
-
 ::acpp::app::dns::DNS::Config MakeDnsServiceConfig(const Config& config) {
     ::acpp::app::dns::DNS::Config dns_config;
-    const uint32_t workers = std::max<uint32_t>(1, config.GetWorkers());
     dns_config.servers     = config.GetDns().servers;
     dns_config.timeout_sec = config.GetDns().timeout;
-    dns_config.cache_size  = ComputeWorkerDnsCacheSize(config.GetDns().cache_size, workers);
-    dns_config.global_cache_size = config.GetDns().cache_size;
+    dns_config.cache_size  = config.GetDns().cache_size;
+    dns_config.global_cache_size = 0;
     dns_config.min_ttl     = config.GetDns().min_ttl;
     dns_config.max_ttl     = config.GetDns().max_ttl;
     return dns_config;
@@ -147,7 +132,6 @@ uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     const Config& config, const std::vector<PreparedStartupInbound>& inbounds) {
     WorkerRuntimeConfig runtime_config;
-    runtime_config.dns = MakeDnsServiceConfig(config);
     runtime_config.timeouts = config.GetTimeouts();
     runtime_config.limits = config.GetLimits();
     runtime_config.routing = config.GetRouting();
@@ -166,7 +150,8 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
 
 WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
                             ShardedStats& stats,
-                            geo::GeoManager* geo_manager) {
+                            geo::GeoManager* geo_manager,
+                            app::dns::DNSWorker& dns_worker) {
     WorkerPool pool;
     const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
     pool.workers.reserve(workers);
@@ -178,7 +163,8 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
         pool.work_guards.push_back(net::make_work_guard(*pool.io_contexts[i]));
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
-            i, *pool.io_contexts[i], runtime_config, worker_stats, geo_manager));
+            i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
+            geo_manager));
     }
 
     return pool;
@@ -192,13 +178,15 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
     const auto inbounds = PrepareStartupInbounds(config.GetStaticInbounds(), enable_test_mode);
     env.main_ctx = std::make_unique<net::io_context>();
-    env.panel_dns_service = std::make_unique<app::dns::DNS>(
-        *env.main_ctx, MakeDnsServiceConfig(config));
+    env.dns_worker = std::make_unique<app::dns::DNSWorker>(
+        *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
+    env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);
     env.geo_manager = CreateGeoManager(config);
     env.stats = std::make_unique<ShardedStats>(config.GetWorkers());
     env.connection_limiters = CreateConnectionLimiters(config);
     const WorkerRuntimeConfig worker_runtime_config = MakeWorkerRuntimeConfig(config, inbounds);
-    env.worker_pool = CreateWorkerPool(worker_runtime_config, *env.stats, env.geo_manager.get());
+    env.worker_pool = CreateWorkerPool(
+        worker_runtime_config, *env.stats, env.geo_manager.get(), *env.dns_worker);
     env.controller = std::make_unique<Controller>(
         *env.main_ctx, env.worker_pool.workers, env.connection_limiters);
 
@@ -232,6 +220,7 @@ RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {
         *env.controller,
         env.worker_pool.io_contexts,
         env.inbound_startup,
+        *env.dns_worker,
         env.enable_controller,
     };
 }

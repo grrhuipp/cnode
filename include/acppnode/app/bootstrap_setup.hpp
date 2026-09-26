@@ -17,6 +17,7 @@ class Controller;
 class Worker;
 namespace app::dns {
 class DNS;
+class DNSWorker;
 }
 namespace geo {
 class GeoManager;
@@ -46,6 +47,7 @@ struct BootstrapEnvironment {
     BootstrapEnvironment& operator=(const BootstrapEnvironment&) = delete;
 
     std::unique_ptr<net::io_context> main_ctx;
+    std::unique_ptr<app::dns::DNSWorker> dns_worker;
     std::unique_ptr<app::dns::DNS> panel_dns_service;
     std::unique_ptr<geo::GeoManager> geo_manager;
     std::unique_ptr<ShardedStats> stats;
@@ -59,7 +61,8 @@ struct BootstrapEnvironment {
 [[nodiscard]] WorkerPool CreateWorkerPool(
     const WorkerRuntimeConfig& runtime_config,
     ShardedStats& stats,
-    geo::GeoManager* geo_manager);
+    geo::GeoManager* geo_manager,
+    app::dns::DNSWorker& dns_worker);
 
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
     const Config& config,

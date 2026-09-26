@@ -1,4 +1,6 @@
 #include "cache_internal.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
+#include "acppnode/app/worker_mailbox.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "global_cache.hpp"
@@ -526,18 +528,61 @@ DnsCacheStats DNS::Impl::GetCacheStats() const {
     return cache.GetStats();
 }
 
-DNS::DNS(net::io_context& io_context, const Config& config)
-    : impl_(std::make_unique<Impl>(io_context, config)) {
+struct DNSWorker::Impl {
+    Impl(net::io_context& main_context,
+         const DNS::Config& config, size_t mailbox_capacity)
+        : server(main_context, config)
+        , mailbox(main_context, mailbox_capacity) {}
+
+    net::awaitable<DnsResult> ResolveOwned(std::string domain) {
+        co_return co_await server.Resolve(domain);
+    }
+
+    net::awaitable<DnsCacheStats> ReadCacheStats() {
+        co_return server.GetCacheStats();
+    }
+
+    DNS server;
+    WorkerMailbox mailbox;
+};
+
+DNSWorker::DNSWorker(net::io_context& main_context,
+                     const DNS::Config& config, size_t mailbox_capacity)
+    : impl_(std::make_unique<Impl>(main_context, config, mailbox_capacity)) {}
+
+DNSWorker::~DNSWorker() = default;
+
+net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
+    try {
+        co_return co_await impl_->mailbox.Post(impl_->ResolveOwned(std::move(domain)));
+    } catch (const WorkerMailboxFull&) {
+        DnsResult rejected;
+        rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
+        co_return rejected;
+    }
 }
+
+net::awaitable<DnsCacheStats> DNSWorker::GetCacheStats() {
+    co_return co_await impl_->mailbox.Post(impl_->ReadCacheStats());
+}
+
+DNS::DNS(net::io_context& io_context, const Config& config)
+    : impl_(std::make_unique<Impl>(io_context, config)) {}
+
+DNS::DNS(DNSWorker& worker) : dns_worker_(&worker) {}
 
 DNS::~DNS() = default;
 
 net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
-    return impl_->Resolve(domain);
+    if (dns_worker_) {
+        co_return co_await dns_worker_->Resolve(std::string(domain));
+    }
+    co_return co_await impl_->Resolve(domain);
 }
 
 DnsCacheStats DNS::GetCacheStats() const {
-    return impl_->GetCacheStats();
+    // Remote facades own no DNS cache. The dedicated service owns its stats.
+    return impl_ ? impl_->GetCacheStats() : DnsCacheStats{};
 }
 
 DnsCacheStats DNS::GetGlobalCacheStats() {

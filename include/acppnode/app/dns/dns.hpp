@@ -13,6 +13,8 @@
 
 namespace acpp::app::dns {
 
+class DNSWorker;
+
 struct DnsResult : ResultStatus {
     std::vector<net::ip::address> addresses;
     bool from_cache = false;
@@ -28,6 +30,8 @@ public:
     using Config = ::acpp::app::dns::Config;
 
     DNS(net::io_context& io_context, const Config& config);
+    // Client facade only: resolution state and sockets live on DNSWorker.
+    explicit DNS(DNSWorker& worker);
     ~DNS();
 
     DNS(const DNS&) = delete;
@@ -41,6 +45,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    DNSWorker* dns_worker_ = nullptr;
 };
 
 }  // namespace acpp::app::dns
