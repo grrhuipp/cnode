@@ -28,9 +28,11 @@ int main() {
         return 1;
     }
     auto in_flight = slot.Snapshot();
-    if (!in_flight || slot.Attach(
-            std::make_unique<TestStream>(rejected_destructions)) ||
-        rejected_destructions != 1) {
+    // A by-value parameter may be destroyed at the end of the caller's full
+    // expression. Observe destruction only after Attach's expression ends.
+    const bool attached_again = slot.Attach(
+        std::make_unique<TestStream>(rejected_destructions));
+    if (!in_flight || attached_again || rejected_destructions != 1) {
         return 2;
     }
 
