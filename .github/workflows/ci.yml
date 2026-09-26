@@ -42,249 +42,163 @@ jobs:
     outputs:
       build_id: ${{ steps.time.outputs.build_id }}
       release_time: ${{ steps.time.outputs.release_time }}
-
     steps:
       - name: Generate timestamp build id
         id: time
         run: |
-          build_id="$(date -u +'%Y%m%dT%H%M%SZ')"
-          release_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
-          echo "release_time=${release_time}" >> "$GITHUB_OUTPUT"
-          echo "BUILD_ID=${build_id}"
+          echo "build_id=$(date -u +'%Y%m%dT%H%M%SZ')" >> "$GITHUB_OUTPUT"
+          echo "release_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
-  build-musl:
-    name: Release (musl ${{ matrix.backend }})
+  build:
+    name: Build and test (${{ matrix.libc }})
     runs-on: ubuntu-24.04
     needs: build-metadata
     container:
-      image: alpine:3.20
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
-          - backend: epoll
-            asset_suffix: musl
-            default_alias: true
+          - libc: musl
+            image: alpine:3.20
+            link_flags: -static
+            sanitizers: 'OFF'
+          - libc: glibc
+            image: ubuntu:24.04
+            link_flags: ''
+            sanitizers: 'ON'
     env:
       BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
-      BUILD_DIR: build-musl-${{ matrix.backend }}
-      ASSET_NAME: cnode-linux-amd64-${{ matrix.asset_suffix }}
+      BUILD_DIR: build-${{ matrix.libc }}-epoll
+      ASSET_NAME: cnode-linux-amd64-${{ matrix.libc }}
+      CCACHE_DIR: ${{ github.workspace }}/build-${{ matrix.libc }}-epoll/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
 
     steps:
-      - name: Install Alpine build tools
+      - name: Install build tools
+        shell: sh
         run: |
-          apk add --no-cache \
-            build-base binutils ccache cmake ninja git curl \
-            zip unzip tar pkgconf linux-headers musl-dev \
-            perl nasm python3
+          if [ '${{ matrix.libc }}' = musl ]; then
+            apk add --no-cache build-base binutils ccache cmake ninja git curl \
+              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 bash file ca-certificates
+          else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              build-essential binutils ccache cmake ninja-build git curl \
+              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 ca-certificates
+          fi
 
       - uses: actions/checkout@v6.0.3
 
       - name: Restore compiler cache
-        id: ccache-musl
         uses: actions/cache/restore@v5.0.5
         with:
           path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-
+          key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-
 
       - name: Configure
         run: |
-          ccache --zero-stats || true
-          cmake -B "$BUILD_DIR" -G Ninja \
+          mkdir -p "$BUILD_DIR"
+          ccache --zero-stats
+          cmake -S . -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_BUILD_TESTS=ON \
+            -DCNODE_TEST_SANITIZERS=${{ matrix.sanitizers }} \
             -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
             -DCNODE_RELEASE_FRAME_POINTERS=OFF \
             -DCNODE_MEMORY_STATS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_EXE_LINKER_FLAGS="-static" \
-            -DBUILD_ID=${{ env.BUILD_ID }}
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link_flags }}" \
+            -DBUILD_ID="$BUILD_ID" 2>&1 | tee "$BUILD_DIR/configure.log"
 
-      - name: Build
-        run: cmake --build "$BUILD_DIR" --target cnode cnode_timeout_scheduler_test cnode_asio_recycling_cache_8_test cnode_asio_recycling_cache_32_test cnode_asio_recycling_cache_64_test cnode_tls_record_buffer_test cnode_vmess_auth_snapshot_test cnode_substream_inbound_lifecycle_test cnode_dns_datagram_test cnode_dns_inflight_test cnode_dns_cache_test cnode_asio_operation_allocator_test cnode_thread_pool_test cnode_blake3_dispatch_test cnode_blake3_portable_test cnode_awaitable_task_group_test cnode_dispatcher_cancellation_test cnode_tls_bio_idle_test cnode_outbound_bind_test cnode_session_access_log_test cnode_config_semantics_test cnode_startup_inbounds_test cnode_anytls_outbound_lifecycle_test cnode_anytls_codec_errors_test cnode_uot_ss2022_test --parallel $(nproc)
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
-
-      - name: Verify VMess integration test registration
+      - name: Build all tests
         run: |
-          registered="$(ctest --test-dir "$BUILD_DIR" -N -R '^cnode_vmess_inbound_handshake_integration_test$')"
-          printf '%s\n' "$registered" | grep -Eq 'Test #[0-9]+: cnode_vmess_inbound_handshake_integration_test' || { echo 'VMess integration test was not registered'; exit 1; }
+          cmake --build "$BUILD_DIR" --target cnode_tests --parallel "$(nproc)" \
+            2>&1 | tee "$BUILD_DIR/build.log"
+          if grep -Ei '(^|[[:space:]])warning(:|[[:space:]])' "$BUILD_DIR/configure.log" "$BUILD_DIR/build.log"; then
+            echo 'Build warnings must be fixed before publishing.'
+            exit 1
+          fi
 
-      - name: Test Worker pool, TLS BIO, and outbound selection
-        run: ctest --test-dir "$BUILD_DIR" -R '^cnode_(timeout_scheduler|timeout_scheduler_contract|asio_recycling_cache_(8|32|64)|tls_coalesced_records_integration|tls_record_buffer|vmess_auth_snapshot|substream_inbound_lifecycle|tls_idle_integration|tls_idle_partial_integration|tls_idle_write_integration|dns_endpoint_integration|tls_cancellation_integration|tls_cancellation_partial_integration|dns_datagram|dns_inflight|dns_cache|asio_operation_allocator|thread_pool|blake3_dispatch|blake3_portable|awaitable_task_group|dispatcher_cancellation|tls_bio_idle|outbound_bind|session_access_log|config_semantics|startup_inbounds|anytls_outbound_lifecycle|anytls_codec_errors|uot_ss2022|static_inbound_outbound_integration|vmess_inbound_handshake_integration|outbound_bind_integration)_test$' --output-on-failure
+      - name: Test
+        run: |
+          ctest --test-dir "$BUILD_DIR" --no-tests=error --output-on-failure \
+            --parallel "$(nproc)" --output-junit "$PWD/$BUILD_DIR/test-results.xml"
 
-      - name: Show compiler cache stats
-        if: always()
-        run: ccache --show-stats || true
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
-
-      - name: Preserve failed Linux regression diagnostics
+      - name: Preserve failed regression diagnostics
         if: failure()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: failed-musl-${{ matrix.backend }}-regressions
+          name: failed-${{ matrix.libc }}-regressions
           retention-days: 3
           path: |
             ${{ env.BUILD_DIR }}/cnode
+            ${{ env.BUILD_DIR }}/configure.log
+            ${{ env.BUILD_DIR }}/build.log
+            ${{ env.BUILD_DIR }}/test-results.xml
             ${{ env.BUILD_DIR }}/Testing/Temporary/LastTest.log
-            ${{ env.BUILD_DIR }}/tls_*_integration_test/**
+            ${{ env.BUILD_DIR }}/*_integration_test/**
 
-      - name: Verify & package musl binary
+      - name: Verify and package
         run: |
           file "$BUILD_DIR/cnode"
           "$BUILD_DIR/cnode" -v
-          ldd "$BUILD_DIR/cnode" 2>&1 && exit 1 || true
+          if [ '${{ matrix.libc }}' = musl ]; then
+            if readelf -l "$BUILD_DIR/cnode" | grep 'INTERP'; then
+              echo 'The default musl artifact must be static.'
+              exit 1
+            fi
+          else
+            ldd "$BUILD_DIR/cnode"
+          fi
           mkdir -p release-assets
           objcopy --only-keep-debug "$BUILD_DIR/cnode" "$BUILD_DIR/$ASSET_NAME.debug"
           strip "$BUILD_DIR/cnode"
           objcopy --add-gnu-debuglink="$BUILD_DIR/$ASSET_NAME.debug" "$BUILD_DIR/cnode"
           cp "$BUILD_DIR/cnode" "release-assets/$ASSET_NAME"
           cp "$BUILD_DIR/$ASSET_NAME.debug" "release-assets/$ASSET_NAME.debug"
-          if [ "${{ matrix.default_alias }}" = "true" ]; then
+          if [ '${{ matrix.libc }}' = musl ]; then
             cp "$BUILD_DIR/cnode" release-assets/cnode-linux-amd64
             cp "$BUILD_DIR/$ASSET_NAME.debug" release-assets/cnode-linux-amd64.debug
           fi
           ls -lh release-assets
 
-      - name: Upload musl artifacts
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: cnode-musl-${{ matrix.backend }}-assets
+          name: cnode-${{ matrix.libc }}-epoll-assets
           path: release-assets/*
           if-no-files-found: error
           compression-level: 0
 
-      - name: Save compiler cache
-        if: always()
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-musl-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-  build-glibc:
-    name: Release (glibc ${{ matrix.backend }})
-    runs-on: ubuntu-24.04
-    needs: build-metadata
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - backend: epoll
-            asset_suffix: glibc
-    env:
-      BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
-      BUILD_DIR: build-glibc-${{ matrix.backend }}
-      ASSET_NAME: cnode-linux-amd64-${{ matrix.asset_suffix }}
-
-    steps:
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential binutils ccache cmake ninja-build git curl \
-            zip unzip tar pkg-config perl nasm file linux-libc-dev python3
-
-      - uses: actions/checkout@v6.0.3
-
-      - name: Restore compiler cache
-        id: ccache-glibc
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-
-
-      - name: Build glibc release variant
-        run: |
-          ccache --zero-stats || true
-          cmake -S . -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DCNODE_BUILD_TESTS=ON \
-            -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
-            -DCNODE_RELEASE_FRAME_POINTERS=OFF \
-            -DCNODE_MEMORY_STATS=ON \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DBUILD_ID=${{ env.BUILD_ID }}
-          cmake --build "$BUILD_DIR" --target cnode cnode_timeout_scheduler_test cnode_asio_recycling_cache_8_test cnode_asio_recycling_cache_32_test cnode_asio_recycling_cache_64_test cnode_tls_record_buffer_test cnode_vmess_auth_snapshot_test cnode_substream_inbound_lifecycle_test cnode_dns_datagram_test cnode_dns_inflight_test cnode_dns_cache_test cnode_asio_operation_allocator_test cnode_thread_pool_test cnode_blake3_dispatch_test cnode_blake3_portable_test cnode_awaitable_task_group_test cnode_dispatcher_cancellation_test cnode_tls_bio_idle_test cnode_outbound_bind_test cnode_session_access_log_test cnode_config_semantics_test cnode_startup_inbounds_test cnode_anytls_outbound_lifecycle_test cnode_anytls_codec_errors_test cnode_uot_ss2022_test --parallel $(nproc)
-          registered="$(ctest --test-dir "$BUILD_DIR" -N -R '^cnode_vmess_inbound_handshake_integration_test$')"
-          printf '%s\n' "$registered" | grep -Eq 'Test #[0-9]+: cnode_vmess_inbound_handshake_integration_test' || { echo 'VMess integration test was not registered'; exit 1; }
-          ctest --test-dir "$BUILD_DIR" -R '^cnode_(timeout_scheduler|timeout_scheduler_contract|asio_recycling_cache_(8|32|64)|tls_coalesced_records_integration|tls_record_buffer|vmess_auth_snapshot|substream_inbound_lifecycle|tls_idle_integration|tls_idle_partial_integration|tls_idle_write_integration|dns_endpoint_integration|tls_cancellation_integration|tls_cancellation_partial_integration|dns_datagram|dns_inflight|dns_cache|asio_operation_allocator|thread_pool|blake3_dispatch|blake3_portable|awaitable_task_group|dispatcher_cancellation|tls_bio_idle|outbound_bind|session_access_log|config_semantics|startup_inbounds|anytls_outbound_lifecycle|anytls_codec_errors|uot_ss2022|static_inbound_outbound_integration|vmess_inbound_handshake_integration|outbound_bind_integration)_test$' --output-on-failure
-          "$BUILD_DIR/cnode" -v
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
-
       - name: Show compiler cache stats
         if: always()
-        run: ccache --show-stats || true
-        env:
-          CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
-
-      - name: Sanitize Worker allocator and scheduler
-        run: |
-          c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror \
-            -DASIO_STANDALONE -DCNODE_MEMORY_STATS -DCNODE_TEST_ALLOCATOR_FAULT \
-            -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
-            tests/thread_pool_test.cpp -o "$BUILD_DIR/pool-sanitizer-test"
-          "$BUILD_DIR/pool-sanitizer-test"
-          c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror \
-            -DASIO_STANDALONE -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
-            -include tests/timeout_scheduler_allocation.hpp \
-            tests/timeout_scheduler_test.cpp tests/timeout_scheduler_new.cpp \
-            src/transport/internet/timeout_scheduler.cpp \
-            -o "$BUILD_DIR/scheduler-sanitizer-test"
-          "$BUILD_DIR/scheduler-sanitizer-test"
-
-      - name: Package glibc binary
-        run: |
-          file "$BUILD_DIR/cnode"
-          ldd "$BUILD_DIR/cnode"
-          mkdir -p glibc-assets
-          objcopy --only-keep-debug "$BUILD_DIR/cnode" "$BUILD_DIR/$ASSET_NAME.debug"
-          strip "$BUILD_DIR/cnode"
-          objcopy --add-gnu-debuglink="$BUILD_DIR/$ASSET_NAME.debug" "$BUILD_DIR/cnode"
-          cp "$BUILD_DIR/cnode" "glibc-assets/$ASSET_NAME"
-          cp "$BUILD_DIR/$ASSET_NAME.debug" "glibc-assets/$ASSET_NAME.debug"
-          ls -lh glibc-assets
-
-      - name: Upload glibc artifacts
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: cnode-glibc-${{ matrix.backend }}-assets
-          path: glibc-assets/*
-          if-no-files-found: error
-          compression-level: 0
+        run: ccache --show-stats
 
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v5.0.5
         with:
           path: ${{ env.BUILD_DIR }}/.ccache
-          key: ccache-glibc-${{ matrix.backend }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-${{ matrix.libc }}-epoll-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
-    needs: [build-metadata, build-musl, build-glibc]
+    needs: [build-metadata, build]
     if: github.event_name == 'push'
     env:
       BUILD_ID: ${{ needs.build-metadata.outputs.build_id }}
       RELEASE_TIME: ${{ needs.build-metadata.outputs.release_time }}
-
     permissions:
       contents: write
       actions: read
-
     steps:
       - name: Download release artifacts
         env:
@@ -316,29 +230,18 @@ jobs:
           tag_ref="tags/${{ env.RELEASE_TAG }}"
           if gh api "repos/${{ github.repository }}/git/ref/${tag_ref}" >/dev/null 2>&1; then
             gh api -X PATCH "repos/${{ github.repository }}/git/refs/${tag_ref}" \
-              -f sha="${{ github.sha }}" \
-              -F force=true >/dev/null
+              -f sha="${{ github.sha }}" -F force=true >/dev/null
           else
             gh api -X POST "repos/${{ github.repository }}/git/refs" \
-              -f ref="refs/${tag_ref}" \
-              -f sha="${{ github.sha }}" >/dev/null
+              -f ref="refs/${tag_ref}" -f sha="${{ github.sha }}" >/dev/null
           fi
-
           if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release delete "${{ env.RELEASE_TAG }}" \
-              --repo "${{ github.repository }}" \
-              --yes
+            gh release delete "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" --yes
           fi
-
-          gh release create "${{ env.RELEASE_TAG }}" \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "${{ env.RELEASE_TAG }}" \
-            --notes-file release-notes.md \
-            --latest
-
+          gh release create "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" --title "${{ env.RELEASE_TAG }}" \
+            --notes-file release-notes.md --latest
           gh release upload "${{ env.RELEASE_TAG }}" release-assets/* \
-            --repo "${{ github.repository }}" \
-            --clobber
+            --repo "${{ github.repository }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

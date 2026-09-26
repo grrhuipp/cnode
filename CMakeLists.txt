@@ -14,7 +14,8 @@ option(CNODE_IO_URING "Use Asio io_uring backend on Linux" OFF)
 option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
-option(CNODE_BUILD_TESTS "Build cnode unit tests" OFF)
+option(CNODE_BUILD_TESTS "Build cnode tests" OFF)
+option(CNODE_TEST_SANITIZERS "Include ASan/UBSan regression targets in CTest" OFF)
 # Keep Asio's existing per-io-thread, per-purpose cache large enough for
 # completion batches. This does not replace global allocation or add a pool;
 # buffers and application-owned objects still use the owning Worker's PMR.
@@ -1993,7 +1994,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${concurrentqueue_SOURCE_DIR}
     )
-    target_link_libraries(cnode_udp_channel_test PRIVATE asio::asio Threads::Threads cnode_zlib)
+    target_link_libraries(cnode_udp_channel_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
     if(WIN32)
         target_link_libraries(cnode_udp_channel_test PRIVATE ws2_32)
         target_compile_definitions(cnode_udp_channel_test PRIVATE _WIN32_WINNT=0x0A00)
@@ -2775,7 +2776,7 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_startup_inbounds_test COMMAND cnode_startup_inbounds_test)
 
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         foreach(integration IN ITEMS dns_endpoint tls_cancellation)
             add_test(NAME cnode_${integration}_integration_test
@@ -2862,6 +2863,7 @@ if(CNODE_BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/invalid_config_sources_test.cmake)
     set_tests_properties(cnode_invalid_config_sources_test PROPERTIES RESOURCE_LOCK builtin_test_port)
 
+    include(cmake/test_suite.cmake)
 endif()
 
 # ============================================================================

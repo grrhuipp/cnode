@@ -38,17 +38,17 @@ function(expect_rejected case_name main_content sidecar_name sidecar_content)
         TIMEOUT 5)
 
     if("${result}" STREQUAL "0")
-        message(FATAL_ERROR
+        message(SEND_ERROR
             "${case_name}: invalid config was accepted\nstdout=${stdout}\nstderr=${stderr}")
     endif()
     if(NOT "${result}" MATCHES "^[0-9]+$")
-        message(FATAL_ERROR
+        message(SEND_ERROR
             "${case_name}: cnode did not reject promptly: ${result}\nstdout=${stdout}\nstderr=${stderr}")
     endif()
     if(ARGC GREATER 4)
         set(output "${stdout}\n${stderr}")
         if(NOT "${output}" MATCHES "${ARGV4}")
-            message(FATAL_ERROR
+            message(SEND_ERROR
                 "${case_name}: rejection lost expected cause '${ARGV4}'\nstdout=${stdout}\nstderr=${stderr}")
         endif()
     endif()
@@ -72,11 +72,11 @@ function(expect_started case_name main_content sidecar_name sidecar_content)
         TIMEOUT 1)
 
     if("${result}" MATCHES "^[0-9]+$")
-        message(FATAL_ERROR
+        message(SEND_ERROR
             "${case_name}: valid config exited before startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
     endif()
     if(NOT "${stdout}" MATCHES "server started")
-        message(FATAL_ERROR
+        message(SEND_ERROR
             "${case_name}: valid config did not reach startup: ${result}\nstdout=${stdout}\nstderr=${stderr}")
     endif()
 endfunction()
@@ -84,7 +84,7 @@ endfunction()
 function(expect_outbound_credentials case_name protocol credentials accepted)
     foreach(format IN ITEMS flat nested)
         if(format STREQUAL "flat")
-            set(settings "{\"server\":\"127.0.0.1\",\"server_port\":443,${credentials}}")
+            set(settings "{\"address\":\"127.0.0.1\",\"port\":443,${credentials}}")
         elseif(protocol STREQUAL "vmess" OR protocol STREQUAL "vless")
             set(settings "{\"vnext\":[{\"address\":\"127.0.0.1\",\"port\":443,\"users\":[{${credentials}}]}]}")
         else()
@@ -158,103 +158,94 @@ expect_started(valid_zero_log_retention
 expect_rejected(non_boolean_log_compression
     [=[{"log":{"gzip":"false"}}]=] "" ""
     "gzip must be a boolean")
-expect_rejected(conflicting_log_compression
-    [=[{"log":{"gzip":true,"compress":false}}]=] "" ""
-    "gzip and compress must match")
-expect_started(equal_log_compression_aliases
-    [=[{"workers":1,"log":{"gzip":false,"compress":false}}]=] "" "")
+expect_started(valid_log_compression
+    [=[{"workers":1,"log":{"gzip":false}}]=] "" "")
 expect_rejected(non_string_log_level
     [=[{"log":{"loglevel":123}}]=] "" ""
     "loglevel must be a string")
 expect_rejected(non_string_transport_network "{}" "outbounds.json"
-    [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
+    [=[[{"tag":"bad-network-type","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":123,"security":"none"}}]]=]
     "network must be a string")
 expect_rejected(non_string_http_header "{}" "outbounds.json"
-    [=[[{"tag":"bad-header-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":42,"X-Valid":"yes"}}}}]]=]
+    [=[[{"tag":"bad-header-type","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":42,"X-Valid":"yes"}}}}]]=]
     "HTTP header 'Host' must be a string")
 expect_rejected(injected_ws_request_path "{}" "outbounds.json"
-    [=[[{"tag":"bad-ws-path","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws\r\nInjected: yes"}}}]]=]
+    [=[[{"tag":"bad-ws-path","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws\r\nInjected: yes"}}}]]=]
     "ws path must be a valid HTTP request target")
 expect_rejected(injected_http_upgrade_host "{}" "outbounds.json"
-    [=[[{"tag":"bad-http-upgrade-host","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"httpupgrade","security":"none","httpupgradeSettings":{"path":"/up","host":"example.com\r\nInjected: yes"}}}]]=]
+    [=[[{"tag":"bad-http-upgrade-host","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"httpupgrade","security":"none","httpupgradeSettings":{"path":"/up","host":"example.com\r\nInjected: yes"}}}]]=]
     "http upgrade host must be a valid HTTP authority")
 expect_rejected(invalid_http_method "{}" "outbounds.json"
-    [=[[{"tag":"bad-http-method","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","method":"GE T"}}}]]=]
+    [=[[{"tag":"bad-http-method","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","method":"GE T"}}}]]=]
     "http method must be a valid HTTP token")
 expect_rejected(invalid_grpc_authority "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-authority","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"authority":"bad host","serviceName":"svc"}}}]]=]
+    [=[[{"tag":"bad-grpc-authority","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"authority":"bad host","serviceName":"svc"}}}]]=]
     "grpc authority must be a valid HTTP authority")
 expect_rejected(injected_grpc_user_agent "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-user-agent","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","userAgent":"grpc-go/1.0\r\nInjected: yes"}}}]]=]
+    [=[[{"tag":"bad-grpc-user-agent","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","userAgent":"grpc-go/1.0\r\nInjected: yes"}}}]]=]
     "grpc userAgent contains invalid control characters")
 expect_rejected(invalid_ws_real_ip_header "{}" "outbounds.json"
-    [=[[{"tag":"bad-real-ip-header","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","realIpHeader":"Bad Header"}}}]]=]
+    [=[[{"tag":"bad-real-ip-header","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","realIpHeader":"Bad Header"}}}]]=]
     "ws realIpHeader must be a valid HTTP header name")
 expect_rejected(invalid_host_header_authority "{}" "outbounds.json"
-    [=[[{"tag":"bad-host-authority","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"bad host"}}}}]]=]
+    [=[[{"tag":"bad-host-authority","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"bad host"}}}}]]=]
     "HTTP header 'host' must be a valid HTTP authority")
 expect_started(valid_safe_http_request_components
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-http-components","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws?ed=2048","realIpHeader":"X-Real-IP","headers":{"Host":"[2001:db8::1]:443"}}}}]]=])
+    [=[[{"tag":"valid-http-components","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws?ed=2048","realIpHeader":"X-Real-IP","headers":{"Host":"[2001:db8::1]:443"}}}}]]=])
 expect_rejected(non_object_http_headers "{}" "outbounds.json"
-    [=[[{"tag":"bad-headers-shape","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":[]}}}]]=]
+    [=[[{"tag":"bad-headers-shape","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":[]}}}]]=]
     "headers must be an object")
 expect_rejected(invalid_http_header_name "{}" "outbounds.json"
-    [=[[{"tag":"bad-header-name","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Bad Header":"value"}}}}]]=]
+    [=[[{"tag":"bad-header-name","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Bad Header":"value"}}}}]]=]
     "HTTP header name is invalid")
 expect_rejected(injected_http_header_value "{}" "outbounds.json"
-    [=[[{"tag":"bad-header-value","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"example.com\r\nInjected: yes"}}}}]]=]
+    [=[[{"tag":"bad-header-value","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"example.com\r\nInjected: yes"}}}}]]=]
     "HTTP header 'host' contains invalid control characters")
 expect_rejected(conflicting_http_header_case_aliases "{}" "outbounds.json"
-    [=[[{"tag":"bad-header-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"one.example","host":"two.example"}}}}]]=]
+    [=[[{"tag":"bad-header-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"one.example","host":"two.example"}}}}]]=]
     "HTTP header 'host' has conflicting values")
 expect_started(equal_http_header_case_aliases
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-header-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"same.example","host":"same.example"}}}}]]=])
+    [=[[{"tag":"valid-header-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ws","headers":{"Host":"same.example","host":"same.example"}}}}]]=])
 expect_rejected(non_object_outbound_stream_settings "{}" "outbounds.json"
-    [=[[{"tag":"bad-stream-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":[]}]]=]
+    [=[[{"tag":"bad-stream-settings","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":[]}]]=]
     "streamSettings must be an object")
 expect_rejected(non_object_tls_settings "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-settings","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":[]}}]]=]
+    [=[[{"tag":"bad-tls-settings","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":[]}}]]=]
     "tlsSettings must be an object")
 expect_rejected(non_object_tls_certificate "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[42]}}}]]=]
+    [=[[{"tag":"bad-tls-certificate","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[42]}}}]]=]
     "tls certificates entries must be objects")
 expect_rejected(non_string_tls_min_version "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-min-version-type","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":1.3}}}]]=]
+    [=[[{"tag":"bad-tls-min-version-type","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":1.3}}}]]=]
     "minVersion must be a string")
 expect_rejected(unsupported_tls_min_version "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-min-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.1"}}}]]=]
+    [=[[{"tag":"bad-tls-min-version","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.1"}}}]]=]
     "tls minVersion must be 1.2 or 1.3")
 expect_rejected(inverted_tls_versions "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-version-order","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","maxVersion":"1.2"}}}]]=]
+    [=[[{"tag":"bad-tls-version-order","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","maxVersion":"1.2"}}}]]=]
     "tls minVersion must not exceed maxVersion")
-expect_rejected(conflicting_tls_min_version_aliases "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-min-version-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.2","min_version":"1.3"}}}]]=]
-    "minVersion and min_version must match")
 expect_rejected(incompatible_reality_tls_version "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-tls-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","tlsSettings":{"minVersion":"1.2"},"realitySettings":{"serverName":"example.com","publicKey":"invalid-until-after-version-validation"}}}]]=]
+    [=[[{"tag":"bad-reality-tls-version","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","tlsSettings":{"minVersion":"1.2"},"realitySettings":{"serverName":"example.com","publicKey":"invalid-until-after-version-validation"}}}]]=]
     "reality requires TLS minVersion and maxVersion 1.3")
-expect_started(equal_tls_version_aliases
+expect_started(valid_tls_versions
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-tls-version-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","min_version":"1.3","maxVersion":"1.3","max_version":"1.3"}}}]]=])
+    [=[[{"tag":"valid-tls-version-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","minVersion":"1.3","maxVersion":"1.3"}}}]]=])
 expect_rejected(empty_tls_alpn "{}" "outbounds.json"
-    [=[[{"tag":"bad-empty-alpn","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":[""]}}}]]=]
+    [=[[{"tag":"bad-empty-alpn","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":[""]}}}]]=]
     "tls alpn entries must contain between 1 and 255 bytes")
 expect_rejected(overlong_tls_alpn "{}" "outbounds.json"
-    "[{\"tag\":\"bad-long-alpn\",\"protocol\":\"vless\",\"settings\":{\"server\":\"example.com\",\"server_port\":443,\"uuid\":\"b831381d-6324-4d53-ad4f-8cda48b30811\",\"encryption\":\"none\"},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"example.com\",\"alpn\":[\"${ALPN_TOO_LONG}\"]}}}]"
+    "[{\"tag\":\"bad-long-alpn\",\"protocol\":\"vless\",\"settings\":{\"address\":\"example.com\",\"port\":443,\"id\":\"b831381d-6324-4d53-ad4f-8cda48b30811\",\"encryption\":\"none\"},\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"example.com\",\"alpn\":[\"${ALPN_TOO_LONG}\"]}}}]"
     "tls alpn entries must contain between 1 and 255 bytes")
 expect_rejected(duplicate_tls_alpn "{}" "outbounds.json"
-    [=[[{"tag":"bad-duplicate-alpn","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h2","h2"]}}}]]=]
+    [=[[{"tag":"bad-duplicate-alpn","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h2","h2"]}}}]]=]
     "tls alpn entries must contain between 1 and 255 bytes and must be unique")
 expect_rejected(non_string_tls_ca "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":42}}}]]=]
+    [=[[{"tag":"bad-tls-ca","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":42}}}]]=]
     "caFile must be a string")
-expect_rejected(conflicting_tls_ca_aliases "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-ca-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"one.pem","ca_file":"two.pem"}}}]]=]
-    "caFile and ca_file must match")
 expect_rejected(insecure_tls_ca "{}" "outbounds.json"
-    [=[[{"tag":"bad-insecure-ca","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":true,"caFile":"ca.pem"}}}]]=]
+    [=[[{"tag":"bad-insecure-ca","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":true,"caFile":"ca.pem"}}}]]=]
     "tls caFile cannot be used with allowInsecure")
 expect_rejected(inbound_tls_ca "{}" "inbounds.json"
     [=[[{"tag":"bad-inbound-ca","protocol":"vless","listen":"127.0.0.1","port":43191,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"caFile":"ca.pem"}}}]]=]
@@ -265,52 +256,43 @@ expect_rejected(inbound_allow_insecure "{}" "inbounds.json"
 expect_rejected(sniffing_fakedns "{}" "inbounds.json"
     [=[[{"tag":"bad-fakedns-sniff","protocol":"vless","listen":"127.0.0.1","port":43193,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"sniffing":{"enabled":true,"destOverride":["fakedns"]}}]]=]
     "sniffing destOverride fakedns is not supported")
-expect_started(equal_tls_ca_aliases
+expect_started(valid_tls_ca
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"same.pem","ca_file":"same.pem"}}}]]=])
+    [=[[{"tag":"valid-tls-ca-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","caFile":"same.pem"}}}]]=])
 expect_rejected(non_array_tls_certificates "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-certificates","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":{}}}}]]=]
+    [=[[{"tag":"bad-tls-certificates","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":{}}}}]]=]
     "tls certificates must be an array")
 expect_rejected(multiple_tls_certificates "{}" "outbounds.json"
-    [=[[{"tag":"bad-multiple-certificates","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"one.pem","keyFile":"one.key"},{"certificateFile":"two.pem","keyFile":"two.key"}]}}}]]=]
+    [=[[{"tag":"bad-multiple-certificates","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"one.pem","keyFile":"one.key"},{"certificateFile":"two.pem","keyFile":"two.key"}]}}}]]=]
     "multiple TLS certificates are not supported")
 expect_rejected(incomplete_tls_certificate_entry "{}" "outbounds.json"
-    [=[[{"tag":"bad-incomplete-certificate","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"cert.pem"}]}}}]]=]
+    [=[[{"tag":"bad-incomplete-certificate","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"cert.pem"}]}}}]]=]
     "must provide certificateFile and keyFile")
 expect_rejected(orphan_tls_cert_file "{}" "outbounds.json"
-    [=[[{"tag":"bad-orphan-cert","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certFile":"cert.pem"}}}]]=]
+    [=[[{"tag":"bad-orphan-cert","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certFile":"cert.pem"}}}]]=]
     "tls certFile and keyFile must be configured together")
 expect_rejected(conflicting_tls_certificate_sources "{}" "outbounds.json"
-    [=[[{"tag":"bad-certificate-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"array.pem","keyFile":"array.key"}],"certFile":"direct.pem","keyFile":"direct.key"}}}]]=]
+    [=[[{"tag":"bad-certificate-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"array.pem","keyFile":"array.key"}],"certFile":"direct.pem","keyFile":"direct.key"}}}]]=]
     "tls certificates and certFile/keyFile must match")
 expect_started(equal_tls_certificate_sources
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-certificate-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"same.pem","keyFile":"same.key"}],"certFile":"same.pem","keyFile":"same.key"}}}]]=])
-expect_rejected(conflicting_outbound_stream_settings_aliases "{}" "outbounds.json"
-    [=[[{"tag":"bad-stream-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"none"},"stream_settings":{"network":"grpc","security":"none"}}]]=]
-    "streamSettings and stream_settings must match")
-expect_rejected(conflicting_grpc_service_names "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"one","service_name":"two"}}}]]=]
-    "serviceName and service_name must match")
-expect_started(equal_grpc_service_name_aliases
+    [=[[{"tag":"valid-certificate-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","certificates":[{"certificateFile":"same.pem","keyFile":"same.key"}],"certFile":"same.pem","keyFile":"same.key"}}}]]=])
+expect_started(valid_grpc_service_name
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-grpc-alias","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"same","service_name":"same"}}}]]=])
+    [=[[{"tag":"valid-grpc-alias","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"same"}}}]]=])
 expect_rejected(non_boolean_tls_allow_insecure "{}" "outbounds.json"
-    [=[[{"tag":"bad-tls-bool","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":"true"}}}]]=]
+    [=[[{"tag":"bad-tls-bool","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com","allowInsecure":"true"}}}]]=]
     "allowInsecure must be a boolean")
 expect_rejected(invalid_reality_min_client_version "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-version","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"1.8.0.1"}}}]]=]
+    [=[[{"tag":"bad-reality-version","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"1.8.0.1"}}}]]=]
     "REALITY minClientVer is invalid")
 expect_rejected(reversed_reality_client_version_range "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-range","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"2.0.0","maxClientVer":"1.9.0"}}}]]=]
+    [=[[{"tag":"bad-reality-range","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"minClientVer":"2.0.0","maxClientVer":"1.9.0"}}}]]=]
     "REALITY minClientVer must not exceed maxClientVer")
 expect_rejected(negative_read_timeout
     [=[{"timeouts":{"read":-1}}]=] "" "")
-expect_rejected(conflicting_idle_timeout_aliases
-    [=[{"timeouts":{"connIdle":30,"idle":60}}]=] "" ""
-    "connIdle and idle must match")
-expect_started(equal_idle_timeout_aliases
-    [=[{"workers":1,"timeouts":{"connIdle":30,"idle":30}}]=] "" "")
+expect_started(valid_idle_timeout
+    [=[{"workers":1,"timeouts":{"connIdle":30}}]=] "" "")
 expect_rejected(negative_connection_limit
     [=[{"limits":{"maxConnections":-1}}]=] "" "")
 expect_rejected(negative_dns_cache_size
@@ -378,7 +360,7 @@ expect_rejected(non_array_static_users "{}" "inbounds.json"
     [=[[{"tag":"bad-static-users","protocol":"vmess","listen":"127.0.0.1","port":12100,"settings":{"clients":{}},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     "clients must be an array")
 expect_rejected(non_string_static_user_id "{}" "inbounds.json"
-    [=[[{"tag":"bad-static-user-id","protocol":"vmess","listen":"127.0.0.1","port":12100,"settings":{"clients":[{"id":42,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"bad-static-user-id","protocol":"vmess","listen":"127.0.0.1","port":12100,"settings":{"clients":[{"id":42}]},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     "id must be a string")
 expect_rejected(non_string_static_cipher_method "{}" "inbounds.json"
     [=[[{"tag":"bad-static-method","protocol":"shadowsocks","listen":"127.0.0.1","port":12100,"settings":{"method":42,"password":"secret"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
@@ -388,7 +370,7 @@ expect_rejected(conflicting_static_user_array_aliases "{}" "inbounds.json"
     "clients and users must match")
 expect_started(equal_static_user_array_aliases
     [=[{"workers":1}]=] "inbounds.json"
-    [=[[{"tag":"valid-static-user-alias","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=])
+    [=[[{"tag":"valid-static-user-alias","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=])
 expect_rejected(duplicate_panel_node_ids
     [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1,1],"NodeType":"vmess"}]}]=]
     "" "")
@@ -417,33 +399,18 @@ expect_rejected(non_string_route_domain_suffix "{}" "routing.json"
 expect_rejected(non_array_route_domain_suffix "{}" "routing.json"
     [=[{"rules":[{"domainSuffix":"example.com","outboundTag":"direct"}]}]=]
     "domainSuffix must be an array of strings")
-expect_rejected(conflicting_route_domain_suffix_aliases "{}" "routing.json"
-    [=[{"rules":[{"domainSuffix":["one.example"],"domain_suffix":["two.example"],"outboundTag":"direct"}]}]=]
-    "domainSuffix and domain_suffix must match")
-expect_started(equal_route_domain_suffix_aliases
+expect_started(valid_route_domain_suffix
     [=[{"workers":1}]=] "routing.json"
-    [=[{"rules":[{"domainSuffix":["same.example"],"domain_suffix":["same.example"],"outboundTag":"direct"}]}]=])
-expect_rejected(conflicting_route_inbound_tag_aliases "{}" "routing.json"
-    [=[{"rules":[{"inboundTag":"one","inbound_tag":"two","outboundTag":"direct"}]}]=]
-    "inboundTag and inbound_tag must match")
-expect_rejected(conflicting_route_source_port_aliases "{}" "routing.json"
-    [=[{"rules":[{"sourcePort":"80,443","source_port":[80,8443],"outboundTag":"direct"}]}]=]
-    "sourcePort and source_port must match")
-expect_rejected(conflicting_route_outbound_tag_aliases "{}" "routing.json"
-    [=[{"rules":[{"network":"tcp","outboundTag":"direct","outbound_tag":"blocked"}]}]=]
-    "outboundTag and outbound_tag must match")
-expect_rejected(conflicting_route_domain_strategy_aliases "{}" "routing.json"
-    [=[{"domainStrategy":"AsIs","domain_strategy":"IPIfNonMatch","rules":[{"network":"tcp","outboundTag":"direct"}]}]=]
-    "domainStrategy and domain_strategy must match")
+    [=[{"rules":[{"domainSuffix":["same.example"],"outboundTag":"direct"}]}]=])
 expect_rejected(unsupported_route_domain_strategy "{}" "routing.json"
     [=[{"domainStrategy":"IPIfNonMacth","rules":[{"network":"tcp","outboundTag":"direct"}]}]=]
     "routing domainStrategy contains unsupported value")
 expect_started(canonical_route_domain_strategy
     [=[{"workers":1}]=] "routing.json"
     [=[{"domainStrategy":"ipondemand","rules":[{"network":"tcp","outboundTag":"direct"}]}]=])
-expect_started(equal_normalized_route_aliases
+expect_started(valid_normalized_route
     [=[{"workers":1}]=] "routing.json"
-    [=[{"domainStrategy":"AsIs","domain_strategy":"asis","rules":[{"inboundTag":"in-a,in-b","inbound_tag":["in-a","in-b"],"sourcePort":"80,443","source_port":[80,443],"outboundTag":"direct","outbound_tag":"direct"}]}]=])
+    [=[{"domainStrategy":"AsIs","rules":[{"inboundTag":"in-a,in-b","sourcePort":"80,443","outboundTag":"direct"}]}]=])
 expect_rejected(empty_route_domain_keyword "{}" "routing.json"
     [=[{"rules":[{"domain":["keyword:"],"outboundTag":"direct"}]}]=]
     "routing domain keyword must not be empty")
@@ -494,47 +461,40 @@ expect_rejected(unsupported_freedom_domain_strategy "{}" "outbounds.json"
 expect_rejected(non_string_freedom_domain_strategy "{}" "outbounds.json"
     [=[[{"tag":"bad-freedom-strategy-type","protocol":"freedom","settings":{"domainStrategy":1}}]]=]
     "unsupported or invalid")
-expect_rejected(conflicting_freedom_domain_strategy_aliases "{}" "outbounds.json"
-    [=[[{"tag":"bad-freedom-strategy-alias","protocol":"freedom","settings":{"domainStrategy":"UseIP","domain_strategy":"ForceIP"}}]]=]
-    "unsupported or invalid")
-expect_started(equal_normalized_freedom_domain_strategy_aliases
+expect_started(valid_normalized_freedom_domain_strategy
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"normalized-freedom-strategy","protocol":"freedom","settings":{"domainStrategy":"UseIPv6v4","domain_strategy":"useipv6v4"}}]]=])
+    [=[[{"tag":"normalized-freedom-strategy","protocol":"freedom","settings":{"domainStrategy":"UseIPv6v4"}}]]=])
 expect_rejected(invalid_outbound_send_through "{}" "outbounds.json"
     [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":"not-an-ip"}]]=])
 expect_rejected(non_string_outbound_send_through "{}" "outbounds.json"
     [=[[{"tag":"bad-bind","protocol":"freedom","sendThrough":123}]]=])
 expect_rejected(invalid_xhttp_download_send_through "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-bind","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"sendThrough":"not-an-ip","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-bind","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"sendThrough":"not-an-ip","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(non_integer_xhttp_download_port "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":"443","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":"443","network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(missing_xhttp_download_port "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
-expect_rejected(conflicting_xhttp_download_ports "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"server_port":8443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-port","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(missing_xhttp_download_address "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-address","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
-expect_rejected(conflicting_xhttp_download_addresses "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-address","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","server":"other.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-address","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(non_xhttp_download_network "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-network","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"tcp"}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-network","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"tcp"}}}}}]]=])
 expect_rejected(stream_one_xhttp_download "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"stream-one"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"stream-one"}}}}}}]]=])
 expect_rejected(stream_one_xhttp_upload_with_download "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"stream-one","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-mode","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"stream-one","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(non_object_xhttp_download_settings "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-shape","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":443}}}]]=])
+    [=[[{"tag":"bad-xhttp-shape","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":443}}}]]=])
 expect_rejected(duplicate_xhttp_download_settings "{}" "outbounds.json"
-    [=[[{"tag":"bad-xhttp-duplicate","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":{"address":"one.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}},"extra":{"downloadSettings":{"address":"two.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"bad-xhttp-duplicate","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"downloadSettings":{"address":"one.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}},"extra":{"downloadSettings":{"address":"two.example.com","port":443,"network":"xhttp","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(nested_xhttp_download_settings "{}" "outbounds.json"
     [=[[
       {
         "tag":"bad-xhttp-nested",
         "protocol":"vless",
         "settings":{
-          "server":"upload.example.com",
-          "server_port":443,
-          "uuid":"b831381d-6324-4d53-ad4f-8cda48b30811",
+          "address":"upload.example.com",
+          "port":443,
+          "id":"b831381d-6324-4d53-ad4f-8cda48b30811",
           "encryption":"none"
         },
         "streamSettings":{
@@ -563,42 +523,38 @@ expect_rejected(nested_xhttp_download_settings "{}" "outbounds.json"
     ]]=])
 expect_started(valid_xhttp_split_download
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-xhttp-split","protocol":"vless","settings":{"server":"upload.example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
+    [=[[{"tag":"valid-xhttp-split","protocol":"vless","settings":{"address":"upload.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto","extra":{"downloadSettings":{"address":"download.example.com","port":443,"network":"xhttp","security":"none","xhttpSettings":{"mode":"auto"}}}}}}]]=])
 expect_rejected(non_integer_grpc_initial_window "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":"65535"}}}]]=])
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":"65535"}}}]]=])
 expect_rejected(negative_grpc_initial_window "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":-1}}}]]=])
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":-1}}}]]=])
 expect_rejected(overflow_grpc_initial_window "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":2147483648}}}]]=])
-expect_rejected(conflicting_grpc_initial_windows "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":65535,"initial_window_size":65536}}}]]=])
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":2147483648}}}]]=])
 expect_rejected(legacy_plural_grpc_initial_window "{}" "outbounds.json"
-    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_windows_size":65535}}}]]=])
+    [=[[{"tag":"bad-grpc-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_windows_size":65535}}}]]=])
 expect_rejected(non_integer_http2_initial_window "{}" "outbounds.json"
-    [=[[{"tag":"bad-h2-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","initialWindowSize":"65535"}}}]]=])
+    [=[[{"tag":"bad-h2-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"h2","security":"none","httpSettings":{"path":"/h2","initialWindowSize":"65535"}}}]]=])
 expect_started(valid_zero_grpc_initial_window
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-grpc-zero-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initial_window_size":0}}}]]=])
+    [=[[{"tag":"valid-grpc-zero-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","initialWindowSize":0}}}]]=])
 expect_rejected(non_integer_reality_max_time_diff "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":"60000"}}}]]=])
+    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":"60000"}}}]]=])
 expect_rejected(negative_reality_max_time_diff "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":-1}}}]]=])
-expect_rejected(conflicting_reality_max_time_diff "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":60000,"max_time_diff":30000}}}]]=])
+    [=[[{"tag":"bad-reality-time-window","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","maxTimeDiff":-1}}}]]=])
 expect_rejected(invalid_reality_client_short_id "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-short-id","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"not-hex"}}}]]=]
+    [=[[{"tag":"bad-reality-short-id","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"not-hex"}}}]]=]
     "REALITY shortId is invalid")
 expect_rejected(invalid_reality_server_short_id "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-short-id","protocol":"vless","listen":"127.0.0.1","port":12102,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["not-hex"]}}}]]=]
     "REALITY shortIds contains an invalid value")
 expect_rejected(invalid_reality_public_key "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-public-key","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"not-base64url","shortId":"0123456789abcdef"}}}]]=]
+    [=[[{"tag":"bad-reality-public-key","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"not-base64url","shortId":"0123456789abcdef"}}}]]=]
     "REALITY publicKey is invalid")
 expect_rejected(invalid_reality_private_key "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-private-key","protocol":"vless","listen":"127.0.0.1","port":12103,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"not-base64url","shortIds":["0123456789abcdef"]}}}]]=]
     "REALITY privateKey is invalid")
 expect_rejected(missing_reality_outbound_public_key "{}" "outbounds.json"
-    [=[[{"tag":"missing-reality-public-key","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","shortId":"0123456789abcdef"}}}]]=]
+    [=[[{"tag":"missing-reality-public-key","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","shortId":"0123456789abcdef"}}}]]=]
     "outbound REALITY requires publicKey")
 expect_rejected(missing_reality_inbound_private_key "{}" "inbounds.json"
     [=[[{"tag":"missing-reality-private-key","protocol":"vless","listen":"127.0.0.1","port":12104,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"shortIds":["0123456789abcdef"]}}}]]=]
@@ -619,17 +575,17 @@ expect_rejected(unsupported_reality_target_alias "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"target":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "dest/target is not supported")
 expect_rejected(unsupported_reality_fingerprint "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-fingerprint","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"chrome"}}}]]=]
+    [=[[{"tag":"bad-reality-fingerprint","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"chrome"}}}]]=]
     "ClientHello fingerprint")
 expect_rejected(unsupported_reality_spider "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spiderX":"/"}}}]]=]
+    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spiderX":"/"}}}]]=]
     "REALITY crawler")
 expect_rejected(unsupported_reality_spider_alias "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spider_x":"/"}}}]]=]
+    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spider_x":"/"}}}]]=]
     "spiderX/spider_x is not supported")
 expect_started(valid_native_reality_client
     [=[{"workers":1}]=] "outbounds.json"
-    [=[[{"tag":"valid-native-reality","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef"}}}]]=])
+    [=[[{"tag":"valid-native-reality","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef"}}}]]=])
 expect_rejected(unsupported_reality_mldsa_seed "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"],"mldsa65Seed":"configured-but-unused"}}}]]=]
     "ML-DSA-65")
@@ -637,10 +593,10 @@ expect_rejected(unsupported_reality_mldsa_seed_alias "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"],"mldsa65_seed":"configured-but-unused"}}}]]=]
     "ML-DSA-65")
 expect_rejected(unsupported_reality_mldsa_verify "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65Verify":"configured-but-unused"}}}]]=]
+    [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65Verify":"configured-but-unused"}}}]]=]
     "signing and verification are not supported")
 expect_rejected(unsupported_reality_mldsa_verify_alias "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65_verify":"configured-but-unused"}}}]]=]
+    [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65_verify":"configured-but-unused"}}}]]=]
     "signing and verification are not supported")
 expect_rejected(unsupported_reality_proxy_protocol "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"xver":1,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
@@ -657,25 +613,21 @@ expect_started(valid_zero_reality_proxy_protocol
 expect_rejected(invalid_vmess_outbound "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{}}]]=])
 expect_rejected(overflow_vmess_outbound_port "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":65536,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}]]=])
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"address":"example.com","port":65536,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}]]=])
 expect_rejected(unsupported_vmess_alter_id "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":64}}]]=])
-expect_rejected(unsupported_vmess_alter_id_alias "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alter_id":1}}]]=])
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":64}}]]=])
 expect_rejected(negative_vmess_alter_id "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":-1}}]]=])
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":-1}}]]=])
 expect_rejected(non_integer_vmess_alter_id "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":"0"}}]]=])
-expect_rejected(conflicting_vmess_alter_id_aliases "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vmess","settings":{"server":"example.com","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":0,"alter_id":64}}]]=])
+    [=[[{"tag":"proxy","protocol":"vmess","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":"0"}}]]=])
 expect_rejected(nested_unsupported_vmess_alter_id "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"vmess","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","alterId":64}]}]}}]]=])
 expect_rejected(negative_vless_outbound_port "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"vless","settings":{"server":"example.com","server_port":-1,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]]=])
+    [=[[{"tag":"proxy","protocol":"vless","settings":{"address":"example.com","port":-1,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]]=])
 expect_rejected(string_trojan_outbound_port "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"trojan","settings":{"server":"example.com","server_port":"443","password":"secret"}}]]=])
+    [=[[{"tag":"proxy","protocol":"trojan","settings":{"address":"example.com","port":"443","password":"secret"}}]]=])
 expect_outbound_credentials(invalid_vmess_outbound_uuid vmess
-    [=["uuid":"not-a-uuid"]=] FALSE)
+    [=["id":"not-a-uuid"]=] FALSE)
 expect_outbound_credentials(valid_vmess_outbound_uuid vmess
     [=["id":"b831381d-6324-4d53-ad4f-8cda48b30811"]=] TRUE)
 expect_outbound_credentials(invalid_vless_outbound_uuid vless
@@ -721,41 +673,35 @@ expect_outbound_credentials(valid_ss2022_chacha_psk shadowsocks
     [=["method":"2022-blake3-chacha20-poly1305","password":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]=] TRUE)
 
 expect_rejected(overflow_ss_outbound_port "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":65536,"method":"aes-256-gcm","password":"secret"}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":65536,"method":"aes-256-gcm","password":"secret"}}]]=])
 expect_rejected(invalid_ss_uot_boolean_version "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":3}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":3}}]]=])
 expect_rejected(non_boolean_ss_uot "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":"true"}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":"true"}}]]=])
 expect_rejected(invalid_ss_uot_object_version "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","udp_over_tcp":{"enabled":true,"version":3}}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":{"enabled":true,"version":3}}}]]=])
 expect_rejected(non_boolean_ss_uot_enabled "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","udp_over_tcp":{"enabled":1,"version":2}}}]]=])
-expect_rejected(conflicting_ss_uot_aliases "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":false,"udp_over_tcp":true}}]]=])
-expect_rejected(conflicting_ss_uot_version_aliases "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":1,"uot_version":2}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":{"enabled":1,"version":2}}}]]=])
 expect_rejected(orphan_ss_uot_version "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"server":"example.com","server_port":443,"method":"aes-256-gcm","password":"secret","uotVersion":2}}]]=])
+    [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uotVersion":2}}]]=])
 expect_rejected(nested_invalid_ss_uot_version "{}" "outbounds.json"
     [=[[{"tag":"proxy","protocol":"shadowsocks","settings":{"servers":[{"address":"example.com","port":443,"method":"aes-256-gcm","password":"secret","uot":true,"uotVersion":3}]}}]]=])
-expect_rejected(invalid_anytls_preferred_port "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":"bad","port":443,"password":"secret"}}]]=])
+expect_rejected(invalid_anytls_port_type "{}" "outbounds.json"
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":"bad","password":"secret"}}]]=])
 expect_rejected(non_integer_anytls_idle_check_interval "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionCheckInterval":"30"}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":"30"}}]]=])
 expect_rejected(overflow_anytls_idle_check_clock "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"127.0.0.1","server_port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"127.0.0.1","port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807}}]]=])
 expect_rejected(overflow_anytls_idle_timeout_clock "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"127.0.0.1","server_port":443,"password":"secret","idleSessionTimeout":9223372036854775807}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"127.0.0.1","port":443,"password":"secret","idleSessionTimeout":9223372036854775807}}]]=])
 expect_rejected(zero_anytls_idle_timeout "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":0}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","idleSessionTimeout":0}}]]=])
 expect_rejected(overflow_anytls_idle_timeout "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":18446744073709551615}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","idleSessionTimeout":18446744073709551615}}]]=])
 expect_rejected(negative_anytls_min_idle_sessions "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","minIdleSession":-1}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","minIdleSession":-1}}]]=])
 expect_rejected(non_integer_anytls_min_idle_sessions "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","minIdleSession":"1"}}]]=])
-expect_rejected(conflicting_anytls_idle_timeout_aliases "{}" "outbounds.json"
-    [=[[{"tag":"proxy","protocol":"anytls","settings":{"server":"example.com","server_port":443,"password":"secret","idleSessionTimeout":60,"idle_session_timeout":61}}]]=])
+    [=[[{"tag":"proxy","protocol":"anytls","settings":{"address":"example.com","port":443,"password":"secret","minIdleSession":"1"}}]]=])
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/cert.pem" AUTH_PADDING_CERT)
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_LIST_DIR}/fixtures/anytls-pool/key.pem" AUTH_PADDING_KEY)
 set(AUTH_PADDING_TLS "\"streamSettings\":{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"certificates\":[{\"certificateFile\":\"${AUTH_PADDING_CERT}\",\"keyFile\":\"${AUTH_PADDING_KEY}\"}]}}")
@@ -838,27 +784,27 @@ expect_rejected("ip_literal_route_0"
 expect_rejected("ip_literal_outbound_vmess_0"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vmess","settings":{"address":"127.0.0.1:9","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_0"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vless","settings":{"address":"127.0.0.1:9","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_0"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"trojan","settings":{"address":"127.0.0.1:9","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_0"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"address":"127.0.0.1:9","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_0"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1:9","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"anytls","settings":{"address":"127.0.0.1:9","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_1"
     [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1\u0000ignored"}]}]=]
@@ -886,27 +832,27 @@ expect_rejected("ip_literal_route_1"
 expect_rejected("ip_literal_outbound_vmess_1"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vmess","settings":{"address":"127.0.0.1\u0000ignored","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_1"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vless","settings":{"address":"127.0.0.1\u0000ignored","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_1"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"trojan","settings":{"address":"127.0.0.1\u0000ignored","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_1"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"address":"127.0.0.1\u0000ignored","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_1"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1\u0000ignored","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"anytls","settings":{"address":"127.0.0.1\u0000ignored","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_2"
     [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"[::1]"}]}]=]
@@ -934,27 +880,27 @@ expect_rejected("ip_literal_route_2"
 expect_rejected("ip_literal_outbound_vmess_2"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vmess","settings":{"address":"[::1]","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_2"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vless","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vless","settings":{"address":"[::1]","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_2"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"trojan","settings":{"address":"[::1]","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_2"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"address":"[::1]","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_2"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"[::1]","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"anytls","settings":{"address":"[::1]","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_3"
     [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"127.0.0.1 "}]}]=]
@@ -982,27 +928,27 @@ expect_rejected("ip_literal_route_3"
 expect_rejected("ip_literal_outbound_vmess_3"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vmess","settings":{"address":"127.0.0.1 ","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_3"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vless","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vless","settings":{"address":"127.0.0.1 ","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_3"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"trojan","settings":{"address":"127.0.0.1 ","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_3"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"address":"127.0.0.1 ","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_3"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"127.0.0.1 ","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"anytls","settings":{"address":"127.0.0.1 ","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_panel_ListenIP_4"
     [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1","Key":"fixture","NodeIDs":[1],"NodeType":"vmess","ListenIP":"fe80::1%invalid"}]}]=]
@@ -1030,27 +976,27 @@ expect_rejected("ip_literal_route_4"
 expect_rejected("ip_literal_outbound_vmess_4"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vmess","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vmess","settings":{"address":"fe80::1%invalid","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_vless_4"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"vless","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"vless","settings":{"address":"fe80::1%invalid","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_trojan_4"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"trojan","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"trojan","settings":{"address":"fe80::1%invalid","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_shadowsocks_4"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    [=[[{"tag":"literal","protocol":"shadowsocks","settings":{"address":"fe80::1%invalid","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_outbound_anytls_4"
     [=[{"workers":2,"log":{"enable":false}}]=]
     [=[outbounds.json]=]
-    [=[[{"tag":"literal","protocol":"anytls","settings":{"server":"fe80::1%invalid","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
+    [=[[{"tag":"literal","protocol":"anytls","settings":{"address":"fe80::1%invalid","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","password":"fixture","method":"aes-128-gcm"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"allowInsecure":true}}}]]=]
     [=[outbound 'literal'.*unsupported or invalid]=])
 expect_rejected("ip_literal_url_0"
     [=[{"workers":2,"log":{"enable":false},"panels":[{"Name":"ip-validation","Type":"V2board","APIHost":"http://127.0.0.1\u0000ignored","Key":"fixture","NodeIDs":[1],"NodeType":"vmess"}]}]=]

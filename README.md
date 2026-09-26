@@ -19,6 +19,18 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 默认按多数据 Worker 运行；各数据 Worker 同构，分别拥有监听和转发资源。Linux 使用 `SO_REUSEPORT`；Windows 使用 `SO_REUSEADDR` 作为允许的降级，不保证相同的连接分布。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
+## 构建与测试
+
+本地与 CI 使用同一测试入口（需要 Python 3）：
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCNODE_BUILD_TESTS=ON
+cmake --build build --config Release --target cnode_tests --parallel 2
+ctest --test-dir build -C Release --no-tests=error --output-on-failure --parallel 2
+```
+
+`cnode_tests` 构建主程序和全部测试，CTest 统一执行单元、契约及集成测试。Linux glibc 可在配置时添加 `-DCNODE_TEST_SANITIZERS=ON`，将内存池和调度器的 ASan/UBSan 回归纳入同一次 CTest。CI 的 musl/glibc 共用这一流程；默认发布产物仍为静态 musl。
+
 ## 架构总览
 
 所有 TCP / UDP 请求最终只能经过一条数据链路：
