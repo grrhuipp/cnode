@@ -160,14 +160,14 @@ jobs:
             ldd "$BUILD_DIR/cnode"
           fi
           mkdir -p release-assets
-          objcopy --only-keep-debug "$BUILD_DIR/cnode" "$BUILD_DIR/$ASSET_NAME.debug"
-          strip "$BUILD_DIR/cnode"
-          objcopy --add-gnu-debuglink="$BUILD_DIR/$ASSET_NAME.debug" "$BUILD_DIR/cnode"
+          # Never mutate the build/test executable during packaging.
           cp "$BUILD_DIR/cnode" "release-assets/$ASSET_NAME"
-          cp "$BUILD_DIR/$ASSET_NAME.debug" "release-assets/$ASSET_NAME.debug"
+          objcopy --only-keep-debug "release-assets/$ASSET_NAME" "release-assets/$ASSET_NAME.debug"
+          strip "release-assets/$ASSET_NAME"
+          objcopy --add-gnu-debuglink="release-assets/$ASSET_NAME.debug" "release-assets/$ASSET_NAME"
           if [ '${{ matrix.libc }}' = musl ]; then
-            cp "$BUILD_DIR/cnode" release-assets/cnode-linux-amd64
-            cp "$BUILD_DIR/$ASSET_NAME.debug" release-assets/cnode-linux-amd64.debug
+            cp "release-assets/$ASSET_NAME" release-assets/cnode-linux-amd64
+            cp "release-assets/$ASSET_NAME.debug" release-assets/cnode-linux-amd64.debug
           fi
           ls -lh release-assets
 
