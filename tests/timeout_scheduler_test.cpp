@@ -330,6 +330,46 @@ bool TestPoolMaintenance() {
     return pool.GetFootprint().mapped_bytes == 0;
 }
 
+bool TestPmrSchedulerReentrancy() {
+    using namespace std::chrono_literals;
+    struct DefaultResourceScope {
+        acpp::memory::ThreadPoolFacade resource;
+        std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
+        ~DefaultResourceScope() { std::pmr::set_default_resource(previous); }
+    } resource_scope;
+    auto& pool = acpp::memory::ThreadPool();
+    pool.PurgeIdle();
+    bool survivor_ran = false;
+    {
+        acpp::net::io_context io;
+        auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+        acpp::WorkerMemoryReclaimer reclaimer;
+        reclaimer.Start(scheduler);
+        std::vector<acpp::TimeoutToken> tokens;
+        tokens.reserve(12000);
+        // Real Worker resource, beyond the initial map/heap reserves. Rehash
+        // releases the old bucket array before publishing its replacement.
+        // Descending deadlines force stale-top queries to traverse many IDs.
+        for (int i = 0; i < 12000; ++i) {
+            pool.PurgeIdle();
+            tokens.push_back(scheduler.ScheduleAfter(48h - std::chrono::seconds(i), [] {}));
+        }
+        for (auto& token : tokens) {
+            pool.PurgeIdle();
+            scheduler.Cancel(token);
+        }
+        auto survivor = scheduler.ScheduleAfter(20ms, [&] { survivor_ran = true; });
+        io.run();
+        if (!survivor_ran || pool.GetFootprint().idle_bytes) return false;
+        // Also exercise service teardown while the allocator observer is bound.
+        for (int i = 0; i < 2048; ++i)
+            tokens.push_back(scheduler.ScheduleAfter(1h, [] {}));
+        acpp::TimeoutScheduler::ReleaseForIoContext(io);
+    }
+    pool.PurgeIdle();
+    return pool.GetFootprint().mapped_bytes == 0;
+}
+
 bool TestMaintenanceCancellation() {
     using namespace std::chrono_literals;
     acpp::net::io_context io;
@@ -366,7 +406,9 @@ int main() {
     using namespace std::chrono_literals;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    bool allocation_checks_passed = TestPoolMaintenance();
+    bool allocation_checks_passed = TestPmrSchedulerReentrancy();
+    std::printf("PMR scheduler reentrancy: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
+    allocation_checks_passed = TestPoolMaintenance() && allocation_checks_passed;
     std::printf("pool maintenance: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
     allocation_checks_passed = TestMaintenanceCancellation() && allocation_checks_passed;
     allocation_checks_passed = TestCancellationAllocation() && allocation_checks_passed;

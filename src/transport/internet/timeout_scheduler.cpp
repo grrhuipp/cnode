@@ -115,6 +115,12 @@ struct TimeoutScheduler::Impl {
         PruneHeapTop();
         const auto next_deadline = deadline_heap.empty() ? maintenance_deadline
             : std::min(deadline_heap.front().deadline, maintenance_deadline);
+        ArmDeadline(next_deadline);
+    }
+
+    // May run from a PMR deallocation while events is rehashing or the heap
+    // is reallocating. Do not inspect either container from this leaf path.
+    void ArmDeadline(std::chrono::steady_clock::time_point next_deadline) {
         if (next_deadline == std::chrono::steady_clock::time_point::max()) return;
 
         if (wait_pending) {
@@ -355,7 +361,7 @@ bool TimeoutScheduler::SetMaintenanceDeadline(
     impl_->maintenance_owner = owner;
     impl_->maintenance_callback = callback;
     impl_->maintenance_deadline = deadline;
-    impl_->ArmTimer();
+    impl_->ArmDeadline(deadline);
     return true;
 }
 
@@ -364,7 +370,10 @@ void TimeoutScheduler::CancelMaintenance(void* owner) noexcept {
     impl_->maintenance_deadline = std::chrono::steady_clock::time_point::max();
     impl_->maintenance_owner = nullptr;
     impl_->maintenance_callback = nullptr;
-    impl_->ReconcileTimerAfterCancellation();
+    // Allocator notifications can also cancel maintenance during a container
+    // mutation (including the timer-initiation OOM fallback). Defer all heap
+    // pruning and event lookup to OnTimer, after the current stack unwinds.
+    impl_->RequestWakeup();
 }
 
 void TimeoutScheduler::Cancel(TimeoutToken& token) noexcept {

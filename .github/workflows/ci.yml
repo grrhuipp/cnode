@@ -228,7 +228,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
-      - name: Sanitize Worker pool ownership and geometry
+      - name: Sanitize Worker allocator and scheduler
         run: |
           c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
             -fsanitize=address,undefined -Wall -Wextra -Wpedantic \
@@ -236,6 +236,13 @@ jobs:
             -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
             tests/thread_pool_test.cpp -o "$BUILD_DIR/pool-sanitizer-test"
           "$BUILD_DIR/pool-sanitizer-test"
+          c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -Wall -Wextra -Wpedantic \
+            -DASIO_STANDALONE -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
+            -include tests/timeout_scheduler_allocation.hpp \
+            tests/timeout_scheduler_test.cpp src/transport/internet/timeout_scheduler.cpp \
+            -o "$BUILD_DIR/scheduler-sanitizer-test"
+          "$BUILD_DIR/scheduler-sanitizer-test"
 
       - name: Package glibc binary
         run: |

@@ -62,7 +62,7 @@ if(COMPACT_SOURCE MATCHES "compacted.reserve" OR
 endif()
 
 string(FIND "${SCHEDULER_SOURCE}"
-    "void TimeoutScheduler::Cancel" CANCEL_BEGIN)
+    "void TimeoutScheduler::Cancel(TimeoutToken" CANCEL_BEGIN)
 string(FIND "${SCHEDULER_SOURCE}"
     "}  // namespace acpp" CANCEL_END)
 if(CANCEL_BEGIN EQUAL -1 OR CANCEL_END EQUAL -1 OR
@@ -76,3 +76,26 @@ if(NOT CANCEL_SOURCE MATCHES "impl_->MaybeCompactHeap[(][)]")
     message(FATAL_ERROR
         "cancellation must reclaim non-top deadline heap tombstones")
 endif()
+
+# PMR deallocation can notify maintenance before a container commits a rehash
+# or replacement buffer. These entry points must only manipulate timer state.
+foreach(PART IN ITEMS LEAF ENTRY)
+    if(PART STREQUAL "LEAF")
+        set(BEGIN_TEXT "    void ArmDeadline(")
+        set(END_TEXT "    void ReconcileTimerAfterCancellation()")
+    else()
+        set(BEGIN_TEXT "bool TimeoutScheduler::SetMaintenanceDeadline(")
+        set(END_TEXT "void TimeoutScheduler::Cancel(TimeoutToken")
+    endif()
+    string(FIND "${SCHEDULER_SOURCE}" "${BEGIN_TEXT}" BEGIN_POS)
+    string(FIND "${SCHEDULER_SOURCE}" "${END_TEXT}" END_POS)
+    if(BEGIN_POS EQUAL -1 OR END_POS EQUAL -1 OR NOT BEGIN_POS LESS END_POS)
+        message(FATAL_ERROR "could not isolate allocator-safe maintenance path")
+    endif()
+    math(EXPR LENGTH "${END_POS} - ${BEGIN_POS}")
+    string(SUBSTRING "${SCHEDULER_SOURCE}" ${BEGIN_POS} ${LENGTH} MAINTENANCE_SOURCE)
+    if(MAINTENANCE_SOURCE MATCHES
+       "events[.]|deadline_heap|PruneHeapTop[(]|ArmTimer[(]|ReconcileTimerAfterCancellation[(]")
+        message(FATAL_ERROR "maintenance notification must not reenter scheduler containers")
+    endif()
+endforeach()

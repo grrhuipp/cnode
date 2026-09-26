@@ -75,6 +75,8 @@ public:
 
     // One owner-thread maintenance deadline, independent of connection events.
     // Stored inline: no callback allocation, map node, or second timer.
+    // May be called during a PMR container mutation: neither entry point
+    // inspects the event map or deadline heap. Reconciliation is deferred.
     // False means the scheduler has already been released. Arming may throw.
     [[nodiscard]] bool SetMaintenanceDeadline(
         void* owner, void (*callback)(void*) noexcept,
