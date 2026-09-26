@@ -558,11 +558,12 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
     }
 
     impl_->Touch();
-    // Wait without pinning an Asio ciphertext buffer. Buffered ciphertext in
-    // Asio is separate from SSL_pending/SSL_has_pending and must also be drained.
+    // SSL_pending/SSL_has_pending exclude ciphertext still in the read BIO.
+    // Drain both that BIO and Asio's remaining input before waiting on TCP;
+    // otherwise coalesced TLS records can stall without another network edge.
     SSL* ssl = NativeSsl();
     if (buf.size() != 0 && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0 &&
-        !impl_->stream.has_buffered_input()) {
+        BIO_ctrl_pending(SSL_get_rbio(ssl)) == 0 && !impl_->stream.has_buffered_input()) {
         const auto ec = co_await impl_->stream.next_layer().Tcp().WaitReadable();
         if (ec == io_error::eof || ec == io_error::operation_aborted) co_return 0;
         if (ec) throw IoSystemError(ec);
@@ -595,7 +596,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
     // OpenSSL 已有解密/待处理记录时必须直接 SSL_read；否则先等待
     // 底层 TCP 可读，避免给每条空闲 TLS 连接预留 8KB payload Buffer。
     if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0 &&
-        !impl_->stream.has_buffered_input()) {
+        BIO_ctrl_pending(SSL_get_rbio(ssl)) == 0 && !impl_->stream.has_buffered_input()) {
         TcpStream* tcp = BaseTcpStream();
         if (!tcp) {
             co_return buf::MultiBuffer{};

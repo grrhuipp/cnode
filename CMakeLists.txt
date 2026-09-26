@@ -2768,6 +2768,12 @@ if(CNODE_BUILD_TESTS)
                 --output ${CMAKE_CURRENT_BINARY_DIR}/tls_cancellation_partial_integration_test
                 --partial-record)
         set_tests_properties(cnode_tls_cancellation_partial_integration_test PROPERTIES TIMEOUT 40)
+        add_test(NAME cnode_tls_coalesced_records_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_coalesced_records_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_coalesced_records_integration_test)
+        set_tests_properties(cnode_tls_coalesced_records_integration_test PROPERTIES TIMEOUT 35)
         add_test(NAME cnode_tls_idle_write_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_idle_write_integration.py
