@@ -15,10 +15,8 @@ int main() {
         acpp::detail::XHttpPacketSessionKeyEq>;
     Map sessions;
 
-    Key first{.owner = &first_context};
-    first.session_id = "shared-session";
-    Key second{.owner = &second_context};
-    second.session_id = "shared-session";
+    Key first{.owner = &first_context, .session_id = "shared-session"};
+    Key second{.owner = &second_context, .session_id = "shared-session"};
     sessions.emplace(std::move(first), 1);
     sessions.emplace(std::move(second), 2);
 

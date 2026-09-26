@@ -130,7 +130,7 @@ std::optional<acpp::proxyman::inbound::UserSet> BuildVmessUsers(
     std::span<const acpp::proxyman::inbound::RuntimeUser>) {
     return acpp::proxyman::inbound::UserSet{
         acpp::proxyman::inbound::PreparedVmessUsers{
-            acpp::proxyman::inbound::PreparedVmessUser{.uuid = "alias-user"}}};
+            acpp::proxyman::inbound::PreparedVmessUser{.uuid = "alias-user", .profile = {}}}};
 }
 
 std::optional<acpp::proxyman::inbound::UserSet> BuildTrojanUsers(

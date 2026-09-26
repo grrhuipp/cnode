@@ -111,10 +111,11 @@ int main() {
     for (bool logical : {false, true}) for (bool codec : {false, true}) for (int fault = 0; fault < 8; ++fault) {
         net::io_context io;
         State state{.fault = fault};
-        proxyman::inbound::ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-        receiver.inbound_tag = "test";
-        receiver.protocol = "fixture";
-        receiver.proxy_protocol = ProxyProtocolMode::Off;
+        proxyman::inbound::ReceiverSettings receiver{
+            .inbound_tag = "test", .inbound_tags = {}, .protocol = "fixture",
+            .stream_settings = {},
+            .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
+            .proxy_protocol = ProxyProtocolMode::Off};
         receiver.stream_settings.network = logical ? "grpc" : "tcp";
         auto handler = std::make_shared<proxyman::inbound::Handler>(std::move(receiver), std::make_unique<Proxy>(fault, codec));
         Dispatcher dispatcher;

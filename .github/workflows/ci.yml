@@ -85,6 +85,8 @@ jobs:
             apk add --no-cache build-base binutils ccache cmake ninja git curl \
               zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 bash file ca-certificates
           else
+            # Keep package manpages: update-alternatives must find its targets.
+            rm -f /etc/dpkg/dpkg.cfg.d/excludes
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential binutils ccache cmake ninja-build git curl \

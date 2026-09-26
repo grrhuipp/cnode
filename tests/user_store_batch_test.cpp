@@ -24,9 +24,9 @@ void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); 
 
 int main() {
     using namespace acpp::proxyman::inbound;
-    const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{.uuid = "old-first"}};
-    const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "old-second"}};
-    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.uuid = "unrelated"}};
+    const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{.uuid = "old-first", .profile = {}}};
+    const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "old-second", .profile = {}}};
+    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.uuid = "unrelated", .profile = {}}};
     const std::array initial{
         UserStore::UserUpdate{"first", first_old},
         UserStore::UserUpdate{"second", second_old},
@@ -37,8 +37,9 @@ int main() {
     const auto unrelated_view = UserStore::VmessUsers("unrelated").users;
 
     const UserSet first_new = PreparedVmessUsers{
-        PreparedVmessUser{.uuid = "new-first-1"}, PreparedVmessUser{.uuid = "new-first-2"}};
-    const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "new-second"}};
+        PreparedVmessUser{.uuid = "new-first-1", .profile = {}},
+        PreparedVmessUser{.uuid = "new-first-2", .profile = {}}};
+    const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "new-second", .profile = {}}};
     const UserSet third_new = PreparedVlessUsers{PreparedVlessUser{}};
     const std::array updates{
         UserStore::UserUpdate{"first", first_new},

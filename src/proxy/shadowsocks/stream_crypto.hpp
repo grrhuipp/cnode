@@ -75,7 +75,9 @@ public:
         }
 
         int final_len = 0;
-        uint8_t dummy[1]{};
+        // EVP's finalization contract requires space for a complete block,
+        // even though the supported AEAD modes must produce no final bytes.
+        uint8_t dummy[EVP_MAX_BLOCK_LENGTH]{};
         return EVP_DecryptFinal_ex(ctx_, dummy, &final_len) == 1 &&
             final_len == 0;
     }

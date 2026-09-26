@@ -7,7 +7,6 @@
 #include <vector>
 
 namespace {
-thread_local bool deny_allocation = false;
 thread_local size_t failures = 0;
 thread_local int allocation_budget = -1;
 thread_local bool track_allocations = false;
@@ -16,7 +15,7 @@ thread_local size_t live_count = 0;
 }
 
 void* operator new(std::size_t size) {
-    if (deny_allocation || allocation_budget == 0) { ++failures; throw std::bad_alloc(); }
+    if (allocation_budget == 0) { ++failures; throw std::bad_alloc(); }
     if (allocation_budget > 0) --allocation_budget;
     if (void* pointer = std::malloc(size ? size : 1)) {
         if (track_allocations) {
@@ -70,47 +69,6 @@ bool Matches(const InitialPayload& payload, std::span<const uint8_t> expected) {
     std::vector<uint8_t> actual(expected.size());
     return payload.CopyPrefixTo(actual.data(), actual.size()) == expected.size() &&
         std::equal(actual.begin(), actual.end(), expected.begin(), expected.end());
-}
-
-void InitialFailure() {
-    const std::array<uint8_t, 17> prefix{0x31, 0x32};
-    const std::array<uint8_t, 9000> suffix{0x51, 0x52};
-    for (bool assign : {false, true}) {
-        InitialPayload initial;
-        initial.append(prefix);
-        bool caught = false;
-        failures = 0;
-        deny_allocation = true;
-        try {
-            if (assign) initial.assign(suffix);
-            else initial.append(suffix);
-        } catch (const std::bad_alloc&) { caught = true; }
-        deny_allocation = false;
-        Check(caught && failures && Matches(initial, prefix),
-              assign ? "initial assignment preserves old payload" : "initial spill preserves old payload");
-    }
-}
-
-void BufferFailure() {
-    buf::MultiBuffer payload;
-    for (size_t i = 0; i < 8; ++i) payload.push_back(Buffer(1));
-    auto extra = Buffer(5);
-    bool caught = false;
-    deny_allocation = true;
-    try { payload.push_back(std::move(extra)); }
-    catch (const std::bad_alloc&) { caught = true; }
-    deny_allocation = false;
-    Check(caught && payload.size() == 8 && payload.byte_size() == 8,
-          "spill insertion preserves byte accounting");
-
-    buf::MultiBuffer tail;
-    tail.push_back(Buffer(33));
-    const std::array<uint8_t, 9000> suffix{};
-    deny_allocation = true;
-    bool appended = buf::AppendSpanToMultiBuffer(suffix, tail);
-    deny_allocation = false;
-    Check(!appended && tail.byte_size() == 33 && tail.back()->Len() == 33,
-          "failed append preserves existing tail");
 }
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {

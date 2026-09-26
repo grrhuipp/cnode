@@ -144,7 +144,7 @@ int main() {
     groups.insert(groups.begin(), 0x13); groups.push_back(0x14); Case(Frame(groups), "", false);
     auto compressed = Frame({}); compressed[0] = 1; Case(compressed, "", false);
     Bytes combined = Frame({});
-    for (const auto body : {Bytes{0x0a, 1, 'a'}, Bytes{0x0a, 0}, Bytes{0x0a, 1, 'b'}}) {
+    for (const auto& body : {Bytes{0x0a, 1, 'a'}, Bytes{0x0a, 0}, Bytes{0x0a, 1, 'b'}}) {
         const auto next = Frame(body); combined.insert(combined.end(), next.begin(), next.end());
     }
     Case(combined, "ab", true);
