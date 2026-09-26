@@ -486,7 +486,6 @@ protected:
         return this == &other;
     }
 };
-inline std::pmr::memory_resource& ThreadMemoryResource() noexcept { return ThreadPool(); }
 extern "C" void cnode_set_tls_buffer_allocator(
     void* (*alloc_fn)(std::size_t), void (*free_fn)(void*));
 inline void* AllocateTlsReadWriteBuffer(std::size_t size) { return AllocatePmr(size); }
