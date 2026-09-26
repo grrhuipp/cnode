@@ -200,12 +200,7 @@ add_library(cnode_blake3 STATIC
     ${blake3_SOURCE_DIR}/c/blake3_portable.c
 )
 target_include_directories(cnode_blake3 PUBLIC ${blake3_SOURCE_DIR}/c)
-target_compile_definitions(cnode_blake3 PRIVATE
-    BLAKE3_NO_SSE2
-    BLAKE3_NO_SSE41
-    BLAKE3_NO_AVX2
-    BLAKE3_NO_AVX512
-)
+include(cmake/blake3_simd.cmake)
 message(STATUS "Using BLAKE3 via FetchContent")
 
 add_library(cnode_zlib STATIC
@@ -260,7 +255,6 @@ set(CNODE_SOURCES
     # App - DNS
     src/app/dns/dns.cpp
     src/app/dns/cache.cpp
-    src/app/dns/global_cache.cpp
 
     # Geo
     src/geo/geodata.cpp
@@ -306,7 +300,6 @@ set(CNODE_SOURCES
     src/app/worker.cpp
     src/service/controller/controller.cpp
     src/common/awaitable_batch.cpp
-    src/common/awaitable_task_group.cpp
     src/service/controller/node_transition.cpp
     src/service/controller/node_runtime.cpp
     src/service/controller/online_snapshot.cpp
@@ -1295,7 +1288,6 @@ if(CNODE_BUILD_TESTS)
         src/proxy/anytls/padding.cpp
         src/proxy/anytls/credentials.cpp
         src/proxy/anytls/validator.cpp
-        src/common/awaitable_task_group.cpp
         src/app/proxyman/inbound/factory.cpp
         src/app/proxyman/inbound/user_store.cpp
         src/transport/async_stream.cpp
@@ -1402,7 +1394,6 @@ if(CNODE_BUILD_TESTS)
         src/app/proxyman/outbound/factory.cpp
         src/app/dns/dns.cpp
         src/app/dns/cache.cpp
-        src/app/dns/global_cache.cpp
         src/transport/async_stream.cpp
         src/transport/internet/outbound_target_builder.cpp
         src/transport/internet/outbound_bind.cpp
@@ -1725,7 +1716,6 @@ if(CNODE_BUILD_TESTS)
         tests/dns_inflight_test.cpp
         src/app/dns/dns.cpp
         src/app/dns/cache.cpp
-        src/app/dns/global_cache.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/infra/log.cpp
     )
@@ -1764,24 +1754,24 @@ if(CNODE_BUILD_TESTS)
     )
     add_test(NAME cnode_dns_cache_test COMMAND cnode_dns_cache_test)
 
-    add_executable(cnode_global_dns_cache_test
-        tests/global_dns_cache_test.cpp
-        src/app/dns/global_cache.cpp
-    )
-    target_include_directories(cnode_global_dns_cache_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(cnode_global_dns_cache_test PRIVATE asio::asio Threads::Threads)
+    add_executable(cnode_dns_datagram_test
+        tests/dns_datagram_test.cpp
+        src/app/dns/dns.cpp
+        src/app/dns/cache.cpp
+        src/transport/internet/timeout_scheduler.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_dns_datagram_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${concurrentqueue_SOURCE_DIR})
+    target_link_libraries(cnode_dns_datagram_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
     if(WIN32)
-        target_link_libraries(cnode_global_dns_cache_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_global_dns_cache_test PRIVATE _WIN32_WINNT=0x0A00)
+        target_link_libraries(cnode_dns_datagram_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_dns_datagram_test PRIVATE _WIN32_WINNT=0x0A00)
     endif()
-    target_compile_options(cnode_global_dns_cache_test PRIVATE
+    target_compile_options(cnode_dns_datagram_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(NAME cnode_global_dns_cache_test COMMAND cnode_global_dns_cache_test)
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_dns_datagram_test COMMAND cnode_dns_datagram_test)
+    set_tests_properties(cnode_dns_datagram_test cnode_dns_inflight_test PROPERTIES TIMEOUT 20)
 
     add_executable(cnode_router_test
         tests/router_test.cpp
@@ -1970,7 +1960,6 @@ if(CNODE_BUILD_TESTS)
         src/app/udp_callback_router.cpp
         src/app/dns/dns.cpp
         src/app/dns/cache.cpp
-        src/app/dns/global_cache.cpp
         src/transport/internet/timeout_scheduler.cpp
         src/common/error.cpp
         src/common/session.cpp
@@ -2023,6 +2012,23 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_buffer_ownership_test COMMAND cnode_buffer_ownership_test)
 
+    add_executable(cnode_blake3_dispatch_test tests/blake3_dispatch_test.cpp)
+    target_link_libraries(cnode_blake3_dispatch_test PRIVATE cnode_blake3)
+    add_test(NAME cnode_blake3_dispatch_test COMMAND cnode_blake3_dispatch_test)
+
+    # Exercise the fallback dispatcher independently of the build host's ISA.
+    add_library(cnode_blake3_portable_test_lib STATIC
+        ${blake3_SOURCE_DIR}/c/blake3.c
+        ${blake3_SOURCE_DIR}/c/blake3_dispatch.c
+        ${blake3_SOURCE_DIR}/c/blake3_portable.c)
+    target_include_directories(cnode_blake3_portable_test_lib PUBLIC ${blake3_SOURCE_DIR}/c)
+    target_compile_definitions(cnode_blake3_portable_test_lib PRIVATE
+        BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
+    add_executable(cnode_blake3_portable_test tests/blake3_dispatch_test.cpp)
+    target_compile_definitions(cnode_blake3_portable_test PRIVATE CNODE_EXPECT_PORTABLE)
+    target_link_libraries(cnode_blake3_portable_test PRIVATE cnode_blake3_portable_test_lib)
+    add_test(NAME cnode_blake3_portable_test COMMAND cnode_blake3_portable_test)
+
     add_executable(cnode_thread_pool_test tests/thread_pool_test.cpp)
     target_include_directories(cnode_thread_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(cnode_thread_pool_test PRIVATE asio::asio Threads::Threads)
@@ -2030,6 +2036,28 @@ if(CNODE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_thread_pool_test COMMAND cnode_thread_pool_test)
+
+    add_executable(cnode_asio_operation_allocator_test
+        tests/asio_operation_allocator_test.cpp
+        src/transport/async_stream.cpp
+        src/transport/internet/tcp_stream.cpp
+        src/transport/internet/proxy_protocol.cpp
+        src/transport/internet/timeout_scheduler.cpp
+        src/common/error.cpp
+        src/common/session.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_asio_operation_allocator_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
+    target_link_libraries(cnode_asio_operation_allocator_test PRIVATE asio::asio Threads::Threads cnode_zlib ssl crypto)
+    if(WIN32)
+        target_link_libraries(cnode_asio_operation_allocator_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_asio_operation_allocator_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_asio_operation_allocator_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_asio_operation_allocator_test COMMAND cnode_asio_operation_allocator_test)
+    set_tests_properties(cnode_asio_operation_allocator_test PROPERTIES TIMEOUT 10)
 
     add_executable(cnode_tls_bio_idle_test tests/tls_bio_idle_test.cpp)
     target_link_libraries(cnode_tls_bio_idle_test PRIVATE crypto)
@@ -2070,8 +2098,6 @@ if(CNODE_BUILD_TESTS)
         src/app/session_tracking.cpp
         src/app/dns/dns.cpp
         src/app/dns/cache.cpp
-        src/app/dns/global_cache.cpp
-        src/common/awaitable_task_group.cpp
         src/transport/async_stream.cpp
         src/transport/internet/tcp_stream.cpp
         src/transport/internet/proxy_protocol.cpp
@@ -2398,7 +2424,6 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_awaitable_task_group_test
         tests/awaitable_task_group_test.cpp
-        src/common/awaitable_task_group.cpp
     )
     target_include_directories(cnode_awaitable_task_group_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -2410,7 +2435,7 @@ if(CNODE_BUILD_TESTS)
     )
     # Exercise launch allocations even after an earlier case populated Asio caches.
     target_compile_definitions(cnode_awaitable_task_group_test PRIVATE
-        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
+        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_MEMORY_STATS)
     if(WIN32)
         target_link_libraries(cnode_awaitable_task_group_test PRIVATE ws2_32)
         target_compile_definitions(
@@ -2696,6 +2721,21 @@ if(CNODE_BUILD_TESTS)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        foreach(integration IN ITEMS dns_endpoint tls_cancellation)
+            add_test(NAME cnode_${integration}_integration_test
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py
+                    --binary $<TARGET_FILE:cnode>
+                    --output ${CMAKE_CURRENT_BINARY_DIR}/${integration}_integration_test)
+            set_tests_properties(cnode_${integration}_integration_test PROPERTIES TIMEOUT 40)
+        endforeach()
+        add_test(NAME cnode_tls_cancellation_partial_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_cancellation_partial_integration_test
+                --partial-record)
+        set_tests_properties(cnode_tls_cancellation_partial_integration_test PROPERTIES TIMEOUT 40)
         add_test(
             NAME cnode_static_inbound_outbound_integration_test
             COMMAND ${Python3_EXECUTABLE}

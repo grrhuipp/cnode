@@ -226,7 +226,7 @@ IP 字段必须是完整地址：IPv4 使用四段无前导零的十进制格式
 
 回调型连接超时由每个 Worker 的 TimeoutScheduler 汇聚到一个在途定时等待。取消事件不会重新分配等待或影响其他事件，取消索引在原存储中整理。限速、Mux 背压和 accept 退避的协程休眠由 AsyncDelay 直接等待可取消定时器，不再通过调度回调和通知 channel 中转；只有所属 Worker 能操作这些对象，销毁前必须收束在途协程。
 
-DNSWorker 将多个调用者的并发同域查询合并为一次解析，每个调用者独立取得结果。缓存写入分配失败不会丢失已经取得的答案；缓存在完整构建新条目后才淘汰旧条目。
+DNSWorker 将多个调用者的并发同域查询合并为一次解析，每个调用者独立取得结果。每个上游复用一个 UDP socket，三次 A 地址采样与 AAAA 查询并发执行，仍保留多地址合并与按顺序切换上游的语义。主控线程只有一层 DNS 缓存；缓存写入分配失败不会丢失已经取得的答案，缓存在完整构建新条目后才淘汰旧条目。
 
 Worker-local 无锁设计的前提是单 Worker 所有权。Worker 私有 manager、handler 表、listener slot、UDP session、stats shard、allocator 和 buffer provider 只能在所属 Worker 线程访问；跨线程控制面必须通过投递、不可变 snapshot 或明确同步的冷路径完成。
 
@@ -297,6 +297,7 @@ scripts/              部署与更新脚本
 
 ## 开发提示
 
+- x86-64 构建默认启用 BLAKE3 的运行时 SIMD 分派，保留 portable 回退，不要求部署机器与构建机器具有相同指令集。排查时可用 `-DCNODE_BLAKE3_SIMD=OFF` 构建纯 portable 版本。
 - 变更前先分析现有代码和配置，再决定修改方式。
 - 新代码优先沿用现有目录、命名、RAII、协程和错误处理风格。
 - 新增行为要同步考虑静态配置、面板配置、热更新、TCP、UDP、Mux/子流和源进源出语义。

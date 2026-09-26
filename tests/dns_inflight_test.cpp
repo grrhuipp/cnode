@@ -1,6 +1,5 @@
 #include "app/dns/inflight_resolves.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
-#include "app/dns/global_cache.hpp"
 #include "acppnode/common/allocator.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
@@ -26,29 +25,7 @@ namespace net = acpp::net;
 using namespace std::chrono_literals;
 
 thread_local size_t fail_size = 0;
-thread_local size_t fail_worker_size = 0;
 thread_local size_t injected_failures = 0;
-
-class FailingResource final : public std::pmr::memory_resource {
-public:
-    explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
-private:
-    void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_worker_size && size >= fail_worker_size) {
-            fail_worker_size = 0;
-            ++injected_failures;
-            throw std::bad_alloc();
-        }
-        return upstream_->allocate(size, alignment);
-    }
-    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
-        upstream_->deallocate(pointer, size, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    std::pmr::memory_resource* upstream_;
-};
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -169,7 +146,6 @@ void TestSubscriberCancellation() {
 void TestDNSWorker() {
     acpp::app::dns::Config config;
     config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    config.global_cache_size = 0;
     net::io_context main_context;
     auto main_guard = net::make_work_guard(main_context);
     acpp::app::dns::DNSWorker worker(main_context, config, 8);
@@ -214,7 +190,6 @@ void TestDNSWorkerCancellation() {
     acpp::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
-    config.global_cache_size = 0;
     acpp::app::dns::DNSWorker worker(caller, config, 8);
     acpp::app::dns::DNS client(worker);
     net::cancellation_signal signal;
@@ -236,7 +211,6 @@ void TestDNSWorkerCapacity() {
     acpp::app::dns::Config config;
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
-    config.global_cache_size = 0;
     acpp::app::dns::DNSWorker worker(main_context, config, 1);
     acpp::app::dns::DNS client(worker);
     net::cancellation_signal cancel;
@@ -281,39 +255,6 @@ void TestDNSWorkerCapacity() {
     Require(recovered, "cancellation must release the DNS mailbox slot");
 }
 
-void TestL1WarmFailure() {
-    net::io_context io;
-    acpp::app::dns::Config config;
-    config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    acpp::app::dns::DNS dns(io, config);
-    DnsResult answer;
-    answer.addresses.assign(400, net::ip::make_address("192.0.2.9"));
-    acpp::app::dns::GlobalDnsCache::PublishResult("warm.example", answer);
-    const auto failures_before = injected_failures;
-    bool completed = false;
-    std::exception_ptr error;
-    auto request = [&]() -> net::awaitable<void> {
-        fail_worker_size = answer.addresses.size() * sizeof(net::ip::address);
-        auto resolved = co_await dns.Resolve("warm.example");
-        fail_worker_size = 0;
-        Require(resolved.Ok() && resolved.addresses == answer.addresses &&
-                    dns.GetCacheStats().entries == 0 &&
-                    injected_failures == failures_before + 1,
-                "failed L1 warming must preserve the available L2 answer");
-        resolved = co_await dns.Resolve("warm.example");
-        Require(resolved.Ok() && dns.GetCacheStats().entries == 1,
-                "a cache write must recover after an allocation failure");
-    };
-    net::co_spawn(io, request(), [&](std::exception_ptr failure) {
-        error = failure;
-        completed = true;
-    });
-    io.run_for(1s);
-    fail_worker_size = 0;
-    Require(completed, "cached DNS resolution must not depend on network I/O");
-    if (error) std::rethrow_exception(error);
-}
-
 }  // namespace
 
 void* operator new(std::size_t size) {
@@ -330,24 +271,19 @@ void operator delete(void* pointer) noexcept { std::free(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
 int main() {
     acpp::memory::ConfigureProcessAllocator();
-    FailingResource resource(std::pmr::get_default_resource());
-    auto* original = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {
         TestCompletion(Failure::None);
         TestCompletion(Failure::Query);
         TestCompletion(Failure::ResultCopy);
         TestSubscriberCancellation();
-        TestL1WarmFailure();
         TestDNSWorker();
         TestDNSWorkerCancellation();
         TestDNSWorkerCapacity();
     } catch (const std::exception& error) {
         fail_size = 0;
-        fail_worker_size = 0;
         std::cerr << error.what() << '\n';
         passed = false;
     }
-    std::pmr::set_default_resource(original);
     return passed ? 0 : 1;
 }

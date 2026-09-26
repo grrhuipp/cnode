@@ -3,6 +3,7 @@
 #include "acppnode/common/memory_stats.hpp"
 
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,7 @@ inline constexpr int kGlibcTrimThreshold = 64 * 1024;
 inline constexpr int kGlibcMmapThreshold = 64 * 1024;
 inline constexpr std::size_t kThreadPoolChunkBytes = 64 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 32 * 1024;
+inline constexpr std::size_t kThreadPoolMediumClass = 9 * 1024;
 inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
 
 inline void ConfigureProcessGlibc() noexcept {
@@ -102,11 +104,9 @@ inline void OsUnmap(void* address, std::size_t bytes) noexcept {
 }
 
 [[nodiscard]] inline std::size_t PowerOfTwoAtLeast(std::size_t value) noexcept {
-    std::size_t power = 1;
-    while (power < value && power <= (std::numeric_limits<std::size_t>::max() / 2)) {
-        power *= 2;
-    }
-    return power < value ? 0 : power;
+    constexpr auto largest = std::size_t{1} << (std::numeric_limits<std::size_t>::digits - 1);
+    // bit_ceil is undefined if its result cannot be represented.
+    return value > largest ? 0 : std::bit_ceil(value);
 }
 
 class ReturningThreadPool final : public std::pmr::memory_resource {
@@ -122,10 +122,7 @@ public:
     ReturningThreadPool(const ReturningThreadPool&) = delete;
     ReturningThreadPool& operator=(const ReturningThreadPool&) = delete;
 
-    void Purge() noexcept {
-        next_purge_ = {};
-        PurgeExpired();
-    }
+    void Purge() noexcept { PurgeExpired(); }
 
     [[nodiscard]] Footprint GetFootprint() const noexcept { return footprint_; }
 
@@ -154,10 +151,10 @@ public:
         if (class_index >= classes_.size()) {
             return AllocateDirect(bytes, alignment);
         }
-        // Buffer::New's 8 KiB PMR request has a 16 KiB stride. Reuse the
-        // existing Worker-local chunk for that hot class; other large
-        // requests retain their actual-size, lifetime-bound mappings.
-        if (stride >= 4096 && stride != 16384) {
+        // A 9 KiB size class accommodates 8 KiB payloads plus ownership and
+        // alignment headers: seven slots per 64 KiB chunk, rather than three.
+        // This is part of the same pool, not a separate Buffer free-list.
+        if (stride >= 4096 && stride != kThreadPoolMediumClass) {
             return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
@@ -205,7 +202,7 @@ public:
                 chunk->free_head = nullptr;
                 chunk->bump = static_cast<std::byte*>(chunk->map_base) + sizeof(Chunk);
                 MarkIdle(*chunk);
-                PurgeExpired();
+                PurgeExpired(chunk->idle_at);
             }
             return;
         }
@@ -272,6 +269,8 @@ private:
         Chunk* all_prev = nullptr;
         Chunk* rec_next = nullptr;
         Chunk* rec_prev = nullptr;
+        Chunk* idle_next = nullptr;
+        Chunk* idle_prev = nullptr;
         void* map_base = nullptr;
         std::size_t map_bytes = 0;
         std::size_t stride = 0;
@@ -301,15 +300,17 @@ private:
         if (lead == 0 || bytes > std::numeric_limits<std::size_t>::max() - lead) {
             return 0;
         }
-        return PowerOfTwoAtLeast(std::max(lead + bytes, std::size_t{64}));
+        const auto required = lead + bytes;
+        if (required > 8192 && required <= kThreadPoolMediumClass && alignment <= 1024) {
+            return kThreadPoolMediumClass;
+        }
+        return PowerOfTwoAtLeast(std::max(required, std::size_t{64}));
     }
 
     [[nodiscard]] static std::size_t ClassIndex(std::size_t stride) noexcept {
-        std::size_t index = 0;
-        for (std::size_t size = 64; size < stride; size *= 2) {
-            ++index;
-        }
-        return index;
+        if (stride == kThreadPoolMediumClass) return 10;
+        // All remaining strides are checked powers of two >= 64.
+        return static_cast<std::size_t>(std::countr_zero(stride) - 6);
     }
 
     [[nodiscard]] static bool CanCarve(
@@ -323,14 +324,10 @@ private:
         if (footprint_.idle_bytes == 0) {
             return nullptr;
         }
-        for (Chunk* chunk = all_; chunk; chunk = chunk->all_next) {
-            if (chunk->idle && !chunk->direct &&
-                chunk->class_index == class_index && chunk->stride == stride) {
-                if (std::chrono::steady_clock::now() - chunk->idle_at >=
-                    kThreadPoolPurgeDelay) {
-                    ReleaseChunk(*chunk);
-                    return nullptr;
-                }
+        // Allocate already expired the FIFO head. Only inspect genuinely idle
+        // chunks, not thousands of chunks pinned by live connections.
+        for (Chunk* chunk = idle_head_; chunk; chunk = chunk->idle_next) {
+            if (chunk->class_index == class_index && chunk->stride == stride) {
                 return chunk;
             }
         }
@@ -413,6 +410,11 @@ private:
         chunk.idle = true;
         footprint_.idle_bytes += chunk.map_bytes;
         chunk.idle_at = std::chrono::steady_clock::now();
+        chunk.idle_prev = idle_tail_;
+        chunk.idle_next = nullptr;
+        if (idle_tail_) idle_tail_->idle_next = &chunk;
+        else idle_head_ = &chunk;
+        idle_tail_ = &chunk;
     }
 
     void MarkUsed(Chunk& chunk) noexcept {
@@ -421,25 +423,25 @@ private:
         }
         chunk.idle = false;
         footprint_.idle_bytes -= chunk.map_bytes;
+        if (chunk.idle_prev) chunk.idle_prev->idle_next = chunk.idle_next;
+        else idle_head_ = chunk.idle_next;
+        if (chunk.idle_next) chunk.idle_next->idle_prev = chunk.idle_prev;
+        else idle_tail_ = chunk.idle_prev;
+        chunk.idle_prev = nullptr;
+        chunk.idle_next = nullptr;
     }
 
     void PurgeExpired() noexcept {
-        if (footprint_.idle_bytes == 0) {
-            return;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now < next_purge_) {
-            return;
-        }
-        next_purge_ = now + kThreadPoolPurgeDelay;
-        Chunk* chunk = all_;
-        while (chunk) {
-            Chunk* next = chunk->all_next;
-            if (chunk->idle && !chunk->direct &&
-                now - chunk->idle_at >= kThreadPoolPurgeDelay) {
-                ReleaseChunk(*chunk);
-            }
-            chunk = next;
+        if (idle_head_) PurgeExpired(std::chrono::steady_clock::now());
+    }
+
+    void PurgeExpired(std::chrono::steady_clock::time_point now) noexcept {
+        // Idle transitions append in monotonic time order. Checking the oldest
+        // chunk is O(1); actual cleanup visits only expired idle chunks. Reuse
+        // removes a chunk from this same pool's FIFO without changing any other
+        // chunk's deadline. No scan of live mappings, no separate recycling pool.
+        while (idle_head_ && now - idle_head_->idle_at >= kThreadPoolPurgeDelay) {
+            ReleaseChunk(*idle_head_);
         }
     }
 
@@ -484,10 +486,10 @@ private:
             cls.current = nullptr;
         }
         UnlinkRecyclable(chunk);
+        MarkUsed(chunk);
         UnlinkAll(chunk);
         footprint_.mapped_bytes -= chunk.map_bytes;
         footprint_.direct_bytes -= chunk.direct ? chunk.map_bytes : 0;
-        footprint_.idle_bytes -= chunk.idle ? chunk.map_bytes : 0;
         --footprint_.chunks;
         void* mapped = chunk.map_base;
         const std::size_t bytes = chunk.map_bytes;
@@ -535,10 +537,11 @@ private:
         chunk.in_recyclable = false;
     }
 
-    std::array<Class, 10> classes_{};
+    std::array<Class, 11> classes_{};
     Chunk* all_ = nullptr;
+    Chunk* idle_head_ = nullptr;
+    Chunk* idle_tail_ = nullptr;
     Footprint footprint_{};
-    std::chrono::steady_clock::time_point next_purge_{};
 };
 
 [[nodiscard]] inline ReturningThreadPool& ThreadPool() noexcept {

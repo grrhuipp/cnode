@@ -40,7 +40,6 @@ public:
     net::awaitable<DnsResult> Resolve(std::string_view domain);
 
     DnsCacheStats GetCacheStats() const;
-    [[nodiscard]] static DnsCacheStats GetGlobalCacheStats();
 
 private:
     struct Impl;

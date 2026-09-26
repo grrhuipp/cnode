@@ -110,28 +110,27 @@ void TestCapacityAndResults() {
 
     DnsResult negative;
     negative.error = acpp::ErrorCode::DNS_NO_RECORD;
-    negative.from_cache = true;
     negative.ttl = 1;
     cache.Store("two.example", negative);
     const auto cached_negative = cache.Get("two.example");
     Require(cached_negative && cached_negative->negative &&
-                cached_negative->addresses.empty() && cached_negative->ttl == 1,
-            "L2 negative answers must replace positives without extending their remaining TTL");
+                cached_negative->addresses.empty() && cached_negative->ttl <= 10,
+            "negative answers must replace positives and clamp the TTL");
     auto cached_answer = answer;
-    cached_answer.from_cache = true;
     cached_answer.ttl = 1;
     cache.Store("two.example", cached_answer);
-    Require(!cache.Get("two.example")->negative && cache.Get("two.example")->ttl == 1,
-            "L2 positive answers must also retain their remaining TTL");
+    Require(!cache.Get("two.example")->negative && cache.Get("two.example")->ttl <= 10,
+            "positive answers must replace negatives and clamp the TTL");
 
     DnsResult temporary_failure;
     temporary_failure.error = acpp::ErrorCode::DNS_RESOLVE_FAILED;
     cache.Store("two.example", temporary_failure);
     Require(cache.Get("two.example").has_value(),
             "temporary failures must not replace valid cached data");
+    DnsCache expired(1, 0, 600);
     cached_answer.ttl = 0;
-    cache.Store("two.example", cached_answer);
-    Require(!cache.Get("two.example") && cache.GetStats().entries == 1,
+    expired.Store("two.example", cached_answer);
+    Require(!expired.Get("two.example") && expired.GetStats().entries == 0,
             "expired entries must be removed from both ownership and statistics");
 
     DnsCache disabled(0, 10, 600);

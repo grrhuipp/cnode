@@ -15,6 +15,7 @@
 #include <asio/ssl.hpp>
 #include <asio/associated_cancellation_slot.hpp>
 #include <asio/bind_cancellation_slot.hpp>
+#include <asio/bind_allocator.hpp>
 #include <asio/write.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -266,11 +267,12 @@ public:
         return net::async_initiate<CompletionToken, void(IoErrorCode, std::size_t)>(
             [this](auto&& handler, MutableBufferSequence buffers) mutable {
                 auto ex = get_executor();
+                const auto allocator = net::get_associated_allocator(handler);
                 if (!stream_->TlsLayerCanRead()) {
-                    net::post(ex,
+                    net::post(ex, net::bind_allocator(allocator,
                         [handler = std::forward<decltype(handler)>(handler)]() mutable {
                             std::move(handler)(io_error::eof, 0);
-                        });
+                        }));
                     return;
                 }
 
@@ -284,11 +286,11 @@ public:
                     const std::size_t pending =
                         stream_->ConsumeTlsLayerPendingData(buffer);
                     if (pending > 0) {
-                        net::post(ex,
+                        net::post(ex, net::bind_allocator(allocator,
                             [handler = std::forward<decltype(handler)>(handler),
                              pending]() mutable {
                                 std::move(handler)(IoErrorCode{}, pending);
-                            });
+                            }));
                         return;
                     }
                     break;
@@ -298,12 +300,12 @@ public:
                 stream_->BeginTlsLayerRead();
                 stream_->TlsLayerSocket().async_read_some(
                     buffers,
-                    net::bind_cancellation_slot(cancellation, [this,
+                    net::bind_allocator(allocator, net::bind_cancellation_slot(cancellation, [this,
                      handler = std::forward<decltype(handler)>(handler)](
                         IoErrorCode ec, std::size_t n) mutable {
                         stream_->EndTlsLayerRead(ec, n);
                         std::move(handler)(ec, n);
-                    }));
+                    })));
             },
             token,
             buffers);
@@ -315,12 +317,13 @@ public:
         return net::async_initiate<CompletionToken, void(IoErrorCode, std::size_t)>(
             [this](auto&& handler, ConstBufferSequence buffers) mutable {
                 auto ex = get_executor();
+                const auto allocator = net::get_associated_allocator(handler);
                 if (!stream_->TlsLayerCanWrite()) {
-                    net::post(ex,
+                    net::post(ex, net::bind_allocator(allocator,
                         [handler = std::forward<decltype(handler)>(handler)](
                             ) mutable {
                             std::move(handler)(io_error::broken_pipe, 0);
-                        });
+                        }));
                     return;
                 }
 
@@ -328,12 +331,12 @@ public:
                 stream_->BeginTlsLayerWrite();
                 stream_->TlsLayerSocket().async_write_some(
                     buffers,
-                    net::bind_cancellation_slot(cancellation, [this,
+                    net::bind_allocator(allocator, net::bind_cancellation_slot(cancellation, [this,
                      handler = std::forward<decltype(handler)>(handler)](
                         IoErrorCode ec, std::size_t n) mutable {
                         stream_->EndTlsLayerWrite(ec, n);
                         std::move(handler)(ec, n);
-                    }));
+                    })));
             },
             token,
             buffers);
@@ -466,7 +469,7 @@ net::awaitable<bool> TlsStream::Handshake() {
     auto [ec] = co_await impl_->stream.async_handshake(
         is_server_ ? net::ssl::stream_base::server
                    : net::ssl::stream_base::client,
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec) {
         const unsigned long err_code = ERR_get_error();
@@ -545,7 +548,7 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
 
     impl_->Touch();
     auto [ec, n] = co_await impl_->stream.async_read_some(
-        buf, net::as_tuple(net::use_awaitable));
+        buf, net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (ec) {
         if (ec == io_error::eof ||
             ec == net::ssl::error::stream_truncated ||
@@ -592,7 +595,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
 
     auto [ec, n] = co_await impl_->stream.async_read_some(
         net::mutable_buffer(out->Tail().data(), out->Available()),
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (ec || n == 0) {
         if (!ec ||
             ec == io_error::eof ||
@@ -614,7 +617,8 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
 
     impl_->Touch();
     auto [ec, n] = co_await net::async_write(
-        impl_->stream, buf, net::as_tuple(net::use_awaitable));
+        impl_->stream, buf,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -632,7 +636,8 @@ net::awaitable<void> TlsStream::WriteBuffers(
 
     impl_->Touch();
     auto [ec, n] = co_await net::async_write(
-        impl_->stream, buffers, net::as_tuple(net::use_awaitable));
+        impl_->stream, buffers,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     (void)n;
     if (ec) {
         throw IoSystemError(ec);
@@ -652,7 +657,8 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     out.AppendMultiBuffer(mb);
     if (!out.empty()) {
         auto [ec, n] = co_await net::async_write(
-            impl_->stream, out.Span(), net::as_tuple(net::use_awaitable));
+            impl_->stream, out.Span(),
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
         (void)n;
         if (ec) {
             throw IoSystemError(ec);
@@ -681,7 +687,7 @@ net::awaitable<void> TlsStream::AsyncShutdownWrite() {
         impl_->Touch();
         LOG_NET_DEBUG("TLS: sending close_notify");
         auto [ec] = co_await impl_->stream.async_shutdown(
-            net::as_tuple(net::use_awaitable));
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
         if (ec && ec != net::ssl::error::stream_truncated &&
             ec != io_error::eof && ec != io_error::operation_aborted) {
             LOG_NET_DEBUG("TLS: close_notify failed: {}", ec.message());

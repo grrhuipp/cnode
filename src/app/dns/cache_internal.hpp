@@ -16,8 +16,7 @@ struct DnsCacheEntry {
     bool negative = false;
 };
 
-// One bounded cache owned by one Worker. Only the process-wide immutable
-// result cache needs shards; local entries share the full local capacity.
+// One bounded cache owned by the main/control DNS executor.
 class DnsCache {
 public:
     explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl);

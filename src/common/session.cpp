@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <format>
+#include <iterator>
 
 namespace acpp {
 
@@ -28,8 +29,6 @@ std::string FormatAccessLog(const session::Context& ctx) {
             src_host = "unknown";
         }
     }
-    std::string src = iputil::FormatEndpointForLog(src_host, ctx.inbound.source_port);
-
     const char* net_str = NetworkToString(ctx.content.network);
 
     const TargetAddress& t = ctx.outbound.target;
@@ -51,19 +50,31 @@ std::string FormatAccessLog(const session::Context& ctx) {
         ? std::string_view("-")
         : ctx.outbound.tag;
 
-    std::string access = std::format(
-        "from {} accepted {}:{} [{}",
-        src,
-        net_str,
-        iputil::FormatEndpointForLog(target_host, t.port),
-        in_tag);
+    // Only the final owning string crosses the logging queue. Do not use the
+    // Worker PMR for it or retain connection-local formatting scratch.
+    std::string access;
+    access.reserve(128 + src_host.size() + target_host.size() +
+                   in_tag.size() + out_tag.size() + ctx.inbound.user_email.size());
+    auto endpoint = [&](std::string_view host, uint16_t port) {
+        const bool brackets = iputil::NeedsIpv6Brackets(host);
+        std::format_to(std::back_inserter(access), "{}{}{}:{}",
+                       brackets ? "[" : "", host, brackets ? "]" : "", port);
+    };
+    access.append("from ");
+    endpoint(src_host, ctx.inbound.source_port);
+    access.append(" accepted ");
+    access.append(net_str);
+    access.push_back(':');
+    endpoint(target_host, t.port);
+    access.append(" [");
+    access.append(in_tag);
     if (in_tag != out_tag) {
         access.append(" -> ");
         access.append(out_tag);
     }
     access.push_back(']');
     if (ctx.inbound.user_id > 0) {
-        access.append(std::format(" user:{}", ctx.inbound.user_id));
+        std::format_to(std::back_inserter(access), " user:{}", ctx.inbound.user_id);
     } else if (!ctx.inbound.user_email.empty()) {
         access.append(" user:");
         access.append(ctx.inbound.user_email);

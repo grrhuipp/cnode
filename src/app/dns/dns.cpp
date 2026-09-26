@@ -3,17 +3,14 @@
 #include "acppnode/app/worker_mailbox.hpp"
 #include "acppnode/common/domain_name.hpp"
 #include "acppnode/common/ip_address.hpp"
-#include "global_cache.hpp"
+#include "datagram_exchange.hpp"
+#include "../../common/awaitable_task_group.hpp"
 #include "inflight_resolves.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-
-#include <asio/ip/udp.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <format>
-#include <random>
 #include <stdexcept>
 #include <span>
 
@@ -61,16 +58,6 @@ void AppendUniqueAddresses(
 }  // namespace
 
 struct DNS::Impl {
-    struct ParsedResponse : ResultStatus {
-        std::vector<net::ip::address> addresses;
-        uint32_t ttl = 60;
-        bool negative_cacheable = false;
-
-        [[nodiscard]] bool Ok() const noexcept {
-            return ResultStatus::Ok() && !addresses.empty();
-        }
-    };
-
     Impl(net::io_context& io_context, const Config& config);
 
     net::awaitable<DnsResult> Resolve(std::string_view domain);
@@ -79,23 +66,20 @@ struct DNS::Impl {
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
     net::awaitable<DnsResult> QueryServer(
-        const net::ip::udp::endpoint& server,
+        DatagramExchange& server,
         std::string_view domain,
         bool query_aaaa);
     void BuildQueryTo(memory::ByteVector& query,
                       std::string_view domain,
                       uint16_t txid,
                       bool query_aaaa);
-    ParsedResponse ParseResponse(
-        std::span<const uint8_t> response,
-        uint16_t expected_txid,
-        uint32_t& out_ttl);
+    DnsResult ParseResponse(std::span<const uint8_t> response, uint16_t expected_txid);
 
     net::io_context& io_context;
     const Config config;
     DnsCache cache;
     InflightResolves inflight_resolves;
-    uint16_t txid_counter = 1;
+    std::vector<std::shared_ptr<DatagramExchange>> upstreams;
 };
 
 DNS::Impl::Impl(net::io_context& io_context, const Config& config)
@@ -109,13 +93,10 @@ DNS::Impl::Impl(net::io_context& io_context, const Config& config)
     for (const auto& server : config.servers) {
         if (server.port() == 0) throw std::invalid_argument("DNS server port must be positive");
     }
-    GlobalDnsCache::Configure(
-        config.global_cache_size,
-        config.min_ttl,
-        config.max_ttl);
-
-    std::random_device rd;
-    txid_counter = static_cast<uint16_t>(rd() & 0xFFFF);
+    upstreams.reserve(config.servers.size());
+    for (const auto& server : config.servers) {
+        upstreams.push_back(std::make_shared<DatagramExchange>(io_context, server));
+    }
 }
 
 net::awaitable<DnsResult> DNS::Impl::Resolve(
@@ -133,17 +114,12 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
         co_return result;
     }
 
+    memory::ThreadLocalString canonical(domain);
+    if (canonical.back() == '.') canonical.pop_back();
+    for (char& c : canonical) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    domain = canonical;
     if (auto cached = cache.Get(domain)) {
         co_return MakeCachedResult(*cached);
-    }
-
-    if (auto cached = GlobalDnsCache::Lookup(domain)) {
-        try {
-            cache.Store(domain, *cached);
-        } catch (const std::bad_alloc&) {
-            // Optional L1 warming must not discard an available L2 answer.
-        }
-        co_return std::move(*cached);
     }
 
     co_return co_await inflight_resolves.Run(domain, [this, domain] {
@@ -168,12 +144,6 @@ net::awaitable<DnsResult> DNS::Impl::ResolveUncached(std::string_view domain) {
     } catch (const std::bad_alloc&) {
         // Cache storage is optional; resolution completion is not.
     }
-    try {
-        GlobalDnsCache::PublishResult(domain, result);
-    } catch (const std::bad_alloc&) {
-        // A failed snapshot allocation must not strand inflight subscribers.
-    }
-
     co_return result;
 }
 
@@ -183,13 +153,23 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
     last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
     last_result.error_msg = "DNS server unavailable";
 
-    for (const auto& server : config.servers) {
+    for (const auto& server : upstreams) {
+        // Preserve three A samples (round-robin answer collection), but do not
+        // serialize their RTTs or hold AAAA behind them. Join all children before
+        // returning or moving to another upstream, including cancellation/OOM.
+        std::array<DnsResult, kAddressQueryAttempts + 1> answers;
+        auto collect = [&](size_t index) -> net::awaitable<void> {
+            answers[index] = co_await QueryServer(*server, domain, index == kAddressQueryAttempts);
+        };
+        co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
+            for (size_t i = 0; i < answers.size(); ++i) group.Spawn(collect(i));
+        });
         DnsResult a_result;
         a_result.error = ErrorCode::DNS_RESOLVE_FAILED;
         a_result.error_msg = "DNS A query failed";
 
         for (size_t attempt = 0; attempt < kAddressQueryAttempts; ++attempt) {
-            auto attempt_result = co_await QueryServer(server, domain, false);
+            auto attempt_result = std::move(answers[attempt]);
             if (attempt_result.Ok()) {
                 if (!a_result.Ok()) {
                     a_result = std::move(attempt_result);
@@ -204,7 +184,7 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
             }
         }
 
-        auto aaaa_result = co_await QueryServer(server, domain, true);
+        auto aaaa_result = std::move(answers.back());
 
         if (a_result.Ok() || aaaa_result.Ok()) {
             DnsResult result;
@@ -242,79 +222,23 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
 }
 
 net::awaitable<DnsResult> DNS::Impl::QueryServer(
-    const net::ip::udp::endpoint& server,
+    DatagramExchange& server,
     std::string_view domain,
     bool query_aaaa) {
     DnsResult result;
-    const uint16_t txid = txid_counter++;
     memory::ByteVector query;
-    BuildQueryTo(query, domain, txid, query_aaaa);
-
-    udp::socket socket(io_context);
-    IoErrorCode ec;
-    socket.open(server.protocol(), ec);
-    if (ec) {
-        result.error = ErrorCode::SOCKET_CREATE_FAILED;
-        result.error_msg = ec.message();
+    BuildQueryTo(query, domain, 0, query_aaaa);
+    auto response = co_await server.Exchange(query, std::chrono::seconds(config.timeout_sec));
+    if (response.error) {
+        result.error = response.error == io_error::timed_out ? ErrorCode::DNS_TIMEOUT :
+            response.error == io_error::operation_aborted ? ErrorCode::CANCELLED :
+            response.error == io_error::no_buffer_space ? ErrorCode::RESOURCE_EXHAUSTED :
+            ErrorCode::DNS_RESOLVE_FAILED;
+        result.error_msg = response.error.message();
         co_return result;
     }
-
-    socket.connect(server, ec);
-    if (ec) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = ec.message();
-        co_return result;
-    }
-
-    auto [send_ec, sent] = co_await socket.async_send(
-        net::buffer(query),
-        net::as_tuple(net::use_awaitable));
-    (void)sent;
-    if (send_ec) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = send_ec.message();
-        co_return result;
-    }
-
-    std::array<uint8_t, 512> response{};
-    bool timed_out = false;
-    TimeoutToken timeout_token = TimeoutScheduler::ForIoContext(io_context).ScheduleAfter(
-        std::chrono::seconds(config.timeout_sec),
-        [&socket, &timed_out]() {
-            timed_out = true;
-            IoErrorCode ignored;
-            socket.cancel(ignored);
-        });
-    auto [recv_ec, received] = co_await socket.async_receive(
-        net::buffer(response),
-        net::as_tuple(net::use_awaitable));
-    TimeoutScheduler::ForIoContext(io_context).Cancel(timeout_token);
-
-    if (recv_ec == io_error::operation_aborted && timed_out) {
-        result.error = ErrorCode::DNS_TIMEOUT;
-        result.error_msg = "DNS query timed out";
-        co_return result;
-    }
-
-    if (recv_ec) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = recv_ec.message();
-        co_return result;
-    }
-
-    uint32_t ttl = config.min_ttl;
-    auto parsed = ParseResponse(
-        std::span<const uint8_t>(response.data(), received), txid, ttl);
-    if (!parsed.Ok()) {
-        result.error = parsed.error;
-        result.error_msg = parsed.error_msg;
-        co_return result;
-    }
-
-    result.addresses = std::move(parsed.addresses);
-    result.ttl = parsed.ttl;
-    result.error = ErrorCode::OK;
-    co_return result;
+    const uint16_t txid = (query[0] << 8) | query[1];
+    co_return ParseResponse(std::span<const uint8_t>(response.bytes.data(), response.size), txid);
 }
 
 void DNS::Impl::BuildQueryTo(
@@ -368,11 +292,9 @@ void DNS::Impl::BuildQueryTo(
     query.push_back(0x01);
 }
 
-DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
-    std::span<const uint8_t> response,
-    uint16_t expected_txid,
-    uint32_t& out_ttl) {
-    ParsedResponse result;
+DnsResult DNS::Impl::ParseResponse(
+    std::span<const uint8_t> response, uint16_t expected_txid) {
+    DnsResult result;
 
     if (response.size() < 12) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
@@ -390,9 +312,9 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
 
     const uint16_t flags =
         (static_cast<uint16_t>(response[2]) << 8) | response[3];
-    if (!(flags & wire::FLAG_QR)) {
+    if (!(flags & wire::FLAG_QR) || (flags & 0x0200)) {
         result.error = ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS packet is not a response";
+        result.error_msg = "DNS packet is not a complete response";
         return result;
     }
 
@@ -400,7 +322,6 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
     if (rcode == wire::RCODE_NAME_ERROR) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NXDOMAIN";
-        result.negative_cacheable = true;
         return result;
     }
     if (rcode != wire::RCODE_OK) {
@@ -429,7 +350,6 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
     if (ancount == 0) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NODATA";
-        result.negative_cacheable = true;
         return result;
     }
 
@@ -455,11 +375,16 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
         pos += 4;
     }
 
+    if (ancount > (response.size() - pos) / 11) {
+        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS answer count exceeds packet";
+        return result;
+    }
     std::vector<net::ip::address> addresses;
     addresses.reserve(ancount);
     uint32_t min_ttl = UINT32_MAX;
 
-    for (uint16_t i = 0; i < ancount && pos < response.size(); ++i) {
+    for (uint16_t i = 0; i < ancount; ++i) {
         while (pos < response.size()) {
             const uint8_t len = response[pos];
             if (len == 0) {
@@ -481,6 +406,11 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
 
         const uint16_t type =
             (static_cast<uint16_t>(response[pos]) << 8) | response[pos + 1];
+        if (response[pos + 2] != 0 || response[pos + 3] != 1) {
+            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error_msg = "DNS answer class is not IN";
+            return result;
+        }
         const uint32_t ttl =
             (static_cast<uint32_t>(response[pos + 4]) << 24) |
             (static_cast<uint32_t>(response[pos + 5]) << 16) |
@@ -514,13 +444,11 @@ DNS::Impl::ParsedResponse DNS::Impl::ParseResponse(
     if (addresses.empty()) {
         result.error = ErrorCode::DNS_NO_RECORD;
         result.error_msg = "No supported DNS records in response";
-        result.negative_cacheable = true;
         return result;
     }
 
-    out_ttl = (min_ttl == UINT32_MAX) ? 60 : min_ttl;
     result.addresses = std::move(addresses);
-    result.ttl = out_ttl;
+    result.ttl = (min_ttl == UINT32_MAX) ? 60 : min_ttl;
     return result;
 }
 
@@ -583,10 +511,6 @@ net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
 DnsCacheStats DNS::GetCacheStats() const {
     // Remote facades own no DNS cache. The dedicated service owns its stats.
     return impl_ ? impl_->GetCacheStats() : DnsCacheStats{};
-}
-
-DnsCacheStats DNS::GetGlobalCacheStats() {
-    return GlobalDnsCache::GetStats();
 }
 
 }  // namespace acpp::app::dns

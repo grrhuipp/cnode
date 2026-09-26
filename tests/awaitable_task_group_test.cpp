@@ -10,6 +10,7 @@
 #include <asio/this_coro.hpp>
 #include <asio/use_future.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -23,6 +24,26 @@ namespace {
 namespace net = acpp::net;
 using async_allocation_test::fail_after;
 using async_allocation_test::injected;
+
+class GroupResource final : public std::pmr::memory_resource {
+public:
+    std::atomic<size_t> live{0};
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        async_allocation_test::Check();
+        auto* result = upstream_.allocate(bytes, alignment);
+        live.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
+        upstream_.deallocate(pointer, bytes, alignment);
+        live.fetch_sub(1, std::memory_order_relaxed);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    acpp::memory::ThreadPoolFacade upstream_;
+};
 
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -225,6 +246,18 @@ net::awaitable<void> CrossExecutor(net::any_io_executor caller,
     parent = (co_await net::this_coro::executor) == caller;
 }
 
+void TestMoveOnlyStart() {
+    net::io_context io;
+    bool started = false;
+    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
+        [value = std::make_unique<int>(42), &started](acpp::AwaitableTaskGroup&) {
+            started = *value == 42;
+        }), net::use_future);
+    io.run();
+    result.get();
+    Check(started, "a move-only start callback must not require std::function");
+}
+
 void TestExecutor() {
     net::io_context caller, worker;
     auto guard = net::make_work_guard(worker);
@@ -250,16 +283,25 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 int main() {
+    GroupResource resource;
+    auto* previous = std::pmr::set_default_resource(&resource);
+    int result = 0;
     try {
         TestDynamicCancellation();
         TestExplicitCancel();
         TestFailure(false);
         TestFailure(true);
         TestAllocationFailures();
+        TestMoveOnlyStart();
         TestExecutor();
+        Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
+        Check(acpp::memory::CrossThreadFreeCount() == 0,
+              "group and child PMR objects must be freed on the target executor");
     } catch (const std::exception& error) {
         fail_after = -1;
         std::cerr << error.what() << '\n';
-        return 1;
+        result = 1;
     }
+    std::pmr::set_default_resource(previous);
+    return result;
 }

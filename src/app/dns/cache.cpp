@@ -48,11 +48,7 @@ void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     if (!prepared.negative) {
         prepared.addresses.assign(result.addresses.begin(), result.addresses.end());
     }
-    // L2 hits carry a remaining TTL. Applying the minimum again would extend
-    // their lifetime every time an answer is copied into a Worker's L1 cache.
-    prepared.ttl = result.from_cache
-        ? result.ttl
-        : std::clamp(result.ttl, min_ttl_, max_ttl_);
+    prepared.ttl = std::clamp(result.ttl, min_ttl_, max_ttl_);
     const auto now = steady_clock::now();
     prepared.expire_time = now + std::chrono::seconds(prepared.ttl);
 

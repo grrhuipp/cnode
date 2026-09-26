@@ -11,6 +11,7 @@
 #include <asio/write.hpp>
 #include <asio/connect.hpp>
 #include <asio/buffer.hpp>
+#include <asio/bind_allocator.hpp>
 
 #include <algorithm>
 #include <array>
@@ -184,7 +185,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 
     ArmReadDeadline();
     auto [ec, n] = co_await impl_->socket.async_read_some(buf,
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     CancelReadDeadline();
 
     if (ec) {
@@ -247,7 +248,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     ArmReadDeadline();
     auto [ec, n] = co_await impl_->socket.async_read_some(
         net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     CancelReadDeadline();
 
     if (ec || n == 0) {
@@ -284,7 +285,8 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
 
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, out.Span(), net::as_tuple(net::use_awaitable));
+        impl_->socket, out.Span(),
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     DisarmWriteDeadline();
 
     if (ec) {
@@ -308,7 +310,8 @@ net::awaitable<void> TcpStream::WriteBuffers(
 
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, out.Span(), net::as_tuple(net::use_awaitable));
+        impl_->socket, out.Span(),
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     DisarmWriteDeadline();
     (void)n;
 
@@ -325,7 +328,7 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
 
     ArmWriteDeadline();
     auto [ec, n] = co_await net::async_write(impl_->socket, buf,
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     DisarmWriteDeadline();
 
     if (ec) {
@@ -411,7 +414,8 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
         ? net::socket_base::message_peek
         : net::socket_base::message_flags{0};
     auto [ec, n] = co_await impl_->socket.async_receive(
-        buffer, flags, net::as_tuple(net::use_awaitable));
+        buffer, flags,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (!ec && n > 0 && !peek) {
         TouchActivity();
     }
@@ -572,7 +576,7 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
     ArmReadDeadline();
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
-        net::as_tuple(net::use_awaitable));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     CancelReadDeadline();
     co_return ec;
 }
@@ -663,7 +667,8 @@ net::awaitable<DialResult> TcpStream::Connect(
     IoErrorCode connect_ec;
 
     try {
-        co_await socket.async_connect(endpoint, net::use_awaitable);
+        co_await socket.async_connect(endpoint,
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
     } catch (const IoSystemError& e) {
         connect_ec = e.code();
     }
@@ -729,7 +734,8 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
     IoErrorCode connect_ec;
 
     try {
-        co_await socket.async_connect(remote_endpoint, net::use_awaitable);
+        co_await socket.async_connect(remote_endpoint,
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
     } catch (const IoSystemError& e) {
         connect_ec = e.code();
     }

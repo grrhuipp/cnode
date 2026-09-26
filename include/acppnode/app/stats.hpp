@@ -28,10 +28,6 @@ struct StatsSnapshot {
     uint64_t bytes_out = 0;
     uint64_t errors = 0;
 
-    uint64_t dns_queries = 0;
-    uint64_t dns_cache_hits = 0;
-    uint64_t dns_cache_misses = 0;
-
     double bytes_in_rate = 0;
     double bytes_out_rate = 0;
     double connections_rate = 0;

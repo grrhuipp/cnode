@@ -35,7 +35,6 @@ namespace {
     dns_config.servers     = config.GetDns().servers;
     dns_config.timeout_sec = config.GetDns().timeout;
     dns_config.cache_size  = config.GetDns().cache_size;
-    dns_config.global_cache_size = 0;
     dns_config.min_ttl     = config.GetDns().min_ttl;
     dns_config.max_ttl     = config.GetDns().max_ttl;
     return dns_config;
