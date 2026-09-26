@@ -231,16 +231,17 @@ jobs:
       - name: Sanitize Worker allocator and scheduler
         run: |
           c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -Wall -Wextra -Wpedantic \
+            -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror \
             -DASIO_STANDALONE -DCNODE_MEMORY_STATS -DCNODE_TEST_ALLOCATOR_FAULT \
             -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
             tests/thread_pool_test.cpp -o "$BUILD_DIR/pool-sanitizer-test"
           "$BUILD_DIR/pool-sanitizer-test"
           c++ -std=c++23 -O1 -g -pthread -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -Wall -Wextra -Wpedantic \
+            -fsanitize=address,undefined -Wall -Wextra -Wpedantic -Werror \
             -DASIO_STANDALONE -Iinclude -I"$BUILD_DIR/_deps/asio-src/asio/include" \
             -include tests/timeout_scheduler_allocation.hpp \
-            tests/timeout_scheduler_test.cpp src/transport/internet/timeout_scheduler.cpp \
+            tests/timeout_scheduler_test.cpp tests/timeout_scheduler_new.cpp \
+            src/transport/internet/timeout_scheduler.cpp \
             -o "$BUILD_DIR/scheduler-sanitizer-test"
           "$BUILD_DIR/scheduler-sanitizer-test"
 

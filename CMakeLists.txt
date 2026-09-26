@@ -2276,6 +2276,7 @@ if(CNODE_BUILD_TESTS)
 
     add_executable(cnode_timeout_scheduler_test
         tests/timeout_scheduler_test.cpp
+        tests/timeout_scheduler_new.cpp
         src/transport/internet/timeout_scheduler.cpp
     )
     target_include_directories(cnode_timeout_scheduler_test PRIVATE

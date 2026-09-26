@@ -20,29 +20,14 @@
 
 namespace {
 
-thread_local bool reject_allocations = false;
-thread_local std::size_t rejected_allocations = 0;
+using timeout_allocation_test::reject_allocations;
+using timeout_allocation_test::rejected_allocations;
 
 static_assert(noexcept(std::declval<acpp::TimeoutScheduler&>().Cancel(
     std::declval<acpp::TimeoutToken&>())));
 static_assert(std::is_nothrow_move_assignable_v<acpp::TimeoutToken>);
 
 }  // namespace
-
-void* operator new(std::size_t size) {
-    if (reject_allocations) {
-        ++rejected_allocations;
-        throw std::bad_alloc();
-    }
-    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
-    throw std::bad_alloc();
-}
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
-}
-void operator delete(void* pointer, const std::nothrow_t&) noexcept { ::operator delete(pointer); }
 
 namespace {
 
