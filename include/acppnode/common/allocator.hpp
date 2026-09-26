@@ -56,6 +56,7 @@ inline constexpr int kGlibcMmapThreshold = 64 * 1024;
 inline constexpr std::size_t kThreadPoolChunkBytes = 64 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 32 * 1024;
 inline constexpr std::size_t kThreadPoolMediumClass = 9 * 1024;
+inline constexpr std::size_t kThreadPoolLargeClass = 18 * 1024;
 inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
 
 inline void ConfigureProcessGlibc() noexcept {
@@ -90,6 +91,8 @@ inline void OsUnmap(void* address, std::size_t bytes) noexcept {
         ::munmap(address, bytes);
     }
 #elif defined(_WIN32)
+    // MEM_RELEASE releases the complete reservation and requires size zero.
+    (void)bytes;
     if (address) {
         ::VirtualFree(address, 0, 0x8000u);
     }
@@ -153,8 +156,11 @@ public:
         }
         // A 9 KiB size class accommodates 8 KiB payloads plus ownership and
         // alignment headers: seven slots per 64 KiB chunk, rather than three.
-        // This is part of the same pool, not a separate Buffer free-list.
-        if (stride >= 4096 && stride != kThreadPoolMediumClass) {
+        // An 18 KiB class similarly fits 17 KiB TLS staging buffers plus
+        // ownership headers: three slots per chunk instead of direct mappings.
+        // Both are part of this pool, not separate protocol buffer free-lists.
+        if (stride >= 4096 && stride != kThreadPoolMediumClass &&
+            stride != kThreadPoolLargeClass) {
             return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
@@ -304,11 +310,15 @@ private:
         if (required > 8192 && required <= kThreadPoolMediumClass && alignment <= 1024) {
             return kThreadPoolMediumClass;
         }
+        if (required > 16384 && required <= kThreadPoolLargeClass && alignment <= 1024) {
+            return kThreadPoolLargeClass;
+        }
         return PowerOfTwoAtLeast(std::max(required, std::size_t{64}));
     }
 
     [[nodiscard]] static std::size_t ClassIndex(std::size_t stride) noexcept {
         if (stride == kThreadPoolMediumClass) return 10;
+        if (stride == kThreadPoolLargeClass) return 11;
         // All remaining strides are checked powers of two >= 64.
         return static_cast<std::size_t>(std::countr_zero(stride) - 6);
     }
@@ -537,7 +547,7 @@ private:
         chunk.in_recyclable = false;
     }
 
-    std::array<Class, 11> classes_{};
+    std::array<Class, 12> classes_{};
     Chunk* all_ = nullptr;
     Chunk* idle_head_ = nullptr;
     Chunk* idle_tail_ = nullptr;

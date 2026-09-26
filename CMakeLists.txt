@@ -15,7 +15,10 @@ option(CNODE_ENABLE_LTO "Enable Release link-time optimization" ON)
 option(CNODE_RELEASE_DEBUG_SYMBOLS "Emit debug info for Release builds so CI can split .debug symbol files" ON)
 option(CNODE_RELEASE_FRAME_POINTERS "Keep frame pointers in Release builds for perf/heaptrack symbolization" ON)
 option(CNODE_BUILD_TESTS "Build cnode unit tests" OFF)
-set(CNODE_ASIO_RECYCLING_CACHE_SIZE 8 CACHE STRING "Asio small-block recycling cache size")
+# Keep Asio's existing per-io-thread, per-purpose cache large enough for
+# completion batches. This does not replace global allocation or add a pool;
+# buffers and application-owned objects still use the owning Worker's PMR.
+set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio small-block recycling cache size")
 set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
 
 if(CNODE_IO_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -2078,6 +2081,24 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
     add_test(NAME cnode_asio_operation_allocator_test COMMAND cnode_asio_operation_allocator_test)
     set_tests_properties(cnode_asio_operation_allocator_test PROPERTIES TIMEOUT 10)
+
+    foreach(cache_size IN ITEMS 8 32 64)
+        add_executable(cnode_asio_recycling_cache_${cache_size}_test tests/asio_recycling_cache_test.cpp)
+        target_include_directories(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
+            ${asio_SOURCE_DIR}/asio/include)
+        target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
+            ASIO_STANDALONE ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${cache_size})
+        target_link_libraries(cnode_asio_recycling_cache_${cache_size}_test PRIVATE Threads::Threads)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_compile_definitions(cnode_asio_recycling_cache_${cache_size}_test PRIVATE CNODE_WRAP_ALIGNED_ALLOC)
+            target_link_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE -Wl,--wrap=aligned_alloc)
+        endif()
+        target_compile_options(cnode_asio_recycling_cache_${cache_size}_test PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        add_test(NAME cnode_asio_recycling_cache_${cache_size}_test
+            COMMAND cnode_asio_recycling_cache_${cache_size}_test)
+    endforeach()
 
     add_executable(cnode_tls_record_buffer_test tests/tls_record_buffer_test.cpp)
     target_include_directories(cnode_tls_record_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
