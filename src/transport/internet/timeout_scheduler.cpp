@@ -2,6 +2,7 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 #include <asio/execution_context.hpp>
 #include <asio/steady_timer.hpp>
 
@@ -51,6 +52,10 @@ struct TimeoutScheduler::Impl {
     bool released = false;
     bool dispatching_ready_batch = false;
     std::chrono::steady_clock::time_point armed_deadline{};
+    std::chrono::steady_clock::time_point maintenance_deadline =
+        std::chrono::steady_clock::time_point::max();
+    void* maintenance_owner = nullptr;
+    void (*maintenance_callback)(void*) noexcept = nullptr;
 
     void PushHeap(HeapEntry entry) {
         deadline_heap.push_back(entry);
@@ -108,11 +113,9 @@ struct TimeoutScheduler::Impl {
 
     void ArmTimer() {
         PruneHeapTop();
-        if (deadline_heap.empty()) {
-            return;
-        }
-
-        const auto next_deadline = deadline_heap.front().deadline;
+        const auto next_deadline = deadline_heap.empty() ? maintenance_deadline
+            : std::min(deadline_heap.front().deadline, maintenance_deadline);
+        if (next_deadline == std::chrono::steady_clock::time_point::max()) return;
 
         if (wait_pending) {
             // Preserve the existing operation until its completion is
@@ -139,7 +142,8 @@ struct TimeoutScheduler::Impl {
         PruneHeapTop();
         // A later remaining deadline can use the already-armed earlier wake.
         // With no events, wake now so io_context::run can finish promptly.
-        if (deadline_heap.empty()) {
+        if (deadline_heap.empty() &&
+            maintenance_deadline == std::chrono::steady_clock::time_point::max()) {
             RequestWakeup();
         }
     }
@@ -197,6 +201,11 @@ struct TimeoutScheduler::Impl {
         dispatching_ready_batch = false;
         ready.clear();
 
+        if (!released && maintenance_callback &&
+            maintenance_deadline <= std::chrono::steady_clock::now()) {
+            maintenance_deadline = std::chrono::steady_clock::time_point::max();
+            maintenance_callback(maintenance_owner);
+        }
         if (!released) {
             MaybeCompactHeap();
             ArmTimer();
@@ -205,6 +214,9 @@ struct TimeoutScheduler::Impl {
 
     void Release() noexcept {
         released = true;
+        maintenance_deadline = std::chrono::steady_clock::time_point::max();
+        maintenance_owner = nullptr;
+        maintenance_callback = nullptr;
         RequestWakeup();
         dispatching_ready_batch = false;
         events.clear();
@@ -330,6 +342,29 @@ TimeoutToken TimeoutScheduler::ScheduleAfter(
     impl_->ArmTimer();
 
     return token;
+}
+
+bool TimeoutScheduler::SetMaintenanceDeadline(
+    void* owner, void (*callback)(void*) noexcept,
+    std::chrono::steady_clock::time_point deadline) {
+    if (impl_->released) return false;
+    if (!owner || !callback ||
+        (impl_->maintenance_owner && impl_->maintenance_owner != owner)) {
+        throw std::logic_error("timeout maintenance owner conflict");
+    }
+    impl_->maintenance_owner = owner;
+    impl_->maintenance_callback = callback;
+    impl_->maintenance_deadline = deadline;
+    impl_->ArmTimer();
+    return true;
+}
+
+void TimeoutScheduler::CancelMaintenance(void* owner) noexcept {
+    if (impl_->maintenance_owner != owner) return;
+    impl_->maintenance_deadline = std::chrono::steady_clock::time_point::max();
+    impl_->maintenance_owner = nullptr;
+    impl_->maintenance_callback = nullptr;
+    impl_->ReconcileTimerAfterCancellation();
 }
 
 void TimeoutScheduler::Cancel(TimeoutToken& token) noexcept {

@@ -4,6 +4,7 @@
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/traffic_types.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
+#include "worker_memory_reclaimer.hpp"
 #include "acppnode/app/worker_stats.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/rule.hpp"
@@ -186,6 +187,7 @@ struct Worker::RuntimeState {
     std::unique_ptr<rule::Manager> rule_manager;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
     bool started = false;
+    WorkerMemoryReclaimer memory_reclaimer;
 };
 
 namespace {
@@ -245,6 +247,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
         return;
     }
 
+    memory_reclaimer.Start(TimeoutScheduler::ForIoContext(io_context));
     dispatcher->BindRequestPolicy(*rule_manager);
     dispatcher->BindSessionTracking(*session_tracking);
     dispatcher->BindDnsService(*dns_service);

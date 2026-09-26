@@ -73,6 +73,14 @@ public:
         std::chrono::milliseconds delay,
         Callback cb);
 
+    // One owner-thread maintenance deadline, independent of connection events.
+    // Stored inline: no callback allocation, map node, or second timer.
+    // False means the scheduler has already been released. Arming may throw.
+    [[nodiscard]] bool SetMaintenanceDeadline(
+        void* owner, void (*callback)(void*) noexcept,
+        std::chrono::steady_clock::time_point deadline);
+    void CancelMaintenance(void* owner) noexcept;
+
     // Erases the callback without allocating or re-arming the timer. Safe for
     // owner destruction and reentrant cancellation within a callback batch.
     void Cancel(TimeoutToken& token) noexcept;

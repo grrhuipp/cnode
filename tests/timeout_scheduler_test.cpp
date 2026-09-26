@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
+#include "../src/app/worker_memory_reclaimer.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -272,13 +273,103 @@ bool TestMaximumDelay() {
     return !maximum_ran && immediate_ran;
 }
 
+bool TestPoolMaintenance() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    auto& pool = acpp::memory::ThreadPool();
+    pool.PurgeIdle();
+    acpp::WorkerMemoryReclaimer reclaimer;
+    reclaimer.Start(scheduler);
+    std::vector<void*> buffers;
+    for (int i = 0; i < 12; ++i) {
+        auto* p = acpp::memory::AllocatePmr(8192, 16);
+        if (!p) return false;
+        buffers.push_back(p);
+    }
+    auto* held = buffers.back();
+    for (auto* p : buffers) if (p != held) acpp::memory::DeallocatePmr(p);
+    bool idle_returned = false;
+    auto probe = scheduler.ScheduleAfter(50ms, [&] {
+        idle_returned = pool.GetFootprint().idle_bytes == 0 && pool.GetFootprint().mapped_bytes > 0;
+        acpp::memory::DeallocatePmr(held);
+    });
+    // No allocations or explicit collection calls after entering the loop.
+    // The final empty mapping must return without waiting for a monitor sweep.
+    io.run();
+    if (!idle_returned || pool.GetFootprint().mapped_bytes != 0) return false;
+
+    io.restart();
+    auto* p = acpp::memory::AllocatePmr(128, 8);
+    acpp::memory::DeallocatePmr(p);
+    p = acpp::memory::AllocatePmr(128, 16);
+    bool reused_survived = false;
+    auto reuse_probe = scheduler.ScheduleAfter(30ms, [&] {
+        reused_survived = pool.GetFootprint().mapped_bytes > 0 && pool.GetFootprint().idle_bytes == 0;
+        acpp::memory::DeallocatePmr(p);
+    });
+    io.run();
+    if (!reused_survived || pool.GetFootprint().mapped_bytes != 0) return false;
+
+    // Timer-initiation OOM on a free must not escape, leak a wakeup, or retain
+    // an empty mapping. The subsequent successful cycle must still work.
+    io.restart();
+    p = acpp::memory::AllocatePmr(128, 16);
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    acpp::memory::DeallocatePmr(p);
+    timeout_allocation_test::reject_asio_allocations = false;
+    if (timeout_allocation_test::rejected_asio_allocations == before || pool.GetFootprint().mapped_bytes) return false;
+    p = acpp::memory::AllocatePmr(128, 16);
+    acpp::memory::DeallocatePmr(p);
+    io.run();
+    if (pool.GetFootprint().mapped_bytes) return false;
+    acpp::TimeoutScheduler::ReleaseForIoContext(io);
+    p = acpp::memory::AllocatePmr(128, 16);
+    acpp::memory::DeallocatePmr(p);
+    return pool.GetFootprint().mapped_bytes == 0;
+}
+
+bool TestMaintenanceCancellation() {
+    using namespace std::chrono_literals;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    bool fired = false;
+    const auto callback = [](void* p) noexcept { *static_cast<bool*>(p) = true; };
+    if (!scheduler.SetMaintenanceDeadline(&fired, callback, std::chrono::steady_clock::now() + 5ms)) return false;
+    bool other = false;
+    bool conflict = false;
+    try {
+        (void)scheduler.SetMaintenanceDeadline(&other, callback, std::chrono::steady_clock::now());
+    } catch (const std::logic_error&) { conflict = true; }
+    scheduler.CancelMaintenance(&other);
+    auto cancelled = scheduler.ScheduleAfter(1ms, [] {});
+    scheduler.Cancel(cancelled); // Must not cancel the maintenance wakeup.
+    io.run();
+    if (!conflict || !fired || other) return false;
+    io.restart();
+    fired = false;
+    if (!scheduler.SetMaintenanceDeadline(&fired, callback, std::chrono::steady_clock::now() + 1h)) return false;
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    timeout_allocation_test::reject_asio_allocations = true;
+    reject_allocations = true;
+    scheduler.CancelMaintenance(&fired);
+    reject_allocations = false;
+    timeout_allocation_test::reject_asio_allocations = false;
+    io.run();
+    return !fired && timeout_allocation_test::rejected_asio_allocations == before;
+}
+
 }  // namespace
 
 int main() {
     using namespace std::chrono_literals;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    bool allocation_checks_passed = TestCancellationAllocation();
+    bool allocation_checks_passed = TestPoolMaintenance();
+    std::printf("pool maintenance: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
+    allocation_checks_passed = TestMaintenanceCancellation() && allocation_checks_passed;
+    allocation_checks_passed = TestCancellationAllocation() && allocation_checks_passed;
     allocation_checks_passed = TestDestructionAllocation() && allocation_checks_passed;
     allocation_checks_passed = TestEarlierDeadlineAllocation() && allocation_checks_passed;
     allocation_checks_passed = TestFailedInitialWait() && allocation_checks_passed;
