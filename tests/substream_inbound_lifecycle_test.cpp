@@ -296,7 +296,8 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
-    ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     session::Context context;
     context.inbound.tag = "lifecycle";
     context.inbound.source_ip = "127.0.0.1";
@@ -426,7 +427,8 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
-    ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     session::Context context;
     context.inbound.tag = "handshake";
     TimeoutsConfig timeouts;
@@ -533,7 +535,8 @@ void RunIdentityCase(int mode, bool baseline) {
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
-    ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     session::Context context;
     context.inbound.tag = "identity";
     context.inbound.source_ip = "127.0.0.1";
@@ -669,7 +672,8 @@ void RunParsingCase(int mode) {
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     ParsingDispatcher dispatcher;
-    ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     session::Context context;
     context.inbound.tag = "parsing";
     TimeoutsConfig timeouts;
@@ -758,7 +762,8 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     QueueDispatcher dispatcher(io);
-    ReceiverSettings receiver{.dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     session::Context context;
     context.inbound.tag = "queue";
     TimeoutsConfig timeouts;

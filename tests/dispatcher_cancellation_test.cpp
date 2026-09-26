@@ -276,8 +276,8 @@ bool SiblingIsolation(bool controlled) {
     app::dispatcher::DefaultDispatcher dispatcher;
     dispatcher.BindOutboundManager(manager);
     dispatcher.BindRequestLoadState(load);
-    routing::DispatchPolicy policy_a{SniffConfig{.enabled = false}, routing::ForceOutbound{"direct"}};
-    routing::DispatchPolicy policy_b{SniffConfig{.enabled = false}, routing::ForceOutbound{"second"}};
+    routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
+    routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;
     ctx_a.outbound.target = ctx_b.outbound.target = TargetAddress("192.0.2.1", 443);
     StatsShard stats;

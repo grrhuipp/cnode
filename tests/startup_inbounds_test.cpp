@@ -19,7 +19,7 @@ std::optional<UserSet> BuildUsers(std::string_view, const StaticUserConfig& sour
     PreparedVmessUsers users;
     for (const auto& client : source.clients) {
         if (client.id == "reject") return std::nullopt;
-        users.push_back(PreparedVmessUser{.uuid = client.id});
+        users.push_back(PreparedVmessUser{.uuid = client.id, .profile = {}});
     }
     return users;
 }
@@ -30,7 +30,7 @@ StaticInboundConfig Source(std::string tag, uint16_t port, std::string user = "s
     source.tags.push_back(std::move(tag));
     source.port = port;
     source.listen = *InboundListen::Parse("127.0.0.1");
-    source.static_users.clients.push_back(StaticUser{.id = std::move(user)});
+    source.static_users.clients.push_back(StaticUser{.id = std::move(user), .password = {}, .email = {}, .flow = {}});
     return source;
 }
 
@@ -52,7 +52,7 @@ int main() {
     registration.build_static_users = &BuildUsers;
     RegisterProxy("vmess", registration);
 
-    UserStore::ApplyUsers("static-owner", UserSet{PreparedVmessUsers{PreparedVmessUser{.uuid = "sentinel"}}});
+    UserStore::ApplyUsers("static-owner", UserSet{PreparedVmessUsers{PreparedVmessUser{.uuid = "sentinel", .profile = {}}}});
     const auto old = UserStore::VmessUsers("static-owner").users;
     if (!Rejected({Source(std::string(constants::test::kTestInboundTag), 12000)}, true) || user_builds != 0 ||
         !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0) return 1;

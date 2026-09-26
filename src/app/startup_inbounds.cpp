@@ -49,6 +49,7 @@ PreparedStartupInbound PrepareInbound(
             ? routing::OutboundSelectionPolicy{routing::ForceOutbound(*source.outbound_tag)}
             : routing::OutboundSelectionPolicy{routing::RouteWithFallback(
                 std::string(constants::protocol::kDirect))},
+        .build_request = {},
     };
 
     if (!proxyman::inbound::HasProxy(entry.protocol)) {

@@ -105,13 +105,6 @@ void ApplyProxyProtocolResult(
         ctx.inbound.source_port);
 }
 
-[[nodiscard]] ErrorCode ProxyProtocolError(
-    ProxyProtocolReadStatus status) noexcept {
-    return status == ProxyProtocolReadStatus::TimedOut
-        ? ErrorCode::TIMEOUT
-        : ErrorCode::PROTOCOL_DECODE_FAILED;
-}
-
 class ConnectionLimitScope {
 public:
     ConnectionLimitScope(ConnectionLimiterPtr limiter, std::string_view ip)

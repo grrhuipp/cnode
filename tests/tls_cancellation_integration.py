@@ -116,12 +116,15 @@ async def main(args):
         await until(lambda: received.payload(1) == BANNER)
         await asyncio.wait_for(partial_sent.wait(), 1)
         # Normal heap collection runs every 10s; idle variants cross that boundary.
+        result['stage'] = 'idle'
         await asyncio.sleep(args.idle_seconds)
+        result['stage'] = 'resume-record' if args.resume_record else 'fin-barrier'
         if args.resume_record:
             assert args.partial_record and record_tail
             peer_writer.write(record_tail)
             await peer_writer.drain()
             await until(lambda: received.payload(1) == expected_payload)
+        result['stage'] = 'fin-barrier'
         started = time.monotonic()
         writer.write(frame(3, 1))
         await received.barrier(writer)
@@ -144,12 +147,20 @@ async def main(args):
                       fin_replies=received.count(3, 1), session_alive=not received.closed)
     except Exception as error:
         result['error'] = repr(error)
+        if 'received' in locals():
+            result['received_frames'] = [(c, sid, len(p)) for c, sid, p in received.values]
+            result['session_closed'] = received.closed
+        if 'child' in locals():
+            result['exit_code'] = child.poll()
     finally:
         await resources.close()
     result['peer_errors'] = resources.errors
     result['passed'] &= not resources.errors
     (args.output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     print(json.dumps(result), flush=True)
+    if not result['passed']:
+        for log in sorted((args.output / 'logs').glob('error*.log')):
+            print(log.read_text(errors='replace')[-16000:], flush=True)
     return 0 if result['passed'] else 1
 
 

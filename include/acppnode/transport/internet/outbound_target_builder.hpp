@@ -29,8 +29,8 @@ struct OutboundTargetOptions {
     const tcp::endpoint* inbound_local_addr = nullptr;
     std::string_view inbound_source_ip;
     uint16_t inbound_source_port = 0;
-    std::optional<OutboundBind::Selection> ordered_bind_v4;
-    std::optional<OutboundBind::Selection> ordered_bind_v6;
+    std::optional<OutboundBind::Selection> ordered_bind_v4 = std::nullopt;
+    std::optional<OutboundBind::Selection> ordered_bind_v6 = std::nullopt;
     std::string_view tls_server_name;
     std::string_view ws_host;
 };

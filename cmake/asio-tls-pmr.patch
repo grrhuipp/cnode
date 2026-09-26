@@ -1,3 +1,20 @@
+diff --git a/asio/include/asio/ssl/detail/impl/openssl_init.ipp b/asio/include/asio/ssl/detail/impl/openssl_init.ipp
+index 511809e32..1d7db3a1d 100644
+--- a/asio/include/asio/ssl/detail/impl/openssl_init.ipp
++++ b/asio/include/asio/ssl/detail/impl/openssl_init.ipp
+@@ -86,10 +86,12 @@ public:
+        // && (OPENSSL_VERSION_NUMBER < 0x10100000L)
+        // && !defined(SSL_OP_NO_COMPRESSION)
+ #if !defined(OPENSSL_IS_BORINGSSL) \
++    && !defined(OPENSSL_IS_AWSLC) \
+     && !defined(ASIO_USE_WOLFSSL) \
+     && (OPENSSL_VERSION_NUMBER < 0x30000000L)
+     ::CONF_modules_unload(1);
+ #endif // !defined(OPENSSL_IS_BORINGSSL)
++       //   && !defined(OPENSSL_IS_AWSLC)
+        //   && !defined(ASIO_USE_WOLFSSL)
+        //   && (OPENSSL_VERSION_NUMBER < 0x30000000L)
+ #if !defined(OPENSSL_NO_ENGINE) \
 diff --git a/asio/include/asio/ssl/detail/io.hpp b/asio/include/asio/ssl/detail/io.hpp
 index d951db593..dfedc865f 100644
 --- a/asio/include/asio/ssl/detail/io.hpp

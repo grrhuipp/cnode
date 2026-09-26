@@ -125,6 +125,17 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/${{ env.BUILD_DIR }}/.ccache
 
+      - name: Preserve failed Linux regression diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: failed-musl-${{ matrix.backend }}-regressions
+          retention-days: 3
+          path: |
+            ${{ env.BUILD_DIR }}/cnode
+            ${{ env.BUILD_DIR }}/Testing/Temporary/LastTest.log
+            ${{ env.BUILD_DIR }}/tls_*_integration_test/**
+
       - name: Verify & package musl binary
         run: |
           file "$BUILD_DIR/cnode"
