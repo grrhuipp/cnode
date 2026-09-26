@@ -53,10 +53,10 @@ inline constexpr bool kAllocatorCollects = true;
 inline constexpr int kGlibcArenaMax = 2;
 inline constexpr int kGlibcTrimThreshold = 64 * 1024;
 inline constexpr int kGlibcMmapThreshold = 64 * 1024;
-inline constexpr std::size_t kThreadPoolChunkBytes = 64 * 1024;
+inline constexpr std::size_t kThreadPoolChunkBytes = 68 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 32 * 1024;
 inline constexpr std::size_t kThreadPoolMediumClass = 9 * 1024;
-inline constexpr std::size_t kThreadPoolLargeClass = 18 * 1024;
+inline constexpr std::size_t kThreadPoolLargePayloadBytes = 17 * 1024;
 inline constexpr std::chrono::milliseconds kThreadPoolPurgeDelay{10};
 
 inline void ConfigureProcessGlibc() noexcept {
@@ -155,12 +155,12 @@ public:
             return AllocateDirect(bytes, alignment);
         }
         // A 9 KiB size class accommodates 8 KiB payloads plus ownership and
-        // alignment headers: seven slots per 64 KiB chunk, rather than three.
-        // An 18 KiB class similarly fits 17 KiB TLS staging buffers plus
-        // ownership headers: three slots per chunk instead of direct mappings.
+        // alignment headers: seven slots per 68 KiB chunk, rather than three.
+        // The large class fits 17 KiB payloads plus ownership/alignment headers.
+        // A physical 68 KiB chunk holds three of these slots, not four.
         // Both are part of this pool, not separate protocol buffer free-lists.
         if (stride >= 4096 && stride != kThreadPoolMediumClass &&
-            stride != kThreadPoolLargeClass) {
+            stride != LargeStride()) {
             return AllocateDirect(bytes, alignment);
         }
         Class& cls = classes_[class_index];
@@ -300,6 +300,16 @@ private:
         return RoundUp(sizeof(SlotHeader), alignment);
     }
 
+    static constexpr std::size_t kLargeAlignment =
+        std::max(std::size_t{16}, alignof(std::max_align_t));
+
+    [[nodiscard]] static std::size_t LargeStride() noexcept {
+        // Match AllocatePmr's ownership prefix, backlink and alignment space.
+        // Keep this overhead explicit rather than rounding payloads to 18 KiB.
+        return RoundUp(Lead(kLargeAlignment) + sizeof(BlockPrefix) + kLargeAlignment +
+                       sizeof(void*) + kThreadPoolLargePayloadBytes, kLargeAlignment);
+    }
+
     [[nodiscard]] static std::size_t Stride(
         std::size_t bytes, std::size_t alignment) noexcept {
         const std::size_t lead = Lead(alignment);
@@ -310,15 +320,16 @@ private:
         if (required > 8192 && required <= kThreadPoolMediumClass && alignment <= 1024) {
             return kThreadPoolMediumClass;
         }
-        if (required > 16384 && required <= kThreadPoolLargeClass && alignment <= 1024) {
-            return kThreadPoolLargeClass;
+        if (required > 16384 && required <= LargeStride() &&
+            alignment <= kLargeAlignment) {
+            return LargeStride();
         }
         return PowerOfTwoAtLeast(std::max(required, std::size_t{64}));
     }
 
     [[nodiscard]] static std::size_t ClassIndex(std::size_t stride) noexcept {
         if (stride == kThreadPoolMediumClass) return 10;
-        if (stride == kThreadPoolLargeClass) return 11;
+        if (stride == LargeStride()) return 11;
         // All remaining strides are checked powers of two >= 64.
         return static_cast<std::size_t>(std::countr_zero(stride) - 6);
     }

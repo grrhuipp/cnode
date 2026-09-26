@@ -430,13 +430,29 @@ bool RunPmr() {
     return acpp::memory::AllocatePmr(std::numeric_limits<std::size_t>::max(), 16) == nullptr;
 }
 
+bool RunAll() {
+    struct Case { const char* name; bool (*run)(); };
+    for (const auto& test : std::array{
+             Case{"pool", RunPool}, Case{"fragmented", RunFragmented},
+             Case{"mixed", RunMixed}, Case{"9KiB class", RunHotClass},
+             Case{"17KiB payload class", RunLargeClass}, Case{"Buffer", RunBufferIntegration},
+             Case{"idle accounting", RunIdleAccounting}, Case{"idle FIFO", RunIdleQueue},
+             Case{"PMR prefix", RunPmr}}) {
+        if (!test.run()) {
+            std::fprintf(stderr, "pool case failed: %s\n", test.name);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
     bool worker = false;
-    std::thread thread([&worker] { worker = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunLargeClass() && RunBufferIntegration() && RunIdleAccounting() && RunIdleQueue() && RunPmr(); });
+    std::thread thread([&worker] { worker = RunAll(); });
     thread.join();
-    const bool main_thread = RunPool() && RunFragmented() && RunMixed() && RunHotClass() && RunLargeClass() && RunBufferIntegration() && RunIdleAccounting() && RunIdleQueue() && RunPmr();
+    const bool main_thread = RunAll();
     std::printf("pool same-thread direct/reuse/alignment/purge/Buffer: %s\n",
                 worker && main_thread ? "PASS" : "FAIL");
     return worker && main_thread ? 0 : 1;

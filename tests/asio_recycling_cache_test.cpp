@@ -7,12 +7,14 @@
 #include <thread>
 
 namespace {
-thread_local size_t system_allocations = 0;
+// The linker redirects aligned_alloc after compilation. Volatile prevents
+// the optimizer assuming this private counter is unchanged by the libc call.
+thread_local volatile size_t system_allocations = 0;
 }
 #if defined(CNODE_WRAP_ALIGNED_ALLOC)
 extern "C" void* __real_aligned_alloc(size_t alignment, size_t size);
 extern "C" void* __wrap_aligned_alloc(size_t alignment, size_t size) {
-    ++system_allocations;
+    system_allocations = system_allocations + 1;
     return __real_aligned_alloc(alignment, size);
 }
 #endif
@@ -41,7 +43,16 @@ Result RunPurpose(int rounds) {
         }
         return true;
     };
+    const auto cold_before = system_allocations;
     if (!cycle()) return {false, 0};
+#if defined(CNODE_WRAP_ALIGNED_ALLOC)
+    if (system_allocations - cold_before != batch) {
+        std::fprintf(stderr, "aligned_alloc instrumentation did not observe cold allocations\n");
+        return {false, 0};
+    }
+#else
+    (void)cold_before;
+#endif
     const auto before = system_allocations;
     for (int i = 0; i < rounds; ++i) if (!cycle()) return {false, 0};
     const auto slow = system_allocations - before;
