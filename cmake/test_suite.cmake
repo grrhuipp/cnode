@@ -9,6 +9,11 @@ if(CNODE_TEST_SANITIZERS)
         set(target "${base}_sanitized")
         get_target_property(sources ${base} SOURCES)
         add_executable(${target} ${sources})
+        # Keep sanitizer instrumentation and fault-injection allocation pairs
+        # in their original translation units, independently of release LTO.
+        set_target_properties(${target} PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION OFF
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
         foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
             get_target_property(value ${base} ${property})
             if(value)
