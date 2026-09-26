@@ -94,6 +94,8 @@ FetchContent_Declare(
     GIT_TAG asio-1-32-0
 )
 FetchContent_MakeAvailable(asio)
+include(cmake/patch_asio_tls.cmake)
+cnode_patch_asio_tls("${asio_SOURCE_DIR}")
 
 add_library(asio_standalone INTERFACE)
 add_library(asio::asio ALIAS asio_standalone)
@@ -953,6 +955,24 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(NAME cnode_grpc_hunk_test COMMAND cnode_grpc_hunk_test)
+
+    add_executable(cnode_vmess_auth_snapshot_test
+        tests/vmess_auth_snapshot_test.cpp
+        src/proxy/vmess/validator.cpp
+        src/proxy/vmess/aead/authid.cpp
+        src/app/proxyman/inbound/user_store.cpp
+        src/common/sharded_user_stats.cpp)
+    target_include_directories(cnode_vmess_auth_snapshot_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/vmess)
+    target_link_libraries(cnode_vmess_auth_snapshot_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
+    if(WIN32)
+        target_link_libraries(cnode_vmess_auth_snapshot_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_vmess_auth_snapshot_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_vmess_auth_snapshot_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_vmess_auth_snapshot_test COMMAND cnode_vmess_auth_snapshot_test)
 
     add_executable(cnode_vmess_cipher_test
         tests/vmess_cipher_test.cpp
@@ -2059,6 +2079,18 @@ if(CNODE_BUILD_TESTS)
     add_test(NAME cnode_asio_operation_allocator_test COMMAND cnode_asio_operation_allocator_test)
     set_tests_properties(cnode_asio_operation_allocator_test PROPERTIES TIMEOUT 10)
 
+    add_executable(cnode_tls_record_buffer_test tests/tls_record_buffer_test.cpp)
+    target_include_directories(cnode_tls_record_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cnode_tls_record_buffer_test PRIVATE asio::asio Threads::Threads ssl crypto)
+    if(WIN32)
+        target_link_libraries(cnode_tls_record_buffer_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_tls_record_buffer_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_tls_record_buffer_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_tls_record_buffer_test COMMAND cnode_tls_record_buffer_test)
+
     add_executable(cnode_tls_bio_idle_test tests/tls_bio_idle_test.cpp)
     target_link_libraries(cnode_tls_bio_idle_test PRIVATE crypto)
     target_compile_options(cnode_tls_bio_idle_test PRIVATE
@@ -2736,6 +2768,25 @@ if(CNODE_BUILD_TESTS)
                 --output ${CMAKE_CURRENT_BINARY_DIR}/tls_cancellation_partial_integration_test
                 --partial-record)
         set_tests_properties(cnode_tls_cancellation_partial_integration_test PROPERTIES TIMEOUT 40)
+        add_test(NAME cnode_tls_idle_write_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_idle_write_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/tls_idle_write_integration_test)
+        set_tests_properties(cnode_tls_idle_write_integration_test PROPERTIES TIMEOUT 45)
+        foreach(mode IN ITEMS idle idle_partial)
+            set(extra_args)
+            if(mode STREQUAL "idle_partial")
+                set(extra_args --partial-record --resume-record)
+            endif()
+            add_test(NAME cnode_tls_${mode}_integration_test
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py
+                    --binary $<TARGET_FILE:cnode>
+                    --output ${CMAKE_CURRENT_BINARY_DIR}/tls_${mode}_integration_test
+                    --idle-seconds 12 ${extra_args})
+            set_tests_properties(cnode_tls_${mode}_integration_test PROPERTIES TIMEOUT 40)
+        endforeach()
         add_test(
             NAME cnode_static_inbound_outbound_integration_test
             COMMAND ${Python3_EXECUTABLE}

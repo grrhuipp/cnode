@@ -221,7 +221,11 @@ proxy::vmess::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
                    tag, client_ip, request->target,
-                   request->user && request->user->profile ? request->user->profile->email : "");
+                   ctx.inbound.user_email);
+
+    // Header authentication and replay checks are finished. Body/response keys
+    // are already owned by request; do not move a user-table owner into Session.
+    request->SetUser({});
 
     // 在 move 之前提取所有需要的字段
     TargetAddress target = request->target;

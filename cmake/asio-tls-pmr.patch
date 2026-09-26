@@ -1,0 +1,280 @@
+diff --git a/asio/include/asio/ssl/detail/io.hpp b/asio/include/asio/ssl/detail/io.hpp
+index d951db593..dfedc865f 100644
+--- a/asio/include/asio/ssl/detail/io.hpp
++++ b/asio/include/asio/ssl/detail/io.hpp
+@@ -43,8 +43,8 @@ std::size_t io(Stream& next_layer, stream_core& core,
+     // the underlying transport.
+     if (core.input_.size() == 0)
+     {
+-      core.input_ = asio::buffer(core.input_buffer_,
+-          next_layer.read_some(core.input_buffer_, io_ec));
++      const asio::mutable_buffer input = core.prepare_input_buffer();
++      core.input_ = asio::buffer(input, next_layer.read_some(input, io_ec));
+       if (!ec)
+         ec = io_ec;
+     }
+@@ -60,7 +60,7 @@ std::size_t io(Stream& next_layer, stream_core& core,
+     // Get output data from the engine and write it to the underlying
+     // transport.
+     asio::write(next_layer,
+-        core.engine_.get_output(core.output_buffer_), io_ec);
++        core.engine_.get_output(core.prepare_output_buffer()), io_ec);
+     if (!ec)
+       ec = io_ec;
+ 
+@@ -72,7 +72,7 @@ std::size_t io(Stream& next_layer, stream_core& core,
+     // Get output data from the engine and write it to the underlying
+     // transport.
+     asio::write(next_layer,
+-        core.engine_.get_output(core.output_buffer_), io_ec);
++        core.engine_.get_output(core.prepare_output_buffer()), io_ec);
+     if (!ec)
+       ec = io_ec;
+ 
+@@ -165,6 +165,14 @@ public:
+           // pos_infin if a read is in progress, and neg_infin otherwise.
+           if (core_.expiry(core_.pending_read_) == core_.neg_infin())
+           {
++            asio::mutable_buffer input;
++            try { input = core_.prepare_input_buffer(); }
++            catch (const std::bad_alloc&)
++            {
++              ec_ = asio::error::no_memory;
++              want_ = engine::want_nothing;
++              goto complete;
++            }
+             // Prevent other read operations from being started.
+             core_.pending_read_.expires_at(core_.pos_infin());
+ 
+@@ -173,7 +181,7 @@ public:
+ 
+             // Start reading some data from the underlying transport.
+             next_layer_.async_read_some(
+-                asio::buffer(core_.input_buffer_),
++                input,
+                 static_cast<io_op&&>(*this));
+           }
+           else
+@@ -198,6 +206,14 @@ public:
+           // pos_infin if a write is in progress, and neg_infin otherwise.
+           if (core_.expiry(core_.pending_write_) == core_.neg_infin())
+           {
++            asio::mutable_buffer output;
++            try { output = core_.prepare_output_buffer(); }
++            catch (const std::bad_alloc&)
++            {
++              ec_ = asio::error::no_memory;
++              want_ = engine::want_nothing;
++              goto complete;
++            }
+             // Prevent other write operations from being started.
+             core_.pending_write_.expires_at(core_.pos_infin());
+ 
+@@ -206,7 +222,7 @@ public:
+ 
+             // Start writing all the data to the underlying transport.
+             asio::async_write(next_layer_,
+-                core_.engine_.get_output(core_.output_buffer_),
++                core_.engine_.get_output(output),
+                 static_cast<io_op&&>(*this));
+           }
+           else
+@@ -223,6 +239,7 @@ public:
+           return;
+ 
+         default:
++        complete:
+ 
+           // The SSL operation is done and we can invoke the handler, but we
+           // have to keep in mind that this function might be being called from
+@@ -235,7 +252,7 @@ public:
+                   __FILE__, __LINE__, Operation::tracking_name()));
+ 
+             next_layer_.async_read_some(
+-                asio::buffer(core_.input_buffer_, 0),
++                asio::mutable_buffer(),
+                 static_cast<io_op&&>(*this));
+ 
+             // Yield control until asynchronous operation completes. Control
+diff --git a/asio/include/asio/ssl/detail/stream_core.hpp b/asio/include/asio/ssl/detail/stream_core.hpp
+index 0ec763d4a..567e5fc2f 100644
+--- a/asio/include/asio/ssl/detail/stream_core.hpp
++++ b/asio/include/asio/ssl/detail/stream_core.hpp
+@@ -24,6 +24,8 @@
+ #endif // defined(ASIO_HAS_BOOST_DATE_TIME)
+ #include "asio/ssl/detail/engine.hpp"
+ #include "asio/buffer.hpp"
++#include <memory_resource>
++#include <vector>
+ 
+ #include "asio/detail/push_options.hpp"
+ 
+@@ -36,15 +38,17 @@ struct stream_core
+   // According to the OpenSSL documentation, this is the buffer size that is
+   // sufficient to hold the largest possible TLS record.
+   enum { max_tls_record_size = 17 * 1024 };
++  typedef std::pmr::vector<unsigned char> buffer_storage;
+ 
+   template <typename Executor>
+-  stream_core(SSL_CTX* context, const Executor& ex)
++  stream_core(SSL_CTX* context, const Executor& ex,
++      std::pmr::memory_resource* resource = std::pmr::new_delete_resource())
+     : engine_(context),
+       pending_read_(ex),
+       pending_write_(ex),
+-      output_buffer_space_(max_tls_record_size),
++      output_buffer_space_(resource),
+       output_buffer_(asio::buffer(output_buffer_space_)),
+-      input_buffer_space_(max_tls_record_size),
++      input_buffer_space_(resource),
+       input_buffer_(asio::buffer(input_buffer_space_))
+   {
+     pending_read_.expires_at(neg_infin());
+@@ -52,13 +56,14 @@ struct stream_core
+   }
+ 
+   template <typename Executor>
+-  stream_core(SSL* ssl_impl, const Executor& ex)
++  stream_core(SSL* ssl_impl, const Executor& ex,
++      std::pmr::memory_resource* resource = std::pmr::new_delete_resource())
+     : engine_(ssl_impl),
+       pending_read_(ex),
+       pending_write_(ex),
+-      output_buffer_space_(max_tls_record_size),
++      output_buffer_space_(resource),
+       output_buffer_(asio::buffer(output_buffer_space_)),
+-      input_buffer_space_(max_tls_record_size),
++      input_buffer_space_(resource),
+       input_buffer_(asio::buffer(input_buffer_space_))
+   {
+     pending_read_.expires_at(neg_infin());
+@@ -83,12 +88,10 @@ struct stream_core
+            other.pending_write_)),
+ #endif // defined(ASIO_HAS_BOOST_DATE_TIME)
+       output_buffer_space_(
+-          static_cast<std::vector<unsigned char>&&>(
+-            other.output_buffer_space_)),
++          static_cast<buffer_storage&&>(other.output_buffer_space_)),
+       output_buffer_(other.output_buffer_),
+       input_buffer_space_(
+-          static_cast<std::vector<unsigned char>&&>(
+-            other.input_buffer_space_)),
++          static_cast<buffer_storage&&>(other.input_buffer_space_)),
+       input_buffer_(other.input_buffer_),
+       input_(other.input_)
+   {
+@@ -121,15 +124,16 @@ struct stream_core
+         static_cast<asio::steady_timer&&>(
+           other.pending_write_);
+ #endif // defined(ASIO_HAS_BOOST_DATE_TIME)
+-      output_buffer_space_ =
+-        static_cast<std::vector<unsigned char>&&>(
+-          other.output_buffer_space_);
+-      output_buffer_ = other.output_buffer_;
+-      input_buffer_space_ =
+-        static_cast<std::vector<unsigned char>&&>(
+-          other.input_buffer_space_);
+-      input_buffer_ = other.input_buffer_;
+-      input_ = other.input_;
++      // PMR move assignment can copy across different resources. Rebind views.
++      const std::size_t input_size = other.input_.size();
++      const std::size_t input_offset = input_size
++        ? static_cast<const unsigned char*>(other.input_.data())
++            - other.input_buffer_space_.data() : 0;
++      output_buffer_space_ = static_cast<buffer_storage&&>(other.output_buffer_space_);
++      output_buffer_ = asio::buffer(output_buffer_space_);
++      input_buffer_space_ = static_cast<buffer_storage&&>(other.input_buffer_space_);
++      input_buffer_ = asio::buffer(input_buffer_space_);
++      input_ = asio::buffer(input_buffer_ + input_offset, input_size);
+       other.output_buffer_ = asio::mutable_buffer(0, 0);
+       other.input_buffer_ = asio::mutable_buffer(0, 0);
+       other.input_ = asio::const_buffer(0, 0);
+@@ -137,6 +141,36 @@ struct stream_core
+     return *this;
+   }
+ 
++  asio::mutable_buffer prepare_input_buffer()
++  {
++    if (input_buffer_space_.empty()) input_buffer_space_.resize(max_tls_record_size);
++    input_buffer_ = asio::buffer(input_buffer_space_);
++    return input_buffer_;
++  }
++
++  asio::mutable_buffer prepare_output_buffer()
++  {
++    if (output_buffer_space_.empty()) output_buffer_space_.resize(max_tls_record_size);
++    output_buffer_ = asio::buffer(output_buffer_space_);
++    return output_buffer_;
++  }
++
++  // Caller must own the executor and have joined every SSL operation. Retain
++  // unconsumed ciphertext even when the native SSL engine itself is empty.
++  void release_idle_buffers()
++  {
++    if (input_.size() == 0)
++    {
++      buffer_storage empty(input_buffer_space_.get_allocator());
++      input_buffer_space_.swap(empty);
++      input_buffer_ = asio::mutable_buffer();
++      input_ = asio::const_buffer();
++    }
++    buffer_storage empty(output_buffer_space_.get_allocator());
++    output_buffer_space_.swap(empty);
++    output_buffer_ = asio::mutable_buffer();
++  }
++
+   // The SSL engine.
+   engine engine_;
+ 
+@@ -193,13 +227,13 @@ struct stream_core
+ #endif // defined(ASIO_HAS_BOOST_DATE_TIME)
+ 
+   // Buffer space used to prepare output intended for the transport.
+-  std::vector<unsigned char> output_buffer_space_;
++  buffer_storage output_buffer_space_;
+ 
+   // A buffer that may be used to prepare output intended for the transport.
+   asio::mutable_buffer output_buffer_;
+ 
+   // Buffer space used to read input intended for the engine.
+-  std::vector<unsigned char> input_buffer_space_;
++  buffer_storage input_buffer_space_;
+ 
+   // A buffer that may be used to read input intended for the engine.
+   asio::mutable_buffer input_buffer_;
+diff --git a/asio/include/asio/ssl/stream.hpp b/asio/include/asio/ssl/stream.hpp
+index 9cf83e003..e212b7ab9 100644
+--- a/asio/include/asio/ssl/stream.hpp
++++ b/asio/include/asio/ssl/stream.hpp
+@@ -119,9 +119,10 @@ public:
+    * @param handle An existing native SSL implementation.
+    */
+   template <typename Arg>
+-  stream(Arg&& arg, native_handle_type handle)
++  stream(Arg&& arg, native_handle_type handle,
++      std::pmr::memory_resource* resource = std::pmr::new_delete_resource())
+     : next_layer_(static_cast<Arg&&>(arg)),
+-      core_(handle, next_layer_.lowest_layer().get_executor())
++      core_(handle, next_layer_.lowest_layer().get_executor(), resource)
+   {
+   }
+ 
+@@ -205,6 +206,18 @@ public:
+     return core_.engine_.native_handle();
+   }
+ 
++  // cnode: owner-executor only, with no outstanding SSL operations. The caller
++  // must not free buffers used by a suspended transport read/write.
++  void release_idle_buffers()
++  {
++    core_.release_idle_buffers();
++  }
++
++  bool has_buffered_input() const
++  {
++    return core_.input_.size() != 0;
++  }
++
+   /// Get a reference to the next layer.
+   /**
+    * This function returns a reference to the next layer in a stack of stream

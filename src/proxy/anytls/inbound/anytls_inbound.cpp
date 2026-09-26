@@ -893,6 +893,10 @@ Handler::Process(
         }
     }
 
+    // Metadata is owned by ctx; authentication must not pin an old user table
+    // for the lifetime of this control transport and all its logical streams.
+    user.reset();
+
     // The authenticated socket is an AnyTLS control transport. The shared
     // access-session boundary suppresses MUX containers while each logical
     // child below replaces this with TCP/UDP and reports independently.

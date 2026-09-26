@@ -290,6 +290,8 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"lifecycle", users}};
     UserStore::ApplyUsers(updates);
+    std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
+        UserStore::FindAnyTlsUser("lifecycle", hash);
     anytls::Validator validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
@@ -318,6 +320,13 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
         }));
     io.poll();
     Check(dispatcher.active == 2 && stream.pending_reads == 1, "both logical requests must be pending");
+    if (!mux && !baseline) {
+        Check(!old_table.expired(), "published snapshot must still own its users");
+        UserStore::ApplyUsers(updates);
+        Check(old_table.expired(), "authenticated control transport must not retain the old user table");
+        Check(context.inbound.user_id == 1 && context.inbound.user_email == "lifecycle@test",
+              "session metadata must survive destruction of its authentication snapshot");
+    }
     if (blocked_writes) {
         stream.block_writes = true;
         dispatcher.write_payload = true;

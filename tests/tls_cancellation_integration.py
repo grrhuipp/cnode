@@ -24,11 +24,15 @@ async def main(args):
     partial_sent = asyncio.Event()
     extra = bytearray()
     close_notify_received = False
+    record_tail = b''
+    resume_payload = b'incomplete TLS record must never become payload'
+    expected_payload = BANNER + (resume_payload if args.resume_record else b'')
     result = {'passed': False, 'partial_record': args.partial_record,
+              'idle_seconds': args.idle_seconds, 'resume_record': args.resume_record,
               'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}
 
     async def trojan(reader, writer):
-        nonlocal peer_writer, close_notify_received
+        nonlocal peer_writer, close_notify_received, record_tail
         peer_writer = writer
         incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -65,9 +69,10 @@ async def main(args):
         assert secured.write(BANNER) == len(BANNER)
         await flush()
         if args.partial_record:
-            secured.write(b'incomplete TLS record must never become payload')
+            secured.write(resume_payload)
             encrypted = outgoing.read()
             assert len(encrypted) > 6
+            record_tail = encrypted[6:]
             # Leave SSL waiting inside a record, after the TCP readability wait.
             writer.write(encrypted[:6])
             await writer.drain()
@@ -110,7 +115,13 @@ async def main(args):
         await writer.drain()
         await until(lambda: received.payload(1) == BANNER)
         await asyncio.wait_for(partial_sent.wait(), 1)
-        await asyncio.sleep(0.1)
+        # Normal heap collection runs every 10s; idle variants cross that boundary.
+        await asyncio.sleep(args.idle_seconds)
+        if args.resume_record:
+            assert args.partial_record and record_tail
+            peer_writer.write(record_tail)
+            await peer_writer.drain()
+            await until(lambda: received.payload(1) == expected_payload)
         started = time.monotonic()
         writer.write(frame(3, 1))
         await received.barrier(writer)
@@ -126,7 +137,7 @@ async def main(args):
         if not timely and peer_writer:
             peer_writer.transport.abort()
         await received.barrier(writer)
-        result.update(passed=timely and not extra and received.payload(1) == BANNER
+        result.update(passed=timely and not extra and received.payload(1) == expected_payload
                       and close_notify_received and received.count(3, 1) == 0
                       and not received.closed and child.poll() is None,
                       close_notify_received=close_notify_received, extra_bytes=len(extra),
@@ -147,4 +158,6 @@ if __name__ == '__main__':
     parser.add_argument('--binary', required=True, type=lambda x: Path(x).resolve())
     parser.add_argument('--output', required=True, type=lambda x: Path(x).resolve())
     parser.add_argument('--partial-record', action='store_true')
+    parser.add_argument('--idle-seconds', type=float, default=0.1)
+    parser.add_argument('--resume-record', action='store_true')
     raise SystemExit(asyncio.run(main(parser.parse_args())))

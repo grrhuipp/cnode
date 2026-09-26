@@ -171,54 +171,54 @@ proxy::shadowsocks::inbound::Handler::Process(
         co_return fail(error);
     }
 
-    const auto* matched = session_result->user;
-    if (!matched) {
-        LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
-        if (limiter_) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
-        }
-        stats_->OnError();
-        co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
-    const auto& profile = *matched->profile;
-
-    // ── 6. 填充上下文 ─────────────────────────────────────────────────────────
-    ctx.inbound.user_id = profile.user_id;
-    ctx.inbound.user_email = profile.email;
-    ctx.content.speed_limit = profile.speed_limit;
-
-    // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-    int64_t uid = profile.user_id;
-    if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
-            FormatTimestamp(ctx.accept_time_us),
-            ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-            profile.device_limit,
-            validator_.OnlineDeviceCount(tag, uid));
-        co_return fail(ErrorCode::PERMISSION_DENIED);
-    }
-
-    validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
-    user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
-
-    LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
-                   tag, client_ip, session_result->target, ctx.inbound.user_email);
-
-    // ── 7. 填充 session 并进入 dispatcher ───────────────────────────────────
-    ctx.outbound.original_target = session_result->target;
-    ctx.outbound.target = std::move(session_result->target);
-    ctx.content.network = Network::TCP;
-
     auto request_reader = std::move(session_result->body_reader);
-    auto response_writer_result = ss::WriteTCPResponse(
-        *matched, cipher_info_, session_result->request_salt, *stream);
-    if (!request_reader) {
-        co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+    std::unique_ptr<transport::MultiBufferWriter> response_writer;
+    {
+        const auto* matched = session_result->user;
+        if (!matched) {
+            LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
+            if (limiter_) {
+                limiter_->OnAuthFailTracked(tag, client_ip);
+            }
+            stats_->OnError();
+            co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+        }
+        const auto& profile = *matched->profile;
+        ctx.inbound.user_id = profile.user_id;
+        ctx.inbound.user_email = profile.email;
+        ctx.content.speed_limit = profile.speed_limit;
+
+        int64_t uid = profile.user_id;
+        if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+                FormatTimestamp(ctx.accept_time_us),
+                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
+                profile.device_limit,
+                validator_.OnlineDeviceCount(tag, uid));
+            co_return fail(ErrorCode::PERMISSION_DENIED);
+        }
+        validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
+        user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
+
+        LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
+                       tag, client_ip, session_result->target, ctx.inbound.user_email);
+        ctx.outbound.original_target = session_result->target;
+        ctx.outbound.target = std::move(session_result->target);
+        ctx.content.network = Network::TCP;
+
+        auto response_writer_result = ss::WriteTCPResponse(
+            *matched, cipher_info_, session_result->request_salt, *stream);
+        if (!request_reader) {
+            co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        if (!response_writer_result) {
+            co_return fail(response_writer_result.error());
+        }
+        response_writer = std::move(response_writer_result.value());
     }
-    if (!response_writer_result) {
-        co_return fail(response_writer_result.error());
-    }
-    auto response_writer = std::move(response_writer_result.value());
+    // Both directions now own their cipher/key state, including the lazy
+    // response header. Authentication ownership must end before UoT/relay waits.
+    session_result->SetUser({});
 
     if (const auto uot_version = proxy::uot::VersionFromMagicAddress(
             ctx.outbound.target)) {

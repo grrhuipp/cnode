@@ -499,6 +499,9 @@ proxy::vless::inbound::Handler::Process(
         }
     }
 
+    // Flow validation and metadata copy are complete; no credential is needed
+    // by the request body or Vision's per-session UUID state.
+    user_info.reset();
     validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
     user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
 

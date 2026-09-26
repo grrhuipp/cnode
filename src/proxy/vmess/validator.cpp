@@ -153,7 +153,9 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
     };
 
     mutable HotUserCache hot_cache;
-    mutable std::shared_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
+    // Cache entries borrow credentials only while the currently loaded table
+    // owns them. An idle validator must not retain a replaced authentication table.
+    mutable std::weak_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
     mutable int64_t last_hot_cache_cleanup = 0;
     mutable SessionHistory session_history;
     UserOnlineTracker stats;
@@ -211,7 +213,8 @@ TimedUserValidator::FindByAuthIDForTag(
     };
 
     auto view = proxyman::inbound::UserStore::VmessUsers(tag);
-    if (view.users.get() != impl_->hot_users.get()) {
+    const auto hot_users = impl_->hot_users.lock();
+    if (!hot_users || view.users.get() != hot_users.get()) {
         impl_->hot_cache.Clear();
         impl_->hot_users = view.users;
     }

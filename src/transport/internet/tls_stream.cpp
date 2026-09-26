@@ -366,7 +366,7 @@ struct TlsStream::Impl : memory::ThreadAllocated {
     }
 
     Impl(std::unique_ptr<TcpStream> inner, SSL_CTX* ctx)
-        : stream(TlsTcpLayer(std::move(inner)), NewSsl(ctx)) {
+        : stream(TlsTcpLayer(std::move(inner)), NewSsl(ctx), std::pmr::get_default_resource()) {
         next = CurrentThreadHead();
         if (next) next->prev = this;
         CurrentThreadHead() = this;
@@ -382,7 +382,16 @@ struct TlsStream::Impl : memory::ThreadAllocated {
 
     void Touch() noexcept { last_activity = std::chrono::steady_clock::now(); }
 
+    struct Operation {
+        explicit Operation(Impl& owner) noexcept : owner(owner) { ++owner.active_operations; }
+        ~Operation() { --owner.active_operations; }
+        Operation(const Operation&) = delete;
+        Operation& operator=(const Operation&) = delete;
+        Impl& owner;
+    };
+
     SslStream stream;
+    size_t active_operations = 0;
     Impl* prev = nullptr;
     Impl* next = nullptr;
     std::chrono::steady_clock::time_point last_activity =
@@ -393,13 +402,14 @@ struct TlsStream::Impl : memory::ThreadAllocated {
 void TlsStream::CollectIdleBuffersForCurrentThread() noexcept {
     const auto now = std::chrono::steady_clock::now();
     for (Impl* current = Impl::CurrentThreadHead(); current; current = current->next) {
-        if (!current->handshake_complete ||
+        if (!current->handshake_complete || current->active_operations != 0 ||
             now - current->last_activity < std::chrono::seconds(2)) {
             continue;
         }
         SSL* ssl = current->stream.native_handle();
         if (ssl && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
             ReleaseIdleSslBioPair(ssl);
+            current->stream.release_idle_buffers();
         }
     }
 }
@@ -466,6 +476,7 @@ net::awaitable<bool> TlsStream::Handshake() {
         co_return true;
     }
 
+    Impl::Operation operation(*impl_);
     auto [ec] = co_await impl_->stream.async_handshake(
         is_server_ ? net::ssl::stream_base::server
                    : net::ssl::stream_base::client,
@@ -547,6 +558,16 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
     }
 
     impl_->Touch();
+    // Wait without pinning an Asio ciphertext buffer. Buffered ciphertext in
+    // Asio is separate from SSL_pending/SSL_has_pending and must also be drained.
+    SSL* ssl = NativeSsl();
+    if (buf.size() != 0 && SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0 &&
+        !impl_->stream.has_buffered_input()) {
+        const auto ec = co_await impl_->stream.next_layer().Tcp().WaitReadable();
+        if (ec == io_error::eof || ec == io_error::operation_aborted) co_return 0;
+        if (ec) throw IoSystemError(ec);
+    }
+    Impl::Operation operation(*impl_);
     auto [ec, n] = co_await impl_->stream.async_read_some(
         buf, net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (ec) {
@@ -573,7 +594,8 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
 
     // OpenSSL 已有解密/待处理记录时必须直接 SSL_read；否则先等待
     // 底层 TCP 可读，避免给每条空闲 TLS 连接预留 8KB payload Buffer。
-    if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0) {
+    if (SSL_pending(ssl) == 0 && SSL_has_pending(ssl) == 0 &&
+        !impl_->stream.has_buffered_input()) {
         TcpStream* tcp = BaseTcpStream();
         if (!tcp) {
             co_return buf::MultiBuffer{};
@@ -593,6 +615,7 @@ net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
         co_return buf::MultiBuffer{};
     }
 
+    Impl::Operation operation(*impl_);
     auto [ec, n] = co_await impl_->stream.async_read_some(
         net::mutable_buffer(out->Tail().data(), out->Available()),
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
@@ -616,6 +639,7 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     }
 
     impl_->Touch();
+    Impl::Operation operation(*impl_);
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buf,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
@@ -635,6 +659,7 @@ net::awaitable<void> TlsStream::WriteBuffers(
     }
 
     impl_->Touch();
+    Impl::Operation operation(*impl_);
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buffers,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
@@ -656,6 +681,7 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     ConstBufferSpanBuilder<8> out;
     out.AppendMultiBuffer(mb);
     if (!out.empty()) {
+        Impl::Operation operation(*impl_);
         auto [ec, n] = co_await net::async_write(
             impl_->stream, out.Span(),
             net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
@@ -686,6 +712,7 @@ net::awaitable<void> TlsStream::AsyncShutdownWrite() {
         shutdown_initiated_ = true;
         impl_->Touch();
         LOG_NET_DEBUG("TLS: sending close_notify");
+        Impl::Operation operation(*impl_);
         auto [ec] = co_await impl_->stream.async_shutdown(
             net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
         if (ec && ec != net::ssl::error::stream_truncated &&

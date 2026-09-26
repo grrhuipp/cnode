@@ -249,6 +249,9 @@ proxy::trojan::inbound::Handler::Process(
         }
     }
 
+    // Session metadata is owned; release the authentication snapshot before I/O.
+    user_info.reset();
+
     // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
     validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
     user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
