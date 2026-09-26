@@ -275,14 +275,24 @@ jobs:
 
     permissions:
       contents: write
+      actions: read
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v8.0.1
-        with:
-          path: release-assets
-          pattern: cnode-*-assets
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'cnode-*-assets' --dir artifact-download
+          mkdir -p release-assets
+          while IFS= read -r -d '' asset; do
+            name="$(basename "$asset")"
+            test ! -e "release-assets/$name" || { echo "Duplicate release asset: $name"; exit 1; }
+            cp -- "$asset" "release-assets/$name"
+          done < <(find artifact-download -type f -print0)
+          test -s release-assets/cnode-linux-amd64-musl
+          test -s release-assets/cnode-linux-amd64-glibc
 
       - name: Publish release assets
         run: |
