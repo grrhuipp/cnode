@@ -378,11 +378,11 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         if (inbound.control) {
             co_return co_await DoRelayLink(
                 io_context, *inbound.reader, *inbound.writer, *inbound.control,
-                target_endpoint, ctx, stats, relay_config);
+                target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer,
-            target_endpoint, ctx, stats, relay_config);
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
     const TargetAddress protocol_target = use_uot

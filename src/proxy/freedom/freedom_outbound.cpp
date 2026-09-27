@@ -229,7 +229,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
-    // 不做 redirect（保持 UDP 逐包目标语义），首包/嗅探 payload 不适用于 UDP。
+    // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == Network::UDP) {
         if (!settings_.enable_udp) {
             co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
@@ -258,10 +258,11 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         target.SetWriteTimeout(relay_write_timeout);
         if (inbound.control) {
             co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-                *inbound.control, target, ctx, stats, relay_config);
+                *inbound.control, target, ctx, stats, relay_config,
+                std::move(first_payload));
         }
         co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-            target, ctx, stats, relay_config);
+            target, ctx, stats, relay_config, std::move(first_payload));
     }
 
     // redirect：替换目标地址（Xray freedom redirect 语义）

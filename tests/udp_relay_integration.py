@@ -114,6 +114,32 @@ class Client:
             raise AssertionError(f'UDP datagram changed: expected {len(expected)}, received {size}')
 
 
+class NativeClient:
+    def __init__(self, sock, target_port):
+        self.sock = sock
+        self.target = b'\1\x7f\0\0\1' + struct.pack('!H', target_port)
+        self.writer = None
+
+    @classmethod
+    async def connect(cls, port, target_host, target_port):
+        assert target_host == '127.0.0.1'
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.connect(('127.0.0.1', port))
+        return cls(sock, target_port)
+
+    async def send(self, payload):
+        salt = os.urandom(16)
+        packet = salt + EchoPeer.cipher(salt).encrypt(b'\0' * 12, self.target + payload, None)
+        await asyncio.get_running_loop().sock_sendall(self.sock, packet)
+
+    async def receive(self, expected):
+        packet = await asyncio.wait_for(asyncio.get_running_loop().sock_recv(self.sock, 65536), 4)
+        plain = EchoPeer.cipher(packet[:16]).decrypt(b'\0' * 12, packet[16:], None)
+        if plain != self.target + expected:
+            raise AssertionError('native UDP target or datagram boundary changed')
+
+
 async def run_case(binary, output, protocol, mode):
     output.mkdir(parents=True, exist_ok=True)
     dns = SilentDns()
@@ -143,6 +169,12 @@ async def run_case(binary, output, protocol, mode):
         'outbounds.json': [outbound],
         'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'udp-out'}]},
     }
+    sniffing = mode in ('sniff_echo', 'native_sniff_echo', 'sniff_burst', 'native_sniff_burst')
+    configs['inbounds.json'][0]['sniffing'] = {'enabled': sniffing}
+    if mode.startswith('native_'):
+        configs['inbounds.json'][0]['protocol'] = 'shadowsocks'
+        configs['inbounds.json'][0]['settings'] = {
+            'method': 'aes-128-gcm', 'clients': [{'password': 'secret'}]}
     for name, config in configs.items():
         (output / name).write_text(json.dumps(config), encoding='utf-8')
     clients = []
@@ -180,10 +212,27 @@ async def run_case(binary, output, protocol, mode):
                     await survivor.receive(payload)
                     result['survivor_after_cancel'] = len(payload)
             else:
-                client = await Client.connect(inbound_port, '127.0.0.1',
+                client_type = NativeClient if mode.startswith('native_') else Client
+                client = await client_type.connect(inbound_port, '127.0.0.1',
                                               53 if protocol == 'shadowsocks' else peer_port)
                 clients.append(client)
-                if mode == 'late_reply':
+                if sniffing:
+                    # The first packet must arrive without waiting for another.
+                    await client.send(b'first-datagram')
+                    burst = mode.endswith('_burst')
+                    if not burst:
+                        await client.receive(b'first-datagram')
+                    # Queued packets must retain boundaries, including >8KB data.
+                    payloads = (bytes(range(256)) * 80, b'third-datagram')
+                    for payload in payloads:
+                        await client.send(payload)
+                    if burst:
+                        await client.receive(b'first-datagram')
+                    for payload in payloads:
+                        await client.receive(payload)
+                    if client.writer is not None:
+                        client.writer.write_eof()
+                elif mode == 'late_reply':
                     await client.send(b'late')
                     client.writer.write_eof()
                     await client.receive(b'late')
@@ -192,13 +241,14 @@ async def run_case(binary, output, protocol, mode):
                         await client.send(payload)
                         await client.receive(payload)
                     client.writer.write_eof()
-                if await asyncio.wait_for(client.reader.read(), 2):
+                if client.writer is not None and await asyncio.wait_for(client.reader.read(), 2):
                     raise AssertionError('unexpected data after both datagrams')
             result['dns_requests'] = dns.requests
             result['peer_packets'] = peer.received
             result['peer_errors'] = peer.errors
             expected = ([] if mode == 'dns_timeout' else [4] if mode == 'late_reply'
-                        else [13, 20480] if mode == 'shared_cancel' else [14, 20480])
+                        else [13, 20480] if mode == 'shared_cancel'
+                        else [14, 20480, 14] if sniffing else [14, 20480])
             result['passed'] = not peer.errors and peer.received == expected
         except Exception as error:
             result['error'] = repr(error)
@@ -209,6 +259,8 @@ async def run_case(binary, output, protocol, mode):
         finally:
             for client in clients:
                 await close_writer(client.writer)
+                if isinstance(client, NativeClient):
+                    client.sock.close()
             if child.poll() is None:
                 child.terminate()
             child.wait(timeout=5)
@@ -227,7 +279,11 @@ async def main(args):
     results = []
     cases = [('shadowsocks', 'dns_timeout'), ('freedom', 'dns_timeout'),
              ('freedom', 'shared_cancel'), ('freedom', 'echo'), ('shadowsocks', 'echo'),
-             ('freedom', 'late_reply'), ('shadowsocks', 'late_reply')]
+             ('freedom', 'late_reply'), ('shadowsocks', 'late_reply'),
+             ('freedom', 'sniff_echo'), ('shadowsocks', 'sniff_echo'),
+             ('freedom', 'native_sniff_echo'), ('shadowsocks', 'native_sniff_echo'),
+             ('freedom', 'sniff_burst'), ('shadowsocks', 'sniff_burst'),
+             ('freedom', 'native_sniff_burst'), ('shadowsocks', 'native_sniff_burst')]
     if args.case:
         selected = set(args.case)
         assert selected <= {f'{protocol}-{mode}' for protocol, mode in cases}

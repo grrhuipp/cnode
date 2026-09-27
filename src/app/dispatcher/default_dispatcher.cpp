@@ -312,10 +312,6 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         static constexpr size_t kSniffMaxBytes = 4096;
         buf::MultiBuffer sniff_payload;
         static constexpr auto kTcpSniffWindow = std::chrono::milliseconds(200);
-        static constexpr auto kUdpSniffWindow = std::chrono::seconds(3);
-        const auto sniff_window = ctx.content.network == Network::UDP
-            ? std::chrono::duration_cast<std::chrono::milliseconds>(kUdpSniffWindow)
-            : kTcpSniffWindow;
         memory::ByteVector sniff_scratch;
 
         auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
@@ -370,6 +366,12 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                         ApplySniffOverride(ctx, policy.sniffing, sniffed);
                         break;
                     }
+                    // Datagram boundaries must survive sniffing. Additional
+                    // reads are stream-only: never merge subsequent UDP packets
+                    // into the first payload or wait for another request packet.
+                    if (ctx.content.network == Network::UDP) {
+                        break;
+                    }
                     if (!sniffed.need_more) {
                         ++no_clue_attempts;
                         if (no_clue_attempts >= 2) {
@@ -379,7 +381,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                     if (buf::TotalLen(sniff_payload) >= kSniffMaxBytes) {
                         break;
                     }
-                    const auto remaining = sniff_window -
+                    const auto remaining = kTcpSniffWindow -
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - sniff_started);
                     if (remaining <= std::chrono::milliseconds::zero()) {
