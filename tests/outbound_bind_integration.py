@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import os
 from pathlib import Path
+import socket
 import struct
 import subprocess
 import time
@@ -83,8 +84,29 @@ async def run_case(binary, root, addresses, strategy, succeeds, *, domain=False)
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_server(echo, "127.0.0.1", 0)
-    destination_port = server.sockets[0].getsockname()[1]
+    refused_v6 = None
+    for attempt in range(20):
+        server = await asyncio.start_server(echo, "127.0.0.1", 0)
+        destination_port = server.sockets[0].getsockname()[1]
+        if not domain:
+            break
+        # Own the IPv6 port without listening. An unreserved ephemeral port
+        # could belong to another test, or become the outbound socket's own
+        # source port (a loopback TCP self-connection rather than refusal).
+        refused_v6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        refused_v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            refused_v6.bind(("::1", destination_port))
+            break
+        except OSError:
+            refused_v6.close()
+            refused_v6 = None
+            server.close()
+            await server.wait_closed()
+            if attempt == 19:
+                if dns_socket:
+                    dns_socket.close()
+                raise
     try:
         with (root / "child.log").open("w", encoding="utf-8") as log:
             child = subprocess.Popen(
@@ -121,6 +143,8 @@ async def run_case(binary, root, addresses, strategy, succeeds, *, domain=False)
     finally:
         server.close()
         await server.wait_closed()
+        if refused_v6:
+            refused_v6.close()
         if dns_socket:
             dns_socket.close()
 
