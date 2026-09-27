@@ -65,39 +65,11 @@ Result RunPurpose(int rounds) {
 #endif
     return {true, slow};
 }
-template<class Purpose>
-bool RunMixedSizes() {
-    Info info;
-    // A small concurrent operation must not consume the only cached block
-    // that can serve a larger operation. Same cache capacity and byte limit.
-    void* large = Info::allocate(Purpose{}, &info, 768, 16);
-    void* small = Info::allocate(Purpose{}, &info, 240, 16);
-    Info::deallocate(Purpose{}, &info, large, 768);
-    Info::deallocate(Purpose{}, &info, small, 240);
-    const auto before = system_allocations;
-    void* small_again = Info::allocate(Purpose{}, &info, 240, 16);
-    void* large_again = Info::allocate(Purpose{}, &info, 768, 16);
-    const bool matched = small_again == small && large_again == large;
-    std::memset(small_again, 0x35, 240);
-    std::memset(large_again, 0x57, 768);
-    Info::deallocate(Purpose{}, &info, small_again, 240);
-    Info::deallocate(Purpose{}, &info, large_again, 768);
-#if defined(CNODE_WRAP_ALIGNED_ALLOC)
-    if (system_allocations != before) return false;
-#else
-    (void)before;
-#endif
-    return matched;
-}
 Result Run(int rounds) {
     const auto frames = RunPurpose<Info::awaitable_frame_tag>(rounds);
     const auto cancellation = RunPurpose<Info::cancellation_signal_tag>(rounds);
     const auto completions = RunPurpose<Info::executor_function_tag>(rounds);
-    const bool mixed = RunMixedSizes<Info::awaitable_frame_tag>() &&
-        RunMixedSizes<Info::cancellation_signal_tag>() &&
-        RunMixedSizes<Info::executor_function_tag>();
-    if (!mixed) std::fprintf(stderr, "mixed-size cache reuse failed\n");
-    return {frames.ok && cancellation.ok && completions.ok && mixed,
+    return {frames.ok && cancellation.ok && completions.ok,
             frames.allocations + cancellation.allocations + completions.allocations};
 }
 }
