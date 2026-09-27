@@ -82,5 +82,30 @@ int main() {
     if (!UserStore::VmessUsers("first").empty() ||
         UserStore::FindTrojanUser("second", "new-second") ||
         UserStore::VmessUsers("unrelated").users != unrelated_view) return 3;
+    PreparedShadowsocksUser ss_user;
+    ss_user.password = "identity-user";
+    ss_user.profile.user_id = 7;
+    ss_user.psk_hash.fill(0x11);
+    UserStore::ApplyUsers("ss-hash", UserSet{PreparedShadowsocksUsers{ss_user}});
+    const auto ss_view = UserStore::ShadowsocksUsers("ss-hash");
+    if (ss_view.size() != 1 || ss_view[0].psk_hash != ss_user.psk_hash) return 4;
+    ss_user.psk_hash.fill(0x22);
+    const UserSet ss_update = PreparedShadowsocksUsers{ss_user};
+    bool ss_completed = false;
+    for (std::ptrdiff_t limit = 0; limit < 512; ++limit) {
+        fail_after = limit;
+        try {
+            UserStore::AddUsers("ss-hash", ss_update);
+            ss_completed = true;
+        } catch (const std::bad_alloc&) {
+        }
+        fail_after = -1;
+        if (ss_completed) break;
+        if (UserStore::ShadowsocksUsers("ss-hash").users != ss_view.users) return 5;
+    }
+    if (!ss_completed || ss_view[0].psk_hash[0] != 0x11 ||
+        UserStore::ShadowsocksUsers("ss-hash")[0].psk_hash != ss_user.psk_hash) return 6;
+    UserStore::RemoveUsers("ss-hash", ss_update);
+    if (!UserStore::ShadowsocksUsers("ss-hash").empty() || ss_view[0].psk_hash[0] != 0x11) return 7;
     std::cout << "batch publication preserved old snapshot across " << failures << " allocation failures\n";
 }

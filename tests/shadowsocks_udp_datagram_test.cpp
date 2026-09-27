@@ -103,7 +103,8 @@ void Check2022(const TargetAddress& target,
                std::span<const uint8_t> payload,
                ss::SsCipherType cipher_type,
                size_t key_size,
-               proxyman::inbound::PreparedAeadCipher prepared_cipher) {
+               proxyman::inbound::PreparedAeadCipher prepared_cipher,
+               bool identity = false) {
     const ss::SsCipherInfo cipher{cipher_type, key_size, key_size};
     ss::KeyBytes key;
     std::array<uint8_t, 32> key_bytes{};
@@ -113,18 +114,28 @@ void Check2022(const TargetAddress& target,
     Check(key.assign(std::span<const uint8_t>(key_bytes).first(key_size)),
           "failed to initialize Shadowsocks 2022 key");
 
+    std::array<ss::KeyBytes, 2> chain{};
+    std::span<const ss::KeyBytes> psk_chain;
+    if (identity) {
+        auto identity_bytes = key_bytes;
+        for (auto& byte : identity_bytes) byte ^= 0xa5;
+        Check(chain[0].assign(std::span<const uint8_t>(identity_bytes).first(key_size)),
+              "failed to initialize identity key");
+        chain[1] = key;
+        psk_chain = chain;
+    }
     ss::Ss2022UdpSessionState encoder;
     Check(ss::Init2022UdpSessionState(encoder, cipher, key),
           "failed to initialize Shadowsocks 2022 UDP state");
     const size_t encoded_size = ss::Encode2022UdpRequestPacketTo(
-        target, payload.data(), payload.size(), encoder, {}, nullptr, 0);
+        target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
     Check(encoded_size > source.size(),
           "Shadowsocks 2022 UDP size calculation failed");
     Check(encoder.next_packet_id == 0,
           "Shadowsocks 2022 size calculation advanced packet state");
     std::vector<uint8_t> encoded(encoded_size);
     Check(ss::Encode2022UdpRequestPacketTo(
-              target, payload.data(), payload.size(), encoder, {},
+              target, payload.data(), payload.size(), encoder, psk_chain,
               encoded.data(), encoded.size()) == encoded.size(),
           "Shadowsocks 2022 UDP encoding failed");
     Check(encoder.next_packet_id == 1,
@@ -135,11 +146,34 @@ void Check2022(const TargetAddress& target,
     proxyman::inbound::UserStore::ShadowsocksCredential user;
     Check(user.derived_key.assign(key.span()),
           "failed to initialize Shadowsocks 2022 decode user");
+    if (identity) {
+        Check(user.identity_key.assign(chain[0].span()) &&
+              ss::Hash2022Psk(key.span(), user.psk_hash),
+              "failed to prepare identity credential");
+    }
     user.cipher_type = prepared_cipher;
     user.key_size = cipher.key_size;
     user.salt_size = cipher.salt_size;
+    if (identity) {
+        auto decoy = user;
+        decoy.derived_key.bytes[0] ^= 0x5a;
+        Check(ss::Hash2022Psk(decoy.derived_key.span(), decoy.psk_hash),
+              "failed to prepare decoy credential");
+        auto other_identity = decoy;
+        other_identity.identity_key.bytes[0] ^= 0x33;
+        user_list->push_back(std::move(other_identity));
+        user_list->push_back(std::move(decoy));
+    }
     user_list->push_back(std::move(user));
     const proxyman::inbound::UserStore::ShadowsocksUsersView users{user_list};
+    if (identity) {
+        auto bad_users = std::make_shared<proxyman::inbound::UserStore::ShadowsocksUserList>(*user_list);
+        bad_users->back().psk_hash[0] ^= 1;
+        ss::Ss2022UdpReplayCache bad_cache;
+        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), {bad_users},
+                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache),
+              "identity authentication ignored prepared PSK hash");
+    }
     std::vector<uint8_t> corrupted = encoded;
     corrupted.back() ^= 0x01;
     ss::Ss2022UdpReplayCache validation_cache;
@@ -256,6 +290,10 @@ int main() {
         target, source, payload.Bytes(),
         ss::SsCipherType::CHACHA20_POLY1305_2022, 32,
         proxyman::inbound::PreparedAeadCipher::CHACHA20_POLY1305_2022);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16,
+              proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022, true);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32,
+              proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022, true);
     Check2022ReplayWindow();
     return 0;
 }

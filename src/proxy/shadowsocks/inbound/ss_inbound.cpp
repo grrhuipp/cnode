@@ -619,6 +619,10 @@ const bool kSsInboundRegistered = [] {
                              tag, client.email);
                     return std::nullopt;
                 }
+                if (!info.identity_key.empty() &&
+                    !acpp::ss::Hash2022Psk(info.derived_key.span(), info.psk_hash)) {
+                    return std::nullopt;
+                }
                 info.profile.email = client.email;
                 users.push_back(std::move(info));
             }
@@ -691,6 +695,10 @@ const bool kSsInboundRegistered = [] {
                     LOG_WARN("Inbound '{}': invalid SS password for user '{}'",
                              req.tag, runtime_user.email);
                     continue;
+                }
+                if (!info.identity_key.empty() &&
+                    !acpp::ss::Hash2022Psk(info.derived_key.span(), info.psk_hash)) {
+                    return std::nullopt;
                 }
                 users.push_back(std::move(info));
             }

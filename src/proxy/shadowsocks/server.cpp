@@ -701,11 +701,7 @@ bool MatchIdentityHeader(const proxyman::inbound::UserStore::ShadowsocksCredenti
         return false;
     }
 
-    std::array<uint8_t, 16> expected_hash{};
-    if (!Hash2022Psk(user.derived_key.span(), std::span<uint8_t, 16>(expected_hash))) {
-        return false;
-    }
-    return identity_hash == expected_hash;
+    return identity_hash == user.psk_hash;
 }
 
 bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCredential& user,

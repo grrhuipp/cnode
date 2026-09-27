@@ -533,6 +533,11 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::array<uint8_t, 16> encrypted_separate{};
     std::memcpy(encrypted_separate.data(), datagram, encrypted_separate.size());
 
+    // Reuse the identity header only within this packet and snapshot view.
+    // Users sharing a server key do not need identical AES work repeated.
+    std::span<const uint8_t> previous_identity_key;
+    std::array<uint8_t, 16> previous_separate{};
+    std::array<uint8_t, 16> previous_identity{};
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
         const bool has_identity = !user.identity_key.empty();
@@ -542,8 +547,13 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
             continue;
         }
 
-        std::array<uint8_t, 16> separate{};
-        if (!AesBlockCrypt(header_key, encrypted_separate, separate, false)) {
+        const bool reuse_identity = has_identity &&
+            std::equal(header_key.begin(), header_key.end(),
+                       previous_identity_key.begin(), previous_identity_key.end());
+        std::array<uint8_t, 16> separate = reuse_identity
+            ? previous_separate : std::array<uint8_t, 16>{};
+        if (!reuse_identity &&
+            !AesBlockCrypt(header_key, encrypted_separate, separate, false)) {
             continue;
         }
 
@@ -553,21 +563,24 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
                     kMinBodyPlain + SsAeadCipher::kTagSize) {
                 continue;
             }
-            std::array<uint8_t, 16> identity_cipher{};
-            std::memcpy(identity_cipher.data(),
-                        datagram + kSs2022UdpSeparateHeaderSize,
-                        identity_cipher.size());
-            std::array<uint8_t, 16> identity_plain{};
-            if (!AesBlockCrypt(header_key, identity_cipher, identity_plain, false)) {
-                continue;
-            }
-            for (size_t j = 0; j < identity_plain.size(); ++j) {
-                identity_plain[j] ^= separate[j];
+            if (!reuse_identity) {
+                std::array<uint8_t, 16> identity_cipher{};
+                std::memcpy(identity_cipher.data(),
+                            datagram + kSs2022UdpSeparateHeaderSize,
+                            identity_cipher.size());
+                std::array<uint8_t, 16> identity_plain{};
+                if (!AesBlockCrypt(header_key, identity_cipher, identity_plain, false)) {
+                    continue;
+                }
+                for (size_t j = 0; j < identity_plain.size(); ++j) {
+                    identity_plain[j] ^= separate[j];
+                }
+                previous_identity_key = header_key;
+                previous_separate = separate;
+                previous_identity = identity_plain;
             }
 
-            std::array<uint8_t, 16> user_hash{};
-            if (!Hash2022Psk(user.derived_key.span(), user_hash) ||
-                !std::equal(identity_plain.begin(), identity_plain.end(), user_hash.begin())) {
+            if (previous_identity != user.psk_hash) {
                 continue;
             }
             body_offset += kSs2022UdpSeparateHeaderSize;
