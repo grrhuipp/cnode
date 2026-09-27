@@ -16,6 +16,7 @@
 #include <asio/associated_cancellation_slot.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/bind_allocator.hpp>
+#include <asio/deferred.hpp>
 #include <asio/write.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -643,7 +644,7 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
     Impl::Operation operation(*impl_);
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buf,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -663,7 +664,7 @@ net::awaitable<void> TlsStream::WriteBuffers(
     Impl::Operation operation(*impl_);
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buffers,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
     (void)n;
     if (ec) {
         throw IoSystemError(ec);
@@ -685,7 +686,7 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
         Impl::Operation operation(*impl_);
         auto [ec, n] = co_await net::async_write(
             impl_->stream, out.Span(),
-            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
         (void)n;
         if (ec) {
             throw IoSystemError(ec);
