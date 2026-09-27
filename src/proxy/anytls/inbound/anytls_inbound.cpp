@@ -334,7 +334,8 @@ public:
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
@@ -357,7 +358,8 @@ public:
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             mb.clear();
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
@@ -391,7 +393,8 @@ public:
             co_return std::expected<void, ErrorCode>{};
         }
 
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }

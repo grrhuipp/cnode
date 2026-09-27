@@ -388,16 +388,13 @@ WritePacketWithPadding(AsyncStream& stream,
     co_return std::expected<void, ErrorCode>{};
 }
 
-net::awaitable<std::expected<void, ErrorCode>>
-WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
-                                    const PaddingScheme& scheme,
-                                    uint32_t packet_index,
-                                    uint8_t cmd,
-                                    uint32_t sid,
-                                    buf::MultiBuffer mb) {
-    if (scheme.RecordFor(packet_index).empty()) {
-        co_return co_await WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
-    }
+static net::awaitable<std::expected<void, ErrorCode>>
+WritePaddedMultiBufferFrames(AsyncStream& stream,
+                            const PaddingScheme& scheme,
+                            uint32_t packet_index,
+                            uint8_t cmd,
+                            uint32_t sid,
+                            buf::MultiBuffer mb) {
 
     memory::ByteVector packet;
     packet.reserve(buf::TotalLen(mb) + (mb.size() * kFrameHeaderSize));
@@ -415,15 +412,25 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
 }
 
 net::awaitable<std::expected<void, ErrorCode>>
-WriteBuffersAsFramesWithPadding(AsyncStream& stream,
-                                const PaddingScheme& scheme,
-                                uint32_t packet_index,
-                                uint8_t cmd,
-                                uint32_t sid,
-                                std::span<const net::const_buffer> buffers) {
+WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
+                                    const PaddingScheme& scheme,
+                                    uint32_t packet_index,
+                                    uint8_t cmd,
+                                    uint32_t sid,
+                                    buf::MultiBuffer mb) {
     if (scheme.RecordFor(packet_index).empty()) {
-        co_return co_await WriteBuffersAsFrameBatchImpl(stream, cmd, sid, buffers);
+        return WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
     }
+    return WritePaddedMultiBufferFrames(stream, scheme, packet_index, cmd, sid, std::move(mb));
+}
+
+static net::awaitable<std::expected<void, ErrorCode>>
+WritePaddedBufferFrames(AsyncStream& stream,
+                       const PaddingScheme& scheme,
+                       uint32_t packet_index,
+                       uint8_t cmd,
+                       uint32_t sid,
+                       std::span<const net::const_buffer> buffers) {
 
     size_t payload_bytes = 0;
     size_t non_empty_count = 0;
@@ -454,6 +461,19 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
         }
     }
     co_return co_await WritePacketWithPadding(stream, scheme, packet_index, std::move(packet));
+}
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+                                const PaddingScheme& scheme,
+                                uint32_t packet_index,
+                                uint8_t cmd,
+                                uint32_t sid,
+                                std::span<const net::const_buffer> buffers) {
+    if (scheme.RecordFor(packet_index).empty()) {
+        return WriteBuffersAsFrameBatchImpl(stream, cmd, sid, buffers);
+    }
+    return WritePaddedBufferFrames(stream, scheme, packet_index, cmd, sid, buffers);
 }
 
 net::awaitable<std::expected<FrameHeader, ErrorCode>>

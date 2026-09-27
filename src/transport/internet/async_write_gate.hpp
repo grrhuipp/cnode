@@ -64,6 +64,14 @@ public:
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 
+    // Owner-thread synchronous fast path. Only contended callers need to
+    // construct an acquisition coroutine; leases retain identical ownership.
+    [[nodiscard]] Lease TryAcquire() noexcept {
+        if (busy_ || cancelled_) return {};
+        busy_ = true;
+        return Lease{this};
+    }
+
     [[nodiscard]] net::awaitable<Lease> Acquire() {
         while (busy_ && !cancelled_) {
             auto [ec] = co_await signal_.async_receive(
@@ -72,12 +80,7 @@ public:
                 co_return Lease{};
             }
         }
-        if (cancelled_) {
-            co_return Lease{};
-        }
-
-        busy_ = true;
-        co_return Lease{this};
+        co_return TryAcquire();
     }
 
     void Cancel() noexcept {

@@ -264,7 +264,8 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteOpenPacket(memory::ByteVector packet) {
-        auto write_lease = co_await write_gate.Acquire();
+        auto write_lease = write_gate.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
@@ -305,7 +306,8 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>>
     WritePayloadFrames(uint32_t sid, LogicalStream& logical, buf::MultiBuffer mb) {
-        auto write_lease = co_await write_gate.Acquire();
+        auto write_lease = write_gate.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             mb.clear();
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
@@ -342,7 +344,8 @@ struct Handler::ClientSession {
             co_return std::expected<void, ErrorCode>{};
         }
 
-        auto write_lease = co_await write_gate.Acquire();
+        auto write_lease = write_gate.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
@@ -367,7 +370,8 @@ struct Handler::ClientSession {
 
     net::awaitable<std::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-        auto write_lease = co_await write_gate.Acquire();
+        auto write_lease = write_gate.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
