@@ -63,49 +63,13 @@ WriteMultiBufferAsFrameBatchImpl(AsyncStream& stream,
                                  uint8_t cmd,
                                  uint32_t sid,
                                  buf::MultiBuffer mb) {
-    static constexpr size_t kStackFrames = buf::MultiBuffer::kInlineCapacity;
-    std::array<std::array<uint8_t, kFrameHeaderSize>, kStackFrames> stack_headers{};
-    std::array<net::const_buffer, kStackFrames * 2> stack_buffers{};
-    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers;
-    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-
-    const bool use_spill = mb.size() > kStackFrames;
-    if (use_spill) {
-        spill_headers.reserve(mb.size());
-        spill_buffers.reserve(mb.size() * 2);
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, mb);
+    if (!encoded) {
+        mb.clear();
+        co_return encoded;
     }
-
-    size_t stack_frame_count = 0;
-    size_t stack_buffer_count = 0;
-
-    for (auto* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        if (bytes.size() > kMaxFramePayload) {
-            mb.clear();
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        if (use_spill) {
-            auto& header =
-                spill_headers.emplace_back(BuildFrameHeaderBytes(cmd, sid, bytes.size()));
-            spill_buffers.emplace_back(header.data(), header.size());
-            spill_buffers.emplace_back(bytes.data(), bytes.size());
-            continue;
-        }
-
-        auto& header = stack_headers[stack_frame_count++];
-        header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
-        stack_buffers[stack_buffer_count++] =
-            net::const_buffer(header.data(), header.size());
-        stack_buffers[stack_buffer_count++] =
-            net::const_buffer(bytes.data(), bytes.size());
-    }
-
-    const auto buffers = use_spill
-        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
-        : std::span<const net::const_buffer>(stack_buffers.data(), stack_buffer_count);
+    const auto buffers = batch.Buffers();
 
     if (!buffers.empty()) {
         try {
@@ -186,6 +150,39 @@ WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
 }
 
 }  // namespace
+
+std::expected<void, ErrorCode> FrameBatch::Encode(
+    uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload) {
+    count_ = 0;
+    spill_headers_.clear();
+    spill_buffers_.clear();
+    spilled_ = payload.size() > kInlineFrames;
+    if (spilled_) {
+        spill_headers_.reserve(payload.size());
+        spill_buffers_.reserve(payload.size() * 2);
+    }
+    for (const auto* buffer : payload) {
+        if (!buffer || buffer->IsEmpty()) continue;
+        const auto bytes = buffer->Bytes();
+        if (bytes.size() > kMaxFramePayload) {
+            count_ = 0;
+            spill_buffers_.clear();
+            return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        if (spilled_) {
+            auto& header = spill_headers_.emplace_back(
+                BuildFrameHeaderBytes(cmd, sid, bytes.size()));
+            spill_buffers_.emplace_back(header.data(), header.size());
+            spill_buffers_.emplace_back(bytes.data(), bytes.size());
+        } else {
+            auto& header = headers_[count_ / 2];
+            header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
+            buffers_[count_++] = net::const_buffer(header.data(), header.size());
+            buffers_[count_++] = net::const_buffer(bytes.data(), bytes.size());
+        }
+    }
+    return {};
+}
 
 net::awaitable<std::expected<void, ErrorCode>>
 WriteMultiBufferAsFrameBatch(AsyncStream& stream,

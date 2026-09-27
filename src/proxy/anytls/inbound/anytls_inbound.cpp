@@ -368,10 +368,18 @@ public:
         else throw transport::WriteClosed();
 
         try {
-            auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
-                *stream_, cmd, sid, std::move(mb));
+            anytls::FrameBatch batch;
+            auto result = batch.Encode(cmd, sid, mb);
+            if (result && !batch.Buffers().empty()) {
+                co_await stream_->WriteBuffers(batch.Buffers());
+            }
+            mb.clear();
             if (!result) CancelAll();
             co_return result;
+        } catch (const IoSystemError& e) {
+            mb.clear();
+            CancelAll();
+            co_return std::unexpected(MapAsioError(e.code()));
         } catch (...) {
             CancelAll();
             throw;

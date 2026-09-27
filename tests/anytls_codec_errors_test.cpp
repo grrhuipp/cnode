@@ -147,6 +147,28 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
     }
 }
 
+bool RunFrameBatch() {
+    anytls::FrameBatch batch;
+    for (size_t count : {size_t(1), size_t(9), size_t(1), size_t(0)}) {
+        auto payload = Payload(count);
+        if (!batch.Encode(2, 1, payload)) return false;
+        const auto buffers = batch.Buffers();
+        if (buffers.size() != count * 2) return false;
+        size_t index = 0;
+        for (const auto* block : payload) {
+            const auto& header = buffers[index * 2];
+            const auto& body = buffers[index * 2 + 1];
+            const auto* bytes = static_cast<const uint8_t*>(header.data());
+            if (header.size() != 7 || bytes[0] != 2 || bytes[1] != 0 ||
+                bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 1 ||
+                bytes[5] != 0 || bytes[6] != 1 || body.size() != 1 ||
+                body.data() != block->Bytes().data()) return false;
+            ++index;
+        }
+    }
+    return true;
+}
+
 bool RunDeferredBatch() {
     net::io_context io;
     Stream stream;
@@ -210,6 +232,7 @@ bool Run(int operation, Fault fault, size_t threshold) {
 
 int main() {
     size_t passed = 0, total = 0;
+    passed += RunFrameBatch(); ++total;
     passed += RunDeferredBatch(); ++total;
     for (int operation = 0; operation < 18; ++operation) {
         passed += Run(operation, Fault::None, 0); ++total;

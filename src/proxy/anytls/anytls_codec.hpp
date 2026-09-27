@@ -6,6 +6,7 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/target_address.hpp"
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <span>
@@ -48,6 +49,29 @@ struct FrameHeader {
     uint8_t cmd = 0;
     uint32_t sid = 0;
     uint16_t length = 0;
+};
+
+// Write-phase encoding storage. Payloads remain borrowed from the caller's
+// MultiBuffer; this object must not move or outlive that write operation.
+class FrameBatch {
+public:
+    FrameBatch() = default;
+    FrameBatch(const FrameBatch&) = delete;
+    FrameBatch& operator=(const FrameBatch&) = delete;
+    [[nodiscard]] std::expected<void, ErrorCode> Encode(
+        uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload);
+    [[nodiscard]] std::span<const net::const_buffer> Buffers() const noexcept {
+        return spilled_ ? std::span<const net::const_buffer>(spill_buffers_)
+                        : std::span<const net::const_buffer>(buffers_.data(), count_);
+    }
+private:
+    static constexpr size_t kInlineFrames = buf::MultiBuffer::kInlineCapacity;
+    std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
+    std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
+    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;
+    memory::ThreadLocalVector<net::const_buffer> spill_buffers_;
+    size_t count_ = 0;
+    bool spilled_ = false;
 };
 
 class PaddingScheme;
