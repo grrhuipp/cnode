@@ -3,6 +3,8 @@
 #include "shadowsocks_protocol.hpp"
 
 #include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/crypto.h>
 
 #include <array>
 #include <chrono>
@@ -101,38 +103,22 @@ inline bool AesBlockCrypt(std::span<const uint8_t> key,
                           std::span<const uint8_t, 16> input,
                           std::span<uint8_t, 16> output,
                           bool encrypt) {
-    const EVP_CIPHER* cipher = nullptr;
-    if (key.size() == 16) {
-        cipher = EVP_aes_128_ecb();
-    } else if (key.size() == 32) {
-        cipher = EVP_aes_256_ecb();
-    } else {
-        return false;
+    if (key.size() != 16 && key.size() != 32) return false;
+
+    // A single SS2022 header block needs no EVP session or heap allocation.
+    // AWS-LC's public AES APIs retain hardware/software dispatch. The schedule
+    // belongs only to this synchronous operation, never to an idle connection.
+    AES_KEY schedule;
+    const auto bits = static_cast<unsigned>(key.size() * 8);
+    const int status = encrypt
+        ? AES_set_encrypt_key(key.data(), bits, &schedule)
+        : AES_set_decrypt_key(key.data(), bits, &schedule);
+    if (status == 0) {
+        if (encrypt) AES_encrypt(input.data(), output.data(), &schedule);
+        else AES_decrypt(input.data(), output.data(), &schedule);
     }
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return false;
-    }
-
-    int out_len = 0;
-    int final_len = 0;
-    const bool ok =
-        (encrypt
-            ? EVP_EncryptInit_ex(ctx, cipher, nullptr, key.data(), nullptr) == 1
-            : EVP_DecryptInit_ex(ctx, cipher, nullptr, key.data(), nullptr) == 1) &&
-        EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
-        (encrypt
-            ? EVP_EncryptUpdate(ctx, output.data(), &out_len, input.data(), 16) == 1
-            : EVP_DecryptUpdate(ctx, output.data(), &out_len, input.data(), 16) == 1) &&
-        out_len == 16 &&
-        (encrypt
-            ? EVP_EncryptFinal_ex(ctx, output.data() + out_len, &final_len) == 1
-            : EVP_DecryptFinal_ex(ctx, output.data() + out_len, &final_len) == 1) &&
-        final_len == 0;
-
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+    OPENSSL_cleanse(&schedule, sizeof(schedule));
+    return status == 0;
 }
 
 }  // namespace acpp::ss

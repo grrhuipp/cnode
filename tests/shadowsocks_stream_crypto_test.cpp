@@ -1,5 +1,6 @@
 #include "stream_crypto.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,17 @@
 #include <iostream>
 #include <string_view>
 #include <vector>
+
+namespace {
+thread_local volatile size_t system_allocations = 0;
+}
+#if defined(CNODE_WRAP_MALLOC)
+extern "C" void* __real_malloc(size_t);
+extern "C" void* __wrap_malloc(size_t size) {
+    system_allocations = system_allocations + 1;
+    return __real_malloc(size);
+}
+#endif
 
 namespace {
 
@@ -20,6 +32,53 @@ using namespace acpp;
 void Check(bool condition, std::string_view message) {
     if (!condition) {
         Fail(message);
+    }
+}
+
+void TestAesBlock() {
+    // FIPS 197 single-block AES-128/AES-256 known-answer vectors.
+    const std::array<uint8_t, 16> plain{
+        0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
+        0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff};
+    const std::array<std::array<uint8_t, 16>, 2> expected{{
+        {0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a},
+        {0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89}}};
+    std::array<uint8_t, 34> keys{};
+    for (size_t i = 0; i < 32; ++i) keys[i + 1] = static_cast<uint8_t>(i);
+#if defined(CNODE_WRAP_MALLOC)
+    const auto cold = system_allocations;
+    auto* ctx = EVP_CIPHER_CTX_new();
+    Check(ctx != nullptr && system_allocations > cold, "malloc instrumentation is inactive");
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    const auto before = system_allocations;
+    for (size_t index = 0; index < 2; ++index) {
+        const auto key = std::span<const uint8_t>(keys).subspan(1, index ? 32 : 16);
+        for (int round = 0; round < 64; ++round) {
+            std::array<uint8_t, 18> guarded;
+            guarded.fill(0xa5);
+            auto output = std::span<uint8_t>(guarded).subspan<1, 16>();
+            Check(ss::AesBlockCrypt(key, plain, output, true), "AES block encrypt failed");
+            Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES known answer mismatch");
+            Check(ss::AesBlockCrypt(key, output, output, false), "AES in-place decrypt failed");
+            Check(std::equal(output.begin(), output.end(), plain.begin()), "AES plaintext mismatch");
+            Check(ss::AesBlockCrypt(key, output, output, true), "AES in-place encrypt failed");
+            Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES in-place ciphertext mismatch");
+            Check(guarded.front() == 0xa5 && guarded.back() == 0xa5, "AES wrote outside output block");
+        }
+    }
+#if defined(CNODE_WRAP_MALLOC)
+    Check(system_allocations == before, "AES block operation allocated heap memory");
+#else
+    (void)before;
+#endif
+    for (size_t size : {size_t(0),size_t(1),size_t(15),size_t(17),size_t(24),size_t(31),size_t(33)}) {
+        auto output = plain;
+        for (bool encrypt : {false, true}) {
+            Check(!ss::AesBlockCrypt(std::span<const uint8_t>(keys).first(size), plain, output, encrypt),
+                  "AES accepted unsupported key size");
+            Check(output == plain, "AES invalid key modified output");
+        }
     }
 }
 
@@ -123,6 +182,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
 }  // namespace
 
 int main() {
+    TestAesBlock();
     TestLargeRecord(buf::Buffer::kSize, ss::SsCipherType::AES_256_GCM);
     TestLargeRecord(buf::Buffer::kSize + 1, ss::SsCipherType::AES_256_GCM);
     TestLargeRecord(ss::kMaxChunkPayload, ss::SsCipherType::AES_256_GCM);

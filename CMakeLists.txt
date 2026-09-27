@@ -1147,6 +1147,16 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_shadowsocks_stream_crypto_test
         COMMAND cnode_shadowsocks_stream_crypto_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_WRAP_MALLOC)
+        target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE -Wl,--wrap=malloc)
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        add_test(NAME cnode_shadowsocks_aes_software_test
+            COMMAND cnode_shadowsocks_stream_crypto_test)
+        set_tests_properties(cnode_shadowsocks_aes_software_test PROPERTIES
+            ENVIRONMENT "OPENSSL_ia32cap=0")
+    endif()
 
     add_executable(cnode_v2board_http_response_test
         tests/v2board_http_response_test.cpp
