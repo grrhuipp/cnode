@@ -92,6 +92,39 @@ void TestIO(CountingResource& resource) {
             "cancellation must release its PMR socket operation on the owner");
 }
 
+void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
+    net::io_context io;
+    acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    acpp::tcp::socket socket(io), peer(io);
+    socket.connect(acceptor.local_endpoint());
+    acceptor.accept(peer);
+    acpp::TcpStream stream(std::move(socket));
+    net::cancellation_signal signal;
+    net::steady_timer timer(io, 5ms);
+    bool completed = false, cancelled = false;
+    std::exception_ptr error;
+    const auto before = resource.allocations;
+    auto read = [&]() -> net::awaitable<void> {
+        if (multi_buffer) {
+            auto buffers = co_await stream.ReadMultiBuffer();
+            cancelled = !acpp::buf::HasData(buffers);
+        } else {
+            char byte{};
+            cancelled = co_await stream.AsyncRead(net::buffer(&byte, 1)) == 0;
+        }
+    };
+    net::co_spawn(io, read(), net::bind_cancellation_slot(signal.slot(),
+        [&](std::exception_ptr e) { error = e; completed = true; }));
+    timer.async_wait([&](acpp::IoErrorCode ec) {
+        if (!ec) signal.emit(net::cancellation_type::terminal);
+    });
+    io.run_for(1s);
+    if (error) std::rethrow_exception(error);
+    Require(completed && cancelled && resource.allocations > before,
+            "read cancellation must propagate through the allocator-bound operation");
+    Require(peer.is_open() && stream.IsOpen(), "cancellation must not close the connection");
+}
+
 void TestInitiationFailure(CountingResource& resource) {
     net::io_context io;
     acpp::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
@@ -118,6 +151,8 @@ int main() {
     bool passed = true;
     try {
         TestIO(resource);
+        TestReadCancellation(resource, false);
+        TestReadCancellation(resource, true);
         TestInitiationFailure(resource);
         Require(resource.live == 0 && !resource.wrong_thread, "all operations and scheduler allocations must be released on owner");
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; passed = false; }

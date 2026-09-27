@@ -8,6 +8,7 @@
 #include <asio/read.hpp>
 #include <asio/as_tuple.hpp>
 #include <asio/use_awaitable.hpp>
+#include <asio/deferred.hpp>
 #include <asio/write.hpp>
 #include <asio/connect.hpp>
 #include <asio/buffer.hpp>
@@ -185,7 +186,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 
     ArmReadDeadline();
     auto [ec, n] = co_await impl_->socket.async_read_some(buf,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
     CancelReadDeadline();
 
     if (ec) {
@@ -248,7 +249,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     ArmReadDeadline();
     auto [ec, n] = co_await impl_->socket.async_read_some(
         net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
     CancelReadDeadline();
 
     if (ec || n == 0) {
@@ -576,7 +577,7 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
     ArmReadDeadline();
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
     CancelReadDeadline();
     co_return ec;
 }
