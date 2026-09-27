@@ -4,7 +4,7 @@
 
 #include <blake3.h>
 #include <openssl/evp.h>
-#include <openssl/kdf.h>
+#include <openssl/hkdf.h>
 
 #include <algorithm>
 #include <cctype>
@@ -244,37 +244,19 @@ bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) 
 bool DeriveSubkey(const uint8_t* key, size_t key_size,
                   const uint8_t* salt, size_t salt_size,
                   uint8_t* out_subkey) {
-    const char* info = "ss-subkey";
-    const size_t info_size = std::strlen(info);
+    static constexpr uint8_t info[] = "ss-subkey";
     constexpr size_t kMaxOpenSslParamSize = static_cast<size_t>(std::numeric_limits<int>::max());
     if (!key || !salt || !out_subkey ||
         key_size > kMaxOpenSslParamSize ||
-        salt_size > kMaxOpenSslParamSize ||
-        info_size > kMaxOpenSslParamSize) {
+        salt_size > kMaxOpenSslParamSize) {
         return false;
     }
 
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
-    if (!ctx) {
-        return false;
-    }
-
-    size_t out_len = key_size;
-    const bool ok =
-        EVP_PKEY_derive_init(ctx) == 1 &&
-        EVP_PKEY_CTX_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXTRACT_AND_EXPAND) == 1 &&
-        EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha1()) == 1 &&
-        EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, salt_size) == 1 &&
-        EVP_PKEY_CTX_set1_hkdf_key(ctx, key, key_size) == 1 &&
-        EVP_PKEY_CTX_add1_hkdf_info(
-            ctx,
-            reinterpret_cast<const uint8_t*>(info),
-            info_size) == 1 &&
-        EVP_PKEY_derive(ctx, out_subkey, &out_len) == 1 &&
-        out_len == key_size;
-
-    EVP_PKEY_CTX_free(ctx);
-    return ok;
+    // The one-shot API owns operation-local state and cleanses its PRK.
+    // Avoid allocating a generic PKEY context and copies of key/salt/info for
+    // every authentication attempt in a native UDP packet's user search.
+    return HKDF(out_subkey, key_size, EVP_sha1(), key, key_size,
+                salt, salt_size, info, sizeof(info) - 1) == 1;
 }
 
 // ============================================================================

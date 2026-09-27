@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -80,6 +81,53 @@ void TestAesBlock() {
             Check(output == plain, "AES invalid key modified output");
         }
     }
+}
+
+void TestDeriveSubkey() {
+    // Independent HMAC-SHA1 Extract+Expand answers for info="ss-subkey".
+    const std::array<std::array<uint8_t, 32>, 2> expected{{
+        {0xf0,0xa4,0xbe,0x5d,0x42,0x09,0xa6,0x16,0x8b,0x93,0x6a,0x2b,0xa4,0x4c,0xa3,0x40},
+        {0x7d,0xc1,0x97,0xfc,0xef,0x2d,0xc7,0xe6,0x61,0x03,0x27,0x35,0x76,0x75,0xfc,0x6a,
+         0x83,0x16,0x98,0x33,0x5a,0x9b,0x23,0xd1,0x24,0x22,0xa6,0xb2,0x06,0x77,0x91,0xa6}}};
+    std::array<uint8_t, 32> key{}, salt{}, warm{};
+    for (size_t i = 0; i < key.size(); ++i) {
+        key[i] = static_cast<uint8_t>(i);
+        salt[i] = static_cast<uint8_t>(0xa0 + i);
+    }
+    Check(ss::DeriveSubkey(key.data(), 32, salt.data(), 32, warm.data()),
+          "HKDF warmup failed");
+    const auto before = system_allocations;
+    for (size_t index = 0; index < expected.size(); ++index) {
+        const size_t size = index ? 32 : 16;
+        for (int round = 0; round < 64; ++round) {
+            std::array<uint8_t, 34> guarded;
+            guarded.fill(0xa5);
+            Check(ss::DeriveSubkey(key.data(), size, salt.data(), size, guarded.data() + 1),
+                  "HKDF derivation failed");
+            Check(std::equal(expected[index].begin(), expected[index].begin() + size,
+                             guarded.begin() + 1), "HKDF known answer mismatch");
+            Check(guarded.front() == 0xa5 && guarded[size + 1] == 0xa5,
+                  "HKDF wrote outside output");
+            auto in_place = key;
+            Check(ss::DeriveSubkey(in_place.data(), size, salt.data(), size, in_place.data()),
+                  "HKDF in-place derivation failed");
+            Check(std::equal(expected[index].begin(), expected[index].begin() + size,
+                             in_place.begin()), "HKDF in-place result mismatch");
+        }
+    }
+#if defined(CNODE_WRAP_MALLOC)
+    Check(system_allocations == before, "HKDF derivation allocated heap memory");
+#else
+    (void)before;
+#endif
+    const size_t oversized = static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
+    auto output = warm;
+    Check(!ss::DeriveSubkey(nullptr, 32, salt.data(), 32, output.data()), "HKDF accepted null key");
+    Check(!ss::DeriveSubkey(key.data(), 32, nullptr, 32, output.data()), "HKDF accepted null salt");
+    Check(!ss::DeriveSubkey(key.data(), 32, salt.data(), 32, nullptr), "HKDF accepted null output");
+    Check(!ss::DeriveSubkey(key.data(), oversized, salt.data(), 32, output.data()), "HKDF accepted oversized key");
+    Check(!ss::DeriveSubkey(key.data(), 32, salt.data(), oversized, output.data()), "HKDF accepted oversized salt");
+    Check(output == warm, "invalid HKDF input modified output");
 }
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
@@ -183,6 +231,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
 
 int main() {
     TestAesBlock();
+    TestDeriveSubkey();
     TestLargeRecord(buf::Buffer::kSize, ss::SsCipherType::AES_256_GCM);
     TestLargeRecord(buf::Buffer::kSize + 1, ss::SsCipherType::AES_256_GCM);
     TestLargeRecord(ss::kMaxChunkPayload, ss::SsCipherType::AES_256_GCM);
