@@ -98,8 +98,8 @@ FetchContent_Declare(
     GIT_TAG asio-1-32-0
 )
 FetchContent_MakeAvailable(asio)
-include(cmake/patch_asio_tls.cmake)
-cnode_patch_asio_tls("${asio_SOURCE_DIR}")
+include(cmake/patch_asio.cmake)
+cnode_patch_asio("${asio_SOURCE_DIR}")
 
 add_library(asio_standalone INTERFACE)
 add_library(asio::asio ALIAS asio_standalone)
