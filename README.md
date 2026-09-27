@@ -21,7 +21,7 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 
 ## 构建与测试
 
-本地与 CI 使用同一测试入口（需要 Python 3）：
+本地与 CI 使用同一测试入口（需要 Python 3 及 `cryptography`，可用 `python -m pip install cryptography` 安装测试依赖）：
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCNODE_BUILD_TESTS=ON

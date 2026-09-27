@@ -2788,6 +2788,12 @@ if(CNODE_BUILD_TESTS)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME cnode_udp_relay_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_relay_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/udp_relay_integration_test)
+        set_tests_properties(cnode_udp_relay_integration_test PROPERTIES TIMEOUT 90)
         foreach(integration IN ITEMS dns_endpoint tls_cancellation)
             add_test(NAME cnode_${integration}_integration_test
                 COMMAND ${Python3_EXECUTABLE}

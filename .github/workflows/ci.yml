@@ -83,14 +83,14 @@ jobs:
         run: |
           if [ '${{ matrix.libc }}' = musl ]; then
             apk add --no-cache build-base binutils ccache cmake ninja git curl \
-              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 bash file ca-certificates
+              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-cryptography bash file ca-certificates
           else
             # Keep package manpages: update-alternatives must find its targets.
             rm -f /etc/dpkg/dpkg.cfg.d/excludes
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential binutils ccache cmake ninja-build git curl \
-              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 ca-certificates
+              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-cryptography ca-certificates
           fi
 
       - uses: actions/checkout@v6.0.3
