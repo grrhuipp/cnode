@@ -1,4 +1,5 @@
 #include "ss_udp.hpp"
+#include "shadowsocks_crypto.hpp"
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 
 #include <algorithm>
@@ -52,9 +53,8 @@ buf::MultiBuffer MakePayload(const std::vector<uint8_t>& source,
 
 void CheckClassic(const TargetAddress& target,
                   const std::vector<uint8_t>& source,
-                  std::span<const uint8_t> payload) {
-    const ss::SsCipherInfo cipher{
-        ss::SsCipherType::AES_128_GCM, 16, 16};
+                  std::span<const uint8_t> payload,
+                  const ss::SsCipherInfo& cipher) {
     const ss::KeyBytes key = ss::DeriveKey("udp-datagram-test", cipher.key_size);
     const size_t encoded_size = ss::EncodeUdpPacketTo(
         target, payload.data(), payload.size(), key.span(),
@@ -74,6 +74,28 @@ void CheckClassic(const TargetAddress& target,
     Check(decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source,
           "classic Shadowsocks split one MultiBuffer datagram");
+
+    // Cross-check the one-shot AEAD API against the existing streaming EVP
+    // implementation, rather than only round-tripping through the new path.
+    std::array<uint8_t, 32> subkey{};
+    std::array<uint8_t, 12> nonce{};
+    Check(ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
+                          subkey.data()), "reference subkey derivation failed");
+    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size);
+    const auto body = std::span<const uint8_t>(encoded).subspan(cipher.salt_size);
+    std::vector<uint8_t> plaintext(body.size() - ss::SsAeadCipher::kTagSize);
+    Check(reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()),
+          "EVP could not decrypt one-shot AEAD ciphertext");
+    Check(std::equal(source.begin(), source.end(), plaintext.end() - source.size()),
+          "reference AEAD plaintext mismatch");
+    std::vector<uint8_t> reference_ciphertext(body.size());
+    Check(reference.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
+          std::equal(body.begin(), body.end(), reference_ciphertext.begin()),
+          "AEAD ciphertext/tag differ from streaming EVP");
+    encoded.back() ^= 1;
+    Check(!ss::DecodeUdpPacketWithKey(encoded.data(), encoded.size(), key.span(),
+                                    cipher.type, cipher.key_size, cipher.salt_size),
+          "datagram AEAD accepted a modified tag");
 }
 
 void Check2022(const TargetAddress& target,
@@ -217,7 +239,15 @@ int main() {
           std::equal(payload.Bytes().begin(), payload.Bytes().end(), source.begin()),
           "Shadowsocks UDP payload coalescing mismatch");
 
-    CheckClassic(target, source, payload.Bytes());
+    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
+        const auto cipher = ss::ParseCipherMethod(method);
+        Check(cipher.has_value(), "test cipher unavailable");
+        CheckClassic(target, source, payload.Bytes(), *cipher);
+    }
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::AES_256_GCM_2022, 32,
+        proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022);
     Check2022(
         target, source, payload.Bytes(),
         ss::SsCipherType::AES_128_GCM_2022, 16,

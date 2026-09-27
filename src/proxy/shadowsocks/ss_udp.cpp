@@ -3,12 +3,14 @@
 #include "acppnode/common/allocator.hpp"
 
 #include <openssl/evp.h>
+#include <openssl/aead.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <limits>
 #include <span>
 
 namespace acpp::ss {
@@ -299,13 +301,36 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
     return parsed;
 }
 
+[[nodiscard]] const EVP_AEAD* DatagramAead(SsCipherType type) noexcept {
+    switch (BaseCipherType(type)) {
+        case SsCipherType::AES_128_GCM: return EVP_aead_aes_128_gcm();
+        case SsCipherType::AES_256_GCM: return EVP_aead_aes_256_gcm();
+        case SsCipherType::CHACHA20_POLY1305: return EVP_aead_chacha20_poly1305();
+        default: return nullptr;
+    }
+}
+
 [[nodiscard]] bool AeadEncrypt(SsCipherType cipher_type,
                                std::span<const uint8_t> key,
                                std::span<const uint8_t, 12> nonce,
                                std::span<const uint8_t> plaintext,
                                uint8_t* output) {
-    SsAeadCipher aead(cipher_type, key.data(), key.size());
-    return aead.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), output);
+    const auto* algorithm = DatagramAead(cipher_type);
+    if (!algorithm || plaintext.size() >
+            std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
+    // One datagram, one synchronous stack-owned AEAD context. No connection
+    // cache or EVP_CIPHER_CTX allocation is needed for this bounded operation.
+    EVP_AEAD_CTX context{};
+    size_t written = 0;
+    const size_t capacity = plaintext.size() + SsAeadCipher::kTagSize;
+    const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
+                                    SsAeadCipher::kTagSize, nullptr) == 1 &&
+        EVP_AEAD_CTX_seal(&context, output, &written, capacity,
+                         nonce.data(), nonce.size(), plaintext.data(), plaintext.size(),
+                         nullptr, 0) == 1;
+    EVP_AEAD_CTX_cleanup(&context);
+    OPENSSL_cleanse(&context, sizeof(context));
+    return ok && written == capacity;
 }
 
 [[nodiscard]] bool AeadDecrypt(SsCipherType cipher_type,
@@ -313,8 +338,19 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
                                std::span<const uint8_t, 12> nonce,
                                std::span<const uint8_t> ciphertext,
                                uint8_t* output) {
-    SsAeadCipher aead(cipher_type, key.data(), key.size());
-    return aead.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), output);
+    const auto* algorithm = DatagramAead(cipher_type);
+    if (!algorithm || ciphertext.size() < SsAeadCipher::kTagSize) return false;
+    EVP_AEAD_CTX context{};
+    size_t written = 0;
+    const size_t capacity = ciphertext.size() - SsAeadCipher::kTagSize;
+    const bool ok = EVP_AEAD_CTX_init(&context, algorithm, key.data(), key.size(),
+                                    SsAeadCipher::kTagSize, nullptr) == 1 &&
+        EVP_AEAD_CTX_open(&context, output, &written, capacity,
+                         nonce.data(), nonce.size(), ciphertext.data(), ciphertext.size(),
+                         nullptr, 0) == 1;
+    EVP_AEAD_CTX_cleanup(&context);
+    OPENSSL_cleanse(&context, sizeof(context));
+    return ok && written == capacity;
 }
 
 [[nodiscard]] uint32_t Load32LE(const uint8_t* data) noexcept {
