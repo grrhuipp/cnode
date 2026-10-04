@@ -1,9 +1,8 @@
 #pragma once
 
-#include "acppnode/common/error.hpp"
+#include "acppnode/common/asio_types.hpp"
 
 #include <cstddef>
-#include <cstdint>
 #include <new>
 #include <span>
 #include <type_traits>
@@ -12,11 +11,9 @@
 namespace acpp {
 
 struct TargetAddress;
-class UDPSession;
 
-// UDP receive 回调的只读视图。
-// data 指向 UDPSession 的 receive buffer，仅在同步回调期间有效；
-// 需要排队或跨协程保存时，回调方应复制到 Buffer/MultiBuffer 局部持有类型。
+// Native datagram inbound 的同步回包视图。借用的字节与地址只在当前
+// 回调期间有效；需要排队或跨协程保存时，接收方必须拥有其数据。
 struct UDPPacketView {
     const TargetAddress& target;
     std::span<const uint8_t> data;
@@ -25,8 +22,8 @@ struct UDPPacketView {
 // ============================================================================
 // InlineUdpCallback - UDP 热路径的小对象回调
 //
-// 只支持 move-only；常见 relay/mux/SS UDP 回包 lambda 直接放在对象内，
-// 注册回调时不经过 std::function 的 type-erasure 堆节点。
+// 只支持 move-only；native inbound 回包 lambda 直接放在对象内，
+// 不申请动态回调节点，也不承载出站 socket 或第二条请求链路。
 // ============================================================================
 template <typename... Args>
 class InlineUdpCallback {
@@ -139,20 +136,10 @@ private:
     void (*destroy_)(void*) = nullptr;
 };
 
-using PacketCallback = InlineUdpCallback<UDPPacketView>;
 using RoutedPacketCallback =
     InlineUdpCallback<UDPPacketView, const udp::endpoint&>;
 
 // datagram 入站与 Mux UDP 子会话通过 transport::Link 进入 dispatcher；
 // UDP-capable 出站在自己的 Process 内准备 Worker-local UDP 资源并进入 relay。
-
-// ============================================================================
-// UDP Relay 结果
-// ============================================================================
-struct UDPRelayResult : ResultStatus {
-    uint64_t bytes_up = 0;
-    uint64_t bytes_down = 0;
-    bool client_closed_first = false;
-};
 
 }  // namespace acpp

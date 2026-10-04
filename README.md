@@ -201,12 +201,19 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - gRPC Hunk 的单条未压缩 protobuf 消息正文最多 4 MiB。接收长度头不预分配消息存储，正文按实际收到的字节增长；完整校验后才交付 data，重复字段取最后一个，消费或关闭后释放消息存储。该存储与 relay 的 8KB payload Buffer 分开计量。发送端将较大写入分成多条有界 Hunk，接收端拒绝超限、压缩或畸形消息。
 - gRPC、h2 和 XHTTP 的 HTTP/2 服务端共用会话、流准入、HPACK 状态及控制帧处理。每个连接最多接纳 256 个并发流；超过容量以 REFUSED_STREAM 拒绝新流，单流接收队列超过 4 MiB 时以 ENHANCE_YOUR_CALM 重置该流，已有流继续工作。无效 RST_STREAM 属于连接错误，以 GOAWAY 报告并关闭连接。
 - V2Board Shadowsocks 2022 节点会自动使用面板下发的 `server_key` 作为 identity PSK，并按 V2Board 规则从用户 UUID 前缀构造用户 PSK；无需把订阅中的两段式密码回填到用户表。
-- Shadowsocks 和 AnyTLS inbound 会自动识别 UoT v2（`sp.v2.udp-over-tcp.arpa`）及 v1（`sp.udp-over-tcp.arpa`）。Shadowsocks outbound 可用 `"uot": true` 开启 UoT（默认 v2），以 `"uotVersion": 1` 选择 v1；也接受 `"udp_over_tcp": {"enabled": true, "version": 2}`。
+- Shadowsocks 和 AnyTLS inbound 会自动识别 UoT v2（`sp.v2.udp-over-tcp.arpa`）及 v1（`sp.udp-over-tcp.arpa`）。Shadowsocks outbound 可用 `"uot": true` 开启 UoT（默认 v2），以 `"uotVersion": 1` 选择 v1；也可使用 `"uot": {"enabled": true, "version": 2}`。
 - VMess outbound 的 UUID 和 Shadowsocks outbound 的加密方法、密码会在加载配置时验证。Shadowsocks 省略 `method` 时使用 `aes-256-gcm`；显式的空值、非字符串或未知方法会报错。SS2022 每段 PSK 必须符合所选方法的密钥长度，身份链只支持 AES 方法，不能包含无效或空片段；错误配置不会启动服务。
 - VLESS outbound 的 Vision flow 要求 TCP 搭配 TLS 或 Reality；明文 TCP、WebSocket 等组合会在加载配置时被拒绝。VLESS 的 1–30 字节自定义 ID 仍按 UUIDv5 映射，与入站使用同一转换。
 - AnyTLS outbound 的 `idleSessionCheckInterval`（默认 30 秒）驱动各 Worker 的周期检查，`idleSessionTimeout`（默认 60 秒）决定空闲到期时间；`minIdleSession`（默认 0）保留该 Worker 最近归还的已建立空闲会话。占用中的会话不参与空闲淘汰，handler 退役时关闭其会话并取消检查。
 - AnyTLS 出站请求使用统一的 relay 空闲、写入和半关闭超时；持续接收数据不会延长半关闭的绝对截止时间。取消受阻写入会关闭物理会话；成功请求归还前清除请求超时，空闲连接的寿命随后由会话池控制。
-- Freedom 和 Shadowsocks 原生 UDP 出站使用同一套请求级端点和 relay；写入超时包含域名解析等待，取消一个请求不关闭其他请求共享的 UDP socket。上行半关闭后，在 `timeouts.downlinkOnly` 指定的时间内继续接收回包。每个请求最多排队 256 个原始回包、合计 512 KiB，超限会结束该请求并保留资源不足错误；流量只在成功发送后计入。
+- Freedom 和 Shadowsocks 原生 UDP 出站共用 datagram transport，并沿统一请求主链进入 relay。每个逻辑请求独占一个 UDP socket，本地源端口在请求存续期间保持不变；取消或关闭不会影响其他请求，即使它们访问同一远端。写入预算包含 DNS 等待；Shadowsocks 仅把认证通过的回包计为有效活动。
+- UDP 出站 socket 的地址族在创建时确定：literal IPv6 目标自动使用 IPv6，显式绑定按配置执行；不兼容的目标或解析结果会失败，不会重建 socket 或改变源端口。每 Worker 最多同时拥有 4096 个原生 UDP 出站 socket；容量或系统资源不足时拒绝新请求，不降级为共享 socket。运行时日志的 `udp_sockets` 统计实际打开的出站 socket，不包含入站监听或 DNS socket。
+- UDP 按需接收，在可读后才申请 payload，不保留应用层回包队列；内核接收队列满时遵循 UDP 丢包语义。上行半关闭后，在 `timeouts.downlinkOnly` 的绝对窗口内继续收包；流量只在成功发送后计入。底层 socket 可识别零长度 datagram，但当前 MultiBuffer 转发边界不将其当作数据转发。
+- 原生 UDP 入站在接收缓冲或单包处理内存不足时丢弃当前包，继续在原 socket 上接收；空闲等待前释放接收缓冲。仍在注册的接收循环意外结束、或监听提交后无法启动接收循环时，进程以失败状态退出，避免留下已绑定但无人读取的端口。
+- 原生 UDP association 在没有新包时也会分批回收已关闭和过期记录；每个 Worker 共用一个维护任务，不为每个 association 建定时器。association 的 idle 仍按有效上行活动判断，并使用接收循环启动时的 timeout 快照；单纯下行不续此预算，idle 为零只禁用开放会话的过期，已关闭记录仍回收。分批回收不等于 association 总量或总内存已有上限。
+- 原生 UDP 更换监听 socket 或注销入站时，先停止新请求并取消旧请求，再等待旧分发任务实际结束；删除 association 或关闭 socket 不等于请求完成。同 socket 的协议更新保留现有会话，旧请求继续使用创建时的元数据和分发策略，新请求使用新配置。
+- TCP 和原生 UDP 的 idle/read/write/phase 超时共用聚合状态，由所属 Worker 的调度器承载；逻辑读写结束或连接关闭时撤销对应预算，阶段句柄随清除而失效。
+- `info` 级别的周期资源日志包括 `runtime.process`（Linux 当前 FD 数及软上限，Windows 进程 handle 数）与 `runtime.worker`（各 Worker 的 UDP association、待处理输入/回包、调度事件及池内存）。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=大小/容量`、`timeout_buckets` 可区分活跃事件与历史峰值容量保留；容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD/handle 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
 - 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - WS 入站默认使用 `X-Forwarded-For` 的首个 IP 作为客户端地址；缺失或无效时保留 TCP 对端。`streamSettings.wsSettings.realIpHeader` 可指定其他头，设为 `""` 可关闭该行为。此头可被伪造：仅应通过可信代理访问源站，且代理必须覆盖客户端传入的同名头；当前程序不自行校验代理来源。通过 HTTP 头无法恢复客户端源端口，日志记为 `:0`。
 - 面板 `DNSType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。

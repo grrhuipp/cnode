@@ -355,6 +355,85 @@ bool TestPmrSchedulerReentrancy() {
     return pool.GetFootprint().mapped_bytes == 0;
 }
 
+bool TestResourceReuseAndPeakRetention() {
+    using namespace std::chrono_literals;
+    struct DefaultResourceScope {
+        acpp::memory::ThreadPoolFacade resource;
+        std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
+        ~DefaultResourceScope() { std::pmr::set_default_resource(previous); }
+    } resource_scope;
+    constexpr std::size_t kRounds = 1000;
+    constexpr std::size_t kEventsPerRound = 32;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    auto& pool = acpp::memory::ThreadPool();
+    acpp::WorkerMemoryReclaimer reclaimer;
+    reclaimer.Start(scheduler);
+
+    acpp::TimeoutScheduler::ResourceStats plateau{};
+    for (std::size_t round = 0; round < kRounds; ++round) {
+        if (round != 0) io.restart();
+        std::size_t expired = 0;
+        std::vector<acpp::TimeoutToken> tokens;
+        tokens.reserve(kEventsPerRound);
+        for (std::size_t i = 0; i < kEventsPerRound; ++i) {
+            const auto delay = (i % 2 == 0) ? 0ms : 1h;
+            tokens.push_back(scheduler.ScheduleAfter(delay, [&] { ++expired; }));
+        }
+        for (std::size_t i = 1; i < tokens.size(); i += 2) {
+            scheduler.Cancel(tokens[i]);
+        }
+        // Let the same reclaimer return empty PMR blocks with no subsequent
+        // traffic or explicit collection; do not cancel its maintenance wake.
+        io.run();
+
+        const auto stats = scheduler.GetResourceStats();
+        if (expired != kEventsPerRound / 2 || stats.active_events != 0 ||
+            stats.heap_entries != 0 || stats.ready_events != 0 || stats.wait_pending ||
+            pool.GetFootprint().idle_bytes != 0) {
+            return false;
+        }
+        if (round == 0) {
+            plateau = stats;
+        } else if (stats.heap_capacity != plateau.heap_capacity ||
+            stats.event_buckets != plateau.event_buckets) {
+            std::printf("resource reuse grew at round %zu: heap=%zu/%zu buckets=%zu/%zu\n",
+                round, stats.heap_capacity, plateau.heap_capacity,
+                stats.event_buckets, plateau.event_buckets);
+            return false;
+        }
+    }
+
+    // A separate one-off peak records retained container capacity without
+    // treating it as a leak or imposing a reclamation policy.
+    io.restart();
+    constexpr std::size_t kPeakEvents = 8192;
+    std::vector<acpp::TimeoutToken> peak_tokens;
+    peak_tokens.reserve(kPeakEvents);
+    for (std::size_t i = 0; i < kPeakEvents; ++i) {
+        peak_tokens.push_back(scheduler.ScheduleAfter(1h, [] {}));
+    }
+    const auto peak = scheduler.GetResourceStats();
+    for (auto& token : peak_tokens) scheduler.Cancel(token);
+    io.run();
+    const auto retained = scheduler.GetResourceStats();
+    std::printf("scheduler peak retention: peak=%zu heap_capacity=%zu buckets=%zu; "
+                "after_cancel active=%zu heap=%zu capacity=%zu buckets=%zu\n",
+        peak.active_events, peak.heap_capacity, peak.event_buckets,
+        retained.active_events, retained.heap_entries, retained.heap_capacity,
+        retained.event_buckets);
+    if (peak.active_events != kPeakEvents || retained.active_events != 0 ||
+        retained.heap_entries != 0 || retained.ready_events != 0 ||
+        retained.wait_pending || pool.GetFootprint().idle_bytes != 0) {
+        return false;
+    }
+
+    reclaimer.Stop();
+    acpp::TimeoutScheduler::ReleaseForIoContext(io);
+    pool.PurgeIdle();
+    return pool.GetFootprint().idle_bytes == 0;
+}
+
 bool TestMaintenanceCancellation() {
     using namespace std::chrono_literals;
     acpp::net::io_context io;
@@ -391,7 +470,9 @@ int main() {
     using namespace std::chrono_literals;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    bool allocation_checks_passed = TestPmrSchedulerReentrancy();
+    bool allocation_checks_passed = TestResourceReuseAndPeakRetention();
+    std::printf("scheduler resource reuse: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
+    allocation_checks_passed = TestPmrSchedulerReentrancy() && allocation_checks_passed;
     std::printf("PMR scheduler reentrancy: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
     allocation_checks_passed = TestPoolMaintenance() && allocation_checks_passed;
     std::printf("pool maintenance: %s\n", allocation_checks_passed ? "PASS" : "FAIL");

@@ -3,6 +3,7 @@
 
 #include "../common/awaitable_batch.hpp"
 #include "../common/monitor_loop.hpp"
+#include "../common/process_resources.hpp"
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/defaults.hpp"
@@ -71,17 +72,18 @@ std::string FormatRate(double bytes_per_sec) {
 }
 
 net::awaitable<std::vector<Worker::RuntimeStatsSnapshot>>
-CollectWorkerRuntimeStats(const MonitorContext& ctx) {
+CollectWorkerRuntimeStats(const MonitorContext& ctx, bool include_resources) {
     std::vector<Worker::RuntimeStatsSnapshot> snapshots(ctx.workers.size());
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(ctx.workers.size());
     for (size_t i = 0; i < ctx.workers.size(); ++i) {
         tasks.push_back(
             [](Worker* worker,
-               Worker::RuntimeStatsSnapshot& out) -> net::awaitable<void> {
+               Worker::RuntimeStatsSnapshot& out,
+               bool collect_resources) -> net::awaitable<void> {
                 out = co_await worker->PostTask(
-                    worker->CollectRuntimeStatsTask());
-            }(ctx.workers[i].get(), snapshots[i])
+                    worker->CollectRuntimeStatsTask(collect_resources));
+            }(ctx.workers[i].get(), snapshots[i], include_resources)
         );
     }
     co_await RunAwaitableBatch(
@@ -131,7 +133,7 @@ net::awaitable<void> RuntimeSamplingLoop(
     [[maybe_unused]] auto last_steady_collect_at = steady_clock::time_point{};
     auto last_log_flush_at = steady_clock::time_point{};
     while (true) {
-        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
+        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, false);
         auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
         ctx.stats.SampleNow(aggregate_stats);
         constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
@@ -228,7 +230,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
     auto last_glibc_sample = std::chrono::steady_clock::time_point{};
 #endif
     while (true) {
-        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx);
+        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, true);
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
 
         const auto dns_stats = co_await ctx.dns_worker.GetCacheStats();
@@ -244,13 +246,13 @@ net::awaitable<void> RuntimeStatsOutputLoop(
 
         const double mem_mb = static_cast<double>(ReadResidentMemoryBytes()) / (1024.0 * 1024.0);
 
-        size_t total_udp_sessions = 0;
+        size_t total_udp_sockets = 0;
         size_t pool_mapped_bytes = 0;
         size_t pool_direct_bytes = 0;
         size_t pool_idle_bytes = 0;
         size_t pool_chunks = 0;
         for (const auto& worker_snapshot : worker_snapshots) {
-            total_udp_sessions += worker_snapshot.memory.udp_sessions;
+            total_udp_sockets += worker_snapshot.memory.udp_sockets;
             pool_mapped_bytes += worker_snapshot.memory.pool_mapped_bytes;
             pool_direct_bytes += worker_snapshot.memory.pool_direct_bytes;
             pool_idle_bytes += worker_snapshot.memory.pool_idle_bytes;
@@ -258,7 +260,7 @@ net::awaitable<void> RuntimeStatsOutputLoop(
         }
         const auto user_stats = proxyman::inbound::UserStore::GetStats();
         LOG_INFO(
-            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sessions={} users={}",
+            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sockets={} users={}",
             total_conns,
             mem_mb,
             pool_mapped_bytes / (1024 * 1024),
@@ -273,8 +275,29 @@ net::awaitable<void> RuntimeStatsOutputLoop(
             dns_hit_rate,
             dns_stats.entries,
             dns_stats.capacity,
-            total_udp_sessions,
+            total_udp_sockets,
             user_stats.TotalUsers());
+
+        const auto descriptors = ReadProcessDescriptors();
+        LOG_INFO("runtime.process {}={} soft_limit={}",
+                 descriptors.kind,
+                 descriptors.open ? std::to_string(*descriptors.open) : "unknown",
+                 descriptors.soft_limit ? std::to_string(*descriptors.soft_limit)
+                     : descriptors.soft_limit_unlimited ? "unlimited" : "unknown");
+        for (const auto& worker : worker_snapshots) {
+            const auto& r = *worker.resources;
+            LOG_INFO(
+                "runtime.worker id={} conn={} udp_sockets={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_input_packets={} udp_input_bytes={} udp_reply_packets={} udp_reply_bytes={} udp_reply_senders={} udp_native_dispatches={} timeout_events={} timeout_heap={}/{} timeout_buckets={} timeout_ready={} timeout_waiters={} pool_mapped={} pool_direct={} pool_idle={} pool_chunks={}",
+                worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
+                r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
+                r.udp_associations, r.udp_closed_associations,
+                r.udp_input_datagrams, r.udp_input_bytes,
+                r.udp_reply_datagrams, r.udp_reply_bytes, r.udp_reply_senders,
+                r.udp_native_dispatches, r.timeout_events, r.timeout_heap_entries, r.timeout_heap_capacity,
+                r.timeout_event_buckets, r.timeout_ready_events, r.timeout_waiters,
+                worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
+                worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
+        }
 
 #ifdef __GLIBC__
         const auto heap_now = std::chrono::steady_clock::now();

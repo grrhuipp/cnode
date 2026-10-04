@@ -1,6 +1,5 @@
 #pragma once
 
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/rate_limiter_fwd.hpp"
 
 #include <memory>
@@ -17,12 +16,13 @@ struct StatsShard;
 namespace acpp::proxyman::inbound {
 
 class Handler;
+struct BuildRequest;
 struct DatagramHandlerBuildResult;
 // ============================================================================
 // Manager - per-Worker inbound handler manager
 //
 // 对齐 xray-core features/inbound.Manager 的职责边界。它只在 Worker 线程访问，
-// 不加锁；跨线程入口仍由 Worker 的 *Async 方法 post 到 io_context。
+// 不加锁；跨线程控制面操作只能经所属 Worker 的有界 mailbox 投递。
 // ============================================================================
 class Manager final {
 public:
@@ -46,8 +46,8 @@ public:
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
-    // ReplaceHandler 原子替换同 tag handler。调用方持有的 shared_ptr 让在途
-    // 物理连接和 detached 逻辑子流继续使用原 handler。
+    // ReplaceHandler 在所属 Worker 上替换同 tag handler。调用方持有的
+    // shared_ptr 让在途物理连接及其任务组持有的逻辑子任务继续使用原 handler。
     [[nodiscard]] HandlerPtr ReplaceHandler(std::unique_ptr<Handler> handler);
 
     // RemoveHandler 只撤销 manager 所有权；在途请求按 shared_ptr 自然收尾。

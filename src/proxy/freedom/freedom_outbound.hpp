@@ -17,9 +17,6 @@
 #include <vector>
 
 namespace acpp {
-class UDPSession;
-class UDPSessionManager;
-
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
@@ -49,7 +46,6 @@ struct FreedomSettings {
     DomainStrategy domain_strategy = DomainStrategy::AsIs;
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
     bool enable_udp = true;               // 是否启用 UDP
-    int udp_timeout = defaults::kUdpSessionTimeout;     // UDP 会话超时（秒）
 };
 
 // ============================================================================
@@ -60,7 +56,6 @@ public:
     Handler(const std::string& tag,
             const FreedomSettings& settings,
             ::acpp::app::dns::DNS& dns_service,
-            ::acpp::UDPSessionManager* udp_session_manager,  // Per-worker UDP manager
             std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
 
     net::awaitable<OutboundProcessResult> Process(
@@ -87,19 +82,12 @@ private:
         const tcp::endpoint* inbound_local_addr,
         const net::ip::address& remote_addr);
 
-    // 取得（或创建）当前 Worker 的 Full Cone UDP socket。仅由 Process 的
-    // UDP 数据面调用；保留 manager 返回的精确容量/绑定错误。
-    std::expected<std::shared_ptr<::acpp::UDPSession>, ErrorCode> AcquireUdpSession(
-        session::Context& ctx);
-
     std::string tag_;
     FreedomSettings settings_;
     ::acpp::app::dns::DNS& dns_service_;
-    ::acpp::UDPSessionManager* udp_session_manager_;  // Per-worker UDP manager
     std::chrono::seconds dial_timeout_;
     std::optional<TargetAddress> redirect_target_;
     std::string redirect_target_text_;
-    std::optional<std::string> explicit_udp_session_id_;
     StreamSettings stream_settings_;          // 默认 tcp/none
 };
 

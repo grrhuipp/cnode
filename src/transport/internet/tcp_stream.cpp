@@ -4,6 +4,7 @@
 #include "acppnode/common/memory_stats.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "connection_timeouts.hpp"
 
 #include <asio/read.hpp>
 #include <asio/as_tuple.hpp>
@@ -16,7 +17,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <limits>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -32,7 +32,20 @@ namespace acpp {
 namespace {
 constexpr size_t kProxyHeaderMaxBytes = 2048;
 constexpr size_t kProxyProbeBytes = 256;
-using std::chrono::steady_clock;
+template<class Timeouts, bool IsRead>
+struct OperationTimeoutScope {
+    explicit OperationTimeoutScope(Timeouts& timeouts) : timeouts(timeouts) {
+        if constexpr (IsRead) timeouts.BeginRead();
+        else timeouts.BeginWrite();
+    }
+    OperationTimeoutScope(const OperationTimeoutScope&) = delete;
+    OperationTimeoutScope& operator=(const OperationTimeoutScope&) = delete;
+    ~OperationTimeoutScope() noexcept {
+        if constexpr (IsRead) timeouts.EndRead();
+        else timeouts.EndWrite();
+    }
+    Timeouts& timeouts;
+};
 
 struct PendingOperationState {
     bool timed_out = false;
@@ -49,19 +62,6 @@ struct PendingOperationState {
 
 net::io_context& SocketIoContext(tcp::socket& socket) {
     return static_cast<net::io_context&>(socket.get_executor().context());
-}
-
-uint32_t SecondsToU32(std::chrono::seconds timeout) noexcept {
-    if (timeout.count() <= 0) {
-        return 0;
-    }
-    const auto value = static_cast<uint64_t>(timeout.count());
-    return static_cast<uint32_t>(
-        std::min<uint64_t>(value, std::numeric_limits<uint32_t>::max()));
-}
-
-std::chrono::seconds SecondsFromU32(uint32_t timeout_sec) noexcept {
-    return std::chrono::seconds(timeout_sec);
 }
 
 ProxyProtocolReadResult ProxyReadResult(
@@ -87,16 +87,19 @@ enum Flag : uint8_t {
     kReadShutdown           = 1u << 1,
     kWriteShutdown          = 1u << 2,
     kCountedActive          = 1u << 3,
-    kIdleTimedOut           = 1u << 4,
-    kReadTimedOut           = 1u << 5,
-    kWriteTimedOut          = 1u << 6,
-    kPhaseDeadlineTimedOut  = 1u << 7,
 };
 
 struct TcpStream::Impl : memory::ThreadAllocated {
-    explicit Impl(tcp::socket socket)
+    explicit Impl(tcp::socket socket, TcpStream& owner)
         : socket(std::move(socket))
-        , timeout_scheduler(&TimeoutScheduler::ForIoContext(SocketIoContext(this->socket))) {}
+        , owner(owner)
+        , timeouts(SocketIoContext(this->socket), *this) {}
+
+    void OnTimeout(ErrorCode reason) noexcept {
+        if (reason != ErrorCode::CANCELLED) owner.Cancellation().Stop(reason);
+        owner.Cancel();
+        owner.Close();
+    }
 
     [[nodiscard]] bool HasFlag(Flag flag) const noexcept {
         return (flags & static_cast<uint8_t>(flag)) != 0;
@@ -110,28 +113,12 @@ struct TcpStream::Impl : memory::ThreadAllocated {
         }
     }
 
-    [[nodiscard]] bool ConsumeFlag(Flag flag) noexcept {
-        const bool value = HasFlag(flag);
-        SetFlag(flag, false);
-        return value;
-    }
-
     tcp::socket socket;
-    TimeoutScheduler* timeout_scheduler = nullptr;
+    TcpStream& owner;
+    transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     buf::MultiBuffer pending_data;
-    TimeoutToken idle_timer_token;
-    TimeoutToken read_deadline_token;
-    TimeoutToken write_deadline_token;
-    TimeoutToken phase_deadline_token;
-    std::chrono::steady_clock::time_point write_deadline_at;
     StreamLabelKind stream_label = StreamLabelKind::Unknown;
     uint8_t flags = 0;
-    uint32_t idle_timeout_sec = 0;
-    uint32_t read_timeout_sec = 0;
-    uint32_t write_timeout_sec = 0;
-    uint32_t phase_deadline_generation = 0;
-    uint64_t idle_activity_epoch = 0;
-    bool write_deadline_active = false;
 };
 
 // ============================================================================
@@ -157,7 +144,7 @@ void TcpStream::operator delete(void* p, std::size_t size) noexcept {
 }
 
 TcpStream::TcpStream(tcp::socket socket)
-    : impl_(std::make_unique<Impl>(std::move(socket))) {
+    : impl_(std::make_unique<Impl>(std::move(socket), *this)) {
     if (impl_->socket.is_open()) {
         impl_->SetFlag(kCountedActive);
         memory::OnTcpStreamNew();
@@ -183,10 +170,9 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         co_return copy;
     }
 
-    ArmReadDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_read_some(buf,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    CancelReadDeadline();
 
     if (ec) {
         if (ec == io_error::eof) {
@@ -245,11 +231,10 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     if (!buffer) {
         co_return buf::MultiBuffer{};
     }
-    ArmReadDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_read_some(
         net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    CancelReadDeadline();
 
     if (ec || n == 0) {
         if (!ec || ec == io_error::eof ||
@@ -283,11 +268,10 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     out.AppendMultiBuffer(mb);
     if (out.empty()) co_return;
 
-    ArmWriteDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    DisarmWriteDeadline();
 
     if (ec) {
         throw IoSystemError(ec);
@@ -308,11 +292,10 @@ net::awaitable<void> TcpStream::WriteBuffers(
         co_return;
     }
 
-    ArmWriteDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    DisarmWriteDeadline();
     (void)n;
 
     if (ec) {
@@ -326,10 +309,9 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
         co_return 0;
     }
 
-    ArmWriteDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(impl_->socket, buf,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    DisarmWriteDeadline();
 
     if (ec) {
         throw IoSystemError(ec);
@@ -362,11 +344,8 @@ void TcpStream::ShutdownWrite() {
 }
 
 void TcpStream::Close() {
+    impl_->timeouts.Stop();
     NotifyClosed();
-    CancelIdleTimer();
-    CancelReadDeadline();
-    CancelWriteDeadline();
-    CancelPhaseDeadline();
     if (impl_->socket.is_open()) {
         IoErrorCode ec;
         // 仅错误路径使用 abortive close；正常关闭保持 FIN 语义，
@@ -413,6 +392,7 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
     const auto flags = peek
         ? net::socket_base::message_peek
         : net::socket_base::message_flags{0};
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_receive(
         buffer, flags,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
@@ -573,11 +553,10 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
         co_return IoErrorCode{};
     }
 
-    ArmReadDeadline();
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
-    CancelReadDeadline();
     co_return ec;
 }
 
@@ -598,22 +577,22 @@ size_t TcpStream::ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcep
 }
 
 void TcpStream::BeginTlsLayerRead() {
-    ArmReadDeadline();
+    impl_->timeouts.BeginRead();
 }
 
 void TcpStream::EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept {
-    CancelReadDeadline();
+    impl_->timeouts.EndRead();
     if (!ec && n > 0) {
         TouchActivity();
     }
 }
 
 void TcpStream::BeginTlsLayerWrite() {
-    ArmWriteDeadline();
+    impl_->timeouts.BeginWrite();
 }
 
 void TcpStream::EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept {
-    DisarmWriteDeadline();
+    impl_->timeouts.EndWrite();
     if (!ec && n > 0) {
         TouchActivity();
     }
@@ -763,83 +742,40 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
 // ============================================================================
 
 void TcpStream::SetIdleTimeout(std::chrono::seconds timeout) {
-    impl_->idle_timeout_sec = SecondsToU32(timeout);
-    if (impl_->idle_timeout_sec > 0) {
-        ++impl_->idle_activity_epoch;
-        impl_->SetFlag(kIdleTimedOut, false);
-        ScheduleIdleCheck();
-    } else {
-        impl_->SetFlag(kIdleTimedOut, false);
-        CancelIdleTimer();
-    }
+    impl_->timeouts.SetIdleTimeout(timeout);
 }
 
 bool TcpStream::ConsumeIdleTimeout() noexcept {
-    return impl_->ConsumeFlag(kIdleTimedOut);
+    return impl_->timeouts.ConsumeIdleTimeout();
 }
 
 void TcpStream::SetReadTimeout(std::chrono::seconds timeout) {
-    impl_->read_timeout_sec = SecondsToU32(timeout);
-    if (impl_->read_timeout_sec == 0) {
-        impl_->SetFlag(kReadTimedOut, false);
-        CancelReadDeadline();
-    }
+    impl_->timeouts.SetReadTimeout(timeout);
 }
 
 void TcpStream::SetWriteTimeout(std::chrono::seconds timeout) {
-    impl_->write_timeout_sec = SecondsToU32(timeout);
-    if (impl_->write_timeout_sec == 0) {
-        impl_->SetFlag(kWriteTimedOut, false);
-        CancelWriteDeadline();
-    }
+    impl_->timeouts.SetWriteTimeout(timeout);
 }
 
 bool TcpStream::ConsumeReadTimeout() noexcept {
-    return impl_->ConsumeFlag(kReadTimedOut);
+    return impl_->timeouts.ConsumeReadTimeout();
 }
 
 bool TcpStream::ConsumeWriteTimeout() noexcept {
-    return impl_->ConsumeFlag(kWriteTimedOut);
+    return impl_->timeouts.ConsumeWriteTimeout();
 }
 
 PhaseDeadlineHandle TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) {
-    ClearPhaseDeadline();
-    if (timeout.count() <= 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) {
-        return {};
-    }
-
-    impl_->SetFlag(kPhaseDeadlineTimedOut, false);
-    const uint32_t generation = impl_->phase_deadline_generation;
-
-    uint32_t* generation_state = &impl_->phase_deadline_generation;
-    const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
-    const auto delay = timeout >= maximum ? std::chrono::milliseconds::max() :
-        std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-    impl_->phase_deadline_token = impl_->timeout_scheduler->ScheduleAfter(
-        delay,
-        [this, generation]() {
-            if (impl_->phase_deadline_generation != generation) {
-                return;
-            }
-            impl_->SetFlag(kPhaseDeadlineTimedOut);
-            Cancel();
-    });
-
-    return PhaseDeadlineHandle{
-        &impl_->flags,
-        static_cast<uint8_t>(kPhaseDeadlineTimedOut),
-        generation_state,
-        generation};
+    if (!impl_->socket.is_open()) return {};
+    return impl_->timeouts.StartPhaseDeadline(timeout);
 }
 
 void TcpStream::ClearPhaseDeadline() {
-    impl_->SetFlag(kPhaseDeadlineTimedOut, false);
-    ++impl_->phase_deadline_generation;
-    CancelPhaseDeadline();
+    impl_->timeouts.ClearPhaseDeadline();
 }
 
 bool TcpStream::ConsumePhaseDeadline() noexcept {
-    return impl_->ConsumeFlag(kPhaseDeadlineTimedOut);
+    return impl_->timeouts.ConsumePhaseDeadline();
 }
 
 size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
@@ -855,151 +791,9 @@ void TcpStream::ReleasePendingData() noexcept {
     impl_->pending_data.clear();
 }
 
-// 每次成功 I/O 后调用。idle timeout 只需要判断“期间是否发生过 I/O”，
-// 用递增序号避免热路径每包读取 steady_clock。
-void TcpStream::TouchActivity() {
-    if (impl_->idle_timeout_sec == 0) return;
-    ++impl_->idle_activity_epoch;
-    impl_->SetFlag(kIdleTimedOut, false);
-}
-
-// 启动/续调惰性 idle 检查。定时器到期后比较活动序号；
-// 若期间没有 I/O 则 cancel socket，否则重新调度一个完整 idle 周期。
-// 安全性：通过 token 从共享调度器撤销事件；析构路径先 cancel token 再释放对象。
-void TcpStream::ScheduleIdleCheck() {
-    if (impl_->idle_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
-
-    CancelIdleTimer();
-
-    const auto timeout = SecondsFromU32(impl_->idle_timeout_sec);
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-    const auto observed_epoch = impl_->idle_activity_epoch;
-
-    // 捕获 this——timer 是成员，析构前自动 cancel，安全
-    TcpStream* self = this;
-    impl_->idle_timer_token = impl_->timeout_scheduler->ScheduleAfter(remaining, [self, observed_epoch]() {
-        if (!self->impl_->socket.is_open()) return;
-        if (self->impl_->idle_activity_epoch == observed_epoch) {
-            self->impl_->SetFlag(kIdleTimedOut);
-            // 记录触发 idle timeout 的连接端点，辅助排查断连
-            if (Log::ShouldLog(LogLevel::DEBUG)) {
-                IoErrorCode ep_ec;
-                auto remote = self->impl_->socket.remote_endpoint(ep_ec);
-                const std::string_view label = self->StreamLabel();
-                if (!ep_ec) {
-                    LOG_NET_DEBUG("idle timeout fired: [{}] remote={}:{} limit={}s",
-                                    label.empty() ? "?" : label,
-                                    remote.address().to_string(), remote.port(),
-                                    self->impl_->idle_timeout_sec);
-                } else {
-                    LOG_NET_DEBUG("idle timeout fired: [{}] limit={}s",
-                                    label.empty() ? "?" : label,
-                                    self->impl_->idle_timeout_sec);
-                }
-            }
-            self->Cancel();
-        } else {
-            self->ScheduleIdleCheck();
-        }
-    });
-}
-
-void TcpStream::CancelIdleTimer() noexcept {
-    if (impl_->timeout_scheduler) {
-        impl_->timeout_scheduler->Cancel(impl_->idle_timer_token);
-    } else {
-        impl_->idle_timer_token.Reset();
-    }
-}
-
-void TcpStream::ArmReadDeadline() {
-    if (impl_->read_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
-
-    CancelReadDeadline();
-    impl_->SetFlag(kReadTimedOut, false);
-    impl_->read_deadline_token = impl_->timeout_scheduler->ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            SecondsFromU32(impl_->read_timeout_sec)),
-        [this]() {
-            impl_->SetFlag(kReadTimedOut);
-            Cancel();
-    });
-}
-
-void TcpStream::ArmWriteDeadline() {
-    if (impl_->write_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
-
-    impl_->SetFlag(kWriteTimedOut, false);
-    impl_->write_deadline_active = true;
-    impl_->write_deadline_at = steady_clock::now() + SecondsFromU32(impl_->write_timeout_sec);
-    if (!impl_->write_deadline_token.Valid()) {
-        ScheduleWriteDeadlineCheck();
-    }
-}
-
-void TcpStream::DisarmWriteDeadline() noexcept {
-    impl_->write_deadline_active = false;
-}
-
-void TcpStream::ScheduleWriteDeadlineCheck() {
-    if (impl_->write_timeout_sec == 0 || !impl_->socket.is_open() || impl_->timeout_scheduler == nullptr) return;
-    if (!impl_->write_deadline_active) return;
-
-    const auto now = steady_clock::now();
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        impl_->write_deadline_at - now);
-    if (remaining <= std::chrono::milliseconds::zero()) {
-        remaining = std::chrono::milliseconds(1);
-    }
-
-    TcpStream* self = this;
-    impl_->write_deadline_token = impl_->timeout_scheduler->ScheduleAfter(
-        remaining,
-        [self]() {
-            self->impl_->write_deadline_token.Reset();
-            if (!self->impl_->socket.is_open() || self->impl_->write_timeout_sec == 0) {
-                return;
-            }
-            if (!self->impl_->write_deadline_active) {
-                return;
-            }
-
-            const auto now = steady_clock::now();
-            if (now >= self->impl_->write_deadline_at) {
-                self->impl_->SetFlag(kWriteTimedOut);
-                self->impl_->write_deadline_active = false;
-                self->Cancel();
-                return;
-            }
-
-            self->ScheduleWriteDeadlineCheck();
-    });
-}
-
-void TcpStream::CancelReadDeadline() noexcept {
-    if (impl_->timeout_scheduler) {
-        impl_->timeout_scheduler->Cancel(impl_->read_deadline_token);
-    } else {
-        impl_->read_deadline_token.Reset();
-    }
-}
-
-void TcpStream::CancelWriteDeadline() noexcept {
-    impl_->write_deadline_active = false;
-    impl_->SetFlag(kWriteTimedOut, false);
-    if (impl_->timeout_scheduler) {
-        impl_->timeout_scheduler->Cancel(impl_->write_deadline_token);
-    } else {
-        impl_->write_deadline_token.Reset();
-    }
-}
-
-void TcpStream::CancelPhaseDeadline() noexcept {
-    if (impl_->timeout_scheduler) {
-        impl_->timeout_scheduler->Cancel(impl_->phase_deadline_token);
-    } else {
-        impl_->phase_deadline_token.Reset();
-    }
+// Successful I/O refreshes the authoritative connection idle deadline.
+void TcpStream::TouchActivity() noexcept {
+    impl_->timeouts.TouchActivity();
 }
 
 void TcpStream::ReleaseActiveCounter() noexcept {

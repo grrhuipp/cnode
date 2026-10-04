@@ -854,7 +854,7 @@ Handler::Process(
     }
     auto user = validator_.Validate(ctx.inbound.tag, auth_hash);
     if (!user) {
-        if (limiter_) {
+        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
         }
         stats_->OnError();

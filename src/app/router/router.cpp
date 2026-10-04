@@ -396,12 +396,10 @@ private:
             return true;
         }
 
-        if (ctx.inbound.tags) {
-            for (const auto& tag : *ctx.inbound.tags) {
-                if (tag == ctx.inbound.tag) continue;
-                if (ContainsSortedString(inbound_tag_values, tag)) {
-                    return true;
-                }
+        for (const auto& tag : ctx.inbound.tags) {
+            if (tag == ctx.inbound.tag) continue;
+            if (ContainsSortedString(inbound_tag_values, tag)) {
+                return true;
             }
         }
         return false;

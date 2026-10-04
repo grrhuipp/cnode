@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <span>
 
 namespace acpp::detail {
@@ -15,9 +16,14 @@ class UdpReceiveBuffer final {
 public:
     static constexpr size_t kMaxWireBytes = 65535;
 
-    [[nodiscard]] net::mutable_buffer Prepare(size_t available_bytes) {
-        large_.clear();
+    void Release() noexcept {
         small_ = buf::BufferGuard{};
+        memory::ByteVector empty{large_.get_allocator()};
+        large_.swap(empty);
+    }
+
+    [[nodiscard]] net::mutable_buffer Prepare(size_t available_bytes) {
+        Release();
 
         const size_t capacity = std::clamp<size_t>(
             available_bytes, 1, kMaxWireBytes);
@@ -29,7 +35,12 @@ public:
             return net::buffer(small_->data, buf::Buffer::kSize);
         }
 
-        large_.resize(capacity);
+        try {
+            large_.resize(capacity);
+        } catch (const std::bad_alloc&) {
+            Release();
+            return {};
+        }
         return net::buffer(large_.data(), large_.size());
     }
 

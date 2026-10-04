@@ -402,7 +402,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
-                acpp::UDPSessionManager* /*udp_mgr*/,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_config = trojan_config;
                 runtime_config.timeout = timeout;

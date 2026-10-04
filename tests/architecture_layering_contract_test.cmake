@@ -100,11 +100,37 @@ foreach(PROXYMAN_SOURCE_PATH IN LISTS PROXYMAN_SOURCES)
     endif()
 endforeach()
 
+set(DATAGRAM_SOCKET_HEADER
+    "${SOURCE_DIR}/include/acppnode/transport/internet/datagram_socket.hpp")
+set(DATAGRAM_SOCKET_SOURCE
+    "${SOURCE_DIR}/src/transport/internet/datagram_socket.cpp")
+set(CONNECTION_TIMEOUTS_HEADER
+    "${SOURCE_DIR}/src/transport/internet/connection_timeouts.hpp")
+file(READ "${DATAGRAM_SOCKET_HEADER}" DATAGRAM_SOCKET_HEADER_SOURCE)
+file(READ "${DATAGRAM_SOCKET_SOURCE}" DATAGRAM_SOCKET_SOURCE_TEXT)
+file(READ "${CONNECTION_TIMEOUTS_HEADER}" CONNECTION_TIMEOUTS_SOURCE)
+foreach(LOWER_SOURCE IN ITEMS
+        DATAGRAM_SOCKET_HEADER_SOURCE DATAGRAM_SOCKET_SOURCE_TEXT CONNECTION_TIMEOUTS_SOURCE)
+    if(${LOWER_SOURCE} MATCHES
+           "acppnode/app/|app::dns|PanelConfig|panel/|proxy/|json::|nlohmann::|UDPSession|UDPSessionManager|shared_ptr|steady_timer|ReplyQueue|reply_queue|read_loop|ReadLoop|RunReceive|StartReceive")
+        message(FATAL_ERROR
+            "datagram transport and timeout lower layer must not own app, protocol, session, timer, read-loop or reply-queue architecture")
+    endif()
+endforeach()
+string(REGEX MATCHALL "TimeoutToken [A-Za-z_][A-Za-z0-9_]*"
+    CONNECTION_TIMEOUT_TOKENS "${CONNECTION_TIMEOUTS_SOURCE}")
+list(LENGTH CONNECTION_TIMEOUT_TOKENS CONNECTION_TIMEOUT_TOKEN_COUNT)
+if(NOT CONNECTION_TIMEOUT_TOKEN_COUNT EQUAL 1 OR
+   CONNECTION_TIMEOUTS_SOURCE MATCHES "steady_timer")
+    message(FATAL_ERROR
+        "connection timeouts must use one scheduler token, not a per-connection timer")
+endif()
+
 set(CORE_LAYER_FILES
     "${SOURCE_DIR}/src/app/worker.cpp"
     "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp"
     "${SOURCE_DIR}/src/app/router/router.cpp"
-    "${SOURCE_DIR}/src/app/udp_channel.cpp"
+    "${SOURCE_DIR}/src/transport/internet/datagram_socket.cpp"
     "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
     "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp"
     "${SOURCE_DIR}/src/app/proxyman/inbound/manager.cpp"
@@ -125,7 +151,7 @@ set(HOT_PATH_FILES
     "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp"
     "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp"
     "${SOURCE_DIR}/src/app/router/router.cpp"
-    "${SOURCE_DIR}/src/app/udp_channel.cpp"
+    "${SOURCE_DIR}/src/transport/internet/datagram_socket.cpp"
     "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
     "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp")
 foreach(HOT_PATH_FILE IN LISTS HOT_PATH_FILES)
@@ -333,6 +359,77 @@ foreach(CONTROLLER_SOURCE_PATH IN LISTS CONTROLLER_SOURCES)
             "controller must normalize RuntimeUser, not construct protocol credentials: ${CONTROLLER_SOURCE_PATH}")
     endif()
 endforeach()
+
+# The panel facade owns Impl but does not add an asynchronous stage. Request
+# timeout/cancellation and HTTP state remain in Impl and its request task.
+file(READ "${SOURCE_DIR}/src/api/v2board/v2board.cpp" PANEL_CLIENT_SOURCE)
+file(READ "${SOURCE_DIR}/include/acppnode/api/api.hpp" PANEL_API_SOURCE)
+if(PANEL_API_SOURCE MATCHES "void[ \t]+Debug[(]" OR
+   PANEL_CLIENT_SOURCE MATCHES "debug_enabled_|APIClient::(Impl::)?Debug[(]")
+    message(FATAL_ERROR
+        "panel API must not restore the unused mutable Debug switch or its PImpl state")
+endif()
+foreach(PANEL_METHOD IN ITEMS
+        GetNodeInfo GetUserList ReportNodeStatus ReportNodeOnlineUsers
+        ReportUserTraffic GetNodeRule ReportIllegal)
+    if(NOT PANEL_CLIENT_SOURCE MATCHES
+           "APIClient::${PANEL_METHOD}\\([^)]*\\)[ \r\n]*\\{[ \r\n]*return impl_->${PANEL_METHOD}\\([^;]*\\);[ \r\n]*\\}")
+        message(FATAL_ERROR
+            "panel PImpl facade must directly return the Impl task: ${PANEL_METHOD}")
+    endif()
+endforeach()
+if(NOT PANEL_CLIENT_SOURCE MATCHES
+       "return http::RunRequest\\([ \r\n]*HttpExchange\\(method, path, body, if_none_match\\), config_\\.RequestTimeout\\);")
+    message(FATAL_ERROR
+        "panel HTTP request must enter the owning timeout task without a forwarding coroutine")
+endif()
+
+# TLS's public PImpl surface needs opaque native handles, not the SSL API,
+# concrete TCP implementation or configuration definitions.
+file(READ "${SOURCE_DIR}/include/acppnode/transport/internet/tls_stream.hpp" TLS_PUBLIC_SOURCE)
+if(TLS_PUBLIC_SOURCE MATCHES
+       "#include [<\"][^>\"\r\n]*(tcp_stream\\.hpp|tls_config\\.hpp|openssl/ssl\\.h)[>\"]")
+    message(FATAL_ERROR
+        "TLS PImpl public header must not pull implementation or configuration definitions")
+endif()
+
+# HTTPUpgrade contributes only read-side pending bytes after the handshake;
+# transparent writes must not add a coroutine frame to every forwarding batch.
+file(READ "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp" TRANSPORT_SOURCE)
+string(FIND "${TRANSPORT_SOURCE}" "class HttpUpgradeStream final" UPGRADE_BEGIN)
+string(FIND "${TRANSPORT_SOURCE}" "class Http1BodyStream final" UPGRADE_END)
+if(UPGRADE_BEGIN LESS 0 OR UPGRADE_END LESS_EQUAL UPGRADE_BEGIN)
+    message(FATAL_ERROR "HTTPUpgrade transport implementation boundary not found")
+endif()
+math(EXPR UPGRADE_LENGTH "${UPGRADE_END} - ${UPGRADE_BEGIN}")
+string(SUBSTRING "${TRANSPORT_SOURCE}" ${UPGRADE_BEGIN} ${UPGRADE_LENGTH} UPGRADE_SOURCE)
+foreach(UPGRADE_WRITE IN ITEMS AsyncWrite WriteMultiBuffer WriteBuffers)
+    if(NOT UPGRADE_SOURCE MATCHES "return inner_->${UPGRADE_WRITE}\\(")
+        message(FATAL_ERROR
+            "HTTPUpgrade transparent writes must directly return the underlying task: ${UPGRADE_WRITE}")
+    endif()
+endforeach()
+
+if(NOT TRANSPORT_SOURCE MATCHES
+       "return WriteRawDataSerialized\\(stream_id, \\{\\}, true\\);")
+    message(FATAL_ERROR
+        "HTTP/2 raw EOF must directly return the owning serialized-write task")
+endif()
+
+# DNS clients have a single bounded path to the main Worker's private Impl.
+file(READ "${SOURCE_DIR}/src/app/dns/dns.cpp" DNS_SOURCE)
+if(DNS_SOURCE MATCHES "DNS::Impl|DNS::DNS\\(|DNS::GetCacheStats\\(")
+    message(FATAL_ERROR
+        "DNS client must not expose a local server, cache access or second PImpl")
+endif()
+if(NOT DNS_SOURCE MATCHES "return worker_\\.Resolve\\(std::string\\(domain\\)\\);")
+    message(FATAL_ERROR
+        "DNS client must capture owned input and directly return the bounded worker task")
+endif()
+if(NOT DNS_SOURCE MATCHES "return impl_->mailbox\\.Post\\(impl_->ReadCacheStats\\(\\)\\);")
+    message(FATAL_ERROR
+        "DNS stats must use the bounded worker mailbox without a forwarding coroutine")
+endif()
 
 foreach(PROTOCOL_VALIDATOR IN ITEMS
         "${SOURCE_DIR}/src/proxy/vmess/validator.hpp"

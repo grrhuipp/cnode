@@ -133,7 +133,9 @@ public:
     using MemoryStats = WorkerMemoryStats;
     using RuntimeStatsSnapshot = WorkerRuntimeStatsSnapshot;
 
-    net::awaitable<RuntimeStatsSnapshot> CollectRuntimeStatsTask() const;
+    // Resource traversal is requested only by the low-frequency diagnostics loop.
+    net::awaitable<RuntimeStatsSnapshot> CollectRuntimeStatsTask(
+        bool include_resources) const;
     net::awaitable<void> CollectHeapTask(bool force);
 
 private:
@@ -145,8 +147,6 @@ private:
         ConnectionLimiterPtr limiter,
         const proxyman::inbound::BuildRequest& req,
         proxyman::inbound::ReceiverSettings receiver);
-
-    void UnregisterListenerOnWorkerThread(std::string_view tag);
 
     void AddOutboundOnWorkerThread(
         proxyman::outbound::PreparedOutboundConfig config);

@@ -30,8 +30,8 @@ BootstrapEnvironment& BootstrapEnvironment::operator=(BootstrapEnvironment&&) no
 
 namespace {
 
-::acpp::app::dns::DNS::Config MakeDnsServiceConfig(const Config& config) {
-    ::acpp::app::dns::DNS::Config dns_config;
+::acpp::app::dns::Config MakeDnsServiceConfig(const Config& config) {
+    ::acpp::app::dns::Config dns_config;
     dns_config.servers     = config.GetDns().servers;
     dns_config.timeout_sec = config.GetDns().timeout;
     dns_config.cache_size  = config.GetDns().cache_size;

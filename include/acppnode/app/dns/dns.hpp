@@ -1,13 +1,9 @@
 #pragma once
 
-#include "acppnode/app/dns/config.hpp"
-#include "acppnode/app/dns/stats.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/error.hpp"
 
 #include <cstdint>
-#include <memory>
-#include <string>
 #include <string_view>
 #include <vector>
 
@@ -27,24 +23,17 @@ struct DnsResult : ResultStatus {
 
 class DNS final {
 public:
-    using Config = ::acpp::app::dns::Config;
-
-    DNS(net::io_context& io_context, const Config& config);
-    // Client facade only: resolution state and sockets live on DNSWorker.
-    explicit DNS(DNSWorker& worker);
-    ~DNS();
+    // Client only: all resolution state and sockets belong to DNSWorker.
+    explicit DNS(DNSWorker& worker) noexcept : worker_(worker) {}
 
     DNS(const DNS&) = delete;
     DNS& operator=(const DNS&) = delete;
 
+    // Copies domain at task creation. The DNSWorker must outlive the task.
     net::awaitable<DnsResult> Resolve(std::string_view domain);
 
-    DnsCacheStats GetCacheStats() const;
-
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    DNSWorker* dns_worker_ = nullptr;
+    DNSWorker& worker_;
 };
 
 }  // namespace acpp::app::dns

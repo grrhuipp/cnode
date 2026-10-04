@@ -14,9 +14,6 @@
 #include <string_view>
 
 namespace acpp {
-class UDPSession;
-class UDPSessionManager;
-
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
@@ -50,8 +47,7 @@ public:
     Handler(std::string tag,
             const ::acpp::SsOutboundConfig& config,
             const Credentials& credentials,
-            ::acpp::app::dns::DNS& dns_service,
-            ::acpp::UDPSessionManager* udp_session_manager);
+            ::acpp::app::dns::DNS& dns_service);
 
     ~Handler() noexcept override = default;
 
@@ -74,7 +70,6 @@ private:
     const ::acpp::SsOutboundConfig config_;
     const Credentials credentials_;
     ::acpp::app::dns::DNS& dns_service_;
-    ::acpp::UDPSessionManager* udp_session_manager_ = nullptr;
 };
 
 }  // namespace proxy::shadowsocks::outbound

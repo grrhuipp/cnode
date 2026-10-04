@@ -163,7 +163,8 @@ proxy::trojan::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] Process start from {}", tag, client_ip);
 
-    if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
+        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -225,7 +226,7 @@ proxy::trojan::inbound::Handler::Process(
                       request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0),
                       validator_.Size(),
                       validator_.SizeForTag(tag));
-        if (limiter_) {
+        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);

@@ -1,5 +1,6 @@
 #include "app/dns/inflight_resolves.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
+#include "acppnode/app/worker_mailbox.hpp"
 #include "acppnode/common/allocator.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
@@ -15,7 +16,9 @@
 #include <iostream>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <type_traits>
 
 namespace {
 
@@ -30,6 +33,13 @@ thread_local size_t injected_failures = 0;
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
+
+template <typename T>
+concept HasSyncCacheStats = requires(const T& client) { client.GetCacheStats(); };
+static_assert(!std::is_default_constructible_v<acpp::app::dns::DNS>);
+static_assert(!std::is_constructible_v<acpp::app::dns::DNS,
+    net::io_context&, const acpp::app::dns::Config&>);
+static_assert(!HasSyncCacheStats<acpp::app::dns::DNS>);
 
 enum class Failure { None, Query, ResultCopy };
 
@@ -184,6 +194,52 @@ void TestDNSWorker() {
             "multiple caller executors must receive owned answers from one DNS Worker");
 }
 
+void TestDNSRemoteInputOwnership() {
+    net::io_context main_context;
+    net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
+    acpp::app::dns::Config config;
+    config.servers = {sink.local_endpoint()};
+    acpp::app::dns::DNSWorker worker(main_context, config, 8);
+    acpp::app::dns::DNS client(worker);
+    std::string domain = "192.0.2.1";
+    auto task = client.Resolve(domain);
+    // The remote facade must capture owned input before the task is scheduled.
+    // Reusing the caller's storage must not change the submitted DNS request.
+    domain.assign("192.0.2.2");
+    bool completed = false;
+    std::exception_ptr failure;
+    DnsResult answer;
+    net::co_spawn(main_context, std::move(task),
+        [&](std::exception_ptr error, DnsResult result) {
+            failure = error;
+            answer = std::move(result);
+            completed = true;
+        });
+    main_context.run();
+    Require(completed && !failure && answer.Ok() && answer.addresses.size() == 1 &&
+                answer.addresses.front() == net::ip::make_address("192.0.2.1"),
+            "remote DNS facade must own its input at task creation");
+}
+
+void TestDNSClientLifetime() {
+    net::io_context main_context;
+    net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
+    acpp::app::dns::Config config;
+    config.servers = {sink.local_endpoint()};
+    acpp::app::dns::DNSWorker worker(main_context, config, 8);
+    // The facade must not be captured in a deferred coroutine: the task only
+    // needs its input and the DNSWorker, not this already-destroyed client.
+    auto task = acpp::app::dns::DNS(worker).Resolve("192.0.2.3");
+    bool resolved = false;
+    net::co_spawn(main_context, std::move(task),
+        [&](std::exception_ptr error, DnsResult result) {
+            resolved = !error && result.Ok() && result.addresses.size() == 1 &&
+                result.addresses.front() == net::ip::make_address("192.0.2.3");
+        });
+    main_context.run();
+    Require(resolved, "DNS tasks must not borrow the lightweight client facade");
+}
+
 void TestDNSWorkerCancellation() {
     net::io_context caller;
     net::ip::udp::socket sink(caller, {net::ip::address_v4::loopback(), 0});
@@ -205,7 +261,7 @@ void TestDNSWorkerCancellation() {
     Require(completed, "cancellation must stop waiting for the main control Worker's DNS service");
 }
 
-void TestDNSWorkerCapacity() {
+void TestDNSWorkerCapacity(bool stats_request) {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
     acpp::app::dns::Config config;
@@ -233,24 +289,46 @@ void TestDNSWorkerCapacity() {
     sink.async_receive_from(net::buffer(query), sender,
         [&](const acpp::IoErrorCode& error, size_t) {
             if (error) return;
-            net::co_spawn(main_context, client.Resolve("192.0.2.4"),
-                [&](std::exception_ptr error, DnsResult result) {
-                    failure = error;
-                    rejected = result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
-                    cancel.emit(net::cancellation_type::terminal);
-                    watchdog.cancel();
-                });
+            if (stats_request) {
+                net::co_spawn(main_context, worker.GetCacheStats(),
+                    [&](std::exception_ptr error, acpp::app::dns::DnsCacheStats) {
+                        failure = error;
+                        try {
+                            if (error) std::rethrow_exception(error);
+                        } catch (const acpp::WorkerMailboxFull&) {
+                            rejected = true;
+                            failure = {};
+                        } catch (...) {}
+                        cancel.emit(net::cancellation_type::terminal);
+                        watchdog.cancel();
+                    });
+            } else {
+                net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+                    [&](std::exception_ptr error, DnsResult result) {
+                        failure = error;
+                        rejected = result.error == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+                        cancel.emit(net::cancellation_type::terminal);
+                        watchdog.cancel();
+                    });
+            }
         });
     main_context.run();
     Require(owner_done && !failure && rejected,
-            "a full DNS mailbox must reject rather than queue another query");
+            "a full DNS mailbox must reject rather than queue a lookup or stats request");
 
     main_context.restart();
     bool recovered = false;
-    net::co_spawn(main_context, client.Resolve("192.0.2.4"),
-        [&](std::exception_ptr error, DnsResult result) {
-            recovered = !error && result.Ok();
-        });
+    if (stats_request) {
+        net::co_spawn(main_context, worker.GetCacheStats(),
+            [&](std::exception_ptr error, acpp::app::dns::DnsCacheStats) {
+                recovered = !error;
+            });
+    } else {
+        net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+            [&](std::exception_ptr error, DnsResult result) {
+                recovered = !error && result.Ok();
+            });
+    }
     main_context.run();
     Require(recovered, "cancellation must release the DNS mailbox slot");
 }
@@ -278,8 +356,11 @@ int main() {
         TestCompletion(Failure::ResultCopy);
         TestSubscriberCancellation();
         TestDNSWorker();
+        TestDNSRemoteInputOwnership();
+        TestDNSClientLifetime();
         TestDNSWorkerCancellation();
-        TestDNSWorkerCapacity();
+        TestDNSWorkerCapacity(false);
+        TestDNSWorkerCapacity(true);
     } catch (const std::exception& error) {
         fail_size = 0;
         std::cerr << error.what() << '\n';

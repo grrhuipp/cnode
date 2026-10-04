@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 USER = uuid.UUID('b831381d-6324-4d53-ad4f-8cda48b30811')
+SECOND_USER = uuid.UUID('c942492e-7435-5e64-be5f-9ddb59c41922')
 
 
 class SilentDns(asyncio.DatagramProtocol):
@@ -29,6 +30,34 @@ class SilentDns(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, peer):
         self.requests += 1
+
+
+class GatedReplyPeer(asyncio.DatagramProtocol):
+    """Hold replies until the test has observed every request in a round."""
+    def __init__(self):
+        self.transport = None
+        self.requests = asyncio.Queue()
+        self.received = []
+        self.errors = []
+        self.delayed = []
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, peer):
+        self.received.append(len(data))
+        self.requests.put_nowait((data, peer))
+
+    async def next_round(self, expected_payloads):
+        observed = [await asyncio.wait_for(self.requests.get(), 4)
+                    for _ in expected_payloads]
+        by_payload = {payload: address for payload, address in observed}
+        if len(by_payload) != len(observed) or set(by_payload) != set(expected_payloads):
+            raise AssertionError(f'peer round mismatch: {observed!r}')
+        return by_payload
+
+    def reply(self, address, payload):
+        self.transport.sendto(payload, address)
 
 
 class EchoPeer(asyncio.DatagramProtocol):
@@ -88,14 +117,14 @@ class Client:
         self.response_header = False
 
     @classmethod
-    async def connect(cls, port, target_host, target_port):
+    async def connect(cls, port, target_host, target_port, user=USER):
         reader, writer = await asyncio.open_connection('127.0.0.1', port)
         if target_host == '127.0.0.1':
             address = b'\1\x7f\0\0\1'
         else:
             name = target_host.encode('ascii')
             address = b'\2' + bytes([len(name)]) + name
-        writer.write(b'\0' + USER.bytes + b'\0\2' + struct.pack('!H', target_port) + address)
+        writer.write(b'\0' + user.bytes + b'\0\2' + struct.pack('!H', target_port) + address)
         await writer.drain()
         return cls(reader, writer)
 
@@ -148,7 +177,8 @@ async def run_case(binary, output, protocol, mode):
     if mode in ('dns_timeout', 'shared_cancel'):
         dns_transport, _ = await loop.create_datagram_endpoint(lambda: dns, local_addr=('127.77.0.2', 0))
     dns_server = f'127.77.0.2:{dns_transport.get_extra_info("sockname")[1]}' if dns_transport else '127.77.0.2'
-    peer = EchoPeer(protocol, mode)
+    isolated = mode in ('isolation', 'isolation_cancel')
+    peer = GatedReplyPeer() if isolated else EchoPeer(protocol, mode)
     peer_transport, _ = await loop.create_datagram_endpoint(lambda: peer, local_addr=('127.0.0.1', 0))
     peer_port = peer_transport.get_extra_info('sockname')[1]
     with socket.socket() as reserved:
@@ -165,7 +195,9 @@ async def run_case(binary, output, protocol, mode):
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'udp-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
                            'port': inbound_port,
-                           'settings': {'clients': [{'id': str(USER)}]}}],
+                           'settings': {'clients': [{'id': str(USER)},
+                                                     {'id': str(SECOND_USER)}] if isolated else
+                                                    [{'id': str(USER)}]}}],
         'outbounds.json': [outbound],
         'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'udp-out'}]},
     }
@@ -211,6 +243,48 @@ async def run_case(binary, output, protocol, mode):
                     await survivor.send(payload)
                     await survivor.receive(payload)
                     result['survivor_after_cancel'] = len(payload)
+            elif isolated:
+                first = await Client.connect(inbound_port, '127.0.0.1', peer_port)
+                second = await Client.connect(inbound_port, '127.0.0.1', peer_port, SECOND_USER)
+                clients.extend((first, second))
+                first_payload, second_payload = b'client-one-round-one', b'client-two-round-one'
+                await asyncio.gather(first.send(first_payload), second.send(second_payload))
+                first_round = await peer.next_round((first_payload, second_payload))
+                first_port = first_round[first_payload][1]
+                second_port = first_round[second_payload][1]
+                if first_port == second_port:
+                    raise AssertionError(f'isolated Freedom sessions shared peer source port {first_port}')
+                # Replies are intentionally sent in reverse request order. The peer
+                # waits for both flows, so timing cannot hide a shared-socket broadcast.
+                peer.reply(first_round[second_payload], b'reply-for-client-two')
+                await second.receive(b'reply-for-client-two')
+                peer.reply(first_round[first_payload], b'reply-for-client-one')
+                await first.receive(b'reply-for-client-one')
+                # Interleave a second round while both associations are alive;
+                # each must retain its own source port and have no stale packet.
+                next_first = b'client-one-round-two'
+                next_second = b'client-two-round-two'
+                await second.send(next_second)
+                await first.send(next_first)
+                second_round = await peer.next_round((next_first, next_second))
+                if (second_round[next_first][1] != first_port or
+                        second_round[next_second][1] != second_port):
+                    raise AssertionError('UDP association source port changed between rounds')
+                peer.reply(second_round[next_first], b'round-two-for-client-one')
+                await first.receive(b'round-two-for-client-one')
+                peer.reply(second_round[next_second], b'round-two-for-client-two')
+                await second.receive(b'round-two-for-client-two')
+                if mode == 'isolation_cancel':
+                    await close_writer(first.writer)
+                    first.writer = None
+                    next_payload = b'client-two-after-cancel'
+                    await second.send(next_payload)
+                    next_round = await peer.next_round((next_payload,))
+                    if next_round[next_payload][1] != second_port:
+                        raise AssertionError('surviving request changed its peer source port')
+                    peer.reply(next_round[next_payload], b'survivor-after-cancel')
+                    await second.receive(b'survivor-after-cancel')
+                result['peer_source_ports'] = [first_port, second_port]
             else:
                 client_type = NativeClient if mode.startswith('native_') else Client
                 client = await client_type.connect(inbound_port, '127.0.0.1',
@@ -246,7 +320,9 @@ async def run_case(binary, output, protocol, mode):
             result['dns_requests'] = dns.requests
             result['peer_packets'] = peer.received
             result['peer_errors'] = peer.errors
-            expected = ([] if mode == 'dns_timeout' else [4] if mode == 'late_reply'
+            expected = ([] if mode == 'dns_timeout' else
+                        [20, 20, 20, 20, 23] if mode == 'isolation_cancel' else
+                        [20, 20, 20, 20] if mode == 'isolation' else [4] if mode == 'late_reply'
                         else [13, 20480] if mode == 'shared_cancel'
                         else [14, 20480, 14] if sniffing else [14, 20480])
             result['passed'] = not peer.errors and peer.received == expected
@@ -278,7 +354,8 @@ async def run_case(binary, output, protocol, mode):
 async def main(args):
     results = []
     cases = [('shadowsocks', 'dns_timeout'), ('freedom', 'dns_timeout'),
-             ('freedom', 'shared_cancel'), ('freedom', 'echo'), ('shadowsocks', 'echo'),
+             ('freedom', 'shared_cancel'), ('freedom', 'isolation'),
+             ('freedom', 'isolation_cancel'), ('freedom', 'echo'), ('shadowsocks', 'echo'),
              ('freedom', 'late_reply'), ('shadowsocks', 'late_reply'),
              ('freedom', 'sniff_echo'), ('shadowsocks', 'sniff_echo'),
              ('freedom', 'native_sniff_echo'), ('shadowsocks', 'native_sniff_echo'),

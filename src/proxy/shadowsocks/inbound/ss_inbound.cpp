@@ -142,7 +142,8 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
 
-    if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
+        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -160,7 +161,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
-            if (limiter_) {
+            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
                 limiter_->OnAuthFailTracked(tag, client_ip);
             }
             stats_->OnError();
@@ -177,7 +178,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         const auto* matched = session_result->user;
         if (!matched) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
-            if (limiter_) {
+            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
                 limiter_->OnAuthFailTracked(tag, client_ip);
             }
             stats_->OnError();
@@ -298,12 +299,6 @@ proxy::shadowsocks::inbound::Handler::Process(
     const auto tag = request.tag;
     const auto client_ip = request.client_ip;
 
-    if (limiter_ && limiter_->GetLimiter().IsBanned(tag, client_ip)) {
-        LOG_NET_DEBUG("source={} rejected=ip_banned inbound={} network=udp",
-                      client_ip, tag);
-        return std::unexpected(ErrorCode::BLOCKED);
-    }
-
     auto users = validator_.FindUsersForTag(tag);
     if (users.empty()) {
         return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -314,9 +309,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
         udp_replay_cache_);
     if (!decoded) {
-        if (limiter_) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
-        }
+        // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 

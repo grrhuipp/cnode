@@ -433,7 +433,7 @@ public:
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        co_return co_await inner_->AsyncWrite(buffer);
+        return inner_->AsyncWrite(buffer);
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -444,12 +444,12 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        co_await inner_->WriteMultiBuffer(std::move(mb));
+        return inner_->WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        co_await inner_->WriteBuffers(buffers);
+        return inner_->WriteBuffers(buffers);
     }
 
     void ShutdownRead() override {
@@ -3134,7 +3134,7 @@ public:
     }
 
     net::awaitable<bool> WriteRawEndSerialized(uint32_t stream_id) {
-        co_return co_await WriteRawDataSerialized(stream_id, {}, true);
+        return WriteRawDataSerialized(stream_id, {}, true);
     }
 
     net::awaitable<bool> WriteHttpResponseHeadersSerialized(

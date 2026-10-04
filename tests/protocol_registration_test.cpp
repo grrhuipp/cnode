@@ -22,13 +22,11 @@ static_assert(std::invocable<
     std::string_view,
     acpp::net::io_context&,
     acpp::app::dns::DNS&,
-    acpp::UDPSessionManager*,
     std::chrono::seconds>);
 static_assert(!std::invocable<
     OutboundCreator&,
     acpp::net::io_context&,
     acpp::app::dns::DNS&,
-    acpp::UDPSessionManager*,
     std::chrono::seconds>);
 
 template <typename Exception, typename Function>
@@ -147,7 +145,6 @@ CreateOutboundConfig(
         [](std::string_view tag,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           acpp::UDPSessionManager*,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>(std::string(tag));
         }};
@@ -160,7 +157,6 @@ CreateMismatchedOutboundConfig(
         [](std::string_view,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           acpp::UDPSessionManager*,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>("wrong-tag");
         }};
@@ -173,7 +169,6 @@ CreateNullOutboundConfig(
         [](std::string_view,
            acpp::net::io_context&,
            acpp::app::dns::DNS&,
-           acpp::UDPSessionManager*,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return nullptr;
         }};
@@ -355,7 +350,7 @@ bool TestOutboundRegistration() {
     acpp::net::io_context io_context;
     acpp::app::dns::DNS dns;
     auto handler = acpp::proxyman::outbound::NewHandler(
-        *prepared, io_context, dns, nullptr, std::chrono::seconds(1));
+        *prepared, io_context, dns, std::chrono::seconds(1));
     if (!handler || handler->Tag() != source.tag) {
         return false;
     }
@@ -366,7 +361,7 @@ bool TestOutboundRegistration() {
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns, nullptr,
+                *prepared, io_context, dns,
                 std::chrono::seconds(1));
         })) {
         return false;
@@ -378,7 +373,7 @@ bool TestOutboundRegistration() {
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns, nullptr,
+                *prepared, io_context, dns,
                 std::chrono::seconds(1));
         })) {
         return false;
@@ -388,7 +383,7 @@ bool TestOutboundRegistration() {
     missing_creator.tag = "missing-runtime-creator";
     if (!Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                missing_creator, io_context, dns, nullptr,
+                missing_creator, io_context, dns,
                 std::chrono::seconds(1));
         })) {
         return false;

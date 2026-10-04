@@ -402,8 +402,8 @@ public:
             tail = buffer;
             if (remaining == 0) break;
         }
-        const bool coalesce = split_source && tail && !tail->HasUDP() &&
-            tail->Available() + tail->start >= remaining;
+        const bool coalesce = split_source && !split_source->HasUDP() && tail &&
+            !tail->HasUDP() && tail->Available() + tail->start >= remaining;
         BufferGuard split;
         if (split_source && !coalesce) {
             split = BufferGuard{Buffer::New()};
@@ -411,8 +411,14 @@ public:
             std::memcpy(split->Tail().data(), split_source->Bytes().data(), remaining);
             split->Produce(static_cast<uint32_t>(remaining));
         }
-        try { dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes); }
-        catch (const std::bad_alloc&) { return false; }
+        try {
+            if (split_source && split_source->HasUDP()) {
+                split->SetUDP(split_source->UDP());
+            }
+            dst.ReserveAdditional(whole_buffers + (split ? 1 : 0), bytes);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
 
         size_t drained = 0;
         size_t transferred = 0;

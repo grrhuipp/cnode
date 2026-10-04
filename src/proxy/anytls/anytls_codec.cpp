@@ -319,12 +319,6 @@ WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8
 }
 
 net::awaitable<std::expected<void, ErrorCode>>
-WriteFrameBody(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::Buffer& body) {
-    const auto body_bytes = body.Bytes();
-    co_return co_await WriteFrame(stream, cmd, sid, body_bytes);
-}
-
-net::awaitable<std::expected<void, ErrorCode>>
 WritePacketWithPadding(AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,

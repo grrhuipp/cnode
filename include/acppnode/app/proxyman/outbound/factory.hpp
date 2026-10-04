@@ -8,10 +8,6 @@
 #include <string>
 #include <vector>
 
-namespace acpp {
-class UDPSessionManager;
-}  // namespace acpp
-
 namespace acpp::proxyman::outbound {
 
 // Prepared configs are runtime invariants. Construction failures throw;
@@ -20,7 +16,6 @@ namespace acpp::proxyman::outbound {
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,
     ::acpp::app::dns::DNS& dns,
-    ::acpp::UDPSessionManager* udp_mgr,
     std::chrono::seconds dial_timeout);
 
 [[nodiscard]] bool HasProxy(std::string_view protocol);

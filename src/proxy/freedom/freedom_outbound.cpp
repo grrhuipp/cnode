@@ -6,8 +6,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
 #include "../../app/proxyman/outbound/registration.hpp"
-#include "acppnode/app/udp_session.hpp"
-#include "acppnode/app/udp_channel.hpp"
+#include "outbound/udp_request.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
@@ -163,15 +162,6 @@ net::ip::address SelectUdpBindAddress(
     return net::ip::address_v4::any();
 }
 
-std::string MakeUdpSessionId(const net::ip::address& bind_addr) {
-    const auto text = bind_addr.to_string();
-    std::string session_id;
-    session_id.reserve(4 + text.size());
-    session_id.append("udp-");
-    session_id.append(text);
-    return session_id;
-}
-
 OutboundTransportTarget::BindMode ToTransportBindMode(OutboundBind::Mode mode) {
     switch (mode) {
         case OutboundBind::Mode::None:
@@ -192,12 +182,10 @@ Handler::Handler(
     const std::string& tag,
     const FreedomSettings& settings,
     ::acpp::app::dns::DNS& dns_service,
-    UDPSessionManager* udp_session_manager,
     std::chrono::seconds dial_timeout)
     : tag_(tag)
     , settings_(settings)
     , dns_service_(dns_service)
-    , udp_session_manager_(udp_session_manager)
     , dial_timeout_(dial_timeout) {
     if (!settings_.redirect.empty()) {
         auto redir = TargetAddress::Parse(settings_.redirect);
@@ -207,10 +195,6 @@ Handler::Handler(
         }
     }
 
-    if (settings_.send_through.GetMode() == OutboundBind::Mode::Explicit) {
-        explicit_udp_session_id_ =
-            MakeUdpSessionId(*settings_.send_through.ExplicitAddress());
-    }
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
@@ -234,35 +218,33 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         if (!settings_.enable_udp) {
             co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
         }
-        std::expected<std::shared_ptr<UDPSession>, ErrorCode> session_result;
+        auto bind_address = SelectUdpBindAddress(settings_, ctx);
+        if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto selected = settings_.send_through.Select(
+                bind_address, ctx.inbound.source_ip, ctx.inbound.source_port);
+            if (selected.address) bind_address = *selected.address;
+        }
+        std::optional<UdpRequest> target;
         try {
-            session_result = AcquireUdpSession(ctx);
-        } catch (const std::exception& e) {
-            // Dispatcher owns the terminal warning for a failed outbound
-            // Process call. Keep the lower-level cause available at debug
-            // level without emitting a second warning for the same session.
-            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} -> {} via {} > {}",
-                           ctx.inbound.source_ip, ctx.outbound.target,
-                           ctx.outbound.tag, e.what());
-            co_return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
+            target.emplace(io_context, dns_service_, bind_address);
+        } catch (const transport::LinkError& e) {
+            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
+                           ctx.outbound.target, bind_address.to_string(), e.what());
+            co_return std::unexpected(e.code());
+        } catch (const IoSystemError& e) {
+            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
+                           ctx.outbound.target, bind_address.to_string(), e.what());
+            co_return std::unexpected(MapAsioError(e.code()));
         }
-        if (!session_result) {
-            LOG_CONN_DEBUG(ctx, "failed to dial UDP {} -> {} via {}",
-                           ctx.inbound.source_ip, ctx.outbound.target,
-                           ctx.outbound.tag);
-            co_return std::unexpected(session_result.error());
-        }
-        std::shared_ptr<UDPSession> session = std::move(*session_result);
-        UDPChannel target(io_context, std::move(session));
-        target.SetIdleTimeout(relay_idle_timeout);
-        target.SetWriteTimeout(relay_write_timeout);
+        target->SetIdleTimeout(relay_idle_timeout);
+        target->SetWriteTimeout(relay_write_timeout);
         if (inbound.control) {
             co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-                *inbound.control, target, ctx, stats, relay_config,
+                *inbound.control, *target, ctx, stats, relay_config,
                 std::move(first_payload));
         }
         co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
-            target, ctx, stats, relay_config, std::move(first_payload));
+            *target, ctx, stats, relay_config, std::move(first_payload));
     }
 
     // redirect：替换目标地址（Xray freedom redirect 语义）
@@ -402,43 +384,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     co_return co_await DoRelayLink(
         io_context, *inbound.reader, *inbound.writer,
         *stream, ctx, stats, relay_config, std::move(first_payload));
-}
-
-std::expected<std::shared_ptr<UDPSession>, ErrorCode>
-Handler::AcquireUdpSession(session::Context& ctx) {
-    // Per-worker UDP session：同一 Worker 上同一出口 IP 共享一个 UDP socket。
-    net::ip::address bind_addr_storage;
-    std::string session_id_storage;
-    const net::ip::address* bind_addr = nullptr;
-    const std::string* session_id = nullptr;
-    if (settings_.send_through.GetMode() == OutboundBind::Mode::Explicit &&
-        explicit_udp_session_id_) {
-        bind_addr = &*settings_.send_through.ExplicitAddress();
-        session_id = &*explicit_udp_session_id_;
-    } else {
-        bind_addr_storage = SelectUdpBindAddress(settings_, ctx);
-        if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
-            const auto selected = settings_.send_through.Select(
-                bind_addr_storage, ctx.inbound.source_ip, ctx.inbound.source_port);
-            if (selected.address) bind_addr_storage = *selected.address;
-        }
-        session_id_storage = MakeUdpSessionId(bind_addr_storage);
-        bind_addr = &bind_addr_storage;
-        session_id = &session_id_storage;
-    }
-
-    if (!udp_session_manager_) {
-        LOG_NET_WARN("Freedom UDP: UDPSessionManager not available");
-        return std::unexpected(ErrorCode::OUTBOUND_CONNECTION_FAILED);
-    }
-
-    auto session = udp_session_manager_->AcquireSession(*session_id, *bind_addr);
-    if (!session) {
-        return std::unexpected(session.error());
-    }
-
-    LOG_CONN_DEBUG(ctx, "Freedom UDP session {} port {}", *session_id, (*session)->LocalPort());
-    return *session;
 }
 
 net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
@@ -588,10 +533,9 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 std::string_view tag,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
-                acpp::UDPSessionManager* udp_mgr,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
-                    std::string(tag), settings, dns, udp_mgr, timeout);
+                    std::string(tag), settings, dns, timeout);
             }};
     }), true);
 }  // namespace

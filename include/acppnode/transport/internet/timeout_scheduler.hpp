@@ -3,6 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -59,6 +60,15 @@ class TimeoutScheduler {
 public:
     using Callback = std::move_only_function<void()>;
 
+    struct ResourceStats {
+        std::size_t active_events = 0;
+        std::size_t heap_entries = 0;
+        std::size_t heap_capacity = 0;
+        std::size_t event_buckets = 0;
+        std::size_t ready_events = 0;
+        bool wait_pending = false;
+    };
+
     // 获取 io_context 对应的分片（同一 io_context 复用同一调度器）。
     // Worker 线程命中 thread_local 缓存后不走全局锁。
     [[nodiscard]] static TimeoutScheduler& ForIoContext(net::io_context& io_context);
@@ -86,6 +96,9 @@ public:
     // Erases the callback without allocating or re-arming the timer. Safe for
     // owner destruction and reentrant cancellation within a callback batch.
     void Cancel(TimeoutToken& token) noexcept;
+
+    // Cold-path, owner-thread-only observation. No synchronization or allocation.
+    [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 
 private:
     friend class TimeoutSchedulerService;

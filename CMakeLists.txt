@@ -57,6 +57,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 get_property(CNODE_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 
+# Source and dependency headers are UTF-8. Never let the host ANSI code page
+# reinterpret comment bytes as line continuations or corrupt string literals.
+add_compile_options($<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+
 # ============================================================================
 # LTO（链接时优化）— Release 模式启用
 # ============================================================================
@@ -245,6 +249,7 @@ set(CNODE_SOURCES
 
     # Infra (logging, config)
     src/infra/log.cpp
+    src/infra/runtime_failure.cpp
     src/infra/json.cpp
     src/infra/config.cpp
     src/infra/routing_ip_network.cpp
@@ -272,6 +277,7 @@ set(CNODE_SOURCES
     src/transport/internet/outbound_bind.cpp
 
     # Transport - Internet
+    src/transport/internet/datagram_socket.cpp
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
     src/transport/internet/tls_client_context.cpp
@@ -300,6 +306,7 @@ set(CNODE_SOURCES
     src/app/proxyman/inbound/manager.cpp
     src/app/worker/tcp_listener.cpp
     src/app/worker/udp_ingress.cpp
+    src/app/worker/udp_association_reclaimer.cpp
     src/app/proxyman/inbound/user_store.cpp
     src/app/proxyman/outbound/factory.cpp
     src/app/proxyman/outbound/manager.cpp
@@ -323,15 +330,12 @@ set(CNODE_SOURCES
     src/app/bootstrap_shutdown.cpp
     src/app/bootstrap_setup.cpp
     src/app/startup_inbounds.cpp
-    src/app/udp_channel.cpp      # Worker-local UDP request endpoint
     src/app/session_tracking.cpp
     src/proxy/mux/inbound/mux_inbound.cpp
     src/common/rule.cpp
     src/common/session.cpp
     src/common/sharded_user_stats.cpp
     src/app/stats.cpp
-    src/app/udp_callback_router.cpp
-    src/app/udp_session.cpp
     src/app/bootstrap.cpp
 
     # Sniff
@@ -574,6 +578,29 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     add_test(NAME cnode_autosign_cert_test COMMAND cnode_autosign_cert_test)
+
+    add_executable(cnode_inbound_manager_public_surface_test
+        tests/inbound_manager_public_surface_test.cpp)
+    target_include_directories(cnode_inbound_manager_public_surface_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(cnode_inbound_manager_public_surface_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_inbound_manager_public_surface_test
+        COMMAND cnode_inbound_manager_public_surface_test)
+
+    add_executable(cnode_tls_public_surface_test tests/tls_public_surface_test.cpp)
+    target_include_directories(cnode_tls_public_surface_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cnode_tls_public_surface_test PRIVATE asio::asio crypto)
+    if(WIN32)
+        target_link_libraries(cnode_tls_public_surface_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_tls_public_surface_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_tls_public_surface_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_tls_public_surface_test COMMAND cnode_tls_public_surface_test)
 
     add_executable(cnode_tls_client_certificate_test
         tests/tls_client_certificate_test.cpp
@@ -1958,10 +1985,184 @@ if(CNODE_BUILD_TESTS)
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/tcp_read_buffer_contract_test.cmake)
 
+    add_executable(cnode_runtime_failure_test
+        tests/runtime_failure_test.cpp src/infra/runtime_failure.cpp)
+    target_include_directories(cnode_runtime_failure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(cnode_runtime_failure_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_runtime_failure_test COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_runtime_failure_test>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_failure_test.cmake)
+
+    # Instrument the real runtime, not a second listener implementation. Reuse
+    # production source/target settings; test-only cold seams vanish in cnode.
+    set(CNODE_UDP_LISTENER_RUNTIME_SOURCES ${CNODE_SOURCES})
+    list(REMOVE_ITEM CNODE_UDP_LISTENER_RUNTIME_SOURCES src/main.cpp)
+    add_executable(cnode_worker_udp_listener_runtime_test
+        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
+        tests/worker_udp_listener_runtime_test.cpp
+        tests/worker_udp_listener_runtime_new.cpp)
+    add_executable(cnode_worker_udp_retirement_runtime_test
+        ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
+        tests/worker_udp_retirement_runtime_test.cpp)
+    foreach(runtime_test IN ITEMS cnode_worker_udp_listener_runtime_test
+            cnode_worker_udp_retirement_runtime_test)
+        foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
+                COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
+            get_target_property(value cnode ${property})
+            if(value AND NOT value MATCHES "-NOTFOUND$")
+                set_property(TARGET ${runtime_test} PROPERTY ${property} "${value}")
+            endif()
+        endforeach()
+        if(CNODE_IO_URING)
+            add_dependencies(${runtime_test} cnode_liburing_static)
+        endif()
+    endforeach()
+    add_test(NAME cnode_worker_udp_retirement_runtime_test
+        COMMAND cnode_worker_udp_retirement_runtime_test)
+    add_test(NAME cnode_worker_udp_delayed_retirement_runtime_test
+        COMMAND cnode_worker_udp_retirement_runtime_test --delayed-retirement)
+    set_tests_properties(cnode_worker_udp_retirement_runtime_test
+        cnode_worker_udp_delayed_retirement_runtime_test PROPERTIES TIMEOUT 25)
+    target_compile_definitions(cnode_worker_udp_listener_runtime_test PRIVATE
+        CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT CNODE_TEST_ALLOCATOR_FAULT
+        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
+    target_compile_options(cnode_worker_udp_listener_runtime_test PRIVATE
+        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp>"
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fault.hpp>")
+    add_test(NAME cnode_worker_udp_listener_runtime_test
+        COMMAND cnode_worker_udp_listener_runtime_test)
+    add_test(NAME cnode_worker_udp_association_runtime_test
+        COMMAND cnode_worker_udp_listener_runtime_test --associations)
+    set_tests_properties(cnode_worker_udp_association_runtime_test PROPERTIES TIMEOUT 20)
+    add_test(NAME cnode_two_worker_udp_association_runtime_test
+        COMMAND cnode_worker_udp_listener_runtime_test --two-workers-associations)
+    set_tests_properties(cnode_two_worker_udp_association_runtime_test PROPERTIES TIMEOUT 20)
+    foreach(index RANGE 0 1)
+        add_test(NAME cnode_worker_udp_maintenance_${index}_fault_test
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
+                -DSCHEDULE_INDEX=${index}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_maintenance_fatal_test.cmake)
+        set_tests_properties(cnode_worker_udp_maintenance_${index}_fault_test PROPERTIES TIMEOUT 20)
+    endforeach()
+    add_test(NAME cnode_worker_udp_listener_prepare_std_fault_test
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_prepare_sweep_test.cmake)
+    add_test(NAME cnode_worker_udp_listener_prepare_pmr_fault_test
+        COMMAND cnode_worker_udp_listener_runtime_test --prepare-fault-pmr)
+    foreach(index RANGE 0 1)
+        add_test(NAME cnode_worker_udp_listener_spawn_${index}_fault_test
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
+                -DSPAWN_INDEX=${index}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_runtime_fatal_test.cmake)
+        set_tests_properties(cnode_worker_udp_listener_spawn_${index}_fault_test
+            PROPERTIES TIMEOUT 20 SKIP_REGULAR_EXPRESSION "SKIP: IPv6 unavailable")
+    endforeach()
+    add_test(NAME cnode_worker_udp_listener_ready_fault_test
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXECUTABLE=$<TARGET_FILE:cnode_worker_udp_listener_runtime_test>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_udp_listener_ready_fatal_test.cmake)
+    set_tests_properties(cnode_worker_udp_listener_ready_fault_test
+        PROPERTIES TIMEOUT 20 SKIP_REGULAR_EXPRESSION "SKIP: IPv6 unavailable")
+    add_test(NAME cnode_worker_udp_same_socket_cancel_test
+        COMMAND cnode_worker_udp_listener_runtime_test --same-socket-cancel)
+    set_tests_properties(cnode_worker_udp_same_socket_cancel_test PROPERTIES TIMEOUT 15)
+    set_tests_properties(cnode_worker_udp_listener_runtime_test
+        cnode_worker_udp_listener_prepare_std_fault_test
+        cnode_worker_udp_listener_prepare_pmr_fault_test
+        PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
+    add_executable(cnode_worker_udp_listener_oom_test
+        tests/worker_udp_listener_oom_test.cpp
+        tests/worker_udp_listener_new.cpp
+        src/app/worker/udp_ingress.cpp
+        src/app/worker/udp_association_reclaimer.cpp
+        src/transport/internet/timeout_scheduler.cpp
+        src/common/session.cpp
+        src/infra/runtime_failure.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_worker_udp_listener_oom_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+        ${concurrentqueue_SOURCE_DIR})
+    target_compile_definitions(cnode_worker_udp_listener_oom_test PRIVATE
+        CNODE_TEST_ALLOCATOR_FAULT ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING)
+    target_link_libraries(cnode_worker_udp_listener_oom_test PRIVATE asio::asio Threads::Threads cnode_zlib)
+    if(WIN32)
+        target_link_libraries(cnode_worker_udp_listener_oom_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_worker_udp_listener_oom_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_worker_udp_listener_oom_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>")
+    add_test(NAME cnode_worker_udp_listener_oom_test COMMAND cnode_worker_udp_listener_oom_test)
+    set_tests_properties(cnode_worker_udp_listener_oom_test PROPERTIES TIMEOUT 15)
+
+    add_executable(cnode_udp_association_reclaimer_test
+        tests/udp_association_reclaimer_test.cpp
+        src/app/worker/udp_ingress.cpp
+        src/app/worker/udp_association_reclaimer.cpp
+        src/transport/internet/timeout_scheduler.cpp
+        src/common/session.cpp
+        src/infra/runtime_failure.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_udp_association_reclaimer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+        ${concurrentqueue_SOURCE_DIR})
+    target_link_libraries(cnode_udp_association_reclaimer_test PRIVATE
+        asio::asio Threads::Threads cnode_zlib)
+    if(WIN32)
+        target_link_libraries(cnode_udp_association_reclaimer_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_udp_association_reclaimer_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_options(cnode_udp_association_reclaimer_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_udp_association_reclaimer_test COMMAND cnode_udp_association_reclaimer_test)
+    set_tests_properties(cnode_udp_association_reclaimer_test PROPERTIES TIMEOUT 15)
+
+    add_executable(cnode_udp_native_lifecycle_test
+        tests/udp_native_lifecycle_test.cpp
+        tests/udp_native_lifecycle_allocation.cpp
+        src/app/worker/udp_ingress.cpp
+        src/app/worker/udp_association_reclaimer.cpp
+        src/transport/internet/timeout_scheduler.cpp
+        src/common/session.cpp
+        src/infra/runtime_failure.cpp
+        src/infra/log.cpp)
+    target_include_directories(cnode_udp_native_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/app
+        ${concurrentqueue_SOURCE_DIR})
+    target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE
+        asio::asio Threads::Threads cnode_zlib)
+    if(WIN32)
+        target_link_libraries(cnode_udp_native_lifecycle_test PRIVATE ws2_32)
+        target_compile_definitions(cnode_udp_native_lifecycle_test PRIVATE _WIN32_WINNT=0x0A00)
+    endif()
+    target_compile_definitions(cnode_udp_native_lifecycle_test PRIVATE
+        ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING CNODE_TEST_UDP_NATIVE_LIFECYCLE_FAULT)
+    target_compile_options(cnode_udp_native_lifecycle_test PRIVATE
+        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp>"
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_native_lifecycle_allocation.hpp>"
+        "$<$<CXX_COMPILER_ID:MSVC>:/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
+        "$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-include${CMAKE_CURRENT_SOURCE_DIR}/tests/async_allocation_fault.hpp>"
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_udp_native_lifecycle_test COMMAND cnode_udp_native_lifecycle_test)
+    set_tests_properties(cnode_udp_native_lifecycle_test PROPERTIES TIMEOUT 15)
+
     add_executable(cnode_udp_socket_owner_test
         tests/udp_socket_owner_test.cpp
         src/app/worker/udp_ingress.cpp
+        src/app/worker/udp_association_reclaimer.cpp
+        src/transport/internet/timeout_scheduler.cpp
         src/common/session.cpp
+        src/infra/runtime_failure.cpp
         src/infra/log.cpp
     )
     target_include_directories(cnode_udp_socket_owner_test PRIVATE
@@ -1979,6 +2180,7 @@ if(CNODE_BUILD_TESTS)
         target_compile_definitions(
             cnode_udp_socket_owner_test PRIVATE _WIN32_WINNT=0x0A00)
     endif()
+    target_compile_definitions(cnode_udp_socket_owner_test PRIVATE CNODE_TEST_ALLOCATOR_FAULT)
     target_compile_options(cnode_udp_socket_owner_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
@@ -1987,34 +2189,64 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_udp_socket_owner_test
         COMMAND cnode_udp_socket_owner_test)
 
-    add_executable(cnode_udp_channel_test
-        tests/udp_channel_test.cpp
-        src/app/udp_channel.cpp
-        src/app/udp_session.cpp
-        src/app/udp_callback_router.cpp
-        src/app/dns/dns.cpp
-        src/app/dns/cache.cpp
-        src/transport/internet/timeout_scheduler.cpp
-        src/common/error.cpp
-        src/common/session.cpp
-        src/infra/log.cpp
-    )
-    target_include_directories(cnode_udp_channel_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${concurrentqueue_SOURCE_DIR}
-    )
-    target_link_libraries(cnode_udp_channel_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
-    if(WIN32)
-        target_link_libraries(cnode_udp_channel_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_udp_channel_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_udp_channel_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(NAME cnode_udp_channel_test COMMAND cnode_udp_channel_test)
-    set_tests_properties(cnode_udp_channel_test PROPERTIES TIMEOUT 30)
+    foreach(test IN ITEMS udp_request ss_udp_request)
+        add_executable(cnode_${test}_test
+            tests/${test}_test.cpp
+            src/transport/internet/datagram_socket.cpp
+            src/app/dns/dns.cpp
+            src/app/dns/cache.cpp
+            src/transport/internet/timeout_scheduler.cpp
+            src/common/error.cpp
+            src/common/session.cpp
+            src/infra/log.cpp
+        )
+        target_include_directories(cnode_${test}_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${concurrentqueue_SOURCE_DIR}
+        )
+        target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads cnode_zlib crypto)
+        if(test STREQUAL "ss_udp_request")
+            target_sources(cnode_${test}_test PRIVATE
+                src/proxy/shadowsocks/shadowsocks_protocol.cpp
+                src/proxy/shadowsocks/ss_udp.cpp
+            )
+            target_include_directories(cnode_${test}_test PRIVATE ${blake3_SOURCE_DIR}/c)
+            target_link_libraries(cnode_${test}_test PRIVATE cnode_blake3)
+        endif()
+        if(WIN32)
+            target_link_libraries(cnode_${test}_test PRIVATE ws2_32)
+            target_compile_definitions(cnode_${test}_test PRIVATE _WIN32_WINNT=0x0A00)
+        endif()
+        target_compile_options(cnode_${test}_test PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        )
+        add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
+        set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
+    endforeach()
+
+    foreach(test IN ITEMS connection_timeouts datagram_socket)
+        add_executable(cnode_${test}_test
+            tests/${test}_test.cpp
+            src/transport/internet/timeout_scheduler.cpp
+            src/common/error.cpp)
+        if(test STREQUAL "datagram_socket")
+            target_sources(cnode_${test}_test PRIVATE src/transport/internet/datagram_socket.cpp)
+        endif()
+        target_include_directories(cnode_${test}_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(cnode_${test}_test PRIVATE asio::asio Threads::Threads)
+        if(WIN32)
+            target_link_libraries(cnode_${test}_test PRIVATE ws2_32)
+            target_compile_definitions(cnode_${test}_test PRIVATE _WIN32_WINNT=0x0A00)
+        endif()
+        target_compile_options(cnode_${test}_test PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        add_test(NAME cnode_${test}_test COMMAND cnode_${test}_test)
+        set_tests_properties(cnode_${test}_test PROPERTIES TIMEOUT 30)
+    endforeach()
 
     add_executable(cnode_cancellation_source_test tests/cancellation_source_test.cpp)
     target_include_directories(cnode_cancellation_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -2188,31 +2420,6 @@ if(CNODE_BUILD_TESTS)
     add_test(NAME cnode_dispatcher_cancellation_test COMMAND cnode_dispatcher_cancellation_test)
     set_tests_properties(cnode_dispatcher_cancellation_test PROPERTIES TIMEOUT 20)
 
-    add_executable(cnode_udp_callback_router_test
-        tests/udp_callback_router_test.cpp
-        src/app/udp_callback_router.cpp
-    )
-    target_include_directories(cnode_udp_callback_router_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app
-    )
-    target_link_libraries(cnode_udp_callback_router_test PRIVATE
-        asio::asio
-        Threads::Threads
-    )
-    if(WIN32)
-        target_link_libraries(cnode_udp_callback_router_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_udp_callback_router_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_udp_callback_router_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(
-        NAME cnode_udp_callback_router_test
-        COMMAND cnode_udp_callback_router_test)
-
     add_executable(cnode_xhttp_packet_session_key_test
         tests/xhttp_packet_session_key_test.cpp
     )
@@ -2311,7 +2518,8 @@ if(CNODE_BUILD_TESTS)
     add_test(
         NAME cnode_timeout_scheduler_test
         COMMAND cnode_timeout_scheduler_test)
-    set_tests_properties(cnode_timeout_scheduler_test PROPERTIES TIMEOUT 10)
+    # Includes 1000 no-traffic PMR reclamation cycles on the same scheduler.
+    set_tests_properties(cnode_timeout_scheduler_test PROPERTIES TIMEOUT 30)
     add_test(
         NAME cnode_timeout_scheduler_contract_test
         COMMAND ${CMAKE_COMMAND}
@@ -2518,6 +2726,13 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_awaitable_task_group_test
         COMMAND cnode_awaitable_task_group_test)
     set_tests_properties(cnode_awaitable_task_group_test PROPERTIES TIMEOUT 10)
+
+    add_executable(cnode_process_resources_test tests/process_resources_test.cpp)
+    target_include_directories(cnode_process_resources_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_options(cnode_process_resources_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME cnode_process_resources_test COMMAND cnode_process_resources_test)
 
     add_executable(cnode_monitor_loop_test tests/monitor_loop_test.cpp)
     target_include_directories(cnode_monitor_loop_test PRIVATE
@@ -2794,7 +3009,7 @@ if(CNODE_BUILD_TESTS)
                 --binary $<TARGET_FILE:cnode>
                 --output ${CMAKE_CURRENT_BINARY_DIR}/udp_relay_integration_test)
         set_tests_properties(cnode_udp_relay_integration_test PROPERTIES TIMEOUT 90)
-        foreach(integration IN ITEMS dns_endpoint tls_cancellation)
+        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream)
             add_test(NAME cnode_${integration}_integration_test
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py
@@ -2802,6 +3017,8 @@ if(CNODE_BUILD_TESTS)
                     --output ${CMAKE_CURRENT_BINARY_DIR}/${integration}_integration_test)
             set_tests_properties(cnode_${integration}_integration_test PROPERTIES TIMEOUT 40)
         endforeach()
+        set_tests_properties(cnode_grpc_eof_integration_test
+            cnode_grpc_substream_integration_test PROPERTIES TIMEOUT 90)
         add_test(NAME cnode_tls_cancellation_partial_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_cancellation_integration.py

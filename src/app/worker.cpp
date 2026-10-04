@@ -1,5 +1,6 @@
 #include "acppnode/app/worker.hpp"
-#include "udp_receive_buffer.hpp"
+#include "worker/udp_receive_loop.hpp"
+#include "worker/udp_association_reclaimer.hpp"
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/traffic_types.hpp"
@@ -15,6 +16,7 @@
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/string_hash.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/runtime_failure.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/proxyman/inbound/manager.hpp"
@@ -26,7 +28,7 @@
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
-#include "acppnode/app/udp_session.hpp"
+#include "acppnode/transport/internet/datagram_socket.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
@@ -48,6 +50,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 
 namespace acpp {
 
@@ -59,6 +62,8 @@ struct Worker::ListenerSlot {
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_worker;
     std::optional<PortBinding> tcp_binding;
     std::optional<PortBinding> udp_binding;
+    // Keeps a stopped ingress alive until every native dispatch job completes.
+    std::unique_ptr<worker_detail::UdpIngress> retiring_udp;
 };
 
 struct Worker::ListenerState : worker_detail::UdpReplySink {
@@ -71,20 +76,20 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     memory::ThreadLocalUnorderedMap<std::string, std::string> udp_socket_tags;
     memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<worker_detail::UdpIngress>>
         udp_workers;
+    uint64_t udp_resource_drops = 0;
+    size_t udp_receive_loops = 0;
 
     [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
     [[nodiscard]] ListenerKeys CollectTcpListenerKeys(const std::string& tag) const;
     void StopListening(const std::string& tag,
                        ListenerKeys listener_keys) noexcept;
-    [[nodiscard]] bool StartUdpListening(
+    net::awaitable<bool> StartUdpListening(
         Worker& worker,
         const PortBinding& binding,
         std::unique_ptr<Inbound> handler);
     [[nodiscard]] ListenerKeys CollectUdpSocketKeys(const std::string& tag) const;
-    void ResetUdpListening(const std::string& tag,
-                           ListenerKeys socket_keys) noexcept;
-    void StopUdpListening(const std::string& tag,
-                          ListenerKeys socket_keys) noexcept;
+    net::awaitable<void> RetireUdpListening(
+        const std::string& tag, ListenerKeys socket_keys);
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
@@ -102,7 +107,6 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
         std::string socket_key,
-        std::string tag,
         worker_detail::UdpIngress::SocketPtr sock,
         ListenerSlot* listener_slot);
 
@@ -140,13 +144,13 @@ struct Worker::RuntimeState {
         , inbound_manager(std::make_unique<proxyman::inbound::Manager>(stats))
         , session_tracking(std::make_unique<app::SessionTrackingState>())
         , dns_service(std::make_unique<app::dns::DNS>(dns_worker))
-        , udp_session_manager(std::make_unique<UDPSessionManager>(
-              io_context,
-              *dns_service,
-              runtime_config.timeouts.SessionIdleTimeout()))
         , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
         , rule_manager(std::make_unique<rule::Manager>())
         , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
+
+    ~RuntimeState() {
+        if (udp_association_reclaimer) udp_association_reclaimer->Stop();
+    }
 
     [[nodiscard]] std::shared_ptr<const WorkerRuntimeConfig> Snapshot() const {
         return runtime_snapshot.load(std::memory_order_acquire);
@@ -177,16 +181,19 @@ struct Worker::RuntimeState {
     geo::GeoManager* geo_manager = nullptr;
     app::RequestLoadState request_load;
 
+    // Declared before the row owners: Stop precedes their teardown, but the
+    // reclaimer remains alive while all map-owned hooks are unlinked.
+    std::unique_ptr<worker_detail::UdpAssociationReclaimer> udp_association_reclaimer;
     std::unique_ptr<ListenerState> listener_state;
     std::unique_ptr<proxyman::inbound::Manager> inbound_manager;
     std::unique_ptr<app::SessionTrackingState> session_tracking;
     std::unique_ptr<app::dns::DNS> dns_service;
-    std::unique_ptr<UDPSessionManager> udp_session_manager;
     std::unique_ptr<proxyman::outbound::Manager> outbound_manager;
     std::unique_ptr<app::router::Router> router;
     std::unique_ptr<rule::Manager> rule_manager;
     std::unique_ptr<app::dispatcher::DefaultDispatcher> dispatcher;
     bool started = false;
+    bool cold_mutation_active = false;
     WorkerMemoryReclaimer memory_reclaimer;
 };
 
@@ -194,6 +201,24 @@ namespace {
 
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
+
+class ColdMutationGuard {
+public:
+    explicit ColdMutationGuard(bool& active) : active_(active) {
+        if (active_) {
+            throw std::system_error(
+                std::make_error_code(std::errc::device_or_resource_busy),
+                "Worker cold mutation busy");
+        }
+        active_ = true;
+    }
+    ~ColdMutationGuard() { active_ = false; }
+    ColdMutationGuard(const ColdMutationGuard&) = delete;
+    ColdMutationGuard& operator=(const ColdMutationGuard&) = delete;
+
+private:
+    bool& active_;
+};
 
 std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
     std::string key;
@@ -247,7 +272,10 @@ void Worker::RuntimeState::Start(Worker& worker) {
         return;
     }
 
-    memory_reclaimer.Start(TimeoutScheduler::ForIoContext(io_context));
+    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
+    memory_reclaimer.Start(scheduler);
+    udp_association_reclaimer =
+        std::make_unique<worker_detail::UdpAssociationReclaimer>(scheduler);
     dispatcher->BindRequestPolicy(*rule_manager);
     dispatcher->BindSessionTracking(*session_tracking);
     dispatcher->BindDnsService(*dns_service);
@@ -256,10 +284,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
     InitOutbounds(worker, config->outbounds);
     dispatcher->BindOutboundManager(*outbound_manager);
     InitRouter(worker, config->routing, geo_manager);
-    udp_session_manager->StartCleanup();
     started = true;
-    LOG_DEBUG("Worker[{}]: UDP session manager initialized (timeout={}s)",
-              worker.id_, config->timeouts.SessionIdleTimeout().count());
 }
 
 void Worker::RuntimeState::InitOutbounds(
@@ -272,8 +297,7 @@ void Worker::RuntimeState::InitOutbounds(
     for (const auto& prepared_outbound : outbounds) {
         auto handler = proxyman::outbound::NewHandler(
             prepared_outbound, worker.runtime_->io_context,
-            *dns_service, udp_session_manager.get(),
-            dial_timeout);
+            *dns_service, dial_timeout);
 
         if (!outbound_manager->AddHandler(std::move(handler))) {
             throw std::logic_error(
@@ -529,35 +553,39 @@ Worker::ListenerState::CollectUdpSocketKeys(const std::string& tag) const {
     return socket_keys;
 }
 
-void Worker::ListenerState::ResetUdpListening(
-    const std::string& tag,
-    ListenerKeys socket_keys) noexcept {
-    for (const auto& socket_key : socket_keys) {
-        if (auto* udp_worker = FindUdpWorkerBySocketKey(socket_key)) {
-            udp_worker->CloseSocket(socket_key);
+net::awaitable<void> Worker::ListenerState::RetireUdpListening(
+    const std::string& tag, ListenerKeys socket_keys) {
+    auto slot_it = listener_slots.find(tag);
+    auto worker_it = udp_workers.find(tag);
+    if (worker_it != udp_workers.end() && worker_it->second) {
+        if (slot_it == listener_slots.end() || slot_it->second.retiring_udp) {
+            FailRuntime("udp-retirement", "missing or occupied retiring UDP slot");
         }
+        slot_it->second.retiring_udp = std::move(worker_it->second);
+    }
+    if (worker_it != udp_workers.end()) worker_it->second.reset();
 
+    // Retire authoritative listener lookup before cancellation. RequestStop
+    // marks the whole ingress stopping before it closes any owned socket.
+    for (const auto& socket_key : socket_keys) {
         udp_socket_tags.erase(socket_key);
     }
+    // Preserve preparation's reserved capacity through replacement commit.
+    if (slot_it != listener_slots.end()) slot_it->second.udp_binding.reset();
 
-    MaybeShrinkHashContainer(udp_socket_tags, 8);
-    if (auto it = udp_workers.find(tag); it != udp_workers.end()) {
-        if (it->second) {
-            it->second->Close();
+    if (slot_it != listener_slots.end() && slot_it->second.retiring_udp) {
+        auto& retiring = *slot_it->second.retiring_udp;
+        retiring.RequestStop();
+        try {
+            co_await retiring.AsyncJoin();
+        } catch (const std::exception& error) {
+            FailRuntime("udp-join", error.what());
+        } catch (...) {
+            FailRuntime("udp-join", "unknown UDP native-job join failure");
         }
-        it->second.reset();
+        slot_it->second.retiring_udp.reset();
     }
-    if (auto slot_it = listener_slots.find(tag);
-            slot_it != listener_slots.end()) {
-        slot_it->second.udp_binding.reset();
-    }
-}
-
-void Worker::ListenerState::StopUdpListening(
-    const std::string& tag,
-    ListenerKeys socket_keys) noexcept {
-    ResetUdpListening(tag, std::move(socket_keys));
-    udp_workers.erase(tag);
+    co_return;
 }
 
 bool Worker::ListenerState::EnqueueUdpReply(
@@ -719,8 +747,13 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     ctx.worker_id = worker.id_;
     ctx.runtime_generation = runtime_snapshot->runtime_generation;
     ctx.config_generation = runtime_snapshot->config_generation;
-    ctx.inbound.tag      = listener.inbound_tag;
-    ctx.inbound.tags     = listener.RouteInboundTags();
+    ctx.inbound.tag = listener.inbound_tag;
+    if (const auto* route_tags = listener.RouteInboundTags()) {
+        ctx.inbound.tags.reserve(route_tags->size());
+        for (const auto& tag : *route_tags) {
+            ctx.inbound.tags.emplace_back(tag);
+        }
+    }
     const auto local_ep = tcp_stream->LocalEndpoint();
     if (!local_ep.address().is_unspecified()) {
         const auto local_addr = iputil::NormalizeAddress(local_ep.address());
@@ -754,6 +787,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
 // ============================================================================
 
 net::awaitable<bool> Worker::AddListenerTask(PortBinding binding) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     co_return runtime_->listener_state->StartListening(*this, binding);
 }
 
@@ -798,6 +832,7 @@ net::awaitable<bool> Worker::RegisterInboundTask(
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req,
     proxyman::inbound::ReceiverSettings receiver) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     co_return RegisterInboundOnWorkerThread(
         limiter, req, std::move(receiver));
 }
@@ -807,7 +842,7 @@ void Worker::AddOutboundOnWorkerThread(
     auto current_snapshot = runtime_->Snapshot();
     auto handler = proxyman::outbound::NewHandler(
         config, runtime_->io_context,
-        *runtime_->dns_service, runtime_->udp_session_manager.get(),
+        *runtime_->dns_service,
         current_snapshot->timeouts.DialTimeout());
 
     auto next_snapshot = memory::AllocateShared<WorkerRuntimeConfig>(*current_snapshot);
@@ -829,6 +864,7 @@ void Worker::AddOutboundOnWorkerThread(
 
 net::awaitable<void> Worker::AddOutboundTask(
     proxyman::outbound::PreparedOutboundConfig config) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     AddOutboundOnWorkerThread(std::move(config));
     co_return;
 }
@@ -844,37 +880,50 @@ void Worker::RemoveOutboundOnWorkerThread(std::string_view tag) {
 }
 
 net::awaitable<void> Worker::RemoveOutboundTask(std::string tag) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     RemoveOutboundOnWorkerThread(tag);
     co_return;
 }
 
-void Worker::UnregisterListenerOnWorkerThread(std::string_view tag) {
+net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     auto current_snapshot = runtime_->Snapshot();
-    const std::string owned_tag(tag);
     auto next_snapshot = memory::AllocateShared<WorkerRuntimeConfig>(*current_snapshot);
     RemoveInboundRuntimeFromSnapshot(*next_snapshot, tag);
-
     auto tcp_listener_keys =
-        runtime_->listener_state->CollectTcpListenerKeys(owned_tag);
+        runtime_->listener_state->CollectTcpListenerKeys(tag);
     auto udp_socket_keys =
-        runtime_->listener_state->CollectUdpSocketKeys(owned_tag);
+        runtime_->listener_state->CollectUdpSocketKeys(tag);
 
-    auto retiring = runtime_->inbound_manager->GetHandler(owned_tag);
-    runtime_->inbound_manager->RemoveHandler(owned_tag);
-    if (auto slot_it = runtime_->listener_state->listener_slots.find(owned_tag);
+    const auto cancel_throwing = co_await net::this_coro::throw_if_cancelled();
+    auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(net::error::operation_aborted);
+    }
+    co_await net::this_coro::throw_if_cancelled(false);
+    try {
+        runtime_->listener_state->StopListening(tag, std::move(tcp_listener_keys));
+        co_await runtime_->listener_state->RetireUdpListening(
+            tag, std::move(udp_socket_keys));
+    } catch (const std::exception& error) {
+        FailRuntime("udp-retirement", error.what());
+    } catch (...) {
+        FailRuntime("udp-retirement", "unknown UDP retirement failure");
+    }
+
+    runtime_->listener_state->udp_workers.erase(tag);
+    auto retiring = runtime_->inbound_manager->GetHandler(tag);
+    runtime_->inbound_manager->RemoveHandler(tag);
+    if (auto slot_it = runtime_->listener_state->listener_slots.find(tag);
             slot_it != runtime_->listener_state->listener_slots.end() &&
             slot_it->second.handler == retiring) {
         slot_it->second.handler.reset();
     }
-    runtime_->listener_state->StopListening(
-        owned_tag, std::move(tcp_listener_keys));
-    runtime_->listener_state->StopUdpListening(
-        owned_tag, std::move(udp_socket_keys));
     runtime_->StoreSnapshot(std::move(next_snapshot));
-}
-
-net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
-    UnregisterListenerOnWorkerThread(tag);
+    co_await net::this_coro::throw_if_cancelled(cancel_throwing);
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(net::error::operation_aborted);
+    }
     co_return;
 }
 
@@ -926,8 +975,8 @@ Worker::GetDetectResultTask(std::string tag) {
 Worker::MemoryStats Worker::GetMemoryStats() const {
     MemoryStats stats;
 
-    // DNS cache lives on the dedicated DNS Worker, not this data Worker.
-    stats.udp_sessions        = runtime_->udp_session_manager->ActiveSessionCount();
+    // Sample this Worker-owned transport state on its own event loop.
+    stats.udp_sockets        = transport::internet::DatagramSocket::ActiveCount();
     const auto pool = memory::ThreadPool().GetFootprint();
     stats.pool_mapped_bytes = pool.mapped_bytes;
     stats.pool_direct_bytes = pool.direct_bytes;
@@ -937,11 +986,45 @@ Worker::MemoryStats Worker::GetMemoryStats() const {
 }
 
 net::awaitable<Worker::RuntimeStatsSnapshot>
-Worker::CollectRuntimeStatsTask() const {
+Worker::CollectRuntimeStatsTask(bool include_resources) const {
     RuntimeStatsSnapshot snapshot;
     snapshot.memory = GetMemoryStats();
     snapshot.stats = runtime_->stats.Snapshot();
+    snapshot.worker_id = id_;
     snapshot.active_connections = runtime_->request_load.ActiveConnections();
+    if (!include_resources) co_return snapshot;
+    auto& resources = snapshot.resources.emplace();
+    resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
+    resources.udp_receive_loops = runtime_->listener_state->udp_receive_loops;
+    resources.udp_listeners = runtime_->listener_state->udp_socket_tags.size();
+    auto collect_udp = [&](const worker_detail::UdpIngress* ingress) {
+        if (!ingress) return;
+        const auto udp = ingress->GetResourceStats();
+        resources.udp_associations += udp.associations;
+        resources.udp_closed_associations += udp.closed_associations;
+        resources.udp_input_datagrams += udp.input_datagrams;
+        resources.udp_input_bytes += udp.input_bytes;
+        resources.udp_reply_datagrams += udp.reply_datagrams;
+        resources.udp_reply_bytes += udp.reply_bytes;
+        resources.udp_reply_senders += udp.active_reply_senders;
+        resources.udp_native_dispatches += udp.native_dispatches;
+    };
+    for (const auto& [tag, ingress] : runtime_->listener_state->udp_workers) {
+        (void)tag;
+        collect_udp(ingress.get());
+    }
+    for (const auto& [tag, slot] : runtime_->listener_state->listener_slots) {
+        (void)tag;
+        collect_udp(slot.retiring_udp.get());
+    }
+    const auto timeouts = TimeoutScheduler::ForIoContext(
+        runtime_->io_context).GetResourceStats();
+    resources.timeout_events = timeouts.active_events;
+    resources.timeout_heap_entries = timeouts.heap_entries;
+    resources.timeout_heap_capacity = timeouts.heap_capacity;
+    resources.timeout_event_buckets = timeouts.event_buckets;
+    resources.timeout_ready_events = timeouts.ready_events;
+    resources.timeout_waiters = timeouts.wait_pending ? 1 : 0;
     co_return snapshot;
 }
 
@@ -966,6 +1049,7 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
     PortBinding binding,
     ConnectionLimiterPtr limiter,
     proxyman::inbound::BuildRequest req) {
+    ColdMutationGuard mutation(runtime_->cold_mutation_active);
     auto result =
         runtime_->inbound_manager->NewDatagramHandler(limiter, req);
     switch (result.status) {
@@ -979,11 +1063,11 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
             }
             break;
     }
-    co_return runtime_->listener_state->StartUdpListening(
+    co_return co_await runtime_->listener_state->StartUdpListening(
         *this, binding, std::move(result.handler));
 }
 
-bool Worker::ListenerState::StartUdpListening(
+net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     Worker& worker,
     const PortBinding& binding,
     std::unique_ptr<Inbound> handler) {
@@ -994,7 +1078,7 @@ bool Worker::ListenerState::StartUdpListening(
             slot.udp_binding->listen.Overlaps(binding.listen)) {
             LOG_ERROR("Worker[{}]: UDP listener conflict tag={} owner={} port={}",
                       worker.id_, binding.tag, tag, binding.port);
-            return false;
+            co_return false;
         }
     }
 
@@ -1007,13 +1091,26 @@ bool Worker::ListenerState::StartUdpListening(
         existing_slot->second.udp_binding &&
         existing_slot->second.udp_binding->UsesSameSocket(binding) &&
         existing_worker != udp_workers.end() && existing_worker->second) {
-        return existing_worker->second->ReplaceHandler(std::move(handler));
+        auto cancellation = co_await net::this_coro::cancellation_state;
+        if (cancellation.cancelled() != net::cancellation_type::none)
+            throw IoSystemError(net::error::operation_aborted);
+        const bool replaced = existing_worker->second->ReplaceHandler(std::move(handler));
+        if (cancellation.cancelled() != net::cancellation_type::none)
+            throw IoSystemError(net::error::operation_aborted);
+        co_return replaced;
     }
 
+#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
+    worker_udp_listener_runtime_test::OnStage("prepare-listener", 0);
+#endif
+    if (!worker.runtime_->udp_association_reclaimer) {
+        throw std::logic_error("UDP listener runtime is not started");
+    }
     PortBinding committed_binding = binding;
     auto replacement_worker =
         std::make_unique<worker_detail::UdpIngress>(
-            binding.tag, std::move(handler));
+            binding.tag, std::move(handler), *worker.runtime_->udp_association_reclaimer,
+            worker.runtime_->io_context);
     ListenerKeys prepared_socket_keys;
     decltype(udp_socket_tags) prepared_socket_tags;
 
@@ -1073,6 +1170,14 @@ bool Worker::ListenerState::StartUdpListening(
         }
 #endif
 
+        // The OOM path must consume a datagram without allocating another
+        // async operation. Asio's synchronous receive requires user-level
+        // nonblocking mode, not merely native_non_blocking.
+        candidate_sock->non_blocking(true, ec);
+        if (ec) {
+            if (fail_candidate("set nonblocking", ec.message())) continue;
+            break;
+        }
         candidate_sock->bind(ep, ec);
         if (ec) {
             if (fail_candidate("bind", ec.message())) continue;
@@ -1096,128 +1201,160 @@ bool Worker::ListenerState::StartUdpListening(
     if (bound_count == 0) {
         LOG_ERROR("Worker[{}]: no UDP listener bound tag={} protocol={}",
                   worker.id_, binding.tag, binding.protocol);
-        return false;
+        co_return false;
     }
 
-    auto slot_it = listener_slots.try_emplace(binding.tag).first;
-    auto worker_it = udp_workers.try_emplace(binding.tag).first;
-    udp_socket_tags.reserve(
-        udp_socket_tags.size() + prepared_socket_tags.size());
-
-    if (replacing) {
-        LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
-        ResetUdpListening(binding.tag, CollectUdpSocketKeys(binding.tag));
-    } else if (worker_it->second) {
-        worker_it->second->Close();
-    }
-
-    worker_it->second = std::move(replacement_worker);
-    udp_socket_tags.merge(prepared_socket_tags);
-    auto& listener_slot = slot_it->second;
-    listener_slot.udp_binding = std::move(committed_binding);
-
-    for (const auto& socket_key : prepared_socket_keys) {
-        auto bound_sock = worker_it->second->FindSocket(socket_key);
-        if (!bound_sock) {
-            continue;
+    struct PreparedReceive {
+        std::string socket_key;
+        worker_detail::UdpIngress::SocketPtr socket;
+        net::awaitable<void> receive;
+    };
+    memory::ThreadLocalVector<PreparedReceive> prepared_receives;
+    auto retired_socket_keys =
+        (replacing || (existing_worker != udp_workers.end() && existing_worker->second))
+            ? CollectUdpSocketKeys(binding.tag) : ListenerKeys{};
+    ListenerSlotMap::iterator slot_it;
+    decltype(udp_workers)::iterator worker_it;
+    bool inserted_slot = false;
+    bool inserted_worker = false;
+    try {
+        auto slot_entry = listener_slots.try_emplace(binding.tag);
+        slot_it = slot_entry.first;
+        inserted_slot = slot_entry.second;
+        auto worker_entry = udp_workers.try_emplace(binding.tag);
+        worker_it = worker_entry.first;
+        inserted_worker = worker_entry.second;
+        udp_socket_tags.reserve(udp_socket_tags.size() + prepared_socket_tags.size());
+        prepared_receives.reserve(prepared_socket_keys.size());
+        for (const auto& socket_key : prepared_socket_keys) {
+            auto socket = replacement_worker->FindSocket(socket_key);
+            if (!socket) throw std::logic_error("prepared UDP socket is missing");
+            // Prepare frame and owned captures before retiring the old listener.
+            auto receive = UdpReceiveLoop(worker, socket_key, socket, &slot_it->second);
+            prepared_receives.push_back({socket_key, std::move(socket), std::move(receive)});
         }
-        net::co_spawn(worker.runtime_->io_context.get_executor(),
-                      UdpReceiveLoop(
-                          worker, socket_key, binding.tag,
-                          std::move(bound_sock), &listener_slot),
-                      [](std::exception_ptr) {});
+        if (replacing) {
+            LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
+        }
+    } catch (...) {
+        if (inserted_worker) udp_workers.erase(worker_it);
+        if (inserted_slot) listener_slots.erase(slot_it);
+        throw;
+    }
+#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
+    worker_udp_listener_runtime_test::FinishPreparation();
+#endif
+
+    const bool has_retiring_worker = worker_it->second != nullptr;
+    const bool cancel_throwing = co_await net::this_coro::throw_if_cancelled();
+    auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        if (inserted_worker) udp_workers.erase(worker_it);
+        if (inserted_slot) listener_slots.erase(slot_it);
+        throw IoSystemError(net::error::operation_aborted);
+    }
+    if (replacing || has_retiring_worker) {
+        co_await net::this_coro::throw_if_cancelled(false);
+        try {
+            co_await RetireUdpListening(binding.tag, std::move(retired_socket_keys));
+        } catch (const std::exception& error) {
+            FailRuntime("udp-retirement", error.what());
+        } catch (...) {
+            FailRuntime("udp-retirement", "unknown UDP retirement failure");
+        }
+    }
+    try {
+        worker_it->second = std::move(replacement_worker);
+        udp_socket_tags.merge(prepared_socket_tags);
+        auto& listener_slot = slot_it->second;
+        listener_slot.udp_binding = std::move(committed_binding);
+
+        for (size_t index = 0; index < prepared_receives.size(); ++index) {
+            auto& prepared = prepared_receives[index];
+            const auto& socket_key = prepared_socket_keys[index];
+            auto completion = [this, socket_key = std::move(prepared.socket_key),
+                               socket = std::move(prepared.socket)](std::exception_ptr error) {
+                --udp_receive_loops;
+                auto* current = FindUdpWorkerBySocketKey(socket_key);
+                if (!current || !current->OwnsSocket(socket_key, socket.get())) {
+                    return; // Formal retirement; never affect a replacement socket.
+                }
+                if (error) {
+                    try {
+                        std::rethrow_exception(error);
+                    } catch (const std::exception& failure) {
+                        FailRuntime("udp-receive", failure.what());
+                    } catch (...) {
+                        FailRuntime("udp-receive", "unknown receive loop failure");
+                    }
+                }
+                FailRuntime("udp-receive", "registered socket receive loop stopped");
+            };
+            ++udp_receive_loops;
+#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
+            worker_udp_listener_runtime_test::OnStage("spawn", index);
+#endif
+            net::co_spawn(worker.runtime_->io_context.get_executor(),
+                          std::move(prepared.receive), std::move(completion));
+#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
+            worker_udp_listener_runtime_test::ReportSuccessfulSpawn(index);
+            worker_udp_listener_runtime_test::OnStage("ready", index);
+#endif
 
 #ifdef _WIN32
-        LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
+            LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
                   worker.id_, socket_key, binding.tag, binding.protocol);
 #else
-        LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
+            LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, socket_key, binding.tag, binding.protocol);
 #endif
+        }
+    } catch (const std::exception& failure) {
+        // Includes commit, every spawn and readiness formatting. Retirement
+        // cannot be rolled back after any of these operations has begun.
+        FailRuntime("udp-listener-start", failure.what());
+    } catch (...) {
+        FailRuntime("udp-listener-start", "unknown listener commit/startup failure");
     }
-    return true;
+    co_await net::this_coro::throw_if_cancelled(cancel_throwing);
+    if (cancellation.cancelled() != net::cancellation_type::none) {
+        throw IoSystemError(net::error::operation_aborted);
+    }
+    co_return true;
 }
 
 // ============================================================================
 // UdpReceiveLoop — 通用 UDP 数据报收发主循环（协议无关）
 //
-// 设计参考 xray-core transport/internet/udp.Dispatcher：
-//   - Worker 只做 UDP socket 收发；inbound UDP datagram 处理下沉到私有 ingress。
-//   - 每个客户端 (IP:port) 由 UDP ingress 维护一个 transport::Link，首包创建后
-//     交给 dispatcher.Dispatch；路由、出站选择和 UDP relay 均在主链路内完成。
-//   - 会话空闲超过配置的 session idle 后关闭 link，relay 自然退出。
+// Worker binds current-owner checks and the existing Ingress -> Dispatcher
+// entry once. The private loop helper handles bytes only, not request policy.
+// This is a normal factory, not a second listener-lifetime coroutine frame.
 // ============================================================================
 
 net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
     std::string socket_key,
-    std::string tag,
     worker_detail::UdpIngress::SocketPtr sock,
     ListenerSlot* listener_slot) {
     const auto runtime_snapshot = worker.runtime_->Snapshot();
-    const auto session_idle_timeout = runtime_snapshot->timeouts.SessionIdleTimeout();
-
-    const auto find_current_worker = [&]() -> worker_detail::UdpIngress* {
-        auto* current = FindUdpWorkerBySocketKey(socket_key);
-        return current && current->OwnsSocket(socket_key, sock.get())
-            ? current
-            : nullptr;
+    auto is_owned = [this, socket_key](const worker_detail::UdpIngress::SocketPtr& socket) noexcept {
+        const auto* current = FindUdpWorkerBySocketKey(socket_key);
+        return current && current->OwnsSocket(socket_key, socket.get());
     };
-
-    while (true) {
-        auto* udp_worker = find_current_worker();
-        if (!udp_worker || !sock) co_return;
-
-        udp::endpoint client_ep;
-        auto [wait_ec] = co_await sock->async_wait(
-            udp::socket::wait_read,
-            net::as_tuple(net::use_awaitable));
-        udp_worker = find_current_worker();
-        if (!udp_worker) co_return;
-        if (wait_ec == io_error::operation_aborted) co_return;
-        if (wait_ec) {
-            continue;
-        }
-
-        IoErrorCode available_ec;
-        const size_t available_bytes = sock->available(available_ec);
-        if (available_ec) {
-            continue;
-        }
-
-        detail::UdpReceiveBuffer receive_buffer;
-        const auto storage = receive_buffer.Prepare(available_bytes);
-        if (storage.size() == 0) {
-            LOG_ERROR("Worker[{}]: UDP receive buffer allocation failed tag={}", worker.id_, tag);
-            co_return;
-        }
-        auto [ec, n] = co_await sock->async_receive_from(
-            storage, client_ep,
-            net::as_tuple(net::use_awaitable));
-
-        udp_worker = find_current_worker();
-        if (!udp_worker) co_return;
-        if (ec == io_error::operation_aborted) co_return;
-        if (ec || n == 0) {
-            continue;
-        }
-        const auto received = receive_buffer.Data(n);
-
-        // ── 懒清理空闲会话 ────────────────────────────────────────────────
-        const auto now = std::chrono::steady_clock::now();
-        udp_worker->CleanupIdleClientSessions(socket_key, now, session_idle_timeout);
-
-        const proxyman::inbound::ReceiverSettings* listener =
-            listener_slot && listener_slot->handler
-                ? &listener_slot->handler->ReceiverSettings()
-                : nullptr;
-
-        udp_worker->ProcessDatagram(worker_detail::UdpDatagramContext{
+    auto process_datagram = [this, &worker, socket_key = std::move(socket_key),
+                            socket = sock.get(), listener_slot,
+                            runtime_snapshot](
+        const udp::endpoint& client_ep, std::span<const uint8_t> received) {
+        auto* ingress = FindUdpWorkerBySocketKey(socket_key);
+        if (!ingress || !ingress->OwnsSocket(socket_key, socket)) return;
+        const auto* receiver = listener_slot && listener_slot->handler
+            ? &listener_slot->handler->ReceiverSettings() : nullptr;
+        ingress->ProcessDatagram(worker_detail::UdpDatagramContext{
             .socket_key = socket_key,
-            .sock = sock.get(),
+            .sock = socket,
             .client_endpoint = client_ep,
             .payload = received,
-            .receiver = listener,
+            .receiver = receiver,
             .io_context = worker.runtime_->io_context,
             .dispatcher = *worker.runtime_->dispatcher,
             .stats = worker.runtime_->stats,
@@ -1227,7 +1364,9 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .config_generation = runtime_snapshot->config_generation,
             .reply_sink = *this,
         });
-    }
+    };
+    return worker_detail::RunUdpReceiveLoop(
+        std::move(sock), std::move(is_owned), std::move(process_datagram), udp_resource_drops);
 }
 
 }  // namespace acpp

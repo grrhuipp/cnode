@@ -1,6 +1,6 @@
 #include "anytls_outbound.hpp"
 #include "../anytls_codec.hpp"
-#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/memory_stats.hpp"
@@ -477,7 +477,8 @@ bool RunClientPadding() {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNS dns(io, dns_config);
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
     settings.literal_address = net::ip::address_v4::loopback();
@@ -574,7 +575,8 @@ bool RunOpenOrder(int mode, bool before) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNS dns(io, dns_config);
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
     settings.literal_address = net::ip::address_v4::loopback();
@@ -697,7 +699,8 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     } else queue.wire_payload.assign(queue.expected.begin(), queue.expected.begin() + bytes);
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNS dns(io, dns_config);
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
     settings.literal_address = net::ip::make_address("127.0.0.1");
@@ -796,7 +799,8 @@ bool RunIoFault(int mode, int kind) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNS dns(io, dns_config);
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
     settings.literal_address = net::ip::make_address("127.0.0.1");
@@ -884,7 +888,8 @@ bool Run(int mode) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNS dns(io, dns_config);
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
     settings.literal_address = net::ip::make_address("127.0.0.1");

@@ -61,7 +61,6 @@ std::unique_ptr<::acpp::Outbound> NewHandler(
     const PreparedOutboundConfig& config,
     ::acpp::net::io_context& io_context,
     ::acpp::app::dns::DNS& dns,
-    ::acpp::UDPSessionManager* udp_mgr,
     std::chrono::seconds dial_timeout) {
 
     if (!config.create) {
@@ -69,7 +68,7 @@ std::unique_ptr<::acpp::Outbound> NewHandler(
             "prepared outbound '" + config.tag + "' has no creator");
     }
     auto proxy = config.create(
-        config.tag, io_context, dns, udp_mgr, dial_timeout);
+        config.tag, io_context, dns, dial_timeout);
     if (!proxy) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' creator returned null");

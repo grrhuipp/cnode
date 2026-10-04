@@ -57,11 +57,11 @@ void AppendUniqueAddresses(
 
 }  // namespace
 
-struct DNS::Impl {
-    Impl(net::io_context& io_context, const Config& config);
+struct DNSWorker::Impl {
+    Impl(net::io_context& io_context, const Config& config, size_t mailbox_capacity);
 
-    net::awaitable<DnsResult> Resolve(std::string_view domain);
-    DnsCacheStats GetCacheStats() const;
+    net::awaitable<DnsResult> ResolveOwned(std::string domain);
+    net::awaitable<DnsCacheStats> ReadCacheStats();
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
@@ -80,13 +80,16 @@ struct DNS::Impl {
     DnsCache cache;
     InflightResolves inflight_resolves;
     std::vector<std::shared_ptr<DatagramExchange>> upstreams;
+    WorkerMailbox mailbox;
 };
 
-DNS::Impl::Impl(net::io_context& io_context, const Config& config)
+DNSWorker::Impl::Impl(net::io_context& io_context, const Config& config,
+                      size_t mailbox_capacity)
     : io_context(io_context)
     , config(config)
     , cache(config.cache_size, config.min_ttl, config.max_ttl)
-    , inflight_resolves(io_context) {
+    , inflight_resolves(io_context)
+    , mailbox(io_context, mailbox_capacity) {
     if (config.servers.empty()) {
         throw std::invalid_argument("DNS requires at least one server endpoint");
     }
@@ -99,8 +102,9 @@ DNS::Impl::Impl(net::io_context& io_context, const Config& config)
     }
 }
 
-net::awaitable<DnsResult> DNS::Impl::Resolve(
-    std::string_view domain) {
+net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain) {
+    // The only lookup entry owns input throughout cache/inflight/upstream I/O.
+    std::string_view domain = owned_domain;
     if (const auto address = iputil::ParseLiteral(domain)) {
         DnsResult result;
         result.addresses.reserve(1);
@@ -127,7 +131,7 @@ net::awaitable<DnsResult> DNS::Impl::Resolve(
     });
 }
 
-net::awaitable<DnsResult> DNS::Impl::ResolveUncached(std::string_view domain) {
+net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view domain) {
     DnsResult result;
     try {
         result = co_await DoResolve(domain);
@@ -147,7 +151,7 @@ net::awaitable<DnsResult> DNS::Impl::ResolveUncached(std::string_view domain) {
     co_return result;
 }
 
-net::awaitable<DnsResult> DNS::Impl::DoResolve(
+net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
     std::string_view domain) {
     DnsResult last_result;
     last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
@@ -221,7 +225,7 @@ net::awaitable<DnsResult> DNS::Impl::DoResolve(
     co_return last_result;
 }
 
-net::awaitable<DnsResult> DNS::Impl::QueryServer(
+net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
     DatagramExchange& server,
     std::string_view domain,
     bool query_aaaa) {
@@ -241,7 +245,7 @@ net::awaitable<DnsResult> DNS::Impl::QueryServer(
     co_return ParseResponse(std::span<const uint8_t>(response.bytes.data(), response.size), txid);
 }
 
-void DNS::Impl::BuildQueryTo(
+void DNSWorker::Impl::BuildQueryTo(
     memory::ByteVector& query,
     std::string_view domain,
     uint16_t txid,
@@ -292,7 +296,7 @@ void DNS::Impl::BuildQueryTo(
     query.push_back(0x01);
 }
 
-DnsResult DNS::Impl::ParseResponse(
+DnsResult DNSWorker::Impl::ParseResponse(
     std::span<const uint8_t> response, uint16_t expected_txid) {
     DnsResult result;
 
@@ -452,30 +456,12 @@ DnsResult DNS::Impl::ParseResponse(
     return result;
 }
 
-DnsCacheStats DNS::Impl::GetCacheStats() const {
-    return cache.GetStats();
+net::awaitable<DnsCacheStats> DNSWorker::Impl::ReadCacheStats() {
+    co_return cache.GetStats();
 }
 
-struct DNSWorker::Impl {
-    Impl(net::io_context& main_context,
-         const DNS::Config& config, size_t mailbox_capacity)
-        : server(main_context, config)
-        , mailbox(main_context, mailbox_capacity) {}
-
-    net::awaitable<DnsResult> ResolveOwned(std::string domain) {
-        co_return co_await server.Resolve(domain);
-    }
-
-    net::awaitable<DnsCacheStats> ReadCacheStats() {
-        co_return server.GetCacheStats();
-    }
-
-    DNS server;
-    WorkerMailbox mailbox;
-};
-
 DNSWorker::DNSWorker(net::io_context& main_context,
-                     const DNS::Config& config, size_t mailbox_capacity)
+                     const Config& config, size_t mailbox_capacity)
     : impl_(std::make_unique<Impl>(main_context, config, mailbox_capacity)) {}
 
 DNSWorker::~DNSWorker() = default;
@@ -491,26 +477,13 @@ net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
 }
 
 net::awaitable<DnsCacheStats> DNSWorker::GetCacheStats() {
-    co_return co_await impl_->mailbox.Post(impl_->ReadCacheStats());
+    return impl_->mailbox.Post(impl_->ReadCacheStats());
 }
-
-DNS::DNS(net::io_context& io_context, const Config& config)
-    : impl_(std::make_unique<Impl>(io_context, config)) {}
-
-DNS::DNS(DNSWorker& worker) : dns_worker_(&worker) {}
-
-DNS::~DNS() = default;
 
 net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
-    if (dns_worker_) {
-        co_return co_await dns_worker_->Resolve(std::string(domain));
-    }
-    co_return co_await impl_->Resolve(domain);
-}
-
-DnsCacheStats DNS::GetCacheStats() const {
-    // Remote facades own no DNS cache. The dedicated service owns its stats.
-    return impl_ ? impl_->GetCacheStats() : DnsCacheStats{};
+    // Capture the caller's view now, before the bounded mailbox hands the
+    // owned request to the main loop. The client has no live DNS state.
+    return worker_.Resolve(std::string(domain));
 }
 
 }  // namespace acpp::app::dns

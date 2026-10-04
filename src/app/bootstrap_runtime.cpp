@@ -4,6 +4,7 @@
 #include "acppnode/app/bootstrap_monitor.hpp"
 #include "acppnode/app/bootstrap_shutdown.hpp"
 #include "acppnode/infra/log.hpp"
+#include "acppnode/infra/runtime_failure.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"

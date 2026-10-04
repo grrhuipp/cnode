@@ -123,7 +123,7 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
         case 5: co_return Result(co_await anytls::WriteFrame(stream, 2, 1, bytes));
         case 6: {
             auto body = Payload(1);
-            co_return Result(co_await anytls::WriteFrameBody(stream, 2, 1, **body.begin()));
+            co_return Result(co_await anytls::WriteFrame(stream, 2, 1, (*body.begin())->Bytes()));
         }
         case 7: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
         case 8: co_return Result(co_await anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));

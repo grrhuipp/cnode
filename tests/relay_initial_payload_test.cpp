@@ -1,6 +1,7 @@
 #include "acppnode/app/relay.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -30,6 +31,8 @@ struct Endpoint {
     net::io_context* io = nullptr;
     TimeoutToken phase_timer;
     bool phase_expired = false;
+    uint8_t phase_flags = 0;
+    uint32_t phase_generation = 0;
     ErrorCode read_error = ErrorCode::OK;
     ErrorCode write_error = ErrorCode::OK;
     bool allocation_failure = false;
@@ -103,17 +106,33 @@ struct Endpoint {
     void SetReadTimeout(std::chrono::seconds) noexcept {}
     void SetWriteTimeout(std::chrono::seconds) noexcept {}
     PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        if (io) phase_timer = TimeoutScheduler::ForIoContext(*io).ScheduleAfter(timeout, [this] {
+        if (!io) return {};
+        ++phase_generation;
+        phase_expired = false;
+        phase_flags = 0;
+        const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
+        const auto delay = timeout >= maximum ? std::chrono::milliseconds::max()
+            : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+        phase_timer = TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, [this] {
             phase_expired = true;
+            phase_flags = 1;
             Cancel();
         });
-        return {};
+        return {&phase_flags, 1, &phase_generation, phase_generation};
     }
-    void ClearPhaseDeadline() noexcept { phase_timer = {}; }
+    void ClearPhaseDeadline() noexcept {
+        phase_timer = {};
+        ++phase_generation;
+        phase_flags = 0;
+        phase_expired = false;
+    }
     bool ConsumeIdleTimeout() noexcept { return false; }
     bool ConsumeReadTimeout() noexcept { return false; }
     bool ConsumeWriteTimeout() noexcept { return std::exchange(write_timed_out, false); }
-    bool ConsumePhaseDeadline() noexcept { return std::exchange(phase_expired, false); }
+    bool ConsumePhaseDeadline() noexcept {
+        phase_flags = 0;
+        return std::exchange(phase_expired, false);
+    }
 };
 
 net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
@@ -267,6 +286,7 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
 net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, int failure,
                                       size_t prefix_size, size_t later_size, bool limited) {
     Endpoint client, target;
+    client.io = target.io = &io;
     client.input = Payload(later_size, 0x73);
     if (failure == 1) target.write_error = ErrorCode::RESOURCE_EXHAUSTED;
     if (failure == 2) target.allocation_failure = true;

@@ -105,16 +105,7 @@ private:
         bool peek = false);
     void SetPendingData(std::span<const uint8_t> data);
 
-    void TouchActivity();          // 记录 I/O 活动序号（极轻量，替代原 ResetIdleTimer）
-    void ScheduleIdleCheck();      // 启动/续调 idle 检查定时器
-    void CancelIdleTimer() noexcept;
-    void ArmReadDeadline();
-    void ArmWriteDeadline();
-    void DisarmWriteDeadline() noexcept;
-    void ScheduleWriteDeadlineCheck();
-    void CancelReadDeadline() noexcept;
-    void CancelWriteDeadline() noexcept;
-    void CancelPhaseDeadline() noexcept;
+    void TouchActivity() noexcept;
     void ReleaseActiveCounter() noexcept;
     [[nodiscard]] size_t ConsumePendingData(net::mutable_buffer target) noexcept;
     void ReleasePendingData() noexcept;

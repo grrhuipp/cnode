@@ -101,6 +101,47 @@ buf::MultiBuffer Packet(std::span<const uint8_t> data) {
     return result;
 }
 
+class FailingResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingResource(std::pmr::memory_resource* upstream) noexcept
+        : upstream_(upstream) {}
+
+    void RejectNextAllocation() noexcept { reject_next_ = true; }
+    [[nodiscard]] size_t RejectedAllocations() const noexcept { return rejected_; }
+
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        if (reject_next_) {
+            reject_next_ = false;
+            ++rejected_;
+            throw std::bad_alloc();
+        }
+        return upstream_->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
+        upstream_->deallocate(pointer, bytes, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+
+    std::pmr::memory_resource* upstream_;
+    bool reject_next_ = false;
+    size_t rejected_ = 0;
+};
+
+class ScopedDefaultResource {
+public:
+    explicit ScopedDefaultResource(std::pmr::memory_resource* resource) noexcept
+        : previous_(std::pmr::set_default_resource(resource)) {}
+    ~ScopedDefaultResource() { std::pmr::set_default_resource(previous_); }
+    ScopedDefaultResource(const ScopedDefaultResource&) = delete;
+    ScopedDefaultResource& operator=(const ScopedDefaultResource&) = delete;
+
+private:
+    std::pmr::memory_resource* previous_;
+};
+
 template <typename Function>
 bool Inject(int budget, Function operation) {
     failures = 0;
@@ -220,6 +261,93 @@ void TransferMatrix() {
     }
 }
 
+void UdpPrefixTransfer() {
+    const TargetAddress source_target{
+        "split-copy-target-host-name-longer-than-sso.example.com", 14321};
+    const TargetAddress destination_target{
+        "different-destination-target-name-longer-than-sso.example.net", 14322};
+    const auto source_bytes = Pattern(91);
+    constexpr size_t prefix_bytes = 23;
+
+    for (int destination_kind = 0; destination_kind != 3; ++destination_kind) {
+        auto source = Packet(source_bytes);
+        auto* source_buffer = *source.begin();
+        source_buffer->SetUDP(source_target);
+        buf::MultiBuffer destination;
+        buf::Buffer* prior_tail = nullptr;
+        std::vector<uint8_t> destination_before;
+        if (destination_kind != 0) {
+            buf::BufferGuard tail = Buffer(31, 0x6D);
+            prior_tail = tail.get();
+            if (destination_kind == 2) prior_tail->SetUDP(destination_target);
+            destination.push_back(std::move(tail));
+            destination_before = Flatten(destination);
+        }
+
+        const bool moved = source.MovePrefixTo(destination, prefix_bytes);
+        std::vector<uint8_t> expected_destination = destination_before;
+        expected_destination.insert(expected_destination.end(),
+            source_bytes.begin(), source_bytes.begin() + prefix_bytes);
+        const std::vector<uint8_t> expected_source(
+            source_bytes.begin() + prefix_bytes, source_bytes.end());
+        bool metadata_ok = source_buffer->HasUDP() &&
+            source_buffer->UDP().SameEndpoint(source_target) && destination.size() ==
+                static_cast<size_t>(destination_kind == 0 ? 1 : 2);
+        if (destination_kind != 0) {
+            metadata_ok = metadata_ok && *destination.begin() == prior_tail &&
+                destination.begin()[0]->Len() == 31;
+            if (destination_kind == 1) metadata_ok = metadata_ok && !prior_tail->HasUDP();
+            else metadata_ok = metadata_ok && prior_tail->HasUDP() &&
+                prior_tail->UDP().SameEndpoint(destination_target);
+        }
+        auto* split = destination.back();
+        metadata_ok = metadata_ok && split != prior_tail && split->Len() == prefix_bytes &&
+            split->HasUDP() && split->UDP().SameEndpoint(source_target);
+        Check(moved && metadata_ok && Flatten(source) == expected_source &&
+              Flatten(destination) == expected_destination && Consistent(source) &&
+              Consistent(destination),
+              destination_kind == 0 ? "UDP prefix split preserves target to empty destination" :
+              destination_kind == 1 ? "UDP prefix split does not coalesce into TCP tail" :
+                                      "UDP prefix split does not coalesce into UDP tail");
+    }
+
+    bool rolled_back = false;
+    bool retry_metadata = false;
+    bool retry_bytes = false;
+    FailingResource failing_resource{std::pmr::new_delete_resource()};
+    {
+        ScopedDefaultResource default_resource{&failing_resource};
+        const TargetAddress long_target{
+            "split-copy-target-host-name-longer-than-sso.example.com", 14321};
+        auto source = Packet(source_bytes);
+        auto* original = *source.begin();
+        original->SetUDP(long_target);
+        buf::MultiBuffer destination;
+        destination.reserve(1);
+        auto* const source_slot = original;
+
+        failing_resource.RejectNextAllocation();
+        const bool moved_on_failed_copy = source.MovePrefixTo(destination, prefix_bytes);
+        rolled_back = !moved_on_failed_copy && failing_resource.RejectedAllocations() == 1 &&
+            source.size() == 1 && *source.begin() == source_slot &&
+            Flatten(source) == source_bytes && source.byte_size() == source_bytes.size() &&
+            original->HasUDP() && original->UDP().SameEndpoint(long_target) &&
+            destination.empty() && destination.byte_size() == 0 &&
+            Consistent(source) && Consistent(destination);
+
+        const bool retried = source.MovePrefixTo(destination, prefix_bytes);
+        retry_metadata = retried && source.size() == 1 && original->HasUDP() &&
+            original->UDP().SameEndpoint(long_target) && destination.size() == 1 &&
+            destination.back()->HasUDP() &&
+            destination.back()->UDP().SameEndpoint(long_target) &&
+            destination.back()->Len() == prefix_bytes;
+        retry_bytes = source.byte_size() == source_bytes.size() - prefix_bytes &&
+            destination.byte_size() == prefix_bytes && Consistent(source) && Consistent(destination);
+    }
+    Check(rolled_back && retry_metadata && retry_bytes,
+          "UDP target-copy allocation failure rolls back source and destination");
+}
+
 void EdgeCases() {
     // A consumed spill prefix must not invalidate reserve's no-allocation
     // promise for active slots. This previously released a source slot first.
@@ -295,6 +423,7 @@ int main() {
     InitialMatrix();
     AppendMatrix();
     TransferMatrix();
+    UdpPrefixTransfer();
     EdgeCases();
     return failed ? 1 : 0;
 }

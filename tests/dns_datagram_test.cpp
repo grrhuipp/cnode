@@ -1,4 +1,4 @@
-#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "app/dns/datagram_exchange.hpp"
 #include <asio/bind_cancellation_slot.hpp>
@@ -108,8 +108,8 @@ struct Peer {
     bool hold = false, refuse = false, negative = false, noise = false, duplicate_id = false;
 };
 
-DNS::Config Config(Peer& peer) {
-    DNS::Config c;
+acpp::app::dns::Config Config(Peer& peer) {
+    acpp::app::dns::Config c;
     c.servers = {peer.socket.local_endpoint()}; c.min_ttl = 1; c.timeout_sec = 1;
     return c;
 }
@@ -118,7 +118,8 @@ void TestQueries(bool ipv6) {
     net::io_context io;
     Peer peer(io, ipv6);
     peer.noise = true;
-    DNS dns(io, Config(peer));
+    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    DNS dns(worker);
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -150,7 +151,8 @@ void TestIsolation(bool cancel) {
     net::io_context io;
     Peer peer(io);
     peer.hold = cancel;
-    DNS dns(io, Config(peer));
+    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+    DNS dns(worker);
     net::cancellation_signal signal;
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> errors;
@@ -179,7 +181,8 @@ void TestFallback() {
     first.refuse = true;
     auto config = Config(first);
     config.servers.push_back(second.socket.local_endpoint());
-    DNS dns(io, config);
+    acpp::app::dns::DNSWorker worker(io, config, 8);
+    DNS dns(worker);
     bool ok = false;
     net::co_spawn(io, dns.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
         ok = !e && result.Ok(); first.Stop(); second.Stop();
@@ -230,15 +233,18 @@ void TestCacheFailure() {
     try {
         net::io_context io;
         Peer peer(io);
-        DNS dns(io, Config(peer));
+        acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
+        DNS dns(worker);
         std::exception_ptr error;
         bool done = false;
         auto run = [&]() -> net::awaitable<void> {
             auto result = co_await dns.Resolve("cache-fault.example");
-            Require(result.Ok() && resource.faults == 1 && dns.GetCacheStats().entries == 0,
+            const auto failed_stats = co_await worker.GetCacheStats();
+            Require(result.Ok() && resource.faults == 1 && failed_stats.entries == 0,
                     "cache allocation failure must not discard the acquired answer");
             result = co_await dns.Resolve("cache-fault.example");
-            Require(result.Ok() && dns.GetCacheStats().entries == 1,
+            const auto recovered_stats = co_await worker.GetCacheStats();
+            Require(result.Ok() && recovered_stats.entries == 1,
                     "cache must recover after write failure");
         };
         net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });

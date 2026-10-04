@@ -17,6 +17,12 @@ file(READ
 file(READ
     "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp"
     RUNTIME_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/infra/runtime_failure.cpp"
+    FAILURE_SOURCE)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/infra/runtime_failure.hpp"
+    FAILURE_HEADER)
 
 if(RUNTIME_HEADER MATCHES "RuntimeState" OR
    MONITOR_HEADER MATCHES "StartRuntimeMonitoring")
@@ -68,7 +74,9 @@ if(RUNTIME_SOURCE MATCHES "run_for\\(" OR
 endif()
 
 if(NOT RUNTIME_HEADER MATCHES "noreturn" OR
-   NOT SHUTDOWN_SOURCE MATCHES "std::_Exit[(]EXIT_FAILURE[)]" OR
+   NOT FAILURE_HEADER MATCHES "noreturn" OR
+   NOT FAILURE_SOURCE MATCHES "std::_Exit[(]EXIT_FAILURE[)]" OR
+   SHUTDOWN_SOURCE MATCHES "void FailRuntime" OR
    NOT RUNTIME_SOURCE MATCHES "FailRuntime")
     message(FATAL_ERROR "runtime failure must terminate with failure status without unwinding its owners")
 endif()

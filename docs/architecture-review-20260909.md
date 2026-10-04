@@ -551,3 +551,77 @@ VMess EOF 解码分支目前按长度识别结束、跳过标签认证，需补�
 默认嗅探预读对服务器先发协议的等待行为仍待审查。此前已修正协议 Process 范围内的 bad_alloc 分类；该范围之前的 metadata/transport 构造异常归属仍待审查。
 
 继续沿 UDP/Mux/UoT 控制接口检查职责边界，保留唯一 Dispatcher -> outbound -> relay 请求链路和 Worker-local 所有权。后续仍需补充 Linux SO_REUSEPORT 与真实 UDP 冲突验证；面板 HTTP 请求超时的真实 TLS 对端故障注入仍待补充。
+
+## 2026-09-30 阶段审查：面板 PImpl 协程边界
+
+本轮基线 `ebcbd0a`，工作区 `D:/cnode`，未提交、推送或部署。移除 V2Board 外观层七个只做 `co_return co_await impl_->...` 的协程，直接返回 Impl 的任务；`HttpRequest` 同样直接返回拥有 exchange 和超时预算的 `http::RunRequest`。没有新增公开类型、共享所有权或请求链路。
+
+逐项目标审计（是阶段证据，不是全项目完成声明）：
+
+| 要求 / 成功标准 | 当前实物证据 | 覆盖限制 |
+| --- | --- | --- |
+| 分层清晰：协议、分发、选路、出站、转发各司其职 | `architecture_layering_contract_test.cmake` 检查核心层和协议依赖；本轮检查 `DefaultDispatcher::RouteAsync`、`SelectRoute`、`FinishRoute`、`outbound_handler->Process` | 源码契约不能证明所有实现的语义边界；尚未逐个审查全部协议 |
+| 边界清晰：生命周期、取消和临时参数的所有者明确 | `PanelRuntime::client` 唯一持有 API；`request_task.hpp::RunRequest` 持有 exchange，取消后等待其完成；请求取消、超时、面板生命周期与独立心跳行为测试通过 | 本轮网络验证为 Windows；没有新增真实 HTTPS 故障注入 |
+| 调用链统一：入站 → Dispatcher → outbound → relay | 检查 VLESS TCP/UDP 入站的 `dispatcher.Dispatch`、分发的 `outbound_handler->Process` 与出站的 `DoRelayLink`；全量含 UDP relay、首包、分发取消和静态出口回归 | 一个协议的调用链检查及全量绿灯不等于全部协议已逐段审计 |
+| 无过度协程包装：纯转发不建额外帧，必要收束保留 | 七个 API 外观方法和 `HttpRequest` 直接返回任务；新增源码契约固定这八个入口；恢复 GetNodeInfo 包装的变异实现被契约拒绝，恢复后通过 | `HttpGet` / `HttpPost` 仍需维持表达式内 optional/json/string 临时值到子任务结束；不能机械改成直接 return。其他协程包装尚未全部分类 |
+| PImpl 低耦合：实现依赖不逃逸，不为外观新增异步层 | `APIClient` 和完整 Impl 都仅在 `src/api/v2board/v2board.cpp`；API 公共头没有面板实现类型；本轮不改变所有权或公开契约 | 仅检查了此面板和 Router 的 Impl 边界；尚未审查全仓所有 PImpl |
+
+本地 MSVC 19.44、Release、测试开启、LTO 关闭构建通过。最终全量 CTest **142/142，通过，83.62 秒**，无跳过。初始化环境时的失败分别来自缺少 Python、MSVC 默认代码页、AWS-LC 的 C4577 警告以及嵌入式 Python 的导入路径和 cryptography 缺失；补齐本地构建参数和临时 Python 环境后重新跑完整套件，不把早期失败或分批通过当成最终绿灯。没有为环境问题修改产品源码。
+
+证据在 `C:/Users/Administrator/AppData/Local/Temp/cnode-architecture/`：`configure.log`、`build.log`、`build-final.log`、`ctest-final.log`、`contract-mutant.log`、`contract-restored.log`。临时 Python 仅用于本地验证，未进入仓库。新增契约只证明指定入口没有转发协程，不能替代生命周期行为测试，也不能用 142 项通过宣称整个架构目标完成；目标保持 active。
+
+## 2026-09-30 阶段审查：DNS 客户端与主控 Impl 合并边界
+
+继续检查 PImpl 后发现 `DNS` 同时拥有公开本地服务与远程客户端两种模式：生产走 DNSWorker，部分行为测试却直接构造本地 DNS 并同步读缓存。将缓存、在途解析、上游 socket 和有界 mailbox 直接合并到 `DNSWorker::Impl`；删除 `DNS::Impl`、本地服务构造器、`DNS::Config` 别名和 `DNS::GetCacheStats`，不保留兼容入口。`DNS` 现在只有一个 DNSWorker 引用，所有调用者（包括原本直连服务的测试）走同一有界路径。客户端公共头不再包含服务配置、统计或 PImpl 所有权头。
+
+`DNS::Resolve` 直接返回 worker 任务并在调用时复制域名；`DNSWorker::GetCacheStats` 直接返回 mailbox 任务。解析 Impl 的主入口直接按值拥有域名，删除原 `ResolveOwned` → 本地 server → Impl 的包装链。仍保留 DNSWorker 的满邮箱错误归一化、mailbox 的 executor 切换和持槽收束、实际解析的缓存/取消/在途状态协程；这些不是无职责转发。
+
+`dns_inflight_test.cpp` 新增真实任务创建后复用调用方字符串的基线：旧实现返回修改后的地址，测试失败；修复后取得创建任务时的原地址。另覆盖临时 DNS 客户端已销毁但任务仍能完成、查询及统计两类满邮箱拒绝、取消后两类入口恢复。编译期断言禁止客户端默认构造、本地服务构造及同步统计查询。已有双调用线程结果所有权、DNS 取消、socket/ID 复用、缓存分配失败恢复和分发取消回归继续通过。初版新测试因未指定必需 DNS endpoint 而失败，补齐 loopback endpoint 后才得到有效旧行为基线；不将夹具初始化错误当成产品故障。
+
+五项目标的本轮证据：分层与边界由唯一 DNSWorker Impl 所有权及删除公开本地入口固定；统一调用链由查询/统计都经有界 mailbox 及行为测试固定；过度协程包装由客户端和统计直接返回、解析主入口自身拥有域名消除；PImpl 低耦合由删除第二个 Impl、客户端不包含配置/统计、生产与测试不再分叉实现。全量 MSVC Release 构建成功，最终 **CTest 142/142，83.81 秒，无跳过**。日志为同一临时证据目录中的 `dns-baseline-build.log`、`dns-baseline-test.log`、`dns-owner-final-build.log`、`dns-owner-final-ctest.log`。本轮不修改 DNS wire format 或缓存策略，没有提交、推送或部署。
+
+这些证据覆盖 DNS 与面板的本轮边界，不覆盖全仓 transport/协议包装分类；尤其 transport 的纯读写委托与 framing/首包/写门协程仍需逐个区分并验证。全仓目标继续保持 active。
+
+## 2026-09-30 阶段审查：HTTPUpgrade 委托与 TLS 公共头
+
+`HttpUpgradeStream` 的 `AsyncWrite`、`WriteMultiBuffer`、`WriteBuffers` 不处理协议、状态或关闭预算，只转发参数；改为直接返回底层任务。读端仍需要消费 HTTP 握手剩余字节，异步写关闭仍需要维护关闭状态，均保留。没有扩大修改到 Http1BodyStream 的 chunk framing、XHTTP 的延迟上传或 HTTP/2 子流关闭检查；这些分支不能仅凭出现 `co_return co_await` 就机械移除。
+
+新增 `tests/http_upgrade_integration.py` 并接入 CTest，四项真实 Windows loopback 场景包括：握手与 VLESS 首包合并、分片握手、raw → VLESS/HTTPUpgrade → freedom 串联、相同串联的 HTTPUpgrade/TLS。每项逐字节校验 **180,469 字节**双向数据、VLESS 响应头、两方向 EOF 和清理前产品存活；夹具拥有并收束对端任务。旧写包装下四项也全部通过，是等价性基线，不是协议缺陷复现或性能测量。恢复 AsyncWrite 的转发协程时，新增源码契约明确失败；恢复直接返回后通过。
+
+`tls_stream.hpp` 原本已有 PImpl，但仍包含完整 `tcp_stream.hpp`、`tls_config.hpp` 和 `<openssl/ssl.h>`。改为前置声明及 OpenSSL 不透明类型头 `<openssl/ossl_typ.h>`，公开签名不变。新增 `tls_public_surface_test.cpp` 独立编译、不使用 PCH，验证只包含此公共头时 TCP、TLS/REALITY 配置和 SSL/SSL_CTX 均不完整，同时仍可检查工厂、构造器、native handle 和握手任务的类型。人工重新引入 TCP 头时，编译断言与源码契约都失败；恢复后完整构建和测试通过。没有新增 adapter 或 type-erasure。
+
+本轮证据继续对应五项目标：分层由 HTTPUpgrade 保持字节传输职责、TLS 实现依赖不进入公共头固定；边界由 pending 字节与关闭状态协程保留及网络 EOF 检查固定；统一调用链由真实 VLESS 串联走同一 Dispatcher/outbound/relay 验证；纯转发协程由三个写入口直接返回和变异契约固定；PImpl 低耦合由公共头独立编译和不完整类型断言固定。
+
+最终 MSVC Release 构建成功；**CTest 144/144，84.86 秒，无跳过**。临时证据目录继续为 `C:/Users/Administrator/AppData/Local/Temp/cnode-architecture/`：`http-upgrade-baseline.log`、`upgrade-focused.log`、`upgrade-mutant.log`、`tls-surface-mutant-build.log`、`tls-surface-mutant-contract.log`、`transport-final-build.log`、`transport-final-ctest.log`。新网络场景的逐项报告在 `build/http_upgrade_integration_test/{coalesced,fragmented,chain,chain-tls}/result.json`。没有提交、推送或部署。
+
+本轮只验证上述透明委托和公共头边界，尚不证明 HTTP/2/XHTTP 全部状态分支、其他协议包装及所有 PImpl 的审计完成。目标保持 active，不用全量测试绿灯代替全仓完成审计。
+
+## 2026-09-30 阶段审查：AnyTLS 窄入口与入站 Manager 公共头
+
+`WriteFrameBody` 仅由 codec 故障测试调用，没有生产调用；其实现只是把 Buffer 转为 span 后再套一个 WriteFrame 协程。删除声明及实现，不做兼容转接。原测试直接以 Buffer 的字节视图调用生产 `WriteFrame`，Buffer 仍由测试请求作用域持有到异步写结束；保留该用例的异常、部分写入和释放检查。codec **279/279** 用例通过，`released=1`。源码契约拒绝恢复此 Buffer 专用包装入口。其他带 padding 的函数仍持有 packet、record 或 MB 直到实际写入结束，不因末尾出现 co_await 就视为纯转发。
+
+入站 Manager 公共 PImpl 头只使用 `const BuildRequest&`，不应传递包含 prepared 用户和凭据定义；改为前置声明，调用方需要构造值时显式包含其定义。不改变 runtime 接口、manager 所有权或请求调用链。同步纠正已过时的 detached 子流与无界 post 注释，明确 Worker-local 替换及跨线程有界 mailbox。新增独立、不使用 PCH 的 `inbound_manager_public_surface_test.cpp`，验证 BuildRequest、Handler 和 Inbound 在公共头中保持不完整，同时 Manager 构造及 NewHandler 的签名可用。恢复 prepared_config include 的变异实现在编译期断言失败；恢复后完整构建成功，定向测试通过。
+
+本轮对应目标：层级边界由 Manager 不传递协议准备数据定义固定；生命周期由已有 WriteFrame 测试在完成前保有 Buffer 及 279 项回收检查固定；统一调用链由测试与生产都进入 WriteFrame 而非测试专用入口固定；无多余协程由直接删除 WriteFrameBody 固定；PImpl 低耦合由独立编译和不完整类型断言固定。这是局部完成证据，仍不代表全仓包装与 PImpl 已逐个审查。
+
+MSVC Release 全量构建成功；**CTest 145/145，84.79 秒，无跳过**。证据继续保存在临时目录：`anytls-surface-build.log`、`anytls-surface-cases.log`、`inbound-surface-build.log`、`inbound-surface-ctest.log`、`inbound-surface-mutant.log`、`inbound-surface-restored-build.log`、`inbound-surface-restored-test.log`。没有提交、推送或部署；目标仍 active。
+
+## 2026-09-30 阶段审查：删除面板未使用调试能力
+
+全仓调用检查确认公开 `api::API::Debug()` 没有生产或测试调用；V2Board 的唯一写入口也是这个方法，`debug_enabled_` 初始 false，因此其三处 HTTP 调试分支一直不可达。完整删除公开虚接口、APIClient/Impl 两层声明与转发、私有状态和专属日志分支。不接入全局日志配置，不增加新开关或兼容入口；`MethodName` 仍用于真实请求构造，保留。其他已有面板成功/失败日志不变。
+
+本轮边界证据：`api.hpp` 不再让产品接口承担未使用的实现调试能力；V2Board Impl 不再保存只为死入口服务的可变状态；HTTP 请求仍直接进入相同 timeout/exchange 链路，未改变请求数据、发送时机、错误分类或 fallback。新增架构契约拒绝恢复该入口及私有状态，全仓搜索确认生产源码没有残留引用。PImpl 和低耦合成功标准在此项满足；其余架构成功标准继续由已记录的调用链、取消和回归证据支撑，不把删除一个死入口视为全仓完成。
+
+完整 MSVC Release 构建成功，**CTest 145/145，84.97 秒，无跳过**。日志为临时证据目录的 `panel-debug-build.log`、`panel-debug-ctest.log`。没有提交、推送或部署。HTTP/2 与 XHTTP 的共享会话、逻辑端点及任务所有权仍是后续审查范围；目标保持 active。
+
+## 2026-09-30 阶段审查：HTTP/2 EOF 串行化与统一网络回归
+
+检查 HTTP/2 共享会话的写门、substream Close/Abort 和物理读任务。`WriteFrameSerialized`、gRPC/raw 数据写协程必须持有写门租约至完整帧结束；trailers、WINDOW_UPDATE 和 RST_STREAM 编码协程持有帧 payload；后台任务持有 session。保留这些生命周期边界，不将其视为无职责包装。`WriteRawEndSerialized` 只传递空 span 和 end_stream 标志，没有自有 payload 或清理职责，改为直接返回已拥有串行化职责的 `WriteRawDataSerialized`，新增契约阻止恢复该层转发协程。
+
+补跑 `grpc_eof_integration.py` 时，初次 12 项均因旧出站 `server` / `server_port` / `uuid` 字段而在配置加载阶段失败；没有进入本次修改的网络链路。这不是 raw EOF 修改的故障证据。将夹具改为当前 `address` / `port` / `id` 契约，不增加生产兼容解析；重跑 **12/12** 通过，另有 `grpc_substream_integration.py` **6/6** 通过。随后把两份脚本接入 CTest（90 秒上限），避免它们长期不在统一回归中、配置漂移却不被发现。
+
+本轮证据：协议串联及 raw/gRPC 响应 EOF 检查支撑统一请求链路；RST/END_STREAM 和共享连接继续可用的检查支撑子流边界；直接返回 raw EOF task、保留实际写门/帧 payload/task 所有者支撑无过度包装。PImpl 边界本轮未变，继续沿用前述独立编译证据。关闭清理任务中最终写失败与“流已移除、不再允许写”的区分仍需故障注入，当前 18 项网络场景不能证明该错误边界完整；不得只因看见 detached 就删除负责保持 session 寿命的任务，也不能把所有 false 一律升级成物理会话失败。
+
+完整 MSVC Release 构建成功；**CTest 147/147，93.52 秒，无跳过**，其中 gRPC EOF 与隔离测试分别用时 9.01、7.65 秒。证据在临时目录的 `h2-eof-build.log`、`h2-eof-integration.log`（旧夹具失败）、`h2-eof-current-config.log`、`h2-isolation-integration.log`、`h2-suite-build.log`、`h2-suite-ctest.log`，独立逐项结果在 `build/h2-eof-current-config/results.json` 和 `build/h2-isolation-audit/results.json`。未提交、推送或部署。全仓目标仍 active。
+
+补充本轮覆盖审计：原 12 项 EOF 场景中的 raw 测试验证的是出站，不直接执行此次改动的 raw 服务端 EOF 入口。因此另增 raw 服务端 TCP/TLS × 有响应/空响应四项，每项在同一物理连接连续执行 8 个流，校验 48,001 字节上传、目标 EOF、精确响应、响应 END_STREAM 及最后 PING 屏障。Peer 测试端按 raw 模式发送未封装的 VLESS 数据，并使用对应 HTTP path；gRPC 模式不变。扩展后 EOF **16/16** 通过，隔离仍 **6/6**。重复运行 CTest 暴露 bridge 夹具的 remote/local 目录不能已存在，修正为可重复运行；其 FileExistsError 是启动前夹具错误，不作为产品故障。最终重新运行完整套件 **147/147，89.47 秒，无跳过**，日志 `h2-suite-final-ctest.log`，独立扩展报告 `build/h2-eof-with-server/results.json`。这里新增的 raw 服务端场景才是对修改入口的实际网络覆盖，不用旧出站场景替代。

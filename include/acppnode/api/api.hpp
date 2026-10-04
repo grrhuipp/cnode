@@ -212,7 +212,6 @@ public:
     virtual net::awaitable<bool>
     ReportIllegal(const std::vector<api::DetectResult>& detect_results) = 0;
 
-    virtual void Debug() = 0;
 };
 
 }  // namespace api

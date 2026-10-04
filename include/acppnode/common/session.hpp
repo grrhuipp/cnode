@@ -34,7 +34,7 @@ enum class DnsResultState : uint8_t {
 };
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
-// 字符串视图指向冷路径监听配置；用户邮箱使用 Worker 本地短生命周期存储。
+// 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
 struct Inbound {
     net::ip::address source_addr;
     memory::ThreadLocalString source_ip;
@@ -45,14 +45,18 @@ struct Inbound {
     uint16_t peer_port = 0;
     memory::ThreadLocalString client_ip_source = "socket";
     bool client_ip_trusted = true;
+
+    [[nodiscard]] bool HasProxyProtocolClientIP() const noexcept {
+        return client_ip_source == "proxy_protocol" && !source_ip.empty();
+    }
     std::optional<tcp::endpoint> local_endpoint;
-    std::string_view tag;
-    std::string_view protocol;
-    const std::vector<std::string>* tags = nullptr;
+    memory::ThreadLocalString tag;
+    memory::ThreadLocalString protocol;
+    memory::ThreadLocalVector<memory::ThreadLocalString> tags;
     int64_t user_id = 0;
     memory::ThreadLocalString user_email;
     std::string_view transport;
-    std::string_view security;
+    memory::ThreadLocalString security;
     memory::ThreadLocalString tls_sni;
     memory::ThreadLocalString tls_alpn;
     memory::ThreadLocalString tls_version;

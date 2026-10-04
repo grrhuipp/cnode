@@ -1,11 +1,12 @@
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
-#include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/request_load_state.hpp"
 #include "acppnode/features/outbound/outbound.hpp"
 #include "acppnode/features/routing/router.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 #include "acppnode/proxy/outbound.hpp"
+#include "acppnode/transport/internet/tcp_stream.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -44,6 +45,7 @@ struct State {
     bool closed = false;
     bool cleanup_has_owner = false;
     app::RequestLoadState* load = nullptr;
+    TcpStream* phase_stream = nullptr;
 };
 
 net::awaitable<void> Wait(State& state) {
@@ -86,6 +88,9 @@ public:
     void Close() override { state_.closed = true; NotifyClosed(); }
     int NativeHandle() const override { return -1; }
     bool IsOpen() const override { return !state_.closed; }
+protected:
+    TcpStream* BaseTcpStream() override { return state_.phase_stream; }
+    const TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
 private:
     State& state_;
 };
@@ -145,6 +150,11 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State source_state;
+    tcp::socket phase_socket(io);
+    IoErrorCode phase_open_error;
+    phase_socket.open(tcp::v4(), phase_open_error);
+    if (phase_open_error) throw IoSystemError(phase_open_error);
+    TcpStream phase_stream(std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
@@ -158,6 +168,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     Router router;
     auto& outbound = *manager.handler;
     outbound.state.load = &load;
+    outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
     outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
     outbound.state.return_cancelled = which == Case::RelayCancelled;
@@ -176,6 +187,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     StatsShard stats;
     TimeoutsConfig timeouts;
     std::optional<udp::socket> dns_peer;
+    std::optional<app::dns::DNSWorker> dns_worker;
     std::optional<app::dns::DNS> dns;
     if (which == Case::RoutingDns) {
         const auto address = net::ip::make_address("127.0.0.42");
@@ -186,7 +198,8 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         app::dns::Config config;
         config.servers = {dns_peer->local_endpoint()};
         config.timeout_sec = 2;
-        dns.emplace(io, config);
+        dns_worker.emplace(io, config, 8);
+        dns.emplace(*dns_worker);
         dispatcher.BindDnsService(*dns);
         policy.outbound = routing::RouteWithFallback{"direct"};
         ctx.outbound.target = TargetAddress("dispatcher-cancellation.example", 443);

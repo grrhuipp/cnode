@@ -393,4 +393,16 @@ void TimeoutScheduler::Cancel(TimeoutToken& token) noexcept {
     }
 }
 
+TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexcept {
+    const auto& impl = *impl_;
+    return ResourceStats{
+        .active_events = impl.events.size(),
+        .heap_entries = impl.deadline_heap.size(),
+        .heap_capacity = impl.deadline_heap.capacity(),
+        .event_buckets = impl.events.bucket_count(),
+        .ready_events = impl.ready_event_ids.size(),
+        .wait_pending = impl.wait_pending,
+    };
+}
+
 }  // namespace acpp

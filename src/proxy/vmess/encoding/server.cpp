@@ -72,22 +72,6 @@ constexpr size_t kStreamMaxPaddingLen = 64;
     throw IoSystemError(io_error::connection_reset, what);
 }
 
-net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t len) {
-    if (len == 0) {
-        co_return true;
-    }
-
-    try {
-        const std::array<net::const_buffer, 1> buffers{
-            net::buffer(buf, len)
-        };
-        co_await stream.WriteBuffers(buffers);
-    } catch (...) {
-        co_return false;
-    }
-    co_return true;
-}
-
 uint8_t* PrepareScratch(memory::ByteVector& buffer, size_t size) {
     if (buffer.size() < size) {
         buffer.resize(size);
@@ -183,24 +167,6 @@ bool BuildResponseHeader(
     }
 
     return true;
-}
-
-net::awaitable<bool> EncodeResponseHeader(
-    EncodeResponseHeaderState& state,
-    AsyncStream& stream) {
-    std::array<uint8_t, 38> resp_buf{};
-    if (!BuildResponseHeader(state, resp_buf)) {
-        co_return false;
-    }
-
-    if (!co_await WriteFull(stream, resp_buf.data(), resp_buf.size())) {
-        LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader WriteFull failed");
-        co_return false;
-    }
-
-    LOG_NET_DEBUG("VMess encoding: EncodeResponseHeader OK (security={}, option={:#04x})",
-                     static_cast<int>(state.security), static_cast<int>(state.option));
-    co_return true;
 }
 
 struct ResponseBodyEncodeBudget final {
@@ -1187,13 +1153,6 @@ class ResponseBodyWriter final
     : public memory::ThreadAllocated
     , public transport::MultiBufferWriter {
 public:
-    ResponseBodyWriter(const VMessRequest& request, AsyncStream& stream)
-        : stream_(&stream)
-        , packet_mode_(request.command == Command::UDP)
-        , udp_target_(request.target) {
-        InitResponseBodyState(response_body_state_, request);
-    }
-
     ResponseBodyWriter(const VMessRequest& request,
                        AsyncStream& stream,
                        std::array<uint8_t, 38> response_header)
@@ -1271,15 +1230,6 @@ void ServerSession::SetRequest(VMessRequest request) {
     request_set_ = true;
 }
 
-net::awaitable<bool> ServerSession::EncodeResponseHeader(AsyncStream& stream) {
-    if (!request_set_) {
-        co_return false;
-    }
-    EncodeResponseHeaderState state;
-    InitResponseHeaderState(state, request_);
-    co_return co_await ::acpp::vmess::encoding::EncodeResponseHeader(state, stream);
-}
-
 std::unique_ptr<transport::MultiBufferReader> ServerSession::DecodeRequestBody(
     AsyncStream& stream) {
     if (!request_set_) {
@@ -1287,18 +1237,6 @@ std::unique_ptr<transport::MultiBufferReader> ServerSession::DecodeRequestBody(
     }
     try {
         return std::make_unique<RequestBodyReader>(request_, stream);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBody(
-    AsyncStream& stream) {
-    if (!request_set_) {
-        return nullptr;
-    }
-    try {
-        return std::make_unique<ResponseBodyWriter>(request_, stream);
     } catch (...) {
         return nullptr;
     }
@@ -1317,34 +1255,6 @@ std::unique_ptr<transport::MultiBufferWriter> ServerSession::EncodeResponseBodyW
             return nullptr;
         }
         return std::make_unique<ResponseBodyWriter>(request_, stream, response_header);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-net::awaitable<bool> EncodeResponseHeader(
-    const VMessRequest& request,
-    AsyncStream& stream) {
-    EncodeResponseHeaderState header_state;
-    InitResponseHeaderState(header_state, request);
-    co_return co_await EncodeResponseHeader(header_state, stream);
-}
-
-std::unique_ptr<transport::MultiBufferReader> DecodeRequestBody(
-    VMessRequest& request,
-    AsyncStream& stream) {
-    try {
-        return std::make_unique<RequestBodyReader>(request, stream);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBody(
-    const VMessRequest& request,
-    AsyncStream& stream) {
-    try {
-        return std::make_unique<ResponseBodyWriter>(request, stream);
     } catch (...) {
         return nullptr;
     }

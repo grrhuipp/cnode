@@ -1,17 +1,17 @@
 #pragma once
 
 #include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/tls_config.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
-#include <openssl/ssl.h>
+#include <openssl/ossl_typ.h>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace acpp {
 
 struct RealityConfig;
+struct TlsConfig;
 
 // ============================================================================
 // OpenSSL 上下文管理（RAII）

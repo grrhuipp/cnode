@@ -8,6 +8,15 @@ file(READ
 file(READ
     "${SOURCE_DIR}/include/acppnode/transport/internet/timeout_scheduler.hpp"
     SCHEDULER_HEADER)
+file(READ
+    "${SOURCE_DIR}/include/acppnode/app/relay.hpp"
+    RELAY_SOURCE)
+
+if(RELAY_SOURCE MATCHES
+       "TimeoutToken|TimeoutScheduler|ScheduleAfter|steady_timer|AsyncDelay wake|wake[.]WaitFor")
+    message(FATAL_ERROR
+        "relay completion must be event-driven and half-close must use the transport phase budget")
+endif()
 
 if(NOT SCHEDULER_HEADER MATCHES "TimeoutScheduler[*] owner_" OR
    SCHEDULER_HEADER MATCHES "const void[*] owner_" OR

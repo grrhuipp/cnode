@@ -2,15 +2,18 @@
 
 #include "acppnode/app/relay_types.hpp"
 #include "acppnode/common/session.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/token_bucket.hpp"
 #include "acppnode/infra/log.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/transport/internet/async_delay.hpp"
 
 #include <asio/experimental/awaitable_operators.hpp>
+#include <asio/experimental/channel.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/use_awaitable.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -29,7 +32,7 @@ inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 using SteadyClock = std::chrono::steady_clock;
 
 // Owned by the joined relay scope, so either direction can end both waits.
-struct RelayRateLimits {
+struct RelayRateLimits : memory::ThreadAllocated {
     TokenBucket up;
     TokenBucket down;
     AsyncDelay up_wait;
@@ -191,15 +194,14 @@ struct RelayDirectionState {
     bool half_close_expired = false;
     ErrorCode cancellation_error = ErrorCode::OK;
     std::optional<SteadyClock::time_point> half_close_deadline;
-    TimeoutToken half_close_timer;
 };
 
 struct RelayCloseState {
-    explicit RelayCloseState(net::io_context& io) : wake(io) {}
+    explicit RelayCloseState(net::io_context& io) : wake(io, 1) {}
 
     void Complete() noexcept {
         complete = true;
-        wake.Cancel();
+        wake.close();
     }
 
     void Mark(bool client_side) noexcept {
@@ -219,7 +221,7 @@ struct RelayCloseState {
     bool known = false;
     bool client = false;
     bool complete = false;
-    AsyncDelay wake;
+    net::experimental::channel<void(IoErrorCode)> wake;
 };
 
 template <typename Reader>
@@ -356,7 +358,6 @@ template <bool RateLimited,
           typename ToWriter,
           typename ToControl>
 net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
-    net::io_context& io_context,
     FromReader& from_reader,
     FromControl& from_control,
     ToWriter& to_writer,
@@ -392,9 +393,6 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                 CancelRelayControls(from_control, to_control, limits);
                 break;
             }
-
-            from_control.SetReadTimeout(*remaining);
-            to_control.SetWriteTimeout(*remaining);
         }
 
         // 注意：不在这里检查 peer_eof。
@@ -454,24 +452,13 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
                         const auto deadline = half_close_timeout >= room
                             ? SteadyClock::time_point::max() : now + half_close_timeout;
                         peer_state.half_close_deadline = deadline;
-                        peer_state.half_close_timer = TimeoutScheduler::ForIoContext(io_context).ScheduleAfter(
-                            std::chrono::ceil<std::chrono::milliseconds>(deadline - now),
-                            [&from_control, &to_control, &peer_state, limits] {
-                                peer_state.half_close_expired = true;
-                                CancelRelayControls(from_control, to_control, limits);
-                            });
-
+                        // The peer direction reads from to_control. Its phase
+                        // budget shares that transport's single deadline slot;
+                        // cancellation also ends the other I/O and rate waits.
+                        if (!to_control.StartPhaseDeadline(half_close_timeout))
+                            throw transport::LinkError(ErrorCode::INTERNAL);
                         LOG_CONN_DEBUG(ctx, "[relay] {} half-close: arming absolute timeout {}s for peer direction",
                                        is_upload ? "up" : "down", half_close_timeout.count());
-                        from_control.SetIdleTimeout(half_close_timeout);
-                        to_control.SetIdleTimeout(half_close_timeout);
-                        // 一侧已经 EOF 后，另一侧最多只允许保留 half_close_timeout。
-                        // 当前方向退出后，peer direction 会按共享 absolute deadline 收敛。
-                        from_control.SetWriteTimeout(half_close_timeout);
-                        to_control.SetWriteTimeout(half_close_timeout);
-                        // The scoped half-close timer cancels both I/O and rate
-                        // waits, including writes already in flight. No second
-                        // transport phase deadline is needed for this budget.
                     } else {
                         LOG_CONN_DEBUG(ctx, "[relay] {} half-close: timeout=0, cancel peer immediately",
                                        is_upload ? "up" : "down");
@@ -533,6 +520,8 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
         } catch (const transport::LinkError& e) {
             close_state.Mark(operation_side_is_client);
             error = e.code();
+            if (error == ErrorCode::CANCELLED && my_state.cancellation_error != ErrorCode::OK)
+                error = my_state.cancellation_error;
             if (error == ErrorCode::CANCELLED &&
                 (my_state.half_close_expired || ConsumeRelayTimeoutSignals(from_control, to_control))) {
                 error = ErrorCode::RELAY_TIMEOUT;
@@ -548,6 +537,8 @@ net::awaitable<std::pair<uint64_t, ErrorCode>> RelayOneDirectionImpl(
             close_state.Mark(operation_side_is_client);
             error = MapAsioError(e.code());
             const bool io_cancelled = error == ErrorCode::CANCELLED;
+            if (io_cancelled && my_state.cancellation_error != ErrorCode::OK)
+                error = my_state.cancellation_error;
             if (error == ErrorCode::CANCELLED && close_state.complete &&
                 !my_state.half_close_expired && !ConsumeRelayTimeoutSignals(from_control, to_control)) {
                 error = ErrorCode::OK;
@@ -671,7 +662,6 @@ net::awaitable<RelayResult> DoRelayLink(
     if (config.speed_limit == 0) {
         auto [up, down] = co_await (
             relay_detail::RelayOneDirectionImpl<false>(
-                io_context,
                 client_reader,
                 client_control,
                 target,
@@ -687,7 +677,6 @@ net::awaitable<RelayResult> DoRelayLink(
                 ctx,
                 std::move(initial_payload)) &&
             relay_detail::RelayOneDirectionImpl<false>(
-                io_context,
                 target,
                 target,
                 client_writer,
@@ -707,7 +696,6 @@ net::awaitable<RelayResult> DoRelayLink(
     } else {
         auto [up, down] = co_await (
             relay_detail::RelayOneDirectionImpl<true>(
-                io_context,
                 client_reader,
                 client_control,
                 target,
@@ -723,7 +711,6 @@ net::awaitable<RelayResult> DoRelayLink(
                 ctx,
                 std::move(initial_payload)) &&
             relay_detail::RelayOneDirectionImpl<true>(
-                io_context,
                 target,
                 target,
                 client_writer,
@@ -743,7 +730,8 @@ net::awaitable<RelayResult> DoRelayLink(
     }
     };
     auto watch_complete = [&]() -> net::awaitable<void> {
-        if (!close_state.complete) co_await close_state.wake.WaitFor(std::chrono::milliseconds::max());
+        if (!close_state.complete)
+            (void)co_await close_state.wake.async_receive(net::as_tuple(net::use_awaitable));
         if (!close_state.complete) throw transport::LinkError(ErrorCode::CANCELLED);
     };
     (void)co_await (transfer() || watch_complete());
@@ -751,8 +739,6 @@ net::awaitable<RelayResult> DoRelayLink(
     auto [bytes_up, error_up] = up_result;
     auto [bytes_down, error_down] = down_result;
 
-    client_state.half_close_timer = {};
-    target_state.half_close_timer = {};
     client_control.ClearPhaseDeadline();
     target.ClearPhaseDeadline();
 
@@ -848,7 +834,7 @@ net::awaitable<RelayResult> DoRelayLink(
             if (reason == ErrorCode::OK ||
                 (reason == ErrorCode::CANCELLED && error != ErrorCode::CANCELLED)) reason = error;
             if (limits) limits->Cancel(error);
-            close.wake.Cancel();
+            close.wake.close();
         }
     } stop(close_state, limits.get());
     struct CancelContext { StopState& stop; TargetEndpoint& target; } cancel_context{stop, target};
@@ -873,8 +859,7 @@ net::awaitable<RelayResult> DoRelayLink(
     ErrorCode first_error = ErrorCode::OK;
     bool upload_eof = false;
     bool download_eof = false;
-    auto& timeout_scheduler = TimeoutScheduler::ForIoContext(io_context);
-    TimeoutToken half_close_token;
+    bool half_close_armed = false;
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 
     auto remember_error = [&](ErrorCode error) {
@@ -883,20 +868,17 @@ net::awaitable<RelayResult> DoRelayLink(
     };
 
     auto arm_half_close_timeout = [&](std::chrono::seconds timeout) {
-        if (half_close_token.Valid()) return;
+        if (half_close_armed) return;
+        half_close_armed = true;
         if (timeout <= std::chrono::seconds::zero()) {
             stop.Request(ErrorCode::RELAY_TIMEOUT);
             cancel_target();
             return;
         }
-        const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::milliseconds::max());
-        const auto delay = timeout >= maximum ? std::chrono::milliseconds::max() :
-            std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-        half_close_token = timeout_scheduler.ScheduleAfter(delay, [&stop, &cancel_target] {
-            stop.Request(ErrorCode::RELAY_TIMEOUT);
+        if (!target.StartPhaseDeadline(timeout)) {
+            stop.Request(ErrorCode::INTERNAL);
             cancel_target();
-        });
+        }
     };
 
     auto upload = [&]() -> net::awaitable<std::pair<uint64_t, ErrorCode>> {
@@ -1114,7 +1096,7 @@ net::awaitable<RelayResult> DoRelayLink(
     };
     auto watch_stop = [&]() -> net::awaitable<void> {
         if (stop.reason == ErrorCode::OK && !close_state.complete)
-            co_await close_state.wake.WaitFor(std::chrono::milliseconds::max());
+            (void)co_await close_state.wake.async_receive(net::as_tuple(net::use_awaitable));
         if (stop.reason == ErrorCode::OK && !close_state.complete) throw transport::LinkError(ErrorCode::CANCELLED);
     };
     try {
@@ -1126,7 +1108,7 @@ net::awaitable<RelayResult> DoRelayLink(
         }
     }
     remember_error(stop.reason);
-    timeout_scheduler.Cancel(half_close_token);
+    target.ClearPhaseDeadline();
 
     RelayResult result;
     result.bytes_up = first_error == ErrorCode::OK ? up_result.first : ctx.traffic.bytes_up;

@@ -28,6 +28,9 @@ struct ReceiverSettings;
 
 namespace acpp::worker_detail {
 
+class UdpAssociationReclaimer;
+struct UdpAssociationHook;
+
 class UdpReplySink {
 public:
     virtual ~UdpReplySink() noexcept = default;
@@ -57,7 +60,7 @@ struct UdpDatagramContext {
 };
 
 // Worker-private owner for native UDP sockets, client sessions and reply queues.
-class UdpIngress final {
+class UdpIngress final : public memory::ThreadAllocated {
 public:
     // Handles remain Worker-local; receive/send operations retain them only
     // across their own asynchronous cancellation boundary.
@@ -74,24 +77,38 @@ public:
         StartSend,
     };
 
+    struct ResourceStats {
+        size_t associations = 0;
+        size_t closed_associations = 0;
+        uint64_t input_datagrams = 0;
+        uint64_t input_bytes = 0;
+        uint64_t reply_datagrams = 0;
+        uint64_t reply_bytes = 0;
+        size_t active_reply_senders = 0;
+        size_t native_dispatches = 0;
+    };
+
     struct PendingUdpReplyDeleter {
         void operator()(PendingUdpReply* reply) const noexcept;
     };
     using PendingUdpReplyPtr =
         std::unique_ptr<PendingUdpReply, PendingUdpReplyDeleter>;
 
-    UdpIngress(std::string tag, std::unique_ptr<::acpp::Inbound> proxy);
+    UdpIngress(std::string tag, std::unique_ptr<::acpp::Inbound> proxy,
+               UdpAssociationReclaimer& reclaimer, net::io_context& io_context);
     ~UdpIngress() noexcept;
 
     UdpIngress(const UdpIngress&) = delete;
     UdpIngress& operator=(const UdpIngress&) = delete;
 
     [[nodiscard]] std::string_view Tag() const noexcept;
+    [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 
     // Keep Worker-local sockets stable while replacing cold-path protocol state.
     [[nodiscard]] bool ReplaceHandler(
         std::unique_ptr<::acpp::Inbound> proxy) noexcept;
-    void Close() noexcept;
+    void RequestStop() noexcept;
+    [[nodiscard]] net::awaitable<void> AsyncJoin();
 
     void ProcessDatagram(const UdpDatagramContext& datagram);
 
@@ -111,7 +128,7 @@ public:
     [[nodiscard]] bool CompleteReplySend(
         const std::string& socket_key,
         const PendingUdpReply& completed_reply);
-    void ClearReplyQueue(const std::string& socket_key);
+    void ClearReplyQueue(std::string_view socket_key);
 
     [[nodiscard]] bool HasClientSession(const std::string& socket_key,
                                         const std::string& client_key) const noexcept;
@@ -125,7 +142,8 @@ public:
         ReplyCallback reply_callback,
         udp::endpoint reply_endpoint,
         ::acpp::InboundDatagramOwner session_owner,
-        std::chrono::steady_clock::time_point now);
+        std::chrono::steady_clock::time_point now,
+        std::chrono::seconds idle_timeout);
     [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
                                          const std::string& client_key,
                                          const TargetAddress& target,
@@ -133,10 +151,7 @@ public:
                                          const ::acpp::InboundDatagramOwner& session_owner,
                                          buf::MultiBuffer payload,
                                          std::chrono::steady_clock::time_point now);
-    void CleanupIdleClientSessions(const std::string& socket_key,
-                                   std::chrono::steady_clock::time_point now,
-                                   std::chrono::seconds idle_timeout);
-    void CleanupClientSessions(const std::string& socket_key) noexcept;
+    void CleanupClientSessions(std::string_view socket_key) noexcept;
     void CleanupAllClientSessions() noexcept;
 
     [[nodiscard]] static SocketPtr MakeSocket(net::io_context& io_context) {
@@ -153,10 +168,17 @@ public:
     [[nodiscard]] bool OwnsSocket(
         const std::string& socket_key,
         const udp::socket* socket) const noexcept;
-    void CloseSocket(const std::string& socket_key) noexcept;
+    void CloseSocket(std::string_view socket_key) noexcept;
     void CloseAllSockets() noexcept;
 
 private:
+    friend class UdpAssociationReclaimer;
+    void ReclaimAssociation(UdpAssociationHook& hook,
+                            std::chrono::steady_clock::time_point now) noexcept;
+    void FinishNativeJob(ClientSession& session) noexcept;
+    void RollbackNativeJob(ClientSession& session) noexcept;
+    void RetireNativeJob(ClientSession& session) noexcept;
+    static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -190,6 +212,7 @@ public:
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
 
 private:
+    friend class UdpIngress;
     void CloseWithError(ErrorCode error) noexcept;
 
     struct Impl;

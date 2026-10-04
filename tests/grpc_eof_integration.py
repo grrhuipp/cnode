@@ -28,11 +28,11 @@ def grpc_transport(tls, server, raw=False):
 def protocol_settings(protocol, port=None):
     if protocol in ('vless', 'vmess'):
         settings = {'clients': [{'id': str(USER)}]} if port is None else {
-            'server': '127.0.0.1', 'server_port': port, 'uuid': str(USER)}
+            'address': '127.0.0.1', 'port': port, 'id': str(USER)}
     else:
         settings = {'password': 'fixture-secret'}
         if port is not None:
-            settings.update(server='127.0.0.1', server_port=port)
+            settings.update(address='127.0.0.1', port=port)
         if protocol == 'shadowsocks':
             settings['method'] = 'aes-128-gcm'
     return settings
@@ -60,8 +60,8 @@ async def bridge(args, scenario, output, result, resources):
     remote_port, front_port = available_port(), available_port()
     remote = output / 'remote'
     local = output / 'local'
-    remote.mkdir()
-    local.mkdir()
+    remote.mkdir(exist_ok=True)
+    local.mkdir(exist_ok=True)
     configure(remote, {'protocol': protocol, 'listen': '127.0.0.1', 'port': remote_port,
         'settings': protocol_settings(protocol), 'streamSettings': grpc_transport(True, True)},
         {'protocol': 'freedom', 'settings': {}})
@@ -99,6 +99,41 @@ async def bridge(args, scenario, output, result, resources):
                   response_bytes=len(response),
                   payload_bytes=len(PAYLOAD), payload_sha256=hashlib.sha256(PAYLOAD).hexdigest(),
                   same_front_connection=True, peer_frame_error=peer.error)
+
+
+async def inbound_raw(args, scenario, output, result, resources):
+    tls, empty = scenario
+    received = []
+    response = b'' if empty else PAYLOAD
+
+    async def destination(reader, writer):
+        data = await reader.read()
+        assert data == PAYLOAD, 'raw inbound lost upload before target EOF'
+        received.append(data)
+        writer.write(response)
+        await writer.drain()
+
+    target_port = await resources.listen(destination)
+    port = available_port()
+    configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,
+                       'settings': protocol_settings('vless'),
+                       'streamSettings': grpc_transport(tls, True, raw=True)},
+              {'protocol': 'freedom', 'settings': {}})
+    resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
+    reader, writer = await resources.connect(port, tls=tls)
+    writer.write(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + h2frame(4))
+    await writer.drain()
+    peer = Peer(resources, reader, writer, raw=True)
+    for sid in range(1, args.requests * 2, 2):
+        await peer.open(sid, target_port, PAYLOAD, tls, end=True)
+        await peer.wait_message(sid, b'\0\0' + response)
+        await until(lambda: peer.closed or any(kind in (0, 1) and flags & 1 and stream_id == sid
+                    for kind, flags, stream_id, _ in peer.frames), 5)
+        assert not peer.closed and not peer.error, 'raw END_STREAM closed the shared connection'
+    await peer.ping(b'raw-done')
+    assert received == [PAYLOAD] * args.requests
+    result.update(passed=True, requests=len(received), response_bytes=len(response),
+                  payload_bytes=len(PAYLOAD), same_front_connection=True, target_eof=True)
 
 
 async def outbound(args, scenario, output, result, resources):
@@ -153,6 +188,8 @@ async def main(args):
     cases += [('bridge-vmess-empty-response', bridge, ('vmess', None, True))]
     cases += [('outbound-tcp', outbound, (False, False)), ('outbound-tls', outbound, (True, False)),
               ('outbound-h2-tcp', outbound, (False, True)), ('outbound-h2-tls', outbound, (True, True))]
+    cases += [(f'inbound-h2-{mode}-{"tls" if tls else "tcp"}', inbound_raw, (tls, empty))
+              for tls in (False, True) for mode, empty in (('response', False), ('empty', True))]
     results = []
     for name, scenario, value in cases:
         if args.case and name != args.case:

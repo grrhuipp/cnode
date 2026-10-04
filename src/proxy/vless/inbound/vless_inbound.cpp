@@ -334,7 +334,8 @@ proxy::vless::inbound::Handler::Process(
         return fail(error);
     };
 
-    if (limiter_ && limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+    if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
+        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -440,7 +441,7 @@ proxy::vless::inbound::Handler::Process(
     if (!user_info) {
         LOG_NET_WARN("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
                       tag, client_ip, validator_.Size(), validator_.SizeForTag(tag));
-        if (limiter_) {
+        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);

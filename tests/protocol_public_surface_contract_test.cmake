@@ -36,6 +36,11 @@ endif()
 set(ANYTLS_INBOUND
     "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp")
 file(READ "${SOURCE_DIR}/src/proxy/anytls/anytls_codec.cpp" ANYTLS_CODEC_SOURCE)
+file(READ "${SOURCE_DIR}/src/proxy/anytls/anytls_codec.hpp" ANYTLS_CODEC_HEADER)
+if(ANYTLS_CODEC_SOURCE MATCHES "WriteFrameBody" OR ANYTLS_CODEC_HEADER MATCHES "WriteFrameBody")
+    message(FATAL_ERROR
+        "AnyTLS callers must pass byte views to WriteFrame without a Buffer-specific wrapper")
+endif()
 if(ANYTLS_CODEC_SOURCE MATCHES "catch[ \t]*[(][.][.][.][)]|MapWriteException")
     message(FATAL_ERROR
         "AnyTLS codec must preserve non-I/O exceptions for the owning request or physical task")
@@ -460,6 +465,12 @@ set(VMESS_CLIENT_ENCODING
 set(VMESS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp")
 file(READ "${VMESS_SERVER_ENCODING}" VMESS_SERVER_ENCODING_SOURCE)
+file(READ "${SOURCE_DIR}/src/proxy/vmess/encoding/server.hpp" VMESS_SERVER_ENCODING_HEADER)
+if(VMESS_SERVER_ENCODING_HEADER MATCHES "EncodeResponseHeader[(]|EncodeResponseBody[(]" OR
+   VMESS_SERVER_ENCODING_SOURCE MATCHES "ServerSession::EncodeResponseHeader|ServerSession::EncodeResponseBody[(]|ResponseBodyWriter[(]const VMessRequest& request, AsyncStream& stream[)]")
+    message(FATAL_ERROR
+        "VMess server responses must use the single header-carrying writer factory, not standalone header/body wrappers")
+endif()
 file(READ "${VMESS_CLIENT_ENCODING}" VMESS_CLIENT_ENCODING_SOURCE)
 file(READ "${VMESS_OUTBOUND}" VMESS_OUTBOUND_SOURCE)
 if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
@@ -512,23 +523,6 @@ endif()
 set(SHADOWSOCKS_OUTBOUND
     "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/ss_outbound.cpp")
 file(READ "${SHADOWSOCKS_OUTBOUND}" SHADOWSOCKS_OUTBOUND_SOURCE)
-if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "buf::InspectUdpDatagram[(]payload[)]" OR
-   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "buf::ContiguousBufferView view[(]payload[)]")
-    message(FATAL_ERROR
-        "Shadowsocks outbound must encode one complete MultiBuffer datagram")
-endif()
-if(SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "for [(]buf::Buffer[*] buffer : mb[)][ \t\r\n]*[{][\t\r\n ]*if .*EncodePacket")
-    message(FATAL_ERROR
-        "Shadowsocks outbound must not encode one UDP packet per Buffer")
-endif()
-if(NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "Shadowsocks UDP requires one datagram target")
-    message(FATAL_ERROR
-        "Shadowsocks UDP scatter writes must not be silently discarded")
-endif()
 set(SHADOWSOCKS_UDP_HEADER
     "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.hpp")
 set(SHADOWSOCKS_UDP_SOURCE
@@ -566,179 +560,121 @@ if(SHADOWSOCKS_INBOUND_SOURCE MATCHES
     message(FATAL_ERROR
         "Shadowsocks UDP response encoding must belong to its captured session context")
 endif()
-set(UDP_RELAY "${SOURCE_DIR}/src/app/udp_channel.cpp")
-file(READ "${UDP_RELAY}" UDP_RELAY_SOURCE)
-if(NOT UDP_RELAY_SOURCE MATCHES
-        "buf::InspectUdpDatagram[(]payload[)]")
-    message(FATAL_ERROR
-        "UDP channel must preserve one MultiBuffer as one datagram")
-endif()
-set(UDP_SESSION "${SOURCE_DIR}/src/app/udp_session.cpp")
-set(UDP_CALLBACK_ROUTER "${SOURCE_DIR}/src/app/udp_callback_router.cpp")
-set(UDP_CALLBACK_ROUTER_HEADER "${SOURCE_DIR}/src/app/udp_callback_router.hpp")
-set(UDP_SESSION_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp")
+foreach(REMOVED_UDP_MANAGER_FILE IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/udp_channel.hpp"
+        "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp"
+        "${SOURCE_DIR}/src/app/udp_channel.cpp"
+        "${SOURCE_DIR}/src/app/udp_session.cpp"
+        "${SOURCE_DIR}/src/app/udp_callback_router.cpp"
+        "${SOURCE_DIR}/src/app/udp_callback_router.hpp"
+        "${SOURCE_DIR}/tests/udp_callback_router_test.cpp"
+        "${SOURCE_DIR}/tests/udp_channel_test.cpp")
+    if(EXISTS "${REMOVED_UDP_MANAGER_FILE}")
+        message(FATAL_ERROR
+            "removed shared UDP manager architecture must not return: ${REMOVED_UDP_MANAGER_FILE}")
+    endif()
+endforeach()
 set(UDP_TYPES_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_types.hpp")
-file(READ "${UDP_SESSION}" UDP_SESSION_SOURCE)
-file(READ "${UDP_CALLBACK_ROUTER}" UDP_CALLBACK_ROUTER_SOURCE)
-file(READ "${UDP_CALLBACK_ROUTER_HEADER}" UDP_CALLBACK_ROUTER_HEADER_SOURCE)
-file(READ "${UDP_SESSION_HEADER}" UDP_SESSION_HEADER_SOURCE)
 file(READ "${UDP_TYPES_HEADER}" UDP_TYPES_HEADER_SOURCE)
-if(UDP_SESSION_SOURCE MATCHES
-        "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*buf::Buffer::kSize")
-    message(FATAL_ERROR
-        "UDPSession receive capacity must not be limited to one Buffer")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES "socket[.]available")
-    message(FATAL_ERROR
-        "UDPSession must size large datagrams before receiving them")
-endif()
-string(REGEX MATCHALL "ResolveEndpoint[(]target[)]"
-    UDP_RESOLVE_CALLS "${UDP_SESSION_SOURCE}")
-list(LENGTH UDP_RESOLVE_CALLS UDP_RESOLVE_CALL_COUNT)
-if(NOT UDP_RESOLVE_CALL_COUNT EQUAL 1)
-    message(FATAL_ERROR
-        "UDPSession must have one owning datagram send path")
-endif()
-string(REGEX MATCHALL "SendResolved[\r\n (]"
-    UDP_SEND_CALLS "${UDP_SESSION_SOURCE}")
-list(LENGTH UDP_SEND_CALLS UDP_SEND_CALL_COUNT)
-if(NOT UDP_SEND_CALL_COUNT EQUAL 2)
-    message(FATAL_ERROR
-        "UDPSession must centralize socket send, accounting and payload limits")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-    "RunReceive[(]std::shared_ptr<Impl> self[)]")
-    message(FATAL_ERROR
-        "UDPSession receive loop must own Impl until cancellation completes")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-        "receive_started = false" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "if [(]self->running[)]" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "[!]it->second->IsRunning[(][)]" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "const auto receive_error = session_handle->StartReceive[(][)]")
-    message(FATAL_ERROR
-        "UDPSession must reject duplicate receive loops and replace dead sessions")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-        "it->second[.]use_count[(][)] != 1" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "it->second[.]use_count[(][)] == 1" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "std::allocate_shared<UDPSession>" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "it->second->CanRetire[(]impl_->session_timeout[)]" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "return std::unexpected[(]ErrorCode::NETWORK_IO_ERROR[)]")
-    message(FATAL_ERROR
-        "UDPSessionManager must retain sessions while Worker-local owning handles exist")
-endif()
-if(UDP_SESSION_HEADER_SOURCE MATCHES
-        "const uint8_t[*] data,[\r\n ]+size_t len[\r\n ]*[)];")
-    message(FATAL_ERROR
-        "UDPSession sends must carry a registered callback identity")
-endif()
-set(FREEDOM_OUTBOUND_SOURCE_PATH
-    "${SOURCE_DIR}/src/proxy/freedom/freedom_outbound.cpp")
-file(READ "${FREEDOM_OUTBOUND_SOURCE_PATH}" FREEDOM_OUTBOUND_SOURCE)
-if(NOT FREEDOM_OUTBOUND_SOURCE MATCHES
-        "std::shared_ptr<UDPSession> session =" OR
-   NOT SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "UDPChannel channel_" OR
-   FREEDOM_OUTBOUND_SOURCE MATCHES
-        "UDPSession[*] session =" OR
-   SHADOWSOCKS_OUTBOUND_SOURCE MATCHES
-        "UDPSession& session_")
-    message(FATAL_ERROR
-        "UDP-capable outbounds must retain Worker-local owning session handles")
-endif()
-string(FIND "${UDP_SESSION_HEADER_SOURCE}" "private:" UDP_SESSION_PRIVATE_OFFSET)
-string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode Start(" UDP_SESSION_START_OFFSET)
-string(FIND "${UDP_SESSION_HEADER_SOURCE}" "ErrorCode StartReceive(" UDP_SESSION_RECEIVE_OFFSET)
-string(FIND "${UDP_SESSION_HEADER_SOURCE}" "void Stop(" UDP_SESSION_STOP_OFFSET)
-if(UDP_SESSION_PRIVATE_OFFSET LESS 0 OR
-   UDP_SESSION_START_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET OR
-   UDP_SESSION_RECEIVE_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET OR
-   UDP_SESSION_STOP_OFFSET LESS UDP_SESSION_PRIVATE_OFFSET)
-    message(FATAL_ERROR
-        "UDPSession lifecycle must remain manager-owned private state")
-endif()
-if(UDP_SESSION_SOURCE MATCHES "retired_sessions")
-    message(FATAL_ERROR
-        "UDPSessionManager must not retain every removed session until shutdown")
-endif()
-string(FIND "${UDP_SESSION_SOURCE}" "UDPSessionManager::~UDPSessionManager()" UDP_MANAGER_DTOR_BEGIN)
-string(FIND "${UDP_SESSION_SOURCE}" "UDPSessionManager::AcquireSession(" UDP_MANAGER_DTOR_END)
-if(UDP_MANAGER_DTOR_BEGIN LESS 0 OR UDP_MANAGER_DTOR_END LESS UDP_MANAGER_DTOR_BEGIN)
-    message(FATAL_ERROR "could not isolate UDP manager destruction")
-endif()
-math(EXPR UDP_MANAGER_DTOR_LENGTH "${UDP_MANAGER_DTOR_END} - ${UDP_MANAGER_DTOR_BEGIN}")
-string(SUBSTRING "${UDP_SESSION_SOURCE}" ${UDP_MANAGER_DTOR_BEGIN}
-    ${UDP_MANAGER_DTOR_LENGTH} UDP_MANAGER_DTOR_SOURCE)
-if(NOT UDP_MANAGER_DTOR_SOURCE MATCHES "Cancel[(]impl_->cleanup_token[)]" OR
-   NOT UDP_MANAGER_DTOR_SOURCE MATCHES "session->Stop[(][)]" OR
-   UDP_SESSION_HEADER_SOURCE MATCHES "StopAll[(]")
-    message(FATAL_ERROR
-        "UDP manager destruction must cancel cleanup and live sessions without restoring the unused public shutdown API")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-        "StartCleanup[(][)] \\{[\r\n ]+if [(]impl_->running[)]" OR
-   UDP_SESSION_HEADER_SOURCE MATCHES
-        "TotalPackets(Sent|Received)" OR
-   UDP_SESSION_HEADER_SOURCE MATCHES
-        "(Packets|Bytes)(Sent|Received)[(][)] const")
-    message(FATAL_ERROR
-        "UDPSession cleanup must be idempotent and dead aggregate stats must stay removed")
-endif()
-if(UDP_SESSION_SOURCE MATCHES
-       "registered_callbacks|target_to_callbacks" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "callbacks[.]RegisteredCount[(][)]" OR
-   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
-        "kMaxTargetsPerCallback = 256" OR
-   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
-        "kMaxTargetMappings = 4096" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "callbacks[.]BeginTargetSend[(]" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "mapping_lease[.]Commit[(][)]" OR
-   UDP_SESSION_SOURCE MATCHES
-        "RollbackTarget|CommitTarget" OR
-   NOT UDP_CALLBACK_ROUTER_HEADER_SOURCE MATCHES
-        "~MappingLease[(][)] noexcept" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "MappingLease::Reset[(][)] noexcept" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "owner_->RollbackTarget[(]token_[)]" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "pending_removal" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "DispatchScope" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "target_it->second[.]generation != token[.]generation" OR
-   NOT UDP_CALLBACK_ROUTER_SOURCE MATCHES
-        "pending_sends")
-    message(FATAL_ERROR
-        "UDPSession callback routing must be bounded, reentrant-safe and generation-transactional")
-endif()
-if(NOT UDP_SESSION_SOURCE MATCHES
-        "kMaxSessions = 4096" OR
-   NOT UDP_SESSION_SOURCE MATCHES
-        "[!]it->second->UsesBindAddress[(]bind_address[)]" OR
-   NOT UDP_SESSION_HEADER_SOURCE MATCHES
-        "std::expected<std::shared_ptr<UDPSession>, ErrorCode> AcquireSession" OR
-   UDP_SESSION_HEADER_SOURCE MATCHES
-        "GetOrCreateSession|GetSession[(]|RemoveSession[(]|SessionId[(]|expected<UDPSession[*]")
-    message(FATAL_ERROR
-        "UDPSessionManager acquisition must be bounded, bind-safe and expose exact errors")
-endif()
 if(NOT UDP_TYPES_HEADER_SOURCE MATCHES
         "return invoke_bool_[(]storage_, std::forward<Args>[(]args[)][.][.][.][)]")
     message(FATAL_ERROR
         "UDP callback rejection must propagate through inline type erasure")
 endif()
+
+set(DATAGRAM_SOCKET_HEADER
+    "${SOURCE_DIR}/include/acppnode/transport/internet/datagram_socket.hpp")
+set(DATAGRAM_SOCKET_SOURCE
+    "${SOURCE_DIR}/src/transport/internet/datagram_socket.cpp")
+set(CONNECTION_TIMEOUTS_HEADER
+    "${SOURCE_DIR}/src/transport/internet/connection_timeouts.hpp")
+file(READ "${DATAGRAM_SOCKET_HEADER}" DATAGRAM_SOCKET_HEADER_SOURCE)
+file(READ "${DATAGRAM_SOCKET_SOURCE}" DATAGRAM_SOCKET_SOURCE_TEXT)
+file(READ "${CONNECTION_TIMEOUTS_HEADER}" CONNECTION_TIMEOUTS_SOURCE)
+foreach(LOWER_SOURCE IN ITEMS
+        DATAGRAM_SOCKET_HEADER_SOURCE DATAGRAM_SOCKET_SOURCE_TEXT CONNECTION_TIMEOUTS_SOURCE)
+    if(${LOWER_SOURCE} MATCHES
+           "acppnode/app/|app::dns|PanelConfig|panel/|proxy/|json::|nlohmann::|UDPSession|UDPSessionManager|shared_ptr|steady_timer|ReplyQueue|reply_queue|read_loop|ReadLoop|RunReceive|StartReceive")
+        message(FATAL_ERROR
+            "datagram transport and timeout lower layer must not own app, protocol, session, timer, read-loop or reply-queue architecture")
+    endif()
+endforeach()
+string(REGEX MATCHALL "TimeoutToken [A-Za-z_][A-Za-z0-9_]*"
+    CONNECTION_TIMEOUT_TOKENS "${CONNECTION_TIMEOUTS_SOURCE}")
+list(LENGTH CONNECTION_TIMEOUT_TOKENS CONNECTION_TIMEOUT_TOKEN_COUNT)
+if(NOT CONNECTION_TIMEOUT_TOKEN_COUNT EQUAL 1 OR
+   CONNECTION_TIMEOUTS_SOURCE MATCHES "steady_timer")
+    message(FATAL_ERROR
+        "connection timeouts must use one scheduler token, not a per-connection timer")
+endif()
+
+set(FREEDOM_UDP_REQUEST_HEADER
+    "${SOURCE_DIR}/src/proxy/freedom/outbound/udp_request.hpp")
+set(SHADOWSOCKS_UDP_REQUEST_HEADER
+    "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/udp_request.hpp")
+set(UDP_TARGET_HELPER "${SOURCE_DIR}/src/proxy/udp_target.hpp")
+file(READ "${FREEDOM_UDP_REQUEST_HEADER}" FREEDOM_UDP_REQUEST_SOURCE)
+file(READ "${SHADOWSOCKS_UDP_REQUEST_HEADER}" SHADOWSOCKS_UDP_REQUEST_SOURCE)
+file(READ "${UDP_TARGET_HELPER}" UDP_TARGET_HELPER_SOURCE)
+foreach(UDP_REQUEST_SOURCE IN ITEMS
+        FREEDOM_UDP_REQUEST_SOURCE SHADOWSOCKS_UDP_REQUEST_SOURCE)
+    if(NOT ${UDP_REQUEST_SOURCE} MATCHES
+           "transport::internet::DatagramSocket socket_" OR
+       ${UDP_REQUEST_SOURCE} MATCHES
+           ":[^{]*public[^{]*(MultiBufferReader|MultiBufferWriter)|virtual[ \t]+(net::awaitable|void|bool)")
+        message(FATAL_ERROR
+            "Freedom and Shadowsocks UDP requests must directly own DatagramSocket, without another polymorphic MultiBuffer endpoint")
+    endif()
+    if(NOT ${UDP_REQUEST_SOURCE} MATCHES
+           "buf::InspectUdpDatagram[(]payload[)]")
+        message(FATAL_ERROR
+            "logical UDP writes must continue validating exactly one datagram")
+    endif()
+endforeach()
+if(NOT UDP_TARGET_HELPER_SOURCE MATCHES "ResolveUdpEndpoint" OR
+   NOT UDP_TARGET_HELPER_SOURCE MATCHES "dns[.]Resolve[(]target[.]host[)]" OR
+   NOT UDP_TARGET_HELPER_SOURCE MATCHES "socket[.]IsIPv6[(][)]")
+    message(FATAL_ERROR
+        "outbound-only UDP target resolution must remain in the narrow proxy helper")
+endif()
+if(NOT FREEDOM_UDP_REQUEST_SOURCE MATCHES
+       "ResolveUdpEndpoint[(]dns_, [*]datagram[.]target" OR
+   NOT SHADOWSOCKS_UDP_REQUEST_SOURCE MATCHES
+       "ResolveUdpEndpoint[(]dns_, server_" OR
+   NOT SHADOWSOCKS_UDP_REQUEST_SOURCE MATCHES
+       "EncodePacketTo[(][*]datagram[.]target")
+    message(FATAL_ERROR
+        "UDP target lookup belongs to outbound request preparation; Shadowsocks inner targets remain encoded in each packet")
+endif()
+string(REGEX MATCHALL "StartRead[(][)]"
+    SHADOWSOCKS_READ_SCOPES "${SHADOWSOCKS_UDP_REQUEST_SOURCE}")
+list(LENGTH SHADOWSOCKS_READ_SCOPES SHADOWSOCKS_READ_SCOPE_COUNT)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto read = socket_.StartRead();" SS_READ_START_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "while (true)" SS_READ_LOOP_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto packet = co_await read.Receive();" SS_RECEIVE_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "if (!server_endpoint_ || packet.source != *server_endpoint_) continue;" SS_SOURCE_FILTER_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto decoded =" SS_DECODE_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "if (!decoded || !buf::HasData(decoded->payload)) continue;" SS_INVALID_PACKET_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "socket_.TouchActivity();" SS_TOUCH_ACTIVITY_OFFSET)
+if(NOT SHADOWSOCKS_READ_SCOPE_COUNT EQUAL 1 OR
+   SS_READ_START_OFFSET LESS 0 OR
+   SS_READ_LOOP_OFFSET LESS SS_READ_START_OFFSET OR
+   SS_RECEIVE_OFFSET LESS SS_READ_LOOP_OFFSET OR
+   SS_SOURCE_FILTER_OFFSET LESS SS_RECEIVE_OFFSET OR
+   SS_DECODE_OFFSET LESS SS_SOURCE_FILTER_OFFSET OR
+   SS_INVALID_PACKET_OFFSET LESS SS_DECODE_OFFSET OR
+   SS_TOUCH_ACTIVITY_OFFSET LESS SS_INVALID_PACKET_OFFSET)
+    message(FATAL_ERROR
+        "Shadowsocks must use one logical read scope and touch activity only after authenticated response decoding")
+endif()
+
 set(UDP_WORKER_SOURCE_PATH
     "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp")
 set(UDP_WORKER_HEADER_PATH
@@ -791,7 +727,11 @@ endif()
 if(NOT UDP_WORKER_SOURCE MATCHES
         "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR
    NOT UDP_WORKER_SOURCE MATCHES
-        "decoded->target,[\r\n ]+datagram[.]client_endpoint,[\r\n ]+decoded->session_owner,[\r\n ]+std::move[(]decoded->payload[)]" OR
+        "packet_session->Owns[(]decoded->session_owner[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "packet_session->UpdateReplyEndpoint[(]datagram[.]client_endpoint[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "packet_session->Push[(]decoded->target, std::move[(]decoded->payload[)][)]" OR
    NOT UDP_WORKER_SOURCE MATCHES
         "const udp::endpoint& reply_endpoint")
     message(FATAL_ERROR
@@ -829,21 +769,11 @@ if(WORKER_SOURCE MATCHES
     message(FATAL_ERROR
         "native UDP inbound receive must not be limited to one Buffer")
 endif()
-if(NOT WORKER_SOURCE MATCHES
-        "detail::UdpReceiveBuffer receive_buffer")
+file(READ "${SOURCE_DIR}/src/app/worker/udp_receive_loop.hpp" UDP_RECEIVE_SOURCE)
+if(NOT WORKER_SOURCE MATCHES "return worker_detail::RunUdpReceiveLoop" OR
+   NOT UDP_RECEIVE_SOURCE MATCHES "detail::UdpReceiveBuffer receive_buffer")
     message(FATAL_ERROR
         "native UDP inbound must share the full-datagram receive path")
-endif()
-if(NOT UDP_RELAY_SOURCE MATCHES
-        "self->session->SendTo[(]target, std::move[(]payload[)], callback_id[)]" OR
-   UDP_SESSION_HEADER_SOURCE MATCHES "const uint8_t[*] data")
-    message(FATAL_ERROR "UDP sends must transfer one owning MultiBuffer datagram")
-endif()
-if(NOT UDP_RELAY_SOURCE MATCHES "kMaxPackets = 256" OR
-   NOT UDP_RELAY_SOURCE MATCHES "kMaxBytes = 512 [*] 1024" OR
-   NOT UDP_RELAY_SOURCE MATCHES "callback_id == 0" OR
-   SHADOWSOCKS_OUTBOUND_SOURCE MATCHES "RegisterCallback|StopAndDrain|read_timer_|phase_timer_")
-    message(FATAL_ERROR "UDP registration, bounded queues and deadlines must belong to the generic request channel")
 endif()
 if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
     message(FATAL_ERROR

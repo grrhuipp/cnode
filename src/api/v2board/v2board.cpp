@@ -82,8 +82,6 @@ public:
     net::awaitable<bool>
     ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results) override;
 
-    void Debug() override;
-
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -293,7 +291,6 @@ struct APIClient::Impl {
     net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
     net::awaitable<RuleListFetchResult> GetNodeRule();
     net::awaitable<bool> ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results);
-    void Debug();
 
     net::io_context& io_context_;
     ::acpp::api::Config config_;
@@ -306,7 +303,6 @@ struct APIClient::Impl {
     std::optional<::acpp::api::NodeInfo> cached_config_;
     std::vector<::acpp::api::DetectRule> cached_route_rules_;
     std::unique_ptr<net::ssl::context> https_context_;
-    bool debug_enabled_ = false;
 };
 
 APIClient::Impl::Impl(net::io_context& io_context,
@@ -452,7 +448,7 @@ net::awaitable<HttpResponse>
 APIClient::Impl::HttpRequest(HttpMethod method, const std::string& path,
                            const std::optional<json::value>& body,
                            const std::string& if_none_match) {
-    co_return co_await http::RunRequest(
+    return http::RunRequest(
         HttpExchange(method, path, body, if_none_match), config_.RequestTimeout);
 }
 
@@ -532,10 +528,6 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
     request += "\r\n";
     request += body_text;
 
-    if (debug_enabled_) {
-        LOG_DEBUG("V2Board[{}]: {} {}", config_.Name, MethodName(method), path);
-    }
-
     if (url_parts_.use_ssl) {
         // HTTPS
         auto ssl_ctx = GetOrCreateHttpsContext();
@@ -583,10 +575,6 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
             // apply the request (in particular, an additive traffic POST).
             co_await WriteHttpRequest(stream, request);
             result = co_await http::ReadResponse(stream);
-            if (debug_enabled_) {
-                LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
-                          config_.Name, MethodName(method), path, result.status);
-            }
 
             // The HTTP response is complete. TLS close_notify is best effort
             // and must neither stall indefinitely nor invalidate that response.
@@ -619,10 +607,6 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
 
             co_await WriteHttpRequest(stream, request);
             result = co_await http::ReadResponse(stream);
-            if (debug_enabled_) {
-                LOG_DEBUG("V2Board[{}]: {} {} -> HTTP {}",
-                          config_.Name, MethodName(method), path, result.status);
-            }
 
             IoErrorCode ec;
             stream.shutdown(tcp::socket::shutdown_both, ec);
@@ -830,10 +814,6 @@ APIClient::Impl::ReportIllegal(const std::vector<::acpp::api::DetectResult>& det
     co_return true;
 }
 
-void APIClient::Impl::Debug() {
-    debug_enabled_ = true;
-}
-
 APIClient::APIClient(net::io_context& io_context,
                      const ::acpp::api::Config& config,
                      ::acpp::app::dns::DNS& dns_service)
@@ -844,41 +824,37 @@ APIClient::~APIClient() = default;
 
 net::awaitable<NodeInfoFetchResult>
 APIClient::GetNodeInfo() {
-    co_return co_await impl_->GetNodeInfo();
+    return impl_->GetNodeInfo();
 }
 
 net::awaitable<UserListFetchResult>
 APIClient::GetUserList() {
-    co_return co_await impl_->GetUserList();
+    return impl_->GetUserList();
 }
 
 net::awaitable<bool>
 APIClient::ReportNodeStatus(const ::acpp::api::NodeStatus& node_status) {
-    co_return co_await impl_->ReportNodeStatus(node_status);
+    return impl_->ReportNodeStatus(node_status);
 }
 
 net::awaitable<bool>
 APIClient::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users) {
-    co_return co_await impl_->ReportNodeOnlineUsers(online_users);
+    return impl_->ReportNodeOnlineUsers(online_users);
 }
 
 net::awaitable<bool>
 APIClient::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
-    co_return co_await impl_->ReportUserTraffic(data);
+    return impl_->ReportUserTraffic(data);
 }
 
 net::awaitable<RuleListFetchResult>
 APIClient::GetNodeRule() {
-    co_return co_await impl_->GetNodeRule();
+    return impl_->GetNodeRule();
 }
 
 net::awaitable<bool>
 APIClient::ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results) {
-    co_return co_await impl_->ReportIllegal(detect_results);
-}
-
-void APIClient::Debug() {
-    impl_->Debug();
+    return impl_->ReportIllegal(detect_results);
 }
 
 }  // namespace acpp::api::v2board

@@ -161,12 +161,15 @@ public:
     // 阶段2: IP 检查 (获取真实 IP 后调用)
     // tag: 入站标签，用于区分不同节点的 banned 状态
     // ========================================================================
-    Reject CheckIP(std::string_view tag, std::string_view ip) {
+    Reject CheckIP(
+        std::string_view tag,
+        std::string_view ip,
+        bool check_auth_ban = true) {
         uint64_t h = Hash(ip);
         uint32_t now = Now();
 
         // 1. 检查屏蔽（按 tag+ip 检查，不同节点独立）
-        if (cfg_.auth_fail_limit > 0) {
+        if (check_auth_ban && cfg_.auth_fail_limit > 0) {
             uint64_t ban_h = HashPair(tag, ip);
             if (const Slot* ban_s = FindConst(ban_h)) {
                 if (ban_s->ban_until > now) {
@@ -358,8 +361,11 @@ public:
                RejectReason::NONE : RejectReason::MAX_CONNECTIONS;
     }
 
-    RejectReason TryAcceptIP(std::string_view tag, std::string_view ip) {
-        auto r = lim_.CheckIP(tag, ip);
+    RejectReason TryAcceptIP(
+        std::string_view tag,
+        std::string_view ip,
+        bool check_auth_ban = true) {
+        auto r = lim_.CheckIP(tag, ip, check_auth_ban);
         switch (r) {
             case Reject::IPConnLimit: return RejectReason::MAX_CONNECTIONS_PER_IP;
             case Reject::IPBanned:

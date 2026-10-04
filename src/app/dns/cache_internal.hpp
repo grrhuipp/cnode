@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/stats.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/clock.hpp"
 

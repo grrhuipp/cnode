@@ -7,6 +7,8 @@ file(READ "${SOURCE_DIR}/src/app/worker/tcp_listener.hpp"
     TCP_WORKER_HEADER_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/worker/udp_ingress.hpp"
     UDP_WORKER_HEADER_SOURCE)
+file(READ "${SOURCE_DIR}/src/app/worker/udp_receive_loop.hpp"
+    UDP_RECEIVE_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp" BOOTSTRAP_RUNTIME_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp" BOOTSTRAP_INBOUNDS_SOURCE)
 
@@ -55,9 +57,9 @@ if(WORKER_SOURCE MATCHES "RetireInboundHandler")
 endif()
 
 string(FIND "${WORKER_SOURCE}"
-    "void Worker::UnregisterListenerOnWorkerThread" UNREGISTER_BEGIN)
+    "net::awaitable<void> Worker::UnregisterListenerTask" UNREGISTER_BEGIN)
 string(FIND "${WORKER_SOURCE}"
-    "net::awaitable<void> Worker::UnregisterListenerTask" UNREGISTER_END)
+    "net::awaitable<void> Worker::UpdateRuleTask" UNREGISTER_END)
 if(UNREGISTER_BEGIN EQUAL -1 OR UNREGISTER_END EQUAL -1 OR
    NOT UNREGISTER_BEGIN LESS UNREGISTER_END)
     message(FATAL_ERROR "could not isolate inbound unregister implementation")
@@ -75,30 +77,56 @@ function(require_step needle output_name)
     set(${output_name} ${step_position} PARENT_SCOPE)
 endfunction()
 
+require_step("ColdMutationGuard mutation(runtime_->cold_mutation_active)" GATE_POS)
 require_step("memory::AllocateShared<WorkerRuntimeConfig>" SNAPSHOT_POS)
 require_step("CollectTcpListenerKeys" TCP_PREPARE_POS)
 require_step("CollectUdpSocketKeys" UDP_PREPARE_POS)
 require_step("inbound_manager->RemoveHandler" MANAGER_COMMIT_POS)
 require_step("listener_state->StopListening" TCP_COMMIT_POS)
-require_step("listener_state->StopUdpListening" UDP_COMMIT_POS)
+require_step("co_await runtime_->listener_state->RetireUdpListening" UDP_COMMIT_POS)
 require_step("StoreSnapshot" SNAPSHOT_COMMIT_POS)
+require_step("throw_if_cancelled(cancel_throwing)" CANCEL_RESTORE_POS)
 
-if(NOT SNAPSHOT_POS LESS TCP_PREPARE_POS OR
+if(NOT GATE_POS LESS SNAPSHOT_POS OR
+   NOT SNAPSHOT_POS LESS TCP_PREPARE_POS OR
    NOT TCP_PREPARE_POS LESS UDP_PREPARE_POS OR
-   NOT UDP_PREPARE_POS LESS MANAGER_COMMIT_POS OR
-   NOT MANAGER_COMMIT_POS LESS TCP_COMMIT_POS OR
+   NOT UDP_PREPARE_POS LESS TCP_COMMIT_POS OR
    NOT TCP_COMMIT_POS LESS UDP_COMMIT_POS OR
-   NOT UDP_COMMIT_POS LESS SNAPSHOT_COMMIT_POS)
+   NOT UDP_COMMIT_POS LESS MANAGER_COMMIT_POS OR
+   NOT MANAGER_COMMIT_POS LESS SNAPSHOT_COMMIT_POS OR
+   NOT SNAPSHOT_COMMIT_POS LESS CANCEL_RESTORE_POS)
     message(FATAL_ERROR
-        "inbound unregister must prepare all allocating state before committing manager, listeners, and snapshot")
+        "unregister must gate and prepare first, await UDP retirement before releasing the handler, then commit before restoring cancellation")
 endif()
 
 if(NOT WORKER_SOURCE MATCHES
    "ListenerKeys listener_keys\\) noexcept" OR
-   NOT WORKER_SOURCE MATCHES
-   "ListenerKeys socket_keys\\) noexcept")
+   WORKER_SOURCE MATCHES
+   "UnregisterListenerOnWorkerThread|StopUdpListening|ResetUdpListening")
     message(FATAL_ERROR
-        "prepared listener stop operations must remain non-throwing commit steps")
+        "TCP stop remains synchronous; UDP retirement must not retain a synchronous non-joining bypass")
+endif()
+
+string(FIND "${WORKER_SOURCE}"
+    "net::awaitable<void> Worker::ListenerState::RetireUdpListening" RETIRE_BEGIN)
+string(FIND "${WORKER_SOURCE}"
+    "bool Worker::ListenerState::EnqueueUdpReply" RETIRE_END)
+if(RETIRE_BEGIN EQUAL -1 OR RETIRE_END EQUAL -1 OR
+   NOT RETIRE_BEGIN LESS RETIRE_END)
+    message(FATAL_ERROR "could not isolate UDP retirement implementation")
+endif()
+math(EXPR RETIRE_LENGTH "${RETIRE_END} - ${RETIRE_BEGIN}")
+string(SUBSTRING "${WORKER_SOURCE}" ${RETIRE_BEGIN} ${RETIRE_LENGTH} RETIRE_SOURCE)
+string(FIND "${RETIRE_SOURCE}" "retiring_udp = std::move(worker_it->second)" OWNER_POS)
+string(FIND "${RETIRE_SOURCE}" "retiring.RequestStop()" STOP_POS)
+string(FIND "${RETIRE_SOURCE}" "co_await retiring.AsyncJoin()" JOIN_POS)
+string(FIND "${RETIRE_SOURCE}" "retiring_udp.reset()" RELEASE_POS)
+if(OWNER_POS EQUAL -1 OR STOP_POS EQUAL -1 OR JOIN_POS EQUAL -1 OR
+   RELEASE_POS EQUAL -1 OR NOT OWNER_POS LESS STOP_POS OR
+   NOT STOP_POS LESS JOIN_POS OR NOT JOIN_POS LESS RELEASE_POS OR
+   NOT RETIRE_SOURCE MATCHES "FailRuntime[(]\\\"udp-join\\\"")
+    message(FATAL_ERROR
+        "Worker must retain the retiring ingress through actual join and fail explicitly on a join failure")
 endif()
 
 function(require_reuse_before_restart begin_marker end_marker reuse_marker restart_marker label)
@@ -127,14 +155,14 @@ require_reuse_before_restart(
     "StopListening"
     "TCP")
 require_reuse_before_restart(
-    "bool Worker::ListenerState::StartUdpListening"
+    "net::awaitable<bool> Worker::ListenerState::StartUdpListening"
     "net::awaitable<void> Worker::ListenerState::UdpReceiveLoop"
     "ReplaceHandler"
-    "ResetUdpListening"
+    "co_await RetireUdpListening"
     "UDP")
 
 string(FIND "${WORKER_SOURCE}"
-    "bool Worker::ListenerState::StartUdpListening" UDP_START_BEGIN)
+    "net::awaitable<bool> Worker::ListenerState::StartUdpListening" UDP_START_BEGIN)
 string(FIND "${WORKER_SOURCE}"
     "net::awaitable<void> Worker::ListenerState::UdpReceiveLoop" UDP_START_END)
 math(EXPR UDP_START_LENGTH "${UDP_START_END} - ${UDP_START_BEGIN}")
@@ -143,7 +171,7 @@ string(SUBSTRING "${WORKER_SOURCE}"
 string(FIND "${UDP_START_SOURCE}"
     "if (bound_count == 0)" UDP_BIND_FAILURE_POS)
 string(FIND "${UDP_START_SOURCE}"
-    "ResetUdpListening" UDP_REPLACE_COMMIT_POS)
+    "co_await RetireUdpListening" UDP_REPLACE_COMMIT_POS)
 string(FIND "${UDP_START_SOURCE}"
     "worker_it->second = std::move(replacement_worker)" UDP_WORKER_COMMIT_POS)
 string(FIND "${UDP_START_SOURCE}"
@@ -193,8 +221,11 @@ if(NOT TCP_WORKER_HEADER_SOURCE MATCHES
        "while [(]owns_acceptor[(][)][)]" OR
    NOT WORKER_SOURCE MATCHES
        "if [(][!]owns_acceptor[(][)][)] co_return" OR
-   NOT WORKER_SOURCE MATCHES
-       "udp_worker = find_current_worker[(][)][;][\r\n ]+if [(][!]udp_worker[)] co_return")
+   NOT WORKER_SOURCE MATCHES "return worker_detail::RunUdpReceiveLoop" OR
+   NOT UDP_RECEIVE_SOURCE MATCHES "if [(][!]is_owned[(]socket[)][)]" OR
+   NOT UDP_RECEIVE_SOURCE MATCHES "throw IoSystemError" OR
+   NOT UDP_START_SOURCE MATCHES "FailRuntime[(]\"udp-receive\"" OR
+   NOT UDP_START_SOURCE MATCHES "FailRuntime[(]\"udp-listener-start\"")
     message(FATAL_ERROR
         "listener loops must retain Worker-local socket ownership across asynchronous suspension")
 endif()

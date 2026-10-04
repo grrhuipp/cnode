@@ -284,7 +284,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         co_return;
     }
 
-    if (listener.limiter &&
+    if (listener.limiter && ctx.inbound.HasProxyProtocolClientIP() &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (logical) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
@@ -303,7 +303,9 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             co_return;
         }
         connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
-        reject = listener.limiter->TryAcceptIP(ctx.inbound.tag, ctx.inbound.source_ip);
+        reject = listener.limiter->TryAcceptIP(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,
@@ -415,7 +417,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
-    if (listener.limiter &&
+    if (listener.limiter && ctx.inbound.HasProxyProtocolClientIP() &&
         listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
@@ -510,7 +512,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
 
     if (connection_limit && listener.limiter) {
         connection_limit->UpdateIP(ctx.inbound.source_ip);
-        auto reject = listener.limiter->TryAcceptIP(ctx.inbound.tag, ctx.inbound.source_ip);
+        auto reject = listener.limiter->TryAcceptIP(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,

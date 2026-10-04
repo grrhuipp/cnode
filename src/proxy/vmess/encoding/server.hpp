@@ -22,12 +22,7 @@ public:
 
     void SetRequest(VMessRequest request);
 
-    net::awaitable<bool> EncodeResponseHeader(AsyncStream& stream);
-
     std::unique_ptr<transport::MultiBufferReader> DecodeRequestBody(
-        AsyncStream& stream);
-
-    std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBody(
         AsyncStream& stream);
 
     std::unique_ptr<transport::MultiBufferWriter> EncodeResponseBodyWithHeader(

@@ -1,6 +1,8 @@
 #pragma once
 
+#include "acppnode/app/dns/config.hpp"
 #include "acppnode/app/dns/dns.hpp"
+#include "acppnode/app/dns/stats.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -15,7 +17,7 @@ namespace acpp::app::dns {
 class DNSWorker final {
 public:
     DNSWorker(net::io_context& main_context,
-              const DNS::Config& config, size_t mailbox_capacity);
+              const Config& config, size_t mailbox_capacity);
     ~DNSWorker();
 
     DNSWorker(const DNSWorker&) = delete;

@@ -37,10 +37,11 @@ def grpc(payload):
     return b'\0' + len(body).to_bytes(4, 'big') + body
 
 
-def headers(tls):
+def headers(tls, raw=False):
     values = [(':method', 'POST'), (':scheme', 'https' if tls else 'http'),
-              (':authority', 'localhost'), (':path', '/fixture/Tun'),
-              ('content-type', 'application/grpc'), ('te', 'trailers')]
+              (':authority', 'localhost'), (':path', '/fixture' if raw else '/fixture/Tun'),
+              ('content-type', 'application/octet-stream' if raw else 'application/grpc'),
+              ('te', 'trailers')]
     return b''.join(b'\0' + bytes([len(key)]) + key.encode() + bytes([len(value)]) + value.encode()
                     for key, value in values)
 
@@ -109,8 +110,9 @@ class Peer:
             self.closed = True
 
     async def open(self, sid, target_port, tag, tls, end=False):
-        self.writer.write(h2frame(1, 4, sid, headers(tls)))
-        encoded = grpc(vless(target_port, tag))
+        self.writer.write(h2frame(1, 4, sid, headers(tls, self.raw)))
+        payload = vless(target_port, tag)
+        encoded = payload if self.raw else grpc(payload)
         for offset in range(0, len(encoded), 16384):
             last = offset + 16384 >= len(encoded)
             self.writer.write(h2frame(0, int(end and last), sid, encoded[offset:offset + 16384]))
