@@ -46,8 +46,8 @@ int main() {
     // credential builder. Actual VMess startup is covered by process tests.
     ProxyRegistration registration;
     registration.user_protocol = UserProtocol::Vmess;
-    registration.create_runtime = []() -> std::unique_ptr<ProtocolRuntime> { return {}; };
-    registration.create_tcp_handler = [](ProtocolRuntime&, StatsShard&, ConnectionLimiterPtr,
+    registration.create_runtime = [](net::any_io_executor) -> std::unique_ptr<ProtocolRuntime> { return {}; };
+    registration.create_tcp_handler = [](ProtocolRuntime&, UserOnlineTracker&, ConnectionLimiterPtr,
                                           const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
     registration.build_static_users = &BuildUsers;
     RegisterProxy("vmess", registration);

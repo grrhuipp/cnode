@@ -32,13 +32,13 @@ namespace acpp::trojan {
 // ============================================================================
 class Validator {
 public:
-    Validator();
-    ~Validator();
+    Validator() = default;
+    ~Validator() = default;
 
     Validator(const Validator&) = delete;
     Validator& operator=(const Validator&) = delete;
-    Validator(Validator&&) noexcept;
-    Validator& operator=(Validator&&) noexcept;
+    Validator(Validator&&) noexcept = default;
+    Validator& operator=(Validator&&) noexcept = default;
 
     // ── 认证与查找 ───────────────────────────────────────────────────────────
 
@@ -50,28 +50,7 @@ public:
 
     // ── 在线追踪 ─────────────────────────────────────────────────────────────
 
-    void OnUserConnected(std::string_view tag,
-                         uint64_t user_id,
-                         std::string_view client_ip);
 
-    void OnUserDisconnected(std::string_view tag,
-                            uint64_t user_id,
-                            std::string_view client_ip);
-
-    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
-                                       uint64_t user_id,
-                                       std::string_view client_ip,
-                                       uint32_t device_limit) const;
-
-    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
-                                           uint64_t user_id) const;
-
-    [[nodiscard]] std::vector<OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const;
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp::trojan

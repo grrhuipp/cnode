@@ -1,6 +1,6 @@
 #include "acppnode/transport/internet/inbound_listen.hpp"
 #include "acppnode/app/port_binding.hpp"
-#include "worker/tcp_listener.hpp"
+#include "listener/tcp_listener.hpp"
 
 #include <array>
 #include <string_view>
@@ -81,10 +81,11 @@ int main() {
     }
 
     acpp::net::io_context io_context;
-    acpp::worker_detail::TcpListenerOwner worker("test-inbound");
-    auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
-    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor ||
-        !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
+    acpp::inbound_detail::TcpListenerOwner owner("test-inbound");
+    auto acceptor = owner.CreateAcceptor(
+        "stable-listener", io_context.get_executor());
+    if (!acceptor || owner.FindAcceptor("stable-listener") != acceptor ||
+        !owner.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
 
     acpp::IoErrorCode ec;
     acceptor->open(acpp::tcp::v4(), ec);
@@ -95,8 +96,9 @@ int main() {
     acceptor->listen(acpp::net::socket_base::max_listen_connections, ec);
     if (ec) return 10;
 
-    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 11;
-    if (worker.FindAcceptor("stable-listener") != acceptor ||
+    if (owner.CreateAcceptor(
+            "stable-listener", io_context.get_executor()) != nullptr) return 11;
+    if (owner.FindAcceptor("stable-listener") != acceptor ||
         !acceptor->is_open()) return 12;
 
     bool accept_cancelled = false;
@@ -106,10 +108,10 @@ int main() {
                 accept_ec == acpp::io_error::operation_aborted;
         });
 
-    worker.CloseAcceptor("stable-listener");
-    if (worker.FindAcceptor("stable-listener") != nullptr) return 13;
+    owner.CloseAcceptor("stable-listener");
+    if (owner.FindAcceptor("stable-listener") != nullptr) return 13;
     if (!acceptor || acceptor->is_open() ||
-        worker.OwnsAcceptor("stable-listener", acceptor.get())) return 14;
+        owner.OwnsAcceptor("stable-listener", acceptor.get())) return 14;
     io_context.run();
     if (!accept_cancelled) return 15;
 

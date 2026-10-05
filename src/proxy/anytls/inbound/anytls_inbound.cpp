@@ -22,6 +22,7 @@
 #include "../validator.hpp"
 
 #include <asio/experimental/channel.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -44,47 +45,15 @@ constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
 // queue limit this bounds queued application data to less than 8 MiB/session.
 constexpr size_t kMaxConcurrentSubstreams = 128;
 
-class AnyTLSOnlineSession {
-public:
-    AnyTLSOnlineSession(Validator& validator,
-                        std::string_view tag,
-                        uint64_t user_id,
-                        std::string_view client_ip)
-        : validator_(&validator)
-        , tag_(tag)
-        , user_id_(user_id)
-        , client_ip_(client_ip) {}
 
-    ~AnyTLSOnlineSession() noexcept {
-        if (!validator_ || user_id_ == 0) {
-            return;
-        }
-        try {
-            validator_->OnUserDisconnected(tag_, user_id_, client_ip_);
-        } catch (...) {}
-    }
-
-    AnyTLSOnlineSession(const AnyTLSOnlineSession&) = delete;
-    AnyTLSOnlineSession& operator=(const AnyTLSOnlineSession&) = delete;
-    AnyTLSOnlineSession(AnyTLSOnlineSession&&) = delete;
-    AnyTLSOnlineSession& operator=(AnyTLSOnlineSession&&) = delete;
-
-private:
-    Validator* validator_;
-    std::string tag_;
-    uint64_t user_id_;
-    std::string client_ip_;
-};
-
-void CopySessionContext(const session::Context& source, session::Context& target) {
-    target.conn_id = session::NewID(source.worker_id);
+void CopySessionContext(const session::Context& source, session::Context& target, uint64_t stream_id = 0) {
+    target.conn_id = stream_id ? session::ChildID(source.conn_id, stream_id) : source.conn_id;
     target.inbound = source.inbound;
     target.outbound = source.outbound;
     target.outbounds = source.outbounds;
     target.content = source.content;
     target.traffic = {};
     target.sockopt = source.sockopt;
-    target.worker_id = source.worker_id;
     target.parent_conn_id = source.conn_id;
     target.runtime_generation = source.runtime_generation;
     target.config_generation = source.config_generation;
@@ -93,11 +62,11 @@ void CopySessionContext(const session::Context& source, session::Context& target
 }  // namespace
 
 Handler::Handler(Validator& validator,
-                 StatsShard& stats,
+                 UserOnlineTracker& online,
                  ConnectionLimiterPtr limiter,
                  std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme)
-    : validator_(validator)
-    , stats_(&stats)
+    : Inbound(online)
+    , validator_(validator)
     , limiter_(limiter)
     , padding_scheme_(std::move(padding_scheme)) {}
 
@@ -106,7 +75,7 @@ namespace {
 // A SOCKS target belongs to the logical byte stream, not to a PSH frame.
 // Keep only the bounded address prefix on the coroutine frame; pending owns
 // every byte already read after it and is transferred to TCP relay or UoT.
-net::awaitable<std::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
+net::awaitable<tl::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
     transport::MultiBufferReader& reader, buf::MultiBuffer& pending) {
     auto ensure = [&](size_t required) -> net::awaitable<bool> {
         while (pending.byte_size() < required) {
@@ -117,19 +86,19 @@ net::awaitable<std::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
         co_return true;
     };
     std::array<uint8_t, 1 + 1 + 255 + 2> address{};
-    if (!co_await ensure(1)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    if (!co_await ensure(1)) co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     (void)pending.CopyPrefixTo(std::span(address).first(1));
     const uint8_t type = address[0];
     size_t size = 0;
     if (type == 1) size = 1 + 4 + 2;
     else if (type == 4) size = 1 + 16 + 2;
     else if (type == 3) {
-        if (!co_await ensure(2)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        if (!co_await ensure(2)) co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         (void)pending.CopyPrefixTo(std::span(address).first(2));
-        if (address[1] == 0) co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        if (address[1] == 0) co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         size = 1 + 1 + address[1] + 2;
-    } else co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    if (!co_await ensure(size)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    } else co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (!co_await ensure(size)) co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     (void)pending.CopyPrefixTo(std::span(address).first(size));
     const uint16_t port = static_cast<uint16_t>((uint16_t(address[size - 2]) << 8) | address[size - 1]);
     TargetAddress target;
@@ -146,7 +115,7 @@ net::awaitable<std::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
             reinterpret_cast<const char*>(address.data() + 2), address[1]), port);
     }
     if (!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target))
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     pending.DropPrefixBytes(size);
     co_return target;
 }
@@ -169,12 +138,13 @@ public:
         if (write_closed_) throw transport::WriteClosed();
     }
 
-    AnyTLSSubStream(net::io_context& io_context,
+    AnyTLSSubStream(net::any_io_executor executor,
                     AnyTLSDemuxSession& session,
                     uint32_t sid)
-        : io_context_(io_context)
-        , input_signal_(io_context, 1)
-        , input_space_signal_(io_context, 1)
+        : ctx(executor)
+        , executor_(executor)
+        , input_signal_(executor, 1)
+        , input_space_signal_(executor, 1)
         , session_(session)
         , sid_(sid) {}
 
@@ -277,20 +247,14 @@ private:
     transport::CancellationSource cancellation_;
 
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
     void WakeInputWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
-    net::io_context& io_context_;
+    net::any_io_executor executor_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     net::experimental::channel<void(IoErrorCode)> input_space_signal_;
     AnyTLSDemuxSession& session_; // Run joins all users before destroying the session.
@@ -307,7 +271,7 @@ public:
     AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
                        const routing::DispatchPolicy& policy,
-                       net::io_context& io_context,
+                       net::any_io_executor executor,
                        const session::Context& base_ctx,
                        StatsShard& stats,
                        const TimeoutsConfig& timeouts,
@@ -315,11 +279,12 @@ public:
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
         , policy_(policy)
-        , io_context_(io_context)
+        , executor_(executor)
+        , base_ctx_(executor)
         , stats_(stats)
         , timeouts_(timeouts)
         , padding_scheme_(std::move(padding_scheme))
-        , write_gate_(io_context) {
+        , write_gate_(executor) {
         CopySessionContext(base_ctx, base_ctx_);
     }
 
@@ -332,37 +297,40 @@ public:
 
     net::awaitable<RelayResult> Run();
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
         if (auto sub = FindStream(sid)) {
             if (cmd == anytls::kCmdFIN && sub->RemoteClosed())
-                co_return std::expected<void, ErrorCode>{};
+                co_return tl::expected<void, ErrorCode>{};
             if (cmd == anytls::kCmdSYNACK && sub->IsClosed())
-                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         try {
-            auto result = co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
+            active_write_sid_ = sid;
+            auto result = co_await CommitWrite(anytls::WriteFrame(*stream_, cmd, sid, payload));
+            active_write_sid_.reset();
             if (!result) CancelAll();
             co_return result;
         } catch (...) {
+            active_write_sid_.reset();
             CancelAll();
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             mb.clear();
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
         if (auto sub = FindStream(sid)) sub->CheckWrite();
         else throw transport::WriteClosed();
@@ -371,7 +339,7 @@ public:
             anytls::FrameBatch batch;
             auto result = batch.Encode(cmd, sid, mb);
             if (result && !batch.Buffers().empty()) {
-                co_await stream_->WriteBuffers(batch.Buffers());
+                co_await CommitWrite(stream_->WriteBuffers(batch.Buffers()));
             }
             mb.clear();
             if (!result) CancelAll();
@@ -379,14 +347,14 @@ public:
         } catch (const IoSystemError& e) {
             mb.clear();
             CancelAll();
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         } catch (...) {
             CancelAll();
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteBuffersSerialized(uint8_t cmd,
                            uint32_t sid,
                            std::span<const net::const_buffer> buffers) {
@@ -398,26 +366,37 @@ public:
             }
         }
         if (!has_data) {
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         }
 
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         if (auto sub = FindStream(sid)) sub->CheckWrite();
         else throw transport::WriteClosed();
         const PaddingScheme no_padding;
         try {
-            auto result = co_await anytls::WriteBuffersAsFramesWithPadding(
-                *stream_, no_padding, 0, cmd, sid, buffers);
+            auto result = co_await CommitWrite(anytls::WriteBuffersAsFramesWithPadding(
+                *stream_, no_padding, 0, cmd, sid, buffers));
             if (!result) CancelAll();
             co_return result;
         } catch (...) {
             CancelAll();
             throw;
+        }
+    }
+
+    template <class T>
+    net::awaitable<T> CommitWrite(net::awaitable<T> write) {
+        if constexpr (std::is_void_v<T>) {
+            co_await net::co_spawn(executor_, std::move(write),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        } else {
+            co_return co_await net::co_spawn(executor_, std::move(write),
+                net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
         }
     }
 
@@ -471,13 +450,14 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
     const routing::DispatchPolicy& policy_;
-    net::io_context& io_context_;
+    net::any_io_executor executor_;
     session::Context base_ctx_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
     std::shared_ptr<const PaddingScheme> padding_scheme_;
     transport::internet::AsyncWriteGate write_gate_;
-    memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
+    memory::DataUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
+    std::optional<uint32_t> active_write_sid_;
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
     std::optional<anytls::SessionVersion> session_version_;
@@ -573,9 +553,10 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
         }
         // The token lives inside this child: its callback cannot outlive the
         // task group it borrows. Cancellation covers both reads and SYNACK I/O.
-        auto deadline = TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, [&] {
+        auto deadline = TimeoutScheduler::ForExecutor(executor_).ScheduleAfter(remaining, executor_, [&] {
             timed_out = true;
-            sub.Cancel();
+            if (active_write_sid_ == sub.Sid()) CancelAll();
+            else sub.Cancel();
             tasks.Cancel();
         });
         prepare_error = co_await prepare();
@@ -587,7 +568,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
         }
     };
     try {
-        co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+        co_await RunAwaitableTaskGroup(executor_,
             [&](AwaitableTaskGroup& tasks) { tasks.Spawn(handshake(tasks)); });
     } catch (const IoSystemError&) {
         if (!timed_out) throw;
@@ -597,11 +578,11 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
     // Header preparation is joined and its timer removed before Dispatcher.
     if (uot_reader) {
-        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+        (void)co_await dispatcher_.Dispatch(executor_, policy_, nullptr,
             transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
             InitialPayload{}, ctx, stats_, timeouts_);
     } else {
-        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+        (void)co_await dispatcher_.Dispatch(executor_, policy_, nullptr,
             transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
             ctx, stats_, timeouts_);
     }
@@ -643,7 +624,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         // cleanup, even when the frame loop returns normally.
         tasks.Cancel();
     };
-    co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+    co_await RunAwaitableTaskGroup(executor_,
         [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
     if (result.error == ErrorCode::CONNECTION_CLOSED) result.error = ErrorCode::OK;
     co_return result;
@@ -732,8 +713,8 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                 continue;
             }
             const auto opened_at = std::chrono::steady_clock::now();
-            auto sub = memory::AllocateShared<AnyTLSSubStream>(io_context_, *this, sid);
-            CopySessionContext(base_ctx_, sub->ctx);
+            auto sub = memory::AllocateShared<AnyTLSSubStream>(executor_, *this, sid);
+            CopySessionContext(base_ctx_, sub->ctx, sid);
             sub->ctx.stream_id = sid;
             sub->ctx.content.network = Network::TCP;
             streams_.emplace(sid, sub);
@@ -800,7 +781,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
     co_return result;
 }
 
-net::awaitable<std::expected<void, ErrorCode>> ReadAuth(
+net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     AsyncStream& stream,
     std::array<uint8_t, 32>& hash) {
     std::array<uint8_t, 34> auth{};
@@ -810,33 +791,35 @@ net::awaitable<std::expected<void, ErrorCode>> ReadAuth(
             const auto n = co_await stream.AsyncRead(
                 net::buffer(auth.data() + offset, auth.size() - offset));
             if (n == 0) {
-                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
             }
             offset += n;
         } catch (const IoSystemError& e) {
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
     }
     std::copy_n(auth.begin(), hash.size(), hash.begin());
     const uint16_t padding = static_cast<uint16_t>(
         (static_cast<uint16_t>(auth[32]) << 8) | auth[33]);
     if (auto ok = co_await anytls::DiscardFramePayload(stream, padding); !ok) {
-        co_return std::unexpected(ok.error());
+        co_return tl::unexpected(ok.error());
     }
-    co_return std::expected<void, ErrorCode>{};
+    co_return tl::expected<void, ErrorCode>{};
 }
 
 }  // namespace
 
 net::awaitable<RelayResult>
-Handler::Process(
+Handler::ProcessSession(
     std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
+    StatsShard& stats,
+    UserOnlineLease& online,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     if (!stream) {
@@ -847,7 +830,7 @@ Handler::Process(
 
     std::array<uint8_t, 32> auth_hash{};
     if (auto ok = co_await ReadAuth(*stream, auth_hash); !ok) {
-        stats_->OnError();
+        stats.OnError();
         RelayResult result;
         result.error = ok.error();
         co_return result;
@@ -855,9 +838,9 @@ Handler::Process(
     auto user = validator_.Validate(ctx.inbound.tag, auth_hash);
     if (!user) {
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+            co_await limiter_->OnAuthFailTracked(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip));
         }
-        stats_->OnError();
+        stats.OnError();
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_AUTH_FAILED;
         co_return result;
@@ -875,7 +858,7 @@ Handler::Process(
         std::min(timeouts.WriteTimeout(), control_idle_timeout));
     stream->ClearPhaseDeadline();
 
-    std::optional<AnyTLSOnlineSession> user_session;
+
     if (user->profile) {
         const auto& profile = *user->profile;
         ctx.inbound.user_email = profile.email;
@@ -884,23 +867,19 @@ Handler::Process(
 
         const uint64_t uid = static_cast<uint64_t>(profile.user_id);
         if (uid != 0) {
-            if (!validator_.CanAcceptDevice(
-                    ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-                LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            if (!(co_await online.Acquire(std::string(ctx.inbound.tag), uid, std::string(ctx.inbound.source_ip), profile.device_limit))) {
+                LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={}",
                     FormatTimestamp(ctx.accept_time_us),
                     ctx.inbound.source_ip,
                     ctx.inbound.source_port,
                     ctx.inbound.tag,
                     ctx.inbound.user_email,
-                    profile.device_limit,
-                    validator_.OnlineDeviceCount(ctx.inbound.tag, uid));
-                stats_->OnError();
+                    profile.device_limit);
+                stats.OnError();
                 RelayResult result;
                 result.error = ErrorCode::PERMISSION_DENIED;
                 co_return result;
             }
-            validator_.OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);
-            user_session.emplace(validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
         }
     }
 
@@ -917,9 +896,9 @@ Handler::Process(
         std::move(stream),
         dispatcher,
         receiver.dispatch_policy,
-        io_context,
+        executor,
         ctx,
-        *stats_,
+        stats,
         timeouts,
         padding_scheme_);
     co_return co_await demux.Run();
@@ -930,11 +909,6 @@ Handler::Process(
 namespace {
 class AnyTlsRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
     acpp::anytls::Validator validator;
 };
 
@@ -953,14 +927,14 @@ const bool kInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::AnyTls;
 
-    reg.create_runtime = []() -> std::unique_ptr<
+    reg.create_runtime = []([[maybe_unused]] acpp::net::any_io_executor executor) -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
         return std::make_unique<AnyTlsRuntime>();
     };
 
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
+           acpp::UserOnlineTracker& online,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
             auto* anytls_runtime = dynamic_cast<AnyTlsRuntime*>(&runtime);
@@ -970,7 +944,7 @@ const bool kInboundRegistered = [] {
             }
             return std::make_unique<acpp::proxy::anytls::inbound::Handler>(
                 anytls_runtime->validator,
-                stats,
+                online,
                 limiter,
                 settings->padding_scheme);
         };

@@ -16,7 +16,7 @@ namespace acpp::app::router {
 
 class Router final : public routing::Router {
 public:
-    // Build on the owning Worker before binding to Dispatcher. Failed builds
+    // Build on the owning Runtime before binding to Dispatcher. Failed builds
     // never publish partial matchers, and a published Router cannot be changed.
     Router(const RoutingConfig& config, const ::acpp::geo::GeoManager* geo_manager);
     ~Router() noexcept override;

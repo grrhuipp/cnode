@@ -153,7 +153,7 @@ net::ip::address SelectUdpBindAddress(const SsOutboundConfig& config) {
 }  // namespace
 
 net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Process(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
@@ -162,9 +162,9 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     const RelayConfig& relay_config,
     buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    std::chrono::seconds relay_write_timeout) const {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const bool use_uot =
@@ -173,7 +173,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     if (ctx.content.network == Network::UDP && !use_uot) {
         auto server = MakeServerTarget(config_);
         if (!server.IsValid()) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
 
         auto bind_addr = SelectUdpBindAddress(config_);
@@ -187,7 +187,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 : net::ip::address(net::ip::address_v4::any()));
         }
         UdpRequest target_endpoint(
-            io_context,
+            executor,
             dns_service_,
             bind_addr,
             std::move(server),
@@ -198,11 +198,11 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         target_endpoint.SetWriteTimeout(relay_write_timeout);
         if (inbound.control) {
             co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                executor, *inbound.reader, *inbound.writer, *inbound.control,
                 target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            executor, *inbound.reader, *inbound.writer,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
@@ -229,15 +229,15 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         .ws_host = config_.address,
     });
     if (!transport_target) {
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    auto dial_result = co_await DialOutboundTransport(executor, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -257,7 +257,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         protocol_target, credentials_.Cipher(), credentials_.MasterKey(), credentials_.PskChain(), *stream);
     if (!request_writer_result) {
         stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : request_writer_result.error());
     }
@@ -281,21 +281,22 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         auto request = proxy::uot::EncodeRequest(false, ctx.outbound.target);
         if (!request) {
             target_endpoint.Cancel();
-            co_return std::unexpected(request.error());
+            co_return tl::unexpected(request.error());
         }
+        const auto request_bytes = request->span();
         const std::array<net::const_buffer, 1> request_buffers{
-            net::buffer(request->span())};
+            net::buffer(request_bytes.data(), request_bytes.size())};
         co_await target_endpoint.WriteBuffers(request_buffers);
     }
 
     auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {
         if (inbound.control) {
             co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                executor, *inbound.reader, *inbound.writer, *inbound.control,
                 endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            executor, *inbound.reader, *inbound.writer,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
 
@@ -410,7 +411,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [ss_config = std::move(ss_config), credentials = std::move(*credentials)](
                 std::string_view tag,
-                acpp::net::io_context& /*io_context*/,
+                acpp::net::any_io_executor /*executor*/,
                 acpp::app::dns::DNS& dns_service,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_config = ss_config;

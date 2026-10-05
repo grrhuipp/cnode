@@ -87,7 +87,7 @@ public:
         return invoke_void_ != nullptr || invoke_bool_ != nullptr;
     }
 
-    // 回调异常不能逃出 Worker UDP 接收/回包循环；bool 回调的背压结果原样
+    // 回调异常不能逃出 Runtime UDP 接收/回包循环；bool 回调的背压结果原样
     // 传播，false 也可表示空回调或执行失败。
     [[nodiscard]] bool operator()(Args... args) noexcept {
         if (!invoke_void_ && !invoke_bool_) {
@@ -140,6 +140,6 @@ using RoutedPacketCallback =
     InlineUdpCallback<UDPPacketView, const udp::endpoint&>;
 
 // datagram 入站与 Mux UDP 子会话通过 transport::Link 进入 dispatcher；
-// UDP-capable 出站在自己的 Process 内准备 Worker-local UDP 资源并进入 relay。
+// UDP-capable 出站在自己的 Process 内准备 Runtime-local UDP 资源并进入 relay。
 
 }  // namespace acpp

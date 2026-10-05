@@ -48,7 +48,7 @@ bool JsonValuesEqual(const json::value& lhs, const json::value& rhs) {
 
 }  // namespace
 
-std::expected<const json::object*, std::string>
+tl::expected<const json::object*, std::string>
 ParseAliasedJsonObject(
     const json::object& source,
     std::initializer_list<std::string_view> aliases) {
@@ -58,10 +58,10 @@ ParseAliasedJsonObject(
         const auto* raw = source.if_contains(key);
         if (!raw) continue;
         if (!raw->is_object()) {
-            return std::unexpected(std::format("{} must be an object", key));
+            return tl::unexpected(std::format("{} must be an object", key));
         }
         if (result && !JsonValuesEqual(*result, *raw)) {
-            return std::unexpected(std::format(
+            return tl::unexpected(std::format(
                 "{} and {} must match", first_key, key));
         }
         if (!result) {

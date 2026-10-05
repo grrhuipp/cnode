@@ -11,21 +11,17 @@
 #include <memory>
 #include <string_view>
 
-namespace acpp::app {
-class RequestLoadState;
-}
-
 namespace acpp::proxyman::inbound {
 
 // ============================================================================
-// Handler - per-Worker inbound handler
+// Handler - prepared inbound handler
 //
 // 对齐 xray-core features/inbound.Handler 的职责：一个 handler 绑定 tag、
-// receiver settings 和 proxy.Inbound 实例。Worker 仍拥有
-// SO_REUSEPORT socket，但不再分散持有 receiver settings 与协议对象。
+// receiver settings 和 proxy.Inbound 实例。监听所有者持有 socket，
+// 不分散持有 receiver settings 与协议对象。
 // ============================================================================
 class Handler final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public std::enable_shared_from_this<Handler> {
 public:
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy);
@@ -44,10 +40,10 @@ public:
     }
 
     net::awaitable<void> ProcessAcceptedTCP(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         routing::Dispatcher& dispatcher,
         StatsShard& stats,
-        app::RequestLoadState& request_load,
+        uint32_t pressure_idle_timeout,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> raw_conn,
         session::Context& ctx);
@@ -56,10 +52,10 @@ private:
     class LogicalTransportStreamSink;
 
     net::awaitable<void> ProcessPreparedTransportStream(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         routing::Dispatcher& dispatcher,
         StatsShard& stats,
-        app::RequestLoadState& request_load,
+        uint32_t pressure_idle_timeout,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> stream,
         session::Context& ctx);

@@ -14,7 +14,7 @@ struct PreparedStartupInbound {
 };
 
 // Normalize every startup source, validate the complete set, then prepare all
-// protocol payloads. Preparation has no UserStore or Worker side effects.
+// protocol payloads. Preparation has no UserStore or Runtime side effects.
 [[nodiscard]] std::vector<PreparedStartupInbound> PrepareStartupInbounds(
     std::vector<StaticInboundConfig> sources, bool enable_test_mode);
 

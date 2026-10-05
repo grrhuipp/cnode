@@ -104,7 +104,7 @@ buf::MultiBuffer Payload(size_t count) {
     return result;
 }
 
-template<class T> ErrorCode Result(const std::expected<T, ErrorCode>& value) {
+template<class T> ErrorCode Result(const tl::expected<T, ErrorCode>& value) {
     return value ? ErrorCode::OK : value.error();
 }
 
@@ -178,7 +178,7 @@ bool RunDeferredBatch() {
     const bool idle_before_await = stream.transferred == 0;
     bool returned = false;
     ErrorCode code = ErrorCode::INTERNAL;
-    net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, std::expected<void, ErrorCode> result) {
+    net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, tl::expected<void, ErrorCode> result) {
         returned = error == nullptr;
         code = Result(result);
     });

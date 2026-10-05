@@ -5,17 +5,20 @@
 #include "acppnode/app/bootstrap_panels.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
 #include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
+#include "acppnode/app/dns/dns_service.hpp"
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/worker_runtime_config.hpp"
+#include "acppnode/runtime/runtime.hpp"
+#include "acppnode/runtime/runtime_config.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/geo/geodata.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/transport/internet/transport_stack.hpp"
 
+#include <asio/strand.hpp>
 #include <algorithm>
 #include <filesystem>
 #include <format>
@@ -26,7 +29,6 @@ namespace acpp {
 BootstrapEnvironment::BootstrapEnvironment() = default;
 BootstrapEnvironment::~BootstrapEnvironment() = default;
 BootstrapEnvironment::BootstrapEnvironment(BootstrapEnvironment&&) noexcept = default;
-BootstrapEnvironment& BootstrapEnvironment::operator=(BootstrapEnvironment&&) noexcept = default;
 
 namespace {
 
@@ -86,51 +88,40 @@ std::unique_ptr<geo::GeoManager> CreateGeoManager(const Config& config) {
     return geo_manager;
 }
 
-std::vector<std::unique_ptr<ConnectionLimiter>> CreateConnectionLimiters(const Config& config) {
-    const uint32_t workers = std::max<uint32_t>(1, config.GetWorkers());
-    const auto split_budget = [workers](uint32_t value) -> uint32_t {
-        if (value == 0) return 0;
-        return std::max<uint32_t>(1, (value + workers - 1) / workers);
-    };
-
-    RateLimitConfig limiter_cfg;
-    limiter_cfg.max_connections = split_budget(config.GetLimits().max_connections);
-    limiter_cfg.max_conn_per_ip = split_budget(config.GetLimits().max_connections_per_ip);
-
-    std::vector<std::unique_ptr<ConnectionLimiter>> limiters;
-    limiters.reserve(workers);
-    for (uint32_t i = 0; i < workers; ++i) {
-        limiters.push_back(std::make_unique<ConnectionLimiter>(limiter_cfg));
-    }
-    return limiters;
+std::unique_ptr<ConnectionLimiter> CreateConnectionLimiter(
+    const Config& config, net::any_io_executor executor) {
+    RateLimitConfig limits;
+    limits.max_connections = config.GetLimits().max_connections;
+    limits.max_conn_per_ip = config.GetLimits().max_connections_per_ip;
+    return std::make_unique<ConnectionLimiter>(std::move(executor), limits);
 }
 
-uint32_t ComputePressureThreshold(const WorkerRuntimeConfig& config) {
-    uint32_t threshold = defaults::kMaxConnectionsPerWorker
+uint32_t ComputePressureThreshold(const RuntimeConfig& config) {
+    uint32_t threshold = defaults::kMaxConnectionsPerRuntime
         * defaults::kPressurePercent / 100;
 
     const uint32_t configured_max = config.limits.max_connections;
-    const uint32_t workers = std::max<uint32_t>(1, config.workers);
+
     if (configured_max > 0) {
-        const uint32_t per_worker_budget = std::max<uint32_t>(
-            1, (configured_max + workers - 1) / workers);
+        const uint32_t runtime_budget = std::max<uint32_t>(
+            1, configured_max);
         const uint32_t configured_threshold = std::max<uint32_t>(
-            1, per_worker_budget * defaults::kPressurePercent / 100);
+            1, runtime_budget * defaults::kPressurePercent / 100);
         threshold = std::min(threshold, configured_threshold);
     }
 
     return std::max<uint32_t>(threshold, 1);
 }
 
-uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
+uint32_t ComputePressureIdleTimeout(const RuntimeConfig& config) {
     return config.timeouts.idle > defaults::kPressureIdleTimeout
         ? defaults::kPressureIdleTimeout
         : 0;
 }
 
-WorkerRuntimeConfig MakeWorkerRuntimeConfig(
+RuntimeConfig MakeRuntimeConfig(
     const Config& config, const std::vector<PreparedStartupInbound>& inbounds) {
-    WorkerRuntimeConfig runtime_config;
+    RuntimeConfig runtime_config;
     runtime_config.timeouts = config.GetTimeouts();
     runtime_config.limits = config.GetLimits();
     runtime_config.routing = config.GetRouting();
@@ -139,35 +130,12 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
         runtime_config.static_inbounds.push_back(inbound.runtime);
     }
     runtime_config.outbounds = config.GetPreparedOutbounds();
-    runtime_config.workers = config.GetWorkers();
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
     runtime_config.pressure_idle_timeout = ComputePressureIdleTimeout(runtime_config);
     return runtime_config;
 }
 
 }  // namespace
-
-WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
-                            ShardedStats& stats,
-                            geo::GeoManager* geo_manager,
-                            app::dns::DNSWorker& dns_worker) {
-    WorkerPool pool;
-    const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
-    pool.workers.reserve(workers);
-    pool.io_contexts.reserve(workers);
-    pool.work_guards.reserve(workers);
-
-    for (uint32_t i = 0; i < workers; ++i) {
-        pool.io_contexts.push_back(std::make_unique<net::io_context>());
-        pool.work_guards.push_back(net::make_work_guard(*pool.io_contexts[i]));
-        auto& worker_stats = stats.GetShard(i);
-        pool.workers.push_back(std::make_unique<Worker>(
-            i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
-            geo_manager));
-    }
-
-    return pool;
-}
 
 BootstrapEnvironment CreateBootstrapEnvironment(
     const Config& config,
@@ -176,20 +144,28 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     const bool enable_test_mode =
         test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
     const auto inbounds = PrepareStartupInbounds(config.GetStaticInbounds(), enable_test_mode);
-    env.main_ctx = std::make_unique<net::io_context>();
-    env.dns_worker = std::make_unique<app::dns::DNSWorker>(
-        *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
-    env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);
+    env.io_context = std::make_unique<net::io_context>();
+    TimeoutScheduler::Install(env.io_context->get_executor());
+    InstallXHttpSessionService(env.io_context->get_executor());
+    env.work_guard.emplace(net::make_work_guard(*env.io_context));
+    env.control_executor = net::make_strand(*env.io_context);
+    env.monitor_executor = net::make_strand(*env.io_context);
+    env.io_threads = std::max<uint32_t>(1, config.GetIoThreads());
+    env.dns_service = std::make_unique<app::dns::DNSService>(
+        net::make_strand(*env.io_context), MakeDnsServiceConfig(config), defaults::kServiceChannelCapacity);
+    env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_service);
     env.geo_manager = CreateGeoManager(config);
-    env.stats = std::make_unique<ShardedStats>(config.GetWorkers());
-    env.connection_limiters = CreateConnectionLimiters(config);
-    const WorkerRuntimeConfig worker_runtime_config = MakeWorkerRuntimeConfig(config, inbounds);
-    env.worker_pool = CreateWorkerPool(
-        worker_runtime_config, *env.stats, env.geo_manager.get(), *env.dns_worker);
+    env.stats = std::make_unique<StatsShard>();
+    env.stats_sampler = std::make_unique<StatsSampler>();
+    env.connection_limiter = CreateConnectionLimiter(config, net::make_strand(*env.io_context));
+    const RuntimeConfig runtime_config = MakeRuntimeConfig(config, inbounds);
+    env.runtime = std::make_unique<Runtime>(
+        env.io_context->get_executor(), runtime_config, *env.stats,
+        *env.dns_service, env.geo_manager.get());
     env.controller = std::make_unique<Controller>(
-        *env.main_ctx, env.worker_pool.workers, env.connection_limiters);
+        env.control_executor, *env.runtime, *env.connection_limiter);
 
-    SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
+    SetupPanels(env.control_executor, *env.controller, config, *env.panel_dns_service);
     // Every source and protocol payload is prepared before one RCU publication.
     // These borrowed references stay in this synchronous cold-path call.
     std::vector<proxyman::inbound::UserStore::UserUpdate> user_updates;
@@ -202,26 +178,17 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         LOG_CONSOLE("test_mode enabled port={} uuid={}",
                     constants::test::kTestPort, constants::test::kTestVmessUuid);
     }
-    env.inbound_startup = QueueInboundStartup(
-        worker_runtime_config.static_inbounds,
-        env.worker_pool.workers,
-        env.connection_limiters);
+    env.inbound_startup = InboundStartup{
+        runtime_config.static_inbounds, env.connection_limiter.get()};
 
-    env.enable_controller = !config.GetPanels().empty();
     return env;
 }
 
 RuntimeContext MakeRuntimeContext(BootstrapEnvironment& env) {
     return RuntimeContext{
-        *env.main_ctx,
-        *env.stats,
-        env.worker_pool.workers,
-        *env.controller,
-        env.worker_pool.io_contexts,
-        env.inbound_startup,
-        *env.dns_worker,
-        env.enable_controller,
-    };
+        *env.io_context, env.work_guard, env.control_executor, env.monitor_executor,
+        *env.stats_sampler, *env.runtime, *env.controller, env.inbound_startup,
+        *env.dns_service, env.io_threads};
 }
 
 }  // namespace acpp

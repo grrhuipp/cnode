@@ -8,7 +8,7 @@
 namespace acpp {
 
 void* AsyncStream::operator new(std::size_t size) {
-    if (void* ptr = memory::AllocatePmr(size, alignof(AsyncStream))) {
+    if (void* ptr = memory::AllocateData(size, alignof(AsyncStream))) {
         memory::OnAsyncStreamNew();
         return ptr;
     }
@@ -16,7 +16,7 @@ void* AsyncStream::operator new(std::size_t size) {
 }
 
 void* AsyncStream::operator new(std::size_t size, std::align_val_t alignment) {
-    if (void* ptr = memory::AllocatePmr(size, static_cast<std::size_t>(alignment))) {
+    if (void* ptr = memory::AllocateData(size, static_cast<std::size_t>(alignment))) {
         memory::OnAsyncStreamNew();
         return ptr;
     }
@@ -25,17 +25,17 @@ void* AsyncStream::operator new(std::size_t size, std::align_val_t alignment) {
 
 void AsyncStream::operator delete(void* ptr) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, 0, alignof(AsyncStream));
+    memory::DeallocateData(ptr, 0, alignof(AsyncStream));
 }
 
 void AsyncStream::operator delete(void* ptr, std::size_t size) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, size, alignof(AsyncStream));
+    memory::DeallocateData(ptr, size, alignof(AsyncStream));
 }
 
 void AsyncStream::operator delete(void* ptr, std::align_val_t alignment) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, 0, static_cast<std::size_t>(alignment));
+    memory::DeallocateData(ptr, 0, static_cast<std::size_t>(alignment));
 }
 
 void AsyncStream::operator delete(
@@ -43,7 +43,7 @@ void AsyncStream::operator delete(
     std::size_t size,
     std::align_val_t alignment) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, size, static_cast<std::size_t>(alignment));
+    memory::DeallocateData(ptr, size, static_cast<std::size_t>(alignment));
 }
 
 // ============================================================================

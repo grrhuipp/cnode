@@ -1,5 +1,7 @@
 #include "acppnode/common/error.hpp"
 
+#include <asio/experimental/channel_error.hpp>
+
 namespace acpp {
 
 ErrorCode MapAsioError(const IoErrorCode& ec) {
@@ -11,7 +13,8 @@ ErrorCode MapAsioError(const IoErrorCode& ec) {
     if (ec == io_error::eof) {
         return ErrorCode::SOCKET_EOF;
     }
-    if (ec == io_error::operation_aborted) {
+    if (ec == io_error::operation_aborted ||
+        ec == net::experimental::error::channel_cancelled) {
         return ErrorCode::CANCELLED;
     }
     if (ec == io_error::no_buffer_space) {

@@ -157,7 +157,7 @@ proxy::trojan::outbound::Handler::~Handler() = default;
 
 net::awaitable<OutboundProcessResult>
 proxy::trojan::outbound::Handler::Process(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
@@ -166,9 +166,9 @@ proxy::trojan::outbound::Handler::Process(
     const RelayConfig& relay_config,
     buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    std::chrono::seconds relay_write_timeout) const {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto& target = ctx.outbound.target;
@@ -192,15 +192,15 @@ proxy::trojan::outbound::Handler::Process(
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
             LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_.address);
         }
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    auto dial_result = co_await DialOutboundTransport(executor, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -215,7 +215,7 @@ proxy::trojan::outbound::Handler::Process(
         if (stream) {
             stream->CloseAbortive();
         }
-        return std::unexpected(error);
+        return tl::unexpected(error);
     };
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
@@ -255,21 +255,21 @@ proxy::trojan::outbound::Handler::Process(
             TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
             if (inbound.control) {
                 co_return co_await DoRelayLink(
-                    io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                    executor, *inbound.reader, *inbound.writer, *inbound.control,
                     target_endpoint, ctx, stats, relay_config, std::move(first_payload));
             }
             co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer,
+                executor, *inbound.reader, *inbound.writer,
                 target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
 
         if (inbound.control) {
             co_return co_await DoRelayLink(
-                io_context, *inbound.reader, *inbound.writer, *inbound.control,
+                executor, *inbound.reader, *inbound.writer, *inbound.control,
                 *stream, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer,
+            executor, *inbound.reader, *inbound.writer,
             *stream, ctx, stats, relay_config, std::move(first_payload));
     } catch (const IoSystemError& e) {
         co_return fail_abortive(outbound_protocol_deadline.Expired()
@@ -400,7 +400,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [trojan_config = std::move(trojan_config)](
                 std::string_view tag,
-                acpp::net::io_context& /*io_context*/,
+                acpp::net::any_io_executor /*executor*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_config = trojan_config;

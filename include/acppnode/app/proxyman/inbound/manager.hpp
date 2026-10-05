@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/common/asio_types.hpp"
 
 #include <memory>
 #include <string>
@@ -19,14 +20,15 @@ class Handler;
 struct BuildRequest;
 struct DatagramHandlerBuildResult;
 // ============================================================================
-// Manager - per-Worker inbound handler manager
+// Manager - runtime inbound handler manager
 //
-// 对齐 xray-core features/inbound.Manager 的职责边界。它只在 Worker 线程访问，
-// 不加锁；跨线程控制面操作只能经所属 Worker 的有界 mailbox 投递。
+// 对齐 xray-core features/inbound.Manager 的职责边界。可变状态只在 owner
+// strand 访问；其他执行域只能经有界入口投递。
 // ============================================================================
 class Manager final {
 public:
-    explicit Manager(StatsShard& stats);
+    Manager(net::any_io_executor owner_executor,
+            net::any_io_executor shared_executor);
     ~Manager() noexcept;
 
     Manager(const Manager&) = delete;
@@ -46,15 +48,15 @@ public:
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req);
 
-    // ReplaceHandler 在所属 Worker 上替换同 tag handler。调用方持有的
+    // ReplaceHandler 在 owner strand 上替换同 tag handler。调用方持有的
     // shared_ptr 让在途物理连接及其任务组持有的逻辑子任务继续使用原 handler。
     [[nodiscard]] HandlerPtr ReplaceHandler(std::unique_ptr<Handler> handler);
 
     // RemoveHandler 只撤销 manager 所有权；在途请求按 shared_ptr 自然收尾。
     void RemoveHandler(std::string_view tag);
 
-    [[nodiscard]] std::vector<::acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view protocol, std::string_view tag) const;
+    [[nodiscard]] net::awaitable<std::vector<::acpp::OnlineDevice>>
+    GetOnlineDevices(std::string tag);
 
 private:
     struct Impl;

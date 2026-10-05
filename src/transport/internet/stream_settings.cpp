@@ -90,10 +90,6 @@ void NormalizeInPlace(StreamSettings& settings) {
         settings.security_mode = SecurityMode::None;
     } else if (settings.security == constants::protocol::kTls) {
         settings.security_mode = SecurityMode::Tls;
-    } else if (settings.security == constants::protocol::kReality) {
-        settings.security_mode = SecurityMode::Reality;
-        settings.tls.min_version = TlsVersion::V1_3;
-        settings.tls.max_version = TlsVersion::V1_3;
     } else {
         settings.security_mode = SecurityMode::Unsupported;
     }
@@ -120,21 +116,16 @@ void NormalizeInPlace(StreamSettings& settings) {
     if (settings.security_mode == SecurityMode::Tls) {
         settings.flags |= kFlagTls;
     }
-    if (settings.security_mode == SecurityMode::Reality) {
-        settings.flags |= kFlagReality;
-    }
-
-    const bool tls_like_for_alpn = settings.IsTls();
+    const bool tls_for_alpn = settings.IsTls();
     const bool http_should_default_h2 =
         settings.network_mode == NetworkMode::Http &&
         (settings.http.force_http2 ||
-         (tls_like_for_alpn && settings.tls.alpn.empty()));
+         (tls_for_alpn && settings.tls.alpn.empty()));
     const bool xhttp_should_default_h2 =
         settings.network_mode == NetworkMode::XHttp &&
-        settings.security_mode != SecurityMode::Reality &&
-        (settings.xhttp.AcceptsStreamOne() || tls_like_for_alpn) &&
+        (settings.xhttp.AcceptsStreamOne() || tls_for_alpn) &&
         settings.tls.alpn.empty();
-    if ((settings.network_mode == NetworkMode::Grpc && tls_like_for_alpn) ||
+    if ((settings.network_mode == NetworkMode::Grpc && tls_for_alpn) ||
         http_should_default_h2 ||
         xhttp_should_default_h2) {
         auto has_h2 = std::ranges::find(settings.tls.alpn, "h2") != settings.tls.alpn.end();

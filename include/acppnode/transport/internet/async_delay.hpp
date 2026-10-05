@@ -1,56 +1,54 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
-#include <asio/steady_timer.hpp>
+#include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
-
 #include <chrono>
 #include <stdexcept>
 
 namespace acpp {
 
-// One Worker-local pending delay. The owner must outlive WaitFor, including
-// completion after cancellation. There is no callback registration or second
-// wake channel: cancelling the actual wait needs no completion allocation.
+// A pending delay uses the shared deadline service, never a resident timer.
+// The owner must outlive WaitFor and its cancellation completion.
 class AsyncDelay {
 public:
-    explicit AsyncDelay(net::io_context& io_context) : timer_(io_context) {}
-
+    explicit AsyncDelay(net::any_io_executor executor)
+        : executor_(std::move(executor)), scheduler_(TimeoutScheduler::ForExecutor(executor_)),
+          signal_(executor_, 1) {}
     AsyncDelay(const AsyncDelay&) = delete;
     AsyncDelay& operator=(const AsyncDelay&) = delete;
+    ~AsyncDelay() noexcept { scheduler_.Cancel(token_); }
 
-    // Cancellation ends the delay normally. Callers such as Mux then inspect
-    // their terminal state; parent coroutine cancellation remains in effect.
     [[nodiscard]] net::awaitable<void> WaitFor(std::chrono::milliseconds delay) {
         if (delay <= std::chrono::milliseconds::zero()) co_return;
-        if (waiting_) {
-            throw std::logic_error("AsyncDelay does not support concurrent WaitFor calls");
-        }
+        if (waiting_) throw std::logic_error("AsyncDelay permits one pending wait");
         waiting_ = true;
         try {
-            using Clock = std::chrono::steady_clock;
-            const auto now = Clock::now();
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::time_point::max() - now);
-            timer_.expires_at(delay >= remaining ? Clock::time_point::max() : now + delay);
-            auto [ec] = co_await timer_.async_wait(net::as_tuple(net::use_awaitable));
+            token_ = scheduler_.ScheduleAfter(delay, executor_, [this] {
+                (void)signal_.try_send(IoErrorCode{});
+            });
+            auto [ec] = co_await signal_.async_receive(net::as_tuple(net::use_awaitable));
+            scheduler_.Cancel(token_);
             if (ec && ec != io_error::operation_aborted) throw IoSystemError(ec);
         } catch (...) {
+            scheduler_.Cancel(token_);
             waiting_ = false;
             throw;
         }
         waiting_ = false;
     }
-
     void Cancel() noexcept {
-        IoErrorCode ec;
-        timer_.cancel(ec);
+        scheduler_.Cancel(token_);
+        if (waiting_) (void)signal_.try_send(IoErrorCode{});
     }
-
 private:
-    net::steady_timer timer_;
+    net::any_io_executor executor_;
+    TimeoutScheduler& scheduler_;
+    net::experimental::channel<void(IoErrorCode)> signal_;
+    TimeoutToken token_;
     bool waiting_ = false;
 };
 

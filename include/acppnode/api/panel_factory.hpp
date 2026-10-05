@@ -11,7 +11,7 @@ class DNS;
 namespace acpp::api {
 
 [[nodiscard]] std::unique_ptr<API> CreatePanelClient(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const Config& config,
     app::dns::DNS& dns_service);
 

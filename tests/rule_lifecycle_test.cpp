@@ -1,37 +1,47 @@
 #include "acppnode/common/rule.hpp"
-#include "acppnode/common/session.hpp"
+
+#include <asio/co_spawn.hpp>
+#include <asio/io_context.hpp>
+#include <asio/strand.hpp>
+#include <asio/use_future.hpp>
 
 #include <regex>
-#include <string_view>
-#include <vector>
+#include <string>
 
-int main() {
-    acpp::rule::Manager manager;
-    constexpr std::string_view tag = "panel|vmess|443";
+namespace {
 
-    manager.UpdateRule(tag, {
+acpp::net::awaitable<int> Run(acpp::net::any_io_executor owner) {
+    acpp::rule::Manager manager(owner);
+    const std::string tag = "panel/vmess/443";
+
+    co_await manager.UpdateRule(tag, {
         acpp::rule::DetectRule{
             .ID = 7,
             .Pattern = std::regex("blocked\\.example"),
         },
     });
-    if (!manager.HasRule(tag)) return 1;
 
-    acpp::session::Context ctx;
-    ctx.inbound.tag = tag;
-    ctx.inbound.user_id = 42;
-    ctx.inbound.user_email = "node|user|42";
-    ctx.outbound.target = acpp::TargetAddress("blocked.example", 443);
     acpp::features::policy::RequestPolicy& policy = manager;
-    if (!policy.Blocked(ctx)) return 2;
+    if (!co_await policy.Blocked(
+            tag, 42, "node/user/42", "blocked.example")) co_return 1;
 
-    const auto results = manager.GetDetectResult(tag);
+    const auto results = co_await manager.GetDetectResult(tag);
     if (results.size() != 1 || results.front().UID != 42 ||
-        results.front().RuleID != 7) return 3;
+        results.front().RuleID != 7) co_return 2;
 
-    manager.UpdateRule(tag, {});
-    if (manager.HasRule(tag)) return 4;
-    if (policy.Blocked(ctx)) return 5;
-    if (!manager.GetDetectResult(tag).empty()) return 6;
-    return 0;
+    co_await manager.UpdateRule(tag, {});
+    if (co_await policy.Blocked(
+            tag, 42, "node/user/42", "blocked.example")) co_return 3;
+    if (!(co_await manager.GetDetectResult(tag)).empty()) co_return 4;
+    co_return 0;
+}
+
+}  // namespace
+
+int main() {
+    acpp::net::io_context io;
+    auto result = acpp::net::co_spawn(
+        io, Run(acpp::net::make_strand(io)), acpp::net::use_future);
+    io.run();
+    return result.get();
 }

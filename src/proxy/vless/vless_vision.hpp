@@ -63,7 +63,7 @@ private:
     [[nodiscard]] bool ShouldEndVision(std::span<const uint8_t> data) const noexcept;
     [[nodiscard]] bool AppendVisionFrameBuffers(
         buf::MultiBuffer& header_owner,
-        memory::ThreadLocalVector<net::const_buffer>& out,
+        memory::DataVector<net::const_buffer>& out,
         std::span<const uint8_t> content,
         uint8_t command);
 };

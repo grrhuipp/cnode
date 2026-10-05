@@ -68,12 +68,10 @@ struct MuxReply {
 };
 
 struct ReplyQueueState {
-    explicit ReplyQueueState(net::io_context& io_context, SignalChannel& main_signal)
-        : io_context_(io_context)
-        , main_signal_(main_signal) {}
+    explicit ReplyQueueState(net::any_io_executor executor, SignalChannel& main_signal)
+        : main_signal_(main_signal) { (void)executor; }
 
-    net::io_context& io_context_;
-    memory::ThreadLocalDeque<MuxReply> queue;
+    memory::DataDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
@@ -167,9 +165,6 @@ struct ReplyQueueState {
     }
 
     void WakeReplyWriter() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)main_signal_.try_send(IoErrorCode{});
     }
 
@@ -180,9 +175,6 @@ struct ReplyQueueState {
     void MarkSubLoopDone() noexcept {
         if (active_sub_loops > 0) {
             --active_sub_loops;
-        }
-        if (io_context_.stopped()) {
-            return;
         }
         WakeReplyWriter();
     }
@@ -214,12 +206,10 @@ private:
 };
 
 struct ClientReadQueueState {
-    explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
-        : io_context_(io_context)
-        , space_signal(io_context, 1)
+    explicit ClientReadQueueState(net::any_io_executor executor, SignalChannel& main_signal)
+        : space_signal(executor, 1)
         , main_signal_(main_signal) {}
 
-    net::io_context& io_context_;
     SignalChannel space_signal;
     SignalChannel& main_signal_;
     struct QueuedInput {
@@ -230,7 +220,7 @@ struct ClientReadQueueState {
         buf::MultiBuffer payload;
         size_t bytes = 0;
     };
-    memory::ThreadLocalDeque<QueuedInput> queue;
+    memory::DataDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
     bool done = false;
@@ -238,16 +228,10 @@ struct ClientReadQueueState {
     bool shrink_queue_on_drain = false;
 
     void WakeMain() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)main_signal_.try_send(IoErrorCode{});
     }
 
     void WakeSpace() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)space_signal.try_send(IoErrorCode{});
     }
 
@@ -304,19 +288,19 @@ struct ClientReadQueueState {
 };
 
 class TcpSubState final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     TcpSubState(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         uint16_t session_id,
         ReplyQueueState& reply_queue)
-        : io_context_(io_context)
-        , output_sleep_(io_context)
-        , input_signal_(io_context, 1)
+        : ctx(executor)
+        , output_sleep_(executor)
+        , input_signal_(executor, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue) {}
 
@@ -561,9 +545,6 @@ private:
     }
 
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -590,7 +571,6 @@ private:
         }
     }
 
-    net::io_context& io_context_;
     AsyncDelay output_sleep_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
@@ -603,7 +583,7 @@ private:
         buf::MultiBuffer payload;
         size_t bytes = 0;
     };
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    memory::DataDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
@@ -617,21 +597,21 @@ private:
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
 
 class UdpSubState final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     UdpSubState(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id,
         TargetAddress default_target,
         bool xudp_packet_mode)
-        : io_context_(io_context)
-        , input_signal_(io_context, 1)
+        : ctx(executor)
+        , input_signal_(executor, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue)
         , parent_conn_id_(parent_conn_id)
@@ -807,9 +787,6 @@ private:
     }
 
     void WakeInputReader() noexcept {
-        if (io_context_.stopped()) {
-            return;
-        }
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
@@ -836,7 +813,6 @@ private:
         }
     }
 
-    net::io_context& io_context_;
     net::experimental::channel<void(IoErrorCode)> input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
@@ -852,7 +828,7 @@ private:
         buf::MultiBuffer payload;
         size_t bytes = 0;
     };
-    memory::ThreadLocalDeque<QueuedInput> input_queue_;
+    memory::DataDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
@@ -918,7 +894,7 @@ using UdpSubInfo = std::unique_ptr<UdpSubState>;
 using MuxSubInfo = std::variant<TcpSubInfo, UdpSubInfo>;
 
 net::awaitable<void> RunTcpSubDispatch(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
     TcpSubState* sub,
@@ -934,7 +910,7 @@ net::awaitable<void> RunTcpSubDispatch(
 
     try {
         (void)co_await dispatcher.Dispatch(
-            io_context,
+            executor,
             policy,
             nullptr,
             link,
@@ -950,7 +926,7 @@ net::awaitable<void> RunTcpSubDispatch(
 }
 
 net::awaitable<void> RunUdpSubDispatch(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
     UdpSubState* sub,
@@ -966,7 +942,7 @@ net::awaitable<void> RunUdpSubDispatch(
 
     try {
         (void)co_await dispatcher.Dispatch(
-            io_context,
+            executor,
             policy,
             nullptr,
             link,
@@ -992,7 +968,7 @@ namespace {
 // 每帧可携带 TCP 或 UDP 子会话数据；服务端负责为每个子会话拨号出站。
 // ============================================================================
 net::awaitable<RelayResult> ProcessInboundImpl(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
@@ -1021,12 +997,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
         std::min(timeouts.WriteTimeout(), relay_idle_timeout));
 
     // 回包队列：单线程，无锁；running 保护回调不在 ProcessInbound 退出后继续推送。
-    SignalChannel main_signal{io_context, 1};
-    ReplyQueueState reply_queue{io_context, main_signal};
-    ClientReadQueueState client_reads{io_context, main_signal};
+    SignalChannel main_signal{executor, 1};
+    ReplyQueueState reply_queue{executor, main_signal};
+    ClientReadQueueState client_reads{executor, main_signal};
 
     // TCP / UDP 共用同一个 session_id 命名空间。
-    memory::ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions;
+    memory::DataUnorderedMap<uint16_t, MuxSubInfo> sub_sessions;
 
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
@@ -1121,7 +1097,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                 std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity>
                     inline_buffers{};
-                memory::ThreadLocalVector<net::const_buffer> spill_buffers;
+                memory::DataVector<net::const_buffer> spill_buffers;
                 size_t buffer_count = 0;
                 auto append_buffer = [&](net::const_buffer send_buffer) {
                     if (buffer_count < inline_buffers.size()) {
@@ -1373,15 +1349,14 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         }
 
                         auto sub_state = std::make_unique<UdpSubState>(
-                            io_context,
+                            executor,
                             sid,
                             reply_queue,
                             parent_conn_id,
                             hdr.target,
                             hdr.has_global_id);
                         auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                        sub_ctx.worker_id                = parent_ctx.worker_id;
+                        sub_ctx.conn_id                  = session::ChildID(parent_conn_id, sid);
                         sub_ctx.parent_conn_id           = parent_conn_id;
                         sub_ctx.stream_id                = sid;
                         sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
@@ -1411,7 +1386,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                         try {
                             tasks.Spawn(RunUdpSubDispatch(
-                                    io_context,
+                                    executor,
                                     dispatcher,
                                     policy,
                                     sub_ptr,
@@ -1446,10 +1421,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         }
 
                         auto sub_state = std::make_unique<TcpSubState>(
-                            io_context, sid, reply_queue);
+                            executor, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                        sub_ctx.worker_id                = parent_ctx.worker_id;
+                        sub_ctx.conn_id                  = session::ChildID(parent_conn_id, sid);
                         sub_ctx.parent_conn_id           = parent_conn_id;
                         sub_ctx.stream_id                = sid;
                         sub_ctx.runtime_generation       = parent_ctx.runtime_generation;
@@ -1482,7 +1456,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         // 计数仅用于正常 EOF 排空；任务组持有并 join 真正的完成回调。
                         try {
                             tasks.Spawn(RunTcpSubDispatch(
-                                    io_context,
+                                    executor,
                                     dispatcher,
                                     policy,
                                     sub_ptr,
@@ -1615,8 +1589,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
     // Acquire the join continuation before any task starts. Session storage is
     // released only after the reader, frame loop and every dynamic dispatch have
-    // delivered their co_spawn completion, including failure/cancellation.
-    co_await RunAwaitableTaskGroup(io_context.get_executor(),
+    // reported completion to the owning task group, including failure/cancellation.
+    co_await RunAwaitableTaskGroup(executor,
         [&](AwaitableTaskGroup& tasks) {
             tasks.Spawn(client_reader_loop());
             tasks.Spawn(process_frames(tasks));
@@ -1635,7 +1609,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 }  // namespace
 
 net::awaitable<RelayResult> ProcessInbound(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
@@ -1647,7 +1621,7 @@ net::awaitable<RelayResult> ProcessInbound(
     try {
         LOG_ACCESS(FormatAccessLog(parent_ctx));
         co_return co_await ProcessInboundImpl(
-            io_context,
+            executor,
             client_link,
             client_control,
             dispatcher,

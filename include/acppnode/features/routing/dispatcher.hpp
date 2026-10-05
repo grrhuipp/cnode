@@ -33,7 +33,7 @@ public:
     virtual ~Dispatcher() noexcept = default;
 
     virtual net::awaitable<RelayResult> Dispatch(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         const DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,

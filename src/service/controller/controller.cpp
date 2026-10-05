@@ -1,5 +1,5 @@
 #include "controller_impl.hpp"
-#include "../../common/monitor_loop.hpp"
+#include "../../common/awaitable_task_group.hpp"
 #include "node_transaction.hpp"
 #include "node_runtime.hpp"
 #include "panel_schedule.hpp"
@@ -15,32 +15,32 @@
 
 namespace acpp {
 
-Controller::Controller(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers,
-                       const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
-    : impl_(std::make_shared<Impl>(io_context, workers, limiters)) {}
-
+Controller::Controller(net::any_io_executor executor, Runtime& runtime, ConnectionLimiter& limiter)
+    : impl_(std::make_shared<Impl>(std::move(executor), runtime, limiter)),
+      stop_ticket_(impl_->channel_.TryReserve()) {
+    if (!stop_ticket_) throw ServiceChannelFull();
+}
 Controller::~Controller() = default;
 
-void Controller::AddPanel(std::unique_ptr<api::API> panel,
-                          const PanelConfig& panel_config) {
+void Controller::AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config) {
     impl_->AddPanel(std::move(panel), panel_config);
 }
 
-void Controller::Start() {
-    impl_->Start();
+net::awaitable<void> Controller::Run() {
+    co_await impl_->channel_.Post(impl_->Run());
 }
 
-std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
-    return impl_->GetNodeStats();
+bool Controller::RequestStop() {
+    return impl_->channel_.SendReserved(std::move(stop_ticket_),
+        [owner = impl_] { owner->Stop(); });
 }
 
-Controller::Impl::Impl(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers,
-                       const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
-    : io_context_(io_context)
-    , workers_(workers)
-    , limiters_(limiters) {}
+net::awaitable<std::vector<Controller::NodeStatsInfo>> Controller::GetNodeStats() const {
+    return impl_->channel_.Call([owner = impl_] { return owner->GetNodeStats(); });
+}
+
+Controller::Impl::Impl(net::any_io_executor executor, Runtime& runtime, ConnectionLimiter& limiter)
+    : executor_(std::move(executor)), channel_(executor_, 256), runtime_(runtime), limiter_(limiter) {}
 
 Controller::Impl::PanelRuntime::PanelRuntime(
     std::unique_ptr<api::API> api, const PanelConfig& source)
@@ -52,47 +52,56 @@ Controller::Impl::PanelRuntime::PanelRuntime(
 
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
                                 const PanelConfig& panel_config) {
+    if (running_ || stopping_) throw std::logic_error("panels are frozen after controller startup");
     // Construct the complete entity before publishing it to the owner.
     panels_.push_back(std::make_unique<PanelRuntime>(std::move(panel), panel_config));
 }
 
-void Controller::Impl::Start() {
-    enum class LoopKind { Sync, Status };
-    for (auto& entry : panels_) {
-        auto* panel = entry.get();
-        for (const auto kind : {LoopKind::Sync, LoopKind::Status}) {
-            auto& slot = kind == LoopKind::Sync ? panel->sync_loop : panel->status_loop;
-            if (!slot.expired()) continue;
-            const auto name = std::format("{}/{} {}",
-                panel->config.Name, panel->config.NodeIDs.Front(),
-                kind == LoopKind::Sync ? "sync" : "status");
-            auto self = shared_from_this();
-            auto loop = std::make_shared<monitor_detail::MonitorLoop>(
-                io_context_.get_executor(), name,
-                [self, panel, kind] {
-                    return kind == LoopKind::Sync
-                        ? self->panelSyncLoop(*panel) : self->panelStatusLoop(*panel);
-                },
-                [self, panel, kind](std::string_view loop_name, std::exception_ptr failure) {
-                    if (kind == LoopKind::Sync) {
-                        panel->state = PanelState::Unavailable;
-                    }
-                    if (!failure) {
-                        LOG_WARN("Panel {} monitor: stopped", loop_name);
-                        return;
-                    }
-                    try {
-                        std::rethrow_exception(failure);
-                    } catch (const std::exception& error) {
-                        LOG_ERROR("Panel {} monitor: failed | {}", loop_name, error.what());
-                    } catch (...) {
-                        LOG_ERROR("Panel {} monitor: failed | unknown exception", loop_name);
-                    }
-                });
-            slot = loop;
-            loop->Start();
+net::awaitable<void> Controller::Impl::Run() {
+    if (running_) throw std::logic_error("controller is already running");
+    if (stopping_) co_return;
+    running_ = true;
+    struct Reset {
+        Impl& owner;
+        ~Reset() { owner.tasks_ = nullptr; owner.running_ = false; }
+    } reset{*this};
+    co_await RunAwaitableTaskGroup(executor_, [this](AwaitableTaskGroup& tasks) {
+        tasks_ = &tasks;
+        for (auto& entry : panels_) {
+            tasks.Spawn(RunPanelLoop(*entry, true));
+            tasks.Spawn(RunPanelLoop(*entry, false));
         }
+    });
+}
+
+void Controller::Impl::Stop() {
+    stopping_ = true;
+    if (tasks_) tasks_->Cancel();
+}
+
+net::awaitable<void> Controller::Impl::RunPanelLoop(PanelRuntime& panel, bool sync) {
+    std::exception_ptr failure;
+    try {
+        if (sync) co_await panelSyncLoop(panel);
+        else co_await panelStatusLoop(panel);
+    } catch (...) { failure = std::current_exception(); }
+    if (sync && failure) panel.state = PanelState::Unavailable;
+    const auto name = std::format("{}/{} {}", panel.config.Name,
+        panel.config.NodeIDs.Front(), sync ? "sync" : "status");
+    if (!failure) {
+        LOG_DEBUG("Panel {} monitor: stopped", name);
+        co_return;
     }
+    try { std::rethrow_exception(failure); }
+    catch (const IoSystemError& error) {
+        if (error.code() == io_error::operation_aborted) {
+            LOG_DEBUG("Panel {} monitor: stopped", name);
+            co_return;
+        }
+        LOG_ERROR("Panel {} monitor: failed | {}", name, error.what());
+    } catch (const std::exception& error) {
+        LOG_ERROR("Panel {} monitor: failed | {}", name, error.what());
+    } catch (...) { LOG_ERROR("Panel {} monitor: failed | unknown exception", name); }
 }
 
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
@@ -125,7 +134,7 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
     // Match v2node reporting semantics: the first traffic/online snapshot
     // needs one complete push interval to accumulate meaningful activity.
     auto next_push = Clock::time_point::max();
-    net::steady_timer timer(io_context_);
+    net::steady_timer timer(executor_);
 
     const auto interval = [&](bool pull) {
         if (panel.node.committed) {
@@ -202,7 +211,7 @@ net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel
     using Clock = std::chrono::steady_clock;
     constexpr auto interval = std::chrono::seconds(defaults::kPanelStatusLogInterval);
     auto next_status = Clock::now();
-    net::steady_timer timer(io_context_);
+    net::steady_timer timer(executor_);
     for (;;) {
         // Read the last committed state on the controller executor. No snapshot
         // reference crosses the wait, and no network request delays this loop.
@@ -222,7 +231,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     const int node_id = panel.config.NodeIDs.Front();
     const auto& panel_name = panel.config.Name;
 
-    controller::NodeRuntime runtime(io_context_, workers_, limiters_, panel.config);
+    controller::NodeRuntime runtime(runtime_, limiter_, panel.config);
 
     // One pull attempt is made for each scheduler invocation.
     {
@@ -353,8 +362,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             // The initial local cleanup finished before this panel pull. With
             // no pending cleanup, ApplyNodeChange records {old, next} before
             // its first suspension. Admission and reservation are therefore
-            // one uninterrupted step on the controller executor, covering all
-            // Workers without sharing their live listener state.
+            // one uninterrupted step on the controller executor, covering the
+            // candidate and previously committed runtime state.
             if (panel.node.HasPendingCleanup()) {
                 throw std::logic_error("node admission requires completed local cleanup");
             }

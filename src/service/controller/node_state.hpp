@@ -35,7 +35,7 @@ struct NodeState {
     }
 
     // Controller-executor admission uses the same snapshots as recovery.
-    // Keep both endpoints reserved until every old/candidate Worker effect is
+    // Keep both endpoints reserved until every old/candidate Runtime effect is
     // joined and either committed, compensated or cleaned.
     [[nodiscard]] bool ReservesPort(uint16_t port) const noexcept {
         if (phase != NodeRuntimePhase::Stopped && committed && committed->config.Port == port) {

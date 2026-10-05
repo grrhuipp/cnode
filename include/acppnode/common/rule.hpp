@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/rule_types.hpp"
+#include "acppnode/runtime/channel.hpp"
 #include "acppnode/features/policy/request_policy.hpp"
 
 #include <memory>
@@ -10,25 +11,27 @@
 namespace acpp::rule {
 
 // XrayR common/rule.Manager counterpart.
-// Owned by one Worker and accessed only on that Worker's io_context.
+// Mutable policy state is owned by its service strand.
 class Manager final : public features::policy::RequestPolicy {
 public:
-    Manager();
+    explicit Manager(net::any_io_executor executor,
+                     size_t channel_capacity = 1024);
     ~Manager();
 
     Manager(const Manager&) = delete;
     Manager& operator=(const Manager&) = delete;
-    Manager(Manager&&) noexcept;
-    Manager& operator=(Manager&&) noexcept;
+    Manager(Manager&&) = delete;
+    Manager& operator=(Manager&&) = delete;
 
-    void UpdateRule(std::string_view tag, const std::vector<DetectRule>& new_rule_list);
-    [[nodiscard]] bool HasRule(std::string_view tag) const noexcept;
-    [[nodiscard]] std::vector<DetectResult> GetDetectResult(std::string_view tag);
-    [[nodiscard]] bool Detect(std::string_view tag,
-                              std::string_view destination,
-                              std::string_view email);
-    [[nodiscard]] bool Blocked(
-        const session::Context& ctx) override;
+    net::awaitable<void> UpdateRule(std::string tag,
+                                    std::vector<DetectRule> new_rule_list);
+    [[nodiscard]] net::awaitable<std::vector<DetectResult>>
+        GetDetectResult(std::string tag);
+    [[nodiscard]] net::awaitable<bool> Blocked(
+        std::string inbound_tag,
+        int64_t user_id,
+        std::string user_email,
+        std::string destination) override;
 
 private:
     struct Impl;

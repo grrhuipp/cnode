@@ -118,7 +118,7 @@ std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
 }
 
 class RequestBodyReader final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
@@ -270,7 +270,7 @@ private:
 };
 
 class ResponseBodyWriter final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
@@ -723,7 +723,7 @@ bool DecryptSs2022FixedHeader(const proxyman::inbound::UserStore::ShadowsocksCre
                               fixed_plain.data());
 }
 
-net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022(
+net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession2022(
     AsyncStream& stream,
     Validator& validator,
     const SsCipherInfo& cipher_info,
@@ -732,30 +732,30 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
     const size_t salt_size = cipher_info.salt_size;
     const size_t key_size = cipher_info.key_size;
     if (salt_size > KeyBytes::kMaxSize || key_size > KeyBytes::kMaxSize) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     const auto users = validator.FindUsersForTag(tag);
     if (users.empty()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     ReadTCPSessionResult result;
     result.request_salt.size = salt_size;
     if (!co_await ReadFull(stream, result.request_salt.data(), salt_size)) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
 
     const bool use_identity = Is2022AesCipher(cipher_info.type) && HasIdentityKey(users, key_size);
     std::array<uint8_t, 16> identity_header{};
     if (use_identity &&
         !co_await ReadFull(stream, identity_header.data(), identity_header.size())) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
 
     std::array<uint8_t, kSs2022RequestFixedHeaderSize + SsAeadCipher::kTagSize> enc_fixed{};
     if (!co_await ReadFull(stream, enc_fixed.data(), enc_fixed.size())) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
 
     std::array<uint8_t, 32> read_subkey{};
@@ -794,16 +794,16 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
     }
 
     if (!result.user) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
     if (fixed_plain[0] != 0 ||
         !TimestampFresh(GetU64BE(fixed_plain.data() + 1), UnixSecondsNow())) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const uint16_t variable_len = GetU16BE(fixed_plain.data() + 9);
     if (variable_len == 0) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const size_t variable_cipher_len = variable_len + SsAeadCipher::kTagSize;
@@ -820,36 +820,36 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
             heap_variable_cipher.resize(variable_cipher_len);
             heap_variable_plain.resize(variable_len);
         } catch (...) {
-            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
         variable_cipher = heap_variable_cipher.data();
         variable_plain = heap_variable_plain.data();
     }
 
     if (!co_await ReadFull(stream, variable_cipher, variable_cipher_len)) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
     SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), key_size);
     auto nonce1 = MakeNonce(1);
     if (!read_cipher.Decrypt(nonce1.data(), variable_cipher, variable_cipher_len,
                              variable_plain)) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     auto addr_result = ParseSocks5Address(variable_plain, variable_len);
     if (!addr_result) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     result.target = std::move(addr_result->target);
 
     size_t offset = addr_result->consumed;
     if (offset + 2 > variable_len) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const uint16_t padding_len = GetU16BE(variable_plain + offset);
     offset += 2;
     if (offset + padding_len > variable_len) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     offset += padding_len;
     if (offset < variable_len) {
@@ -865,7 +865,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
             stream,
             kSs2022MaxChunkPayload);
     } catch (...) {
-        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     co_return result;
@@ -873,7 +873,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
 
 }  // namespace
 
-net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
+net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     AsyncStream& stream,
     Validator& validator,
     const SsCipherInfo& cipher_info,
@@ -887,25 +887,25 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     const size_t salt_size = cipher_info.salt_size;
     const size_t key_size = cipher_info.key_size;
     if (salt_size > 64 || key_size > 64) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     ReadTCPSessionResult result;
 
     std::array<uint8_t, 64> salt{};
     if (!co_await ReadFull(stream, salt.data(), salt_size)) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
     result.request_salt.assign(std::span<const uint8_t>(salt.data(), salt_size));
 
     std::array<uint8_t, 2 + SsAeadCipher::kTagSize> enc_len{};
     if (!co_await ReadFull(stream, enc_len.data(), enc_len.size())) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
 
     const auto users = validator.FindUsersForTag(tag);
     if (users.empty()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     uint8_t len_plain[2]{};
@@ -939,7 +939,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     }
 
     if (!result.user) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     SsAeadCipher read_cipher(cipher_info.type, read_subkey.data(), key_size);
@@ -948,13 +948,13 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     const uint16_t payload_len =
         static_cast<uint16_t>((len_plain[0] << 8) | len_plain[1]);
     if (payload_len == 0 || payload_len > kMaxChunkPayload) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     auto nonce1 = MakeNonce(read_nonce);
     detail::StreamAeadDecryptor decryptor(read_cipher);
     if (!decryptor.Init(nonce1.data())) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     buf::MultiBuffer payload_mb;
@@ -962,30 +962,30 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
 
     buf::BufferGuard cipher{buf::Buffer::New()};
     if (!cipher) {
-        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     size_t remaining = payload_len;
     while (remaining > 0) {
         buf::BufferGuard plain{buf::Buffer::New()};
         if (!plain) {
-            co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
 
         const size_t to_process = std::min(remaining, static_cast<size_t>(plain->Available()));
         cipher->Reset();
         if (!co_await ReadFull(stream, cipher->Tail().data(), to_process)) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
         cipher->Produce(static_cast<uint32_t>(to_process));
 
         int produced = 0;
         if (!decryptor.Update(cipher->Bytes().data(), to_process,
                               plain->Tail().data(), &produced)) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         if (produced < 0 || static_cast<size_t>(produced) != to_process) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         plain->Produce(static_cast<uint32_t>(produced));
         payload_mb.push_back(std::move(plain));
@@ -994,10 +994,10 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
 
     std::array<uint8_t, SsAeadCipher::kTagSize> payload_tag{};
     if (!co_await ReadFull(stream, payload_tag.data(), payload_tag.size())) {
-        co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
     }
     if (!decryptor.Final(payload_tag.data())) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     ++read_nonce;
 
@@ -1009,13 +1009,13 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
         }
     }
     if (!first_payload) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     auto first_bytes = first_payload->Bytes();
     auto addr_result = ParseSocks5Address(first_bytes.data(), first_bytes.size());
     if (!addr_result) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     result.target = std::move(addr_result->target);
@@ -1045,13 +1045,13 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
             read_nonce,
             stream);
     } catch (...) {
-        co_return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     co_return result;
 }
 
-std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCPResponse(
+tl::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCPResponse(
     const proxyman::inbound::UserStore::ShadowsocksCredential& user,
     const SsCipherInfo& cipher_info,
     const KeyBytes& request_salt,
@@ -1059,7 +1059,7 @@ std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode> WriteTCP
     try {
         return std::make_unique<ResponseBodyWriter>(user, cipher_info, request_salt, stream);
     } catch (...) {
-        return std::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 }
 

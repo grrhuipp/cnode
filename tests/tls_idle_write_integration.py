@@ -41,8 +41,6 @@ async def main(args):
         config_file.write_text(json.dumps(config), encoding='utf-8')
         child = resources.spawn([args.binary, '--config-dir', args.output], args.output / 'child.log')
         reader, writer = await resources.connect(front_port, tls=True)
-        sock = writer.get_extra_info('socket')
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         # Pause ciphertext reads, not only SSLProtocol's application delivery.
         raw_transport = writer.transport._ssl_protocol._transport
         raw_transport.pause_reading()
@@ -50,13 +48,12 @@ async def main(args):
                      + frame(1, 1) + frame(2, 1, target(backend_port) + REQUEST))
         await writer.drain()
         await asyncio.wait_for(started.wait(), 3)
-        # Do not consume TLS application data. Cross the 10s Worker heap sweep
+        # Do not consume TLS application data. Cross the 10s idle interval
         # with backpressure still present, then demand exact byte recovery.
         await asyncio.sleep(12)
         result['blocked_across_collection'] = not drained.is_set()
         assert not drained.is_set(), 'fixture did not sustain write backpressure'
         assert child.poll() is None
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         raw_transport.resume_reading()
         received = Frames(resources, reader)
         await until(lambda: sum(len(p) for c, sid, p in received.values if c == 2 and sid == 1) >= len(data), timeout=15)

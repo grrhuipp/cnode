@@ -13,11 +13,11 @@ namespace acpp::proxy::shadowsocks::outbound {
 // packet target is encoded as supplied; only the server name is resolved here.
 class UdpRequest final {
 public:
-    UdpRequest(net::io_context& io, app::dns::DNS& dns,
+    UdpRequest(net::any_io_executor executor, app::dns::DNS& dns,
                const net::ip::address& bind_address, TargetAddress server,
                const ss::SsCipherInfo& cipher_info, const ss::KeyBytes& master_key,
                std::span<const ss::KeyBytes> psk_chain)
-        : io_(io), dns_(dns), socket_(io, bind_address), server_(std::move(server)),
+        : executor_(executor), dns_(dns), socket_(executor, bind_address), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
         if (ss::Is2022Cipher(cipher_info_)) {
             ss2022_state_.emplace();
@@ -56,7 +56,7 @@ public:
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
         if (!server_endpoint_) {
-            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write, io_);
+            auto server = co_await ResolveUdpEndpoint(dns_, server_, socket_, write, executor_);
             if (!server) throw transport::LinkError(server.error());
             server_endpoint_ = *server;
         }
@@ -112,7 +112,7 @@ private:
             cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size, output, output_size);
     }
 
-    net::io_context& io_;
+    net::any_io_executor executor_;
     app::dns::DNS& dns_;
     transport::internet::DatagramSocket socket_;
     const TargetAddress server_;

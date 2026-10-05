@@ -14,7 +14,6 @@ concept Complete = requires { sizeof(T); };
 
 static_assert(!Complete<acpp::TcpStream>);
 static_assert(!Complete<acpp::TlsConfig>);
-static_assert(!Complete<acpp::RealityConfig>);
 static_assert(!Complete<SSL> && !Complete<SSL_CTX>);
 static_assert(std::derived_from<acpp::TlsStream, acpp::AsyncStream>);
 static_assert(std::is_constructible_v<acpp::TlsStream,

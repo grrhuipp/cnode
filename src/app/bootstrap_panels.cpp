@@ -8,7 +8,7 @@
 
 namespace acpp {
 
-void SetupPanels(net::io_context& main_ctx,
+void SetupPanels(net::any_io_executor executor,
                  Controller& controller,
                  const Config& config,
                  app::dns::DNS& panel_dns_service) {
@@ -29,7 +29,7 @@ void SetupPanels(net::io_context& main_ctx,
             PanelConfig node_panel_config = panel_config;
             node_panel_config.NodeIDs = PanelNodeIds::Single(node_id);
 
-            auto panel = api::CreatePanelClient(main_ctx, api_config, panel_dns_service);
+            auto panel = api::CreatePanelClient(executor, api_config, panel_dns_service);
             controller.AddPanel(std::move(panel), node_panel_config);
         }
 

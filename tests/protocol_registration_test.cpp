@@ -2,6 +2,7 @@
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/proxyman/outbound/factory.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "registration.hpp"
@@ -20,7 +21,7 @@ using OutboundCreator = acpp::proxyman::outbound::PreparedOutboundCreator;
 static_assert(std::invocable<
     OutboundCreator&,
     std::string_view,
-    acpp::net::io_context&,
+    acpp::net::any_io_executor,
     acpp::app::dns::DNS&,
     std::chrono::seconds>);
 static_assert(!std::invocable<
@@ -41,32 +42,31 @@ bool Throws(Function&& function) {
     return false;
 }
 
-class DummyRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
-public:
-    std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view) const override {
-        return {};
-    }
-};
+class DummyRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {};
 
 class DummyDatagramHandler final : public acpp::Inbound {
 public:
-    acpp::net::awaitable<acpp::RelayResult> Process(
+    explicit DummyDatagramHandler(acpp::UserOnlineTracker& online)
+        : Inbound(online) {}
+
+    acpp::net::awaitable<acpp::RelayResult> ProcessSession(
         std::unique_ptr<acpp::AsyncStream>,
         acpp::routing::Dispatcher&,
         const acpp::proxyman::inbound::ReceiverSettings&,
-        acpp::net::io_context&,
+        acpp::net::any_io_executor,
         acpp::session::Context&,
+        acpp::StatsShard&,
+        acpp::UserOnlineLease&,
         const acpp::TimeoutsConfig&,
         uint32_t) override {
         co_return acpp::RelayResult{};
     }
 
-    std::expected<
+    tl::expected<
         acpp::InboundDatagramResult,
         acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest&) override {
-        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+        return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
@@ -77,7 +77,7 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
     acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::net::io_context&,
+        acpp::net::any_io_executor,
         const acpp::tcp::endpoint*,
         acpp::session::Context&,
         const acpp::TimeoutsConfig&,
@@ -86,7 +86,7 @@ public:
         const acpp::RelayConfig&,
         acpp::buf::MultiBuffer,
         std::chrono::seconds,
-        std::chrono::seconds) override {
+        std::chrono::seconds) const override {
         co_return acpp::RelayResult{};
     }
 
@@ -95,13 +95,13 @@ private:
 };
 
 std::unique_ptr<acpp::proxyman::inbound::ProtocolRuntime>
-CreateInboundRuntime() {
+CreateInboundRuntime(acpp::net::any_io_executor) {
     return std::make_unique<DummyRuntime>();
 }
 
 std::unique_ptr<acpp::Inbound> CreateInboundHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
-    acpp::StatsShard&,
+    acpp::UserOnlineTracker&,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
@@ -109,7 +109,7 @@ std::unique_ptr<acpp::Inbound> CreateInboundHandler(
 
 std::unique_ptr<acpp::Inbound> FailDatagramHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
-    acpp::StatsShard&,
+    acpp::UserOnlineTracker&,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
     return nullptr;
@@ -117,10 +117,10 @@ std::unique_ptr<acpp::Inbound> FailDatagramHandler(
 
 std::unique_ptr<acpp::Inbound> CreateDatagramHandler(
     acpp::proxyman::inbound::ProtocolRuntime&,
-    acpp::StatsShard&,
+    acpp::UserOnlineTracker& online,
     acpp::ConnectionLimiterPtr,
     const acpp::proxyman::inbound::BuildRequest&) {
-    return std::make_unique<DummyDatagramHandler>();
+    return std::make_unique<DummyDatagramHandler>(online);
 }
 
 std::optional<acpp::proxyman::inbound::UserSet> BuildVmessUsers(
@@ -143,7 +143,7 @@ CreateOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view tag,
-           acpp::net::io_context&,
+           acpp::net::any_io_executor,
            acpp::app::dns::DNS&,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>(std::string(tag));
@@ -155,7 +155,7 @@ CreateMismatchedOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view,
-           acpp::net::io_context&,
+           acpp::net::any_io_executor,
            acpp::app::dns::DNS&,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return std::make_unique<DummyOutbound>("wrong-tag");
@@ -167,7 +167,7 @@ CreateNullOutboundConfig(
     const acpp::infra::OutboundSourceConfig&) {
     return acpp::proxyman::outbound::PreparedOutboundCreator{
         [](std::string_view,
-           acpp::net::io_context&,
+           acpp::net::any_io_executor,
            acpp::app::dns::DNS&,
            std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
             return nullptr;
@@ -181,6 +181,8 @@ CreateEmptyOutboundConfig(
 }
 
 bool TestInboundRegistration() {
+    acpp::net::io_context io_context;
+    acpp::UserOnlineTracker online(io_context.get_executor());
     acpp::proxyman::inbound::ProxyRegistration valid;
     valid.create_runtime = &CreateInboundRuntime;
     valid.create_tcp_handler = &CreateInboundHandler;
@@ -235,15 +237,15 @@ bool TestInboundRegistration() {
         return false;
     }
     if (!acpp::proxyman::inbound::HasProxy("test-inbound")) return false;
-    if (!acpp::proxyman::inbound::NewProtocolRuntime("test-inbound")) {
+    if (!acpp::proxyman::inbound::NewProtocolRuntime(
+            "test-inbound", io_context.get_executor())) {
         return false;
     }
 
     const acpp::proxyman::inbound::BuildRequest request;
     DummyRuntime runtime;
-    acpp::StatsShard stats;
     auto unknown_udp = acpp::proxyman::inbound::NewDatagramHandler(
-        "unknown-udp", runtime, stats, nullptr, request);
+        "unknown-udp", runtime, online, nullptr, request);
     if (unknown_udp.status !=
             acpp::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         unknown_udp.handler) {
@@ -251,7 +253,7 @@ bool TestInboundRegistration() {
     }
 
     auto unsupported_udp = acpp::proxyman::inbound::NewDatagramHandler(
-        "test-inbound", runtime, stats, nullptr, request);
+        "test-inbound", runtime, online, nullptr, request);
     if (unsupported_udp.status !=
             acpp::proxyman::inbound::DatagramHandlerBuildStatus::Unsupported ||
         unsupported_udp.handler) {
@@ -263,7 +265,7 @@ bool TestInboundRegistration() {
     acpp::proxyman::inbound::RegisterProxy(
         "failed-udp", failed_udp_registration);
     auto failed_udp = acpp::proxyman::inbound::NewDatagramHandler(
-        "failed-udp", runtime, stats, nullptr, request);
+        "failed-udp", runtime, online, nullptr, request);
     if (failed_udp.status !=
             acpp::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         failed_udp.handler) {
@@ -275,7 +277,7 @@ bool TestInboundRegistration() {
     acpp::proxyman::inbound::RegisterProxy(
         "ready-udp", ready_udp_registration);
     auto ready_udp = acpp::proxyman::inbound::NewDatagramHandler(
-        "ready-udp", runtime, stats, nullptr, request);
+        "ready-udp", runtime, online, nullptr, request);
     if (ready_udp.status !=
             acpp::proxyman::inbound::DatagramHandlerBuildStatus::Ready ||
         !ready_udp.handler) {
@@ -350,7 +352,7 @@ bool TestOutboundRegistration() {
     acpp::net::io_context io_context;
     acpp::app::dns::DNS dns;
     auto handler = acpp::proxyman::outbound::NewHandler(
-        *prepared, io_context, dns, std::chrono::seconds(1));
+        *prepared, io_context.get_executor(), dns, std::chrono::seconds(1));
     if (!handler || handler->Tag() != source.tag) {
         return false;
     }
@@ -361,7 +363,7 @@ bool TestOutboundRegistration() {
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns,
+                *prepared, io_context.get_executor(), dns,
                 std::chrono::seconds(1));
         })) {
         return false;
@@ -373,7 +375,7 @@ bool TestOutboundRegistration() {
     prepared = acpp::proxyman::outbound::PrepareOutboundConfig(source);
     if (!prepared || !Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                *prepared, io_context, dns,
+                *prepared, io_context.get_executor(), dns,
                 std::chrono::seconds(1));
         })) {
         return false;
@@ -383,7 +385,7 @@ bool TestOutboundRegistration() {
     missing_creator.tag = "missing-runtime-creator";
     if (!Throws<std::logic_error>([&] {
             (void)acpp::proxyman::outbound::NewHandler(
-                missing_creator, io_context, dns,
+                missing_creator, io_context.get_executor(), dns,
                 std::chrono::seconds(1));
         })) {
         return false;

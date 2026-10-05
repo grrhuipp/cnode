@@ -8,7 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -59,7 +59,7 @@ public:
             std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
 
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
@@ -68,19 +68,19 @@ public:
         const RelayConfig& relay_config,
         buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        std::chrono::seconds relay_write_timeout) const override;
 
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
-    net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
-    ResolveTargets(session::Context& ctx);
+    net::awaitable<tl::expected<std::vector<net::ip::address>, ErrorCode>>
+    ResolveTargets(session::Context& ctx) const;
 
     // 确定本地绑定地址
     std::optional<net::ip::address> DetermineLocalAddress(
         const tcp::endpoint* inbound_local_addr,
-        const net::ip::address& remote_addr);
+        const net::ip::address& remote_addr) const;
 
     std::string tag_;
     FreedomSettings settings_;

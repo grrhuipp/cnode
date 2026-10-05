@@ -9,9 +9,9 @@ namespace acpp::proxy::freedom::outbound {
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
 class UdpRequest final {
 public:
-    UdpRequest(net::io_context& io, app::dns::DNS& dns,
+    UdpRequest(net::any_io_executor executor, app::dns::DNS& dns,
                const net::ip::address& bind_address)
-        : io_(io), dns_(dns), socket_(io, bind_address) {}
+        : executor_(executor), dns_(dns), socket_(executor, bind_address) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
         auto read = socket_.StartRead();
@@ -38,7 +38,7 @@ public:
             co_await write.SendTo(udp::endpoint(*datagram.target->resolved_addr, datagram.target->port),
                                  std::move(payload));
         } else {
-            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write, io_);
+            auto target = co_await ResolveUdpEndpoint(dns_, *datagram.target, socket_, write, executor_);
             if (!target) throw transport::LinkError(target.error());
             co_await write.SendTo(*target, std::move(payload));
         }
@@ -59,7 +59,7 @@ public:
     bool ConsumePhaseDeadline() noexcept { return socket_.ConsumePhaseDeadline(); }
 
 private:
-    net::io_context& io_;
+    net::any_io_executor executor_;
     app::dns::DNS& dns_;
     transport::internet::DatagramSocket socket_;
     bool write_closed_ = false;

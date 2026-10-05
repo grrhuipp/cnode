@@ -32,7 +32,7 @@ Write-Utf8NoBom (Join-Path $CnodeDir "config.json") @"
     "access": "$($LogDir.Replace('\','/'))/cnode-access.log",
     "error": "$($LogDir.Replace('\','/'))/cnode-error.log"
   },
-  "workers": 1,
+  "ioThreads": 1,
   "dns": { "servers": ["8.8.8.8"] },
   "panels": []
 }

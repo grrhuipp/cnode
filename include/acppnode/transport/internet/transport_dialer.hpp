@@ -14,7 +14,7 @@ struct Context;
 // 消费冷路径预构建候选，建立 TCP 连接，并按 StreamSettings 完成 TLS/WS。
 [[nodiscard]]
 net::awaitable<DialResult> DialOutboundTransport(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target);
 

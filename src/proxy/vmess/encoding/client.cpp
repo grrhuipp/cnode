@@ -596,11 +596,11 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
         }
         if (payload.size() >
             ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
         if (!co_await EncodeRequestBodyChunk(
                 state, stream, payload.data(), payload.size())) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         co_return VMessHandshakeResult{};
     }
@@ -609,7 +609,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
     const size_t max_padding_len =
         (state.global_padding && state.mask) ? kStreamMaxPaddingLen : 0;
     if (buf::Buffer::kSize <= 2 + overhead + max_padding_len) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const size_t max_chunk_size = std::min(
         size_t(::acpp::vmess::MAX_CHUNK_SIZE - overhead),
@@ -625,7 +625,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
                 stream,
                 payload.data() + offset,
                 chunk_size)) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         offset += chunk_size;
     }
@@ -652,7 +652,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         if (code == ErrorCode::OK) {
             code = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        return std::unexpected(code);
+        return tl::unexpected(code);
     };
 
     if (state.sent) {

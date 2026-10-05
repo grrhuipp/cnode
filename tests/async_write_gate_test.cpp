@@ -12,7 +12,7 @@
 
 int main() {
     acpp::net::io_context io_context;
-    acpp::transport::internet::AsyncWriteGate gate(io_context);
+    acpp::transport::internet::AsyncWriteGate gate(io_context.get_executor());
 
     // The immediate path must be exclusive, movable, and reusable. Repeated
     // releases also leave a stale notification for the contended path below.

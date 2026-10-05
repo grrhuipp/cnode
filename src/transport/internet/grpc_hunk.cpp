@@ -79,7 +79,7 @@ std::optional<DataField> DecodeMessage(std::span<const uint8_t> bytes) noexcept 
 
 }  // namespace
 
-std::expected<size_t, std::string_view> GrpcHunkDecoder::Feed(std::span<const uint8_t> bytes) {
+tl::expected<size_t, std::string_view> GrpcHunkDecoder::Feed(std::span<const uint8_t> bytes) {
     size_t consumed = 0;
     while (consumed < bytes.size() && Payload().empty()) {
         if (prefix_size_ < prefix_.size()) {
@@ -88,11 +88,11 @@ std::expected<size_t, std::string_view> GrpcHunkDecoder::Feed(std::span<const ui
             prefix_size_ += size;
             consumed += size;
             if (prefix_size_ != prefix_.size()) break;
-            if (prefix_[0] != 0) return std::unexpected("gRPC compressed messages are unsupported");
+            if (prefix_[0] != 0) return tl::unexpected("gRPC compressed messages are unsupported");
             message_size_ = (uint32_t(prefix_[1]) << 24) | (uint32_t(prefix_[2]) << 16) |
                             (uint32_t(prefix_[3]) << 8) | prefix_[4];
             if (message_size_ > kMaxGrpcHunkMessageSize)
-                return std::unexpected("gRPC message exceeds 4 MiB");
+                return tl::unexpected("gRPC message exceeds 4 MiB");
         }
         const size_t size = std::min(message_size_ - message_.size(), bytes.size() - consumed);
         if (size) {
@@ -107,7 +107,7 @@ std::expected<size_t, std::string_view> GrpcHunkDecoder::Feed(std::span<const ui
         }
         if (message_.size() != message_size_) break;
         const auto data = DecodeMessage(message_);
-        if (!data) return std::unexpected("invalid gRPC Hunk protobuf message");
+        if (!data) return tl::unexpected("invalid gRPC Hunk protobuf message");
         prefix_size_ = message_size_ = 0;
         data_offset_ = data->offset;
         data_end_ = data->offset + data->size;

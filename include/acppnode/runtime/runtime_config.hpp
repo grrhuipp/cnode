@@ -1,0 +1,27 @@
+#pragma once
+
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "acppnode/app/static_inbound_prepared_config.hpp"
+#include "acppnode/common/defaults.hpp"
+#include "acppnode/infra/runtime_config_types.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace acpp {
+
+struct RuntimeConfig {
+    uint64_t runtime_generation = 1;
+    uint64_t config_generation = 1;
+    TimeoutsConfig timeouts;
+    LimitsConfig limits;
+    RoutingConfig routing;
+    std::vector<StaticInboundRuntimeEntry> static_inbounds;
+    std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
+    uint32_t entry_capacity = defaults::kServiceChannelCapacity;
+    uint32_t pressure_threshold = 1;
+    uint32_t pressure_idle_timeout = 0;
+};
+
+}  // namespace acpp

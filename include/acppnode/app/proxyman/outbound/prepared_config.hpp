@@ -19,7 +19,7 @@ namespace acpp::proxyman::outbound {
 
 using PreparedOutboundCreator = std::function<std::unique_ptr<::acpp::Outbound>(
     std::string_view tag,
-    ::acpp::net::io_context& io_context,
+    ::acpp::net::any_io_executor executor,
     ::acpp::app::dns::DNS& dns,
     std::chrono::seconds dial_timeout)>;
 

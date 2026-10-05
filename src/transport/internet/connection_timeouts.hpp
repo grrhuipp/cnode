@@ -12,7 +12,7 @@
 
 namespace acpp::transport::internet::detail {
 
-// Worker-thread-only aggregate deadlines for one connection. The scheduler
+// Session-strand-only aggregate deadlines for one connection. The scheduler
 // callback borrows this object; destruction cancels its sole event token.
 template<class Owner>
 class ConnectionTimeouts {
@@ -20,8 +20,8 @@ public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
-    ConnectionTimeouts(net::io_context& io_context, Owner& owner)
-        : scheduler_(TimeoutScheduler::ForIoContext(io_context)), owner_(owner) {}
+    ConnectionTimeouts(net::any_io_executor executor, Owner& owner)
+        : scheduler_(TimeoutScheduler::ForExecutor(executor)), executor_(std::move(executor)), owner_(owner) {}
     ConnectionTimeouts(const ConnectionTimeouts&) = delete;
     ConnectionTimeouts& operator=(const ConnectionTimeouts&) = delete;
     ~ConnectionTimeouts() noexcept { Stop(); }
@@ -170,7 +170,7 @@ private:
         if (token_.Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
         scheduler_.Cancel(token_);
         armed_deadline_.reset();
-        token_ = scheduler_.ScheduleAfter(DelayUntil(first), [this]() noexcept { OnWake(); });
+        token_ = scheduler_.ScheduleAfter(DelayUntil(first), executor_, [this]() noexcept { OnWake(); });
         armed_deadline_ = first;
     }
     void ReconcileNoThrow() noexcept {
@@ -201,6 +201,7 @@ private:
     }
 
     TimeoutScheduler& scheduler_;
+    net::any_io_executor executor_;
     Owner& owner_;
     TimeoutToken token_;
     std::optional<TimePoint> idle_deadline_, read_deadline_, write_deadline_, phase_deadline_;

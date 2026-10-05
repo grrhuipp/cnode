@@ -13,7 +13,7 @@
 
 namespace acpp {
 
-net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
                                      bool allow_xhttp_download);
 
@@ -136,9 +136,6 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
     if (!settings.grpc.authority.empty()) {
         return settings.grpc.authority;
     }
-    if (settings.IsReality()) {
-        return {};
-    }
     return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
 }
 
@@ -179,7 +176,7 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
     return {};
 }
 
-net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 AttachXHttpDownloadTarget(OutboundTransportTarget target,
                           const OutboundTargetOptions& options,
                           bool allow_xhttp_download) {
@@ -192,17 +189,17 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
 
     const auto& upload_xhttp = options.stream_settings->xhttp;
     if (upload_xhttp.IsStreamOne()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const auto& download = *upload_xhttp.download_settings;
     if (download.address.empty() || download.port == 0) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     if (!download.stream_settings.IsXHttp() ||
         download.stream_settings.IsUnsupported() ||
         download.stream_settings.xhttp.IsStreamOne()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     auto download_target = co_await BuildOutboundTransportTargetInternal(
@@ -224,7 +221,7 @@ AttachXHttpDownloadTarget(OutboundTransportTarget target,
         },
         false);
     if (!download_target) {
-        co_return std::unexpected(download_target.error());
+        co_return tl::unexpected(download_target.error());
     }
 
     target.xhttp_download_target =
@@ -243,14 +240,14 @@ std::string_view ResolveOutboundTlsServerName(
     return fallback_server_name;
 }
 
-net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
                                      bool allow_xhttp_download) {
     if (!options.stream_settings || options.port == 0) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
     if (!options.literal_address && options.address.empty()) {
-        co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     const OutboundBind unbound;
@@ -317,12 +314,12 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
             allow_xhttp_download);
     }
     if (!options.dns_service) {
-        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
     auto dns_result = co_await options.dns_service->Resolve(options.address);
     if (!dns_result.Ok() || dns_result.addresses.empty()) {
-        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
     if (bind.GetMode() == OutboundBind::Mode::Ordered) {
         target.candidates.reserve(dns_result.addresses.size());
@@ -359,7 +356,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
                     allow_xhttp_download);
             }
         }
-        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
     if (has_v4) {
@@ -403,7 +400,7 @@ BuildOutboundTransportTargetInternal(OutboundTargetOptions options,
         allow_xhttp_download);
 }
 
-net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options) {
     return BuildOutboundTransportTargetInternal(std::move(options), true);
 }

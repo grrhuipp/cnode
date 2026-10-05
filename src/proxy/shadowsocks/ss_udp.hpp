@@ -32,7 +32,7 @@ private:
     bool initialized_ = false;
 };
 
-// Worker-local cache. It deliberately rejects new sessions when full instead of
+// Handler-owned bounded cache. It rejects new sessions when full instead of
 // evicting a still-protected session and reopening a replay window.
 class Ss2022UdpReplayCache {
 public:
@@ -61,7 +61,7 @@ private:
 
     void PruneExpired(std::chrono::steady_clock::time_point now);
 
-    memory::ThreadLocalUnorderedMap<uint64_t, Session> sessions_;
+    memory::DataUnorderedMap<uint64_t, Session> sessions_;
 };
 
 // ============================================================================
@@ -92,11 +92,11 @@ struct Ss2022UdpSessionState {
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
-    memory::ThreadLocalString session_key;
+    memory::DataString session_key;
     size_t               user_index = 0;   // 匹配用户在 users 列表中的下标
     // reply_* 由 UDP 接收侧直接拿来编码回包，不再经过额外回调包装
     int64_t              user_id = 0;
-    memory::ThreadLocalString user_email;
+    memory::DataString user_email;
     uint64_t             speed_limit = 0;
     KeyBytes             reply_key;
     SsCipherInfo         cipher_info{};

@@ -5,6 +5,7 @@
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "acppnode/infra/log.hpp"
 
+#include <openssl/rand.h>
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -27,7 +28,7 @@ void RecordDialAttempt(
 }
 
 net::awaitable<DialResult> DialSingleCandidate(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate);
 
@@ -49,9 +50,6 @@ enum class XHttpOutboundMode {
     if (cfg.mode.empty() || cfg.mode == "auto") {
         if (cfg.download_settings) {
             return XHttpOutboundMode::StreamUp;
-        }
-        if (settings.IsReality()) {
-            return XHttpOutboundMode::StreamOne;
         }
         if (settings.IsTls() && !HasOnlyHttp11Alpn(settings)) {
             return XHttpOutboundMode::StreamUp;
@@ -99,7 +97,9 @@ enum class XHttpOutboundMode {
 }
 
 [[nodiscard]] std::string MakeXHttpSessionId(uint64_t conn_id) {
-    thread_local uint64_t sequence = 0;
+    uint64_t nonce = 0;
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&nonce), sizeof(nonce)) != 1)
+        throw std::runtime_error("xhttp session entropy unavailable");
     const auto now = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
 
@@ -109,7 +109,7 @@ enum class XHttpOutboundMode {
     id.push_back('-');
     id = AppendU64Hex(std::move(id), conn_id);
     id.push_back('-');
-    id = AppendU64Hex(std::move(id), ++sequence);
+    id = AppendU64Hex(std::move(id), nonce);
     return id;
 }
 
@@ -142,13 +142,13 @@ public:
         , upload_(std::move(upload))
         , conn_id_(conn_id) {}
 
-    XHttpSplitClientStream(net::io_context& io_context,
+    XHttpSplitClientStream(net::any_io_executor executor,
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
                            const OutboundDialCandidate& candidate,
                            std::string upload_path,
                            uint64_t conn_id)
-        : io_context_(&io_context)
+        : executor_(executor)
         , downlink_(std::move(downlink))
         , target_(target)
         , stream_settings_(*target.stream_settings)
@@ -337,11 +337,11 @@ private:
             co_await upload_->WriteBuffers(initial_payload);
             co_return;
         }
-        if (!io_context_ || !target_.stream_settings) {
+        if (!executor_ || !target_.stream_settings) {
             ThrowXHttpPacketError("xhttp stream-up missing target");
         }
 
-        auto tcp_result = co_await DialSingleCandidate(*io_context_, target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(executor_, target_, candidate_);
         if (!tcp_result.Ok()) {
             ThrowXHttpPacketError("xhttp stream-up dial failed");
         }
@@ -366,7 +366,7 @@ private:
         pending_initial_.clear();
     }
 
-    net::io_context* io_context_ = nullptr;
+    net::any_io_executor executor_{};
     std::unique_ptr<AsyncStream> downlink_;
     std::unique_ptr<AsyncStream> upload_;
     OutboundTransportTarget target_;
@@ -380,13 +380,13 @@ private:
 
 class XHttpPacketUpClientStream final : public AsyncStream {
 public:
-    XHttpPacketUpClientStream(net::io_context& io_context,
+    XHttpPacketUpClientStream(net::any_io_executor executor,
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
                               const OutboundDialCandidate& candidate,
                               std::string session_id,
                               uint64_t conn_id)
-        : io_context_(io_context)
+        : executor_(executor)
         , downlink_(std::move(downlink))
         , target_(target)
         , stream_settings_(*target.stream_settings)
@@ -538,7 +538,7 @@ private:
             session_id_,
             next_seq_);
 
-        auto tcp_result = co_await DialSingleCandidate(io_context_, target_, candidate_);
+        auto tcp_result = co_await DialSingleCandidate(executor_, target_, candidate_);
         if (!tcp_result.Ok()) {
             ThrowXHttpPacketError("xhttp packet-up dial failed");
         }
@@ -560,7 +560,7 @@ private:
         ++next_seq_;
     }
 
-    net::io_context& io_context_;
+    net::any_io_executor executor_;
     std::unique_ptr<AsyncStream> downlink_;
     OutboundTransportTarget target_;
     StreamSettings stream_settings_;
@@ -573,7 +573,7 @@ private:
 };
 
 net::awaitable<DialResult> DialSingleCandidate(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
@@ -582,10 +582,10 @@ net::awaitable<DialResult> DialSingleCandidate(
     DialResult tcp_result;
     if (bind_local) {
         tcp_result = co_await TcpStream::ConnectWithBind(
-            io_context, *bind_local, candidate.endpoint, target.timeout);
+            executor, *bind_local, candidate.endpoint, target.timeout);
     } else {
         tcp_result = co_await TcpStream::Connect(
-            io_context, candidate.endpoint, target.timeout);
+            executor, candidate.endpoint, target.timeout);
     }
 
     tcp_result.attempted_remote_addr = candidate.endpoint.address();
@@ -593,7 +593,7 @@ net::awaitable<DialResult> DialSingleCandidate(
 }
 
 net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate,
@@ -602,7 +602,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     std::span<const net::const_buffer> packet_payload = {}) {
 
     RecordDialAttempt(ctx, candidate);
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
+    auto tcp_result = co_await DialSingleCandidate(executor, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -648,13 +648,13 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
 }
 
 net::awaitable<DialResult> DialAndBuildSingleCandidate(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
     RecordDialAttempt(ctx, candidate);
-    auto tcp_result = co_await DialSingleCandidate(io_context, target, candidate);
+    auto tcp_result = co_await DialSingleCandidate(executor, target, candidate);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -689,7 +689,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
 }
 
 net::awaitable<DialResult> DialAndBuildCandidatesSequential(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target,
     std::span<const OutboundDialCandidate> candidates) {
@@ -699,7 +699,7 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
 
     for (const auto& candidate : candidates) {
         auto attempt = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, candidate);
+            executor, ctx, target, candidate);
         if (attempt.Ok()) {
             co_return attempt;
         }
@@ -716,7 +716,7 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
 }
 
 net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target,
     std::span<const OutboundDialCandidate> candidates) {
@@ -756,7 +756,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     auto try_downlink_candidate = [&](const OutboundDialCandidate& candidate)
         -> net::awaitable<bool> {
         auto attempt = co_await DialAndBuildXHttpRequestCandidate(
-            io_context,
+            executor,
             ctx,
             downlink_target,
             candidate,
@@ -802,7 +802,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     if (mode == XHttpOutboundMode::PacketUp) {
         auto result = DialResult::Success(
             std::make_unique<XHttpPacketUpClientStream>(
-                io_context,
+                executor,
                 std::move(downlink),
                 target,
                 *upload_candidate,
@@ -814,7 +814,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 
     auto result = DialResult::Success(
         std::make_unique<XHttpSplitClientStream>(
-            io_context,
+            executor,
             std::move(downlink),
             target,
             *upload_candidate,
@@ -827,7 +827,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 }  // namespace
 
 net::awaitable<DialResult> DialOutboundTransport(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
     const OutboundTransportTarget& target) {
 
@@ -846,26 +846,26 @@ net::awaitable<DialResult> DialOutboundTransport(
         if (target.single_candidate) {
             std::array<OutboundDialCandidate, 1> candidates{*target.single_candidate};
             result = co_await DialXHttpSplitOutboundTransport(
-                io_context,
+                executor,
                 ctx,
                 target,
                 candidates);
         } else {
             result = co_await DialXHttpSplitOutboundTransport(
-                io_context,
+                executor,
                 ctx,
                 target,
                 target.candidates);
         }
     } else if (target.single_candidate) {
         result = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, *target.single_candidate);
+            executor, ctx, target, *target.single_candidate);
     } else if (target.candidates.size() == 1) {
         result = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, target.candidates.front());
+            executor, ctx, target, target.candidates.front());
     } else {
         result = co_await DialAndBuildCandidatesSequential(
-            io_context, ctx, target, target.candidates);
+            executor, ctx, target, target.candidates);
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

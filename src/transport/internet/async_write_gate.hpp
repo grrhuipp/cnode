@@ -10,7 +10,7 @@
 
 namespace acpp::transport::internet {
 
-// Worker-local coroutine mutex for serialized transport writes. Cancellation
+// Session-strand admission gate for serialized transport writes. Cancellation
 // closes the signal channel so every queued acquirer is resumed; a single
 // condition-variable style notification is insufficient for terminal state.
 class AsyncWriteGate {
@@ -55,16 +55,13 @@ public:
         AsyncWriteGate* gate_ = nullptr;
     };
 
-    explicit AsyncWriteGate(net::io_context& io_context)
-        : signal_(io_context, 1) {}
-
     explicit AsyncWriteGate(net::any_io_executor executor)
         : signal_(std::move(executor), 1) {}
 
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 
-    // Owner-thread synchronous fast path. Only contended callers need to
+    // Owner-strand synchronous fast path. Only contended callers need to
     // construct an acquisition coroutine; leases retain identical ownership.
     [[nodiscard]] Lease TryAcquire() noexcept {
         if (busy_ || cancelled_) return {};

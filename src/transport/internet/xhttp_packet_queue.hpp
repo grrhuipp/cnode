@@ -115,8 +115,8 @@ private:
         }
     }
 
-    memory::ThreadLocalDeque<QueuedPacket> ready_;
-    memory::ThreadLocalMap<uint64_t, QueuedPacket> pending_;
+    memory::DataDeque<QueuedPacket> ready_;
+    memory::DataMap<uint64_t, QueuedPacket> pending_;
     size_t queued_bytes_ = 0;
     size_t queued_packets_ = 0;
     uint64_t next_seq_ = 0;

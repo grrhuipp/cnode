@@ -1,408 +1,275 @@
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/runtime/channel.hpp"
 
 #include <algorithm>
-#include <stdexcept>
+#include <atomic>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/execution_context.hpp>
+#include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
-
+#include <asio/strand.hpp>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
 namespace acpp {
 
+struct TimeoutToken::State {
+    TimeoutScheduler* owner = nullptr;
+    std::weak_ptr<void> lifetime;
+    uint64_t id = 0;
+    std::shared_ptr<void> admission;
+    TimeoutScheduler::Callback callback;
+    bool active = true;
+};
+
 struct TimeoutScheduler::Impl {
-    explicit Impl(net::io_context& io_context)
-        : timer(io_context) {
-        events.reserve(kInitialEventReserve);
-        deadline_heap.reserve(kInitialEventReserve);
-        ready_event_ids.reserve(kMaxReadyBatch);
-    }
-
-    static constexpr size_t kInitialEventReserve = 1024;
-    static constexpr size_t kMaxReadyBatch = 64;
-    static constexpr size_t kHeapCompactStaleFloor = 1024;
-
+    struct AdmissionCounter { std::atomic<std::size_t> outstanding{0}; };
+    struct Admission {
+        explicit Admission(std::shared_ptr<AdmissionCounter> counter) : counter(std::move(counter)) {}
+        ~Admission() { counter->outstanding.fetch_sub(1, std::memory_order_release); }
+        std::shared_ptr<AdmissionCounter> counter;
+    };
     struct Event {
         std::chrono::steady_clock::time_point deadline;
-        Callback cb;
+        net::any_io_executor callback_executor;
+        std::weak_ptr<TimeoutToken::State> state;
+        std::shared_ptr<Admission> admission;
     };
-
     struct HeapEntry {
         std::chrono::steady_clock::time_point deadline;
-        uint64_t id = 0;
+        uint64_t id;
     };
-
-    struct HeapCompare {
-        bool operator()(const HeapEntry& lhs, const HeapEntry& rhs) const noexcept {
-            if (lhs.deadline == rhs.deadline) {
-                return lhs.id > rhs.id;
-            }
-            return lhs.deadline > rhs.deadline;
+    struct Compare {
+        bool operator()(const HeapEntry& a, const HeapEntry& b) const noexcept {
+            return a.deadline == b.deadline ? a.id > b.id : a.deadline > b.deadline;
         }
     };
+    explicit Impl(net::any_io_executor executor)
+        : executor(net::make_strand(std::move(executor))), timer(this->executor), observations(this->executor, 64) {
+        events.reserve(1024);
+        heap.reserve(1024);
+    }
 
+    net::any_io_executor executor;
     net::steady_timer timer;
-    using TimeoutEventMap = memory::ThreadLocalUnorderedMap<uint64_t, Event>;
-
-    TimeoutEventMap events;
-    memory::ThreadLocalVector<HeapEntry> deadline_heap;
-    memory::ThreadLocalVector<uint64_t> ready_event_ids;
-    uint64_t next_id = 1;
+    std::unordered_map<uint64_t, Event> events;
+    std::vector<HeapEntry> heap;
+    ServiceChannel observations;
+    std::shared_ptr<AdmissionCounter> counter = std::make_shared<AdmissionCounter>();
+    std::atomic<uint64_t> next_id{1};
     bool wait_pending = false;
     bool wakeup_requested = false;
     bool released = false;
-    bool dispatching_ready_batch = false;
     std::chrono::steady_clock::time_point armed_deadline{};
-    std::chrono::steady_clock::time_point maintenance_deadline =
-        std::chrono::steady_clock::time_point::max();
-    void* maintenance_owner = nullptr;
-    void (*maintenance_callback)(void*) noexcept = nullptr;
 
-    void PushHeap(HeapEntry entry) {
-        deadline_heap.push_back(entry);
-        std::push_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
+    [[nodiscard]] std::shared_ptr<Admission> Reserve() {
+        auto count = counter->outstanding.load(std::memory_order_relaxed);
+        do {
+            if (count >= kCapacity) throw std::length_error("timeout scheduler capacity exhausted");
+        } while (!counter->outstanding.compare_exchange_weak(count, count + 1,
+            std::memory_order_acquire, std::memory_order_relaxed));
+        try { return memory::AllocateShared<Admission>(counter); }
+        catch (...) { counter->outstanding.fetch_sub(1, std::memory_order_release); throw; }
     }
-
-    HeapEntry PopHeap() {
-        std::pop_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
-        auto entry = deadline_heap.back();
-        deadline_heap.pop_back();
-        return entry;
-    }
-
-    void PruneHeapTop() {
-        while (!deadline_heap.empty()) {
-            const auto& top = deadline_heap.front();
-            auto it = events.find(top.id);
-            if (it != events.end() && it->second.deadline == top.deadline) {
-                return;
-            }
-            (void)PopHeap();
+    void Prune() {
+        while (!heap.empty()) {
+            auto it = events.find(heap.front().id);
+            if (it != events.end() && it->second.deadline == heap.front().deadline) break;
+            std::pop_heap(heap.begin(), heap.end(), Compare{});
+            heap.pop_back();
         }
     }
-
-    void MaybeCompactHeap() noexcept {
-        if (released || dispatching_ready_batch ||
-            deadline_heap.size() <= events.size()) {
-            return;
-        }
-
-        const size_t stale = deadline_heap.size() - events.size();
-        if (stale < kHeapCompactStaleFloor ||
-            stale < deadline_heap.size() / 2) {
-            return;
-        }
-
-        // The index contains trivial values, so cancelled entries can be
-        // removed in place. Cancellation and owner destruction never need a
-        // replacement allocation, even when the stale tail is large.
-        std::erase_if(deadline_heap, [this](const HeapEntry& entry) {
-            const auto it = events.find(entry.id);
+    void Compact() noexcept {
+        if (heap.size() <= events.size() + 1024 || heap.size() < events.size() * 2) return;
+        std::erase_if(heap, [this](const HeapEntry& entry) {
+            auto it = events.find(entry.id);
             return it == events.end() || it->second.deadline != entry.deadline;
         });
-        std::make_heap(deadline_heap.begin(), deadline_heap.end(), HeapCompare{});
+        std::make_heap(heap.begin(), heap.end(), Compare{});
     }
-
-    void RequestWakeup() noexcept {
-        if (!wait_pending || wakeup_requested) {
-            return;
-        }
-        IoErrorCode ec;
-        timer.cancel(ec);
+    void Wake() noexcept {
+        if (!wait_pending || wakeup_requested) return;
+        IoErrorCode ignored;
+        timer.cancel(ignored);
         wakeup_requested = true;
     }
-
-    void ArmTimer() {
-        PruneHeapTop();
-        const auto next_deadline = deadline_heap.empty() ? maintenance_deadline
-            : std::min(deadline_heap.front().deadline, maintenance_deadline);
-        ArmDeadline(next_deadline);
-    }
-
-    // May run from a PMR deallocation while events is rehashing or the heap
-    // is reallocating. Do not inspect either container from this leaf path.
-    void ArmDeadline(std::chrono::steady_clock::time_point next_deadline) {
-        if (next_deadline == std::chrono::steady_clock::time_point::max()) return;
-
-        if (wait_pending) {
-            // Preserve the existing operation until its completion is
-            // delivered. An earlier event only wakes it; scheduling a second
-            // wait here could cancel the old one and then fail to allocate.
-            if (next_deadline < armed_deadline) {
-                RequestWakeup();
-            }
-            return;
-        }
-
-        timer.expires_at(next_deadline);
-        timer.async_wait([this](const IoErrorCode& ec) {
-            OnTimer(ec);
-        });
-        // async_wait never invokes inline. Publish ownership only after its
-        // initiation succeeds; an exception must leave no fictitious wait.
-        armed_deadline = next_deadline;
+    void Arm() {
+        Prune();
+        if (heap.empty()) { Wake(); return; }
+        const auto first = heap.front().deadline;
+        if (wait_pending) { if (first < armed_deadline) Wake(); return; }
+        timer.expires_at(first);
+        timer.async_wait([this](IoErrorCode ec) { OnTimer(ec); });
+        armed_deadline = first;
         wait_pending = true;
         wakeup_requested = false;
     }
-
-    void ReconcileTimerAfterCancellation() noexcept {
-        PruneHeapTop();
-        // A later remaining deadline can use the already-armed earlier wake.
-        // With no events, wake now so io_context::run can finish promptly.
-        if (deadline_heap.empty() &&
-            maintenance_deadline == std::chrono::steady_clock::time_point::max()) {
-            RequestWakeup();
-        }
-    }
-
-    void OnTimer(const IoErrorCode& ec) {
-        wait_pending = false;
-        wakeup_requested = false;
+    void OnTimer(IoErrorCode ec) {
+        wait_pending = wakeup_requested = false;
         if (released) return;
-        if (ec && ec != io_error::operation_aborted) {
-            throw IoSystemError(ec);
-        }
-
-        auto& ready = ready_event_ids;
-        ready.clear();
-
+        if (ec && ec != io_error::operation_aborted) throw IoSystemError(ec);
         const auto now = std::chrono::steady_clock::now();
-        while (ready.size() < kMaxReadyBatch) {
-            PruneHeapTop();
-            if (deadline_heap.empty() || deadline_heap.front().deadline > now) {
-                break;
-            }
-
-            const auto entry = PopHeap();
-            auto it = events.find(entry.id);
-            if (it == events.end() || it->second.deadline != entry.deadline) {
-                continue;
-            }
-            ready.push_back(entry.id);
+        for (std::size_t batch = 0; batch < 64; ++batch) {
+            Prune();
+            if (heap.empty() || heap.front().deadline > now) break;
+            const auto id = heap.front().id;
+            std::pop_heap(heap.begin(), heap.end(), Compare{});
+            heap.pop_back();
+            auto node = events.extract(id);
+            if (node.empty()) continue;
+            auto event = std::move(node.mapped());
+            net::post(event.callback_executor,
+                [state = std::move(event.state), admission = std::move(event.admission)]() mutable {
+                    if (auto handle = state.lock(); handle && handle->active) {
+                        handle->active = false;
+                        auto callback_admission = std::move(handle->admission);
+                        auto callback = std::move(handle->callback);
+                        try { if (callback) callback(); } catch (...) {}
+                    }
+                });
         }
-
-        // Keep due callbacks in events until the instant they execute. A prior
-        // callback in this same ready batch may cancel and destroy a later
-        // callback owner; Cancel must still be able to erase that event.
-        dispatching_ready_batch = true;
-        for (size_t i = 0; i < ready.size(); ++i) {
-            const uint64_t id = ready[i];
-            auto it = events.find(id);
-            if (it == events.end()) {
-                continue;
-            }
-            Callback cb = std::move(it->second.cb);
-            events.erase(it);
-            try {
-                if (cb) cb();
-            } catch (...) {
-                // Asio propagates handler exceptions out of io_context::run().
-                // Isolate owner callbacks so one failed timeout cannot skip
-                // later callbacks. Scheduler infrastructure failures still
-                // propagate to the process runtime failure boundary.
-            }
-            if (released) {
-                break;
-            }
-        }
-        dispatching_ready_batch = false;
-        ready.clear();
-
-        if (!released && maintenance_callback &&
-            maintenance_deadline <= std::chrono::steady_clock::now()) {
-            maintenance_deadline = std::chrono::steady_clock::time_point::max();
-            maintenance_callback(maintenance_owner);
-        }
-        if (!released) {
-            MaybeCompactHeap();
-            ArmTimer();
-        }
+        Compact();
+        Arm();
     }
-
+    void Insert(uint64_t id, Event event) {
+        if (released) return;
+        const auto deadline = event.deadline;
+        events.emplace(id, std::move(event));
+        try {
+            heap.push_back({deadline, id});
+            std::push_heap(heap.begin(), heap.end(), Compare{});
+            Arm();
+        } catch (...) { events.erase(id); throw; }
+    }
+    void Erase(uint64_t id) noexcept {
+        events.erase(id);
+        Prune();
+        Compact();
+        if (heap.empty()) Wake();
+    }
     void Release() noexcept {
         released = true;
-        maintenance_deadline = std::chrono::steady_clock::time_point::max();
-        maintenance_owner = nullptr;
-        maintenance_callback = nullptr;
-        RequestWakeup();
-        dispatching_ready_batch = false;
+        Wake();
         events.clear();
-        deadline_heap.clear();
-        ready_event_ids.clear();
+        heap.clear();
     }
 };
-
-namespace {
-
-thread_local net::io_context* tl_cached_context = nullptr;
-thread_local TimeoutScheduler* tl_cached_scheduler = nullptr;
-
-}  // namespace
 
 class TimeoutSchedulerService final : public asio::execution_context::service {
 public:
     static asio::execution_context::id id;
+    explicit TimeoutSchedulerService(asio::execution_context& context)
+        : service(context) {}
 
-    explicit TimeoutSchedulerService(asio::execution_context& ctx)
-        : asio::execution_context::service(ctx)
-        , scheduler_(static_cast<net::io_context&>(ctx)) {}
-
-    [[nodiscard]] TimeoutScheduler& Scheduler() noexcept {
-        return scheduler_;
+    void Install(net::any_io_executor shared_executor) {
+        std::lock_guard lock(mutex_);
+        if (scheduler_) {
+            if (*shared_executor_ != shared_executor)
+                throw std::logic_error("timeout scheduler cannot be rebound to another executor");
+            return;
+        }
+        shared_executor_ = shared_executor;
+        scheduler_ = std::unique_ptr<TimeoutScheduler>(
+            new TimeoutScheduler(std::move(shared_executor)));
     }
 
-    void ShutdownNow() noexcept {
-        ClearThreadCache();
-        scheduler_.Release();
+    TimeoutScheduler& Get() {
+        std::lock_guard lock(mutex_);
+        if (!scheduler_)
+            throw std::logic_error("timeout scheduler is not installed");
+        return *scheduler_;
+    }
+
+    void Release() noexcept {
+        std::lock_guard lock(mutex_);
+        if (scheduler_) scheduler_->Release();
     }
 
 private:
-    void ClearThreadCache() noexcept {
-        if (tl_cached_scheduler == &scheduler_) {
-            tl_cached_context = nullptr;
-            tl_cached_scheduler = nullptr;
-        }
-    }
-
     void shutdown() override {
-        ClearThreadCache();
-        scheduler_.Release();
+        std::lock_guard lock(mutex_);
+        if (scheduler_) scheduler_->Release();
+        scheduler_.reset();
+        shared_executor_.reset();
     }
 
-    TimeoutScheduler scheduler_;
+    std::mutex mutex_;
+    std::optional<net::any_io_executor> shared_executor_;
+    std::unique_ptr<TimeoutScheduler> scheduler_;
 };
-
 asio::execution_context::id TimeoutSchedulerService::id;
 
-TimeoutScheduler::TimeoutScheduler(net::io_context& io_context)
-    : impl_(std::make_unique<Impl>(io_context)) {}
+TimeoutScheduler::TimeoutScheduler(net::any_io_executor executor)
+    : impl_(std::make_shared<Impl>(std::move(executor))) {}
 
-TimeoutToken::~TimeoutToken() noexcept {
-    if (Valid()) {
-        owner_->Cancel(*this);
-    }
+void TimeoutScheduler::Install(net::any_io_executor shared_executor) {
+    auto& service = asio::use_service<TimeoutSchedulerService>(shared_executor.context());
+    service.Install(std::move(shared_executor));
 }
+TimeoutScheduler& TimeoutScheduler::ForExecutor(net::any_io_executor executor) {
+    return asio::use_service<TimeoutSchedulerService>(executor.context()).Get();
+}
+void TimeoutScheduler::ReleaseForExecutor(net::any_io_executor executor) noexcept {
+    if (asio::has_service<TimeoutSchedulerService>(executor.context()))
+        asio::use_service<TimeoutSchedulerService>(executor.context()).Release();
+}
+void TimeoutScheduler::Release() noexcept { impl_->Release(); }
 
+TimeoutToken::~TimeoutToken() noexcept { Reset(); }
+TimeoutToken::TimeoutToken(TimeoutToken&&) noexcept = default;
 TimeoutToken& TimeoutToken::operator=(TimeoutToken&& other) noexcept {
-    if (this != &other) {
-        if (Valid()) {
-            owner_->Cancel(*this);
-        }
-        id_ = std::exchange(other.id_, 0);
-        owner_ = std::exchange(other.owner_, nullptr);
-    }
+    if (this != &other) { Reset(); state_ = std::move(other.state_); }
     return *this;
 }
-
-TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& io_context) {
-    if (tl_cached_context == &io_context && tl_cached_scheduler) {
-        return *tl_cached_scheduler;
-    }
-
-    auto& service = asio::use_service<TimeoutSchedulerService>(io_context);
-    auto* ptr = &service.Scheduler();
-    tl_cached_context = &io_context;
-    tl_cached_scheduler = ptr;
-    return *ptr;
+bool TimeoutToken::Valid() const noexcept { return state_ && state_->active; }
+void TimeoutToken::Reset() noexcept {
+    if (state_ && !state_->lifetime.expired()) state_->owner->Cancel(*this);
+    else state_.reset();
 }
 
-void TimeoutScheduler::ReleaseForIoContext(net::io_context& io_context) {
-    if (tl_cached_context == &io_context) {
-        tl_cached_context = nullptr;
-        tl_cached_scheduler = nullptr;
-    }
-
-    if (!asio::has_service<TimeoutSchedulerService>(io_context)) {
-        return;
-    }
-    auto& service = asio::use_service<TimeoutSchedulerService>(io_context);
-    service.ShutdownNow();
-}
-
-void TimeoutScheduler::Release() noexcept {
-    impl_->Release();
-}
-
-TimeoutToken TimeoutScheduler::ScheduleAfter(
-    std::chrono::milliseconds delay,
-    Callback cb) {
-    if (impl_->released) {
-        return {};
-    }
-
-    if (delay < std::chrono::milliseconds::zero()) {
-        delay = std::chrono::milliseconds::zero();
-    }
-
-    TimeoutToken token;
-    token.id_ = impl_->next_id++;
-    token.owner_ = this;
-    using Clock = std::chrono::steady_clock;
-    const auto now = Clock::now();
+TimeoutToken TimeoutScheduler::ScheduleAfter(std::chrono::milliseconds delay,
+    net::any_io_executor callback_executor, Callback callback) {
+    auto admission = impl_->Reserve();
+    auto state = memory::AllocateShared<TimeoutToken::State>();
+    state->admission = admission;
+    state->owner = this;
+    state->lifetime = impl_;
+    state->id = impl_->next_id.fetch_add(1, std::memory_order_relaxed);
+    state->callback = std::move(callback);
+    delay = std::max(delay, std::chrono::milliseconds::zero());
+    const auto now = std::chrono::steady_clock::now();
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::time_point::max() - now);
-    const auto deadline = delay >= remaining
-        ? Clock::time_point::max() : now + delay;
-
-    impl_->events.emplace(token.id_, Impl::Event{deadline, std::move(cb)});
-    impl_->PushHeap(Impl::HeapEntry{deadline, token.id_});
-    impl_->ArmTimer();
-
+        std::chrono::steady_clock::time_point::max() - now);
+    const auto deadline = delay >= remaining ? std::chrono::steady_clock::time_point::max() : now + delay;
+    net::post(impl_->executor, [impl = impl_.get(), id = state->id,
+        event = Impl::Event{deadline, std::move(callback_executor), state, std::move(admission)}]() mutable {
+        impl->Insert(id, std::move(event));
+    });
+    TimeoutToken token;
+    token.state_ = std::move(state);
     return token;
 }
-
-bool TimeoutScheduler::SetMaintenanceDeadline(
-    void* owner, void (*callback)(void*) noexcept,
-    std::chrono::steady_clock::time_point deadline) {
-    if (impl_->released) return false;
-    if (!owner || !callback ||
-        (impl_->maintenance_owner && impl_->maintenance_owner != owner)) {
-        throw std::logic_error("timeout maintenance owner conflict");
-    }
-    impl_->maintenance_owner = owner;
-    impl_->maintenance_callback = callback;
-    impl_->maintenance_deadline = deadline;
-    impl_->ArmDeadline(deadline);
-    return true;
-}
-
-void TimeoutScheduler::CancelMaintenance(void* owner) noexcept {
-    if (impl_->maintenance_owner != owner) return;
-    impl_->maintenance_deadline = std::chrono::steady_clock::time_point::max();
-    impl_->maintenance_owner = nullptr;
-    impl_->maintenance_callback = nullptr;
-    // Allocator notifications can also cancel maintenance during a container
-    // mutation (including the timer-initiation OOM fallback). Defer all heap
-    // pruning and event lookup to OnTimer, after the current stack unwinds.
-    impl_->RequestWakeup();
-}
-
 void TimeoutScheduler::Cancel(TimeoutToken& token) noexcept {
-    if (!token.Valid()) return;
-    if (token.owner_ != this) {
-        return;
-    }
-
-    const uint64_t id = token.id_;
-    token.Reset();
-    if (!impl_->released) {
-        const bool removed = impl_->events.erase(id) != 0;
-        if (removed) {
-            impl_->ReconcileTimerAfterCancellation();
-            impl_->MaybeCompactHeap();
-        }
-    }
+    if (!token.state_ || token.state_->owner != this) return;
+    auto state = std::move(token.state_);
+    if (!std::exchange(state->active, false)) return;
+    state->callback = {};
+    // The reservation remains in the deadline command/event until this owned
+    // cancellation executes. Failed allocation still invalidates the callback.
+    try { net::post(impl_->executor, [impl = impl_.get(), id = state->id, admission = std::move(state->admission)] { impl->Erase(id); }); }
+    catch (...) {}
 }
-
-TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexcept {
-    const auto& impl = *impl_;
-    return ResourceStats{
-        .active_events = impl.events.size(),
-        .heap_entries = impl.deadline_heap.size(),
-        .heap_capacity = impl.deadline_heap.capacity(),
-        .event_buckets = impl.events.bucket_count(),
-        .ready_events = impl.ready_event_ids.size(),
-        .wait_pending = impl.wait_pending,
-    };
+net::awaitable<TimeoutScheduler::ResourceStats> TimeoutScheduler::GetResourceStats() {
+    co_return co_await impl_->observations.Call([impl = impl_] {
+        return ResourceStats{.active_events = impl->events.size(), .heap_entries = impl->heap.size(),
+            .heap_capacity = impl->heap.capacity(), .event_buckets = impl->events.bucket_count(),
+            .ready_events = 0, .wait_pending = impl->wait_pending};
+    });
 }
 
 }  // namespace acpp

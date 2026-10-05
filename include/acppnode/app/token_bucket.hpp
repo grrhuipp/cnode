@@ -8,7 +8,7 @@
 
 namespace acpp {
 
-// Worker-local byte reservations. Initial credit is one second of traffic;
+// Runtime-local byte reservations. Initial credit is one second of traffic;
 // idle credit is capped at two seconds. Waiting cannot earn reserved bytes again.
 class TokenBucket {
 public:

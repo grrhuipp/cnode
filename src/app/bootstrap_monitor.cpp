@@ -1,408 +1,206 @@
 #include "acppnode/app/bootstrap_monitor.hpp"
 #include "acppnode/app/bootstrap_runtime.hpp"
-
-#include "../common/awaitable_batch.hpp"
-#include "../common/monitor_loop.hpp"
+#include "../common/awaitable_task_group.hpp"
 #include "../common/process_resources.hpp"
-
-#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/defaults.hpp"
 #include "acppnode/common/memory_stats.hpp"
+#include "acppnode/runtime/channel.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
+#include "acppnode/app/dns/dns_service.hpp"
 #include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/app/worker_stats.hpp"
+#include "acppnode/runtime/runtime.hpp"
+#include "acppnode/runtime/runtime_stats.hpp"
 
-#include <algorithm>
-#include <array>
+#include <asio/as_tuple.hpp>
+#include <asio/steady_timer.hpp>
 #include <chrono>
 #include <exception>
 #include <fstream>
-#include <vector>
 
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
-
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
 #endif
 
 namespace acpp {
-
 namespace {
-
 struct MonitorContext {
-    net::io_context& main_ctx;
-    ShardedStats& stats;
-    const std::vector<std::unique_ptr<Worker>>& workers;
+    net::any_io_executor executor;
+    StatsSampler& stats_sampler;
+    Runtime& runtime;
     Controller& controller;
-    app::dns::DNSWorker& dns_worker;
+    app::dns::DNSService& dns_service;
 };
 
 size_t ReadResidentMemoryBytes() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX counters{};
-    if (GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-            sizeof(counters))) {
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)))
         return static_cast<size_t>(counters.WorkingSetSize);
-    }
 #else
     std::ifstream status("/proc/self/status");
     std::string line;
-    while (std::getline(status, line)) {
-        if (line.starts_with("VmRSS:")) {
-            return std::stoull(line.substr(6)) * 1024;
-        }
-    }
+    while (std::getline(status, line))
+        if (line.starts_with("VmRSS:")) return std::stoull(line.substr(6)) * 1024;
 #endif
     return 0;
 }
 
 std::string FormatRate(double bytes_per_sec) {
-    return acpp::FormatBytes(static_cast<uint64_t>(bytes_per_sec)) + "/s";
+    return FormatBytes(static_cast<uint64_t>(bytes_per_sec)) + "/s";
 }
 
-net::awaitable<std::vector<Worker::RuntimeStatsSnapshot>>
-CollectWorkerRuntimeStats(const MonitorContext& ctx, bool include_resources) {
-    std::vector<Worker::RuntimeStatsSnapshot> snapshots(ctx.workers.size());
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(ctx.workers.size());
-    for (size_t i = 0; i < ctx.workers.size(); ++i) {
-        tasks.push_back(
-            [](Worker* worker,
-               Worker::RuntimeStatsSnapshot& out,
-               bool collect_resources) -> net::awaitable<void> {
-                out = co_await worker->PostTask(
-                    worker->CollectRuntimeStatsTask(collect_resources));
-            }(ctx.workers[i].get(), snapshots[i], include_resources)
-        );
-    }
-    co_await RunAwaitableBatch(
-        ctx.main_ctx.get_executor(), std::move(tasks));
-    co_return snapshots;
-}
-
-net::awaitable<void> CollectWorkerHeaps(const MonitorContext& ctx, bool force) {
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(ctx.workers.size());
-    for (const auto& worker : ctx.workers) {
-        tasks.push_back(
-            [](Worker* owner, bool burst) -> net::awaitable<void> {
-                co_await owner->PostTask(owner->CollectHeapTask(burst));
-            }(worker.get(), force));
-    }
-    co_await RunAwaitableBatch(ctx.main_ctx.get_executor(), std::move(tasks));
-    // The control thread may also hold short-lived PMR allocations.
-    if (force) {
-        memory::CollectBurst();
-    } else {
-        memory::CollectSteady();
-    }
-}
-
-StatsSnapshot AggregateWorkerStats(
-    const std::vector<Worker::RuntimeStatsSnapshot>& worker_snapshots) {
-    StatsSnapshot snapshot;
-    for (const auto& worker_snapshot : worker_snapshots) {
-        const auto& s = worker_snapshot.stats;
-        snapshot.connections_total  += s.connections_total;
-        snapshot.connections_active += s.connections_active;
-        snapshot.bytes_in           += s.bytes_in;
-        snapshot.bytes_out          += s.bytes_out;
-        snapshot.errors             += s.errors;
-    }
-    return snapshot;
-}
-
-net::awaitable<void> RuntimeSamplingLoop(
-    const MonitorContext& ctx) {
-    net::steady_timer timer(ctx.main_ctx);
-    [[maybe_unused]] uint32_t last_sample_total_conns = 0;
-    [[maybe_unused]] uint64_t last_force_collect_total_connections = 0;
-    [[maybe_unused]] bool churn_collect_baseline_set = false;
-    [[maybe_unused]] auto last_force_collect_at = steady_clock::time_point{};
-    [[maybe_unused]] auto last_steady_collect_at = steady_clock::time_point{};
-    auto last_log_flush_at = steady_clock::time_point{};
+net::awaitable<void> RuntimeSamplingLoop(const MonitorContext& ctx) {
+    net::steady_timer timer(ctx.executor);
+    auto last_log_flush = std::chrono::steady_clock::time_point{};
     while (true) {
-        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, false);
-        auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
-        ctx.stats.SampleNow(aggregate_stats);
-        constexpr auto kAsyncLogFlushInterval = std::chrono::seconds(5);
-        if constexpr (memory::kAllocatorCollects) {
-            constexpr uint32_t kForceCollectMinPrevConns = 4096;
-            constexpr uint32_t kForceCollectDropFactor = 4;
-            constexpr uint32_t kForceCollectConnFloor = 64;
-            constexpr auto kForceCollectCooldown = std::chrono::seconds(5);
-            constexpr uint64_t kChurnForceCollectConnections = 2048;
-            constexpr uint32_t kChurnForceCollectMinConns = 512;
-            constexpr auto kChurnForceCollectCooldown = std::chrono::seconds(60);
-            constexpr auto kSteadyCollectInterval = std::chrono::seconds(10);
-            constexpr auto kIdleCollectInterval = std::chrono::seconds(1);
-
-            uint32_t total_conns = 0;
-            for (const auto& worker_snapshot : worker_snapshots) {
-                total_conns += worker_snapshot.active_connections;
-            }
-
-            uint32_t force_threshold = last_sample_total_conns / kForceCollectDropFactor;
-            if (force_threshold < kForceCollectConnFloor) {
-                force_threshold = kForceCollectConnFloor;
-            }
-
-            const bool burst_drain =
-                last_sample_total_conns >= kForceCollectMinPrevConns &&
-                total_conns <= force_threshold;
-            const bool newly_idle = (total_conns == 0 && last_sample_total_conns > 0);
-            const auto now = steady_clock::now();
-            const bool cooldown_ok =
-                last_force_collect_at.time_since_epoch().count() == 0 ||
-                now - last_force_collect_at >= kForceCollectCooldown;
-            if (!churn_collect_baseline_set) {
-                last_force_collect_total_connections = aggregate_stats.connections_total;
-                churn_collect_baseline_set = true;
-            }
-            const uint64_t churn_since_force =
-                aggregate_stats.connections_total >= last_force_collect_total_connections
-                    ? aggregate_stats.connections_total - last_force_collect_total_connections
-                    : 0;
-            const bool churn_collect_due =
-                total_conns >= kChurnForceCollectMinConns &&
-                churn_since_force >= kChurnForceCollectConnections &&
-                (last_force_collect_at.time_since_epoch().count() == 0 ||
-                 now - last_force_collect_at >= kChurnForceCollectCooldown);
-            const auto steady_interval = total_conns == 0
-                ? kIdleCollectInterval : kSteadyCollectInterval;
-            const bool steady_collect_due =
-                last_steady_collect_at.time_since_epoch().count() == 0 ||
-                now - last_steady_collect_at >= steady_interval;
-
-            if (((burst_drain || newly_idle) && cooldown_ok) || churn_collect_due) {
-                const char* reason =
-                    churn_collect_due ? "churn" : (newly_idle ? "idle" : "burst-drain");
-                LOG_INFO("mem-collect force reason={} conn={} churn={}",
-                         reason, total_conns, churn_since_force);
-                try {
-                    co_await CollectWorkerHeaps(ctx, true);
-                } catch (const std::exception& error) {
-                    LOG_WARN("Worker heap collection skipped: {}", error.what());
-                }
-                last_force_collect_at = now;
-                last_steady_collect_at = now;
-                last_force_collect_total_connections = aggregate_stats.connections_total;
-            } else if (steady_collect_due) {
-                try {
-                    co_await CollectWorkerHeaps(ctx, false);
-                } catch (const std::exception& error) {
-                    LOG_WARN("Worker heap collection skipped: {}", error.what());
-                }
-                last_steady_collect_at = now;
-            }
-
-            last_sample_total_conns = total_conns;
-        }
-        {
-            const auto flush_now = steady_clock::now();
-            if (last_log_flush_at.time_since_epoch().count() == 0 ||
-                flush_now - last_log_flush_at >= kAsyncLogFlushInterval) {
-                Log::Flush();
-                last_log_flush_at = flush_now;
-            }
+        const auto snapshot = co_await ctx.runtime.CollectRuntimeStats(false);
+        ctx.stats_sampler.SampleNow(snapshot.stats);
+        const auto now = std::chrono::steady_clock::now();
+        if (last_log_flush.time_since_epoch().count() == 0 || now - last_log_flush >= std::chrono::seconds(5)) {
+            Log::Flush();
+            last_log_flush = now;
         }
         timer.expires_after(std::chrono::seconds(1));
-        auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-        if (ec) break;
+        auto [error] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+        if (error) co_return;
     }
 }
 
-net::awaitable<void> RuntimeStatsOutputLoop(
-    const MonitorContext& ctx) {
-    net::steady_timer timer(ctx.main_ctx);
+net::awaitable<void> RuntimeStatsOutputLoop(const MonitorContext& ctx) {
+    net::steady_timer timer(ctx.executor);
 #ifdef __GLIBC__
     auto last_glibc_sample = std::chrono::steady_clock::time_point{};
 #endif
     while (true) {
-        auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, true);
-        auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
-
-        const auto dns_stats = co_await ctx.dns_worker.GetCacheStats();
-        const uint64_t dns_total = dns_stats.hits + dns_stats.misses;
-        const double dns_hit_rate = dns_total > 0
-            ? 100.0 * static_cast<double>(dns_stats.hits) / static_cast<double>(dns_total)
-            : 0.0;
-
-        uint32_t total_conns = 0;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            total_conns += worker_snapshot.active_connections;
-        }
-
-        const double mem_mb = static_cast<double>(ReadResidentMemoryBytes()) / (1024.0 * 1024.0);
-
-        size_t total_udp_sockets = 0;
-        size_t pool_mapped_bytes = 0;
-        size_t pool_direct_bytes = 0;
-        size_t pool_idle_bytes = 0;
-        size_t pool_chunks = 0;
-        for (const auto& worker_snapshot : worker_snapshots) {
-            total_udp_sockets += worker_snapshot.memory.udp_sockets;
-            pool_mapped_bytes += worker_snapshot.memory.pool_mapped_bytes;
-            pool_direct_bytes += worker_snapshot.memory.pool_direct_bytes;
-            pool_idle_bytes += worker_snapshot.memory.pool_idle_bytes;
-            pool_chunks += worker_snapshot.memory.pool_chunks;
-        }
-        const auto user_stats = proxyman::inbound::UserStore::GetStats();
-        LOG_INFO(
-            "runtime conn={} mem={:.1f}MB pool_mapped={}MB pool_direct={}MB pool_idle={}KB pool_chunks={} pmr_wrong_thread={} traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sockets={} users={}",
-            total_conns,
-            mem_mb,
-            pool_mapped_bytes / (1024 * 1024),
-            pool_direct_bytes / (1024 * 1024),
-            pool_idle_bytes / 1024,
-            pool_chunks,
-            memory::CrossThreadFreeCount(),
-            acpp::FormatBytes(snapshot.bytes_in),
-            acpp::FormatBytes(snapshot.bytes_out),
-            FormatRate(snapshot.bytes_in_rate),
-            FormatRate(snapshot.bytes_out_rate),
-            dns_hit_rate,
-            dns_stats.entries,
-            dns_stats.capacity,
-            total_udp_sockets,
-            user_stats.TotalUsers());
-
+        const auto runtime = co_await ctx.runtime.CollectRuntimeStats(true);
+        const auto stats = ctx.stats_sampler.WithCurrentRate(runtime.stats);
+        const auto dns = co_await ctx.dns_service.GetCacheStats();
+        const auto dns_total = dns.hits + dns.misses;
+        const auto hit_rate = dns_total ? 100.0 * static_cast<double>(dns.hits) / dns_total : 0.0;
+        const auto users = proxyman::inbound::UserStore::GetStats();
+        LOG_INFO("runtime conn={} mem={:.1f}MB traffic_in={} traffic_out={} rate_down={} rate_up={} dns_hit={:.0f}% dns_cache={}/{} udp_sockets={} users={}",
+            runtime.active_connections, static_cast<double>(ReadResidentMemoryBytes()) / (1024 * 1024),
+            FormatBytes(stats.bytes_in), FormatBytes(stats.bytes_out),
+            FormatRate(stats.bytes_in_rate), FormatRate(stats.bytes_out_rate), hit_rate,
+            dns.entries, dns.capacity, runtime.memory.udp_sockets, users.TotalUsers());
         const auto descriptors = ReadProcessDescriptors();
-        LOG_INFO("runtime.process {}={} soft_limit={}",
-                 descriptors.kind,
-                 descriptors.open ? std::to_string(*descriptors.open) : "unknown",
-                 descriptors.soft_limit ? std::to_string(*descriptors.soft_limit)
-                     : descriptors.soft_limit_unlimited ? "unlimited" : "unknown");
-        for (const auto& worker : worker_snapshots) {
-            const auto& r = *worker.resources;
-            LOG_INFO(
-                "runtime.worker id={} conn={} udp_sockets={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_input_packets={} udp_input_bytes={} udp_reply_packets={} udp_reply_bytes={} udp_reply_senders={} udp_native_dispatches={} timeout_events={} timeout_heap={}/{} timeout_buckets={} timeout_ready={} timeout_waiters={} pool_mapped={} pool_direct={} pool_idle={} pool_chunks={}",
-                worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
+        LOG_INFO("runtime.process {}={} soft_limit={}", descriptors.kind,
+            descriptors.open ? std::to_string(*descriptors.open) : "unknown",
+            descriptors.soft_limit ? std::to_string(*descriptors.soft_limit)
+                : descriptors.soft_limit_unlimited ? "unlimited" : "unknown");
+        if (runtime.resources) {
+            const auto& r = *runtime.resources;
+            LOG_INFO("runtime.resources conn={} udp_sockets={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_retiring={} udp_input_packets={} udp_input_bytes={} udp_reply_packets={} udp_reply_bytes={} udp_reply_senders={} udp_native_dispatches={} timeout_events={} timeout_heap={}/{} timeout_buckets={} timeout_ready={} timeout_waiters={}",
+                runtime.active_connections, runtime.memory.udp_sockets,
                 r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
-                r.udp_associations, r.udp_closed_associations,
-                r.udp_input_datagrams, r.udp_input_bytes,
-                r.udp_reply_datagrams, r.udp_reply_bytes, r.udp_reply_senders,
-                r.udp_native_dispatches, r.timeout_events, r.timeout_heap_entries, r.timeout_heap_capacity,
-                r.timeout_event_buckets, r.timeout_ready_events, r.timeout_waiters,
-                worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
-                worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
+                r.udp_associations, r.udp_retiring_associations, r.udp_input_datagrams,
+                r.udp_input_bytes, r.udp_reply_datagrams, r.udp_reply_bytes,
+                r.udp_reply_senders, r.udp_native_dispatches, r.timeout_events,
+                r.timeout_heap_entries, r.timeout_heap_capacity, r.timeout_event_buckets,
+                r.timeout_ready_events, r.timeout_waiters);
         }
-
 #ifdef __GLIBC__
-        const auto heap_now = std::chrono::steady_clock::now();
-        if (last_glibc_sample.time_since_epoch().count() == 0 ||
-            heap_now - last_glibc_sample >= std::chrono::minutes(5)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_glibc_sample.time_since_epoch().count() == 0 || now - last_glibc_sample >= std::chrono::minutes(5)) {
             const auto heap = ::mallinfo2();
             LOG_INFO("runtime.glibc arena={}MB used={}MB free={}MB mmap={}MB mmap_chunks={} top_free={}MB",
-                     heap.arena / (1024 * 1024),
-                     heap.uordblks / (1024 * 1024),
-                     heap.fordblks / (1024 * 1024),
-                     heap.hblkhd / (1024 * 1024),
-                     heap.hblks,
-                     heap.keepcost / (1024 * 1024));
-            last_glibc_sample = heap_now;
+                heap.arena / (1024 * 1024), heap.uordblks / (1024 * 1024),
+                heap.fordblks / (1024 * 1024), heap.hblkhd / (1024 * 1024),
+                heap.hblks, heap.keepcost / (1024 * 1024));
+            last_glibc_sample = now;
         }
 #endif
-
 #ifdef CNODE_MEMORY_STATS
-        const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
+        const auto allocation_stats = memory::SnapshotRuntimeMemoryStats();
         LOG_DEBUG("runtime.memory async_stream={}/{} tcp_stream={}/{} tls_stream={}/{}",
-                  runtime_mem.async_streams_live,
-                  runtime_mem.async_streams_peak,
-                  runtime_mem.tcp_streams_live,
-                  runtime_mem.tcp_streams_peak,
-                  runtime_mem.tls_streams_live,
-                  runtime_mem.tls_streams_peak);
+            allocation_stats.async_streams_live, allocation_stats.async_streams_peak,
+            allocation_stats.tcp_streams_live, allocation_stats.tcp_streams_peak,
+            allocation_stats.tls_streams_live, allocation_stats.tls_streams_peak);
 #endif
-
-        auto node_stats = ctx.controller.GetNodeStats();
-        if (!node_stats.empty()) {
-            size_t node_users = 0;
-            size_t node_online = 0;
-            uint64_t node_up = 0;
-            uint64_t node_down = 0;
-            for (const auto& ns : node_stats) {
-                node_users += ns.total_users;
-                node_online += ns.online_users;
-                node_up += ns.bytes_up;
-                node_down += ns.bytes_down;
-                LOG_DEBUG(
-                    "runtime.node name={} port={} network={} users={} online={} upload={} download={}",
-                    naming::BuildPanelNodeStatsKey(ns.panel_name, ns.node_id),
-                    ns.port,
-                    ns.network,
-                    ns.total_users,
-                    ns.online_users,
-                    acpp::FormatBytes(ns.bytes_up),
-                    acpp::FormatBytes(ns.bytes_down));
-            }
-            LOG_INFO("runtime.nodes count={} users={} online={} upload={} download={}",
-                     node_stats.size(),
-                     node_users,
-                     node_online,
-                     acpp::FormatBytes(node_up),
-                     acpp::FormatBytes(node_down));
+        const auto nodes = co_await ctx.controller.GetNodeStats();
+        size_t total_users = 0;
+        size_t online_users = 0;
+        uint64_t upload = 0;
+        uint64_t download = 0;
+        for (const auto& node : nodes) {
+            total_users += node.total_users;
+            online_users += node.online_users;
+            upload += node.bytes_up;
+            download += node.bytes_down;
+            LOG_DEBUG("runtime.node name={} port={} network={} users={} online={} upload={} download={}",
+                naming::BuildPanelNodeStatsKey(node.panel_name, node.node_id), node.port,
+                node.network, node.total_users, node.online_users,
+                FormatBytes(node.bytes_up), FormatBytes(node.bytes_down));
         }
-
+        if (!nodes.empty()) LOG_INFO("runtime.nodes count={} users={} online={} upload={} download={}",
+            nodes.size(), total_users, online_users, FormatBytes(upload), FormatBytes(download));
         timer.expires_after(std::chrono::seconds(defaults::kStatsOutputInterval));
-        auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
-        if (ec) break;
+        auto [error] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
+        if (error) co_return;
     }
 }
 
 void ReportMonitorExit(std::string_view name, std::exception_ptr failure) {
-    if (!failure) {
-        LOG_WARN("runtime monitor loop={} stopped", name);
-        return;
-    }
-    try {
-        std::rethrow_exception(failure);
-    } catch (const std::exception& error) {
-        LOG_ERROR("runtime monitor loop={} failed: {}", name, error.what());
-    } catch (...) {
-        LOG_ERROR("runtime monitor loop={} failed with unknown exception", name);
-    }
+    if (!failure) { LOG_DEBUG("runtime monitor loop={} stopped", name); return; }
+    try { std::rethrow_exception(failure); }
+    catch (const IoSystemError& error) {
+        if (error.code() == io_error::operation_aborted) LOG_DEBUG("runtime monitor loop={} stopped", name);
+        else LOG_ERROR("runtime monitor loop={} failed: {}", name, error.what());
+    } catch (const std::exception& error) { LOG_ERROR("runtime monitor loop={} failed: {}", name, error.what()); }
+    catch (...) { LOG_ERROR("runtime monitor loop={} failed with unknown exception", name); }
 }
-
-}  // namespace
+}
 
 struct RuntimeMonitor::Impl {
-    explicit Impl(const RuntimeContext& runtime_context) {
-        const MonitorContext ctx{
-            runtime_context.main_ctx, runtime_context.stats,
-            runtime_context.workers, runtime_context.controller,
-            runtime_context.dns_worker};
-        loops = {
-            std::make_shared<monitor_detail::MonitorLoop>(
-                ctx.main_ctx.get_executor(), "sampling",
-                [ctx] { return RuntimeSamplingLoop(ctx); }, ReportMonitorExit),
-            std::make_shared<monitor_detail::MonitorLoop>(
-                ctx.main_ctx.get_executor(), "stats-output",
-                [ctx] { return RuntimeStatsOutputLoop(ctx); }, ReportMonitorExit),
-        };
+    explicit Impl(const RuntimeContext& runtime)
+        : context{runtime.monitor_executor, runtime.stats_sampler, runtime.runtime,
+                  runtime.controller, runtime.dns_service},
+          channel(context.executor, 4) {}
+    net::awaitable<void> Run() {
+        if (stopping) co_return;
+        if (running) throw std::logic_error("runtime monitor is already running");
+        running = true;
+        struct Reset { Impl& owner; ~Reset() { owner.tasks = nullptr; owner.running = false; } } reset{*this};
+        co_await RunAwaitableTaskGroup(context.executor, [this](AwaitableTaskGroup& group) {
+            tasks = &group;
+            group.Spawn(RunLoop(true));
+            group.Spawn(RunLoop(false));
+        });
     }
-
-    std::array<std::shared_ptr<monitor_detail::MonitorLoop>, 2> loops;
+    net::awaitable<void> RunLoop(bool sampling) {
+        std::exception_ptr failure;
+        try {
+            if (sampling) co_await RuntimeSamplingLoop(context);
+            else co_await RuntimeStatsOutputLoop(context);
+        } catch (...) { failure = std::current_exception(); }
+        ReportMonitorExit(sampling ? "sampling" : "stats-output", failure);
+    }
+    void Stop() { stopping = true; if (tasks) tasks->Cancel(); }
+    MonitorContext context;
+    ServiceChannel channel;
+    AwaitableTaskGroup* tasks = nullptr;
+    bool running = false;
+    bool stopping = false;
 };
 
-RuntimeMonitor::RuntimeMonitor(const RuntimeContext& ctx)
-    : impl_(std::make_unique<Impl>(ctx)) {}
-
-RuntimeMonitor::~RuntimeMonitor() = default;
-
-void RuntimeMonitor::Start() {
-    for (const auto& loop : impl_->loops) loop->Start();
+RuntimeMonitor::RuntimeMonitor(const RuntimeContext& context)
+    : impl_(std::make_shared<Impl>(context)), stop_ticket_(impl_->channel.TryReserve()) {
+    if (!stop_ticket_) throw ServiceChannelFull();
 }
-
+RuntimeMonitor::~RuntimeMonitor() = default;
+net::awaitable<void> RuntimeMonitor::Run() {
+    auto owner = impl_;
+    co_await owner->channel.Post(owner->Run());
+}
+bool RuntimeMonitor::RequestStop() {
+    return impl_->channel.SendReserved(std::move(stop_ticket_), [owner = impl_] { owner->Stop(); });
+}
 }  // namespace acpp

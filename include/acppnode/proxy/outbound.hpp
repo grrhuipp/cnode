@@ -7,7 +7,7 @@
 #include "acppnode/transport/link.hpp"
 
 #include <chrono>
-#include <expected>
+#include <tl/expected.hpp>
 #include <string>
 #include <string_view>
 
@@ -24,12 +24,12 @@ namespace session {
 struct Context;
 }
 
-using OutboundProcessResult = std::expected<RelayResult, ErrorCode>;
+using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
 
 // ============================================================================
 // Outbound - 出站接口
 // ============================================================================
-class Outbound : public memory::ThreadAllocated {
+class Outbound : public memory::DataAllocated {
 public:
     virtual ~Outbound() noexcept = default;
 
@@ -40,7 +40,7 @@ public:
     // transport target resolution, dialing, protocol setup, and relay.
     // first_payload transfers ownership; all application bytes enter relay.
     virtual net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
+        net::any_io_executor executor,
         const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
@@ -49,7 +49,9 @@ public:
         const RelayConfig& relay_config,
         buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) = 0;
+        std::chrono::seconds relay_write_timeout) const = 0;
+
+    virtual net::awaitable<void> Stop() const { co_return; }
 };
 
 }  // namespace acpp

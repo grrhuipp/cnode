@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cnode",
+  "version-string": "1.0.0",
+  "builtin-baseline": "a0b1c8d3a477c1cb4813d8e127a56961707ca42b",
+  "dependencies": [
+    "asio",
+    "blake3",
+    "aws-lc",
+    "concurrentqueue",
+    "tl-expected",
+    "zlib"
+  ]
+}

@@ -30,12 +30,12 @@ class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
 // │ 1. 所有操作（ShutdownRead/ShutdownWrite/Cancel/Close）必须幂等         │
 // │ 2. Close() 后所有 Async 操作应立即返回错误                               │
 // │ 3. Cancel() 仅取消挂起操作，不改变连接状态                               │
-// │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
+// │ 4. 半关闭写端不得启动与正在进行的读操作冲突的组合操作                   │
 // └─────────────────────────────────────────────────────────────────────────┘
 // ============================================================================
 class AsyncStream : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
-    // 流对象在所属 Worker 线程创建和销毁，分配走该线程的 PMR 池。
+    // 流对象归所属会话 strand；操作存储支持跨线程分配与释放。
     [[nodiscard]] static void* operator new(std::size_t size);
     [[nodiscard]] static void* operator new(std::size_t size, std::align_val_t alignment);
     static void operator delete(void* ptr) noexcept;

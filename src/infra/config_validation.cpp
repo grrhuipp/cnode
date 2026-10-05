@@ -10,8 +10,8 @@
 namespace acpp {
 
 bool Config::Validate() const {
-    if (workers_ == 0 || workers_ > defaults::kMaxWorkers) {
-        LOG_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
+    if (io_threads_ == 0 || io_threads_ > defaults::kMaxIoThreads) {
+        LOG_ERROR("ioThreads must be between 1 and {}", defaults::kMaxIoThreads);
         return false;
     }
 
@@ -92,7 +92,7 @@ std::vector<std::string> Config::GetUsedGeoIPTags() const {
     std::vector<std::string> tags;
     for (const auto& rule : routing_.rules) {
         for (const auto& tag : rule.geoip) {
-            if (!std::ranges::contains(tags, tag)) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
                 tags.push_back(tag);
             }
         }
@@ -104,7 +104,7 @@ std::vector<std::string> Config::GetUsedGeoSiteTags() const {
     std::vector<std::string> tags;
     for (const auto& rule : routing_.rules) {
         for (const auto& tag : rule.geosite) {
-            if (!std::ranges::contains(tags, tag)) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
                 tags.push_back(tag);
             }
         }

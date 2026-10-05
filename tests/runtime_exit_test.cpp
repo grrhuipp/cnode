@@ -40,7 +40,7 @@ bool WriteConfig(const fs::path& root,
 
     std::ofstream main_config(root / "config.json", std::ios::binary);
     main_config
-        << R"({"log":{"enable":false,"logDir":")" << (root / "logs").generic_string() << R"("},"workers":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5},"panels":[{"Name":"shutdown-panel","Type":"V2board","APIHost":"http://127.0.0.1:)"
+        << R"({"log":{"enable":false,"logDir":")" << (root / "logs").generic_string() << R"("},"ioThreads":2,"dns":{"servers":["127.0.0.1","::1"],"timeout":5,"cacheSize":1000,"minTTL":30,"maxTTL":3600},"limits":{"maxConnections":0,"maxConnectionsPerIP":100},"timeouts":{"handshake":60,"dial":10,"read":15,"write":30,"idle":300,"uplinkOnly":5,"downlinkOnly":5},"panels":[{"Name":"shutdown-panel","Type":"V2board","APIHost":"http://127.0.0.1:)"
         << panel_port
         << R"(","Key":"shutdown-key","NodeIDs":[1],"NodeType":"vmess","ListenIP":"auto","SendIP":"auto"}]})"
         << '\n';
@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
         available.close();
         {
             std::ofstream config(root / "config.json", std::ios::binary);
-            config << R"({"workers":2,"log":{"enable":false,"logDir":")"
+            config << R"({"ioThreads":2,"log":{"enable":false,"logDir":")"
                    << (root / "logs").generic_string() << R"("}})";
             if (!config) return 15;
             if (!test_implicit) {
@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
                     const auto port = fixture.NodePort();
                     bool owner_ready = false;
                     if (panel_static_collision) {
-                        owner_ready = WaitForOutput(output_path, "server started workers=2", 1, 12s) &&
+                        owner_ready = WaitForOutput(output_path, "server started threads=2", 1, 12s) &&
                             NodeListening(port);
                     } else if (panel_collision_race) {
                         const int winner = WaitForReadyNode(output_path);
@@ -509,9 +509,8 @@ int main(int argc, char** argv) {
         std::ifstream output_file(output_path, std::ios::binary);
         const std::string output{std::istreambuf_iterator<char>(output_file), {}};
         if (exit_code != 1 ||
-            output.find("runtime failed phase=inbound-startup") == std::string::npos ||
+            output.find("Failed to initialize runtime: static inbound startup failed") == std::string::npos ||
             output.find("tag=shutdown-test-1 port=" + std::to_string(port) + " stage=tcp-listen") == std::string::npos ||
-            output.find("status=forced") == std::string::npos ||
             output.find("server started") != std::string::npos ||
             output.find("cnode stopped") != std::string::npos) {
             std::cerr << "unexpected startup failure exit or diagnostic: " << exit_code << '\n' << output;
@@ -575,12 +574,12 @@ int main(int argc, char** argv) {
         std::cerr << "child never reached hanging panel endpoint\n" << output;
         return 8;
     }
-    if (output.find("status=forced") == std::string::npos) {
-        std::cerr << "missing forced shutdown diagnostic\n" << output;
+    if (output.find("status=stopping") == std::string::npos) {
+        std::cerr << "missing graceful shutdown diagnostic\n" << output;
         return 7;
     }
-    if (output.find("cnode stopped") != std::string::npos) {
-        std::cerr << "forced shutdown entered the runtime teardown path\n" << output;
+    if (output.find("cnode stopped") == std::string::npos) {
+        std::cerr << "runtime did not complete graceful teardown\n" << output;
         return 9;
     }
 

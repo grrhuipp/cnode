@@ -198,7 +198,7 @@ Handler::Handler(
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& /*timeouts*/,
@@ -207,16 +207,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const RelayConfig& relay_config,
     buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    std::chrono::seconds relay_write_timeout) const {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == Network::UDP) {
         if (!settings_.enable_udp) {
-            co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
+            co_return tl::unexpected(ErrorCode::NOT_SUPPORTED);
         }
         auto bind_address = SelectUdpBindAddress(settings_, ctx);
         if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
@@ -226,24 +226,24 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
         std::optional<UdpRequest> target;
         try {
-            target.emplace(io_context, dns_service_, bind_address);
+            target.emplace(executor, dns_service_, bind_address);
         } catch (const transport::LinkError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
                            ctx.outbound.target, bind_address.to_string(), e.what());
-            co_return std::unexpected(e.code());
+            co_return tl::unexpected(e.code());
         } catch (const IoSystemError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
                            ctx.outbound.target, bind_address.to_string(), e.what());
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         }
         target->SetIdleTimeout(relay_idle_timeout);
         target->SetWriteTimeout(relay_write_timeout);
         if (inbound.control) {
-            co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
+            co_return co_await DoRelayLink(executor, *inbound.reader, *inbound.writer,
                 *inbound.control, *target, ctx, stats, relay_config,
                 std::move(first_payload));
         }
-        co_return co_await DoRelayLink(io_context, *inbound.reader, *inbound.writer,
+        co_return co_await DoRelayLink(executor, *inbound.reader, *inbound.writer,
             *target, ctx, stats, relay_config, std::move(first_payload));
     }
 
@@ -257,7 +257,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     const auto& target = ctx.outbound.target;
     if (!target.IsValid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target);
@@ -295,7 +295,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     } else {
         auto remote_addrs = co_await ResolveTargets(ctx);
         if (!remote_addrs || remote_addrs->empty()) {
-            co_return std::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
+            co_return tl::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
         }
 
         transport_target.candidates.reserve(remote_addrs->size());
@@ -306,7 +306,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             });
         }
         if (transport_target.candidates.empty()) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);
         }
         if (transport_target.candidates.size() == 1) {
             transport_target.single_candidate = std::move(transport_target.candidates.front());
@@ -335,7 +335,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     ctx.outbound.connected_target_addr.reset();
     ctx.outbound.dial_target_addr.reset();
     ctx.outbound.connected_local_addr.reset();
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
+    auto dial_result = co_await DialOutboundTransport(executor, ctx, transport_target);
     if (dial_result.attempted_remote_addr &&
         !dial_result.attempted_remote_addr->is_unspecified()) {
         ctx.outbound.dial_target_addr =
@@ -347,7 +347,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} via {} > {}",
                        ctx.inbound.source_ip, ctx.outbound.target,
                        ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -378,16 +378,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
 
     if (inbound_control) {
         co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *inbound_control,
+            executor, *inbound.reader, *inbound.writer, *inbound_control,
             *stream, ctx, stats, relay_config, std::move(first_payload));
     }
     co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
+        executor, *inbound.reader, *inbound.writer,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
-net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
-Handler::ResolveTargets(session::Context& ctx) {
+net::awaitable<tl::expected<std::vector<net::ip::address>, ErrorCode>>
+Handler::ResolveTargets(session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
     // 如果目标已经有解析结果，直接复用 dispatcher/router 阶段的 DNS 结果。
@@ -401,7 +401,7 @@ Handler::ResolveTargets(session::Context& ctx) {
         co_return addresses;
     }
     if (!target.IsDomain()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     // 需要 DNS 解析
@@ -414,7 +414,7 @@ Handler::ResolveTargets(session::Context& ctx) {
 
     if (!dns_result.Ok()) {
         ctx.content.dns_result = session::DnsResultState::Failed;
-        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
     std::vector<net::ip::address> addresses;
@@ -453,7 +453,7 @@ Handler::ResolveTargets(session::Context& ctx) {
 
     if (addresses.empty()) {
         ctx.content.dns_result = session::DnsResultState::Failed;
-        co_return std::unexpected(ErrorCode::DNS_NO_RECORD);
+        co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
     }
 
     ctx.content.dns_result = dns_result.from_cache
@@ -464,7 +464,7 @@ Handler::ResolveTargets(session::Context& ctx) {
 
 std::optional<net::ip::address> Handler::DetermineLocalAddress(
     const tcp::endpoint* inbound_local_addr,
-    const net::ip::address& remote_addr) {
+    const net::ip::address& remote_addr) const {
 
     if (settings_.send_through.GetMode() == OutboundBind::Mode::Auto) {
         // auto 模式：源进源出
@@ -531,7 +531,7 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [settings = std::move(settings)](
                 std::string_view tag,
-                acpp::net::io_context& /*io_context*/,
+                acpp::net::any_io_executor /*executor*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::freedom::outbound::Handler>(

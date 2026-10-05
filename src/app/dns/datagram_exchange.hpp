@@ -28,13 +28,14 @@ public:
         IoErrorCode error;
     };
 
-    DatagramExchange(net::io_context& io, udp::endpoint endpoint)
-        : socket_(io), endpoint_(endpoint), scheduler_(TimeoutScheduler::ForIoContext(io)) {}
+    DatagramExchange(net::any_io_executor executor, udp::endpoint endpoint)
+        : socket_(executor), endpoint_(endpoint), scheduler_(TimeoutScheduler::ForExecutor(executor)), receive_done_(executor, 1) {}
 
     net::awaitable<Reply> Exchange(std::span<uint8_t> query, std::chrono::seconds timeout) {
         // The caller owns query until completion, including cancellation unwind.
         auto owner = shared_from_this();
         Reply failure;
+        if (closed_) { failure.error = io_error::operation_aborted; co_return failure; }
         if (issued_ == 65536 && !pending_.empty()) {
             failure.error = io_error::no_buffer_space;
             co_return failure;
@@ -46,7 +47,7 @@ public:
             udp::socket replacement(socket_.get_executor());
             replacement.open(endpoint_.protocol(), failure.error);
             if (!failure.error) replacement.connect(endpoint_, failure.error);
-            // Sending a tiny datagram must never block the main/control loop.
+            // Sending a tiny datagram must never block the DNS service strand.
             if (!failure.error) replacement.non_blocking(true, failure.error);
             if (failure.error) co_return failure;
             socket_ = std::move(replacement);
@@ -68,7 +69,7 @@ public:
         query[1] = static_cast<uint8_t>(id);
         Pending request(*this, id, query);
         pending_.emplace(id, &request);
-        request.timeout = scheduler_.ScheduleAfter(timeout, [&request] {
+        request.timeout = scheduler_.ScheduleAfter(timeout, socket_.get_executor(), [&request] {
             request.owner.Complete(request.id, io_error::timed_out);
         });
         socket_.send(net::buffer(query.data(), query.size()), 0, failure.error);
@@ -77,6 +78,17 @@ public:
         (void)co_await request.completion.async_receive(net::as_tuple(net::use_awaitable));
         if (!request.reply.size && !request.reply.error) request.reply.error = io_error::operation_aborted;
         co_return std::move(request.reply);
+    }
+
+    net::awaitable<void> Close() {
+        if (!closed_) {
+            closed_ = true;
+            FailAll(io_error::operation_aborted);
+            IoErrorCode ignored;
+            socket_.cancel(ignored);
+            socket_.close(ignored);
+        }
+        if (reading_) (void)co_await receive_done_.async_receive(net::as_tuple(net::use_awaitable));
     }
 
 private:
@@ -152,12 +164,13 @@ private:
     }
 
     void Receive() {
-        if (reading_ || pending_.empty()) return;
+        if (closed_ || reading_ || pending_.empty()) return;
         reading_ = true;
         try {
             socket_.async_receive(net::buffer(buffer_),
                 [self = shared_from_this(), generation = generation_](IoErrorCode ec, size_t size) {
                     self->reading_ = false;
+                    if (self->closed_) { self->receive_done_.close(); return; }
                     if (generation != self->generation_) {
                         self->Receive();
                         return;
@@ -185,12 +198,14 @@ private:
     udp::socket socket_;
     udp::endpoint endpoint_;
     TimeoutScheduler& scheduler_;
+    net::experimental::channel<void(IoErrorCode)> receive_done_;
     std::unordered_map<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
     size_t issued_ = 0;
     uint64_t generation_ = 0;
     bool reading_ = false;
+    bool closed_ = false;
 };
 
 } // namespace acpp::app::dns

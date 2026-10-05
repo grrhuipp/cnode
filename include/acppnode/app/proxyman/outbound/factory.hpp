@@ -14,7 +14,7 @@ namespace acpp::proxyman::outbound {
 // callers must not continue with a partially installed outbound table.
 [[nodiscard]] std::unique_ptr<::acpp::Outbound> NewHandler(
     const PreparedOutboundConfig& config,
-    ::acpp::net::io_context& io_context,
+    ::acpp::net::any_io_executor executor,
     ::acpp::app::dns::DNS& dns,
     std::chrono::seconds dial_timeout);
 

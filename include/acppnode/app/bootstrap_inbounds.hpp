@@ -1,23 +1,14 @@
 #pragma once
-
 #include "acppnode/app/static_inbound_prepared_config.hpp"
-
-#include <future>
-#include <memory>
+#include "acppnode/common/asio_types.hpp"
 #include <vector>
 
 namespace acpp {
-
 class ConnectionLimiter;
-class Worker;
+class Runtime;
 struct InboundStartup {
     std::vector<StaticInboundRuntimeEntry> entries;
-    std::vector<std::future<void>> worker_results;
+    ConnectionLimiter* limiter = nullptr;
 };
-
-[[nodiscard]] InboundStartup QueueInboundStartup(
-    const std::vector<StaticInboundRuntimeEntry>& runtime_inbounds,
-    const std::vector<std::unique_ptr<Worker>>& workers,
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters);
-
+net::awaitable<void> SetupRuntimeInbounds(Runtime&, InboundStartup);
 }  // namespace acpp

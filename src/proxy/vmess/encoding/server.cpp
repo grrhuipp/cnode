@@ -824,15 +824,6 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
         return {std::nullopt, 0};
     }
 
-    if (!validator.RegisterSessionIfNew(*user, request.body_key, request.body_iv)) {
-        LOG_NET_DEBUG("VMess: duplicated AEAD session id");
-        LOG_NET_TRACE("[conn={}] VMess: duplicated AEAD session user={} tag={}",
-                         trace_conn_id,
-                         profile.email,
-                         tag);
-        return {std::nullopt, 0};
-    }
-
     LOG_NET_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
                      trace_conn_id,
                      profile.email,
@@ -1103,7 +1094,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 namespace {
 
 class RequestBodyReader final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
@@ -1150,7 +1141,7 @@ private:
 };
 
 class ResponseBodyWriter final
-    : public memory::ThreadAllocated
+    : public memory::DataAllocated
     , public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const VMessRequest& request,

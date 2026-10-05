@@ -28,6 +28,21 @@
 
 namespace acpp {
 
+namespace detail {
+
+[[nodiscard]] constexpr uint16_t ByteSwap(uint16_t value) noexcept {
+    return static_cast<uint16_t>((value << 8) | (value >> 8));
+}
+
+[[nodiscard]] constexpr uint32_t ByteSwap(uint32_t value) noexcept {
+    return ((value & 0x000000ffU) << 24) |
+           ((value & 0x0000ff00U) << 8) |
+           ((value & 0x00ff0000U) >> 8) |
+           ((value & 0xff000000U) >> 24);
+}
+
+}  // namespace detail
+
 // ============================================================================
 // ByteReader - 安全的字节读取器
 // ============================================================================
@@ -92,7 +107,7 @@ public:
         std::memcpy(&result, data_ + pos_, 2);
         pos_ += 2;
         if constexpr (std::endian::native == std::endian::little)
-            result = std::byteswap(result);
+            result = detail::ByteSwap(result);
         return result;
     }
 
@@ -105,7 +120,7 @@ public:
         std::memcpy(&result, data_ + pos_, 4);
         pos_ += 4;
         if constexpr (std::endian::native == std::endian::little)
-            result = std::byteswap(result);
+            result = detail::ByteSwap(result);
         return result;
     }
 
@@ -130,7 +145,7 @@ public:
      * 读取固定长度字符串视图。
      *
      * 返回值只在 ByteReader 底层输入缓冲区存活期间有效；协议解析热路径用它
-     * 避免先分配 std::string，再拷贝到 TargetAddress 的 worker heap 字符串。
+     * 避免先分配 std::string，再拷贝到 TargetAddress 的拥有型字符串。
      */
     [[nodiscard]] std::string_view ReadStringView(size_t len) noexcept {
         auto span = ReadBytes(len);
@@ -161,7 +176,7 @@ private:
      * 检查是否可以读取指定字节数
      */
     [[nodiscard]] bool CanRead(size_t count) noexcept {
-        if (error_ || pos_ + count > size_) {
+        if (error_ || count > size_ - pos_) {
             error_ = true;
             return false;
         }
@@ -208,7 +223,7 @@ public:
     bool WriteU16BE(uint16_t value) noexcept {
         if (!CanWrite(2)) return false;
         if constexpr (std::endian::native == std::endian::little)
-            value = std::byteswap(value);
+            value = detail::ByteSwap(value);
         std::memcpy(data_ + pos_, &value, 2);
         pos_ += 2;
         return true;
@@ -217,7 +232,7 @@ public:
     bool WriteU32BE(uint32_t value) noexcept {
         if (!CanWrite(4)) return false;
         if constexpr (std::endian::native == std::endian::little)
-            value = std::byteswap(value);
+            value = detail::ByteSwap(value);
         std::memcpy(data_ + pos_, &value, 4);
         pos_ += 4;
         return true;
@@ -244,7 +259,7 @@ public:
 
 private:
     [[nodiscard]] bool CanWrite(size_t count) noexcept {
-        if (error_ || pos_ + count > capacity_) {
+        if (error_ || count > capacity_ - pos_) {
             error_ = true;
             return false;
         }

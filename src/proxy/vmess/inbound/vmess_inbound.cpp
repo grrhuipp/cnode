@@ -15,7 +15,7 @@
 #include "acppnode/common/session.hpp"
 
 #include <algorithm>
-#include <expected>
+#include <tl/expected.hpp>
 #include <span>
 #include <utility>
 
@@ -23,38 +23,6 @@ namespace acpp {
 
 namespace {
 
-class VMessOnlineSession {
-public:
-    VMessOnlineSession(::acpp::vmess::TimedUserValidator& manager,
-                       std::string_view tag,
-                       uint64_t user_id,
-                       std::string_view client_ip)
-        : manager_(&manager)
-        , tag_(tag)
-        , user_id_(user_id)
-        , client_ip_(client_ip) {}
-
-    ~VMessOnlineSession() noexcept {
-        if (!manager_ || user_id_ == 0) {
-            return;
-        }
-        try {
-            manager_->OnUserDisconnected(tag_, user_id_, client_ip_);
-        } catch (...) {
-        }
-    }
-
-    VMessOnlineSession(const VMessOnlineSession&) = delete;
-    VMessOnlineSession& operator=(const VMessOnlineSession&) = delete;
-    VMessOnlineSession(VMessOnlineSession&&) = delete;
-    VMessOnlineSession& operator=(VMessOnlineSession&&) = delete;
-
-private:
-    ::acpp::vmess::TimedUserValidator* manager_;
-    memory::ThreadLocalString tag_;
-    uint64_t user_id_;
-    memory::ThreadLocalString client_ip_;
-};
 
 [[nodiscard]] std::string FormatHexPrefix(const uint8_t* data, size_t len, size_t max_bytes = 24) {
     if (!data || len == 0) {
@@ -86,27 +54,29 @@ private:
 
 proxy::vmess::inbound::Handler::Handler(
     ::acpp::vmess::TimedUserValidator& validator,
-    StatsShard& stats,
+    UserOnlineTracker& online,
     ConnectionLimiterPtr limiter)
-    : validator_(validator)
-    , stats_(&stats)
+    : Inbound(online)
+    , validator_(validator)
     , limiter_(std::move(limiter))
 {}
 
 net::awaitable<RelayResult>
-proxy::vmess::inbound::Handler::Process(
+proxy::vmess::inbound::Handler::ProcessSession(
     std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
+    StatsShard& stats,
+    UserOnlineLease& online,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        stats.OnError();
         RelayResult result;
         result.error = error;
         return result;
@@ -115,13 +85,13 @@ proxy::vmess::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[VMess][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        (co_await limiter_->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
     }
-    std::optional<VMessOnlineSession> user_session;
+
 
     buf::BufferGuard handshake_guard{buf::Buffer::New()};
     if (!handshake_guard) {
@@ -173,8 +143,13 @@ proxy::vmess::inbound::Handler::Process(
                        FormatHexPrefix(handshake_buf, total_read));
         LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
+            co_await limiter_->OnAuthFailTracked(std::string(tag), std::string(client_ip));
         }
+        co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+
+    if (!request->user || !(co_await validator_.RegisterSessionIfNew(
+            request->user->uuid_bytes, request->body_key, request->body_iv))) {
         co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
@@ -206,18 +181,13 @@ proxy::vmess::inbound::Handler::Process(
 
         // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
         uint64_t uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        if (!(co_await online.Acquire(std::string(tag), uid, std::string(ctx.inbound.source_ip), profile.device_limit))) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, uid));
+                profile.device_limit);
             co_return fail(ErrorCode::PERMISSION_DENIED);
         }
-
-        validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
-        user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
     }
 
     LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
@@ -251,25 +221,25 @@ proxy::vmess::inbound::Handler::Process(
 
     if (net == Network::MUX) {
         co_return co_await mux::ProcessInbound(
-            io_context,
+            executor,
             transport::Link{request_reader.get(), response_writer.get()},
             *stream,
             dispatcher,
             receiver.dispatch_policy,
             ctx,
-            *stats_,
+            stats,
             timeouts,
             pressure_idle_timeout);
     }
 
     co_return co_await dispatcher.Dispatch(
-        io_context,
+        executor,
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{request_reader.get(), response_writer.get()},
         InitialPayload{},
         ctx,
-        *stats_,
+        stats,
         timeouts);
 }
 
@@ -281,11 +251,7 @@ proxy::vmess::inbound::Handler::Process(
 namespace {
 class VmessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
+    explicit VmessRuntime(acpp::net::any_io_executor executor) : validator(std::move(executor)) {}
     acpp::vmess::TimedUserValidator validator;
 };
 
@@ -293,14 +259,14 @@ const bool kVmessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vmess;
 
-    reg.create_runtime = []() -> std::unique_ptr<
+    reg.create_runtime = [](acpp::net::any_io_executor executor) -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<VmessRuntime>();
+        return std::make_unique<VmessRuntime>(std::move(executor));
     };
 
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
+           acpp::UserOnlineTracker& online,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
             auto* vmess_runtime = dynamic_cast<VmessRuntime*>(&runtime);
@@ -309,7 +275,7 @@ const bool kVmessInboundRegistered = [] {
             }
             return std::make_unique<acpp::proxy::vmess::inbound::Handler>(
                 vmess_runtime->validator,
-                stats,
+                online,
                 limiter);
         };
 

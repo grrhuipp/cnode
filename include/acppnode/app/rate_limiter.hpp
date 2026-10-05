@@ -1,10 +1,13 @@
 #pragma once
 #include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/runtime/channel.hpp"
+#include <string>
+#include <optional>
 // ============================================================================
-// Worker 私有连接限制器 (Per-Worker Rate Limiter)
+// 串行连接准入状态与有界跨会话入口
 //
 // 设计特点：
-// 1. Worker 私有 - 只在所属 io_context 上访问，无锁/无 atomic
+// 1. 状态由服务 strand 独占，调用者经有界入口进入
 // 2. 固定内存 - 无动态分配，启动时分配固定大小
 // 3. O(1) 操作 - 开放寻址哈希表，最坏 O(探测长度)
 // 4. Cache 友好 - 每个槽位 64 字节对齐
@@ -128,7 +131,7 @@ static_assert(sizeof(Slot) == 64, "Slot must be 64 bytes");
 // ============================================================================
 // 统一限制器
 // ============================================================================
-template<size_t N = 16384>  // Worker 私有槽位数量，必须是 2 的幂
+template<size_t N = 16384>  // 服务槽位数量，必须是 2 的幂
 class RateLimiter {
     static_assert((N & (N - 1)) == 0, "N must be power of 2");
     static constexpr size_t kMask = N - 1;
@@ -352,39 +355,70 @@ public:
         return s[static_cast<int>(r)];
     }
 
-    ConnectionLimiter() = default;
-    explicit ConnectionLimiter(const RateLimitConfig& c)
-        : lim_(c) {}
+    explicit ConnectionLimiter(net::any_io_executor executor, const RateLimitConfig& config = {})
+        : lim_(config), channel_(std::move(executor), 4096) {}
 
-    RejectReason TryAcceptGlobal() {
-        return lim_.CheckGlobal() == Reject::None ?
-               RejectReason::NONE : RejectReason::MAX_CONNECTIONS;
+    struct Permit {
+        ServiceChannel::Reservation reservation;
+        std::string ip;
+        bool ip_accepted = false;
+    };
+    struct Admission {
+        RejectReason reason = RejectReason::NONE;
+        std::optional<Permit> permit;
+    };
+
+    net::awaitable<Admission> AcquireGlobal() {
+        auto reservation = channel_.TryReserve();
+        if (!reservation) throw ServiceChannelFull();
+        const auto reason = co_await channel_.CallReserved(reservation, [this] {
+            return lim_.CheckGlobal() == Reject::None ?
+                RejectReason::NONE : RejectReason::MAX_CONNECTIONS;
+        });
+        if (reason != RejectReason::NONE) co_return Admission{.reason = reason, .permit = {}};
+        co_return Admission{.reason = reason,
+            .permit = Permit{.reservation = std::move(reservation), .ip = {}, .ip_accepted = false}};
     }
 
-    RejectReason TryAcceptIP(
-        std::string_view tag,
-        std::string_view ip,
-        bool check_auth_ban = true) {
-        auto r = lim_.CheckIP(tag, ip, check_auth_ban);
-        switch (r) {
-            case Reject::IPConnLimit: return RejectReason::MAX_CONNECTIONS_PER_IP;
-            case Reject::IPBanned:
-            case Reject::IPRateLimit: return RejectReason::IP_BANNED;
-            default: return RejectReason::NONE;
+    net::awaitable<RejectReason> AcquireIP(Permit& permit, std::string tag,
+                                          std::string ip, bool check_auth_ban = true) {
+        const auto reason = co_await channel_.CallReserved(permit.reservation,
+            [this, tag = std::move(tag), ip, check_auth_ban] {
+                switch (lim_.CheckIP(tag, ip, check_auth_ban)) {
+                    case Reject::IPConnLimit: return RejectReason::MAX_CONNECTIONS_PER_IP;
+                    case Reject::IPBanned:
+                    case Reject::IPRateLimit: return RejectReason::IP_BANNED;
+                    default: return RejectReason::NONE;
+                }
+            });
+        if (reason == RejectReason::NONE) {
+            permit.ip = std::move(ip);
+            permit.ip_accepted = true;
         }
+        co_return reason;
     }
 
-    void ReleaseGlobal() { lim_.UndoGlobal(); }
-    void Release(std::string_view ip) { lim_.Release(ip); }
-
-    void OnAuthFailTracked(std::string_view tag, std::string_view ip) {
-        lim_.OnAuthFailTracked(tag, ip);
+    net::awaitable<void> Release(Permit permit) {
+        co_await channel_.CallReserved(permit.reservation,
+            [this, ip = std::move(permit.ip), ip_accepted = permit.ip_accepted] {
+                if (ip_accepted) lim_.Release(ip);
+                else lim_.UndoGlobal();
+            });
     }
-
-    DefaultRateLimiter& GetLimiter() { return lim_; }
+    net::awaitable<void> OnAuthFailTracked(std::string tag, std::string ip) {
+        return channel_.Call([this, tag = std::move(tag), ip = std::move(ip)] {
+            lim_.OnAuthFailTracked(tag, ip);
+        });
+    }
+    net::awaitable<bool> IsBanned(std::string tag, std::string ip) {
+        return channel_.Call([this, tag = std::move(tag), ip = std::move(ip)] {
+            return lim_.IsBanned(tag, ip);
+        });
+    }
 
 private:
     DefaultRateLimiter lim_;
+    ServiceChannel channel_;
 };
 
 }  // namespace acpp

@@ -4,7 +4,7 @@
 
 namespace acpp {
 
-std::expected<std::optional<bool>, std::string>
+tl::expected<std::optional<bool>, std::string>
 ParseAliasedJsonBool(
     const json::object& source,
     std::initializer_list<std::string_view> aliases) {
@@ -14,13 +14,13 @@ ParseAliasedJsonBool(
         const auto* raw = source.if_contains(key);
         if (!raw) continue;
         if (!raw->is_bool()) {
-            return std::unexpected(
+            return tl::unexpected(
                 std::format("{} must be a boolean", key));
         }
 
         const bool value = raw->as_bool();
         if (result && *result != value) {
-            return std::unexpected(std::format(
+            return tl::unexpected(std::format(
                 "{} and {} must match", first_key, key));
         }
         if (!result) {

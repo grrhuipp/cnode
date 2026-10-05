@@ -12,7 +12,6 @@ inline constexpr std::string_view kOutboundFile = "outbounds.json";
 inline constexpr std::string_view kRouteFile = "routing.json";
 inline constexpr std::string_view kGeoIpFile = "geoip.dat";
 inline constexpr std::string_view kGeoSiteFile = "geosite.dat";
-inline constexpr std::string_view kDefaultLogDir = "/var/log/acppnode";
 }  // namespace paths
 
 namespace logging {
@@ -41,7 +40,6 @@ inline constexpr std::string_view kHttpUpgrade = "httpupgrade";
 inline constexpr std::string_view kGrpc = "grpc";
 inline constexpr std::string_view kXHttp = "xhttp";
 inline constexpr std::string_view kTls = "tls";
-inline constexpr std::string_view kReality = "reality";
 inline constexpr std::string_view kNone = "none";
 inline constexpr std::string_view kHttp = "http";
 inline constexpr std::string_view kHttps = "https";

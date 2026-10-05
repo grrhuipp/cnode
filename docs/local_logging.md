@@ -29,7 +29,7 @@ YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: message
 YYYY/MM/DD HH:MM:SS [Level] [conn_id] component: inbound=tag user=id message
 ```
 
-`component` 对齐 xray-core 包路径，例如 `app/dispatcher`、`proxy/freedom`、`transport/internet/tcp`。`conn_id` 只输出 Worker 本地 32 位序号。日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出用户身份字段。失败消息保留 `source -> target via outbound` 和原因。
+`component` 对齐 xray-core 包路径，例如 `app/dispatcher`、`proxy/freedom`、`transport/internet/tcp`。`conn_id` 输出进程运行时分配的连接序号低 32 位。日志入队前复制身份字段，后台 writer 不借用 session 内的字符串。未认证连接不输出用户身份字段。失败消息保留 `source -> target via outbound` 和原因。
 
 示例：
 
@@ -57,16 +57,17 @@ access 以简短的 `from source accepted network:target` 记录访问事实；�
 2026/07/19 20:42:06 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> ipv6_first] user:714443 sendThrough:2602:2b5:20:111::abcd
 ```
 
-access 不带 `[Info]`，也不写组件、源码行或 Worker。使用 `LOG_ACCESS` 写入；认证失败、拨号失败和 relay 异常进入 error logger。
+access 不带 `[Info]`，也不写组件、源码行或执行线程。使用 `LOG_ACCESS` 写入；认证失败、拨号失败和 relay 异常进入 error logger。
 
 ## 4. 文件和后端
 
 - error logger 写入 `error_YYYY-MM-DD.log`。
 - access logger 写入 `access_YYYY-MM-DD.log`。
+- `logDir` 留空时写入可执行文件所在目录的 `logs` 子目录。
 - 控制台使用相同的时间与级别，但不写 component：`YYYY/MM/DD HH:MM:SS [Level] message`。
-- Worker 和协议热路径只做级别判断、消息构造和非阻塞入队。
+- 会话和协议热路径只做级别判断、消息构造和非阻塞入队。
 - 后台 writer 负责落盘、刷新、按日轮转、gzip 和保留期清理。
-- 队列满时不阻塞 Worker，丢弃数量写入 error logger。
+- 队列满时不阻塞事件循环，丢弃数量写入 error logger。
 
 面板控制台日志使用固定的状态行，避免把“配置已加载”误认为“面板已连接”：
 
@@ -89,4 +90,4 @@ V2Board 节点卡片和 `runtime.nodes` 的 `online` 沿用 v2node 口径：统�
 - error 和 access 不得混写。
 - access 不增加级别；`loglevel` 只过滤 error logger。
 - 不记录密码、UUID 凭据、面板 Key、Bearer Token 或请求正文。
-- 不新增协议私有日志队列、直接文件 writer 或跨 Worker 可变日志对象。
+- 不新增协议私有日志队列、直接文件 writer 或跨会话可变日志对象。

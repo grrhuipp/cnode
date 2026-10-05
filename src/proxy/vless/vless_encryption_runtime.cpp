@@ -277,32 +277,41 @@ net::awaitable<bool> WriteBytes(transport::MultiBufferWriter& writer,
 
 }  // namespace
 
-bool VlessEncryptionClientTicketCache::Valid(
-    std::chrono::steady_clock::time_point now) const noexcept {
-    return pfs_key.size() == kVlessEncryptionPfsKeySize &&
-           expires_at > now &&
-           std::ranges::any_of(ticket, [](uint8_t value) {
-               return value != 0;
-           });
+net::awaitable<std::optional<VlessEncryptionClientTicketCache::Ticket>>
+VlessEncryptionClientTicketCache::Snapshot(std::chrono::steady_clock::time_point now) {
+    return channel_.Call([this, now]() -> std::optional<Ticket> {
+        if (ticket_.pfs_key.size() != kVlessEncryptionPfsKeySize || ticket_.expires_at <= now ||
+            !std::ranges::any_of(ticket_.ticket, [](uint8_t value) { return value != 0; }))
+            return std::nullopt;
+        return ticket_;
+    });
 }
 
-void VlessEncryptionClientTicketCache::Store(
-    const VlessEncryptionClientPfsOpenResult& open,
-    std::chrono::steady_clock::time_point now) {
-    if (open.ticket_seconds == 0 ||
-        open.pfs_key.size() != kVlessEncryptionPfsKeySize) {
-        Clear();
-        return;
-    }
-    pfs_key.assign(open.pfs_key.begin(), open.pfs_key.end());
-    ticket = open.ticket;
-    expires_at = now + std::chrono::seconds(open.ticket_seconds);
+net::awaitable<void> VlessEncryptionClientTicketCache::Store(
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket, memory::ByteVector pfs_key,
+    uint16_t seconds, std::chrono::steady_clock::time_point now) {
+    return channel_.Call([this, ticket, pfs_key = std::move(pfs_key), seconds, now]() mutable {
+        ++ticket_.generation;
+        if (seconds == 0 || pfs_key.size() != kVlessEncryptionPfsKeySize) {
+            ticket_.pfs_key.clear();
+            ticket_.ticket = {};
+            ticket_.expires_at = {};
+            return;
+        }
+        ticket_.pfs_key = std::move(pfs_key);
+        ticket_.ticket = ticket;
+        ticket_.expires_at = now + std::chrono::seconds(seconds);
+    });
 }
 
-void VlessEncryptionClientTicketCache::Clear() noexcept {
-    pfs_key.clear();
-    ticket = {};
-    expires_at = {};
+net::awaitable<void> VlessEncryptionClientTicketCache::Clear(uint64_t generation) {
+    return channel_.Call([this, generation] {
+        if (ticket_.generation != generation) return;
+        ticket_.pfs_key.clear();
+        ticket_.ticket = {};
+        ticket_.expires_at = {};
+        ++ticket_.generation;
+    });
 }
 
 void VlessEncryptionServerTicketStore::Prune(
@@ -312,10 +321,10 @@ void VlessEncryptionServerTicketStore::Prune(
     });
 }
 
-std::optional<memory::ByteVector> VlessEncryptionServerTicketStore::Lookup(
-    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
-    std::span<const uint8_t> nfs_key,
+net::awaitable<std::optional<memory::ByteVector>> VlessEncryptionServerTicketStore::Lookup(
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket, memory::ByteVector nfs_key,
     std::chrono::steady_clock::time_point now) {
+    return channel_.Call([this, ticket, nfs_key = std::move(nfs_key), now]() -> std::optional<memory::ByteVector> {
     if (nfs_key.size() != kVlessMlKem768SharedSecretSize) {
         return std::nullopt;
     }
@@ -333,15 +342,16 @@ std::optional<memory::ByteVector> VlessEncryptionServerTicketStore::Lookup(
         it->seen_nfs_keys.end()) {
         return std::nullopt;
     }
+    if (it->seen_nfs_keys.size() >= 256) return std::nullopt;
     it->seen_nfs_keys.push_back(nfs_key_array);
     return it->pfs_key;
+    });
 }
 
-void VlessEncryptionServerTicketStore::Store(
-    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
-    std::span<const uint8_t> pfs_key,
-    uint16_t seconds,
-    std::chrono::steady_clock::time_point now) {
+net::awaitable<void> VlessEncryptionServerTicketStore::Store(
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket, memory::ByteVector pfs_key,
+    uint16_t seconds, std::chrono::steady_clock::time_point now) {
+    return channel_.Call([this, ticket, pfs_key = std::move(pfs_key), seconds, now] {
     if (seconds == 0 || pfs_key.size() != kVlessEncryptionPfsKeySize) {
         return;
     }
@@ -354,6 +364,7 @@ void VlessEncryptionServerTicketStore::Store(
     session.pfs_key.assign(pfs_key.begin(), pfs_key.end());
     session.expires_at = now + std::chrono::seconds(seconds);
     sessions_.push_back(std::move(session));
+    });
 }
 
 net::awaitable<std::optional<VlessEncryptionRuntime>>
@@ -374,12 +385,15 @@ RunVlessEncryptionClientHandshake(
     }
 
     const auto now = std::chrono::steady_clock::now();
-    if (config.zero_rtt && ticket_cache && ticket_cache->Valid(now)) {
+    auto cached_ticket = config.zero_rtt && ticket_cache
+        ? co_await ticket_cache->Snapshot(now)
+        : std::optional<VlessEncryptionClientTicketCache::Ticket>{};
+    if (cached_ticket) {
         auto zero = BuildVlessEncryptionClientZeroRttRequest(
             IvSpan(nfs->iv),
             nfs->nfs_key,
-            ticket_cache->pfs_key,
-            TicketSpan(ticket_cache->ticket),
+            cached_ticket->pfs_key,
+            TicketSpan(cached_ticket->ticket),
             cipher);
         if (zero) {
             co_await WriteBytes(raw_writer, nfs->bytes);
@@ -390,7 +404,7 @@ RunVlessEncryptionClientHandshake(
                 IvSpan(nfs->iv),
                 cipher);
         }
-        ticket_cache->Clear();
+        co_await ticket_cache->Clear(cached_ticket->generation);
     }
 
     auto pfs = BuildVlessEncryptionClientPfsHello(*nfs_aead);
@@ -437,7 +451,9 @@ RunVlessEncryptionClientHandshake(
     }
 
     if (ticket_cache) {
-        ticket_cache->Store(*server_open, std::chrono::steady_clock::now());
+        co_await ticket_cache->Store(server_open->ticket,
+            memory::ByteVector(server_open->pfs_key.begin(), server_open->pfs_key.end()),
+            server_open->ticket_seconds, std::chrono::steady_clock::now());
     }
 
     co_return BuildClientRuntime(
@@ -513,9 +529,9 @@ RunVlessEncryptionServerHandshake(
         }
 
         const auto now = std::chrono::steady_clock::now();
-        auto pfs_key = ticket_store->Lookup(
-            TicketSpan(*ticket),
-            nfs->nfs_key,
+        auto pfs_key = co_await ticket_store->Lookup(
+            *ticket,
+            memory::ByteVector(nfs->nfs_key.begin(), nfs->nfs_key.end()),
             now);
         if (!pfs_key) {
             co_return std::nullopt;
@@ -584,9 +600,9 @@ RunVlessEncryptionServerHandshake(
     }
 
     if (ticket_store) {
-        ticket_store->Store(
-            TicketSpan(response->ticket),
-            response->pfs_key,
+        co_await ticket_store->Store(
+            response->ticket,
+            memory::ByteVector(response->pfs_key.begin(), response->pfs_key.end()),
             response->ticket_seconds,
             std::chrono::steady_clock::now());
     }

@@ -3,7 +3,7 @@
 #include "acppnode/app/port_binding.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/rate_limiter.hpp"
-#include "acppnode/app/worker.hpp"
+#include "acppnode/runtime/runtime.hpp"
 
 #include <format>
 #include <stdexcept>
@@ -11,19 +11,16 @@
 
 namespace acpp {
 
-namespace {
-
-net::awaitable<void> SetupWorkerInbounds(
-    Worker& worker,
-    std::vector<StaticInboundRuntimeEntry> inbounds,
-    ConnectionLimiterPtr connection_limiter) {
-    co_await worker.StartRuntimeTask();
+net::awaitable<void> SetupRuntimeInbounds(Runtime& runtime, InboundStartup startup) {
+    const auto& inbounds = startup.entries;
+    ConnectionLimiterPtr connection_limiter = startup.limiter;
+    co_await runtime.Initialize();
 
     for (const auto& inbound : inbounds) {
         const auto fail = [&](const char* stage) {
             throw std::runtime_error(std::format(
-                "static inbound startup failed worker={} tag={} port={} stage={}",
-                worker.Id(), inbound.tag, inbound.port, stage));
+                "static inbound startup failed tag={} port={} stage={}",
+                inbound.tag, inbound.port, stage));
         };
         auto receiver = proxyman::inbound::MakeReceiverSettings(
             inbound.tag,
@@ -35,7 +32,7 @@ net::awaitable<void> SetupWorkerInbounds(
             ProxyProtocolMode::Auto,
             inbound.outbound_policy);
 
-        if (!co_await worker.RegisterInboundTask(
+        if (!co_await runtime.RegisterInbound(
                 connection_limiter,
                 inbound.build_request,
                 std::move(receiver))) {
@@ -47,11 +44,11 @@ net::awaitable<void> SetupWorkerInbounds(
             inbound.protocol,
             inbound.tag,
             inbound.listen);
-        if (!co_await worker.AddListenerTask(binding)) {
+        if (!co_await runtime.AddListener(binding)) {
             fail("tcp-listen");
         }
 
-        if (!co_await worker.AddUdpListenerTask(
+        if (!co_await runtime.AddUdpListener(
                 binding,
                 connection_limiter,
                 inbound.build_request)) {
@@ -60,24 +57,5 @@ net::awaitable<void> SetupWorkerInbounds(
     }
 }
 
-}  // namespace
-
-InboundStartup QueueInboundStartup(
-    const std::vector<StaticInboundRuntimeEntry>& runtime_inbounds,
-    const std::vector<std::unique_ptr<Worker>>& workers,
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& connection_limiters) {
-    InboundStartup startup;
-    startup.entries = runtime_inbounds;
-    startup.worker_results.reserve(workers.size());
-    for (const auto& worker : workers) {
-        if (worker->Id() >= connection_limiters.size()) {
-            throw std::runtime_error("worker has no matching connection limiter");
-        }
-        auto* limiter = connection_limiters[worker->Id()].get();
-        startup.worker_results.push_back(worker->PostForFuture(
-            SetupWorkerInbounds(*worker, startup.entries, limiter)));
-    }
-    return startup;
-}
 
 }  // namespace acpp

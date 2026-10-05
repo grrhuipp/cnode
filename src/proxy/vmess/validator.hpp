@@ -12,6 +12,7 @@
 // ============================================================================
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/runtime/channel.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -30,11 +31,11 @@ namespace vmess {
 // 线程模型：
 //   - 认证用户表为进程级单份 RCU 快照，认证路径只做 atomic load
 //   - 面板/静态更新在冷路径构建新快照后无锁发布
-//   - 在线追踪为 Worker 私有状态
+//   - 在线追踪由独立服务持有
 // ============================================================================
 class TimedUserValidator {
 public:
-    TimedUserValidator();
+    explicit TimedUserValidator(net::any_io_executor executor);
     ~TimedUserValidator();
 
     TimedUserValidator(const TimedUserValidator&) = delete;
@@ -53,31 +54,10 @@ public:
 
     // Records AEAD request body key/IV for replay protection.
     // Returns false if the same user/key/IV tuple is still inside the replay window.
-    [[nodiscard]] bool RegisterSessionIfNew(
-        const proxyman::inbound::UserStore::VmessCredential& user,
-        const std::array<uint8_t, 16>& body_key,
-        const std::array<uint8_t, 16>& body_iv) const;
-
-    // ── 在线追踪 ─────────────────────────────────────────────────────────────
-
-    void OnUserConnected(std::string_view tag,
-                         uint64_t user_id,
-                         std::string_view client_ip);
-
-    void OnUserDisconnected(std::string_view tag,
-                            uint64_t user_id,
-                            std::string_view client_ip);
-
-    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
-                                       uint64_t user_id,
-                                       std::string_view client_ip,
-                                       uint32_t device_limit) const;
-
-    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
-                                           uint64_t user_id) const;
-
-    [[nodiscard]] std::vector<OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const;
+    [[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
+        std::array<uint8_t, 16> user,
+        std::array<uint8_t, 16> body_key,
+        std::array<uint8_t, 16> body_iv);
 
 private:
     struct Impl;

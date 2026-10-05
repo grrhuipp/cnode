@@ -5,6 +5,12 @@
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <asio/co_spawn.hpp>
+#include <asio/use_future.hpp>
+#include <asio/strand.hpp>
+#include <thread>
+#include <future>
+#include <vector>
 
 int main() {
     using namespace acpp::proxyman::inbound;
@@ -16,7 +22,8 @@ int main() {
         constexpr auto tag = "snapshot-lifetime";
         const UserSet users = PreparedVmessUsers{user};
         UserStore::ApplyUsers(tag, users);
-        acpp::vmess::TimedUserValidator validator;
+        acpp::net::io_context io;
+        acpp::vmess::TimedUserValidator validator(acpp::net::make_strand(io));
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::array<uint8_t, 16> auth;
@@ -35,11 +42,23 @@ int main() {
         UserStore::ClearUsers(UserProtocol::Vmess, tag);
         if (!old_table.expired()) throw std::runtime_error("idle validator pinned a removed table");
         if (validator.FindByAuthIDForTag(tag, auth.data(), timestamp))
-            throw std::runtime_error("expired hot-cache credentials must never authenticate");
+            throw std::runtime_error("removed credentials must never authenticate");
         UserStore::ApplyUsers(tag, users);
         if (!validator.FindByAuthIDForTag(tag, auth.data(), timestamp))
             throw std::runtime_error("validator must recover after table removal");
         UserStore::ClearUsers(UserProtocol::Vmess, tag);
-        std::cout << "VMess hot cache: replaced/removed table released, stale pointers invalidated PASS\n";
+        std::vector<std::future<bool>> attempts;
+        std::array<uint8_t, 16> body_key{};
+        std::array<uint8_t, 16> body_iv{};
+        for (unsigned i = 0; i < 64; ++i)
+            attempts.push_back(acpp::net::co_spawn(acpp::net::make_strand(io),
+                validator.RegisterSessionIfNew(user.uuid_bytes, body_key, body_iv), acpp::net::use_future));
+        std::array<std::thread, 4> workers;
+        for (auto& worker : workers) worker = std::thread([&] { io.run(); });
+        for (auto& worker : workers) worker.join();
+        unsigned accepted = 0;
+        for (auto& attempt : attempts) accepted += attempt.get();
+        if (accepted != 1) throw std::runtime_error("concurrent replay checks must reserve the tuple exactly once");
+        std::cout << "VMess immutable authentication snapshot: replaced/removed table released, stale pointers invalidated PASS\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -5,10 +5,11 @@
 //
 // The panel sync state, node/user caches, traffic aggregation, and builder
 // helpers are cold-path controller implementation details. Keep this public
-// boundary narrow so panel synchronization cannot leak into Worker hot paths.
+// boundary narrow so panel synchronization cannot leak into Runtime hot paths.
 // ============================================================================
 
 #include "acppnode/common/asio_types.hpp"
+#include "acppnode/runtime/channel.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +21,7 @@
 namespace acpp {
 
 class ConnectionLimiter;
-class Worker;
+class Runtime;
 struct PanelConfig;
 
 namespace api {
@@ -29,9 +30,7 @@ class API;
 
 class Controller {
 public:
-    Controller(net::io_context& io_context,
-               const std::vector<std::unique_ptr<Worker>>& workers,
-               const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
+    Controller(net::any_io_executor executor, Runtime& runtime, ConnectionLimiter& limiter);
     ~Controller();
 
     Controller(const Controller&) = delete;
@@ -40,7 +39,8 @@ public:
     Controller& operator=(Controller&&) = delete;
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
-    void Start();
+    net::awaitable<void> Run();
+    [[nodiscard]] bool RequestStop();
 
     struct NodeStatsInfo {
         std::string panel_name;
@@ -52,11 +52,12 @@ public:
         uint64_t    bytes_up     = 0;
         uint64_t    bytes_down   = 0;
     };
-    [[nodiscard]] std::vector<NodeStatsInfo> GetNodeStats() const;
+    [[nodiscard]] net::awaitable<std::vector<NodeStatsInfo>> GetNodeStats() const;
 
 private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
+    ServiceChannel::Reservation stop_ticket_;
 };
 
 }  // namespace acpp

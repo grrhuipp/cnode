@@ -20,24 +20,26 @@ namespace acpp::proxy::vless::inbound {
 class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::vless::Validator& validator,
-            ::acpp::StatsShard& stats,
+            ::acpp::UserOnlineTracker& online,
             ::acpp::ConnectionLimiterPtr limiter,
+            ::acpp::net::any_io_executor service_executor,
             std::shared_ptr<
                 const ::acpp::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
 
-    ::acpp::net::awaitable<::acpp::RelayResult> Process(
+    ::acpp::net::awaitable<::acpp::RelayResult> ProcessSession(
         std::unique_ptr<::acpp::AsyncStream> stream,
         ::acpp::routing::Dispatcher& dispatcher,
         const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
-        ::acpp::net::io_context& io_context,
+        ::acpp::net::any_io_executor executor,
         ::acpp::session::Context& ctx,
+        ::acpp::StatsShard& stats,
+        ::acpp::UserOnlineLease& online,
         const ::acpp::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
     ::acpp::vless::Validator& validator_;
-    ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption_;
     std::unique_ptr<::acpp::vless::VlessEncryptionServerTicketStore>

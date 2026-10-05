@@ -54,12 +54,6 @@
 #include <asio/system_error.hpp>
 #include <asio/write.hpp>
 
-// liburing headers expose BLOCK_SIZE as a macro; keep it from breaking
-// third-party C++ headers that use BLOCK_SIZE as an identifier.
-#ifdef BLOCK_SIZE
-#  undef BLOCK_SIZE
-#endif
-
 // Windows 宏污染清理
 #ifdef _WIN32
 #  ifdef ERROR
@@ -90,7 +84,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
-#include <expected>
+#include <tl/expected.hpp>
 #include <filesystem>
 #include <format>
 #include <functional>

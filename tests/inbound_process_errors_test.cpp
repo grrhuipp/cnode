@@ -1,5 +1,4 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
-#include "acppnode/app/request_load_state.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/transport/internet/transport_stack.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
@@ -67,10 +66,12 @@ private:
 
 class Proxy final : public Inbound {
 public:
-    Proxy(int fault, bool codec) : fault_(fault), codec_(codec) {}
-    net::awaitable<RelayResult> Process(std::unique_ptr<AsyncStream> stream,
-        routing::Dispatcher&, const proxyman::inbound::ReceiverSettings&, net::io_context&,
-        session::Context&, const TimeoutsConfig&, uint32_t) override {
+    Proxy(UserOnlineTracker& online, int fault, bool codec)
+        : Inbound(online), fault_(fault), codec_(codec) {}
+    net::awaitable<RelayResult> ProcessSession(std::unique_ptr<AsyncStream> stream,
+        routing::Dispatcher&, const proxyman::inbound::ReceiverSettings&,
+        net::any_io_executor, session::Context&, StatsShard&, UserOnlineLease&,
+        const TimeoutsConfig&, uint32_t) override {
         RelayResult result;
         if (codec_) {
             auto text = co_await anytls::ReadFrameText(*stream, 19);
@@ -87,7 +88,7 @@ private:
 };
 
 class Dispatcher final : public routing::Dispatcher {
-    net::awaitable<RelayResult> Dispatch(net::io_context&, const routing::DispatchPolicy&,
+    net::awaitable<RelayResult> Dispatch(net::any_io_executor, const routing::DispatchPolicy&,
         std::unique_ptr<AsyncStream>, transport::Link, InitialPayload, session::Context&,
         StatsShard&, const TimeoutsConfig&) override { throw std::logic_error("unexpected dispatch"); co_return RelayResult{}; }
 };
@@ -96,9 +97,9 @@ class Dispatcher final : public routing::Dispatcher {
 // Replace the external transport builder and reporting sink; execute the
 // production accepted-TCP and logical-transport ownership/error boundaries.
 namespace acpp {
-net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
+net::awaitable<TransportBuildResult> BuildInboundTransport(net::any_io_executor,
     std::unique_ptr<AsyncStream> raw, const StreamSettings&, std::string*, uint64_t,
-    std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*) {
+    std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*, uint64_t) {
     if (streams) { streams->OnInboundTransportStream(std::move(raw)); co_return std::unique_ptr<AsyncStream>{}; }
     co_return std::move(raw);
 }
@@ -117,17 +118,19 @@ int main() {
             .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
             .proxy_protocol = ProxyProtocolMode::Off};
         receiver.stream_settings.network = logical ? "grpc" : "tcp";
-        auto handler = std::make_shared<proxyman::inbound::Handler>(std::move(receiver), std::make_unique<Proxy>(fault, codec));
+        UserOnlineTracker online(io.get_executor());
+        auto handler = std::make_shared<proxyman::inbound::Handler>(
+            std::move(receiver), std::make_unique<Proxy>(online, fault, codec));
         Dispatcher dispatcher;
         StatsShard stats;
-        app::RequestLoadState load(100, 0);
         TimeoutsConfig timeouts;
-        session::Context context;
+        session::Context context(io.get_executor());
         context.conn_id = 1;
         context.inbound.tag = "test";
         bool returned = false;
         std::exception_ptr failure;
-        net::co_spawn(io, handler->ProcessAcceptedTCP(io, dispatcher, stats, load, timeouts,
+        net::co_spawn(io, handler->ProcessAcceptedTCP(
+            io.get_executor(), dispatcher, stats, 0, timeouts,
             std::make_unique<Stream>(state), context), [&](std::exception_ptr error) { failure = error; returned = true; });
         io.run();
         if (failure) {

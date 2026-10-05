@@ -7,17 +7,17 @@
 
 namespace acpp::detail {
 
-// Worker-local single-upload owner. Readers take a shared snapshot across
+// Owner-strand single-upload owner. Readers take a shared snapshot across
 // co_await so Close can cancel and detach the stream without destroying an
 // object that still has an asynchronous member function in flight.
 template <typename Stream>
 class BasicXHttpUploadStreamSlot final {
 public:
-    [[nodiscard]] bool Attach(std::unique_ptr<Stream> stream) {
+    [[nodiscard]] bool Attach(std::shared_ptr<Stream> stream) {
         if (!stream || current_) {
             return false;
         }
-        current_ = std::shared_ptr<Stream>(std::move(stream));
+        current_ = std::move(stream);
         return true;
     }
 

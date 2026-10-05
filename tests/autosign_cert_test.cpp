@@ -105,7 +105,7 @@ int main() {
     if (!Require(isolated.cert != nullptr && isolated.key != nullptr,
                  "isolated state material must be generated")) return 1;
     if (!Require(DerEncodePublicKey(isolated.key) != first_key,
-                 "separate Worker-local states must use separate private keys")) return 1;
+                 "separate TLS contexts must use separate private keys")) return 1;
 
     auto reused = state.GetOrCreate("*.example.com", t0 + std::chrono::seconds(299));
     if (!Require(DerEncodeCert(reused.cert) == first_cert,

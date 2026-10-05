@@ -76,7 +76,7 @@ public:
     bool WriteConfig(const std::filesystem::path& root) const {
         std::filesystem::create_directories(root);
         std::ofstream config(root / "config.json", std::ios::binary);
-        config << R"({"workers":)" << (CollisionMode() ? 2 : 1)
+        config << R"({"ioThreads":)" << (CollisionMode() ? 2 : 1)
                << R"(,"log":{"enable":false,"logDir":")"
                << (root / "logs").generic_string()
                << R"("},"dns":{"servers":["127.77.0.1:)" << dns_.local_endpoint().port()

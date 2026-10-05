@@ -141,10 +141,10 @@ size_t EncodeSocks5AddressTo(const TargetAddress& addr,
            RAND_bytes(out.data(), static_cast<int>(out.size())) == 1;
 }
 
-[[nodiscard]] memory::ThreadLocalString SessionKeyFromClientId(
+[[nodiscard]] memory::DataString SessionKeyFromClientId(
     std::span<const uint8_t, 8> client_session_id) {
     static constexpr char kHex[] = "0123456789abcdef";
-    memory::ThreadLocalString out;
+    memory::DataString out;
     out.reserve(7 + 16);
     out.append("ss2022:");
     for (uint8_t b : client_session_id) {

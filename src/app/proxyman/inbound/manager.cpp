@@ -4,43 +4,54 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/online_device.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
 #include "acppnode/common/string_hash.hpp"
+
+#include <asio/strand.hpp>
 
 namespace acpp::proxyman::inbound {
 
 struct Manager::Impl {
-    using HandlerMap = memory::ThreadLocalUnorderedMap<
+    using HandlerMap = memory::DataUnorderedMap<
         std::string,
         std::shared_ptr<Handler>,
         TransparentStringHash,
         TransparentStringEq>;
-    using RuntimeMap = memory::ThreadLocalUnorderedMap<
+    using RuntimeMap = memory::DataUnorderedMap<
         std::string,
         std::unique_ptr<ProtocolRuntime>,
         TransparentStringHash,
         TransparentStringEq>;
 
-    explicit Impl(StatsShard& stats) noexcept
-        : stats(stats) {}
+    Impl(net::any_io_executor owner_executor,
+         net::any_io_executor shared_executor)
+        : owner_executor(std::move(owner_executor)),
+          shared_executor(std::move(shared_executor)),
+          online(net::make_strand(this->shared_executor), 65536) {}
 
     [[nodiscard]] ProtocolRuntime* EnsureRuntime(std::string_view protocol) {
         if (auto it = runtimes.find(protocol); it != runtimes.end()) {
             return it->second.get();
         }
-        auto runtime = NewProtocolRuntime(protocol);
+        auto runtime = NewProtocolRuntime(
+            protocol, net::make_strand(shared_executor));
         if (!runtime) return nullptr;
         auto result = runtimes.emplace(
             std::string(protocol), std::move(runtime));
         return result.first->second.get();
     }
 
-    StatsShard& stats;
+    net::any_io_executor owner_executor;
+    net::any_io_executor shared_executor;
+    UserOnlineTracker online;
     RuntimeMap runtimes;
     HandlerMap handlers;
 };
 
-Manager::Manager(StatsShard& stats)
-    : impl_(std::make_unique<Impl>(stats)) {}
+Manager::Manager(net::any_io_executor owner_executor,
+                 net::any_io_executor shared_executor)
+    : impl_(std::make_unique<Impl>(
+          std::move(owner_executor), std::move(shared_executor))) {}
 
 Manager::~Manager() noexcept = default;
 
@@ -63,7 +74,7 @@ std::unique_ptr<::acpp::Inbound> Manager::NewHandler(
         return nullptr;
     }
     return ::acpp::proxyman::inbound::NewHandler(
-        req.protocol, *runtime, impl_->stats, std::move(limiter), req);
+        req.protocol, *runtime, impl_->online, std::move(limiter), req);
 }
 
 DatagramHandlerBuildResult Manager::NewDatagramHandler(
@@ -74,7 +85,7 @@ DatagramHandlerBuildResult Manager::NewDatagramHandler(
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
     return ::acpp::proxyman::inbound::NewDatagramHandler(
-        req.protocol, *runtime, impl_->stats, std::move(limiter), req);
+        req.protocol, *runtime, impl_->online, std::move(limiter), req);
 }
 
 Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
@@ -104,12 +115,9 @@ void Manager::RemoveHandler(std::string_view tag) {
     impl_->handlers.erase(it);
 }
 
-std::vector<::acpp::OnlineDevice>
-Manager::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
-    if (auto it = impl_->runtimes.find(protocol); it != impl_->runtimes.end()) {
-        return it->second->GetOnlineDevices(tag);
-    }
-    return {};
+net::awaitable<std::vector<::acpp::OnlineDevice>>
+Manager::GetOnlineDevices(std::string tag) {
+    return impl_->online.GetOnlineDevices(std::move(tag));
 }
 
 }  // namespace acpp::proxyman::inbound

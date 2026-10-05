@@ -6,8 +6,8 @@ namespace acpp {
 namespace defaults {
 
 // 运行线程
-constexpr uint32_t kMaxWorkers = 1024;
-constexpr uint32_t kWorkerMailboxCapacity = 256;
+constexpr uint32_t kMaxIoThreads = 1024;
+constexpr uint32_t kServiceChannelCapacity = 256;
 
 // 资源限制
 constexpr uint32_t kMaxConnections = 0;            // 最大并发连接数（0=不限制）
@@ -23,7 +23,7 @@ constexpr uint32_t kUplinkOnlyTimeout = 5;    // 半关闭后另一方向最多�
 constexpr uint32_t kDownlinkOnlyTimeout = 5;  // 半关闭后另一方向最多保留 5 秒
 
 // 连接压力控制
-constexpr uint32_t kMaxConnectionsPerWorker = 10000;  // 每 Worker 连接安全上限
+constexpr uint32_t kMaxConnectionsPerRuntime = 10000;
 constexpr uint32_t kPressurePercent = 75;              // 负载压力阈值百分比
 constexpr uint32_t kPressureIdleTimeout = 60;          // 高压时空闲超时（秒）
 

@@ -8,6 +8,19 @@ namespace {
 using namespace std::chrono_literals;
 using Timeouts = acpp::transport::internet::detail::ConnectionTimeouts<struct Owner>;
 
+class SchedulerScope final {
+public:
+    explicit SchedulerScope(acpp::net::any_io_executor executor)
+        : executor_(std::move(executor)) {
+        acpp::TimeoutScheduler::Install(executor_);
+    }
+    ~SchedulerScope() {
+        acpp::TimeoutScheduler::ReleaseForExecutor(executor_);
+    }
+private:
+    acpp::net::any_io_executor executor_;
+};
+
 struct Owner {
     int calls = 0;
     acpp::ErrorCode reason = acpp::ErrorCode::OK;
@@ -16,8 +29,9 @@ struct Owner {
 
 bool TestIdleAndOperations() {
     acpp::net::io_context io;
+    SchedulerScope scheduler_scope(io.get_executor());
     Owner owner;
-    Timeouts timeouts(io, owner);
+    Timeouts timeouts(io.get_executor(), owner);
     timeouts.SetIdleTimeout(1s);
     timeouts.BeginWrite();
     timeouts.EndWrite();
@@ -29,8 +43,9 @@ bool TestIdleAndOperations() {
 
 bool TestPhaseReplacementAndClear() {
     acpp::net::io_context io;
+    SchedulerScope scheduler_scope(io.get_executor());
     Owner owner;
-    Timeouts timeouts(io, owner);
+    Timeouts timeouts(io.get_executor(), owner);
     auto old = timeouts.StartPhaseDeadline(1s);
     auto current = timeouts.StartPhaseDeadline(2s);
     if (!old || !current || old.Expired() || current.Expired()) return false;
@@ -46,8 +61,9 @@ bool TestPhaseReplacementAndClear() {
 
 bool TestExpiredPhaseAndStopFlag() {
     acpp::net::io_context io;
+    SchedulerScope scheduler_scope(io.get_executor());
     Owner owner;
-    Timeouts timeouts(io, owner);
+    Timeouts timeouts(io.get_executor(), owner);
     auto phase = timeouts.StartPhaseDeadline(1s);
     io.run_for(1100ms);
     if (owner.calls != 1 || !timeouts.ConsumePhaseDeadline()) return false;
@@ -58,9 +74,10 @@ bool TestExpiredPhaseAndStopFlag() {
 
 bool TestDestroyOwnerAndMaximumTimeout() {
     acpp::net::io_context io;
+    SchedulerScope scheduler_scope(io.get_executor());
     auto owner = std::make_unique<Owner>();
     {
-        auto timeouts = std::make_unique<Timeouts>(io, *owner);
+        auto timeouts = std::make_unique<Timeouts>(io.get_executor(), *owner);
         timeouts->SetIdleTimeout(std::chrono::seconds::max());
         timeouts->BeginRead();
         timeouts.reset();

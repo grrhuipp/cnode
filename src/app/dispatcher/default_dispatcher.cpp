@@ -5,7 +5,6 @@
 
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/session_tracking.hpp"
-#include "acppnode/app/request_load_state.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/features/policy/request_policy.hpp"
@@ -118,36 +117,6 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
     co_return std::move(dns_result.addresses);
 }
 
-struct ActiveSessionScope {
-    session::Context& ctx;
-    app::SessionTrackingState* session_tracking = nullptr;
-    bool is_active = false;
-
-    ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState* tracking)
-        : ctx(session_ctx)
-        , session_tracking(tracking) {
-        if (session_tracking && ctx.inbound.user_id > 0) {
-            session_tracking->RegisterActiveSession(
-                ctx.conn_id,
-                ctx.inbound.tag,
-                ctx.inbound.user_id,
-                ctx.traffic);
-            is_active = true;
-        }
-    }
-
-    ~ActiveSessionScope() noexcept {
-        if (!is_active || !session_tracking) {
-            return;
-        }
-
-        session_tracking->UnregisterActiveSession(
-            ctx.conn_id,
-            ctx.traffic);
-    }
-};
-
 }  // namespace
 
 void DefaultDispatcher::BindRouter(const routing::Router& router) noexcept {
@@ -173,12 +142,7 @@ void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
     dns_service_ = &dns_service;
 }
 
-void DefaultDispatcher::BindRequestLoadState(
-    app::RequestLoadState& request_load) noexcept {
-    request_load_ = &request_load;
-}
-
-std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
+std::shared_ptr<const Outbound> DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
     if (!outbound_manager_) {
         return nullptr;
@@ -187,7 +151,7 @@ std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
 }
 
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
     transport::Link inbound_link,
@@ -195,10 +159,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     session::Context& ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
-    app::RequestLoadState::DispatchScope load_scope(request_load_);
-    const uint32_t pressure_idle_timeout = request_load_
-        ? request_load_->PressureIdleTimeout()
-        : 0;
+    const uint32_t pressure_idle_timeout = 0;
     const int64_t auth_completed_at_us = NowMicros();
     const int64_t auth_started_at_us = ctx.inbound.transport_ready_at_unix_us > 0
         ? ctx.inbound.transport_ready_at_unix_us
@@ -211,10 +172,18 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     }
     RelayResult result;
     ErrorCode cancellation_reason = ErrorCode::OK;
+    std::optional<app::SessionTrackingState::Registration> registration;
     try {
-        co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
+        if (session_tracking_ && ctx.inbound.user_id > 0) {
+            registration.emplace(co_await session_tracking_->RegisterActiveSession(
+                ctx.conn_id,
+                std::string(ctx.inbound.tag),
+                ctx.inbound.user_id,
+                ctx.traffic_owner));
+        }
+        co_await RunAwaitableTaskGroup(executor, [&](AwaitableTaskGroup& group) {
             group.Spawn(DispatchPreparedLink(
-                io_context, policy, std::move(inbound), inbound_link,
+                executor, policy, std::move(inbound), inbound_link,
                 std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout,
                 result, group, cancellation_reason));
         });
@@ -241,11 +210,23 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         result.error = cancellation_reason;
         ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
     }
+    if (registration && session_tracking_) {
+        const bool throw_on_cancel = co_await net::this_coro::throw_if_cancelled();
+        co_await net::this_coro::throw_if_cancelled(false);
+        try {
+            co_await session_tracking_->UnregisterActiveSession(
+                std::move(*registration), ctx.traffic);
+        } catch (const std::exception& error) {
+            LOG_CONN_WARN(ctx, "failed to finalize session accounting > {}", error.what());
+            if (result.error == ErrorCode::OK) result.error = ErrorCode::INTERNAL;
+        }
+        co_await net::this_coro::throw_if_cancelled(throw_on_cancel);
+    }
     co_return result;
 }
 
 net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const routing::DispatchPolicy& policy,
     std::unique_ptr<AsyncStream> inbound,
     transport::Link inbound_link,
@@ -388,7 +369,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                         break;
                     }
                     const auto bytes_before = buf::TotalLen(sniff_payload);
-                    net::steady_timer timer(io_context);
+                    net::steady_timer timer(executor);
                     timer.expires_after(remaining);
                     try {
                         co_await (cache_more() ||
@@ -500,9 +481,8 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                    ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag,
                    relay_payload_size);
 
-    ActiveSessionScope relay_scope{ctx, session_tracking_};
     auto outbound_process = co_await outbound_handler->Process(
-        io_context,
+        executor,
         inbound_local_addr ? &*inbound_local_addr : nullptr,
         ctx,
         timeouts,
@@ -541,7 +521,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     co_return;
 }
 
-DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
+net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::FinishRoute(
     session::Context& ctx,
     const detail::OutboundSelection& selection) const {
     ctx.outbound.tag = selection.outbound_tag;
@@ -565,22 +545,30 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
                        ctx.outbound.target, ctx.outbound.tag);
     }
 
-    if (request_policy_ && request_policy_->Blocked(ctx)) {
-        return RouteResult{
-            .handler = {},
-            .error = ErrorCode::BLOCKED,
-        };
+    if (request_policy_) {
+        std::string destination;
+        ctx.outbound.target.ToStringInto(destination);
+        if (co_await request_policy_->Blocked(
+                std::string(ctx.inbound.tag.data(), ctx.inbound.tag.size()),
+                ctx.inbound.user_id,
+                std::string(ctx.inbound.user_email.data(), ctx.inbound.user_email.size()),
+                std::move(destination))) {
+            co_return RouteResult{
+                .handler = {},
+                .error = ErrorCode::BLOCKED,
+            };
+        }
     }
 
     auto handler = ResolveOutboundHandler(selection.outbound_tag);
     if (!handler) {
-        return RouteResult{
+        co_return RouteResult{
             .handler = {},
             .error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND,
         };
     }
 
-    return RouteResult{
+    co_return RouteResult{
         .handler = std::move(handler),
         .error = ErrorCode::OK,
     };
@@ -603,12 +591,12 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     if (!router_ || !detail::RequiresRouting(policy.outbound) ||
         !ctx.outbound.target.IsDomain() ||
         ctx.outbound.target.resolved_addr) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
+        co_return co_await FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     const auto strategy = router_->DomainStrategy();
     if (strategy == routing::DomainStrategy::AsIs || !dns_service_) {
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
+        co_return co_await FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     auto select_with_addresses =
@@ -642,21 +630,21 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     if (strategy == routing::DomainStrategy::IPIfNonMatch) {
         auto initial = SelectRoute(ctx, policy);
         if (initial.source != detail::SelectionSource::Fallback) {
-            co_return FinishRoute(ctx, initial);
+            co_return co_await FinishRoute(ctx, initial);
         }
 
         auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
         if (!addresses.empty()) {
-            co_return FinishRoute(ctx, select_with_addresses(addresses));
+            co_return co_await FinishRoute(ctx, select_with_addresses(addresses));
         }
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
+        co_return co_await FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
     if (!addresses.empty()) {
-        co_return FinishRoute(ctx, select_with_addresses(addresses));
+        co_return co_await FinishRoute(ctx, select_with_addresses(addresses));
     }
-    co_return FinishRoute(ctx, SelectRoute(ctx, policy));
+    co_return co_await FinishRoute(ctx, SelectRoute(ctx, policy));
 }
 
 }  // namespace acpp::app::dispatcher

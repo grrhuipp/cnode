@@ -10,7 +10,7 @@
 namespace acpp::controller {
 
 // Operations are supplied by NodeRuntime in production. Its completion boundary
-// includes all started Worker mutations, even when an operation throws.
+// includes all started Runtime mutations, even when an operation throws.
 template <typename Runtime>
 net::awaitable<void> CleanPendingNodeRuntime(Runtime& runtime, NodeState& state) {
     if (!state.HasPendingCleanup()) co_return;

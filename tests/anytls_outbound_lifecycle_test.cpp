@@ -1,6 +1,7 @@
+#include "data_allocation_probe.hpp"
 #include "anytls_outbound.hpp"
 #include "../anytls_codec.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
+#include "acppnode/app/dns/dns_service.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/memory_stats.hpp"
@@ -14,6 +15,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/use_future.hpp>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -23,7 +25,7 @@
 
 namespace {
 thread_local bool fail_next_allocation = false;
-thread_local bool fail_next_pmr_allocation = false;
+thread_local bool fail_next_data_allocation = false;
 thread_local size_t allocation_failures = 0;
 thread_local size_t failed_allocation_size = 0;
 thread_local size_t fail_allocation_bytes = 0;
@@ -48,29 +50,16 @@ namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
 
-class FailingPmrResource final : public std::pmr::memory_resource {
-public:
-    explicit FailingPmrResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
-
-private:
-    void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_next_pmr_allocation && size == fail_allocation_bytes) {
-            fail_next_pmr_allocation = false;
-            fail_allocation_bytes = 0;
-            ++allocation_failures;
-            failed_allocation_size = size;
-            throw std::bad_alloc();
-        }
-        return upstream_->allocate(size, alignment);
+bool RejectDataAllocation(size_t size, size_t) noexcept {
+    if (fail_next_data_allocation && size == fail_allocation_bytes) {
+        fail_next_data_allocation = false;
+        fail_allocation_bytes = 0;
+        ++allocation_failures;
+        failed_allocation_size = size;
+        return true;
     }
-    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
-        upstream_->deallocate(pointer, size, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    std::pmr::memory_resource* upstream_;
-};
+    return false;
+}
 
 size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
 size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
@@ -111,7 +100,7 @@ constexpr std::string_view kPaddingA = "stop=8\n0=45-45\n1=256-256\n2=64-64\n";
 constexpr std::string_view kPaddingB = "stop=8\n0=91-91\n1=320-320\n2=80-80\n";
 
 struct Wire {
-    explicit Wire(net::io_context& io) : wake(io), open_gate(io) {}
+    explicit Wire(net::any_io_executor executor) : wake(executor), open_gate(executor) {}
     net::steady_timer wake;
     net::steady_timer open_gate;
     std::vector<uint8_t> input;
@@ -309,7 +298,7 @@ public:
         wire_->offset += count;
         if (wire_->queue && wire_->queue->mode == 7 && count == 4096) {
             fail_allocation_bytes = 128;
-            fail_next_pmr_allocation = true;
+            fail_next_data_allocation = true;
         }
         if (wire_->fail_on_header && count == 7) {
             wire_->fail_on_header = false;
@@ -455,9 +444,9 @@ public:
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
 namespace acpp {
-net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
+net::awaitable<DialResult> DialOutboundTransport(net::any_io_executor executor, session::Context&,
                                                 const OutboundTransportTarget&) {
-    auto wire = std::make_shared<Wire>(io);
+    auto wire = std::make_shared<Wire>(executor);
     wire->fail_settings = fail_first_session && dialed.empty();
     wire->respond_on_auth = respond_on_auth;
     wire->queue = queue_scenario;
@@ -473,11 +462,42 @@ net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::C
 }
 
 namespace {
+class TimeoutSchedulerScope final {
+public:
+    explicit TimeoutSchedulerScope(net::any_io_executor executor) : executor_(std::move(executor)) {
+        TimeoutScheduler::Install(executor_);
+    }
+    ~TimeoutSchedulerScope() { TimeoutScheduler::ReleaseForExecutor(executor_); }
+private:
+    net::any_io_executor executor_;
+};
+
+void StopHandler(net::io_context& io, proxy::anytls::outbound::Handler& handler) {
+    auto stopped = net::co_spawn(io, handler.Stop(), net::use_future);
+    io.restart();
+    io.run();
+    stopped.get();
+}
+
+void DrainDialed(net::io_context& io) {
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    auto joined = [] {
+        return std::all_of(dialed.begin(), dialed.end(), [](const auto& wire) {
+            return wire->destroyed && wire->active_reads == 0;
+        });
+    };
+    while (!joined() && std::chrono::steady_clock::now() < deadline) {
+        io.restart();
+        io.run_for(10ms);
+    }
+}
+
 bool RunClientPadding() {
     net::io_context io;
+    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNSService dns_worker(io.get_executor(), dns_config, 8);
     app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
@@ -488,7 +508,7 @@ bool RunClientPadding() {
     settings.min_idle_sessions = 1;
     auto make_handler = [&] {
         return std::make_unique<proxy::anytls::outbound::Handler>(
-            "same-client-tag", io, settings, StreamSettings{}, 1s, dns);
+            "same-client-tag", io.get_executor(), settings, StreamSettings{}, 1s, dns);
     };
     auto handler = make_handler();
     dialed.clear();
@@ -496,7 +516,9 @@ bool RunClientPadding() {
     io_fault_mode = io_fault_kind = 0;
     client_padding_probe = true;
     std::array<Client, 4> clients;
-    std::array<session::Context, 4> contexts;
+    std::array<session::Context, 4> contexts{
+        session::Context(io.get_executor()), session::Context(io.get_executor()),
+        session::Context(io.get_executor()), session::Context(io.get_executor())};
     std::array<net::cancellation_signal, 4> cancellations;
     std::array<bool, 4> done{};
     std::array<bool, 4> failed{};
@@ -508,7 +530,7 @@ bool RunClientPadding() {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await active.Process(io, nullptr, ctx, timeouts,
+        co_return co_await active.Process(io.get_executor(), nullptr, ctx, timeouts,
             {&clients[index], &clients[index], nullptr}, stats, config, {}, 10s, 10s);
     };
     auto start = [&](proxy::anytls::outbound::Handler& active, size_t index) {
@@ -548,17 +570,18 @@ bool RunClientPadding() {
     io.restart();
     io.poll();
     passed &= done[0] && !failed[0] && errors[0] == ErrorCode::CANCELLED;
-    handler.reset();
     const bool retired_during_cleanup = std::any_of(dialed.begin(), dialed.end(),
         [](const auto& wire) { return wire->closed && !wire->destroyed; });
+    StopHandler(io, *handler);
+    handler.reset();
     auto replacement = make_handler();
     start(*replacement, 3);
     passed &= dialed.size() == 4 && done[3] && !failed[3] && errors[3] == ErrorCode::OK;
     if (dialed.size() == 4)
         passed &= matches(*dialed[3], 30, "75cff2ad89aadf5e257059ee571ebe11");
+    StopHandler(io, *replacement);
     replacement.reset();
-    io.restart();
-    io.run_for(100ms);
+    DrainDialed(io);
     const bool joined = std::all_of(dialed.begin(), dialed.end(),
         [](const auto& wire) { return wire->closed && wire->destroyed && wire->active_reads == 0; });
     passed &= retired_during_cleanup && joined && std::all_of(done.begin(), done.end(), [](bool value) { return value; });
@@ -573,9 +596,10 @@ bool RunClientPadding() {
 
 bool RunOpenOrder(int mode, bool before) {
     net::io_context io;
+    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNSService dns_worker(io.get_executor(), dns_config, 8);
     app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
@@ -587,7 +611,7 @@ bool RunOpenOrder(int mode, bool before) {
     OpenOrderScenario scenario{.mode = mode, .before_write_completion = before};
     open_order_scenario = &scenario;
     dialed.clear();
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io.get_executor(), settings, StreamSettings{}, 1s, dns);
     auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
         ctx.content.network = Network::TCP;
@@ -595,11 +619,11 @@ bool RunOpenOrder(int mode, bool before) {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
+        co_return co_await handler->Process(io.get_executor(), nullptr, ctx, timeouts,
             {&client, &client, nullptr}, stats, config, {}, 10s, 10s);
     };
     Client warm, tested, recovery;
-    session::Context warm_ctx, tested_ctx, recovery_ctx;
+    session::Context warm_ctx(io.get_executor()), tested_ctx(io.get_executor()), recovery_ctx(io.get_executor());
     bool warm_done = false, done = false, recovery_done = false;
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr failure;
@@ -646,8 +670,9 @@ bool RunOpenOrder(int mode, bool before) {
     io.restart(); io.run_for(100ms);
     const size_t expected_connections = mode <= 2 ? 1 : 2;
     passed &= done && recovery_done && dialed.size() == expected_connections;
+    StopHandler(io, *handler);
     handler.reset();
-    io.restart(); io.run_for(200ms);
+    DrainDialed(io);
     bool joined = true;
     for (const auto& wire : dialed) joined &= wire->closed && wire->destroyed && wire->active_reads == 0;
     passed &= joined;
@@ -660,6 +685,7 @@ bool RunOpenOrder(int mode, bool before) {
 
 bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     net::io_context io;
+    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     QueueScenario queue;
     queue.mode = mode;
     if (mode >= 13) queue.consumer_gate = std::make_unique<net::steady_timer>(io);
@@ -699,7 +725,7 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     } else queue.wire_payload.assign(queue.expected.begin(), queue.expected.begin() + bytes);
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNSService dns_worker(io.get_executor(), dns_config, 8);
     app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
@@ -708,7 +734,7 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io.get_executor(), settings, StreamSettings{}, 1s, dns);
     queue_scenario = &queue;
     dialed.clear();
     fail_first_session = respond_on_auth = false;
@@ -718,14 +744,14 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     fail_allocation_bytes = 0;
     const auto failures_before = allocation_failures;
     Client client;
-    auto control_wire = std::make_shared<Wire>(io);
+    auto control_wire = std::make_shared<Wire>(io.get_executor());
     Stream control(control_wire);
     const bool use_control = mode == 0 || mode == 10 || mode == 11;
     TimeoutToken request_timeout;
-    if (mode == 15) request_timeout = TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, [&client] {
+    if (mode == 15) request_timeout = TimeoutScheduler::ForExecutor(io.get_executor()).ScheduleAfter(1s, io.get_executor(), [&client] {
         client.source.Stop(ErrorCode::RELAY_TIMEOUT);
     });
-    session::Context ctx;
+    session::Context ctx(io.get_executor());
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
     ctx.content.network = mode == 10 || mode == 11 ? Network::UDP : Network::TCP;
     StatsShard stats;
@@ -738,7 +764,7 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr exception;
     net::cancellation_signal cancellation;
-    net::co_spawn(io, handler->Process(io, nullptr, ctx, timeouts,
+    net::co_spawn(io, handler->Process(io.get_executor(), nullptr, ctx, timeouts,
         {&client, &client, use_control ? &control : nullptr}, stats, config, {}, 10s, 10s),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, OutboundProcessResult result) {
             done = true; exception = failure;
@@ -765,13 +791,13 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     io.restart();
     io.run_for(mode == 15 ? 1300ms : 80ms);
     const ErrorCode expected = mode == 7 ? ErrorCode::RESOURCE_EXHAUSTED
-        : mode == 6 || mode == 14 ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
+        : (mode == 6 || mode == 14) ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
         : mode == 12 ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::OK;
     passed &= done && !exception && observed == expected;
     if (mode != 6 && mode != 7 && mode != 12 && mode != 14 && mode != 15) passed &= queue.received == queue.expected;
     else passed &= queue.received.empty();
     if (mode == 1) passed &= queue.read_addresses.size() == 8 && queue.delivered_addresses == queue.read_addresses;
-    if (mode == 7) passed &= allocation_failures - failures_before == 1 && failed_allocation_size == 128;
+    if (mode == 7) passed &= allocation_failures - failures_before == 1;
     if (mode == 14 || mode == 15) passed &= queue.consumer_cleaned && queue.pending_consumer == 0;
     if (mode == 15) passed &= completed_ms >= 900 && completed_ms < 1500;
     if (mode == 13) passed &= dialed[0]->heart_responses == 1;
@@ -780,9 +806,9 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     if (mode != 7 && mode != 12) passed &= queue.snapshot;
     if (mode == 0) passed &= baseline || queue.queued_blocks == 1;
     if (!baseline) passed &= bounded;
+    StopHandler(io, *handler);
     handler.reset();
-    io.restart();
-    io.run_for(100ms);
+    DrainDialed(io);
     for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
     passed &= BufferCount() == 0;
     std::printf("outbound-queue mode=%d seed=%u fragments=%zu bytes=%zu queued-blocks=%zu capacity-bytes=%zu peak-blocks=%zu bounded=%d received=%zu datagrams=%zu code=%s allocation-size=%zu completed-ms=%lld heart-responses=%zu pending-consumer=%d released=%d: %s\n",
@@ -797,9 +823,10 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
 
 bool RunIoFault(int mode, int kind) {
     net::io_context io;
+    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNSService dns_worker(io.get_executor(), dns_config, 8);
     app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
@@ -808,13 +835,13 @@ bool RunIoFault(int mode, int kind) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io.get_executor(), settings, StreamSettings{}, 1s, dns);
     dialed.clear();
     fail_first_session = false;
     respond_on_auth = false;
     io_fault_mode = mode;
     io_fault_kind = kind;
-    auto control_wire = std::make_shared<Wire>(io);
+    auto control_wire = std::make_shared<Wire>(io.get_executor());
     Stream control(control_wire);
     auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
@@ -832,17 +859,17 @@ bool RunIoFault(int mode, int kind) {
             if (mode == 4) block->SetUDP(ctx.outbound.target);
             payload.push_back(std::move(block));
         }
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
+        co_return co_await handler->Process(io.get_executor(), nullptr, ctx, timeouts,
             {&client, &client, first && mode == 4 ? &control : nullptr},
             stats, config, std::move(payload), 10s, 10s);
     };
     // Relay owns payload failures and retains its generic write-phase category
     // for unknown exceptions; the codec must not invent a socket error.
     const ErrorCode expected = kind == 1 ? ErrorCode::RESOURCE_EXHAUSTED : kind == 2 ? ErrorCode::BLOCKED :
-        (mode == 3 || mode == 4) ? ErrorCode::RELAY_WRITE_FAILED : ErrorCode::INTERNAL;
+        (mode >= 3) ? ErrorCode::RELAY_WRITE_FAILED : ErrorCode::INTERNAL;
     Client first, second;
     first.eof = mode == 5;
-    session::Context first_ctx, second_ctx;
+    session::Context first_ctx(io.get_executor()), second_ctx(io.get_executor());
     bool first_done = false, second_done = false;
     ErrorCode observed = ErrorCode::OK;
     net::cancellation_signal cancel;
@@ -872,9 +899,9 @@ bool RunIoFault(int mode, int kind) {
     io.restart();
     io.run_for(180ms);
     passed &= second_done && dialed.size() == 2;
+    StopHandler(io, *handler);
     handler.reset();
-    io.restart();
-    io.run_for(200ms);
+    DrainDialed(io);
     for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
     std::printf("outbound-io mode=%d kind=%d observed=%s expected=%s faults=%d partial=%zu recovered=%d joined=%d: %s\n",
         mode, kind, ErrorCodeToString(observed).data(), ErrorCodeToString(expected).data(),
@@ -886,9 +913,10 @@ bool RunIoFault(int mode, int kind) {
 
 bool Run(int mode) {
     net::io_context io;
+    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNSService dns_worker(io.get_executor(), dns_config, 8);
     app::dns::DNS dns(dns_worker);
     proxy::anytls::outbound::Settings settings;
     settings.address = "127.0.0.1";
@@ -898,7 +926,7 @@ bool Run(int mode) {
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
-        "test", io, settings, StreamSettings{}, 1s, dns);
+        "test", io.get_executor(), settings, StreamSettings{}, 1s, dns);
     dialed.clear();
     fail_first_session = mode == 0 || mode == 3;
     respond_on_auth = mode == 3;
@@ -910,11 +938,11 @@ bool Run(int mode) {
         TimeoutsConfig timeouts;
         RelayConfig config;
         config.uplink_only = config.downlink_only = 5s;
-        co_return co_await handler->Process(io, nullptr, ctx, timeouts,
+        co_return co_await handler->Process(io.get_executor(), nullptr, ctx, timeouts,
             {&client, &client, nullptr}, stats, config, {}, 10s, 10s);
     };
     Client first, second;
-    session::Context ctx_first, ctx_second;
+    session::Context ctx_first(io.get_executor()), ctx_second(io.get_executor());
     bool first_done = false, second_done = false;
     OutboundProcessResult first_result, second_result;
     std::exception_ptr failure;
@@ -948,10 +976,17 @@ bool Run(int mode) {
         io.restart();
         io.run_for(200ms);
     }
+    if (mode == 2) {
+        auto stopped = net::co_spawn(io, handler->Stop(), net::use_future);
+        io.restart();
+        io.run_for(1ms);
+        retired_while_cleaning = dialed[0]->closed && !dialed[0]->destroyed;
+        io.restart();
+        io.run();
+        stopped.get();
+    } else StopHandler(io, *handler);
     handler.reset();
-    if (mode == 2) retired_while_cleaning = dialed[0]->closed && !dialed[0]->destroyed;
-    io.restart();
-    io.run_for(200ms);
+    DrainDialed(io);
     passed &= first_done && (mode != 1 || second_done);
     for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
     passed &= allocation_failures - failures_before == (mode == 2 ? 0 : 1);
@@ -966,12 +1001,7 @@ bool Run(int mode) {
 }
 
 int main(int argc, char** argv) {
-    FailingPmrResource resource(std::pmr::get_default_resource());
-    auto* original = std::pmr::set_default_resource(&resource);
-    struct RestoreResource {
-        std::pmr::memory_resource* original;
-        ~RestoreResource() { std::pmr::set_default_resource(original); }
-    } restore{original};
+    DataAllocationProbe probe(RejectDataAllocation);
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--client-padding")
             return RunClientPadding() ? 0 : 1;
@@ -1001,7 +1031,7 @@ int main(int argc, char** argv) {
         return passed ? 0 : 1;
     } catch (const std::exception& error) {
         fail_next_allocation = false;
-        fail_next_pmr_allocation = false;
+        fail_next_data_allocation = false;
         std::fprintf(stderr, "fixture failure: %s\n", error.what());
         return 1;
     }

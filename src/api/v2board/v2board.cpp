@@ -57,7 +57,7 @@ namespace ssl = net::ssl;
 
 class APIClient final : public ::acpp::api::API {
 public:
-    APIClient(net::io_context& io_context, const ::acpp::api::Config& config,
+    APIClient(net::any_io_executor executor, const ::acpp::api::Config& config,
               ::acpp::app::dns::DNS& dns_service);
     ~APIClient() override;
 
@@ -258,7 +258,7 @@ net::awaitable<void> WriteHttpRequest(Stream& stream, const std::string& request
 static std::optional<UrlParts> ParseUrl(const std::string& url);
 
 struct APIClient::Impl {
-    Impl(net::io_context& io_context,
+    Impl(net::any_io_executor executor,
          const ::acpp::api::Config& config,
          ::acpp::app::dns::DNS& dns_service);
 
@@ -292,7 +292,7 @@ struct APIClient::Impl {
     net::awaitable<RuleListFetchResult> GetNodeRule();
     net::awaitable<bool> ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_results);
 
-    net::io_context& io_context_;
+    net::any_io_executor executor_;
     ::acpp::api::Config config_;
     UrlParts url_parts_;
     ::acpp::app::dns::DNS& dns_service_;
@@ -305,10 +305,10 @@ struct APIClient::Impl {
     std::unique_ptr<net::ssl::context> https_context_;
 };
 
-APIClient::Impl::Impl(net::io_context& io_context,
+APIClient::Impl::Impl(net::any_io_executor executor,
                       const ::acpp::api::Config& config,
                       ::acpp::app::dns::DNS& dns_service)
-    : io_context_(io_context)
+    : executor_(std::move(executor))
     , config_(config)
     , dns_service_(dns_service) {
 
@@ -539,7 +539,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
 
         std::string last_error;
         for (const auto& endpoint : endpoints) {
-            ssl::stream<tcp::socket> stream(io_context_, *ssl_ctx);
+            ssl::stream<tcp::socket> stream(executor_, *ssl_ctx);
             try {
                 if (url_parts_.literal_address) {
                     auto* verify_param = SSL_get0_param(stream.native_handle());
@@ -593,7 +593,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
         // HTTP
         std::string last_error;
         for (const auto& endpoint : endpoints) {
-            tcp::socket stream(io_context_);
+            tcp::socket stream(executor_);
             try {
                 co_await stream.async_connect(endpoint, net::use_awaitable);
             } catch (const std::exception& e) {
@@ -814,10 +814,10 @@ APIClient::Impl::ReportIllegal(const std::vector<::acpp::api::DetectResult>& det
     co_return true;
 }
 
-APIClient::APIClient(net::io_context& io_context,
+APIClient::APIClient(net::any_io_executor executor,
                      const ::acpp::api::Config& config,
                      ::acpp::app::dns::DNS& dns_service)
-    : impl_(std::make_unique<Impl>(io_context, config, dns_service)) {}
+    : impl_(std::make_unique<Impl>(std::move(executor), config, dns_service)) {}
 
 APIClient::~APIClient() = default;
 
@@ -862,10 +862,10 @@ APIClient::ReportIllegal(const std::vector<::acpp::api::DetectResult>& detect_re
 namespace acpp::api {
 
 std::unique_ptr<API> CreatePanelClient(
-    net::io_context& io_context,
+    net::any_io_executor executor,
     const Config& config,
     app::dns::DNS& dns_service) {
-    return std::make_unique<v2board::APIClient>(io_context, config, dns_service);
+    return std::make_unique<v2board::APIClient>(std::move(executor), config, dns_service);
 }
 
 }  // namespace acpp::api

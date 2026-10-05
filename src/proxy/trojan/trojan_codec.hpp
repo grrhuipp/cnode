@@ -38,7 +38,7 @@ enum class TrojanCommand : uint8_t {
 // Trojan 请求
 // ============================================================================
 struct TrojanRequest {
-    memory::ThreadLocalString password_hash;  // SHA224 密码哈希（十六进制，56字节）
+    memory::DataString password_hash;  // SHA224 密码哈希（十六进制，56字节）
     TrojanCommand             command;        // 命令
     TargetAddress             target;         // 目标地址
 

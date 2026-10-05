@@ -34,7 +34,7 @@ public:
         return prepared_outbounds_;
     }
 
-    uint32_t GetWorkers() const { return workers_; }
+    uint32_t GetIoThreads() const { return io_threads_; }
 
     // 配置目录路径（用于加载 geo 文件）
     const std::filesystem::path& GetConfigDir() const { return config_dir_; }
@@ -55,7 +55,7 @@ private:
     std::vector<PanelConfig> panels_;
     std::vector<StaticInboundConfig> static_inbounds_;
     std::vector<proxyman::outbound::PreparedOutboundConfig> prepared_outbounds_;
-    uint32_t workers_ = 0;  // 0 = CPU 核心数
+    uint32_t io_threads_ = 0;  // 0 = CPU 核心数
     std::filesystem::path config_dir_;
 };
 

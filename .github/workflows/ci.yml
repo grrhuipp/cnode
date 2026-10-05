@@ -9,6 +9,7 @@ on:
       - '.gitignore'
       - 'CMakeLists.txt'
       - 'cmake/**'
+      - 'vcpkg*.json'
       - 'README.md'
       - 'scripts/**/*.sh'
       - 'src/**/*.cpp'
@@ -21,6 +22,7 @@ on:
       - '.gitignore'
       - 'CMakeLists.txt'
       - 'cmake/**'
+      - 'vcpkg*.json'
       - 'README.md'
       - 'scripts/**/*.sh'
       - 'src/**/*.cpp'
@@ -95,6 +97,18 @@ jobs:
 
       - uses: actions/checkout@v6.0.3
 
+      - name: Bootstrap vcpkg
+        run: |
+          export VCPKG_ROOT="$RUNNER_TEMP/vcpkg"
+          export VCPKG_FORCE_SYSTEM_BINARIES=1
+          baseline=$(python3 -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          git -C "$VCPKG_ROOT" checkout "$baseline"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
+          echo "VCPKG_FORCE_SYSTEM_BINARIES=1" >> "$GITHUB_ENV"
+          echo "$VCPKG_ROOT" >> "$GITHUB_PATH"
+
       - name: Restore compiler cache
         uses: actions/cache/restore@v5.0.5
         with:
@@ -107,6 +121,7 @@ jobs:
           mkdir -p "$BUILD_DIR"
           ccache --zero-stats
           cmake -S . -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_BUILD_TESTS=ON \
@@ -130,6 +145,7 @@ jobs:
 
       - name: Test
         run: |
+          ulimit -n 8192
           ctest --test-dir "$BUILD_DIR" --no-tests=error --output-on-failure \
             --parallel "$(nproc)" --output-junit "$PWD/$BUILD_DIR/test-results.xml"
 

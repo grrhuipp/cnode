@@ -106,7 +106,7 @@ private:
     }
 
     std::array<net::const_buffer, StackCapacity> stack_{};
-    memory::ThreadLocalVector<net::const_buffer> spill_;
+    memory::DataVector<net::const_buffer> spill_;
     size_t count_ = 0;
 };
 

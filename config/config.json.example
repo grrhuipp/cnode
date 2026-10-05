@@ -1,12 +1,11 @@
 {
   "log": {
     "loglevel": "info",
-    "access": "/var/log/cnode/access.log",
-    "error": "/var/log/cnode/error.log",
-    "logDir": "/var/log/cnode",
+    "access": "access.log",
+    "error": "error.log",
     "enable": false
   },
-  "workers": 0,
+  "ioThreads": 0,
   "dns": {
     "servers": ["8.8.8.8", "1.1.1.1:53"],
     "timeout": 5,

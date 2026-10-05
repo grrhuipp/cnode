@@ -20,7 +20,7 @@
 #include <span>
 #include <format>
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <utility>
 
@@ -28,38 +28,6 @@ namespace acpp {
 
 namespace {
 
-class TrojanOnlineSession {
-public:
-    TrojanOnlineSession(::acpp::trojan::Validator& manager,
-                        std::string_view tag,
-                        uint64_t user_id,
-                        std::string_view client_ip)
-        : manager_(&manager)
-        , tag_(tag)
-        , user_id_(user_id)
-        , client_ip_(client_ip) {}
-
-    ~TrojanOnlineSession() noexcept {
-        if (!manager_ || user_id_ == 0) {
-            return;
-        }
-        try {
-            manager_->OnUserDisconnected(tag_, user_id_, client_ip_);
-        } catch (...) {
-        }
-    }
-
-    TrojanOnlineSession(const TrojanOnlineSession&) = delete;
-    TrojanOnlineSession& operator=(const TrojanOnlineSession&) = delete;
-    TrojanOnlineSession(TrojanOnlineSession&&) = delete;
-    TrojanOnlineSession& operator=(TrojanOnlineSession&&) = delete;
-
-private:
-    ::acpp::trojan::Validator* manager_;
-    memory::ThreadLocalString tag_;
-    uint64_t user_id_;
-    memory::ThreadLocalString client_ip_;
-};
 
 
 // ============================================================================
@@ -129,27 +97,29 @@ private:
 
 proxy::trojan::inbound::Handler::Handler(
     ::acpp::trojan::Validator& validator,
-    StatsShard& stats,
+    UserOnlineTracker& online,
     ConnectionLimiterPtr limiter)
-    : validator_(validator)
-    , stats_(&stats)
+    : Inbound(online)
+    , validator_(validator)
     , limiter_(std::move(limiter))
 {}
 
 net::awaitable<RelayResult>
-proxy::trojan::inbound::Handler::Process(
+proxy::trojan::inbound::Handler::ProcessSession(
     std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
+    StatsShard& stats,
+    UserOnlineLease& online,
     const TimeoutsConfig& timeouts,
     uint32_t /*pressure_idle_timeout*/)
 {
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        stats.OnError();
         RelayResult result;
         result.error = error;
         return result;
@@ -164,13 +134,13 @@ proxy::trojan::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        (co_await limiter_->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
-    std::optional<TrojanOnlineSession> user_session;
+
 
     buf::BufferGuard handshake_guard{buf::Buffer::New()};
     if (!handshake_guard) {
@@ -178,7 +148,7 @@ proxy::trojan::inbound::Handler::Process(
     }
     uint8_t* handshake_buf = handshake_guard->Tail().data();
     const size_t handshake_capacity = handshake_guard->Available();
-    auto read_handshake = [&]() -> net::awaitable<std::expected<size_t, ErrorCode>> {
+    auto read_handshake = [&]() -> net::awaitable<tl::expected<size_t, ErrorCode>> {
         size_t n = 0;
         try {
             n = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
@@ -186,23 +156,23 @@ proxy::trojan::inbound::Handler::Process(
             if (stream->ConsumePhaseDeadline()) {
                 LOG_CONN_WARN(ctx, "[Trojan][{}] handshake phase deadline from {}",
                                   ctx.inbound.tag, ctx.inbound.source_ip);
-                co_return std::unexpected(ErrorCode::TIMEOUT);
+                co_return tl::unexpected(ErrorCode::TIMEOUT);
             }
             LOG_CONN_WARN(ctx, "[Trojan][{}] handshake read failed from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
         if (n == 0 && stream->ConsumePhaseDeadline()) {
             LOG_CONN_WARN(ctx, "[Trojan][{}] handshake phase deadline from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return tl::unexpected(ErrorCode::TIMEOUT);
         }
         if (n == 0 && stream->ConsumeIdleTimeout()) {
             LOG_CONN_WARN(ctx, "[Trojan][{}] handshake idle timeout from {}",
                               ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return tl::unexpected(ErrorCode::TIMEOUT);
         }
-        if (n == 0) co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        if (n == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
         co_return n;
     };
     auto read_result = co_await read_handshake();
@@ -227,7 +197,7 @@ proxy::trojan::inbound::Handler::Process(
                       validator_.Size(),
                       validator_.SizeForTag(tag));
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
+            co_await limiter_->OnAuthFailTracked(std::string(tag), std::string(client_ip));
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
@@ -239,13 +209,11 @@ proxy::trojan::inbound::Handler::Process(
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
         tracked_uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        if (!(co_await online.Acquire(std::string(tag), tracked_uid, std::string(ctx.inbound.source_ip), profile.device_limit))) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, tracked_uid));
+                profile.device_limit);
             co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
     }
@@ -254,8 +222,6 @@ proxy::trojan::inbound::Handler::Process(
     user_info.reset();
 
     // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-    validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
-    user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
 
     LOG_CONN_DEBUG(ctx, "[Trojan][{}] auth ok: {} -> {} user={}",
                    tag, client_ip, request->target, ctx.inbound.user_email);
@@ -281,13 +247,13 @@ proxy::trojan::inbound::Handler::Process(
         TrojanUdpReader udp_reader(*stream, leftover);
         TrojanUdpWriter udp_writer(*stream);
         co_return co_await dispatcher.Dispatch(
-            io_context,
+            executor,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
             InitialPayload{},
             ctx,
-            *stats_,
+            stats,
             timeouts);
     }
 
@@ -298,13 +264,13 @@ proxy::trojan::inbound::Handler::Process(
 
     auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
-        io_context,
+        executor,
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
         std::move(first_packet),
         ctx,
-        *stats_,
+        stats,
         timeouts);
 }
 
@@ -316,11 +282,6 @@ proxy::trojan::inbound::Handler::Process(
 namespace {
 class TrojanRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
-
     acpp::trojan::Validator validator;
 };
 
@@ -328,14 +289,14 @@ const bool kTrojanInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Trojan;
 
-    reg.create_runtime = []() -> std::unique_ptr<
+    reg.create_runtime = []([[maybe_unused]] acpp::net::any_io_executor executor) -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
         return std::make_unique<TrojanRuntime>();
     };
 
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
+           acpp::UserOnlineTracker& online,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest&) -> std::unique_ptr<acpp::Inbound> {
             auto* trojan_runtime = dynamic_cast<TrojanRuntime*>(&runtime);
@@ -344,7 +305,7 @@ const bool kTrojanInboundRegistered = [] {
             }
             return std::make_unique<acpp::proxy::trojan::inbound::Handler>(
                 trojan_runtime->validator,
-                stats,
+                online,
                 limiter);
         };
 

@@ -6,22 +6,21 @@
 namespace acpp {
 
 // ============================================================================
-// ShardedStats 实现
+// StatsSampler implementation
 // ============================================================================
 
-ShardedStats::ShardedStats(uint32_t num_workers)
-    : shards_(num_workers)
-    , last_sample_time_(steady_clock::now()) {
+StatsSampler::StatsSampler()
+    : last_sample_time_(steady_clock::now()) {
     // samples_ 默认初始化（valid = false），无需额外处理
 }
 
-StatsSnapshot ShardedStats::WithCurrentRate(StatsSnapshot snapshot) const {
+StatsSnapshot StatsSampler::WithCurrentRate(StatsSnapshot snapshot) const {
     snapshot.bytes_in_rate  = current_in_rate_;
     snapshot.bytes_out_rate = current_out_rate_;
     return snapshot;
 }
 
-void ShardedStats::SampleNow(const StatsSnapshot& snapshot) {
+void StatsSampler::SampleNow(const StatsSnapshot& snapshot) {
     auto now = steady_clock::now();
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - last_sample_time_).count();

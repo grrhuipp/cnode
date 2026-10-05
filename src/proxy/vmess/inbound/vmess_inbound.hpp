@@ -17,22 +17,23 @@ namespace acpp::proxy::vmess::inbound {
 class Handler final : public ::acpp::Inbound {
 public:
     Handler(::acpp::vmess::TimedUserValidator& validator,
-            ::acpp::StatsShard& stats,
+            ::acpp::UserOnlineTracker& online,
             ::acpp::ConnectionLimiterPtr limiter);
 
     // 从已建立的传输流解析 VMess AEAD 头，完成用户认证，填充 ctx
-    ::acpp::net::awaitable<::acpp::RelayResult> Process(
+    ::acpp::net::awaitable<::acpp::RelayResult> ProcessSession(
         std::unique_ptr<::acpp::AsyncStream> stream,
         ::acpp::routing::Dispatcher& dispatcher,
         const ::acpp::proxyman::inbound::ReceiverSettings& receiver,
-        ::acpp::net::io_context& io_context,
+        ::acpp::net::any_io_executor executor,
         ::acpp::session::Context& ctx,
+        ::acpp::StatsShard& stats,
+        ::acpp::UserOnlineLease& online,
         const ::acpp::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
     ::acpp::vmess::TimedUserValidator& validator_;
-    ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
 };
 

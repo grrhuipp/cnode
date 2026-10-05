@@ -51,9 +51,8 @@ struct LocalStatsAccumulator {
 };
 
 // ============================================================================
-// 优化的统计分片（64 字节对齐）
-//
-// 热点数据（频繁更新）和冷数据（偶尔更新）分离
+// Connection-local statistics. A physical session owns one instance and
+// submits its final snapshot to the runtime owner strand.
 // ============================================================================
 
 // 热点数据 - 流量统计（每次 I/O 都更新）
@@ -136,16 +135,11 @@ struct alignas(64) StatsShard {
 };
 
 // ============================================================================
-// 优化的分片统计管理器
+// Monitor-owned rate sampler. Aggregate counters belong to Runtime.
 // ============================================================================
-class ShardedStats {
+class StatsSampler {
 public:
-    explicit ShardedStats(uint32_t num_workers);
-
-    // 获取指定 worker 的分片
-    StatsShard& GetShard(uint32_t worker_id) {
-        return shards_[worker_id % shards_.size()];
-    }
+    StatsSampler();
 
     [[nodiscard]] StatsSnapshot WithCurrentRate(StatsSnapshot snapshot) const;
 
@@ -153,8 +147,6 @@ public:
     void SampleNow(const StatsSnapshot& snapshot);
 
 private:
-    std::vector<StatsShard> shards_;
-
     // 速率计算（10 秒滑动平均窗口）
     static constexpr size_t kWindowSize = 10;
 

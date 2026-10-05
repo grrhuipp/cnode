@@ -190,7 +190,7 @@ async def run_case(binary, output, protocol, mode):
             'address': 'udp-sink.test' if mode == 'dns_timeout' else '127.0.0.1',
             'port': peer_port, 'method': 'aes-128-gcm', 'password': 'secret'}]}
     configs = {
-        'config.json': {'workers': 1, 'timeouts': {'write': 1, 'connIdle': 30, 'downlinkOnly': 1},
+        'config.json': {'ioThreads': 1, 'timeouts': {'write': 1, 'connIdle': 30, 'downlinkOnly': 1},
                         'dns': {'servers': [dns_server], 'timeout': 10},
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [{'tag': 'udp-probe', 'protocol': 'vless', 'listen': '127.0.0.1',

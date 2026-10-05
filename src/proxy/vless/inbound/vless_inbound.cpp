@@ -27,7 +27,7 @@
 #include "acppnode/transport/link.hpp"
 
 #include <array>
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -40,38 +40,6 @@ namespace {
 
 using ::acpp::vless::VlessBufferedReader;
 
-class VlessOnlineSession {
-public:
-    VlessOnlineSession(::acpp::vless::Validator& manager,
-                       std::string_view tag,
-                       uint64_t user_id,
-                       std::string_view client_ip)
-        : manager_(&manager)
-        , tag_(tag)
-        , user_id_(user_id)
-        , client_ip_(client_ip) {}
-
-    ~VlessOnlineSession() noexcept {
-        if (!manager_ || user_id_ == 0) {
-            return;
-        }
-        try {
-            manager_->OnUserDisconnected(tag_, user_id_, client_ip_);
-        } catch (...) {
-        }
-    }
-
-    VlessOnlineSession(const VlessOnlineSession&) = delete;
-    VlessOnlineSession& operator=(const VlessOnlineSession&) = delete;
-    VlessOnlineSession(VlessOnlineSession&&) = delete;
-    VlessOnlineSession& operator=(VlessOnlineSession&&) = delete;
-
-private:
-    ::acpp::vless::Validator* manager_;
-    memory::ThreadLocalString tag_;
-    uint64_t user_id_ = 0;
-    memory::ThreadLocalString client_ip_;
-};
 
 class VlessPendingReader final : public transport::MultiBufferReader {
 public:
@@ -197,7 +165,7 @@ public:
         if (header_len_ > 0) {
             const size_t header_len = header_len_;
             std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity> stack_out{};
-            memory::ThreadLocalVector<net::const_buffer> spill_out;
+            memory::DataVector<net::const_buffer> spill_out;
             const bool use_spill = mb.size() > buf::MultiBuffer::kInlineCapacity;
             size_t stack_count = 0;
             header_len_ = 0;
@@ -237,7 +205,7 @@ public:
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (header_len_ > 0) {
             std::array<net::const_buffer, 1 + buf::MultiBuffer::kInlineCapacity> stack_out{};
-            memory::ThreadLocalVector<net::const_buffer> spill_out;
+            memory::DataVector<net::const_buffer> spill_out;
             const bool use_spill = buffers.size() > buf::MultiBuffer::kInlineCapacity;
             size_t stack_count = 0;
             if (use_spill) {
@@ -294,35 +262,39 @@ private:
 
 proxy::vless::inbound::Handler::Handler(
     ::acpp::vless::Validator& validator,
-    StatsShard& stats,
+    UserOnlineTracker& online,
     ConnectionLimiterPtr limiter,
+    net::any_io_executor service_executor,
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption)
-    : validator_(validator)
-    , stats_(&stats)
+    : Inbound(online)
+    , validator_(validator)
     , limiter_(std::move(limiter))
     , decryption_(std::move(decryption)) {
     if (decryption_) {
         decryption_tickets_ = std::make_unique<
-            ::acpp::vless::VlessEncryptionServerTicketStore>();
+            ::acpp::vless::VlessEncryptionServerTicketStore>(
+                std::move(service_executor));
     }
 }
 
 proxy::vless::inbound::Handler::~Handler() = default;
 
 net::awaitable<RelayResult>
-proxy::vless::inbound::Handler::Process(
+proxy::vless::inbound::Handler::ProcessSession(
     std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io_context,
+    net::any_io_executor executor,
     session::Context& ctx,
+    StatsShard& stats,
+    UserOnlineLease& online,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     const std::string_view tag = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
 
     auto fail = [&](ErrorCode error) {
-        stats_->OnError();
+        stats.OnError();
         RelayResult result;
         result.error = error;
         return result;
@@ -335,14 +307,14 @@ proxy::vless::inbound::Handler::Process(
     };
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        (co_await limiter_->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 
-    std::optional<VlessOnlineSession> user_session;
+
     std::array<uint8_t, 1024> handshake{};
     size_t total_read = 0;
     size_t consumed = 0;
@@ -442,7 +414,7 @@ proxy::vless::inbound::Handler::Process(
         LOG_NET_WARN("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
                       tag, client_ip, validator_.Size(), validator_.SizeForTag(tag));
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
+            co_await limiter_->OnAuthFailTracked(std::string(tag), std::string(client_ip));
         }
         co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
@@ -475,7 +447,7 @@ proxy::vless::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision &&
-        (!receiver.stream_settings.IsTlsLike() ||
+        (!receiver.stream_settings.IsTls() ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
         LOG_NET_WARN("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
                       tag, request->flow);
@@ -489,13 +461,11 @@ proxy::vless::inbound::Handler::Process(
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
         tracked_uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+        if (!(co_await online.Acquire(std::string(tag), tracked_uid, std::string(ctx.inbound.source_ip), profile.device_limit))) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, tracked_uid));
+                profile.device_limit);
             co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
     }
@@ -503,8 +473,6 @@ proxy::vless::inbound::Handler::Process(
     // Flow validation and metadata copy are complete; no credential is needed
     // by the request body or Vision's per-session UUID state.
     user_info.reset();
-    validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
-    user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
 
     Network net = Network::TCP;
     if (request->command == ::acpp::vless::Command::UDP) {
@@ -547,13 +515,13 @@ proxy::vless::inbound::Handler::Process(
     if (net == Network::MUX) {
         VlessPendingReader mux_reader(*active_reader, leftover);
         co_return co_await mux::ProcessInbound(
-            io_context,
+            executor,
             transport::Link{&mux_reader, active_writer},
             *stream,
             dispatcher,
             receiver.dispatch_policy,
             ctx,
-            *stats_,
+            stats,
             timeouts,
             pressure_idle_timeout);
     }
@@ -563,13 +531,13 @@ proxy::vless::inbound::Handler::Process(
             *active_reader, ctx.outbound.target, leftover, packet_addr_udp);
         VlessUdpWriter udp_writer(*active_writer, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
-            io_context,
+            executor,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
             InitialPayload{},
             ctx,
-            *stats_,
+            stats,
             timeouts);
     }
 
@@ -585,24 +553,24 @@ proxy::vless::inbound::Handler::Process(
             leftover);
         ::acpp::vless::VisionWriter vision_writer(*active_writer, request->uuid);
         co_return co_await dispatcher.Dispatch(
-            io_context,
+            executor,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&vision_reader, &vision_writer},
             InitialPayload{},
             ctx,
-            *stats_,
+            stats,
             timeouts);
     }
 
     co_return co_await dispatcher.Dispatch(
-        io_context,
+        executor,
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{active_reader, active_writer},
         std::move(first_packet),
         ctx,
-        *stats_,
+        stats,
         timeouts);
 }
 
@@ -611,11 +579,10 @@ proxy::vless::inbound::Handler::Process(
 namespace {
 class VlessRuntime final : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
-    [[nodiscard]] std::vector<acpp::OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const override {
-        return validator.GetOnlineDevices(tag);
-    }
+    explicit VlessRuntime(acpp::net::any_io_executor executor)
+        : executor(std::move(executor)) {}
 
+    acpp::net::any_io_executor executor;
     acpp::vless::Validator validator;
 };
 
@@ -634,14 +601,14 @@ const bool kVlessInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Vless;
 
-    reg.create_runtime = []() -> std::unique_ptr<
+    reg.create_runtime = [](acpp::net::any_io_executor executor) -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
-        return std::make_unique<VlessRuntime>();
+        return std::make_unique<VlessRuntime>(std::move(executor));
     };
 
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::StatsShard& stats,
+           acpp::UserOnlineTracker& online,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
@@ -652,8 +619,9 @@ const bool kVlessInboundRegistered = [] {
             }
             return std::make_unique<acpp::proxy::vless::inbound::Handler>(
                 vless_runtime->validator,
-                stats,
+                online,
                 limiter,
+                vless_runtime->executor,
                 settings->decryption);
         };
 
