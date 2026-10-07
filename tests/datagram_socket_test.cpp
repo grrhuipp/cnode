@@ -2,7 +2,6 @@
 
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link_error.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -23,19 +22,6 @@ namespace {
 using namespace std::chrono_literals;
 using acpp::transport::internet::DatagramSocket;
 using acpp::transport::internet::ReceivedDatagram;
-
-class SchedulerScope final {
-public:
-    explicit SchedulerScope(acpp::net::any_io_executor executor)
-        : executor_(std::move(executor)) {
-        acpp::TimeoutScheduler::Install(executor_);
-    }
-    ~SchedulerScope() {
-        acpp::TimeoutScheduler::ReleaseForExecutor(executor_);
-    }
-private:
-    acpp::net::any_io_executor executor_;
-};
 
 acpp::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
     acpp::buf::MultiBuffer payload;
@@ -79,11 +65,10 @@ acpp::net::awaitable<void> SendEmptyRaw(
 
 bool TestIndependentBindingsAndLargeScatter() {
     acpp::net::io_context io;
-    SchedulerScope scheduler_scope(io.get_executor());
-    DatagramSocket receiver(io.get_executor(), acpp::net::ip::address_v4::loopback());
-    DatagramSocket sender(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
     const auto target = receiver.LocalEndpoint();
-    if (target.port() == sender.LocalEndpoint().port())
+    if (target.port() == sender.LocalEndpoint().port() || DatagramSocket::ActiveCount() < 2)
         return false;
 
     std::vector<uint8_t> bytes(60000);
@@ -150,9 +135,9 @@ bool TestIndependentBindingsAndLargeScatter() {
 
 bool TestZeroLengthAndCancellationIsolation() {
     acpp::net::io_context io;
-    SchedulerScope scheduler_scope(io.get_executor());
-    DatagramSocket first(io.get_executor(), acpp::net::ip::address_v4::loopback());
-    DatagramSocket second(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket first(io, acpp::net::ip::address_v4::loopback());
+    DatagramSocket second(io, acpp::net::ip::address_v4::loopback());
+    const auto count = DatagramSocket::ActiveCount();
 
     auto cancelled_read = first.StartRead();
     auto cancelled_future = acpp::net::co_spawn(io, cancelled_read.Receive(), acpp::net::use_future);
@@ -173,16 +158,15 @@ bool TestZeroLengthAndCancellationIsolation() {
     }
     const auto packet = live_future.get();
     if (!cancelled || !packet.payload.empty() || packet.source.address().is_v6() ||
-        first.IsIPv6() || second.IsIPv6())
+        DatagramSocket::ActiveCount() != count || first.IsIPv6() || second.IsIPv6())
         return false;
     first.Close();
-    return second.LocalEndpoint().port() != 0;
+    return DatagramSocket::ActiveCount() == count - 1 && second.LocalEndpoint().port() != 0;
 }
 
 bool TestParentCancellationPropagation() {
     acpp::net::io_context io;
-    SchedulerScope scheduler_scope(io.get_executor());
-    DatagramSocket socket(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket socket(io, acpp::net::ip::address_v4::loopback());
     acpp::net::cancellation_signal parent_cancel;
     auto future = acpp::net::co_spawn(io, ParentRead(socket),
         acpp::net::bind_cancellation_slot(parent_cancel.slot(), acpp::net::use_future));
@@ -207,10 +191,9 @@ bool TestParentCancellationPropagation() {
 
 bool TestIPv6MaximumAndFamilyValidation() {
     acpp::net::io_context io;
-    SchedulerScope scheduler_scope(io.get_executor());
-    DatagramSocket receiver(io.get_executor(), acpp::net::ip::address_v6::loopback());
-    DatagramSocket sender(io.get_executor(), acpp::net::ip::address_v6::loopback());
-    DatagramSocket v4(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, acpp::net::ip::address_v6::loopback());
+    DatagramSocket sender(io, acpp::net::ip::address_v6::loopback());
+    DatagramSocket v4(io, acpp::net::ip::address_v4::loopback());
     std::vector<uint8_t> bytes(65527, 0xA5);
     auto read = receiver.StartRead();
     auto receiving = acpp::net::co_spawn(io, read.Receive(), acpp::net::use_future);
@@ -251,10 +234,10 @@ bool TestIPv6MaximumAndFamilyValidation() {
 }
 
 bool TestCloseAndReadScopeTimeout() {
+    const auto baseline = DatagramSocket::ActiveCount();
     acpp::net::io_context io;
-    SchedulerScope scheduler_scope(io.get_executor());
-    DatagramSocket receiver(io.get_executor(), acpp::net::ip::address_v4::loopback());
-    DatagramSocket sender(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket receiver(io, acpp::net::ip::address_v4::loopback());
+    DatagramSocket sender(io, acpp::net::ip::address_v4::loopback());
     receiver.SetReadTimeout(1s);
     auto operation = receiver.StartRead();
     auto first = acpp::net::co_spawn(io, operation.Receive(), acpp::net::use_future);
@@ -277,7 +260,7 @@ bool TestCloseAndReadScopeTimeout() {
     catch (const acpp::transport::LinkError&) { timed_out = true; }
     if (!timed_out || !receiver.ConsumeReadTimeout()) return false;
 
-    DatagramSocket closed(io.get_executor(), acpp::net::ip::address_v4::loopback());
+    DatagramSocket closed(io, acpp::net::ip::address_v4::loopback());
     auto pending = closed.StartRead();
     auto pending_future = acpp::net::co_spawn(io, pending.Receive(), acpp::net::use_future);
     io.restart();
@@ -288,7 +271,30 @@ bool TestCloseAndReadScopeTimeout() {
     bool closed_error = false;
     try { (void)pending_future.get(); }
     catch (const acpp::transport::LinkError&) { closed_error = true; }
-    return closed_error;
+    return closed_error && DatagramSocket::ActiveCount() == baseline + 1;
+}
+bool TestSocketLimitAndReclamation() {
+    constexpr std::size_t limit = 4096;
+    const auto baseline = DatagramSocket::ActiveCount();
+    if (baseline >= limit) return false;
+    acpp::net::io_context io;
+    std::vector<std::unique_ptr<DatagramSocket>> sockets;
+    sockets.reserve(limit - baseline);
+    for (std::size_t i = baseline; i < limit; ++i)
+        sockets.push_back(std::make_unique<DatagramSocket>(io, acpp::net::ip::address_v4::loopback()));
+    bool rejected = false;
+    try { DatagramSocket extra(io, acpp::net::ip::address_v4::loopback()); }
+    catch (const acpp::transport::LinkError& error) {
+        rejected = error.code() == acpp::ErrorCode::RESOURCE_EXHAUSTED;
+    }
+    if (!rejected || DatagramSocket::ActiveCount() != limit) return false;
+    sockets.pop_back();
+    {
+        DatagramSocket replacement(io, acpp::net::ip::address_v4::loopback());
+        if (DatagramSocket::ActiveCount() != limit) return false;
+    }
+    sockets.clear();
+    return DatagramSocket::ActiveCount() == baseline;
 }
 }  // namespace
 
@@ -299,9 +305,11 @@ int main() {
         const bool parent_cancel = TestParentCancellationPropagation();
         const bool ipv6 = TestIPv6MaximumAndFamilyValidation();
         const bool timeout_close = TestCloseAndReadScopeTimeout();
-        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d\n",
-                    bindings, cancel, parent_cancel, ipv6, timeout_close);
-        return bindings && cancel && parent_cancel && ipv6 && timeout_close ? 0 : 1;
+        const bool limit = TestSocketLimitAndReclamation();
+        const bool reclaimed = DatagramSocket::ActiveCount() == 0;
+        std::printf("datagram socket: bindings=%d cancel=%d parent_cancel=%d ipv6=%d timeout_close=%d limit=%d reclaimed=%d\n",
+                    bindings, cancel, parent_cancel, ipv6, timeout_close, limit, reclaimed);
+        return bindings && cancel && parent_cancel && ipv6 && timeout_close && limit && reclaimed ? 0 : 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "datagram socket test exception: %s\n", error.what());
         return 1;

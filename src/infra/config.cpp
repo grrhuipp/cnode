@@ -1047,21 +1047,124 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     return cfg;
 }
 
+RealityConfig RealityConfig::FromJson(const json::object& j) {
+    RealityConfig cfg;
+    cfg.show = jbool(j, {"show"}, false);
+    cfg.type = lower_ascii_copy(jstr(j, "type", ""));
+    if (j.contains("dest") || j.contains("target")) {
+        throw std::invalid_argument(
+            "REALITY dest/target is not supported; target fallback for "
+            "unauthenticated handshakes is not implemented");
+    }
+    auto xver = ParseAliasedJsonUint64(j, {"xver"}, 2);
+    if (!xver) {
+        throw std::invalid_argument(std::move(xver.error()));
+    }
+    if (xver->value_or(0) != 0) {
+        throw std::invalid_argument(
+            "REALITY xver 1 and 2 are not supported; PROXY protocol forwarding "
+            "to the REALITY target is not implemented");
+    }
+    cfg.server_names = jstr_array(j, {"serverNames"});
+    const std::string private_key =
+        jstr(j, {"privateKey"}, "");
+    if (!private_key.empty()) {
+        auto parsed = transport::internet::ParseRealityKey(private_key);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY privateKey is invalid");
+        }
+        cfg.private_key = *parsed;
+    }
+    const auto short_ids = jstr_array(j, {"shortIds"});
+    cfg.short_ids.reserve(short_ids.size());
+    for (const auto& short_id : short_ids) {
+        auto parsed = transport::internet::ParseRealityShortId(short_id);
+        if (!parsed) {
+            throw std::invalid_argument(
+                "REALITY shortIds contains an invalid value");
+        }
+        cfg.short_ids.push_back(*parsed);
+    }
+    const auto min_client_version = transport::internet::ParseRealityClientVersion(
+        jstr(j, {"minClientVer"}, ""));
+    if (!min_client_version) {
+        throw std::invalid_argument("REALITY minClientVer is invalid");
+    }
+    cfg.min_client_version = *min_client_version;
+
+    const auto max_client_version = transport::internet::ParseRealityClientVersion(
+        jstr(j, {"maxClientVer"}, ""));
+    if (!max_client_version) {
+        throw std::invalid_argument("REALITY maxClientVer is invalid");
+    }
+    cfg.max_client_version = *max_client_version;
+    if (cfg.min_client_version && cfg.max_client_version &&
+        transport::internet::RealityClientVersionValue(*cfg.min_client_version) >
+            transport::internet::RealityClientVersionValue(
+                *cfg.max_client_version)) {
+        throw std::invalid_argument(
+            "REALITY minClientVer must not exceed maxClientVer");
+    }
+    auto max_time_diff = ParseAliasedJsonUint64(
+        j, {"maxTimeDiff"});
+    if (!max_time_diff) {
+        throw std::invalid_argument(std::move(max_time_diff.error()));
+    }
+    cfg.max_time_diff = max_time_diff->value_or(0);
+    if (j.contains("mldsa65Seed") || j.contains("mldsa65_seed") ||
+        j.contains("mldsa65Verify") || j.contains("mldsa65_verify")) {
+        throw std::invalid_argument(
+            "REALITY ML-DSA-65 certificate signing and verification are not "
+            "supported");
+    }
+    if (j.contains("fingerprint")) {
+        throw std::invalid_argument(
+            "REALITY fingerprint is not supported; ClientHello fingerprint "
+            "emulation is not implemented");
+    }
+    cfg.server_name = jstr(j, {"serverName"}, "");
+    const std::string public_key = jstr(
+        j, {"publicKey"}, "");
+    if (!public_key.empty()) {
+        auto parsed = transport::internet::ParseRealityKey(public_key);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY publicKey is invalid");
+        }
+        cfg.public_key = *parsed;
+    }
+    auto short_id = transport::internet::ParseRealityShortId(
+        jstr(j, {"shortId"}, ""));
+    if (!short_id) {
+        throw std::invalid_argument("REALITY shortId is invalid");
+    }
+    cfg.short_id = *short_id;
+    if (j.contains("spiderX") || j.contains("spider_x")) {
+        throw std::invalid_argument(
+            "REALITY spiderX/spider_x is not supported; the REALITY crawler "
+            "is not implemented");
+    }
+    cfg.master_key_log = jstr(
+        j, {"masterKeyLog"}, "");
+    return cfg;
+}
+
 StreamSettings StreamSettings::FromJson(
     const json::object& j, StreamEndpointRole role) {
     StreamSettings cfg;
+    bool min_version_declared = false;
+    bool max_version_declared = false;
 
     cfg.network  = lower_ascii_copy(
         jstr(j, "network",  std::string(constants::protocol::kTcp)));
     cfg.security = lower_ascii_copy(
         jstr(j, "security", std::string(constants::protocol::kNone)));
 
-    if (cfg.security == "reality" || j.contains("realitySettings")) {
-        throw std::invalid_argument("REALITY is not supported");
-    }
-
     // TLS 配置
     if (const auto* tls = optional_object(j, {"tlsSettings"})) {
+        min_version_declared =
+            tls->contains("minVersion");
+        max_version_declared =
+            tls->contains("maxVersion");
         cfg.tls.min_version = ParseTlsVersion(
             jstr(*tls, {"minVersion"}, "1.2"),
             "minVersion");
@@ -1145,6 +1248,44 @@ StreamSettings StreamSettings::FromJson(
             cfg.tls.cert_file = std::move(direct_cert_file);
             cfg.tls.key_file = std::move(direct_key_file);
         }
+    }
+
+    if (const auto* reality = optional_object(
+            j, {"realitySettings"})) {
+        cfg.reality = RealityConfig::FromJson(*reality);
+    }
+    if (cfg.security == constants::protocol::kReality) {
+        if ((min_version_declared &&
+             cfg.tls.min_version != TlsVersion::V1_3) ||
+            (max_version_declared &&
+             cfg.tls.max_version != TlsVersion::V1_3)) {
+            throw std::invalid_argument(
+                "reality requires TLS minVersion and maxVersion 1.3");
+        }
+        cfg.tls.min_version = TlsVersion::V1_3;
+        cfg.tls.max_version = TlsVersion::V1_3;
+        if (role == StreamEndpointRole::Outbound) {
+            if (!cfg.reality.public_key) {
+                throw std::invalid_argument(
+                    "outbound REALITY requires publicKey");
+            }
+        } else {
+            if (!cfg.reality.private_key) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires privateKey");
+            }
+            if (cfg.reality.server_names.empty()) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires at least one serverName");
+            }
+            if (cfg.reality.short_ids.empty()) {
+                throw std::invalid_argument(
+                    "inbound REALITY requires at least one shortId");
+            }
+        }
+    }
+    if (cfg.tls.server_name.empty() && !cfg.reality.server_name.empty()) {
+        cfg.tls.server_name = cfg.reality.server_name;
     }
 
     // WS 配置
@@ -1426,14 +1567,10 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
             cfg.log_ = LogConfig::FromJson(*log);
         }
 
-        if (j.contains("workers")) {
-            throw std::invalid_argument(
-                "workers is no longer supported; use ioThreads");
-        }
-        cfg.io_threads_ = juint32(j, {"ioThreads"}, cfg.io_threads_);
-        if (cfg.io_threads_ > defaults::kMaxIoThreads) {
+        cfg.workers_ = juint32(j, {"workers"}, cfg.workers_);
+        if (cfg.workers_ > defaults::kMaxWorkers) {
             throw std::invalid_argument(std::format(
-                "ioThreads must be between 0 and {}", defaults::kMaxIoThreads));
+                "workers must be between 0 and {}", defaults::kMaxWorkers));
         }
 
         if (const auto* dns = optional_object(j, {"dns"})) {
@@ -1464,11 +1601,11 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
         };
         parse_panels("panels");
 
-        // I/O 线程默认值
-        if (cfg.io_threads_ == 0) {
-            cfg.io_threads_ = std::thread::hardware_concurrency();
-            if (cfg.io_threads_ == 0) {
-                cfg.io_threads_ = 1;  // 至少 1 个
+        // Workers 默认值
+        if (cfg.workers_ == 0) {
+            cfg.workers_ = std::thread::hardware_concurrency();
+            if (cfg.workers_ == 0) {
+                cfg.workers_ = 1;  // 至少 1 个
             }
         }
 

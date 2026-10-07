@@ -4,7 +4,6 @@
 #include "acppnode/transport/internet/proxy_protocol_mode.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 
-#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,7 +22,6 @@ namespace acpp::proxyman::inbound {
 // 热路径只读，Dispatcher 只接收其中的窄 DispatchPolicy。
 // ============================================================================
 struct ReceiverSettings {
-    uint64_t transport_scope_id = 0;
     std::string      inbound_tag;             // 主标签（map key）
     std::vector<std::string> inbound_tags;   // 所有标签（路由匹配任一）
     std::string      protocol;          // "vmess" / "trojan" 等协议名
@@ -31,7 +29,7 @@ struct ReceiverSettings {
     routing::DispatchPolicy dispatch_policy;
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto; // PROXY Protocol 处理模式
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
-    ConnectionLimiter* limiter = nullptr;      // 有界准入服务入口，runtime 生命周期覆盖它。
+    ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
         return has_route_inbound_tags ? &inbound_tags : nullptr;

@@ -5,13 +5,11 @@
 #include "acppnode/common/clock.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/common/network.hpp"
-#include "acppnode/runtime/channel.hpp"
 
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <memory>
-#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,35 +34,35 @@ enum class DnsResultState : uint8_t {
 };
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
-// 配置标签、协议与安全方式由会话按值持有。
+// 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
 struct Inbound {
     net::ip::address source_addr;
-    memory::DataString source_ip;
+    memory::ThreadLocalString source_ip;
     uint16_t source_port = 0;
     // Physical socket peer is retained separately from an effective client
     // address supplied by a trusted PROXY protocol or HTTP transport header.
-    memory::DataString peer_ip;
+    memory::ThreadLocalString peer_ip;
     uint16_t peer_port = 0;
-    memory::DataString client_ip_source = "socket";
+    memory::ThreadLocalString client_ip_source = "socket";
     bool client_ip_trusted = true;
 
     [[nodiscard]] bool HasProxyProtocolClientIP() const noexcept {
         return client_ip_source == "proxy_protocol" && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
-    memory::DataString tag;
-    memory::DataString protocol;
-    memory::DataVector<memory::DataString> tags;
+    memory::ThreadLocalString tag;
+    memory::ThreadLocalString protocol;
+    memory::ThreadLocalVector<memory::ThreadLocalString> tags;
     int64_t user_id = 0;
-    memory::DataString user_email;
+    memory::ThreadLocalString user_email;
     std::string_view transport;
-    memory::DataString security;
-    memory::DataString tls_sni;
-    memory::DataString tls_alpn;
-    memory::DataString tls_version;
-    memory::DataString tls_fingerprint;
-    memory::DataString http_host;
-    memory::DataString transport_route_id;
+    memory::ThreadLocalString security;
+    memory::ThreadLocalString tls_sni;
+    memory::ThreadLocalString tls_alpn;
+    memory::ThreadLocalString tls_version;
+    memory::ThreadLocalString tls_fingerprint;
+    memory::ThreadLocalString http_host;
+    memory::ThreadLocalString transport_route_id;
     uint64_t transport_handshake_ms = 0;
     int64_t transport_ready_at_unix_us = 0;
 };
@@ -86,22 +84,22 @@ struct Outbound {
     // remote field this is meaningful for direct and proxy next-hop sockets.
     std::optional<net::ip::address> connected_local_addr;
     uint16_t connected_local_port = 0;
-    memory::DataString route_rule;
+    memory::ThreadLocalString route_rule;
     uint64_t dns_latency_ms = 0;
     uint32_t dns_answer_count = 0;
     uint64_t dial_ms = 0;
     uint32_t dial_attempt_count = 0;
     std::vector<net::ip::address> dial_addresses;
     int32_t os_error_code = 0;
-    memory::DataString failure_detail_code;
+    memory::ThreadLocalString failure_detail_code;
     std::string_view tag;
 };
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
     Network network = Network::TCP;
-    memory::DataString protocol;
-    memory::DataString sniff_domain;
+    memory::ThreadLocalString protocol;
+    memory::ThreadLocalString sniff_domain;
     uint64_t speed_limit = 0;
     session::DnsResultState dns_result = session::DnsResultState::None;
     bool multiple_targets = false;
@@ -118,29 +116,12 @@ struct Traffic {
     uint64_t first_byte_ms = 0;
 };
 
-// The connection uses Local() only on its owner strand. Other services receive
-// a bounded value snapshot; they never retain a pointer into Context.
-class TrafficSource {
-public:
-    explicit TrafficSource(net::any_io_executor executor)
-        : channel_(std::move(executor), 2) {}
-    TrafficSource(const TrafficSource&) = delete;
-    TrafficSource& operator=(const TrafficSource&) = delete;
-    [[nodiscard]] Traffic& Local() noexcept { return traffic_; }
-    net::awaitable<Traffic> Snapshot() {
-        return channel_.Call([this] { return traffic_; });
-    }
-private:
-    ServiceChannel channel_;
-    Traffic traffic_;
-};
-
 struct Sockopt {
     int32_t mark = 0;
 };
 
 // Per-connection xray-style session metadata. The object itself stays
-// Session-owned; protocol, routing, outbound and relay code read/write the
+// Worker-local; protocol, routing, outbound and relay code read/write the
 // records directly instead of going through the old app-layer context shell.
 struct Context {
     // 连接标识
@@ -148,24 +129,22 @@ struct Context {
 
     Inbound inbound;
     Outbound outbound;
-    memory::DataVector<Outbound> outbounds;
+    memory::ThreadLocalVector<Outbound> outbounds;
     Content content;
-    std::shared_ptr<TrafficSource> traffic_owner;
-    Traffic& traffic;
+    Traffic traffic;
     std::optional<Sockopt> sockopt;
 
     // 接入时间戳（微秒，使用 steady_clock），用于访问日志。
     int64_t accept_time_us = 0;
 
+    uint32_t worker_id = 0;
     uint64_t parent_conn_id = 0;
     uint64_t stream_id = 0;
     uint64_t runtime_generation = 1;
     uint64_t config_generation = 1;
     uint64_t auth_ms = 0;
 
-    explicit Context(net::any_io_executor executor)
-        : traffic_owner(memory::AllocateShared<TrafficSource>(std::move(executor))),
-          traffic(traffic_owner->Local()) {
+    Context() {
         accept_time_us = NowMicros();
     }
 
@@ -175,20 +154,7 @@ struct Context {
     Context& operator=(Context&&) = delete;
 };
 
-inline constexpr uint64_t kConnectionIdStride =
-    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 2;
-inline constexpr uint64_t kMaxPhysicalSequence =
-    std::numeric_limits<uint64_t>::max() / kConnectionIdStride;
-
-// Physical IDs are allocated serially by the runtime owner. The gap reserves
-// one unique ID for every possible 16-bit logical stream of that connection.
-[[nodiscard]] constexpr ID PhysicalID(uint64_t sequence) noexcept {
-    return sequence * kConnectionIdStride;
-}
-
-[[nodiscard]] constexpr ID ChildID(ID physical_id, uint32_t stream_id) noexcept {
-    return physical_id + static_cast<uint64_t>(stream_id) + 1;
-}
+[[nodiscard]] ID NewID(uint32_t worker_id) noexcept;
 
 }  // namespace session
 

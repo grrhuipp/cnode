@@ -61,19 +61,19 @@ std::optional<UserProtocol> RegisteredUserProtocol(
 }
 
 std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol, net::any_io_executor executor) {
+    std::string_view protocol) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end() || !it->second.create_runtime) {
         return nullptr;
     }
-    return it->second.create_runtime(std::move(executor));
+    return it->second.create_runtime();
 }
 
 std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::UserOnlineTracker& online,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
@@ -81,13 +81,13 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
     if (it == registrations.end() || !it->second.create_tcp_handler) {
         return nullptr;
     }
-    return it->second.create_tcp_handler(runtime, online, limiter, req);
+    return it->second.create_tcp_handler(runtime, stats, limiter, req);
 }
 
 DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::UserOnlineTracker& online,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
@@ -99,7 +99,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
         return {DatagramHandlerBuildStatus::Unsupported, nullptr};
     }
     auto handler =
-        it->second.create_datagram_handler(runtime, online, limiter, req);
+        it->second.create_datagram_handler(runtime, stats, limiter, req);
     if (!handler) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }

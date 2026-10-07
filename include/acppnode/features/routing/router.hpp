@@ -22,7 +22,7 @@ struct RouteDecision {
     uint32_t rule_index = 0;
 };
 
-// Runtime-local, immutable rule lookup. Configuration and matcher construction
+// Worker-local, immutable rule lookup. Configuration and matcher construction
 // belong to the implementation's cold path; fallback belongs to Dispatcher.
 class Router {
 public:

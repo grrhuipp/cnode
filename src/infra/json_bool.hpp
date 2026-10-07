@@ -2,7 +2,7 @@
 
 #include "acppnode/infra/json.hpp"
 
-#include <tl/expected.hpp>
+#include <expected>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -10,7 +10,7 @@
 
 namespace acpp {
 
-[[nodiscard]] tl::expected<std::optional<bool>, std::string>
+[[nodiscard]] std::expected<std::optional<bool>, std::string>
 ParseAliasedJsonBool(
     const json::object& source,
     std::initializer_list<std::string_view> aliases);

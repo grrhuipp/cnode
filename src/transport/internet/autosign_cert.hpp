@@ -22,7 +22,7 @@ public:
     static constexpr size_t kMaxCachedCerts = 256;
     static constexpr auto kRotateInterval = std::chrono::minutes(5);
 
-    // Owned by one physical-session TLS context; strand-serialized.
+    // Owned by one Worker-local TLS context; not thread-safe by design.
     AutoSignState() = default;
     ~AutoSignState();
 

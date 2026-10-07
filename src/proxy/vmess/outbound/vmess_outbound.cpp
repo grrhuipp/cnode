@@ -159,7 +159,7 @@ proxy::vmess::outbound::Handler::Handler(std::string tag,
 
 net::awaitable<OutboundProcessResult>
 proxy::vmess::outbound::Handler::Process(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
@@ -168,9 +168,9 @@ proxy::vmess::outbound::Handler::Process(
     const RelayConfig& relay_config,
     buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) const {
+    std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const auto& target = ctx.outbound.target;
 
@@ -193,7 +193,7 @@ proxy::vmess::outbound::Handler::Process(
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
             LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", config_.address);
         }
-        co_return tl::unexpected(transport_target.error());
+        co_return std::unexpected(transport_target.error());
     }
 
     LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
@@ -201,12 +201,12 @@ proxy::vmess::outbound::Handler::Process(
                    config_.stream_settings.security,
                    config_.stream_settings.network);
 
-    auto dial_result = co_await DialOutboundTransport(executor, ctx, *transport_target);
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
+        co_return std::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -238,7 +238,7 @@ proxy::vmess::outbound::Handler::Process(
         LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
                       ctx.conn_id, ErrorCodeToString(code));
         stream->Cancel();
-        co_return tl::unexpected(outbound_protocol_deadline.Expired()
+        co_return std::unexpected(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : code);
     }
@@ -251,11 +251,11 @@ proxy::vmess::outbound::Handler::Process(
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
     if (inbound.control) {
         co_return co_await DoRelayLink(
-            executor, *inbound.reader, *inbound.writer, *inbound.control,
+            io_context, *inbound.reader, *inbound.writer, *inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
     co_return co_await DoRelayLink(
-        executor, *inbound.reader, *inbound.writer,
+        io_context, *inbound.reader, *inbound.writer,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
@@ -400,7 +400,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [vmess_config = std::move(vmess_config), user = std::move(*user)](
                 std::string_view tag,
-                acpp::net::any_io_executor /*executor*/,
+                acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_config = vmess_config;

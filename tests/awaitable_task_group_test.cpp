@@ -25,6 +25,26 @@ namespace net = acpp::net;
 using async_allocation_test::fail_after;
 using async_allocation_test::injected;
 
+class GroupResource final : public std::pmr::memory_resource {
+public:
+    std::atomic<size_t> live{0};
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        async_allocation_test::Check();
+        auto* result = upstream_.allocate(bytes, alignment);
+        live.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
+        upstream_.deallocate(pointer, bytes, alignment);
+        live.fetch_sub(1, std::memory_order_relaxed);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    acpp::memory::ThreadPoolFacade upstream_;
+};
+
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -263,7 +283,8 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 int main() {
-    const auto live = acpp::memory::live_data_allocations.load();
+    GroupResource resource;
+    auto* previous = std::pmr::set_default_resource(&resource);
     int result = 0;
     try {
         TestDynamicCancellation();
@@ -273,12 +294,14 @@ int main() {
         TestAllocationFailures();
         TestMoveOnlyStart();
         TestExecutor();
-        Check(acpp::memory::live_data_allocations.load() == live,
-              "all task bookkeeping must be released after cross-executor joins");
+        Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
+        Check(acpp::memory::CrossThreadFreeCount() == 0,
+              "group and child PMR objects must be freed on the target executor");
     } catch (const std::exception& error) {
         fail_after = -1;
         std::cerr << error.what() << '\n';
         result = 1;
     }
+    std::pmr::set_default_resource(previous);
     return result;
 }

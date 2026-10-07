@@ -2,7 +2,7 @@
 
 #include "acppnode/common/clock.hpp"
 
-#include <moodycamel/concurrentqueue.h>
+#include <concurrentqueue.h>
 #include <zlib.h>
 
 #include <array>
@@ -20,12 +20,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 namespace acpp {
 
@@ -139,6 +133,9 @@ std::string_view TransportInternetComponent(std::string_view relative) {
     }
     if (leaf.starts_with("tls") || leaf.starts_with("ssl")) {
         return "transport/internet/tls";
+    }
+    if (leaf.starts_with("reality")) {
+        return "transport/internet/reality";
     }
     if (leaf.starts_with("ws") || leaf.find("websocket") != std::string_view::npos) {
         return "transport/internet/websocket";
@@ -394,35 +391,6 @@ std::string LogExtension(const std::filesystem::path& configured_path) {
 
     auto extension = path_for_extension.extension().string();
     return extension.empty() ? ".log" : extension;
-}
-
-std::filesystem::path DefaultLogDirectory() {
-#if defined(_WIN32)
-    std::vector<wchar_t> buffer(256);
-    for (;;) {
-        const auto length = GetModuleFileNameW(
-            nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (length == 0) {
-            throw std::system_error(static_cast<int>(GetLastError()),
-                                    std::system_category(), "GetModuleFileNameW");
-        }
-        if (length < buffer.size()) {
-            return std::filesystem::canonical(
-                std::filesystem::path(buffer.data(), buffer.data() + length))
-                .parent_path() / "logs";
-        }
-        buffer.resize(buffer.size() * 2);
-    }
-#elif defined(__APPLE__)
-    uint32_t size = 256;
-    std::vector<char> buffer(size);
-    while (_NSGetExecutablePath(buffer.data(), &size) != 0) {
-        buffer.resize(size);
-    }
-    return std::filesystem::canonical(buffer.data()).parent_path() / "logs";
-#else
-    return std::filesystem::read_symlink("/proc/self/exe").parent_path() / "logs";
-#endif
 }
 
 std::filesystem::path ResolveConfiguredLogPath(
@@ -894,9 +862,8 @@ bool Log::Init(const std::string& level,
         min_level_.store(ParseLevel(level), std::memory_order_release);
 
         try {
-            const auto resolved_log_dir = log_dir.empty() ? DefaultLogDirectory() : log_dir;
             if (!g_async_log_backend.Start(
-                    resolved_log_dir, error_path, access_path, max_days, rotate_daily, gzip)) {
+                    log_dir, error_path, access_path, max_days, rotate_daily, gzip)) {
                 std::cerr << "Log initialization failed: cannot open access/error log files"
                           << std::endl;
                 return false;
@@ -921,7 +888,7 @@ bool Log::Init(const std::string& level,
                 level,
                 resolved_access_path.string(),
                 resolved_error_path.string(),
-                resolved_log_dir.string(),
+                log_dir.string(),
                 rotation,
                 compression,
                 max_days));
@@ -956,7 +923,7 @@ void Log::Flush() {
 
 void Log::WriteSystem(LogLevel level,
                       std::string message,
-                      std::string_view source_file) {
+                      std::source_location location) {
     if (!ShouldLog(level)) return;
     if (!initialized_.load(std::memory_order_acquire)) {
         if (level >= LogLevel::WARN) {
@@ -970,14 +937,14 @@ void Log::WriteSystem(LogLevel level,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
-        .source_file = std::string(source_file),
+        .source_file = location.file_name(),
         .connection = std::nullopt,
     });
 }
 
 void Log::WriteConnection(LogLevel level,
                           std::string message,
-                          std::string_view source_file) {
+                          std::source_location location) {
     if (!ShouldLog(level)) return;
     if (!initialized_.load(std::memory_order_acquire)) return;
 
@@ -986,7 +953,7 @@ void Log::WriteConnection(LogLevel level,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
-        .source_file = std::string(source_file),
+        .source_file = location.file_name(),
         .connection = std::nullopt,
     });
 }
@@ -994,7 +961,7 @@ void Log::WriteConnection(LogLevel level,
 void Log::WriteConnection(LogLevel level,
                           ConnectionLogContext context,
                           std::string message,
-                          std::string_view source_file) {
+                          std::source_location location) {
     if (!ShouldLog(level)) return;
     if (!initialized_.load(std::memory_order_acquire)) return;
 
@@ -1003,7 +970,7 @@ void Log::WriteConnection(LogLevel level,
         .level = level,
         .timestamp_us = NowMicros(),
         .message = std::move(message),
-        .source_file = std::string(source_file),
+        .source_file = location.file_name(),
         .connection = std::move(context),
     });
 }
@@ -1022,7 +989,7 @@ void Log::WriteAccess(std::string message) {
 
 void Log::WriteConsole(LogLevel level,
                        std::string message,
-                       [[maybe_unused]] std::string_view source_file) {
+                       [[maybe_unused]] std::source_location location) {
     std::lock_guard lock(g_console_mutex);
     if (message.empty()) {
         std::cout << std::endl;

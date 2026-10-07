@@ -14,20 +14,20 @@
 
 namespace acpp::app::dns {
 
-// All access, coroutine resumes and destruction belong to the DNS service strand. A shared
+// All access, coroutine resumes and destruction belong to one Worker. A shared
 // pending result owns the completion channel; no waiter pointers escape into
 // the registry and cancellation removes only the cancelling receive operation.
 class InflightResolves {
     struct Pending {
-        Pending(net::any_io_executor executor, std::string_view name)
-            : domain(name), completion(executor) {}
+        Pending(net::io_context& io_context, std::string_view name)
+            : domain(name), completion(io_context) {}
 
-        memory::DataString domain;
+        memory::ThreadLocalString domain;
         net::experimental::channel<void(IoErrorCode)> completion;
         std::optional<DnsResult> result;
     };
     using PendingPtr = std::shared_ptr<Pending>;
-    using Table = memory::DataUnorderedMap<std::string_view, PendingPtr>;
+    using Table = memory::ThreadLocalUnorderedMap<std::string_view, PendingPtr>;
 
     struct Completion {
         Table& table;
@@ -47,7 +47,7 @@ class InflightResolves {
     };
 
 public:
-    explicit InflightResolves(net::any_io_executor executor) : executor_(executor) {}
+    explicit InflightResolves(net::io_context& io_context) : io_context_(io_context) {}
     InflightResolves(const InflightResolves&) = delete;
     InflightResolves& operator=(const InflightResolves&) = delete;
 
@@ -65,7 +65,7 @@ public:
         }
 
         auto pending = std::allocate_shared<Pending>(
-            memory::DataAllocator<Pending>{}, executor_, domain);
+            memory::ThreadLocalAllocator<Pending>{}, io_context_, domain);
         table_.emplace(std::string_view(pending->domain), pending);
         Completion completion{table_, *pending};
 
@@ -77,7 +77,7 @@ public:
     }
 
 private:
-    net::any_io_executor executor_;
+    net::io_context& io_context_;
     Table table_;
 };
 

@@ -41,7 +41,7 @@ async def run(binary, output, mode):
                    "settings": {"clients": [{"id": str(USER)}]},
                    "sniffing": {"enabled": False}}
         values = {
-            "config.json": {"ioThreads": 1,
+            "config.json": {"workers": 1,
                 "timeouts": {"handshake": 5, "connIdle": 10, "write": 5,
                              "uplinkOnly": 2, "downlinkOnly": 2},
                 "log": {"enable": False, "logDir": (output / "logs").as_posix()}},

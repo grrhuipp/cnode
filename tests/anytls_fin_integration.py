@@ -171,7 +171,7 @@ class Frames:
 
 def configure(output, inbound, outbound):
     values = {
-        'config.json': {'ioThreads': 1, 'timeouts': {'handshake': 5, 'connIdle': 15,
+        'config.json': {'workers': 1, 'timeouts': {'handshake': 5, 'connIdle': 15,
                         'write': 5, 'uplinkOnly': 10, 'downlinkOnly': 10},
                         'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
         'inbounds.json': [dict(inbound, tag='fin-in')],

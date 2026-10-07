@@ -32,7 +32,7 @@ Handler::Handler(const std::string& tag,
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
-    net::any_io_executor /*executor*/,
+    net::io_context& /*io_context*/,
     const tcp::endpoint* /*inbound_local_addr*/,
     session::Context& ctx,
     const TimeoutsConfig& /*timeouts*/,
@@ -41,7 +41,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const RelayConfig& /*relay_config*/,
     buf::MultiBuffer first_payload,
     std::chrono::seconds /*relay_idle_timeout*/,
-    std::chrono::seconds /*relay_write_timeout*/) const {
+    std::chrono::seconds /*relay_write_timeout*/) {
     first_payload.clear();
     if (IsHttpResponse(settings_.response) && inbound.writer) {
         net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
@@ -54,7 +54,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
     }
     LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}", tag_, settings_.response);
-    co_return tl::unexpected(ErrorCode::BLOCKED);
+    co_return std::unexpected(ErrorCode::BLOCKED);
 }
 
 }  // namespace acpp::proxy::blackhole::outbound
@@ -80,7 +80,7 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [settings = std::move(settings)](
                 std::string_view tag,
-                acpp::net::any_io_executor /*executor*/,
+                acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& /*dns*/,
                 std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(

@@ -1,7 +1,8 @@
 #include "controller_impl.hpp"
+#include "../../common/awaitable_batch.hpp"
 
 #include "acppnode/app/traffic_types.hpp"
-#include "acppnode/runtime/runtime.hpp"
+#include "acppnode/app/worker.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/online_device.hpp"
 #include "acppnode/common/serverstatus.hpp"
@@ -17,26 +18,116 @@ namespace acpp {
 
 net::awaitable<std::vector<api::UserTraffic>>
 Controller::Impl::getTraffic(const std::string& tag) {
-    const auto snapshot = co_await runtime_.GetTraffic(tag);
+    using TrafficSnapshot = Worker::UserTrafficSnapshot;
+    std::vector<TrafficSnapshot> per_worker(workers_.size());
+
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers_.size());
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        tasks.push_back(
+            [](Worker* w, const std::string& t,
+               TrafficSnapshot& out) -> net::awaitable<void> {
+                out = co_await w->PostTask(w->GetTrafficTask(t));
+            }(workers_[i].get(), tag, per_worker[i])
+        );
+    }
+    co_await RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
+
+    size_t merged_hint = 0;
+    for (const auto& traffic : per_worker) {
+        merged_hint += traffic.size();
+    }
+
+    std::unordered_map<int64_t, api::UserTraffic> merged;
+    merged.reserve(merged_hint);
+    for (const auto& traffic : per_worker) {
+        for (const auto& [uid, t] : traffic) {
+            auto& m   = merged[uid];
+            m.UID      = uid;
+            m.Upload  += t.upload;
+            m.Download += t.download;
+        }
+    }
+
     std::vector<api::UserTraffic> result;
-    result.reserve(snapshot.size());
-    for (const auto& [uid, traffic] : snapshot) {
-        if (traffic.upload != 0 || traffic.download != 0)
-            result.push_back(api::UserTraffic{.UID = uid, .Email = {}, .Upload = static_cast<int64_t>(traffic.upload),
-                .Download = static_cast<int64_t>(traffic.download)});
+    result.reserve(merged.size());
+    for (const auto& [uid, td] : merged) {
+        if (td.Upload > 0 || td.Download > 0) {
+            result.push_back(td);
+        }
     }
     co_return result;
 }
 
 net::awaitable<controller::OnlineSnapshot>
 Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
-    auto devices = co_await runtime_.GetOnlineDevices(tag);
+    std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
+
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers_.size());
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        tasks.push_back(
+            [](Worker* w, const std::string& t,
+               std::vector<OnlineDevice>& out) -> net::awaitable<void> {
+                out = co_await w->PostTask(w->GetOnlineDeviceTask(t));
+            }(workers_[i].get(), tag, per_worker[i])
+        );
+    }
+    co_await RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
+
+    size_t total_online = 0;
+    for (const auto& online : per_worker) {
+        total_online += online.size();
+    }
+
+    std::vector<OnlineDevice> devices;
+    devices.reserve(total_online);
+    for (const auto& online : per_worker) {
+        devices.insert(devices.end(), online.begin(), online.end());
+    }
     co_return controller::BuildOnlineSnapshot(std::move(devices));
 }
 
 net::awaitable<std::vector<api::DetectResult>>
 Controller::Impl::GetDetectResult(const std::string& tag) {
-    co_return co_await runtime_.GetDetectResults(tag);
+    std::vector<std::vector<api::DetectResult>> per_worker(workers_.size());
+
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers_.size());
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        tasks.push_back(
+            [](Worker* w, const std::string& t,
+               std::vector<api::DetectResult>& out) -> net::awaitable<void> {
+                out = co_await w->PostTask(w->GetDetectResultTask(t));
+            }(workers_[i].get(), tag, per_worker[i])
+        );
+    }
+    co_await RunAwaitableBatch(
+        io_context_.get_executor(), std::move(tasks));
+
+    size_t total = 0;
+    for (const auto& results : per_worker) {
+        total += results.size();
+    }
+
+    std::vector<api::DetectResult> merged;
+    merged.reserve(total);
+    for (const auto& results : per_worker) {
+        for (const auto& result : results) {
+            const auto duplicate = std::find_if(
+                merged.begin(), merged.end(),
+                [&](const api::DetectResult& current) {
+                    return current.UID == result.UID &&
+                           current.RuleID == result.RuleID;
+                });
+            if (duplicate == merged.end()) {
+                merged.push_back(result);
+            }
+        }
+    }
+    co_return merged;
 }
 
 net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,

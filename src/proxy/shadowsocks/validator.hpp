@@ -20,17 +20,17 @@ namespace acpp::ss {
 // 对齐 xray-core proxy/shadowsocks/validator.go：
 //   - 认证用户读取全局 RCU 快照
 //   - 提供按 tag / user_id 查找
-//   - 在线设备由独立服务管理，不进入认证快照
+//   - 承载 Worker 本地在线设备追踪
 // ============================================================================
 class Validator {
 public:
-    Validator() = default;
-    ~Validator() = default;
+    Validator();
+    ~Validator();
 
     Validator(const Validator&) = delete;
     Validator& operator=(const Validator&) = delete;
-    Validator(Validator&&) noexcept = default;
-    Validator& operator=(Validator&&) noexcept = default;
+    Validator(Validator&&) noexcept;
+    Validator& operator=(Validator&&) noexcept;
 
     [[nodiscard]] proxyman::inbound::UserStore::ShadowsocksUsersView
     FindUsersForTag(std::string_view tag) const;
@@ -38,7 +38,28 @@ public:
     [[nodiscard]] size_t Size() const;
     [[nodiscard]] size_t SizeForTag(std::string_view tag) const;
 
+    void OnUserConnected(std::string_view tag,
+                         int64_t user_id,
+                         std::string_view client_ip);
 
+    void OnUserDisconnected(std::string_view tag,
+                            uint64_t user_id,
+                            std::string_view client_ip);
+
+    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
+                                       int64_t user_id,
+                                       std::string_view client_ip,
+                                       uint32_t device_limit) const;
+
+    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
+                                           int64_t user_id) const;
+
+    [[nodiscard]] std::vector<OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp::ss

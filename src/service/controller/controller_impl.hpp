@@ -15,16 +15,18 @@
 
 namespace acpp {
 
-class AwaitableTaskGroup;
+namespace monitor_detail {
+class MonitorLoop;
+}
 
 struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     struct PanelRuntime;
-    Impl(net::any_io_executor executor, Runtime& runtime, ConnectionLimiter& limiter);
+    Impl(net::io_context& io_context,
+         const std::vector<std::unique_ptr<Worker>>& workers,
+         const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
-    net::awaitable<void> Run();
-    net::awaitable<void> RunPanelLoop(PanelRuntime& panel, bool sync);
-    void Stop();
+    void Start();
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
 
@@ -48,13 +50,9 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         const api::NodeInfo& node_config,
         const std::vector<api::UserInfo>& api_users) const;
 
-    net::any_io_executor executor_;
-    ServiceChannel channel_;
-    Runtime& runtime_;
-    ConnectionLimiter& limiter_;
-    AwaitableTaskGroup* tasks_ = nullptr;
-    bool stopping_ = false;
-    bool running_ = false;
+    net::io_context&                       io_context_;
+    const std::vector<std::unique_ptr<Worker>>&  workers_;
+    const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters_;
 
     enum class PanelState {
         Connecting,
@@ -77,6 +75,9 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         PanelState state = PanelState::Connecting;
         controller::NodeState node;
         NodeStats stats;
+        // Active loops retain Impl, which owns these address-stable entities.
+        std::weak_ptr<monitor_detail::MonitorLoop> sync_loop;
+        std::weak_ptr<monitor_detail::MonitorLoop> status_loop;
     };
     std::vector<std::unique_ptr<PanelRuntime>> panels_;
 };

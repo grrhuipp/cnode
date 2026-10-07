@@ -50,7 +50,7 @@ void TestRulesAndOwnership() {
     Require(query.DomainStrategy() == acpp::routing::DomainStrategy::IPIfNonMatch,
             "domain strategy must be available through the feature contract");
 
-    acpp::session::Context ctx(acpp::net::system_executor{});
+    acpp::session::Context ctx;
     ctx.content.network = acpp::Network::TCP;
     ctx.outbound.target = acpp::TargetAddress("WWW.EXAMPLE.COM.", 443);
     ctx.outbound.target.resolved_addr = acpp::net::ip::make_address("192.0.2.1");
@@ -84,21 +84,68 @@ void TestRulesAndOwnership() {
             "routers and borrowed decisions must own independent immutable rule data");
 }
 
+class CountingPmrResource final : public std::pmr::memory_resource {
+public:
+    explicit CountingPmrResource(std::pmr::memory_resource& upstream) noexcept
+        : upstream_(upstream) {}
+
+    size_t OutstandingAllocations() const noexcept { return outstanding_allocations_; }
+    size_t OutstandingBytes() const noexcept { return outstanding_bytes_; }
+    size_t TotalAllocations() const noexcept { return total_allocations_; }
+
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        void* allocation = upstream_.allocate(bytes, alignment);
+        ++outstanding_allocations_;
+        outstanding_bytes_ += bytes;
+        ++total_allocations_;
+        return allocation;
+    }
+
+    void do_deallocate(void* allocation, size_t bytes, size_t alignment) override {
+        --outstanding_allocations_;
+        outstanding_bytes_ -= bytes;
+        upstream_.deallocate(allocation, bytes, alignment);
+    }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+
+    std::pmr::memory_resource& upstream_;
+    size_t outstanding_allocations_ = 0;
+    size_t outstanding_bytes_ = 0;
+    size_t total_allocations_ = 0;
+};
+
+class ScopedDefaultResource final {
+public:
+    explicit ScopedDefaultResource(std::pmr::memory_resource& resource) noexcept
+        : previous_(std::pmr::set_default_resource(&resource)) {}
+    ~ScopedDefaultResource() { std::pmr::set_default_resource(previous_); }
+
+    ScopedDefaultResource(const ScopedDefaultResource&) = delete;
+    ScopedDefaultResource& operator=(const ScopedDefaultResource&) = delete;
+
+private:
+    std::pmr::memory_resource* previous_;
+};
+
 void TestInboundMetadataOwnershipAndRouting() {
-    acpp::net::io_context io;
     using acpp::session::Context;
     {
+        acpp::memory::ThreadPoolFacade worker_pool;
+        CountingPmrResource counted_worker_pool(worker_pool);
         {
-            const size_t baseline_allocations = acpp::memory::live_data_allocations.load();
-            const size_t total_allocations = acpp::memory::data_allocations.load();
+            ScopedDefaultResource use_counted_worker_pool(counted_worker_pool);
+            const size_t baseline_allocations = counted_worker_pool.OutstandingAllocations();
+            const size_t baseline_bytes = counted_worker_pool.OutstandingBytes();
             {
-                Context ctx(io.get_executor());
-                Context copy(io.get_executor());
+                Context ctx;
+                Context copy;
                 {
                     acpp::proxyman::inbound::ReceiverSettings receiver{
-                        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
-                        .stream_settings = {},
-                        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"metadata-test"}}};
+                        .dispatch_policy = {.outbound = acpp::routing::ForceOutbound{"metadata-test"}}};
                     receiver.inbound_tag = std::string(96, 'm');
                     receiver.inbound_tags = {receiver.inbound_tag, std::string(112, 'x')};
                     receiver.protocol = std::string(104, 'p');
@@ -116,24 +163,26 @@ void TestInboundMetadataOwnershipAndRouting() {
                             ctx.inbound.security.size() == 108 && ctx.inbound.tags.size() == 2 &&
                             ctx.inbound.tags[1].size() == 112,
                         "inbound metadata must outlive its cold receiver source");
-                Require(acpp::memory::data_allocations.load() > total_allocations &&
-                            acpp::memory::live_data_allocations.load() > baseline_allocations,
-                        "long inbound metadata and its copy must allocate through data allocation");
-                Require(ctx.inbound.tag.get_allocator().resource() == acpp::memory::DataResource() &&
-                            ctx.inbound.protocol.get_allocator().resource() == acpp::memory::DataResource() &&
-                            ctx.inbound.security.get_allocator().resource() == acpp::memory::DataResource() &&
-                            ctx.inbound.tags.get_allocator().resource() == acpp::memory::DataResource() &&
-                            ctx.inbound.tags[0].get_allocator().resource() == acpp::memory::DataResource() &&
-                            copy.inbound.tag.get_allocator().resource() == acpp::memory::DataResource() &&
-                            copy.inbound.tags[0].get_allocator().resource() == acpp::memory::DataResource(),
-                        "inbound metadata and Context copies must use the data allocation resource");
+                Require(counted_worker_pool.TotalAllocations() > 0 &&
+                            counted_worker_pool.OutstandingAllocations() > baseline_allocations &&
+                            counted_worker_pool.OutstandingBytes() > baseline_bytes,
+                        "long inbound metadata and its copy must allocate through Worker PMR");
+                Require(ctx.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.protocol.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.security.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.tags.get_allocator().resource() == &counted_worker_pool &&
+                            ctx.inbound.tags[0].get_allocator().resource() == &counted_worker_pool &&
+                            copy.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
+                            copy.inbound.tags[0].get_allocator().resource() == &counted_worker_pool,
+                        "inbound metadata and Context copies must use the Worker PMR resource");
                 ctx.inbound.tag[0] = 'c';
                 ctx.inbound.tags[1][0] = 'y';
                 Require(copy.inbound.tag[0] == 'm' && copy.inbound.tags[1][0] == 'x',
                         "copied inbound metadata must be independent owned values");
             }
-            Require(acpp::memory::live_data_allocations.load() == baseline_allocations,
-                    "destroying metadata Contexts must release their data allocation allocations");
+            Require(counted_worker_pool.OutstandingAllocations() == baseline_allocations &&
+                        counted_worker_pool.OutstandingBytes() == baseline_bytes,
+                    "destroying metadata Contexts must release their Worker PMR allocations");
         }
     }
 
@@ -149,7 +198,7 @@ void TestInboundMetadataOwnershipAndRouting() {
     config.rules = {main_tag, extra_tag};
     const Router router(config, nullptr);
 
-    Context routed(io.get_executor());
+    Context routed;
     routed.inbound.tag = std::string(96, 'm');
     routed.inbound.tags.emplace_back(std::string(112, 'x'));
     routed.outbound.target = acpp::TargetAddress("main.example", 443);
@@ -188,7 +237,7 @@ void TestInvalidConstruction() {
                                    "unresolved geo rules must fail construction");
 
     const Router empty(acpp::RoutingConfig{}, nullptr);
-    Require(!empty.Route(acpp::session::Context(acpp::net::system_executor{})).matched,
+    Require(!empty.Route(acpp::session::Context{}).matched,
             "an empty router must have no implicit default");
 }
 

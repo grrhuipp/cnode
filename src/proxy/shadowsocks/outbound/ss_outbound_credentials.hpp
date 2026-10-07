@@ -11,7 +11,7 @@
 namespace acpp::proxy::shadowsocks::outbound {
 
 // A complete, validated credential value. Preparation never drops a chain link
-// or substitutes a different cipher; handlers only consume this value.
+// or substitutes a different cipher; Worker handlers only consume this value.
 class Credentials {
 public:
     [[nodiscard]] static std::optional<Credentials> Prepare(

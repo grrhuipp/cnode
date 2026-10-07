@@ -3,14 +3,14 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/proxy_protocol.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
-#include <tl/expected.hpp>
+#include <expected>
 #include <memory>
 #include <span>
 #include <string_view>
 
 namespace acpp {
 
-using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
+using TransportBuildResult = std::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
 
 class InboundTransportStreamHandler {
 public:
@@ -28,13 +28,6 @@ struct InboundTransportMetadata {
     std::string tls_fingerprint;
 };
 
-// The runtime installs this cross-connection service exactly once with the
-// shared io_context executor, before any listener can accept XHTTP traffic.
-// Reinstalling the same executor is harmless; rebinding is rejected.
-void InstallXHttpSessionService(net::any_io_executor shared_executor);
-// Called after all request tasks have joined and before the io_context dies.
-void ReleaseXHttpSessionService(net::any_io_executor shared_executor) noexcept;
-
 // Consume an optional PROXY protocol prefix from a raw accepted transport.
 // Parsing, timeout handling and preservation of non-PROXY bytes stay entirely
 // inside the transport layer.
@@ -45,14 +38,13 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 // 根据 StreamSettings 将原始 TCP 流包装成最终传输流。
 // 协议层调用 Process()/Handshake() 前，传入的流已经完成 TLS/WS。
 net::awaitable<TransportBuildResult> BuildInboundTransport(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
     std::string* out_real_ip = nullptr,
     uint64_t trace_conn_id = 0,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
-    InboundTransportMetadata* metadata = nullptr,
-    uint64_t transport_scope_id = 0);
+    InboundTransportMetadata* metadata = nullptr);
 
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,

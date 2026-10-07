@@ -102,7 +102,7 @@ function Run-CnodeBlackhole {
     "access": "$($LogDir.Replace('\','/'))/cnode-access.log",
     "error": "$($LogDir.Replace('\','/'))/cnode-error.log"
   },
-  "ioThreads": 1,
+  "workers": 1,
   "dns": { "servers": ["8.8.8.8"] },
   "panels": []
 }

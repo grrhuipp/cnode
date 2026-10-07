@@ -72,9 +72,6 @@ const json::value& SelectConfigList(const json::value& value, std::string_view k
 }
 
 RoutingConfig ParseRoutingConfigValue(const json::value& value) {
-    if (!value.is_object()) {
-        throw std::invalid_argument("routing root must be an object");
-    }
     const auto& obj = value.as_object();
     if (auto* routing = obj.if_contains("routing")) {
         if (!routing->is_object()) {
@@ -297,8 +294,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoSiteFile);
     }
 
-    LOG_CONSOLE("config summary io_threads={} inbounds={} outbounds={} rules={} default_outbound={} panels={}",
-                cfg.io_threads_,
+    LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} default_outbound={} panels={}",
+                cfg.workers_,
                 cfg.static_inbounds_.size(),
                 cfg.prepared_outbounds_.size(),
                 cfg.routing_.rules.size(),

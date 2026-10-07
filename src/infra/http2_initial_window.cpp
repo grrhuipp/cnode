@@ -5,14 +5,14 @@
 
 namespace acpp {
 
-tl::expected<std::optional<uint32_t>, std::string>
+std::expected<std::optional<uint32_t>, std::string>
 ParseHttp2InitialWindow(const json::object& source) {
     auto parsed = ParseAliasedJsonUint64(
         source,
         {"initialWindowSize"},
         kHttp2MaxInitialWindow);
     if (!parsed) {
-        return tl::unexpected(std::move(parsed.error()));
+        return std::unexpected(std::move(parsed.error()));
     }
     if (!*parsed) {
         return std::optional<uint32_t>{};

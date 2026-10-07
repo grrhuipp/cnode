@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include "acppnode/runtime/channel.hpp"
 
 namespace acpp {
 
@@ -17,13 +16,11 @@ public:
     RuntimeMonitor(RuntimeMonitor&&) = delete;
     RuntimeMonitor& operator=(RuntimeMonitor&&) = delete;
 
-    net::awaitable<void> Run();
-    [[nodiscard]] bool RequestStop();
+    void Start();
 
 private:
     struct Impl;
-    std::shared_ptr<Impl> impl_;
-    ServiceChannel::Reservation stop_ticket_;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp

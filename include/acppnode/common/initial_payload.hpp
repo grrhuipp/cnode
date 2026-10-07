@@ -17,7 +17,7 @@ namespace acpp {
 class InitialPayload {
 public:
     // Keep the always-present coroutine-frame footprint small. Larger early
-    // Payload ownership is transferred into the ordinary relay loop once.
+    // payloads use the Worker heap and are transferred into the ordinary relay loop once.
     static constexpr size_t kInlineSize = 256;
 
     InitialPayload() = default;

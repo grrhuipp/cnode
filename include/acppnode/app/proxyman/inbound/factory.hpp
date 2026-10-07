@@ -1,7 +1,6 @@
 #pragma once
 
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/common/online_device.hpp"
@@ -17,7 +16,7 @@ namespace acpp {
 
 class Inbound;
 struct StaticUserConfig;
-class UserOnlineTracker;
+struct StatsShard;
 
 }  // namespace acpp
 
@@ -36,13 +35,14 @@ struct DatagramHandlerBuildResult {
 };
 
 // ============================================================================
-// ProtocolRuntime - 协议认证快照与有界重放服务入口
+// ProtocolRuntime - 每个 Worker 的协议私有可变状态
 // ============================================================================
-class ProtocolRuntime : public memory::DataAllocated {
+class ProtocolRuntime : public memory::ThreadAllocated {
 public:
     virtual ~ProtocolRuntime() noexcept = default;
 
-
+    [[nodiscard]] virtual std::vector<::acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const = 0;
 };
 
 // ============================================================================
@@ -53,20 +53,20 @@ struct ProxyRegistration {
     // registration names to one concrete UserStore partition.
     std::optional<UserProtocol> user_protocol;
 
-    // 创建协议运行态，其可变服务绑定给定 owner executor。
-    std::unique_ptr<ProtocolRuntime> (*create_runtime)(net::any_io_executor executor) = nullptr;
+    // 创建当前 Worker 独占的协议运行态（必须）。
+    std::unique_ptr<ProtocolRuntime> (*create_runtime)() = nullptr;
 
     // 创建 TCP 入站处理器（必须）
     std::unique_ptr<::acpp::Inbound> (*create_tcp_handler)(
         ProtocolRuntime& runtime,
-        ::acpp::UserOnlineTracker& online,
+        ::acpp::StatsShard& stats,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
     std::unique_ptr<::acpp::Inbound> (*create_datagram_handler)(
         ProtocolRuntime& runtime,
-        ::acpp::UserOnlineTracker& online,
+        ::acpp::StatsShard& stats,
         ::acpp::ConnectionLimiterPtr limiter,
         const BuildRequest& req) = nullptr;
 
@@ -99,19 +99,19 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
     std::string_view protocol);
 
 [[nodiscard]] std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol, net::any_io_executor executor);
+    std::string_view protocol);
 
 [[nodiscard]] std::unique_ptr<::acpp::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::UserOnlineTracker& online,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req);
 
 [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::UserOnlineTracker& online,
+    ::acpp::StatsShard& stats,
     ::acpp::ConnectionLimiterPtr limiter,
     const BuildRequest& req);
 

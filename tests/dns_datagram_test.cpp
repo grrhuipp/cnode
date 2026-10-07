@@ -1,14 +1,9 @@
-#include "acppnode/app/dns/dns_service.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/common/allocator.hpp"
-#include "data_allocation_probe.hpp"
 #include "app/dns/datagram_exchange.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
-#include <asio/experimental/concurrent_channel.hpp>
-#include <asio/as_tuple.hpp>
-#include <asio/use_awaitable.hpp>
 #include <asio/steady_timer.hpp>
 #include <array>
 #include <iostream>
@@ -21,44 +16,7 @@ namespace net = acpp::net;
 using namespace std::chrono_literals;
 using acpp::app::dns::DNS;
 using acpp::app::dns::DnsResult;
-class TimeoutSchedulerScope final {
-public:
-    explicit TimeoutSchedulerScope(net::any_io_executor executor) : executor_(std::move(executor)) {
-        acpp::TimeoutScheduler::Install(executor_);
-    }
-    ~TimeoutSchedulerScope() { acpp::TimeoutScheduler::ReleaseForExecutor(executor_); }
-private:
-    net::any_io_executor executor_;
-};
 void Require(bool yes, const char* why) { if (!yes) throw std::runtime_error(why); }
-
-class DNSServiceRun final {
-public:
-    DNSServiceRun(net::io_context& io, acpp::app::dns::DNSService& service)
-        : io_(io), service_(service), stopped_(io, 1) {
-        net::co_spawn(io_, service_.Run(), [this](std::exception_ptr error) {
-            stopped_.try_send(error);
-        });
-    }
-
-    template <typename Handler>
-    void CloseAndJoin(std::exception_ptr error, Handler handler) {
-        net::co_spawn(io_, CloseAndJoinOwned(), [error, handler = std::move(handler)](std::exception_ptr close_error) mutable {
-            handler(error ? error : close_error);
-        });
-    }
-
-private:
-    net::awaitable<void> CloseAndJoinOwned() {
-        co_await service_.Close();
-        auto [run_error] = co_await stopped_.async_receive(net::as_tuple(net::use_awaitable));
-        if (run_error) std::rethrow_exception(run_error);
-    }
-
-    net::io_context& io_;
-    acpp::app::dns::DNSService& service_;
-    net::experimental::concurrent_channel<void(std::exception_ptr)> stopped_;
-};
 
 struct Peer {
     struct Query { std::vector<uint8_t> bytes; acpp::udp::endpoint sender; };
@@ -158,11 +116,9 @@ acpp::app::dns::Config Config(Peer& peer) {
 
 void TestQueries(bool ipv6) {
     net::io_context io;
-    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     Peer peer(io, ipv6);
     peer.noise = true;
-    acpp::app::dns::DNSService worker(io.get_executor(), Config(peer), 8);
-    DNSServiceRun service_run(io, worker);
+    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     std::exception_ptr error;
     bool done = false;
@@ -185,11 +141,7 @@ void TestQueries(bool ipv6) {
         result = co_await dns.Resolve("negative.example");
         Require(result.from_cache && peer.packets == 12, "negative answers must be cached");
     };
-    net::co_spawn(io, run(), [&](std::exception_ptr e) {
-        service_run.CloseAndJoin(e, [&](std::exception_ptr close_error) {
-            error = close_error; done = true; peer.Stop();
-        });
-    });
+    net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
     io.run_for(4s);
     Require(done, "parallel DNS query test timed out");
     if (error) std::rethrow_exception(error);
@@ -197,24 +149,17 @@ void TestQueries(bool ipv6) {
 
 void TestIsolation(bool cancel) {
     net::io_context io;
-    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     Peer peer(io);
     peer.hold = cancel;
-    acpp::app::dns::DNSService worker(io.get_executor(), Config(peer), 8);
-    DNSServiceRun service_run(io, worker);
+    acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     net::cancellation_signal signal;
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> errors;
-    bool service_closed = false;
     size_t completed = 0;
     auto finish = [&](size_t i) { return [&, i](std::exception_ptr e, DnsResult result) {
         errors[i] = e; answers[i] = std::move(result);
-        if (++completed == 2) service_run.CloseAndJoin({}, [&](std::exception_ptr close_error) {
-            service_closed = !close_error;
-            if (close_error) errors[0] = close_error;
-            peer.Stop();
-        });
+        if (++completed == 2) peer.Stop();
     }; };
     net::co_spawn(io, dns.Resolve("timeout.example"), net::bind_cancellation_slot(signal.slot(), finish(0)));
     net::co_spawn(io, dns.Resolve("other.example"), finish(1));
@@ -223,7 +168,7 @@ void TestIsolation(bool cancel) {
         if (!ec) { signal.emit(net::cancellation_type::terminal); peer.Flush("other.example"); }
     });
     io.run_for(3s);
-    Require(completed == 2 && service_closed && !errors[1] && answers[1].Ok(),
+    Require(completed == 2 && !errors[1] && answers[1].Ok(),
             "one cancellation/timeout must not cancel another query's shared socket");
     Require(cancel ? (errors[0] || !answers[0].Ok()) : answers[0].error == acpp::ErrorCode::DNS_TIMEOUT,
             "cancelled or expired requests must return promptly");
@@ -232,19 +177,15 @@ void TestIsolation(bool cancel) {
 
 void TestFallback() {
     net::io_context io;
-    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     Peer first(io), second(io);
     first.refuse = true;
     auto config = Config(first);
     config.servers.push_back(second.socket.local_endpoint());
-    acpp::app::dns::DNSService worker(io.get_executor(), config, 8);
-    DNSServiceRun service_run(io, worker);
+    acpp::app::dns::DNSWorker worker(io, config, 8);
     DNS dns(worker);
     bool ok = false;
     net::co_spawn(io, dns.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
-        service_run.CloseAndJoin(e, [&, result = std::move(result)](std::exception_ptr close_error) {
-            ok = !close_error && result.Ok(); first.Stop(); second.Stop();
-        });
+        ok = !e && result.Ok(); first.Stop(); second.Stop();
     });
     io.run_for(3s);
     Require(ok && first.packets == 4 && second.packets == 4,
@@ -253,10 +194,9 @@ void TestFallback() {
 
 void TestIdRotation() {
     net::io_context io;
-    TimeoutSchedulerScope scheduler_scope(io.get_executor());
     Peer peer(io);
     peer.batch_size = 1;
-    auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(io.get_executor(), peer.socket.local_endpoint());
+    auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(io, peer.socket.local_endpoint());
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -273,46 +213,46 @@ void TestIdRotation() {
     if (error) std::rethrow_exception(error);
 }
 
-std::size_t cache_faults = 0;
-bool RejectCacheWrite(std::size_t bytes, std::size_t) noexcept {
-    if (!cache_faults && bytes == 4 * sizeof(net::ip::address)) {
-        ++cache_faults;
-        return true;
+class CacheFault : public std::pmr::memory_resource {
+public:
+    explicit CacheFault(std::pmr::memory_resource* resource) : upstream(resource) {}
+    size_t faults = 0;
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        if (!faults && bytes == 4 * sizeof(net::ip::address)) { ++faults; throw std::bad_alloc(); }
+        return upstream->allocate(bytes, alignment);
     }
-    return false;
-}
+    void do_deallocate(void* p, size_t bytes, size_t alignment) override { upstream->deallocate(p, bytes, alignment); }
+    bool do_is_equal(const std::pmr::memory_resource& r) const noexcept override { return &r == this; }
+    std::pmr::memory_resource* upstream;
+};
 
 void TestCacheFailure() {
-    cache_faults = 0;
-    DataAllocationProbe probe(RejectCacheWrite);
-    {
+    CacheFault resource(std::pmr::get_default_resource());
+    const auto original = std::pmr::set_default_resource(&resource);
+    try {
         net::io_context io;
-        TimeoutSchedulerScope scheduler_scope(io.get_executor());
         Peer peer(io);
-        acpp::app::dns::DNSService worker(io.get_executor(), Config(peer), 8);
-        DNSServiceRun service_run(io, worker);
+        acpp::app::dns::DNSWorker worker(io, Config(peer), 8);
         DNS dns(worker);
         std::exception_ptr error;
         bool done = false;
         auto run = [&]() -> net::awaitable<void> {
             auto result = co_await dns.Resolve("cache-fault.example");
             const auto failed_stats = co_await worker.GetCacheStats();
-            Require(result.Ok() && cache_faults == 1 && failed_stats.entries == 0,
+            Require(result.Ok() && resource.faults == 1 && failed_stats.entries == 0,
                     "cache allocation failure must not discard the acquired answer");
             result = co_await dns.Resolve("cache-fault.example");
             const auto recovered_stats = co_await worker.GetCacheStats();
             Require(result.Ok() && recovered_stats.entries == 1,
                     "cache must recover after write failure");
         };
-        net::co_spawn(io, run(), [&](std::exception_ptr e) {
-            service_run.CloseAndJoin(e, [&](std::exception_ptr close_error) {
-                error = close_error; done = true; peer.Stop();
-            });
-        });
+        net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
         io.run_for(3s);
         Require(done, "cache fault test timed out");
         if (error) std::rethrow_exception(error);
-    }
+    } catch (...) { std::pmr::set_default_resource(original); throw; }
+    std::pmr::set_default_resource(original);
 }
 }
 int main() {

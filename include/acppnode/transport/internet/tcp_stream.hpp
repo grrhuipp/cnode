@@ -39,9 +39,6 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void>        WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void>        WriteBuffers(std::span<const net::const_buffer> buffers) override;
-    transport::EofAction ReadEofAction() const noexcept override {
-        return transport::EofAction::ShutdownPeerWrite;
-    }
     void ShutdownRead() override;
     void ShutdownWrite() override;
     void Close() override;
@@ -86,14 +83,14 @@ public:
     // 静态工厂方法：连接到已解析的端点
     [[nodiscard]]
     static net::awaitable<DialResult> Connect(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const tcp::endpoint& endpoint,
         std::chrono::seconds timeout = std::chrono::seconds(10));
 
     // 静态工厂方法：绑定本地地址后连接
     [[nodiscard]]
     static net::awaitable<DialResult> ConnectWithBind(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const net::ip::address& local_addr,
         const tcp::endpoint& remote_endpoint,
         std::chrono::seconds timeout = std::chrono::seconds(10));

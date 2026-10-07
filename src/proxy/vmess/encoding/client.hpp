@@ -6,14 +6,14 @@
 #include "acppnode/transport/link.hpp"
 
 #include <array>
-#include <tl/expected.hpp>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string_view>
 
 namespace acpp::vmess::encoding {
 
-using VMessHandshakeResult = tl::expected<void, ErrorCode>;
+using VMessHandshakeResult = std::expected<void, ErrorCode>;
 
 struct EncodeRequestBodyState final {
     std::optional<VMessCipher> cipher;

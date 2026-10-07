@@ -9,7 +9,7 @@
 
 namespace acpp::app::dns {
 
-class DNSService;
+class DNSWorker;
 
 struct DnsResult : ResultStatus {
     std::vector<net::ip::address> addresses;
@@ -23,17 +23,17 @@ struct DnsResult : ResultStatus {
 
 class DNS final {
 public:
-    // Client only: all resolution state and sockets belong to DNSService.
-    explicit DNS(DNSService& service) noexcept : service_(service) {}
+    // Client only: all resolution state and sockets belong to DNSWorker.
+    explicit DNS(DNSWorker& worker) noexcept : worker_(worker) {}
 
     DNS(const DNS&) = delete;
     DNS& operator=(const DNS&) = delete;
 
-    // Copies domain at task creation. The DNSService must outlive the task.
+    // Copies domain at task creation. The DNSWorker must outlive the task.
     net::awaitable<DnsResult> Resolve(std::string_view domain);
 
 private:
-    DNSService& service_;
+    DNSWorker& worker_;
 };
 
 }  // namespace acpp::app::dns

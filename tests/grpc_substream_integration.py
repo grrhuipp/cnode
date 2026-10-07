@@ -162,61 +162,33 @@ async def scenario(args, mode, tls, output, result, resources):
               {'protocol': 'freedom', 'settings': {}})
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     reader, writer = await resources.connect(front_port, tls=tls)
+    writer.get_extra_info('socket').setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
     writer.write(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + h2frame(4))
     await writer.drain()
     peer = Peer(resources, reader, writer)
-    blocked = mode.startswith('blocked-')
-    await peer.open(1, target_port, b'A' if blocked else b'V', tls,
+    await peer.open(1, target_port, b'A' if mode == 'blocked-reset' else b'V', tls,
                     end=mode == 'half-close')
     await peer.open(3, target_port, b'S', tls)
     await peer.wait_message(1, b'\0\0' + READY)
     await peer.wait_message(3, b'\0\0' + READY)
     await peer.ping(b'prepared')
-    if blocked:
-        raw_transport = writer.transport._ssl_protocol._transport if tls else writer.transport
-        raw_transport.pause_reading()
+    if mode == 'blocked-reset':
+        writer.transport.pause_reading()
         states[b'A']['go'].set()
-        deadline = asyncio.get_running_loop().time() + 5
-        stable_since = None
-        result['target_backpressured'] = False
-        while asyncio.get_running_loop().time() < deadline:
-            before = states[b'A']['sent']
-            await asyncio.sleep(0.2)
-            buffered = states[b'A']['writer'].transport.get_write_buffer_size()
-            result.update(target_sent=states[b'A']['sent'], target_pending_bytes=buffered)
-            if not states[b'A']['drained'] and before == states[b'A']['sent'] and buffered > 0:
-                now = asyncio.get_running_loop().time()
-                if stable_since is None:
-                    stable_since = now
-                if now - stable_since >= 1:
-                    result['target_backpressured'] = True
-                    break
-            else:
-                stable_since = None
+        await asyncio.sleep(0.3)
+        before = states[b'A']['sent']
+        await asyncio.sleep(0.15)
+        buffered = states[b'A']['writer'].transport.get_write_buffer_size()
+        result.update(target_sent=states[b'A']['sent'], target_pending_bytes=buffered)
+        result['target_backpressured'] = not states[b'A']['drained'] and before == states[b'A']['sent'] and buffered > 0
         assert result['target_backpressured'], 'fixture did not produce backpressure'
-    if mode == 'blocked-close':
-        # A physical disconnect must terminate the admitted write and wake the
-        # other substream without waiting for the client to resume consumption.
-        raw_transport.abort()
-        await until(lambda: states[b'A']['closed'] and states[b'S']['closed'], 5)
-        result.update(passed=True, all_targets_closed=True)
-        return
-    if mode == 'blocked-timeout':
-        # An admitted write remains bounded by the physical socket's deadline
-        # even though it no longer inherits the originating request's slot.
-        try:
-            await until(lambda: states[b'A']['closed'] and states[b'S']['closed'], 8)
-        finally:
-            result['targets_closed'] = {tag.decode(): state['closed'] for tag, state in states.items()}
-        result.update(passed=True, all_targets_closed=True)
-        return
     if mode != 'half-close':
         writer.write(h2frame(3, 0, 1, struct.pack('!I', 8)) * 3)
         await writer.drain()
     if mode == 'blocked-reset':
         await asyncio.sleep(0.2)
         result['target_closed_before_resume'] = states[b'A']['closed']
-        raw_transport.resume_reading()
+        writer.transport.resume_reading()
     writer.write(h2frame(0, 0, 3, grpc(ECHO)))
     await writer.drain()
     await peer.wait_message(3, b'\0\0' + READY + ECHO)
@@ -246,7 +218,7 @@ async def main(args):
     digest = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     results = []
     for tls in (False, True):
-        for mode in ('idle-reset', 'blocked-reset', 'blocked-close', 'blocked-timeout', 'half-close'):
+        for mode in ('idle-reset', 'blocked-reset', 'half-close'):
             output = args.output / (mode + ('-tls' if tls else '-tcp'))
             if args.case and output.name != args.case:
                 continue

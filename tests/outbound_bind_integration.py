@@ -44,7 +44,7 @@ async def probe_domain(port, destination_port):
 
 def make_configs(inbound_port, addresses, strategy):
     return {
-        "config.json": {"ioThreads": 1, "log": {"enable": False}},
+        "config.json": {"workers": 1, "log": {"enable": False}},
         "inbounds.json": [{
             "tag": "probe", "protocol": "vless", "listen": "127.0.0.1",
             "port": inbound_port, "outboundTag": "chosen",

@@ -33,6 +33,38 @@ ss::KeyBytes ToSsKey(const proxyman::inbound::PreparedKeyBytes& key) {
     return out;
 }
 
+class ShadowsocksOnlineSession {
+public:
+    ShadowsocksOnlineSession(ss::Validator& validator,
+                             std::string_view tag,
+                             int64_t user_id,
+                             std::string_view client_ip)
+        : validator_(&validator)
+        , tag_(tag)
+        , user_id_(user_id)
+        , client_ip_(client_ip) {}
+
+    ~ShadowsocksOnlineSession() noexcept {
+        if (!validator_ || user_id_ == 0) {
+            return;
+        }
+        try {
+            validator_->OnUserDisconnected(tag_, user_id_, client_ip_);
+        } catch (...) {
+        }
+    }
+
+    ShadowsocksOnlineSession(const ShadowsocksOnlineSession&) = delete;
+    ShadowsocksOnlineSession& operator=(const ShadowsocksOnlineSession&) = delete;
+    ShadowsocksOnlineSession(ShadowsocksOnlineSession&&) = delete;
+    ShadowsocksOnlineSession& operator=(ShadowsocksOnlineSession&&) = delete;
+
+private:
+    ss::Validator* validator_;
+    memory::ThreadLocalString tag_;
+    int64_t user_id_;
+    memory::ThreadLocalString client_ip_;
+};
 
 class ShadowsocksUdpResponseContext final : public InboundDatagramResponse {
 public:
@@ -59,15 +91,15 @@ private:
 
 proxy::shadowsocks::inbound::Handler::Handler(
     ss::Validator& validator,
-    UserOnlineTracker& online,
+    StatsShard& stats,
     ConnectionLimiterPtr limiter,
     ss::SsCipherInfo cipher_info)
-    : Inbound(online)
-    , validator_(validator)
+    : validator_(validator)
+    , stats_(&stats)
     , limiter_(std::move(limiter))
     , cipher_info_(cipher_info) {}
 
-void proxy::shadowsocks::inbound::Handler::AdoptOwnerStateFrom(
+void proxy::shadowsocks::inbound::Handler::AdoptWorkerStateFrom(
     Inbound& previous) noexcept {
     auto* previous_handler = dynamic_cast<Handler*>(&previous);
     if (!previous_handler) {
@@ -90,21 +122,19 @@ void proxy::shadowsocks::inbound::Handler::AdoptOwnerStateFrom(
 // 前设置 handshake 超时），无需额外守卫。
 // ----------------------------------------------------------------------------
 net::awaitable<RelayResult>
-proxy::shadowsocks::inbound::Handler::ProcessSession(
+proxy::shadowsocks::inbound::Handler::Process(
     std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
-    net::any_io_executor executor,
+    net::io_context& io_context,
     session::Context& ctx,
-    StatsShard& stats,
-    UserOnlineLease& online,
     const TimeoutsConfig& timeouts,
     uint32_t /*pressure_idle_timeout*/) {
 
     const std::string_view tag   = ctx.inbound.tag;
     const std::string_view client_ip = ctx.inbound.source_ip;
     auto fail = [&](ErrorCode error) {
-        stats.OnError();
+        stats_->OnError();
         RelayResult result;
         result.error = error;
         return result;
@@ -113,29 +143,28 @@ proxy::shadowsocks::inbound::Handler::ProcessSession(
     LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        (co_await limiter_->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
+        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
     }
+    std::optional<ShadowsocksOnlineSession> user_session;
 
-
-    size_t last_matched_index = 0;
     auto session_result = co_await ss::ReadTCPSession(
         *stream,
         validator_,
         cipher_info_,
         tag,
-        last_matched_index);
+        last_matched_index_);
     if (!session_result) {
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
             if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-                co_await limiter_->OnAuthFailTracked(std::string(tag), std::string(client_ip));
+                limiter_->OnAuthFailTracked(tag, client_ip);
             }
-            stats.OnError();
+            stats_->OnError();
         } else {
             LOG_CONN_WARN(ctx, "[SS][{}] ReadTCPSession failed from {}: {}",
                               tag, client_ip, ErrorCodeToString(error));
@@ -150,9 +179,9 @@ proxy::shadowsocks::inbound::Handler::ProcessSession(
         if (!matched) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
             if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-                co_await limiter_->OnAuthFailTracked(std::string(tag), std::string(client_ip));
+                limiter_->OnAuthFailTracked(tag, client_ip);
             }
-            stats.OnError();
+            stats_->OnError();
             co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
         }
         const auto& profile = *matched->profile;
@@ -161,13 +190,16 @@ proxy::shadowsocks::inbound::Handler::ProcessSession(
         ctx.content.speed_limit = profile.speed_limit;
 
         int64_t uid = profile.user_id;
-        if (!(co_await online.Acquire(std::string(tag), uid, std::string(ctx.inbound.source_ip), profile.device_limit))) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={}",
+        if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit);
+                profile.device_limit,
+                validator_.OnlineDeviceCount(tag, uid));
             co_return fail(ErrorCode::PERMISSION_DENIED);
         }
+        validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
+        user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
 
         LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
                        tag, client_ip, session_result->target, ctx.inbound.user_email);
@@ -240,35 +272,36 @@ proxy::shadowsocks::inbound::Handler::ProcessSession(
         ctx.content.network = Network::UDP;
 
         co_return co_await dispatcher.Dispatch(
-            executor,
+            io_context,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&uot_reader, &uot_writer},
             InitialPayload{},
             ctx,
-            stats,
+            *stats_,
             timeouts);
     }
 
     co_return co_await dispatcher.Dispatch(
-        executor,
+        io_context,
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{request_reader.get(), response_writer.get()},
         std::move(session_result->initial_payload),
         ctx,
-        stats,
+        *stats_,
         timeouts);
 }
 
-tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode>
+std::expected<acpp::InboundDatagramResult, acpp::ErrorCode>
 proxy::shadowsocks::inbound::Handler::Process(
     const InboundDatagramRequest& request) {
     const auto tag = request.tag;
+    const auto client_ip = request.client_ip;
 
     auto users = validator_.FindUsersForTag(tag);
     if (users.empty()) {
-        return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     auto decoded = ss::DecodeUdpPacket(
@@ -277,7 +310,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         udp_replay_cache_);
     if (!decoded) {
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
-        return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        return std::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
     const auto& user = users[decoded->user_index];
@@ -285,7 +318,7 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     InboundDatagramResult result;
     if (!result.session_owner.Assign(user.derived_key.span())) {
-        return tl::unexpected(ErrorCode::INTERNAL);
+        return std::unexpected(ErrorCode::INTERNAL);
     }
     result.target = std::move(decoded->target);
     result.payload = std::move(decoded->payload);
@@ -454,6 +487,11 @@ acpp::proxyman::inbound::PreparedKeyBytes ToPreparedKey(acpp::ss::KeyBytes key) 
 class ShadowsocksRuntime final
     : public acpp::proxyman::inbound::ProtocolRuntime {
 public:
+    [[nodiscard]] std::vector<acpp::OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const override {
+        return validator.GetOnlineDevices(tag);
+    }
+
     acpp::ss::Validator validator;
 };
 
@@ -473,14 +511,14 @@ const bool kSsInboundRegistered = [] {
     acpp::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = acpp::proxyman::inbound::UserProtocol::Shadowsocks;
 
-    reg.create_runtime = []([[maybe_unused]] acpp::net::any_io_executor executor) -> std::unique_ptr<
+    reg.create_runtime = []() -> std::unique_ptr<
         acpp::proxyman::inbound::ProtocolRuntime> {
         return std::make_unique<ShadowsocksRuntime>();
     };
 
     reg.create_tcp_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::UserOnlineTracker& online,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<acpp::Inbound> {
             auto* ss_runtime = dynamic_cast<ShadowsocksRuntime*>(&runtime);
@@ -490,14 +528,14 @@ const bool kSsInboundRegistered = [] {
             }
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
                 ss_runtime->validator,
-                online,
+                stats,
                 limiter,
                 settings->cipher);
         };
 
     reg.create_datagram_handler =
         [](acpp::proxyman::inbound::ProtocolRuntime& runtime,
-           acpp::UserOnlineTracker& online,
+           acpp::StatsShard& stats,
            acpp::ConnectionLimiterPtr limiter,
            const acpp::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<acpp::Inbound> {
@@ -507,7 +545,7 @@ const bool kSsInboundRegistered = [] {
                 return nullptr;
             }
             return std::make_unique<acpp::proxy::shadowsocks::inbound::Handler>(
-                ss_runtime->validator, online, limiter, settings->cipher);
+                ss_runtime->validator, stats, limiter, settings->cipher);
         };
 
     reg.prepare_settings =

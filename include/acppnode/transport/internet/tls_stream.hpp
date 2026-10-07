@@ -10,6 +10,7 @@
 
 namespace acpp {
 
+struct RealityConfig;
 struct TlsConfig;
 
 // ============================================================================
@@ -22,6 +23,16 @@ public:
 
     // 创建服务端上下文（自签名，根据 SNI 动态生成证书）
     static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
+
+    // 创建 REALITY 服务端上下文
+    static std::unique_ptr<SslContext> CreateServerReality(
+        const RealityConfig& reality,
+        const TlsConfig& tls_config);
+
+    // 创建 REALITY 客户端上下文
+    static std::unique_ptr<SslContext> CreateClientReality(
+        const RealityConfig& reality,
+        const TlsConfig& tls_config);
 
     // 创建客户端上下文
     static std::unique_ptr<SslContext> CreateClient(const TlsConfig& config);
@@ -60,9 +71,8 @@ public:
 
     ~TlsStream() override;
 
-    void RetainContext(std::unique_ptr<SslContext> context) noexcept {
-        owned_context_ = std::move(context);
-    }
+    // Cold Worker-local sweep; no per-connection timer or cross-thread state.
+    static void CollectIdleBuffersForCurrentThread() noexcept;
 
     // 禁止拷贝
     TlsStream(const TlsStream&) = delete;
@@ -77,6 +87,9 @@ public:
 
     // 设置 ALPN（客户端调用）
     [[nodiscard]] bool SetAlpn(const std::vector<std::string>& protocols);
+
+    // 设置 REALITY 客户端认证（客户端调用）
+    bool SetRealityClient(const RealityConfig& reality);
 
     // 执行 TLS 握手
     net::awaitable<bool> Handshake();
@@ -95,9 +108,6 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
-    transport::EofAction ReadEofAction() const noexcept override {
-        return transport::EofAction::ShutdownPeerWrite;
-    }
     void ShutdownRead() override;
     void ShutdownWrite() override;
     net::awaitable<void> AsyncShutdownWrite() override;
@@ -117,12 +127,11 @@ private:
     SSL* NativeSsl() noexcept;
     const SSL* NativeSsl() const noexcept;
 
-    std::unique_ptr<SslContext> owned_context_;
     std::unique_ptr<Impl> impl_;
     bool is_server_ = false;
     bool handshake_done_ = false;
-    bool read_eof_ = false;
     bool shutdown_initiated_ = false;  // 防止多次 SSL_shutdown
+    std::shared_ptr<void> app_state_;
 };
 
 // ============================================================================
@@ -143,10 +152,19 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     const std::string& server_name = "",
     const std::vector<std::string>& alpn = {});
 
+// 包装现有 TCP 流为 REALITY 客户端
+[[nodiscard]]
+net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
+    std::unique_ptr<TcpStream> inner,
+    SslContext& ctx,
+    const RealityConfig& reality,
+    const std::string& server_name = "",
+    const std::vector<std::string>& alpn = {});
+
 // 连接到 TLS 服务器
 [[nodiscard]]
 net::awaitable<DialResult> ConnectTls(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     const tcp::endpoint& endpoint,
     SslContext& ctx,
     const std::string& server_name = "",

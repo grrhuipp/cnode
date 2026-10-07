@@ -12,7 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <string>
-#include <openssl/rand.h>
+#include <thread>
 
 namespace acpp {
 namespace {
@@ -38,10 +38,14 @@ uint64_t MixHash(uint64_t value) noexcept {
 }
 
 uint64_t RandomIndex() noexcept {
-    uint64_t value = 0;
-    if (RAND_bytes(reinterpret_cast<unsigned char*>(&value), sizeof(value)) != 1)
-        return MixHash(static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
-    return value;
+    static thread_local uint64_t state =
+        static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+        std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
+        0x9e3779b97f4a7c15ull;
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return state * 2685821657736338717ull;
 }
 
 }  // namespace
@@ -75,9 +79,7 @@ std::optional<OutboundBind> OutboundBind::ParseCandidates(
     std::vector<Entry> prepared;
     prepared.reserve(entries.size());
     for (const auto text : entries) {
-        if (text.empty() || text.find('\0') != std::string_view::npos) {
-            return std::nullopt;
-        }
+        if (text.empty() || text.contains('\0')) return std::nullopt;
         Entry entry;
         const auto slash = text.find('/');
         auto address = iputil::ParseLiteral(text.substr(0, slash));

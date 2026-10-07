@@ -3,7 +3,7 @@
 #include "acppnode/infra/json.hpp"
 
 #include <cstdint>
-#include <tl/expected.hpp>
+#include <expected>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -12,7 +12,7 @@
 
 namespace acpp {
 
-[[nodiscard]] tl::expected<std::optional<uint64_t>, std::string>
+[[nodiscard]] std::expected<std::optional<uint64_t>, std::string>
 ParseAliasedJsonUint64(
     const json::object& source,
     std::initializer_list<std::string_view> aliases,

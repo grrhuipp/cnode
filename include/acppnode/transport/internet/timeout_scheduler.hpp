@@ -4,117 +4,62 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
-#include <new>
-#include <type_traits>
 #include <utility>
 
 namespace acpp {
 
-class TimeoutScheduler;
 class TimeoutSchedulerService;
+class TimeoutScheduler;
 
-namespace detail {
-
-// C++20 move-only callback with inline storage. Timeout callbacks are small
-// owner-domain commands; keeping them inline avoids a second allocation and
-// does not impose copyability on captured lifetime tickets.
-class TimeoutCallback final {
-public:
-    static constexpr std::size_t kInlineBytes = 64;
-
-    TimeoutCallback() noexcept = default;
-    TimeoutCallback(std::nullptr_t) noexcept {}
-    TimeoutCallback(const TimeoutCallback&) = delete;
-    TimeoutCallback& operator=(const TimeoutCallback&) = delete;
-
-    TimeoutCallback(TimeoutCallback&& other) noexcept { MoveFrom(std::move(other)); }
-    TimeoutCallback& operator=(TimeoutCallback&& other) noexcept {
-        if (this != &other) {
-            Reset();
-            MoveFrom(std::move(other));
-        }
-        return *this;
-    }
-
-    template<class Function>
-        requires (!std::is_same_v<std::decay_t<Function>, TimeoutCallback> &&
-                  std::is_invocable_v<std::decay_t<Function>&>)
-    TimeoutCallback(Function&& function) {
-        using F = std::decay_t<Function>;
-        static_assert(sizeof(F) <= kInlineBytes,
-            "timeout callback capture exceeds inline storage");
-        static_assert(alignof(F) <= alignof(std::max_align_t),
-            "timeout callback capture alignment exceeds inline storage");
-        static_assert(std::is_nothrow_move_constructible_v<F>,
-            "timeout callback must be nothrow move constructible");
-        new (storage_) F(std::forward<Function>(function));
-        invoke_ = [](void* storage) { (*static_cast<F*>(storage))(); };
-        move_ = [](void* destination, void* source) noexcept {
-            new (destination) F(std::move(*static_cast<F*>(source)));
-            static_cast<F*>(source)->~F();
-        };
-        destroy_ = [](void* storage) noexcept { static_cast<F*>(storage)->~F(); };
-    }
-
-    ~TimeoutCallback() noexcept { Reset(); }
-
-    explicit operator bool() const noexcept { return invoke_ != nullptr; }
-    void operator()() {
-        if (invoke_) invoke_(storage_);
-    }
-
-    void Reset() noexcept {
-        if (destroy_) destroy_(storage_);
-        invoke_ = nullptr;
-        move_ = nullptr;
-        destroy_ = nullptr;
-    }
-
-private:
-    void MoveFrom(TimeoutCallback&& other) noexcept {
-        invoke_ = other.invoke_;
-        move_ = other.move_;
-        destroy_ = other.destroy_;
-        if (!move_) return;
-        move_(storage_, other.storage_);
-        other.invoke_ = nullptr;
-        other.move_ = nullptr;
-        other.destroy_ = nullptr;
-    }
-
-    alignas(std::max_align_t) std::byte storage_[kInlineBytes]{};
-    void (*invoke_)(void*) = nullptr;
-    void (*move_)(void*, void*) noexcept = nullptr;
-    void (*destroy_)(void*) noexcept = nullptr;
-};
-
-}  // namespace detail
-
-// The handle and its callback are accessed only on the callback executor.
-// The scheduler owns deadlines, and never dereferences callback state.
+// ============================================================================
+// TimeoutToken - 共享定时调度器句柄
+// ============================================================================
 class TimeoutToken {
 public:
     TimeoutToken() noexcept = default;
     ~TimeoutToken() noexcept;
     TimeoutToken(const TimeoutToken&) = delete;
     TimeoutToken& operator=(const TimeoutToken&) = delete;
-    TimeoutToken(TimeoutToken&&) noexcept;
-    TimeoutToken& operator=(TimeoutToken&&) noexcept;
-    [[nodiscard]] bool Valid() const noexcept;
-    void Reset() noexcept;
+
+    TimeoutToken(TimeoutToken&& other) noexcept
+        : id_(std::exchange(other.id_, 0))
+        , owner_(std::exchange(other.owner_, nullptr)) {}
+
+    // Assignment replaces ownership: a still-live destination event is
+    // cancelled before the source handle is adopted.
+    TimeoutToken& operator=(TimeoutToken&& other) noexcept;
+
+    [[nodiscard]] bool Valid() const noexcept {
+        return id_ != 0 && owner_ != nullptr;
+    }
+    void Reset() noexcept {
+        id_ = 0;
+        owner_ = nullptr;
+    }
+
 private:
     friend class TimeoutScheduler;
-    struct State;
-    std::shared_ptr<State> state_;
+
+    uint64_t id_ = 0;
+    TimeoutScheduler* owner_ = nullptr;
 };
 
-// A context service owns one strand and one timer. The bounded admission ticket
-// covers the scheduling command, deadline, cancellation, and completion message.
+// ============================================================================
+// TimeoutScheduler - 按 executor 分片的共享超时调度器
+//
+// 目标：
+//   - 用每分片 1 个 steady_timer 承载大量连接的 deadline/timeout
+//   - 避免 TcpStream 每连接常驻多个 timer 对象
+//   - 始终只保留一个在途等待，更早 deadline 唤醒它，由完成回调统一重挂
+//   - 分片内 Schedule/Cancel/OnTimer 在对应 io_context 线程执行，不做热路径锁同步
+// ============================================================================
 class TimeoutScheduler {
 public:
-    using Callback = detail::TimeoutCallback;
-    static constexpr std::size_t kCapacity = 65536;
+    using Callback = std::move_only_function<void()>;
+
     struct ResourceStats {
         std::size_t active_events = 0;
         std::size_t heap_entries = 0;
@@ -124,25 +69,45 @@ public:
         bool wait_pending = false;
     };
 
-    // Runtime installs the centralized service with the shared io_context
-    // executor before constructing any data-plane or control-plane owner.
-    // Reinstalling the same executor is harmless; rebinding is rejected.
-    static void Install(net::any_io_executor shared_executor);
-    [[nodiscard]] static TimeoutScheduler& ForExecutor(net::any_io_executor executor);
-    // Only after run() threads have joined; io_context also releases its service.
-    static void ReleaseForExecutor(net::any_io_executor executor) noexcept;
-    [[nodiscard]] TimeoutToken ScheduleAfter(std::chrono::milliseconds delay,
-        net::any_io_executor callback_executor, Callback callback);
+    // 获取 io_context 对应的分片（同一 io_context 复用同一调度器）。
+    // Worker 线程命中 thread_local 缓存后不走全局锁。
+    [[nodiscard]] static TimeoutScheduler& ForIoContext(net::io_context& io_context);
+
+    // 在所属 io_context 析构前释放分片，避免进程静态析构阶段 timer
+    // 访问已销毁的 reactor。仅在对应 io_context 停止且线程已退出后调用。
+    static void ReleaseForIoContext(net::io_context& io_context);
+
+    // Callback exceptions are isolated inside the scheduler: one failed
+    // timeout must not unwind the owning Worker io_context or skip its batch.
+    [[nodiscard]] TimeoutToken ScheduleAfter(
+        std::chrono::milliseconds delay,
+        Callback cb);
+
+    // One owner-thread maintenance deadline, independent of connection events.
+    // Stored inline: no callback allocation, map node, or second timer.
+    // May be called during a PMR container mutation: neither entry point
+    // inspects the event map or deadline heap. Reconciliation is deferred.
+    // False means the scheduler has already been released. Arming may throw.
+    [[nodiscard]] bool SetMaintenanceDeadline(
+        void* owner, void (*callback)(void*) noexcept,
+        std::chrono::steady_clock::time_point deadline);
+    void CancelMaintenance(void* owner) noexcept;
+
+    // Erases the callback without allocating or re-arming the timer. Safe for
+    // owner destruction and reentrant cancellation within a callback batch.
     void Cancel(TimeoutToken& token) noexcept;
-    [[nodiscard]] net::awaitable<ResourceStats> GetResourceStats();
+
+    // Cold-path, owner-thread-only observation. No synchronization or allocation.
+    [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 
 private:
     friend class TimeoutSchedulerService;
-    friend class TimeoutToken;
-    explicit TimeoutScheduler(net::any_io_executor executor);
+
+    explicit TimeoutScheduler(net::io_context& io_context);
     void Release() noexcept;
+
     struct Impl;
-    std::shared_ptr<Impl> impl_;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp

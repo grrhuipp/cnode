@@ -22,6 +22,35 @@
     }
   },
   {
+    "tag": "static-vless-reality",
+    "protocol": "vless",
+    "listen": "0.0.0.0",
+    "port": 10444,
+    "settings": {
+      "decryption": "none",
+      "clients": [
+        {
+          "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "flow": "xtls-rprx-vision",
+          "email": "vless-static@example.com"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "serverNames": ["www.example.com"],
+        "privateKey": "your-reality-private-key",
+        "shortIds": ["0123456789abcdef"]
+      }
+    },
+    "sniffing": {
+      "enabled": true,
+      "destOverride": ["http", "tls"]
+    }
+  },
+  {
     "tag": "static-trojan",
     "protocol": "trojan",
     "listen": "0.0.0.0",

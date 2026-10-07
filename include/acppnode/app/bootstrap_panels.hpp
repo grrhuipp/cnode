@@ -12,7 +12,7 @@ class DNS;
 
 namespace acpp {
 
-void SetupPanels(net::any_io_executor executor,
+void SetupPanels(net::io_context& main_ctx,
                  Controller& controller,
                  const Config& config,
                  app::dns::DNS& panel_dns_service);

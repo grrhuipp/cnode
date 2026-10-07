@@ -1,6 +1,7 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/common/ip_address.hpp"
 
+#include "acppnode/app/request_load_state.hpp"
 
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -13,8 +14,7 @@
 #include "acppnode/transport/link_error.hpp"
 
 #include <asio/co_spawn.hpp>
-#include "../../../common/awaitable_task_group.hpp"
-#include <asio/this_coro.hpp>
+#include <asio/detached.hpp>
 #include <exception>
 #include <new>
 #include <optional>
@@ -107,25 +107,40 @@ void ApplyProxyProtocolResult(
 
 class ConnectionLimitScope {
 public:
-    explicit ConnectionLimitScope(ConnectionLimiterPtr limiter) : limiter_(limiter) {}
-    net::awaitable<ConnectionLimiter::RejectReason> AcquireGlobal() {
-        auto admission = co_await limiter_->AcquireGlobal();
-        permit_ = std::move(admission.permit);
-        co_return admission.reason;
-    }
-    net::awaitable<ConnectionLimiter::RejectReason> AcquireIP(
-        std::string tag, std::string ip, bool check_auth_ban) {
-        co_return co_await limiter_->AcquireIP(*permit_, std::move(tag), std::move(ip), check_auth_ban);
-    }
-    net::awaitable<void> Release() {
-        if (permit_) {
-            co_await limiter_->Release(std::move(*permit_));
-            permit_.reset();
+    ConnectionLimitScope(ConnectionLimiterPtr limiter, std::string_view ip)
+        : limiter_(limiter), ip_(ip) {}
+
+    ~ConnectionLimitScope() noexcept {
+        if (!limiter_) {
+            return;
+        }
+        try {
+            if (ip_accepted_) {
+                limiter_->Release(ip_);
+            } else {
+                limiter_->ReleaseGlobal();
+            }
+        } catch (...) {
         }
     }
+
+    ConnectionLimitScope(const ConnectionLimitScope&) = delete;
+    ConnectionLimitScope& operator=(const ConnectionLimitScope&) = delete;
+    ConnectionLimitScope(ConnectionLimitScope&&) = delete;
+    ConnectionLimitScope& operator=(ConnectionLimitScope&&) = delete;
+
+    void UpdateIP(std::string_view ip) {
+        ip_.assign(ip.data(), ip.size());
+    }
+
+    void MarkIPAccepted() noexcept {
+        ip_accepted_ = true;
+    }
+
 private:
     ConnectionLimiterPtr limiter_;
-    std::optional<ConnectionLimiter::Permit> permit_;
+    memory::ThreadLocalString ip_;
+    bool ip_accepted_ = false;
 };
 
 class ConnectionStatsScope {
@@ -151,8 +166,9 @@ private:
 };
 
 void CopyTransportBaseContext(const session::Context& source,
-                              session::Context& target, uint64_t stream_id = 0) {
-    target.conn_id = stream_id ? session::ChildID(source.conn_id, stream_id) : source.conn_id;
+                              session::Context& target) {
+    target.conn_id = session::NewID(source.worker_id);
+    target.worker_id = source.worker_id;
     target.accept_time_us = NowMicros();
     target.parent_conn_id = source.conn_id;
     target.stream_id = target.conn_id;
@@ -171,23 +187,20 @@ class Handler::LogicalTransportStreamSink final
     , public std::enable_shared_from_this<LogicalTransportStreamSink> {
 public:
     LogicalTransportStreamSink(std::shared_ptr<Handler> handler,
-                               AwaitableTaskGroup& tasks,
-                               net::any_io_executor executor,
+                               net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
                                StatsShard& stats,
-                               uint32_t pressure_idle_timeout,
+                               app::RequestLoadState& request_load,
                                const TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
                                std::shared_ptr<InboundTransportMetadata> metadata,
                                int64_t transport_started_at_us)
         : handler_(std::move(handler))
-        , tasks_(tasks)
-        , executor_(executor)
+        , io_context_(io_context)
         , dispatcher_(dispatcher)
         , stats_(stats)
-        , pressure_idle_timeout_(pressure_idle_timeout)
+        , request_load_(request_load)
         , timeouts_(timeouts)
-        , base_ctx_(executor)
         , metadata_(std::move(metadata))
         , transport_started_at_us_(transport_started_at_us) {
         CopyTransportBaseContext(base_ctx, base_ctx_);
@@ -199,21 +212,12 @@ public:
         if (!stream) {
             return;
         }
-        if (active_streams_ >= 128) {
-            stream->CloseAbortive();
-            stats_.OnError();
-            return;
-        }
         auto self = shared_from_this();
-        ++active_streams_;
-        auto process = [](std::shared_ptr<LogicalTransportStreamSink> self,
-                          std::unique_ptr<AsyncStream> stream) -> net::awaitable<void> {
-                struct ActiveStream {
-                    size_t& count;
-                    ~ActiveStream() { --count; }
-                } active{self->active_streams_};
-                session::Context ctx(self->executor_);
-                CopyTransportBaseContext(self->base_ctx_, ctx, ++self->next_stream_id_);
+        net::co_spawn(
+            io_context_.get_executor(),
+            [self, stream = std::move(stream)]() mutable -> net::awaitable<void> {
+                session::Context ctx;
+                CopyTransportBaseContext(self->base_ctx_, ctx);
                 if (self->metadata_) {
                     ctx.inbound.tls_sni = self->metadata_->tls_sni;
                     ctx.inbound.tls_alpn = self->metadata_->tls_alpn;
@@ -234,27 +238,23 @@ public:
                         (transport_ready_at_us - self->transport_started_at_us_) / 1000);
                 }
                 co_await self->handler_->ProcessPreparedTransportStream(
-                    self->executor_,
+                    self->io_context_,
                     self->dispatcher_,
                     self->stats_,
-                    self->pressure_idle_timeout_,
+                    self->request_load_,
                     self->timeouts_,
                     std::move(stream),
                     ctx);
-            };
-        try { tasks_.Spawn(process(std::move(self), std::move(stream))); }
-        catch (...) { --active_streams_; throw; }
+            },
+            net::detached);
     }
 
 private:
     std::shared_ptr<Handler> handler_;
-    AwaitableTaskGroup& tasks_;
-    size_t active_streams_ = 0;
-    uint64_t next_stream_id_ = 0;
-    net::any_io_executor executor_;
+    net::io_context& io_context_;
     routing::Dispatcher& dispatcher_;
     StatsShard& stats_;
-    uint32_t pressure_idle_timeout_;
+    app::RequestLoadState& request_load_;
     TimeoutsConfig timeouts_;
     session::Context base_ctx_;
     std::shared_ptr<InboundTransportMetadata> metadata_;
@@ -266,16 +266,13 @@ Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> pr
     , proxy_(std::move(proxy)) {}
 
 net::awaitable<void> Handler::ProcessPreparedTransportStream(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     StatsShard& stats,
-    uint32_t pressure_idle_timeout,
+    app::RequestLoadState& request_load,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> stream,
     session::Context& ctx) {
-    ConnectionLimitScope connection_limit(receiver_.limiter);
-    auto process = [&]() -> net::awaitable<void> {
-
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
@@ -288,15 +285,16 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     }
 
     if (listener.limiter && ctx.inbound.HasProxyProtocolClientIP() &&
-        (co_await listener.limiter->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
+        listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (logical) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
         co_return;
     }
 
+    std::optional<ConnectionLimitScope> connection_limit;
     if (listener.limiter) {
-        auto reject = (co_await connection_limit.AcquireGlobal());
+        auto reject = listener.limiter->TryAcceptGlobal();
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,
@@ -304,9 +302,10 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             stats.OnError();
             co_return;
         }
-        reject = (co_await connection_limit.AcquireIP(
-            std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip),
-            ctx.inbound.HasProxyProtocolClientIP()));
+        connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
+        reject = listener.limiter->TryAcceptIP(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,
@@ -314,6 +313,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             stats.OnError();
             co_return;
         }
+        connection_limit->MarkIPAccepted();
     }
 
     stream->SetStreamLabel("in");
@@ -333,11 +333,10 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
             std::move(stream),
             dispatcher,
             listener,
-            executor,
+            io_context,
             ctx,
-            stats,
             timeouts,
-            pressure_idle_timeout);
+            request_load.PressureIdleTimeout());
     } catch (const transport::LinkError&) {
         stats.OnError();
     } catch (const std::bad_alloc&) {
@@ -351,29 +350,16 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
         LOG_CONN_WARN(ctx, "[Session] logical inbound process exception: unknown");
         stats.OnError();
     }
-
-    };
-    std::exception_ptr failure;
-    try { co_await process(); }
-    catch (...) { failure = std::current_exception(); }
-    const bool throw_on_cancel = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    co_await connection_limit.Release();
-    co_await net::this_coro::throw_if_cancelled(throw_on_cancel);
-    if (failure) std::rethrow_exception(failure);
 }
 
 net::awaitable<void> Handler::ProcessAcceptedTCP(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     StatsShard& stats,
-    uint32_t pressure_idle_timeout,
+    app::RequestLoadState& request_load,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> raw_conn,
     session::Context& ctx) {
-    ConnectionLimitScope connection_limit(receiver_.limiter);
-    auto process = [&]() -> net::awaitable<void> {
-
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
@@ -432,15 +418,16 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
 
     if (listener.limiter && ctx.inbound.HasProxyProtocolClientIP() &&
-        (co_await listener.limiter->IsBanned(std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip)))) {
+        listener.limiter->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_CONN_DEBUG(ctx, "rejected ip_banned (early) src={}:{}",
                        ctx.inbound.source_ip, ctx.inbound.source_port);
         stats.OnError();
         co_return;
     }
 
+    std::optional<ConnectionLimitScope> connection_limit;
     if (listener.limiter) {
-        auto reject = (co_await connection_limit.AcquireGlobal());
+        auto reject = listener.limiter->TryAcceptGlobal();
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,
@@ -448,6 +435,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             stats.OnError();
             co_return;
         }
+        connection_limit.emplace(listener.limiter, ctx.inbound.source_ip);
     }
 
     raw_conn->SetStreamLabel("in");
@@ -462,27 +450,30 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     auto transport_metadata = memory::AllocateShared<InboundTransportMetadata>();
     transport_metadata->real_ip_header =
         std::string(RealIpHeader(listener.stream_settings));
+    std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler;
+    if (listener.stream_settings.IsGrpc() ||
+        listener.stream_settings.IsHttp() ||
+        listener.stream_settings.IsXHttp()) {
+        logical_stream_handler = memory::AllocateShared<LogicalTransportStreamSink>(
+            shared_from_this(),
+            io_context,
+            dispatcher,
+            stats,
+            request_load,
+            timeouts,
+            ctx,
+            transport_metadata,
+            transport_started_at_us);
+    }
+
     std::string ws_real_ip;
-    TransportBuildResult build_result = tl::unexpected(ErrorCode::INTERNAL);
-    auto build_transport = [&](AwaitableTaskGroup& tasks,
-        std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler) -> net::awaitable<void> {
-        build_result = co_await BuildInboundTransport(executor,
-            std::move(raw_conn), listener.stream_settings,
-            listener.stream_settings.NeedsHttpRealIpExtraction() ? &ws_real_ip : nullptr,
-            ctx.conn_id, std::move(logical_stream_handler), transport_metadata.get(),
-            listener.transport_scope_id);
-        tasks.Cancel();
-    };
-    co_await RunAwaitableTaskGroup(executor, [&](AwaitableTaskGroup& tasks) {
-        std::shared_ptr<InboundTransportStreamHandler> logical_stream_handler;
-        if (listener.stream_settings.IsGrpc() || listener.stream_settings.IsHttp() ||
-            listener.stream_settings.IsXHttp()) {
-            logical_stream_handler = memory::AllocateShared<LogicalTransportStreamSink>(
-                shared_from_this(), tasks, executor, dispatcher, stats, pressure_idle_timeout,
-                timeouts, ctx, transport_metadata, transport_started_at_us);
-        }
-        tasks.Spawn(build_transport(tasks, std::move(logical_stream_handler)));
-    });
+    auto build_result = co_await BuildInboundTransport(
+        io_context,
+        std::move(raw_conn), listener.stream_settings,
+        listener.stream_settings.NeedsHttpRealIpExtraction() ? &ws_real_ip : nullptr,
+        ctx.conn_id,
+        std::move(logical_stream_handler),
+        transport_metadata.get());
     const int64_t transport_ended_at_us = NowMicros();
     if (transport_ended_at_us > transport_started_at_us) {
         ctx.inbound.transport_handshake_ms = static_cast<uint64_t>(
@@ -519,10 +510,11 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             ctx, ws_real_ip, RealIpHeader(listener.stream_settings));
     }
 
-    if (listener.limiter) {
-        auto reject = (co_await connection_limit.AcquireIP(
-            std::string(ctx.inbound.tag), std::string(ctx.inbound.source_ip),
-            ctx.inbound.HasProxyProtocolClientIP()));
+    if (connection_limit && listener.limiter) {
+        connection_limit->UpdateIP(ctx.inbound.source_ip);
+        auto reject = listener.limiter->TryAcceptIP(
+            ctx.inbound.tag, ctx.inbound.source_ip,
+            ctx.inbound.HasProxyProtocolClientIP());
         if (reject != ConnectionLimiter::RejectReason::NONE) {
             LOG_CONN_DEBUG(ctx, "rejected conn_limit src={}:{} reason={}",
                            ctx.inbound.source_ip, ctx.inbound.source_port,
@@ -530,6 +522,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             stats.OnError();
             co_return;
         }
+        connection_limit->MarkIPAccepted();
     }
 
     LOG_CONN_DEBUG(ctx, "[Session] Transport ready ({}/{})",
@@ -545,11 +538,10 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             std::move(stream),
             dispatcher,
             listener,
-            executor,
+            io_context,
             ctx,
-            stats,
             timeouts,
-            pressure_idle_timeout);
+            request_load.PressureIdleTimeout());
     } catch (const transport::LinkError&) {
         stats.OnError();
     } catch (const std::bad_alloc&) {
@@ -563,16 +555,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         LOG_CONN_WARN(ctx, "[Session] inbound process exception: unknown");
         stats.OnError();
     }
-
-    };
-    std::exception_ptr failure;
-    try { co_await process(); }
-    catch (...) { failure = std::current_exception(); }
-    const bool throw_on_cancel = co_await net::this_coro::throw_if_cancelled();
-    co_await net::this_coro::throw_if_cancelled(false);
-    co_await connection_limit.Release();
-    co_await net::this_coro::throw_if_cancelled(throw_on_cancel);
-    if (failure) std::rethrow_exception(failure);
 }
 
 }  // namespace acpp::proxyman::inbound

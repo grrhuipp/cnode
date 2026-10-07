@@ -11,7 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <tl/expected.hpp>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -46,11 +46,11 @@ struct EncodedRequest {
 [[nodiscard]] std::optional<Version> VersionFromMagicAddress(
     const TargetAddress& target) noexcept;
 
-[[nodiscard]] tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
+[[nodiscard]] std::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
     const TargetAddress& destination);
 
-[[nodiscard]] net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
+[[nodiscard]] net::awaitable<std::expected<Request, ErrorCode>> ReadRequest(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending);
 

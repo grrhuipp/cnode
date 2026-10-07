@@ -417,7 +417,7 @@ try {
         Write-Utf8NoBom (Join-Path $CnodeDir "config.json") @"
 {
   "log": { "loglevel": "$CnodeLogLevel", "access": "$($LogDir.Replace('\','/'))/cnode-access.log", "error": "$($LogDir.Replace('\','/'))/cnode-error.log", "logDir": "$($LogDir.Replace('\','/'))" },
-  "ioThreads": $CnodeWorkers,
+  "workers": $CnodeWorkers,
   "dns": { "servers": ["8.8.8.8"], "timeout": 5, "cacheSize": 1024, "minTTL": 60, "maxTTL": 300 },
   "timeouts": { "handshake": 10, "dial": 10, "read": 60, "write": 60, "idle": 300 },
   "panels": []
@@ -452,7 +452,7 @@ try {
         Write-Utf8NoBom (Join-Path $CnodeDir "config.json") @"
 {
   "log": { "loglevel": "$CnodeLogLevel", "access": "$($LogDir.Replace('\','/'))/cnode-access.log", "error": "$($LogDir.Replace('\','/'))/cnode-error.log", "logDir": "$($LogDir.Replace('\','/'))" },
-  "ioThreads": $CnodeWorkers,
+  "workers": $CnodeWorkers,
   "dns": { "servers": ["8.8.8.8"], "timeout": 5, "cacheSize": 1024, "minTTL": 60, "maxTTL": 300 },
   "timeouts": { "handshake": 10, "dial": 10, "read": 60, "write": 60, "idle": 300 },
   "panels": []

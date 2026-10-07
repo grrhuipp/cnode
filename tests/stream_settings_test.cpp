@@ -67,13 +67,17 @@ void TestModes() {
     }
     struct SecurityCase { const char* name; SecurityMode mode; };
     for (const auto& item : {SecurityCase{"", SecurityMode::None}, {"NONE", SecurityMode::None},
-                            {"TLS", SecurityMode::Tls}, {"Reality", SecurityMode::Unsupported},
+                            {"TLS", SecurityMode::Tls}, {"Reality", SecurityMode::Reality},
                             {"unknown", SecurityMode::Unsupported}}) {
         StreamSettings source;
         source.security = item.name;
         const auto result = NormalizeStreamSettings(source);
-        Require(result.security_mode == item.mode && result.IsTls() == (item.mode == SecurityMode::Tls),
-            "security mode or flags changed");
+        Require(result.security_mode == item.mode && result.IsTls() == (item.mode == SecurityMode::Tls) &&
+            result.IsReality() == (item.mode == SecurityMode::Reality), "security mode or flags changed");
+        if (item.mode == SecurityMode::Reality) {
+            Require(result.tls.min_version == TlsVersion::V1_3 && result.tls.max_version == TlsVersion::V1_3,
+                "Reality must constrain TLS version");
+        }
     }
 }
 
@@ -82,7 +86,8 @@ void TestAlpnAndDefaults() {
     for (const auto& item : {AlpnCase{"grpc", "tls", "", true}, {"grpc", "none", "", false},
                             {"h2", "none", "", true}, {"http", "none", "", false},
                             {"http", "tls", "", true}, {"xhttp", "none", "auto", true},
-                            {"xhttp", "none", "packet-up", false}, {"xhttp", "tls", "packet-up", true}}) {
+                            {"xhttp", "none", "packet-up", false}, {"xhttp", "tls", "packet-up", true},
+                            {"xhttp", "reality", "auto", false}}) {
         StreamSettings source;
         source.network = item.network;
         source.security = item.security;

@@ -17,6 +17,7 @@
 
 namespace acpp::transport::internet {
 namespace {
+constexpr std::size_t kMaxActiveSockets = 4096;
 constexpr std::size_t kMaxReceiveBuffers = 8;
 constexpr std::size_t kMaxDatagramBytes = kMaxReceiveBuffers * buf::Buffer::kSize;
 constexpr std::size_t kMaxUdpPayloadV4 = 65507;
@@ -78,32 +79,25 @@ void ValidateBuffers(
 }
 }  // namespace
 
-struct DatagramSocket::Impl final : memory::DataAllocated {
+struct DatagramSocket::Impl final : memory::ThreadAllocated {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
 
-    Impl(net::any_io_executor executor, const net::ip::address& bind_address)
-        : socket(executor)
-        , timeouts(executor, *this)
+    Impl(net::io_context& io_context, const net::ip::address& bind_address)
+        : socket(io_context)
+        , timeouts(io_context, *this)
         , ipv6(bind_address.is_v6()) {
+        if (active_count >= kMaxActiveSockets) ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
         IoErrorCode ec;
         socket.open(ipv6 ? udp::v6() : udp::v4(), ec);
         if (ec) throw IoSystemError(ec);
-        // Some platforms default to buffers smaller than a valid UDP payload.
-        // Preserve larger defaults, but allow one full datagram in each direction.
-        const auto ensure_capacity = [this](auto option) {
-            socket.get_option(option);
-            if (option.value() < static_cast<int>(kMaxDatagramBytes)) {
-                socket.set_option(decltype(option){static_cast<int>(kMaxDatagramBytes)});
-            }
-        };
-        ensure_capacity(net::socket_base::send_buffer_size{});
-        ensure_capacity(net::socket_base::receive_buffer_size{});
         if (ipv6) {
             socket.set_option(net::ip::v6_only(true), ec);
             if (ec) throw IoSystemError(ec);
         }
         socket.bind(udp::endpoint(bind_address, 0), ec);
         if (ec) throw IoSystemError(ec);
+        ++active_count;
+        counted = true;
     }
 
     ~Impl() noexcept { Close(ErrorCode::CANCELLED); }
@@ -120,6 +114,10 @@ struct DatagramSocket::Impl final : memory::DataAllocated {
         IoErrorCode ignored;
         socket.cancel(ignored);
         socket.close(ignored);
+        if (counted) {
+            --active_count;
+            counted = false;
+        }
     }
 
     void Cancel(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
@@ -153,9 +151,11 @@ struct DatagramSocket::Impl final : memory::DataAllocated {
     ErrorCode cancellation_reason = ErrorCode::OK;
     bool ipv6 = false;
     bool closed = false;
+    bool counted = false;
     bool read_active = false;
     bool write_active = false;
 
+    inline static thread_local std::size_t active_count = 0;
 };
 
 net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& operation) {
@@ -164,7 +164,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
 
     auto [wait_ec] = co_await socket.async_wait(
         udp::socket::wait_read,
-        net::bind_allocator(memory::DataAllocator<std::byte>{},
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
             net::as_tuple(net::use_awaitable)));
     if (wait_ec) {
         if (operation.Cancelled()) ThrowIfCancelled(operation.CancellationReason());
@@ -189,7 +189,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
     udp::endpoint source;
     auto [receive_ec, received] = co_await socket.async_receive_from(
         std::span<net::mutable_buffer>(buffers.data(), count), source,
-        net::bind_allocator(memory::DataAllocator<std::byte>{},
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
             net::as_tuple(net::use_awaitable)));
     if (receive_ec) {
         if (operation.Cancelled()) ThrowIfCancelled(operation.CancellationReason());
@@ -238,7 +238,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
     }
     auto [send_ec, sent] = co_await socket.async_send_to(
         buffers, destination,
-        net::bind_allocator(memory::DataAllocator<std::byte>{},
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
             net::as_tuple(net::use_awaitable)));
     if (send_ec) {
         if (operation.Cancelled()) ThrowIfCancelled(operation.CancellationReason());
@@ -285,14 +285,14 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     if (payload.size() > kMaxNativeBuffers) {
         auto [ec, bytes] = co_await socket.async_send_to(
             std::span<const net::const_buffer>(single.data(), 1), destination,
-            net::bind_allocator(memory::DataAllocator<std::byte>{},
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
                 net::as_tuple(net::use_awaitable)));
         send_ec = ec;
         sent = bytes;
     } else {
         auto [ec, bytes] = co_await socket.async_send_to(
             sequence, destination,
-            net::bind_allocator(memory::DataAllocator<std::byte>{},
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{},
                 net::as_tuple(net::use_awaitable)));
         send_ec = ec;
         sent = bytes;
@@ -383,8 +383,8 @@ net::awaitable<void> DatagramSocket::WriteOperation::SendTo(
 }
 
 DatagramSocket::DatagramSocket(
-    net::any_io_executor executor, const net::ip::address& bind_address)
-    : impl_(std::make_unique<Impl>(executor, bind_address)) {}
+    net::io_context& io_context, const net::ip::address& bind_address)
+    : impl_(std::make_unique<Impl>(io_context, bind_address)) {}
 
 DatagramSocket::~DatagramSocket() noexcept { Close(); }
 
@@ -425,5 +425,6 @@ udp::endpoint DatagramSocket::LocalEndpoint() const {
     return endpoint;
 }
 
+std::size_t DatagramSocket::ActiveCount() noexcept { return Impl::active_count; }
 
 }  // namespace acpp::transport::internet

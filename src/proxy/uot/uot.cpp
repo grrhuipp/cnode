@@ -74,25 +74,25 @@ size_t EncodeAddressTo(const TargetAddress& target,
     return pos + 2;
 }
 
-tl::expected<DecodedAddress, ErrorCode> DecodeAddress(
+std::expected<DecodedAddress, ErrorCode> DecodeAddress(
     std::span<const uint8_t> data,
     bool socks_address) {
     if (data.empty()) {
-        return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     size_t pos = 1;
     const uint8_t type = data[0];
     if (type == (socks_address ? 0x01 : 0x00)) {
         if (data.size() < 1 + 4 + 2) {
-            return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         net::ip::address_v4::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + pos, bytes.size());
         pos += bytes.size();
         const uint16_t port = ReadU16BE(data.data() + pos);
         if (port == 0) {
-            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         return DecodedAddress{
             TargetAddress(net::ip::make_address_v4(bytes), port),
@@ -100,14 +100,14 @@ tl::expected<DecodedAddress, ErrorCode> DecodeAddress(
     }
     if (type == (socks_address ? 0x04 : 0x01)) {
         if (data.size() < 1 + 16 + 2) {
-            return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         net::ip::address_v6::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + pos, bytes.size());
         pos += bytes.size();
         const uint16_t port = ReadU16BE(data.data() + pos);
         if (port == 0) {
-            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         return DecodedAddress{
             TargetAddress(net::ip::make_address_v6(bytes), port),
@@ -115,22 +115,22 @@ tl::expected<DecodedAddress, ErrorCode> DecodeAddress(
     }
     if (type == (socks_address ? 0x03 : 0x02)) {
         if (data.size() < 2) {
-            return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         const size_t host_len = data[pos++];
         if (host_len == 0 || data.size() < 1 + 1 + host_len + 2) {
-            return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         const std::string_view host(
             reinterpret_cast<const char*>(data.data() + pos), host_len);
         pos += host_len;
         const uint16_t port = ReadU16BE(data.data() + pos);
         if (port == 0) {
-            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         return DecodedAddress{TargetAddress(host, port), pos + 2};
     }
-    return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
 }
 
 size_t AddressEncodedSizeFromPrefix(std::span<const uint8_t> prefix,
@@ -167,35 +167,35 @@ net::awaitable<PendingStatus> EnsurePending(
     co_return PendingStatus::Ready;
 }
 
-net::awaitable<tl::expected<DecodedAddress, ErrorCode>> ReadAddress(
+net::awaitable<std::expected<DecodedAddress, ErrorCode>> ReadAddress(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending,
     size_t offset,
     bool socks_address) {
     const size_t initial_need = offset + 2;
     if (co_await EnsurePending(reader, pending, initial_need) != PendingStatus::Ready) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     std::array<uint8_t, kMaxAddressSize + 1> prefix{};
     const size_t copied = pending.CopyPrefixTo(
         std::span<uint8_t>(prefix.data(), initial_need));
     if (copied != initial_need) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const auto address_prefix = std::span<const uint8_t>(prefix).subspan(offset);
     const size_t address_size = AddressEncodedSizeFromPrefix(
         address_prefix, socks_address);
     if (address_size == 0 || address_size == std::numeric_limits<size_t>::max()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     if (co_await EnsurePending(reader, pending, offset + address_size) !=
         PendingStatus::Ready) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const size_t need = offset + address_size;
     if (pending.CopyPrefixTo(std::span<uint8_t>(prefix.data(), need)) != need) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     co_return DecodeAddress(
         std::span<const uint8_t>(prefix.data() + offset, address_size),
@@ -222,7 +222,7 @@ std::optional<Version> VersionFromMagicAddress(
     return std::nullopt;
 }
 
-tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
+std::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
     const TargetAddress& destination) {
     EncodedRequest out;
@@ -233,26 +233,26 @@ tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
         out.bytes.size() - 1,
         true);
     if (address_size == 0) {
-        return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     out.size = 1 + address_size;
     return out;
 }
 
-net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
+net::awaitable<std::expected<Request, ErrorCode>> ReadRequest(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending) {
     if (co_await EnsurePending(reader, pending, 1) != PendingStatus::Ready) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     std::array<uint8_t, 1> first{};
     if (pending.CopyPrefixTo(first) != first.size() || first[0] > 1) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     auto address = co_await ReadAddress(reader, pending, 1, true);
     if (!address || !address->destination.IsValid()) {
-        co_return tl::unexpected(address
+        co_return std::unexpected(address
             ? ErrorCode::PROTOCOL_INVALID_ADDRESS
             : address.error());
     }

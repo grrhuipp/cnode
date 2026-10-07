@@ -26,7 +26,7 @@ public:
     Handler(const std::string& tag, const BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
@@ -35,7 +35,7 @@ public:
         const RelayConfig& relay_config,
         buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) const override;
+        std::chrono::seconds relay_write_timeout) override;
 
     std::string_view Tag() const noexcept override { return tag_; }
 

@@ -9,17 +9,20 @@
 #include <vector>
 
 namespace acpp {
-class Runtime;
+class Worker;
 class ConnectionLimiter;
 
 namespace controller {
 
-// The concrete cold-path boundary for all-Runtime mutations. Each asynchronous
-// operation joins every started Runtime task before it completes or throws.
+// The concrete cold-path boundary for all-Worker mutations. Each asynchronous
+// operation joins every started Worker task before it completes or throws.
 class NodeRuntime {
 public:
-    NodeRuntime(Runtime& runtime, ConnectionLimiter& limiter, const PanelConfig& config)
-        : runtime_(runtime), limiter_(limiter), config_(config) {}
+    NodeRuntime(net::io_context& io_context,
+                const std::vector<std::unique_ptr<Worker>>& workers,
+                const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters,
+                const PanelConfig& config)
+        : io_context_(io_context), workers_(workers), limiters_(limiters), config_(config) {}
 
     net::awaitable<void> RemoveInbound(const std::string& tag);
     net::awaitable<void> RemoveOutbound(const std::string& tag);
@@ -30,8 +33,9 @@ public:
     void ClearUsers(const std::string& tag, const std::string& protocol);
 
 private:
-    Runtime& runtime_;
-    ConnectionLimiter& limiter_;
+    net::io_context& io_context_;
+    const std::vector<std::unique_ptr<Worker>>& workers_;
+    const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters_;
     const PanelConfig& config_;
 };
 

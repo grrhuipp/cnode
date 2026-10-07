@@ -18,13 +18,13 @@ namespace acpp::anytls {
 
 class Validator {
 public:
-    Validator() = default;
-    ~Validator() = default;
+    Validator();
+    ~Validator();
 
     Validator(const Validator&) = delete;
     Validator& operator=(const Validator&) = delete;
-    Validator(Validator&&) noexcept = default;
-    Validator& operator=(Validator&&) noexcept = default;
+    Validator(Validator&&) noexcept;
+    Validator& operator=(Validator&&) noexcept;
 
     [[nodiscard]] std::shared_ptr<const proxyman::inbound::UserStore::AnyTlsCredential> Validate(
         std::string_view tag,
@@ -33,7 +33,28 @@ public:
     [[nodiscard]] size_t Size() const;
     [[nodiscard]] size_t SizeForTag(std::string_view tag) const;
 
+    void OnUserConnected(std::string_view tag,
+                         uint64_t user_id,
+                         std::string_view client_ip);
 
+    void OnUserDisconnected(std::string_view tag,
+                            uint64_t user_id,
+                            std::string_view client_ip);
+
+    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
+                                       uint64_t user_id,
+                                       std::string_view client_ip,
+                                       uint32_t device_limit) const;
+
+    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
+                                           uint64_t user_id) const;
+
+    [[nodiscard]] std::vector<OnlineDevice>
+    GetOnlineDevices(std::string_view tag) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace acpp::anytls

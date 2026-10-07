@@ -31,13 +31,6 @@ struct ConnectionLogContext {
 //   by loglevel;
 // - access records go to the access logger and intentionally have no severity.
 class Log {
-    // Capture only the field used by the logger, while still evaluating the
-    // default at the call site. Keep the filename as constant data rather than
-    // accessing a compiler-generated source_location descriptor at runtime.
-    static consteval std::string_view SourceFile(std::source_location location) {
-        return location.file_name();
-    }
-
 public:
     [[nodiscard]] static bool Init(const std::string& level,
                                    const std::filesystem::path& log_dir,
@@ -53,12 +46,12 @@ public:
     static void WriteSystem(
         LogLevel level,
         std::string message,
-        std::string_view source_file = SourceFile(std::source_location::current()));
+        std::source_location location = std::source_location::current());
 
     static void WriteConnection(
         LogLevel level,
         std::string message,
-        std::string_view source_file = SourceFile(std::source_location::current()));
+        std::source_location location = std::source_location::current());
 
     static void WriteAccess(std::string message);
 
@@ -66,14 +59,14 @@ public:
         LogLevel level,
         ConnectionLogContext context,
         std::string message,
-        std::string_view source_file = SourceFile(std::source_location::current()));
+        std::source_location location = std::source_location::current());
 
     template <typename Context>
     static void WriteConnection(
         LogLevel level,
         const Context& context,
         std::string message,
-        std::string_view source_file = SourceFile(std::source_location::current())) {
+        std::source_location location = std::source_location::current()) {
         ConnectionLogContext log_context{
             .conn_id = context.conn_id,
             .inbound_tag = {},
@@ -94,13 +87,13 @@ public:
             level,
             std::move(log_context),
             std::move(message),
-            source_file);
+            location);
     }
 
     static void WriteConsole(
         LogLevel level,
         std::string message,
-        std::string_view source_file = SourceFile(std::source_location::current()));
+        std::source_location location = std::source_location::current());
 
     [[nodiscard]] static bool ShouldLog(LogLevel level) noexcept;
 

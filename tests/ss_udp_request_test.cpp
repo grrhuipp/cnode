@@ -1,7 +1,6 @@
 #include "proxy/shadowsocks/outbound/udp_request.hpp"
-#include "runtime_services_fixture.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
-#include "acppnode/app/dns/dns_service.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/redirect_error.hpp>
@@ -28,24 +27,13 @@ void Check(bool condition, std::string_view message) {
 
 struct Fixture {
     net::io_context io;
-    tests::RuntimeServicesFixture runtime_services{io.get_executor()};
-    app::dns::DNSService dns_worker{
-        io.get_executor(), app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
+    app::dns::DNSWorker dns_worker{
+        io, app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
     app::dns::DNS dns{dns_worker};
-
-    net::awaitable<void> RunAndClose(net::awaitable<void> task) {
-        std::exception_ptr failure;
-        try { co_await std::move(task); }
-        catch (...) { failure = std::current_exception(); }
-        co_await dns_worker.Close();
-        if (failure) std::rethrow_exception(failure);
-    }
 
     void Run(net::awaitable<void> task) {
         std::exception_ptr failure;
-        std::exception_ptr dns_failure;
         bool done = false;
-        bool dns_done = false;
         bool expired = false;
         net::steady_timer watchdog(io, 12s);
         watchdog.async_wait([&](const IoErrorCode& ec) {
@@ -54,19 +42,14 @@ struct Fixture {
                 io.stop();
             }
         });
-        net::co_spawn(io, dns_worker.Run(), [&](std::exception_ptr error) {
-            dns_failure = error;
-            dns_done = true;
-        });
-        net::co_spawn(io, RunAndClose(std::move(task)), [&](std::exception_ptr error) {
+        net::co_spawn(io, std::move(task), [&](std::exception_ptr error) {
             failure = error;
             done = true;
             watchdog.cancel();
         });
         io.run();
-        Check(done && dns_done && !expired, "test task or DNS lifecycle watchdog expired");
+        Check(done && !expired, "test task watchdog expired");
         if (failure) std::rethrow_exception(failure);
-        if (dns_failure) std::rethrow_exception(dns_failure);
     }
 };
 
@@ -242,7 +225,7 @@ net::awaitable<void> TestAuthenticatedRoundTrip(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
     const TargetAddress proxy_next_hop = Target(server.local_endpoint());
-    UdpRequest request(fixture.io.get_executor(), fixture.dns,
+    UdpRequest request(fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), proxy_next_hop,
         cipher.info, cipher.key, {});
 
@@ -282,7 +265,7 @@ net::awaitable<void> TestAuthenticatedRoundTrip(Fixture& fixture) {
 net::awaitable<void> TestReadBudgetAgainstSameServerGarbage(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io.get_executor(), fixture.dns,
+    UdpRequest request(fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetReadTimeout(1s);
@@ -300,7 +283,7 @@ net::awaitable<void> TestWrongSourceCannotExtendIdle(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     udp::socket wrong_source(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io.get_executor(), fixture.dns,
+    UdpRequest request(fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetIdleTimeout(1s);
@@ -321,7 +304,7 @@ net::awaitable<void> TestWrongSourceCannotExtendIdle(Fixture& fixture) {
 net::awaitable<void> TestSameSourceGarbageCannotExtendIdle(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io.get_executor(), fixture.dns,
+    UdpRequest request(fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     request.SetIdleTimeout(1s);
@@ -338,7 +321,7 @@ net::awaitable<void> TestSameSourceGarbageCannotExtendIdle(Fixture& fixture) {
 net::awaitable<void> TestMaximumWirePayload(Fixture& fixture) {
     udp::socket server(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto cipher = MakeCipher();
-    UdpRequest request(fixture.io.get_executor(), fixture.dns,
+    UdpRequest request(fixture.io, fixture.dns,
         net::ip::address_v4::loopback(), Target(server.local_endpoint()),
         cipher.info, cipher.key, {});
     const TargetAddress inner_target(net::ip::address_v4::loopback(), 5353);

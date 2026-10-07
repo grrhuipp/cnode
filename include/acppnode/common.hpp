@@ -97,6 +97,6 @@ class API;
 
 class Config;
 class Stats;
-class Runtime;
+class Worker;
 
 }  // namespace acpp

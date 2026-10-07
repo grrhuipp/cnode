@@ -1,6 +1,5 @@
 #include "app/dns/cache_internal.hpp"
 #include "acppnode/common/allocator.hpp"
-#include "data_allocation_probe.hpp"
 
 #include <array>
 #include <iostream>
@@ -13,16 +12,27 @@ namespace {
 
 thread_local int fail_after = -1;
 
-bool RejectAllocation(std::size_t, std::size_t) noexcept {
-    return fail_after >= 0 && fail_after-- == 0;
-}
+class FailingResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
+private:
+    void* do_allocate(size_t size, size_t alignment) override {
+        if (fail_after >= 0 && fail_after-- == 0) throw std::bad_alloc();
+        return upstream_->allocate(size, alignment);
+    }
+    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
+        upstream_->deallocate(pointer, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+    std::pmr::memory_resource* upstream_;
+};
 
 class FailAllocation {
 public:
-    explicit FailAllocation(int after) noexcept : probe_(RejectAllocation) { fail_after = after; }
+    explicit FailAllocation(int after) noexcept { fail_after = after; }
     ~FailAllocation() { fail_after = -1; }
-private:
-    DataAllocationProbe probe_;
 };
 
 void Require(bool condition, const char* message) {
@@ -92,7 +102,7 @@ void TestCapacityAndResults() {
     cache.Store("two.example", answer);
     Require(cache.Get("one.example") && cache.Get("two.example") &&
                 cache.GetStats().entries == 2,
-            "a DNS cache must make its full capacity available to arbitrary domains");
+            "a Worker cache must make its full capacity available to arbitrary domains");
     cache.Store("three.example", answer);
     Require(!cache.Get("one.example") && cache.Get("two.example") &&
                 cache.Get("three.example") && cache.GetStats().entries == 2,
@@ -151,6 +161,8 @@ void TestFailedReplacement() {
 
 int main() {
     acpp::memory::ConfigureProcessAllocator();
+    FailingResource resource(std::pmr::get_default_resource());
+    auto* original = std::pmr::set_default_resource(&resource);
     bool passed = true;
     try {
         TestFailedInsertion(false);
@@ -161,5 +173,6 @@ int main() {
         std::cerr << error.what() << '\n';
         passed = false;
     }
+    std::pmr::set_default_resource(original);
     return passed ? 0 : 1;
 }

@@ -5,7 +5,7 @@
 //
 // 统一 WebSocket 客户端和服务端的公共部分：
 // - 帧解析/编码
-// - 写关闭/完全关闭的幂等管理（会话 strand 的普通状态）
+// - 写关闭/完全关闭的幂等管理（per-Worker 普通状态）
 // ============================================================================
 
 #include "acppnode/transport/async_stream.hpp"
@@ -18,13 +18,13 @@
 #include <openssl/rand.h>
 
 #include <array>
-#include <tl/expected.hpp>
+#include <expected>
 #include <cstring>
 #include <algorithm>
 
 namespace acpp {
 
-using WsHandshakeResult = tl::expected<void, ErrorCode>;
+using WsHandshakeResult = std::expected<void, ErrorCode>;
 
 [[noreturn]] inline void ThrowWsStreamError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
@@ -157,7 +157,7 @@ inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
 //
 // 提供公共功能：
 // - 帧读取 (ReadFrame)
-// - 写关闭/完全关闭的幂等管理（会话 executor 上的普通 bool）
+// - 写关闭/完全关闭的幂等管理（per-Worker executor 上的普通 bool）
 // - pending/decoded 缓冲区管理
 //
 // 子类需要实现：

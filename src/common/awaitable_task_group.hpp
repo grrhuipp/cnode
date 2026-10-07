@@ -151,7 +151,7 @@ net::awaitable<void> RunOnExecutor(Start start) {
 template <typename Start>
 net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start start) {
     if ((co_await net::this_coro::executor) == executor) {
-        // Normal Runtime requests are already on their owner. Do not allocate
+        // Normal Worker requests are already on their owner. Do not allocate
         // another co_spawn operation just to return to the same executor.
         co_await task_group_detail::RunOnExecutor(std::move(start));
     } else {

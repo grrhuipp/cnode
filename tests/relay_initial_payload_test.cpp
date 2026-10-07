@@ -3,7 +3,6 @@
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
-#include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/use_future.hpp>
@@ -19,16 +18,6 @@
 namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
-
-class TimeoutSchedulerScope final {
-public:
-    explicit TimeoutSchedulerScope(net::any_io_executor executor) : executor_(std::move(executor)) {
-        TimeoutScheduler::Install(executor_);
-    }
-    ~TimeoutSchedulerScope() { TimeoutScheduler::ReleaseForExecutor(executor_); }
-private:
-    net::any_io_executor executor_;
-};
 
 buf::MultiBuffer Payload(size_t size, uint8_t byte = 0x42) {
     std::vector<uint8_t> bytes(size, byte);
@@ -56,7 +45,6 @@ struct Endpoint {
     uint64_t written = 0;
     std::vector<uint8_t> output;
     bool cancelled = false;
-    bool pending_read_is_eof = false;
     std::optional<net::steady_timer> pending_read;
     int active_reads = 0;
     transport::CancellationSource cancellation;
@@ -72,9 +60,7 @@ struct Endpoint {
                 explicit ReadScope(int& value) : active(value) { ++active; }
                 ~ReadScope() { --active; }
             } scope(active_reads);
-            const auto [error] = co_await pending_read->async_wait(net::as_tuple(net::use_awaitable));
-            if (error && !pending_read_is_eof) throw IoSystemError(error);
-            co_return buf::MultiBuffer{};
+            co_await pending_read->async_wait(net::use_awaitable);
         }
         co_return std::move(input);
     }
@@ -127,7 +113,7 @@ struct Endpoint {
         const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
         const auto delay = timeout >= maximum ? std::chrono::milliseconds::max()
             : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-        phase_timer = TimeoutScheduler::ForExecutor(io->get_executor()).ScheduleAfter(delay, io->get_executor(), [this] {
+        phase_timer = TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, [this] {
             phase_expired = true;
             phase_flags = 1;
             Cancel();
@@ -159,7 +145,7 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     if (mode == 2) target.read_error = ErrorCode::RELAY_READ_FAILED;
     TimeoutToken external_cancel;
     if (mode >= 14) client.Cancel(mode == 15 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
-    if (mode >= 6 && mode < 14) external_cancel = TimeoutScheduler::ForExecutor(io.get_executor()).ScheduleAfter(50ms, io.get_executor(), [&client, &target, mode] {
+    if (mode >= 6 && mode < 14) external_cancel = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&client, &target, mode] {
         if (mode >= 12) {
             client.Cancel(mode == 13 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
             return;
@@ -168,14 +154,14 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
         target.Cancel(mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
     });
     StatsShard stats;
-    session::Context context(io.get_executor());
+    session::Context context;
     const RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
                              .downlink_only = mode == 4 ? 0s : 1s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = mode == 1 || mode == 5 || mode == 7 || mode == 9 || mode == 11 || mode >= 12
-        ? co_await DoRelayLink(io.get_executor(), client, client, target, context, stats, config,
+        ? co_await DoRelayLink(io, client, client, target, context, stats, config,
             mode >= 14 ? Payload(4000) : buf::MultiBuffer{})
-        : co_await DoRelayLink(io.get_executor(), client, client, client, target, context, stats, config);
+        : co_await DoRelayLink(io, client, client, client, target, context, stats, config);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = mode == 12 || mode == 14 ? ErrorCode::CANCELLED :
         mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? ErrorCode::RELAY_READ_FAILED :
@@ -201,10 +187,10 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     if (mode != 1) block(client);
     if (mode != 0 && mode != 4) block(target);
     StatsShard stats;
-    session::Context context(io.get_executor());
+    session::Context context;
     net::cancellation_signal parent;
     TimeoutToken external;
-    if (mode >= 2) external = TimeoutScheduler::ForExecutor(io.get_executor()).ScheduleAfter(50ms, io.get_executor(), [&] {
+    if (mode >= 2) external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] {
         if (mode == 3) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
@@ -212,8 +198,8 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     const RelayConfig config{.uplink_only = budget, .downlink_only = budget};
     const auto start = std::chrono::steady_clock::now();
     auto relay = controlled
-        ? DoRelayLink(io.get_executor(), client, client, client, target, context, stats, config)
-        : DoRelayLink(io.get_executor(), client, client, target, context, stats, config);
+        ? DoRelayLink(io, client, client, client, target, context, stats, config)
+        : DoRelayLink(io, client, client, target, context, stats, config);
     const auto result = co_await net::co_spawn(io, std::move(relay),
         net::bind_cancellation_slot(parent.slot(), net::use_awaitable));
     const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -245,14 +231,14 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     if (mode == 4) target.SetReadTimeout(1s);
     TimeoutToken external;
     if (mode == 2 || mode == 3)
-        external = TimeoutScheduler::ForExecutor(io.get_executor()).ScheduleAfter(50ms, io.get_executor(), [&] { target.Cancel(); });
+        external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] { target.Cancel(); });
     StatsShard stats;
-    session::Context context(io.get_executor());
+    session::Context context;
     const RelayConfig config{.speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = controlled
-        ? co_await DoRelayLink(io.get_executor(), client, client, client, target, context, stats, config)
-        : co_await DoRelayLink(io.get_executor(), client, client, target, context, stats, config);
+        ? co_await DoRelayLink(io, client, client, client, target, context, stats, config)
+        : co_await DoRelayLink(io, client, client, target, context, stats, config);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = mode == 2 || mode == 3 ? ErrorCode::CANCELLED : ErrorCode::RELAY_TIMEOUT;
     const bool passed = result.error == expected && result.bytes_up == 0 && result.bytes_down == 0 &&
@@ -273,16 +259,16 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
     target_peer.connect(listener.local_endpoint());
     TcpStream target(listener.accept());
     net::cancellation_signal parent;
-    auto external = TimeoutScheduler::ForExecutor(io.get_executor()).ScheduleAfter(50ms, io.get_executor(), [&] {
+    auto external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] {
         if (parent_cancel) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
-    session::Context context(io.get_executor());
+    session::Context context;
     StatsShard stats;
     const RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,
         .speed_limit = limited ? 1000u : 0u};
-    auto relay = controlled ? DoRelayLink(io.get_executor(), client, client, client, target, context, stats, config) :
-        DoRelayLink(io.get_executor(), client, client, target, context, stats, config);
+    auto relay = controlled ? DoRelayLink(io, client, client, client, target, context, stats, config) :
+        DoRelayLink(io, client, client, target, context, stats, config);
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await net::co_spawn(io, std::move(relay),
         net::bind_cancellation_slot(parent.slot(), net::use_awaitable));
@@ -308,16 +294,16 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
     auto prefix = Payload(prefix_size);
     const auto* first_buffer = *prefix.begin();
     StatsShard stats;
-    session::Context context(io.get_executor());
+    session::Context context;
     const RelayConfig config{.uplink_only = 5s, .downlink_only = 5s,
                              .speed_limit = limited ? 1000u : 0u};
     RelayResult result;
     const auto start = std::chrono::steady_clock::now();
     if (controlled) {
-        result = co_await DoRelayLink(io.get_executor(), client, client, client, target, context, stats,
+        result = co_await DoRelayLink(io, client, client, client, target, context, stats,
                                     config, std::move(prefix));
     } else {
-        result = co_await DoRelayLink(io.get_executor(), client, client, target, context, stats,
+        result = co_await DoRelayLink(io, client, client, target, context, stats,
                                     config, std::move(prefix));
     }
     const auto stats_bytes = stats.Snapshot().bytes_out;
@@ -363,12 +349,10 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
     if (mode == 0) {
         client.input = Payload(4000);
         target.eof_action = transport::EofAction::CloseLink;
-        target.pending_read_is_eof = true;
         block(target, 50ms);
     } else if (mode == 1) {
         target.input = Payload(4000);
         target.shutdown_closes_link = true;
-        client.pending_read_is_eof = true;
         block(client, 50ms);
     } else if (mode == 2) {
         client.input = Payload(17);
@@ -384,12 +368,12 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
             mode == 4 ? ErrorCode::BLOCKED : ErrorCode::RELAY_WRITE_FAILED;
     }
     StatsShard stats;
-    session::Context context(io.get_executor());
+    session::Context context;
     const RelayConfig config{.uplink_only = 10s, .downlink_only = 10s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = controlled
-        ? co_await DoRelayLink(io.get_executor(), client, client, client, target, context, stats, config)
-        : co_await DoRelayLink(io.get_executor(), client, client, target, context, stats, config);
+        ? co_await DoRelayLink(io, client, client, client, target, context, stats, config)
+        : co_await DoRelayLink(io, client, client, target, context, stats, config);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto snapshot = stats.Snapshot();
     const bool passed = result.error == expected_error && result.bytes_up == 0 &&
@@ -418,16 +402,16 @@ bool TestInitialPayloadAllocation() {
     bytes.fill(0x33);
     InitialPayload initial;
     initial.assign(bytes);
-    const auto before = memory::rejected_data_allocations.load();
+    const auto before = memory::rejected_pmr_allocations;
     bool failed = false;
-    memory::reject_next_data_allocation = true;
+    memory::reject_next_pmr_allocation = true;
     try { auto payload = initial.MoveToMultiBuffer(); }
     catch (const std::bad_alloc&) { failed = true; }
-    memory::reject_next_data_allocation = false;
+    memory::reject_next_pmr_allocation = false;
     const bool retained = initial.size() == bytes.size() &&
         std::equal(initial.span().begin(), initial.span().end(), bytes.begin(), bytes.end());
     auto recovered = initial.MoveToMultiBuffer();
-    const bool passed = failed && retained && memory::rejected_data_allocations > before &&
+    const bool passed = failed && retained && memory::rejected_pmr_allocations > before &&
         initial.empty() && buf::TotalLen(recovered) == bytes.size();
     std::printf("initial allocation: failed=%d retained=%d recovered=%zu passed=%d\n",
         failed, retained, buf::TotalLen(recovered), passed);
@@ -443,7 +427,6 @@ int main(int argc, char** argv) {
         bool passed = true;
         for (bool controlled : {false, true}) for (int mode = 0; mode < 6; ++mode) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestFullClose(io, controlled, mode), net::use_future);
             io.run();
             passed = future.get() && passed;
@@ -454,7 +437,6 @@ int main(int argc, char** argv) {
         bool source_passed = true;
         for (int mode = 12; mode < 16; ++mode) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
             io.run();
             source_passed = future.get() && source_passed;
@@ -464,7 +446,6 @@ int main(int argc, char** argv) {
     bool passed = TestInitialPayloadAllocation();
     for (int mode = 0; mode < 16; ++mode) {
         net::io_context io;
-        TimeoutSchedulerScope timeout_scheduler(io.get_executor());
         auto future = net::co_spawn(io, TestRateCancellation(io, mode), net::use_future);
         io.run();
         passed = future.get() && passed;
@@ -472,35 +453,30 @@ int main(int argc, char** argv) {
     for (bool controlled : {false, true}) {
         for (bool parent : {false, true}) for (bool limited : {false, true}) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestTcpPending(io, controlled, parent, limited), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestPendingRead(io, controlled, mode), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int mode = 0; mode < 5; ++mode) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestTcpCancellation(io, controlled, mode), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (int failure = 0; failure != 4; ++failure) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestInitialPayload(io, controlled, failure, 7, 5, false), net::use_future);
             io.run();
             passed = future.get() && passed;
         }
         for (auto sizes : {std::pair<size_t, size_t>{2000, 0}, {750, 750}}) {
             net::io_context io;
-            TimeoutSchedulerScope timeout_scheduler(io.get_executor());
             auto future = net::co_spawn(io, TestInitialPayload(io, controlled, 0, sizes.first, sizes.second, true), net::use_future);
             io.run();
             passed = future.get() && passed;

@@ -30,7 +30,6 @@
 #include "acppnode/transport/internet/transport_dialer.hpp"
 #include "acppnode/transport/link.hpp"
 
-#include <asio/strand.hpp>
 #include <array>
 #include <cctype>
 #include <limits>
@@ -267,7 +266,7 @@ public:
 
 private:
     memory::ByteVector pending_;
-    memory::DataDeque<MuxFramePayload> queue_;
+    memory::ThreadLocalDeque<MuxFramePayload> queue_;
     size_t pending_offset_ = 0;
     bool shrink_queue_on_drain_ = false;
     bool failed_ = false;
@@ -564,22 +563,20 @@ private:
 }  // namespace
 
 proxy::vless::outbound::Handler::Handler(std::string tag,
-                                          net::any_io_executor executor,
                                           const VlessOutboundConfig& config,
                                           ::acpp::app::dns::DNS& dns_service)
     : tag_(std::move(tag))
     , config_(config)
     , dns_service_(dns_service)
     , encryption_tickets_(config_.encryption
-          ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>(
-                net::make_strand(std::move(executor)))
+          ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>()
           : nullptr) {}
 
 proxy::vless::outbound::Handler::~Handler() = default;
 
 net::awaitable<OutboundProcessResult>
 proxy::vless::outbound::Handler::Process(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     const tcp::endpoint* inbound_local_addr,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
@@ -588,12 +585,12 @@ proxy::vless::outbound::Handler::Process(
     const RelayConfig& relay_config,
     buf::MultiBuffer first_payload,
     std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) const {
+    std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!config_.flow.empty() && ctx.content.network != Network::TCP) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const auto& target = ctx.outbound.target;
@@ -616,15 +613,15 @@ proxy::vless::outbound::Handler::Process(
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
             LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_.address);
         }
-        co_return tl::unexpected(transport_target.error());
+        co_return std::unexpected(transport_target.error());
     }
 
-    auto dial_result = co_await DialOutboundTransport(executor, ctx, *transport_target);
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
+        co_return std::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -640,7 +637,7 @@ proxy::vless::outbound::Handler::Process(
         if (stream) {
             stream->CloseAbortive();
         }
-        return tl::unexpected(error);
+        return std::unexpected(error);
     };
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
@@ -740,11 +737,11 @@ proxy::vless::outbound::Handler::Process(
             target);
         if (inbound.control) {
             co_return co_await DoRelayLink(
-                executor, *inbound.reader, *inbound.writer, *inbound.control,
+                io_context, *inbound.reader, *inbound.writer, *inbound.control,
                 target_endpoint, ctx, stats, relay_config, std::move(first_payload));
         }
         co_return co_await DoRelayLink(
-            executor, *inbound.reader, *inbound.writer,
+            io_context, *inbound.reader, *inbound.writer,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
@@ -759,11 +756,11 @@ proxy::vless::outbound::Handler::Process(
         config_.uuid_bytes);
     if (inbound.control) {
         co_return co_await DoRelayLink(
-            executor, *inbound.reader, *inbound.writer, *inbound.control,
+            io_context, *inbound.reader, *inbound.writer, *inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
     co_return co_await DoRelayLink(
-        executor, *inbound.reader, *inbound.writer,
+        io_context, *inbound.reader, *inbound.writer,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
 
@@ -923,22 +920,22 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
         if (!vless_config.flow.empty() &&
-            (!vless_config.stream_settings.IsTls() ||
+            (!vless_config.stream_settings.IsTlsLike() ||
              vless_config.stream_settings.network_mode != acpp::NetworkMode::Tcp)) {
-            LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS", cfg.tag);
+            LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS or Reality", cfg.tag);
             return std::nullopt;
         }
 
         return acpp::proxyman::outbound::PreparedOutboundCreator{
             [vless_config = std::move(vless_config)](
                 std::string_view tag,
-                acpp::net::any_io_executor executor,
+                acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 auto runtime_config = vless_config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vless::outbound::Handler>(
-                    std::string(tag), executor, runtime_config, dns);
+                    std::string(tag), runtime_config, dns);
             }};
     }), true);
 }  // namespace

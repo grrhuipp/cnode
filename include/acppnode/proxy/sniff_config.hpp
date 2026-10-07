@@ -25,7 +25,7 @@ struct SniffConfig {
     std::vector<std::string> domains_excluded;
     uint8_t dest_override_mask = kOverrideTls | kOverrideHttp | kOverrideQuic;
 
-    // 冷路径在配置进入 runtime 前刷新；请求期只做协议名 -> bit 判断。
+    // 冷路径在配置进入 Worker 前刷新；请求期只做协议名 -> bit 判断。
     void RefreshHotPathFields() {
         dest_override_mask = 0;
         for (const auto& protocol : dest_override) {

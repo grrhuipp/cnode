@@ -71,7 +71,7 @@ public:
         bool send_started_ = false;
     };
 
-    DatagramSocket(net::any_io_executor executor, const net::ip::address& bind_address);
+    DatagramSocket(net::io_context& io_context, const net::ip::address& bind_address);
     ~DatagramSocket() noexcept;
     DatagramSocket(const DatagramSocket&) = delete;
     DatagramSocket& operator=(const DatagramSocket&) = delete;
@@ -97,6 +97,7 @@ public:
     void Close() noexcept;
     [[nodiscard]] bool IsIPv6() const noexcept;
     [[nodiscard]] udp::endpoint LocalEndpoint() const;
+    [[nodiscard]] static std::size_t ActiveCount() noexcept;
 
 private:
     std::unique_ptr<Impl> impl_;

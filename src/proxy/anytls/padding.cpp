@@ -5,8 +5,7 @@
 #include <charconv>
 #include <map>
 #include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <stdexcept>
+#include <random>
 #include <utility>
 
 namespace acpp::anytls {
@@ -58,14 +57,8 @@ std::optional<SizeRange> ParseRange(std::string_view text) {
 
 int SampleRange(int lo, int hi) {
     if (lo == hi) return lo;
-    const auto width = static_cast<uint32_t>(hi - lo);
-    const uint32_t rejection_threshold = static_cast<uint32_t>(-width) % width;
-    uint32_t sample = 0;
-    do {
-        if (RAND_bytes(reinterpret_cast<unsigned char*>(&sample), sizeof(sample)) != 1)
-            throw std::runtime_error("failed to sample AnyTLS padding");
-    } while (sample < rejection_threshold);
-    return lo + static_cast<int>(sample % width);
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    return std::uniform_int_distribution<int>(lo, hi - 1)(rng);
 }
 
 std::optional<std::vector<PaddingRecord>> ParseRanges(std::string_view text) {

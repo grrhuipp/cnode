@@ -101,6 +101,47 @@ buf::MultiBuffer Packet(std::span<const uint8_t> data) {
     return result;
 }
 
+class FailingResource final : public std::pmr::memory_resource {
+public:
+    explicit FailingResource(std::pmr::memory_resource* upstream) noexcept
+        : upstream_(upstream) {}
+
+    void RejectNextAllocation() noexcept { reject_next_ = true; }
+    [[nodiscard]] size_t RejectedAllocations() const noexcept { return rejected_; }
+
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        if (reject_next_) {
+            reject_next_ = false;
+            ++rejected_;
+            throw std::bad_alloc();
+        }
+        return upstream_->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
+        upstream_->deallocate(pointer, bytes, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+
+    std::pmr::memory_resource* upstream_;
+    bool reject_next_ = false;
+    size_t rejected_ = 0;
+};
+
+class ScopedDefaultResource {
+public:
+    explicit ScopedDefaultResource(std::pmr::memory_resource* resource) noexcept
+        : previous_(std::pmr::set_default_resource(resource)) {}
+    ~ScopedDefaultResource() { std::pmr::set_default_resource(previous_); }
+    ScopedDefaultResource(const ScopedDefaultResource&) = delete;
+    ScopedDefaultResource& operator=(const ScopedDefaultResource&) = delete;
+
+private:
+    std::pmr::memory_resource* previous_;
+};
+
 template <typename Function>
 bool Inject(int budget, Function operation) {
     failures = 0;
@@ -273,7 +314,9 @@ void UdpPrefixTransfer() {
     bool rolled_back = false;
     bool retry_metadata = false;
     bool retry_bytes = false;
+    FailingResource failing_resource{std::pmr::new_delete_resource()};
     {
+        ScopedDefaultResource default_resource{&failing_resource};
         const TargetAddress long_target{
             "split-copy-target-host-name-longer-than-sso.example.com", 14321};
         auto source = Packet(source_bytes);
@@ -283,11 +326,9 @@ void UdpPrefixTransfer() {
         destination.reserve(1);
         auto* const source_slot = original;
 
-        const auto rejected_before = failures;
-        allocation_budget = 1; // Copy buffer succeeds; owned UDP metadata fails.
+        failing_resource.RejectNextAllocation();
         const bool moved_on_failed_copy = source.MovePrefixTo(destination, prefix_bytes);
-        allocation_budget = -1;
-        rolled_back = !moved_on_failed_copy && failures == rejected_before + 1 &&
+        rolled_back = !moved_on_failed_copy && failing_resource.RejectedAllocations() == 1 &&
             source.size() == 1 && *source.begin() == source_slot &&
             Flatten(source) == source_bytes && source.byte_size() == source_bytes.size() &&
             original->HasUDP() && original->UDP().SameEndpoint(long_target) &&

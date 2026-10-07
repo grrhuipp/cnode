@@ -31,7 +31,7 @@ def configs(forced_port, routed_port, inbound_overrides=None):
     routed = dict(forced, tag="routed", port=routed_port)
     routed.pop("outboundTag", None)
     return {
-        "config.json": {"ioThreads": 1, "log": {"enable": False}},
+        "config.json": {"workers": 1, "log": {"enable": False}},
         "inbounds.json": [forced, routed],
         "outbounds.json": [{"tag": "chosen", "protocol": "freedom"}],
         "routing.json": {"rules": [{"type": "field", "inboundTag": ["forced", "routed"], "outboundTag": "blackhole"}]},

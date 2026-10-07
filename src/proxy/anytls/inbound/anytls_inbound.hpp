@@ -27,23 +27,22 @@ namespace acpp::proxy::anytls::inbound {
 class Handler final : public Inbound {
 public:
     Handler(::acpp::anytls::Validator& validator,
-            ::acpp::UserOnlineTracker& online,
+            ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
             std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme = {});
 
-    net::awaitable<RelayResult> ProcessSession(
+    net::awaitable<RelayResult> Process(
         std::unique_ptr<AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
-        net::any_io_executor executor,
+        net::io_context& io_context,
         session::Context& ctx,
-        StatsShard& stats,
-        UserOnlineLease& online,
         const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
     ::acpp::anytls::Validator& validator_;
+    ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
     std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme_;
 };

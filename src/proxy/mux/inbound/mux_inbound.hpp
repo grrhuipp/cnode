@@ -32,7 +32,7 @@ namespace acpp::mux {
 // dispatcher: 子会话回到主请求链路重新路由和出站处理。
 // ============================================================================
 net::awaitable<RelayResult> ProcessInbound(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     transport::Link client_link,
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,

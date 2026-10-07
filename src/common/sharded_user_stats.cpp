@@ -8,25 +8,20 @@
 namespace acpp {
 
 struct UserOnlineTracker::Impl {
-    void OnUserConnected(std::string_view tag, uint64_t user_id, std::string_view client_ip);
-    void OnUserDisconnected(std::string_view tag, uint64_t user_id, std::string_view client_ip);
-    bool CanAcceptDevice(std::string_view tag, uint64_t user_id, std::string_view client_ip, uint32_t device_limit) const;
-    size_t OnlineDeviceCount(std::string_view tag, uint64_t user_id) const;
-    std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
-    using UserConnectionMap = memory::DataUnorderedMap<uint64_t, uint32_t>;
+    using UserConnectionMap = memory::ThreadLocalUnorderedMap<uint64_t, uint32_t>;
     using TagConnectionMap =
-        memory::DataUnorderedMap<std::string,
+        memory::ThreadLocalUnorderedMap<std::string,
                                         UserConnectionMap,
                                         TransparentStringHash,
                                         TransparentStringEq>;
     using DeviceIpMap =
-        memory::DataUnorderedMap<std::string,
+        memory::ThreadLocalUnorderedMap<std::string,
                                         uint32_t,
                                         TransparentStringHash,
                                         TransparentStringEq>;
-    using UserDeviceMap = memory::DataUnorderedMap<uint64_t, DeviceIpMap>;
+    using UserDeviceMap = memory::ThreadLocalUnorderedMap<uint64_t, DeviceIpMap>;
     using TagDeviceMap =
-        memory::DataUnorderedMap<std::string,
+        memory::ThreadLocalUnorderedMap<std::string,
                                         UserDeviceMap,
                                         TransparentStringHash,
                                         TransparentStringEq>;
@@ -35,33 +30,32 @@ struct UserOnlineTracker::Impl {
     TagDeviceMap devices;
 };
 
-UserOnlineTracker::UserOnlineTracker(net::any_io_executor executor, size_t capacity)
-    : impl_(std::make_unique<Impl>()), channel_(std::move(executor), capacity) {}
+UserOnlineTracker::UserOnlineTracker() : impl_(std::make_unique<Impl>()) {}
 
 UserOnlineTracker::~UserOnlineTracker() = default;
 
-void UserOnlineTracker::Impl::OnUserConnected(std::string_view tag,
+void UserOnlineTracker::OnUserConnected(std::string_view tag,
                                         uint64_t user_id,
                                         std::string_view client_ip) {
-    auto& user_connections = connections[std::string(tag)];
+    auto& user_connections = impl_->connections[std::string(tag)];
     user_connections[user_id]++;
 
     if (!client_ip.empty()) {
-        auto& user_devices = devices[std::string(tag)][user_id];
+        auto& user_devices = impl_->devices[std::string(tag)][user_id];
         user_devices[std::string(client_ip)]++;
     }
 }
 
-void UserOnlineTracker::Impl::OnUserDisconnected(std::string_view tag,
+void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
                                            uint64_t user_id,
                                            std::string_view client_ip) {
-    auto tag_it = connections.find(tag);
-    if (tag_it != connections.end()) {
+    auto tag_it = impl_->connections.find(tag);
+    if (tag_it != impl_->connections.end()) {
         auto user_it = tag_it->second.find(user_id);
         if (user_it != tag_it->second.end() && --user_it->second == 0) {
             tag_it->second.erase(user_it);
             if (tag_it->second.empty()) {
-                connections.erase(tag_it);
+                impl_->connections.erase(tag_it);
             }
         }
     }
@@ -70,8 +64,8 @@ void UserOnlineTracker::Impl::OnUserDisconnected(std::string_view tag,
         return;
     }
 
-    auto device_tag_it = devices.find(tag);
-    if (device_tag_it == devices.end()) {
+    auto device_tag_it = impl_->devices.find(tag);
+    if (device_tag_it == impl_->devices.end()) {
         return;
     }
     auto device_user_it = device_tag_it->second.find(user_id);
@@ -89,11 +83,11 @@ void UserOnlineTracker::Impl::OnUserDisconnected(std::string_view tag,
         device_tag_it->second.erase(device_user_it);
     }
     if (device_tag_it->second.empty()) {
-        devices.erase(device_tag_it);
+        impl_->devices.erase(device_tag_it);
     }
 }
 
-bool UserOnlineTracker::Impl::CanAcceptDevice(std::string_view tag,
+bool UserOnlineTracker::CanAcceptDevice(std::string_view tag,
                                         uint64_t user_id,
                                         std::string_view client_ip,
                                         uint32_t device_limit) const {
@@ -101,8 +95,8 @@ bool UserOnlineTracker::Impl::CanAcceptDevice(std::string_view tag,
         return true;
     }
 
-    auto tag_it = devices.find(tag);
-    if (tag_it == devices.end()) {
+    auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) {
         return true;
     }
     auto user_it = tag_it->second.find(user_id);
@@ -115,10 +109,10 @@ bool UserOnlineTracker::Impl::CanAcceptDevice(std::string_view tag,
     return user_it->second.size() < device_limit;
 }
 
-size_t UserOnlineTracker::Impl::OnlineDeviceCount(std::string_view tag,
+size_t UserOnlineTracker::OnlineDeviceCount(std::string_view tag,
                                             uint64_t user_id) const {
-    auto tag_it = devices.find(tag);
-    if (tag_it == devices.end()) {
+    auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) {
         return 0;
     }
     auto user_it = tag_it->second.find(user_id);
@@ -128,11 +122,11 @@ size_t UserOnlineTracker::Impl::OnlineDeviceCount(std::string_view tag,
     return user_it->second.size();
 }
 
-std::vector<OnlineDevice>
-UserOnlineTracker::Impl::GetOnlineDevices(std::string_view tag) const {
+std::vector<UserOnlineTracker::OnlineDevice>
+UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     std::vector<OnlineDevice> result;
-    auto tag_it = devices.find(tag);
-    if (tag_it == devices.end()) {
+    auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) {
         return result;
     }
 
@@ -150,58 +144,6 @@ UserOnlineTracker::Impl::GetOnlineDevices(std::string_view tag) const {
         }
     }
     return result;
-}
-
-net::awaitable<std::optional<UserOnlineTracker::Permit>> UserOnlineTracker::TryAcquire(
-    std::string tag, uint64_t user_id, std::string client_ip, uint32_t device_limit) {
-    auto reservation = channel_.TryReserve();
-    if (!reservation) throw ServiceChannelFull();
-    const bool acquired = co_await channel_.CallReserved(reservation,
-        [this, tag, user_id, client_ip, device_limit] {
-            if (!impl_->CanAcceptDevice(tag, user_id, client_ip, device_limit)) return false;
-            if (user_id != 0) {
-                try { impl_->OnUserConnected(tag, user_id, client_ip); }
-                catch (...) { impl_->OnUserDisconnected(tag, user_id, client_ip); throw; }
-            }
-            return true;
-        });
-    if (!acquired) co_return std::nullopt;
-    co_return Permit{.reservation = std::move(reservation), .tag = std::move(tag),
-        .user_id = user_id, .client_ip = std::move(client_ip)};
-}
-
-net::awaitable<void> UserOnlineTracker::Release(Permit permit) {
-    co_await channel_.CallReserved(permit.reservation,
-        [this, tag = std::move(permit.tag), user_id = permit.user_id,
-         client_ip = std::move(permit.client_ip)] {
-            if (user_id != 0) impl_->OnUserDisconnected(tag, user_id, client_ip);
-        });
-}
-
-net::awaitable<size_t> UserOnlineTracker::OnlineDeviceCount(
-    std::string tag, uint64_t user_id) {
-    return channel_.Call([this, tag = std::move(tag), user_id] {
-        return impl_->OnlineDeviceCount(tag, user_id);
-    });
-}
-
-net::awaitable<std::vector<OnlineDevice>> UserOnlineTracker::GetOnlineDevices(std::string tag) {
-    return channel_.Call([this, tag = std::move(tag)] {
-        return impl_->GetOnlineDevices(tag);
-    });
-}
-
-net::awaitable<bool> UserOnlineLease::Acquire(std::string tag, uint64_t user_id,
-                                            std::string ip, uint32_t limit) {
-    permit_ = co_await owner_.TryAcquire(std::move(tag), user_id, std::move(ip), limit);
-    co_return permit_.has_value();
-}
-
-net::awaitable<void> UserOnlineLease::Release() {
-    if (permit_) {
-        co_await owner_.Release(std::move(*permit_));
-        permit_.reset();
-    }
 }
 
 }  // namespace acpp

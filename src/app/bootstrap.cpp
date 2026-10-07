@@ -6,7 +6,7 @@
 #include "acppnode/app/bootstrap_runtime.hpp"
 #include "acppnode/service/controller/controller.hpp"
 #include "acppnode/app/stats.hpp"
-#include "acppnode/runtime/runtime.hpp"
+#include "acppnode/app/worker.hpp"
 #include "acppnode/geo/geodata.hpp"
 #include "acppnode/app/bootstrap.hpp"
 
@@ -64,6 +64,8 @@ constexpr std::string_view IoBackendName() noexcept {
     return "kqueue";
 #elif defined(_WIN32)
     return "IOCP";
+#elif defined(CNODE_IO_URING_ENABLED)
+    return "io_uring";
 #else
     return "epoll";
 #endif
@@ -114,8 +116,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("runtime io_threads={} io={} accept=single-owner allocator=concurrent",
-                config.GetIoThreads(), IoBackendName());
+#ifdef _WIN32
+    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEADDR allocator=thread-local",
+                config.GetWorkers(), IoBackendName());
+#else
+    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
+                config.GetWorkers(), IoBackendName());
+#endif
 
     if (!config.Validate()) {
         std::cerr << "Invalid configuration\n";
@@ -126,9 +133,6 @@ int RunFromCommandLine(int argc, char* argv[]) {
     try {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
         RunApplicationRuntime(MakeRuntimeContext(env));
-        LOG_CONSOLE("cnode stopped");
-        Log::Shutdown();
-        return 0;
     } catch (const std::exception& e) {
         Log::Shutdown();
         std::cerr << "Failed to initialize runtime: " << e.what() << "\n";

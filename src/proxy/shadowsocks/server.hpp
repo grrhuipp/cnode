@@ -7,7 +7,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link.hpp"
 
-#include <tl/expected.hpp>
+#include <expected>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -30,14 +30,14 @@ struct ReadTCPSessionResult {
 };
 
 // xray-core proxy/shadowsocks/server.go 对应的服务器端握手与 body reader/writer 入口。
-[[nodiscard]] net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>>
+[[nodiscard]] net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>>
 ReadTCPSession(AsyncStream& stream,
                Validator& validator,
                const SsCipherInfo& cipher_info,
                std::string_view tag,
                size_t& last_matched_index);
 
-[[nodiscard]] tl::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode>
+[[nodiscard]] std::expected<std::unique_ptr<transport::MultiBufferWriter>, ErrorCode>
 WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
                  const SsCipherInfo& cipher_info,
                  const KeyBytes& request_salt,

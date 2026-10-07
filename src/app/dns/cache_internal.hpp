@@ -11,7 +11,7 @@
 namespace acpp::app::dns {
 
 struct DnsCacheEntry {
-    memory::DataVector<net::ip::address> addresses;
+    memory::ThreadLocalVector<net::ip::address> addresses;
     time_point expire_time;
     uint32_t ttl;
     bool negative = false;
@@ -30,17 +30,17 @@ public:
 
 private:
     struct CacheNode {
-        memory::DataString domain;
+        memory::ThreadLocalString domain;
         DnsCacheEntry entry;
 
         CacheNode(std::string_view name, DnsCacheEntry value)
             : domain(name), entry(std::move(value)) {}
     };
-    using NodeList = memory::DataList<CacheNode>;
+    using NodeList = memory::ThreadLocalList<CacheNode>;
 
     // New and replaced entries move to the front. Read hits do not reorder.
     NodeList order_;
-    memory::DataUnorderedMap<std::string_view, NodeList::iterator> entries_;
+    memory::ThreadLocalUnorderedMap<std::string_view, NodeList::iterator> entries_;
     size_t capacity_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;

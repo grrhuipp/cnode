@@ -13,7 +13,7 @@ struct Cancellation {
 
 class CancellationSubscription;
 
-// Session-strand source with stable identity. Pending cancellation applies only
+// Worker-local source with stable identity. Pending cancellation applies only
 // to registered work. Stop is permanent and is also delivered to later work.
 // Registration, notification and removal never allocate or post work.
 class CancellationSource {

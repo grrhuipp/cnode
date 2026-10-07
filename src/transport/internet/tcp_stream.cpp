@@ -60,8 +60,8 @@ struct PendingOperationState {
     }
 };
 
-net::any_io_executor SocketExecutor(tcp::socket& socket) {
-    return socket.get_executor();
+net::io_context& SocketIoContext(tcp::socket& socket) {
+    return static_cast<net::io_context&>(socket.get_executor().context());
 }
 
 ProxyProtocolReadResult ProxyReadResult(
@@ -89,11 +89,11 @@ enum Flag : uint8_t {
     kCountedActive          = 1u << 3,
 };
 
-struct TcpStream::Impl : memory::DataAllocated {
+struct TcpStream::Impl : memory::ThreadAllocated {
     explicit Impl(tcp::socket socket, TcpStream& owner)
         : socket(std::move(socket))
         , owner(owner)
-        , timeouts(SocketExecutor(this->socket), *this) {}
+        , timeouts(SocketIoContext(this->socket), *this) {}
 
     void OnTimeout(ErrorCode reason) noexcept {
         if (reason != ErrorCode::CANCELLED) owner.Cancellation().Stop(reason);
@@ -126,7 +126,7 @@ struct TcpStream::Impl : memory::DataAllocated {
 // ============================================================================
 
 void* TcpStream::operator new(std::size_t size) {
-    if (void* p = memory::AllocateData(size, alignof(TcpStream))) {
+    if (void* p = memory::AllocatePmr(size, alignof(TcpStream))) {
         memory::OnAsyncStreamNew();
         return p;
     }
@@ -135,12 +135,12 @@ void* TcpStream::operator new(std::size_t size) {
 
 void TcpStream::operator delete(void* p) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocateData(p, sizeof(TcpStream), alignof(TcpStream));
+    memory::DeallocatePmr(p, sizeof(TcpStream), alignof(TcpStream));
 }
 
 void TcpStream::operator delete(void* p, std::size_t size) noexcept {
     memory::OnAsyncStreamFree();
-    memory::DeallocateData(p, size, alignof(TcpStream));
+    memory::DeallocatePmr(p, size, alignof(TcpStream));
 }
 
 TcpStream::TcpStream(tcp::socket socket)
@@ -172,7 +172,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
 
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_read_some(buf,
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec) {
         if (ec == io_error::eof) {
@@ -234,7 +234,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_read_some(
         net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec || n == 0) {
         if (!ec || ec == io_error::eof ||
@@ -271,7 +271,7 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec) {
         throw IoSystemError(ec);
@@ -295,7 +295,7 @@ net::awaitable<void> TcpStream::WriteBuffers(
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     (void)n;
 
     if (ec) {
@@ -311,7 +311,7 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
 
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await net::async_write(impl_->socket, buf,
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec) {
         throw IoSystemError(ec);
@@ -395,7 +395,7 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_receive(
         buffer, flags,
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     if (!ec && n > 0 && !peek) {
         TouchActivity();
     }
@@ -556,7 +556,7 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
-        net::bind_allocator(memory::DataAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
     co_return ec;
 }
 
@@ -621,7 +621,7 @@ tcp::endpoint TcpStream::RemoteEndpoint() const {
 // ============================================================================
 
 net::awaitable<DialResult> TcpStream::Connect(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     const tcp::endpoint& endpoint,
     std::chrono::seconds timeout) {
 
@@ -629,12 +629,12 @@ net::awaitable<DialResult> TcpStream::Connect(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    tcp::socket socket(executor);
+    tcp::socket socket(io_context);
     PendingOperationState op_state;
 
-    auto& scheduler = TimeoutScheduler::ForExecutor(executor);
+    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
     TimeoutToken token = scheduler.ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), executor,
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
         [&socket, &op_state]() {
             if (op_state.TakeActive()) {
                 op_state.timed_out = true;
@@ -647,7 +647,7 @@ net::awaitable<DialResult> TcpStream::Connect(
 
     try {
         co_await socket.async_connect(endpoint,
-            net::bind_allocator(memory::DataAllocator<std::byte>{}, net::use_awaitable));
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
     } catch (const IoSystemError& e) {
         connect_ec = e.code();
     }
@@ -671,7 +671,7 @@ net::awaitable<DialResult> TcpStream::Connect(
 }
 
 net::awaitable<DialResult> TcpStream::ConnectWithBind(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     const net::ip::address& local_addr,
     const tcp::endpoint& remote_endpoint,
     std::chrono::seconds timeout) {
@@ -680,7 +680,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
-    tcp::socket socket(executor);
+    tcp::socket socket(io_context);
     PendingOperationState op_state;
 
     // 打开 socket
@@ -699,9 +699,9 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
             ErrorCode::SOCKET_BIND_FAILED, ec.message(), ec.value());
     }
 
-    auto& scheduler = TimeoutScheduler::ForExecutor(executor);
+    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
     TimeoutToken token = scheduler.ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), executor,
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
         [&socket, &op_state]() {
             if (op_state.TakeActive()) {
                 op_state.timed_out = true;
@@ -714,7 +714,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
 
     try {
         co_await socket.async_connect(remote_endpoint,
-            net::bind_allocator(memory::DataAllocator<std::byte>{}, net::use_awaitable));
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
     } catch (const IoSystemError& e) {
         connect_ec = e.code();
     }

@@ -11,30 +11,30 @@ namespace acpp::api::v2board {
 
 namespace {
 
-tl::expected<uint16_t, std::string> ParseServerPort(const json::object& source) {
+std::expected<uint16_t, std::string> ParseServerPort(const json::object& source) {
     const auto result = ReadJsonPort(source, {"server_port"});
     switch (result.error) {
         case JsonPortError::None:
             return result.value;
         case JsonPortError::Missing:
-            return tl::unexpected("server_port is required");
+            return std::unexpected("server_port is required");
         case JsonPortError::InvalidType:
-            return tl::unexpected("server_port must be an integer");
+            return std::unexpected("server_port must be an integer");
         case JsonPortError::OutOfRange:
-            return tl::unexpected("server_port must be between 1 and 65535");
+            return std::unexpected("server_port must be between 1 and 65535");
     }
-    return tl::unexpected("server_port is invalid");
+    return std::unexpected("server_port is invalid");
 }
 
 }  // namespace
 
-tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
+std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
     const json::object& source,
     int node_id,
     std::string_view node_type) {
     auto port = ParseServerPort(source);
     if (!port) {
-        return tl::unexpected(std::move(port.error()));
+        return std::unexpected(std::move(port.error()));
     }
 
     ::acpp::api::NodeInfo config;
@@ -52,19 +52,19 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         const auto& settings = network_settings->as_object();
         if (const auto* path = settings.if_contains("path")) {
             if (!path->is_string()) {
-                return tl::unexpected(
+                return std::unexpected(
                     "networkSettings path must be a string");
             }
             config.Path = std::string(path->as_string());
             if (!config.Path.empty() &&
                 !transport::internet::IsValidHttpRequestTarget(config.Path)) {
-                return tl::unexpected(
+                return std::unexpected(
                     "networkSettings path must be a valid HTTP request target");
             }
         }
         if (const auto* headers = settings.if_contains("headers")) {
             if (!headers->is_object()) {
-                return tl::unexpected(
+                return std::unexpected(
                     "networkSettings headers must be an object");
             }
             std::optional<std::string> host;
@@ -73,20 +73,20 @@ tl::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                     continue;
                 }
                 if (!raw_value.is_string()) {
-                    return tl::unexpected(
+                    return std::unexpected(
                         "networkSettings Host must be a string");
                 }
                 const std::string value(raw_value.as_string());
                 if (!transport::internet::IsValidHttpHeaderValue(value)) {
-                    return tl::unexpected(
+                    return std::unexpected(
                         "networkSettings Host contains invalid control characters");
                 }
                 if (!transport::internet::IsValidHttpAuthority(value)) {
-                    return tl::unexpected(
+                    return std::unexpected(
                         "networkSettings Host must be a valid HTTP authority");
                 }
                 if (host && *host != value) {
-                    return tl::unexpected(
+                    return std::unexpected(
                         "networkSettings Host aliases must match");
                 }
                 if (!host) {

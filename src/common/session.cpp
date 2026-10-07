@@ -10,6 +10,14 @@
 
 namespace acpp {
 
+namespace session {
+
+ID NewID(uint32_t worker_id) noexcept {
+    return GenerateWorkerConnId(worker_id);
+}
+
+}  // namespace session
+
 std::string FormatAccessLog(const session::Context& ctx) {
     std::string src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
@@ -43,7 +51,7 @@ std::string FormatAccessLog(const session::Context& ctx) {
         : ctx.outbound.tag;
 
     // Only the final owning string crosses the logging queue. Do not use the
-    // Runtime PMR for it or retain connection-local formatting scratch.
+    // Worker PMR for it or retain connection-local formatting scratch.
     std::string access;
     access.reserve(128 + src_host.size() + target_host.size() +
                    in_tag.size() + out_tag.size() + ctx.inbound.user_email.size());
@@ -107,6 +115,12 @@ std::string FormatTimestamp(int64_t timestamp_us) {
     };
     next_slot = (next_slot + 1) % kTimestampCacheSize;
     return value;
+}
+
+uint64_t GenerateWorkerConnId(uint32_t worker_id) {
+    thread_local uint32_t local_counter = 0;
+    const uint32_t seq = ++local_counter;
+    return (static_cast<uint64_t>(worker_id) << 32) | seq;
 }
 
 }  // namespace acpp

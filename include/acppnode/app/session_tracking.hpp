@@ -1,35 +1,44 @@
 #pragma once
 
 #include "acppnode/app/traffic_types.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/runtime/channel.hpp"
 
 #include <cstdint>
 #include <memory>
-#include <string>
+#include <string_view>
 
 namespace acpp {
-namespace session { class TrafficSource; struct Traffic; }
+
+namespace session {
+struct Traffic;
+}  // namespace session
+
 namespace app {
 
 class SessionTrackingState {
 public:
-    explicit SessionTrackingState(net::any_io_executor executor);
+    SessionTrackingState();
     ~SessionTrackingState();
+
     SessionTrackingState(const SessionTrackingState&) = delete;
     SessionTrackingState& operator=(const SessionTrackingState&) = delete;
+    SessionTrackingState(SessionTrackingState&&) noexcept;
+    SessionTrackingState& operator=(SessionTrackingState&&) noexcept;
 
-    net::awaitable<void> AddUserTraffic(std::string tag, int64_t user_id,
-                                        uint64_t upload, uint64_t download);
-    struct Registration {
-        ServiceChannel::Reservation reservation;
-        uint64_t conn_id = 0;
-    };
-    net::awaitable<Registration> RegisterActiveSession(uint64_t conn_id, std::string tag,
-        int64_t user_id, std::shared_ptr<session::TrafficSource> source);
-    net::awaitable<void> UnregisterActiveSession(Registration registration,
-                                                session::Traffic traffic);
-    net::awaitable<UserTrafficSnapshot> CollectAndResetTraffic(std::string tag);
+    void AddUserTraffic(std::string_view tag,
+                        int64_t user_id,
+                        uint64_t upload,
+                        uint64_t download);
+
+    void RegisterActiveSession(uint64_t conn_id,
+                               std::string_view tag,
+                               int64_t user_id,
+                               session::Traffic& traffic);
+
+    void UnregisterActiveSession(uint64_t conn_id,
+                                 const session::Traffic& traffic) noexcept;
+
+    [[nodiscard]] UserTrafficSnapshot CollectAndResetTraffic(std::string_view tag);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

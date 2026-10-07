@@ -15,11 +15,11 @@ namespace acpp::features::outbound {
 // ============================================================================
 class Manager {
 public:
-    using HandlerPtr = std::shared_ptr<const Outbound>;
+    using HandlerPtr = std::shared_ptr<Outbound>;
 
     virtual ~Manager() noexcept = default;
 
-    [[nodiscard]] virtual HandlerPtr GetHandler(std::string_view tag) const noexcept = 0;
+    [[nodiscard]] virtual HandlerPtr GetHandler(std::string_view tag) noexcept = 0;
 };
 
 }  // namespace acpp::features::outbound

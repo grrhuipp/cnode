@@ -159,7 +159,7 @@ net::awaitable<void> WriteUdpDatagram(
     header->Produce(static_cast<uint32_t>(header_size));
 
     ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header->Bytes().data(), header->Bytes().size()));
+    framed.Append(net::buffer(header->Bytes()));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());
 }

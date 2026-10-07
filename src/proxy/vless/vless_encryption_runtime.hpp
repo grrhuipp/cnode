@@ -8,7 +8,6 @@
 
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
-#include "acppnode/runtime/channel.hpp"
 
 #include <array>
 #include <chrono>
@@ -29,36 +28,28 @@ struct VlessEncryptionRuntime {
     VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
 };
 
-class VlessEncryptionClientTicketCache : public memory::DataAllocated {
-public:
-    explicit VlessEncryptionClientTicketCache(net::any_io_executor executor)
-        : channel_(std::move(executor), 4096) {}
-    struct Ticket {
-        memory::ByteVector pfs_key;
-        std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
-        std::chrono::steady_clock::time_point expires_at{};
-        uint64_t generation = 0;
-    };
-    net::awaitable<std::optional<Ticket>> Snapshot(std::chrono::steady_clock::time_point now);
-    net::awaitable<void> Store(std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
-        memory::ByteVector pfs_key, uint16_t seconds, std::chrono::steady_clock::time_point now);
-    net::awaitable<void> Clear(uint64_t generation);
-private:
-    ServiceChannel channel_;
-    Ticket ticket_;
+struct VlessEncryptionClientTicketCache : memory::ThreadAllocated {
+    memory::ByteVector pfs_key;
+    std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
+    std::chrono::steady_clock::time_point expires_at{};
+
+    [[nodiscard]] bool Valid(std::chrono::steady_clock::time_point now) const noexcept;
+    void Store(const VlessEncryptionClientPfsOpenResult& open,
+               std::chrono::steady_clock::time_point now);
+    void Clear() noexcept;
 };
 
 class VlessEncryptionServerTicketStore {
 public:
-    explicit VlessEncryptionServerTicketStore(net::any_io_executor executor)
-        : channel_(std::move(executor), 4096) {}
-    [[nodiscard]] net::awaitable<std::optional<memory::ByteVector>> Lookup(
-        std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
-        memory::ByteVector nfs_key,
+    [[nodiscard]] std::optional<memory::ByteVector> Lookup(
+        std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
+        std::span<const uint8_t> nfs_key,
         std::chrono::steady_clock::time_point now);
-    net::awaitable<void> Store(std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
-        memory::ByteVector pfs_key, uint16_t seconds,
-        std::chrono::steady_clock::time_point now);
+
+    void Store(std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
+               std::span<const uint8_t> pfs_key,
+               uint16_t seconds,
+               std::chrono::steady_clock::time_point now);
 
 private:
     struct Session {
@@ -71,7 +62,6 @@ private:
 
     void Prune(std::chrono::steady_clock::time_point now);
 
-    ServiceChannel channel_;
     std::vector<Session> sessions_;
 };
 

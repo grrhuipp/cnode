@@ -8,28 +8,28 @@ namespace acpp::proxy::shadowsocks::outbound {
 
 namespace {
 
-tl::expected<SsUotVersion, std::string> ParseVersionValue(
+std::expected<SsUotVersion, std::string> ParseVersionValue(
     const json::value& value,
     std::string_view field) {
     uint64_t raw = 0;
     if (value.is_int64()) {
         const int64_t signed_value = value.as_int64();
         if (signed_value < 0) {
-            return tl::unexpected(std::format("{} must be 1 or 2", field));
+            return std::unexpected(std::format("{} must be 1 or 2", field));
         }
         raw = static_cast<uint64_t>(signed_value);
     } else if (value.is_uint64()) {
         raw = value.as_uint64();
     } else {
-        return tl::unexpected(std::format("{} must be an integer", field));
+        return std::unexpected(std::format("{} must be an integer", field));
     }
 
     if (raw == 1) return SsUotVersion::V1;
     if (raw == 2) return SsUotVersion::V2;
-    return tl::unexpected(std::format("{} must be 1 or 2", field));
+    return std::unexpected(std::format("{} must be 1 or 2", field));
 }
 
-tl::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
+std::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
     const json::object& source) {
     std::optional<SsUotVersion> result;
     std::string_view first_key;
@@ -37,9 +37,9 @@ tl::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
         const auto* value = source.if_contains(key);
         if (!value) continue;
         auto parsed = ParseVersionValue(*value, key);
-        if (!parsed) return tl::unexpected(std::move(parsed.error()));
+        if (!parsed) return std::unexpected(std::move(parsed.error()));
         if (result && *result != *parsed) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{} and {} must match", first_key, key));
         }
         if (!result) {
@@ -50,14 +50,14 @@ tl::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
     return result;
 }
 
-tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
+std::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
     const json::value& value,
     std::string_view field,
     std::optional<SsUotVersion> top_level_version) {
     if (value.is_bool()) {
         if (!value.as_bool()) {
             if (top_level_version) {
-                return tl::unexpected(std::format(
+                return std::unexpected(std::format(
                     "{} is disabled but a UoT version is configured", field));
             }
             return std::optional<SsUotVersion>{};
@@ -67,11 +67,11 @@ tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
     }
 
     if (!value.is_object()) {
-        return tl::unexpected(std::format(
+        return std::unexpected(std::format(
             "{} must be a boolean or object", field));
     }
     if (top_level_version) {
-        return tl::unexpected(std::format(
+        return std::unexpected(std::format(
             "top-level UoT version cannot be combined with {} object", field));
     }
 
@@ -79,7 +79,7 @@ tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
     bool enabled = true;
     if (const auto* enabled_value = object.if_contains("enabled")) {
         if (!enabled_value->is_bool()) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{}.enabled must be a boolean", field));
         }
         enabled = enabled_value->as_bool();
@@ -88,7 +88,7 @@ tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
     const auto* version_value = object.if_contains("version");
     if (!enabled) {
         if (version_value) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{} is disabled but version is configured", field));
         }
         return std::optional<SsUotVersion>{};
@@ -97,23 +97,23 @@ tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(
         return std::optional<SsUotVersion>{SsUotVersion::V2};
     }
     auto version = ParseVersionValue(*version_value, std::format("{}.version", field));
-    if (!version) return tl::unexpected(std::move(version.error()));
+    if (!version) return std::unexpected(std::move(version.error()));
     return std::optional<SsUotVersion>{*version};
 }
 
 }  // namespace
 
-tl::expected<std::optional<SsUotVersion>, std::string>
+std::expected<std::optional<SsUotVersion>, std::string>
 ParseUotVersion(const json::object& source) {
     auto top_level_version = ReadTopLevelVersion(source);
     if (!top_level_version) {
-        return tl::unexpected(std::move(top_level_version.error()));
+        return std::unexpected(std::move(top_level_version.error()));
     }
 
     const auto* uot = source.if_contains("uot");
     if (!uot) {
         if (*top_level_version) {
-            return tl::unexpected("UoT version requires uot");
+            return std::unexpected("UoT version requires uot");
         }
         return std::optional<SsUotVersion>{};
     }

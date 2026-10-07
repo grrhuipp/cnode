@@ -83,7 +83,7 @@ async def run_case(args, mode):
                   {'protocol': 'freedom', 'settings': {}})
         config_path = output / 'config.json'
         config = json.loads(config_path.read_text())
-        config['ioThreads'] = 2
+        config['workers'] = 2
         config['dns'] = {'servers': servers, 'timeout': 1, 'minTTL': 1, 'maxTTL': 30}
         config_path.write_text(json.dumps(config), encoding='utf-8')
         resources.spawn([args.binary, '--config-dir', output], output / 'child.log')

@@ -1,7 +1,7 @@
-#include "runtime_services_fixture.hpp"
 #include "acppnode/app/dispatcher/default_dispatcher.hpp"
-#include "acppnode/app/dns/dns_service.hpp"
+#include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/relay.hpp"
+#include "acppnode/app/request_load_state.hpp"
 #include "acppnode/features/outbound/outbound.hpp"
 #include "acppnode/features/routing/router.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
@@ -13,7 +13,6 @@
 #include <asio/co_spawn.hpp>
 #include <asio/ip/udp.hpp>
 #include <asio/this_coro.hpp>
-#include <asio/use_future.hpp>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +43,8 @@ struct State {
     bool destroyed = false;
     bool notify_closed_on_destroy = false;
     bool closed = false;
+    bool cleanup_has_owner = false;
+    app::RequestLoadState* load = nullptr;
     TcpStream* phase_stream = nullptr;
 };
 
@@ -57,6 +58,7 @@ net::awaitable<void> Wait(State& state) {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         timer.expires_after(20ms);
         co_await timer.async_wait(net::use_awaitable);
+        state.cleanup_has_owner = state.load && state.load->ActiveConnections() != 0;
     }
     --state.active;
     if (error) throw IoSystemError(error);
@@ -95,15 +97,15 @@ private:
 
 class Handler final : public Outbound {
 public:
-    mutable State state;
-    mutable State target_state;
-    mutable bool relay = false;
+    State state;
+    State target_state;
+    bool relay = false;
     std::string_view Tag() const noexcept override { return "direct"; }
     net::awaitable<OutboundProcessResult> Process(
-        net::any_io_executor executor, const tcp::endpoint*, session::Context& ctx,
+        net::io_context& io, const tcp::endpoint*, session::Context& ctx,
         const TimeoutsConfig&, transport::Link inbound, StatsShard& stats,
         const RelayConfig& config, buf::MultiBuffer first,
-        std::chrono::seconds, std::chrono::seconds) const override {
+        std::chrono::seconds, std::chrono::seconds) override {
         ++state.entered;
         if (state.block) co_await Wait(state);
         ++state.committed;
@@ -114,9 +116,9 @@ public:
         }
         if (!relay) co_return RelayResult{};
         Stream target(target_state);
-        if (inbound.control) co_return co_await DoRelayLink(executor, *inbound.reader,
+        if (inbound.control) co_return co_await DoRelayLink(io, *inbound.reader,
             *inbound.writer, *inbound.control, target, ctx, stats, config, std::move(first));
-        co_return co_await DoRelayLink(executor, *inbound.reader, *inbound.writer,
+        co_return co_await DoRelayLink(io, *inbound.reader, *inbound.writer,
             target, ctx, stats, config, std::move(first));
     }
 };
@@ -125,8 +127,8 @@ class Manager final : public features::outbound::Manager {
 public:
     std::shared_ptr<Handler> handler = std::make_shared<Handler>();
     std::shared_ptr<Handler> second;
-    mutable int lookups = 0;
-    HandlerPtr GetHandler(std::string_view tag) const noexcept override {
+    int lookups = 0;
+    HandlerPtr GetHandler(std::string_view tag) noexcept override {
         ++lookups;
         return tag == "second" ? second : handler;
     }
@@ -146,13 +148,14 @@ enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
 
 bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     net::io_context io;
-    tests::RuntimeServicesFixture runtime_services(io.get_executor());
+    app::RequestLoadState load(100, 30);
     State source_state;
     tcp::socket phase_socket(io);
     IoErrorCode phase_open_error;
     phase_socket.open(tcp::v4(), phase_open_error);
     if (phase_open_error) throw IoSystemError(phase_open_error);
     TcpStream phase_stream(std::move(phase_socket));
+    source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
     source_state.read_error = which == Case::SniffLinkError ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::OK;
@@ -164,6 +167,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     Manager manager;
     Router router;
     auto& outbound = *manager.handler;
+    outbound.state.load = &load;
     outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
     outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
@@ -172,21 +176,21 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::RELAY_READ_FAILED;
     app::dispatcher::DefaultDispatcher dispatcher;
     dispatcher.BindOutboundManager(manager);
+    dispatcher.BindRequestLoadState(load);
     dispatcher.BindRouter(router);
     routing::DispatchPolicy policy{SniffConfig{}, routing::ForceOutbound{"direct"}};
     policy.sniffing.enabled = which == Case::Sniff || which == Case::SniffMemory || which == Case::SniffLinkError;
-    session::Context ctx(io.get_executor());
+    session::Context ctx;
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
     ctx.outbound.original_target = ctx.outbound.target;
     ctx.content.network = Network::TCP;
     StatsShard stats;
     TimeoutsConfig timeouts;
     std::optional<udp::socket> dns_peer;
-    std::optional<app::dns::DNSService> dns_worker;
+    std::optional<app::dns::DNSWorker> dns_worker;
     std::optional<app::dns::DNS> dns;
-    std::optional<std::future<void>> dns_run;
     if (which == Case::RoutingDns) {
-        const auto address = net::ip::address_v4::loopback();
+        const auto address = net::ip::make_address("127.0.0.42");
         dns_peer.emplace(io, udp::v4());
         IoErrorCode bind_error;
         dns_peer->bind(udp::endpoint(address, 0), bind_error);
@@ -194,8 +198,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         app::dns::Config config;
         config.servers = {dns_peer->local_endpoint()};
         config.timeout_sec = 2;
-        dns_worker.emplace(io.get_executor(), config, 8);
-        dns_run.emplace(net::co_spawn(io, dns_worker->Run(), net::use_future));
+        dns_worker.emplace(io, config, 8);
         dns.emplace(*dns_worker);
         dispatcher.BindDnsService(*dns);
         policy.outbound = routing::RouteWithFallback{"direct"};
@@ -221,7 +224,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
             else reader->Cancellation().Stop(reason);
         });
     }
-    auto request = dispatcher.Dispatch(io.get_executor(), policy, controlled ? std::move(stream) : nullptr,
+    auto request = dispatcher.Dispatch(io, policy, controlled ? std::move(stream) : nullptr,
         controlled ? transport::Link{} : transport::Link{reader, reader, nullptr},
         InitialPayload{}, ctx, stats, timeouts);
     net::co_spawn(io, std::move(request), net::bind_cancellation_slot(parent.slot(),
@@ -233,14 +236,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         io.restart();
         io.run_for(1s);
     }
-    if (dns_worker) {
-        io.restart();
-        auto closed = net::co_spawn(io, dns_worker->Close(), net::use_future);
-        io.run();
-        closed.get();
-        dns_run->get();
-    }
-    bool passed = completed_in_budget && done && !failure &&
+    bool passed = completed_in_budget && done && !failure && load.ActiveConnections() == 0 &&
         source_state.active == 0 && outbound.state.active == 0 &&
         (!controlled || source_state.destroyed);
     auto expected = reason;
@@ -259,7 +255,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         which == Case::SniffMemory || which == Case::SniffLinkError) passed &= manager.lookups == 0 && outbound.state.entered == 0;
     if (source_state.block || outbound.state.block) {
         const auto& waiting = source_state.block ? source_state : outbound.state;
-        passed &= triggered && waiting.cancelled == 1 && outbound.state.committed == 0;
+        passed &= triggered && waiting.cancelled == 1 && waiting.cleanup_has_owner && outbound.state.committed == 0;
     }
     if (which == Case::RoutingDns) passed &= triggered && ctx.outbound.tag.empty();
     if (which == Case::RelaySuccess) passed &= result.bytes_up == 7 && result.bytes_down == 13 &&
@@ -279,7 +275,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
 
 bool SiblingIsolation(bool controlled) {
     net::io_context io;
-    tests::RuntimeServicesFixture runtime_services(io.get_executor());
+    app::RequestLoadState load(100, 30);
     State a, b;
     auto first = std::make_unique<Stream>(a);
     auto second = std::make_unique<Stream>(b);
@@ -288,12 +284,14 @@ bool SiblingIsolation(bool controlled) {
     manager.second = std::make_shared<Handler>();
     for (const auto& handler : {manager.handler, manager.second}) {
         handler->state.block = true;
+        handler->state.load = &load;
     }
     app::dispatcher::DefaultDispatcher dispatcher;
     dispatcher.BindOutboundManager(manager);
+    dispatcher.BindRequestLoadState(load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
-    session::Context ctx_a(io.get_executor()), ctx_b(io.get_executor());
+    session::Context ctx_a, ctx_b;
     ctx_a.outbound.target = ctx_b.outbound.target = TargetAddress("192.0.2.1", 443);
     StatsShard stats;
     TimeoutsConfig timeouts;
@@ -301,14 +299,14 @@ bool SiblingIsolation(bool controlled) {
     RelayResult result_a, result_b;
     const auto link_a = controlled ? transport::Link{} : transport::Link{first.get(), first.get(), nullptr};
     const auto link_b = controlled ? transport::Link{} : transport::Link{second.get(), second.get(), nullptr};
-    net::co_spawn(io, dispatcher.Dispatch(io.get_executor(), policy_a, controlled ? std::move(first) : nullptr,
+    net::co_spawn(io, dispatcher.Dispatch(io, policy_a, controlled ? std::move(first) : nullptr,
         link_a, InitialPayload{}, ctx_a, stats, timeouts), [&](std::exception_ptr error, RelayResult result) {
             failed |= bool(error);
             first_done = true;
             result_a = result;
-            first_joined = manager.handler->state.active == 0;
+            first_joined = manager.handler->state.active == 0 && load.ActiveConnections() == 1;
         });
-    net::co_spawn(io, dispatcher.Dispatch(io.get_executor(), policy_b, controlled ? std::move(second) : nullptr,
+    net::co_spawn(io, dispatcher.Dispatch(io, policy_b, controlled ? std::move(second) : nullptr,
         link_b, InitialPayload{}, ctx_b, stats, timeouts), [&](std::exception_ptr error, RelayResult result) {
             failed |= bool(error);
             second_done = true;
@@ -326,7 +324,7 @@ bool SiblingIsolation(bool controlled) {
         result_a.error == ErrorCode::RESOURCE_EXHAUSTED && result_b.error == ErrorCode::OK &&
         manager.handler->state.cancelled == 1 && manager.handler->state.committed == 0 &&
         manager.second->state.cancelled == 0 && manager.second->state.committed == 1 &&
-        manager.second->state.active == 0;
+        manager.second->state.active == 0 && load.ActiveConnections() == 0;
     std::printf("sibling isolation controlled=%d first=%s second=%s joined=%d: %s\n", controlled,
         ErrorCodeToString(result_a.error).data(), ErrorCodeToString(result_b.error).data(), first_joined,
         passed ? "PASS" : "FAIL");

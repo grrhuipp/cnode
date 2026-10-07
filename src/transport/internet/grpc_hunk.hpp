@@ -5,7 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <tl/expected.hpp>
+#include <expected>
 #include <span>
 #include <string_view>
 
@@ -13,7 +13,7 @@ namespace acpp::transport::internet {
 
 inline constexpr size_t kMaxGrpcHunkMessageSize = 4 * 1024 * 1024;
 
-// Physical-session framing state. Only received bytes grow storage. A complete
+// Worker-local framing state. Only received bytes grow storage. A complete
 // protobuf message is validated before exposing its final singular data field.
 class GrpcHunkDecoder final {
 public:
@@ -21,7 +21,7 @@ public:
     GrpcHunkDecoder(const GrpcHunkDecoder&) = delete;
     GrpcHunkDecoder& operator=(const GrpcHunkDecoder&) = delete;
 
-    [[nodiscard]] tl::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
+    [[nodiscard]] std::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
     [[nodiscard]] std::span<const uint8_t> Payload() const noexcept;
     void Consume(size_t size) noexcept;
     void Clear() noexcept;

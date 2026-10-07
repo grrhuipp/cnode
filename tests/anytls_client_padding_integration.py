@@ -61,7 +61,7 @@ async def scenario(args, name, output, result, resources):
     peer_a = await resources.listen(server, tls=True)
     peer_b = peer_a if shared_endpoint else await resources.listen(server, tls=True)
     ports = {'a': available_port(), 'b': available_port()}
-    config = {'ioThreads': 1, 'timeouts': {'handshake': 5, 'connIdle': 15, 'write': 5,
+    config = {'workers': 1, 'timeouts': {'handshake': 5, 'connIdle': 15, 'write': 5,
               'uplinkOnly': 10, 'downlinkOnly': 10},
               'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}}
     inbounds = [{'tag': f'client-{key}', 'protocol': 'vless', 'listen': '127.0.0.1', 'port': port,

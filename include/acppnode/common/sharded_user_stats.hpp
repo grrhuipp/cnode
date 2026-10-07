@@ -1,59 +1,56 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/online_device.hpp"
-#include "acppnode/runtime/channel.hpp"
+// ============================================================================
+// sharded_user_stats.hpp — Worker 私有在线用户追踪
+//
+// 从 TimedUserValidator / Validator 中提取的公共逻辑。
+// 协议特有内容（用户存储、认证、HotCache、IP 封禁）各自保留在协议 manager 中。
+//
+// 在线状态归属 Worker 线程：连接建立、断开和面板在线采集都通过
+// 对应 Worker executor 执行，因此无需锁、原子或跨线程协调。
+// ============================================================================
 
+#include "acppnode/common/online_device.hpp"
+
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace acpp {
 
-// Cross-session device admission belongs to this service owner, never to a
-// protocol validator or an execution thread. A successful check reserves the
-// device in the same synchronous service operation.
 class UserOnlineTracker {
 public:
-    explicit UserOnlineTracker(net::any_io_executor executor, size_t capacity = 4096);
+    using OnlineDevice = ::acpp::OnlineDevice;
+
+    UserOnlineTracker();
     ~UserOnlineTracker();
+
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
 
-    struct Permit {
-        ServiceChannel::Reservation reservation;
-        std::string tag;
-        uint64_t user_id = 0;
-        std::string client_ip;
-    };
-    net::awaitable<std::optional<Permit>> TryAcquire(std::string tag, uint64_t user_id,
-                                    std::string client_ip, uint32_t device_limit);
-    net::awaitable<void> Release(Permit permit);
-    net::awaitable<size_t> OnlineDeviceCount(std::string tag, uint64_t user_id);
-    net::awaitable<std::vector<OnlineDevice>> GetOnlineDevices(std::string tag);
-    [[nodiscard]] net::any_io_executor Executor() const { return channel_.Executor(); }
+    void OnUserConnected(std::string_view tag,
+                         uint64_t user_id,
+                         std::string_view client_ip);
 
+    void OnUserDisconnected(std::string_view tag,
+                            uint64_t user_id,
+                            std::string_view client_ip);
+
+    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
+                                       uint64_t user_id,
+                                       std::string_view client_ip,
+                                       uint32_t device_limit) const;
+
+    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
+                                           uint64_t user_id) const;
+
+    std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    ServiceChannel channel_;
-};
-
-// A session owns this reservation and explicitly awaits Release after all its
-// child operations have joined. The destructor never schedules work.
-class UserOnlineLease {
-public:
-    explicit UserOnlineLease(UserOnlineTracker& owner) noexcept : owner_(owner) {}
-    UserOnlineLease(const UserOnlineLease&) = delete;
-    UserOnlineLease& operator=(const UserOnlineLease&) = delete;
-    net::awaitable<bool> Acquire(std::string tag, uint64_t user_id,
-                                 std::string ip, uint32_t limit);
-    net::awaitable<void> Release();
-private:
-    UserOnlineTracker& owner_;
-    std::optional<UserOnlineTracker::Permit> permit_;
 };
 
 }  // namespace acpp

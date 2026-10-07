@@ -26,6 +26,8 @@ class DNS;
 // acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
 namespace proxy::anytls::outbound {
 
+template<class Session> class SessionPool;
+
 struct Settings {
     std::string address;
     uint16_t port = 0;
@@ -47,7 +49,7 @@ struct Settings {
 class Handler final : public Outbound {
 public:
     Handler(std::string tag,
-            net::any_io_executor executor,
+            net::io_context& io_context,
             Settings settings,
             StreamSettings stream_settings,
             std::chrono::seconds dial_timeout,
@@ -55,7 +57,7 @@ public:
     ~Handler() noexcept override;
 
     net::awaitable<OutboundProcessResult> Process(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
@@ -64,24 +66,24 @@ public:
         const RelayConfig& relay_config,
         buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) const override;
-
-    net::awaitable<void> Stop() const override;
+        std::chrono::seconds relay_write_timeout) override;
 
     [[nodiscard]] std::string_view Tag() const noexcept override {
         return tag_;
     }
 
 private:
+    struct PaddingState;
     struct ClientSession;
-    struct Pool;
+    struct LogicalStreamLease;
 
     std::string tag_;
     const Settings settings_;
     const StreamSettings stream_settings_;
     std::chrono::seconds dial_timeout_;
     app::dns::DNS& dns_service_;
-    std::shared_ptr<Pool> pool_;
+    std::shared_ptr<PaddingState> padding_;
+    std::unique_ptr<SessionPool<ClientSession>> pool_;
 };
 
 }  // namespace proxy::anytls::outbound

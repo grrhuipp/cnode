@@ -1,5 +1,8 @@
 #pragma once
 
+#include "acppnode/transport/internet/reality_client_version.hpp"
+#include "acppnode/transport/internet/reality_key.hpp"
+#include "acppnode/transport/internet/reality_short_id.hpp"
 
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json.hpp"
@@ -39,6 +42,7 @@ enum class NetworkMode : uint8_t {
 enum class SecurityMode : uint8_t {
     None = 0,
     Tls  = 1,
+    Reality = 2,
     Unsupported = 255,
 };
 
@@ -50,6 +54,7 @@ enum StreamFlags : uint8_t {
     kFlagGrpc        = 1 << 3,
     kFlagHttp        = 1 << 4,
     kFlagXHttp       = 1 << 5,
+    kFlagReality     = 1 << 6,
 };
 
 // ============================================================================
@@ -142,11 +147,39 @@ struct XHttpConfig {
 };
 
 // ============================================================================
+// REALITY 安全层配置
+// ============================================================================
+struct RealityConfig {
+    // 服务端字段
+    bool show = false;
+    std::string type;
+    std::vector<std::string> server_names;
+    std::optional<transport::internet::RealityKey> private_key;
+    std::vector<transport::internet::RealityShortId> short_ids;
+    std::optional<transport::internet::RealityClientVersion> min_client_version;
+    std::optional<transport::internet::RealityClientVersion> max_client_version;
+    uint64_t max_time_diff = 0;
+
+    // 客户端字段
+    std::string server_name;
+    std::optional<transport::internet::RealityKey> public_key;
+    transport::internet::RealityShortId short_id{};
+
+    // 调试/兼容字段
+    std::string master_key_log;
+
+    [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
+
+    static RealityConfig FromJson(const json::object& j);
+};
+
+// ============================================================================
 // StreamSettings - 传输层 + 安全层组合配置
 //
 // 实现 Xray 式「传输层自由组合」：
 //   network (raw/tcp | ws/websocket | http/http2/h2 | httpupgrade | grpc | xhttp/splithttp)
 //     × security (none | tls)
+//   REALITY 按 Xray 生态约束只支持 raw/tcp、grpc、xhttp/splithttp。
 //
 // 示例：
 //   { "network": "ws", "security": "tls" }          → WS over TLS
@@ -158,6 +191,7 @@ struct StreamSettings {
     std::string security = std::string(constants::protocol::kNone);
 
     TlsConfig tls;             // 当 security == "tls" 时生效
+    RealityConfig reality;     // 当 security == "reality" 时生效
     WsConfig  ws;              // 当 network  == "ws" / "websocket" 时生效
     HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
     HttpConfig http;            // 当 network == "http" / "h2" 时生效
@@ -170,6 +204,8 @@ struct StreamSettings {
     uint8_t      flags         = kFlagNone;
 
     bool IsTls() const noexcept { return (flags & kFlagTls) != 0; }
+    bool IsReality() const noexcept { return (flags & kFlagReality) != 0; }
+    bool IsTlsLike() const noexcept { return IsTls() || IsReality(); }
     bool IsWs()  const noexcept { return (flags & kFlagWs)  != 0; }
     bool IsHttpUpgrade() const noexcept { return (flags & kFlagHttpUpgrade) != 0; }
     bool IsHttp() const noexcept { return (flags & kFlagHttp) != 0; }

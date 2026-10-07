@@ -1,31 +1,32 @@
 #pragma once
+
 #include "acppnode/common/asio_types.hpp"
-#include <asio/executor_work_guard.hpp>
-#include <cstdint>
-#include <optional>
+
+#include <memory>
+#include <vector>
 
 namespace acpp {
 class Controller;
-class StatsSampler;
-class Runtime;
-namespace app::dns { class DNSService; }
+class ShardedStats;
+class Worker;
+namespace app::dns { class DNSWorker; }
 struct InboundStartup;
+}
 
-using RuntimeWorkGuard =
-    net::executor_work_guard<net::io_context::executor_type>;
+namespace acpp {
 
 struct RuntimeContext {
-    net::io_context& io_context;
-    std::optional<RuntimeWorkGuard>& work_guard;
-    net::any_io_executor control_executor;
-    net::any_io_executor monitor_executor;
-    StatsSampler& stats_sampler;
-    Runtime& runtime;
+    net::io_context& main_ctx;
+    ShardedStats& stats;
+    const std::vector<std::unique_ptr<Worker>>& workers;
     Controller& controller;
+    const std::vector<std::unique_ptr<net::io_context>>& io_contexts;
     InboundStartup& inbound_startup;
-    app::dns::DNSService& dns_service;
-    uint32_t io_threads;
+    app::dns::DNSWorker& dns_worker;
+    bool enable_controller = false;
 };
 
-void RunApplicationRuntime(const RuntimeContext&);
+// Transfers control to the process-lifetime runtime; never unwinds active Workers.
+[[noreturn]] void RunApplicationRuntime(const RuntimeContext& ctx) noexcept;
+
 }  // namespace acpp

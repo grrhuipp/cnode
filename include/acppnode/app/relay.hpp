@@ -32,7 +32,7 @@ inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 using SteadyClock = std::chrono::steady_clock;
 
 // Owned by the joined relay scope, so either direction can end both waits.
-struct RelayRateLimits : memory::DataAllocated {
+struct RelayRateLimits : memory::ThreadAllocated {
     TokenBucket up;
     TokenBucket down;
     AsyncDelay up_wait;
@@ -40,8 +40,8 @@ struct RelayRateLimits : memory::DataAllocated {
     bool cancelled = false;
     ErrorCode cancellation_error = ErrorCode::CANCELLED;
 
-    RelayRateLimits(net::any_io_executor executor, uint64_t rate)
-        : up(rate), down(rate), up_wait(executor), down_wait(executor) {}
+    RelayRateLimits(net::io_context& io, uint64_t rate)
+        : up(rate), down(rate), up_wait(io), down_wait(io) {}
 
     void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
         cancelled = true;
@@ -197,8 +197,7 @@ struct RelayDirectionState {
 };
 
 struct RelayCloseState {
-    explicit RelayCloseState(net::any_io_executor executor)
-        : wake(std::move(executor), 1) {}
+    explicit RelayCloseState(net::io_context& io) : wake(io, 1) {}
 
     void Complete() noexcept {
         complete = true;
@@ -602,7 +601,7 @@ template <typename ClientReader,
           typename ClientControl,
           typename TargetEndpoint>
 net::awaitable<RelayResult> DoRelayLink(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     ClientReader& client_reader,
     ClientWriter& client_writer,
     ClientControl& client_control,
@@ -617,7 +616,7 @@ net::awaitable<RelayResult> DoRelayLink(
     RelayResult result;
     relay_detail::RelayDirectionState client_state;
     relay_detail::RelayDirectionState target_state;
-    relay_detail::RelayCloseState close_state(executor);
+    relay_detail::RelayCloseState close_state(io_context);
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 
     LOG_CONN_DEBUG(ctx, "Relay started, speed_limit={}, uplink_only={}s, downlink_only={}s",
@@ -628,7 +627,7 @@ net::awaitable<RelayResult> DoRelayLink(
 
     std::unique_ptr<relay_detail::RelayRateLimits> limits;
     if (config.speed_limit != 0)
-        limits = std::make_unique<relay_detail::RelayRateLimits>(executor, config.speed_limit);
+        limits = std::make_unique<relay_detail::RelayRateLimits>(io_context, config.speed_limit);
     struct CancellationContext {
         ClientControl& client;
         TargetEndpoint& target;
@@ -734,7 +733,6 @@ net::awaitable<RelayResult> DoRelayLink(
         if (!close_state.complete)
             (void)co_await close_state.wake.async_receive(net::as_tuple(net::use_awaitable));
         if (!close_state.complete) throw transport::LinkError(ErrorCode::CANCELLED);
-        relay_detail::CancelRelayControls(client_control, target, limits.get());
     };
     (void)co_await (transfer() || watch_complete());
 
@@ -751,8 +749,7 @@ net::awaitable<RelayResult> DoRelayLink(
     ctx.traffic.bytes_down = bytes_down;
 
     result.error = relay_detail::SelectRelayError(error_up, error_down);
-    if (result.error == ErrorCode::OK &&
-        parent_cancellation.cancelled() != net::cancellation_type::none)
+    if (result.error == ErrorCode::OK && parent_cancellation.cancelled() != net::cancellation_type::none)
         result.error = ErrorCode::CANCELLED;
     if (result.error != ErrorCode::OK)
         ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
@@ -805,7 +802,7 @@ template <typename ClientReader,
           typename ClientWriter,
           typename TargetEndpoint>
 net::awaitable<RelayResult> DoRelayLink(
-    net::any_io_executor executor,
+    net::io_context& io_context,
     ClientReader& client_reader,
     ClientWriter& client_writer,
     TargetEndpoint& target,
@@ -822,8 +819,8 @@ net::awaitable<RelayResult> DoRelayLink(
 
     std::unique_ptr<relay_detail::RelayRateLimits> limits;
     if (config.speed_limit != 0)
-        limits = std::make_unique<relay_detail::RelayRateLimits>(executor, config.speed_limit);
-    relay_detail::RelayCloseState close_state(executor);
+        limits = std::make_unique<relay_detail::RelayRateLimits>(io_context, config.speed_limit);
+    relay_detail::RelayCloseState close_state(io_context);
     // The watchdog participates in the same joined coroutine group. Its
     // completion cancels reader/writer awaits even when no client control exists.
     struct StopState {
@@ -1111,8 +1108,6 @@ net::awaitable<RelayResult> DoRelayLink(
         }
     }
     remember_error(stop.reason);
-    if (parent_cancellation.cancelled() != net::cancellation_type::none)
-        remember_error(ErrorCode::CANCELLED);
     target.ClearPhaseDeadline();
 
     RelayResult result;

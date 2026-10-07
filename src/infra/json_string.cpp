@@ -5,7 +5,7 @@
 
 namespace acpp {
 
-tl::expected<std::optional<std::string>, std::string>
+std::expected<std::optional<std::string>, std::string>
 ParseAliasedJsonString(
     const json::object& source,
     std::initializer_list<std::string_view> aliases) {
@@ -15,13 +15,13 @@ ParseAliasedJsonString(
         const auto* raw = source.if_contains(key);
         if (!raw) continue;
         if (!raw->is_string()) {
-            return tl::unexpected(
+            return std::unexpected(
                 std::format("{} must be a string", key));
         }
 
         std::string value(raw->as_string());
         if (result && *result != value) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{} and {} must match", first_key, key));
         }
         if (!result) {
@@ -32,7 +32,7 @@ ParseAliasedJsonString(
     return result;
 }
 
-tl::expected<std::optional<std::vector<std::string>>, std::string>
+std::expected<std::optional<std::vector<std::string>>, std::string>
 ParseAliasedJsonStringArray(
     const json::object& source,
     std::initializer_list<std::string_view> aliases) {
@@ -42,7 +42,7 @@ ParseAliasedJsonStringArray(
         const auto* raw = source.if_contains(key);
         if (!raw) continue;
         if (!raw->is_array()) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{} must be an array of strings", key));
         }
 
@@ -50,13 +50,13 @@ ParseAliasedJsonStringArray(
         values.reserve(raw->as_array().size());
         for (const auto& item : raw->as_array()) {
             if (!item.is_string()) {
-                return tl::unexpected(std::format(
+                return std::unexpected(std::format(
                     "{} must contain only strings", key));
             }
             values.emplace_back(item.as_string());
         }
         if (result && *result != values) {
-            return tl::unexpected(std::format(
+            return std::unexpected(std::format(
                 "{} and {} must match", first_key, key));
         }
         if (!result) {

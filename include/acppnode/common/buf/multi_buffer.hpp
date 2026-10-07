@@ -22,7 +22,7 @@ struct Buffer;
 // ============================================================================
 // Buffer - relay/MultiBuffer 固定 8KB 数据块
 //
-// 数据面固定 8KB。New/Free 走支持跨线程释放的通用资源，不缓存空闲块。
+// 数据面固定 8KB。New/Free 直接走 PMR，不缓存空闲块。
 // start/end 游标：Advance() 消费无需 memmove，Produce() 记录写入量。
 // ============================================================================
 struct Buffer {
@@ -88,10 +88,10 @@ struct Buffer {
     [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
     [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
     [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
-    // 从通用资源取得固定 8KB 块。只初始化游标，payload 保持
+    // 从 Worker-local PMR 取得固定 8KB 块。只初始化游标，payload 保持
     // 未初始化，避免热路径无谓 memset。
     [[nodiscard]] static Buffer* New() noexcept {
-        void* raw = memory::AllocateData(sizeof(Buffer), alignof(Buffer));
+        void* raw = memory::AllocatePmr(sizeof(Buffer), alignof(Buffer));
         if (!raw) {
             return nullptr;
         }
@@ -102,14 +102,14 @@ struct Buffer {
         return b;
     }
 
-    // 归还。Buffer 含非平凡成员（udp_），先析构再交回同一套资源。
+    // 归还。Buffer 含非平凡成员（udp_），先析构再交回同一套 PMR。
     static void Free(Buffer* b) noexcept {
         if (!b) {
             return;
         }
         memory::OnBufferFree();
         b->~Buffer();
-        memory::DeallocateData(b, sizeof(Buffer), alignof(Buffer));
+        memory::DeallocatePmr(b, sizeof(Buffer), alignof(Buffer));
     }
 };
 
@@ -156,7 +156,7 @@ struct BufferGuard {
 //   - std::move(mb) 即为所有权转移，零数据拷贝（只移动指针）
 //   - 常规协议/分帧路径最多 8 个 Buffer，指针链内联保存，避免每次
 //     ReadMultiBuffer() 为 vector 元数据再做一次堆分配；超过 8 个才 spill
-//     到显式的数据分配资源。
+//     到同一 Worker thread-local heap。
 // ============================================================================
 class MultiBuffer {
 public:
@@ -526,7 +526,7 @@ public:
         }
         clear();
         if (using_spill_) {
-            memory::DataVector<Buffer*> empty;
+            memory::ThreadLocalVector<Buffer*> empty;
             spill_.swap(empty);
             using_spill_ = false;
             spill_start_ = 0;
@@ -665,7 +665,7 @@ private:
     size_t total_bytes_ = 0;
     bool using_spill_ = false;
     size_t spill_start_ = 0;
-    memory::DataVector<Buffer*> spill_;
+    memory::ThreadLocalVector<Buffer*> spill_;
 };
 
 // 计算 MultiBuffer 中所有 Buffer 的有效字节总数

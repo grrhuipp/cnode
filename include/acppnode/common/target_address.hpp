@@ -19,7 +19,7 @@ namespace acpp {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    memory::DataString host;  // 域名；IP 目标只保留 resolved_addr
+    memory::ThreadLocalString host;  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址

@@ -44,14 +44,13 @@ namespace proxy::vless::outbound {
 class Handler final : public ::acpp::Outbound {
 public:
     Handler(std::string tag,
-            ::acpp::net::any_io_executor executor,
             const ::acpp::VlessOutboundConfig& config,
             ::acpp::app::dns::DNS& dns_service);
 
     ~Handler() override;
 
     ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::net::any_io_executor executor,
+        ::acpp::net::io_context& io_context,
         const ::acpp::tcp::endpoint* inbound_local_addr,
         ::acpp::session::Context& ctx,
         const ::acpp::TimeoutsConfig& timeouts,
@@ -60,7 +59,7 @@ public:
         const ::acpp::RelayConfig& relay_config,
         ::acpp::buf::MultiBuffer first_payload,
         std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) const override;
+        std::chrono::seconds relay_write_timeout) override;
 
     std::string_view Tag() const noexcept override { return tag_; }
 

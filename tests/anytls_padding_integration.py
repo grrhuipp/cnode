@@ -34,9 +34,9 @@ async def inbound(args, name, output, result, resources):
     configure(output, {'protocol': 'anytls', 'listen': '127.0.0.1', 'port': port,
                        'settings': {'clients': [{'password': 'secret'}], 'paddingScheme': setting},
                        'streamSettings': tls_settings(True)}, {'protocol': 'freedom', 'settings': {}})
-    # Concurrent sessions must consume the same immutable prepared policy.
+    # Separate worker handlers must consume the same immutable prepared policy.
     config = json.loads((output / 'config.json').read_text())
-    config['ioThreads'] = 2
+    config['workers'] = 2
     (output / 'config.json').write_text(json.dumps(config))
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     updates = []

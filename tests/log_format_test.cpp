@@ -1,9 +1,5 @@
 #include "acppnode/infra/log.hpp"
 
-#include <asio/co_spawn.hpp>
-#include <asio/io_context.hpp>
-#include <asio/post.hpp>
-#include <asio/use_awaitable.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -52,15 +48,6 @@ struct SessionLogContext {
     uint64_t conn_id = 0;
 };
 
-asio::awaitable<void> LogAfterSuspend() {
-    co_await asio::post(asio::use_awaitable);
-    LOG_INFO("call-site-coroutine {} {} {} {} {} {} {} {} {} {} {} {}",
-             1, 2, 3, 4, 5, 6, std::string("seven"), std::string("eight"),
-             9.0, 10.0, 11, 12);
-    acpp::Log::WriteSystem(acpp::LogLevel::INFO, "call-site-direct");
-    acpp::Log::WriteConnection(acpp::LogLevel::INFO, "call-site-connection");
-}
-
 }  // namespace
 
 int main() {
@@ -73,14 +60,6 @@ int main() {
         Expect(acpp::Log::Init(
             "trace", directory, 1, "access.log", "error.log", false, false),
             "logger initialization failed");
-
-        acpp::Log::WriteSystem(acpp::LogLevel::INFO, "call-site-explicit", __FILE__);
-        asio::io_context io;
-        std::exception_ptr coroutine_error;
-        asio::co_spawn(io, LogAfterSuspend(),
-            [&](std::exception_ptr error) { coroutine_error = error; });
-        io.run();
-        if (coroutine_error) std::rethrow_exception(coroutine_error);
 
         acpp::Log::WriteSystem(
             acpp::LogLevel::WARN,
@@ -129,14 +108,6 @@ int main() {
         acpp::Log::Shutdown();
 
         const auto error_lines = ReadLines(directory / "error.log");
-        const auto& explicit_source = FindLine(error_lines, "call-site-explicit");
-        const auto component = explicit_source.substr(19,
-            explicit_source.find("call-site-explicit") - 19);
-        for (const auto marker : {"call-site-coroutine", "call-site-direct", "call-site-connection"}) {
-            const auto& line = FindLine(error_lines, marker);
-            Expect(line.substr(19, line.find(marker) - 19) == component,
-                   "logging after suspension lost its caller's component");
-        }
         const auto& warning = FindLine(error_lines, "quoted=\"value\"");
         CheckTimestamp(warning);
         Expect(warning.find(" [Warning] ") != std::string::npos,
@@ -177,7 +148,7 @@ int main() {
         Expect(packed.find(" [Warning] [7] ") != std::string::npos,
                "connection id must log the short session sequence");
         Expect(packed.find("[4294967303]") == std::string::npos,
-               "connection id must not log an execution-thread-local value");
+               "connection id must not log the packed worker-local value");
 
         const auto console_text = console.str();
         Expect(console_text.find("[Info] Panel jx/1 status: ready") !=

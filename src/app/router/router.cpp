@@ -55,7 +55,7 @@ bool MatchIPv6Prefix(const net::ip::address_v6::bytes_type& ip,
     return (ip[full_bytes] & mask) == (network[full_bytes] & mask);
 }
 
-using StringVector = memory::DataVector<std::string>;
+using StringVector = memory::ThreadLocalVector<std::string>;
 
 void SortUniqueStrings(StringVector& values) {
     std::sort(values.begin(), values.end());
@@ -94,11 +94,11 @@ private:
     };
 
     struct TrieNode {
-        memory::DataVector<TrieChild> children;
+        memory::ThreadLocalVector<TrieChild> children;
         bool terminal = false;
     };
 
-    memory::DataVector<TrieNode> nodes_;
+    memory::ThreadLocalVector<TrieNode> nodes_;
     size_t rule_count_ = 0;
 };
 
@@ -125,10 +125,10 @@ public:
     }
 
 private:
-    memory::DataUnorderedSet<std::string, TransparentStringHash, TransparentStringEq> domains_;
+    memory::ThreadLocalUnorderedSet<std::string, TransparentStringHash, TransparentStringEq> domains_;
     DomainTrie suffix_trie_;
     StringVector keywords_;
-    memory::DataVector<std::regex> regexes_;
+    memory::ThreadLocalVector<std::regex> regexes_;
 };
 
 class IPMatcher {
@@ -150,20 +150,20 @@ private:
         uint32_t network;
         uint32_t mask;
     };
-    memory::DataVector<CIDRRule> rules_;
+    memory::ThreadLocalVector<CIDRRule> rules_;
 
     struct CIDRRuleV6 {
         net::ip::address_v6::bytes_type network{};
         uint8_t prefix = 0;
     };
-    memory::DataVector<CIDRRuleV6> rules_v6_;
+    memory::ThreadLocalVector<CIDRRuleV6> rules_v6_;
 
     struct TrieNode {
         int children[2]{-1, -1};
         int rule_index = -1;
     };
-    memory::DataVector<TrieNode> trie_nodes_;
-    memory::DataVector<TrieNode> trie_nodes_v6_;
+    memory::ThreadLocalVector<TrieNode> trie_nodes_;
+    memory::ThreadLocalVector<TrieNode> trie_nodes_v6_;
     bool index_built_ = false;
 };
 
@@ -205,7 +205,7 @@ public:
         const ::acpp::geo::GeoManager* geo) const;
 
 private:
-    memory::DataVector<::acpp::geo::GeoManager::GeoSiteTagHandle> handles_;
+    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoSiteTagHandle> handles_;
 };
 
 class IPCondition {
@@ -237,7 +237,7 @@ public:
         const ::acpp::geo::GeoManager* geo) const;
 
 private:
-    memory::DataVector<::acpp::geo::GeoManager::GeoIPTagHandle> handles_;
+    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoIPTagHandle> handles_;
 };
 
 class SourceIPCondition {
@@ -332,7 +332,7 @@ struct CompoundRoutingRule {
                !conditions.empty();
     }
 
-    memory::DataVector<Condition> conditions;
+    memory::ThreadLocalVector<Condition> conditions;
     std::string outbound_tag;
     bool has_network_condition = false;
     bool has_protocol_condition = false;
@@ -345,8 +345,8 @@ struct CompoundRoutingRule {
     StringVector protocol_values;
     StringVector inbound_tag_values;
     StringVector user_values;
-    memory::DataVector<RoutingPortRange> port_ranges;
-    memory::DataVector<RoutingPortRange> source_port_ranges;
+    memory::ThreadLocalVector<RoutingPortRange> port_ranges;
+    memory::ThreadLocalVector<RoutingPortRange> source_port_ranges;
 
     [[nodiscard]] bool Match(
         const session::Context& ctx,
@@ -410,7 +410,7 @@ private:
     }
 
     [[nodiscard]] static bool MatchPortRanges(
-        const memory::DataVector<RoutingPortRange>& ranges,
+        const memory::ThreadLocalVector<RoutingPortRange>& ranges,
         uint16_t port) noexcept {
         for (const auto& range : ranges) {
             if (port >= range.start && port <= range.end) return true;
@@ -523,7 +523,7 @@ void DomainMatcher::AddRegex(const std::string& pattern) {
 bool DomainMatcher::Match(std::string_view domain) const {
     domain = ::acpp::domain::WithoutTrailingRootDot(domain);
     char stack_buf[256];
-    memory::DataVector<char> heap_buf;
+    memory::ThreadLocalVector<char> heap_buf;
     char* lower_ptr = stack_buf;
 
     if (domain.size() >= sizeof(stack_buf)) {
@@ -718,7 +718,7 @@ bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
 struct Router::Impl {
     Impl(const RoutingConfig& routing, const ::acpp::geo::GeoManager* geo);
 
-    memory::DataVector<CompoundRoutingRule> compound_rules;
+    memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
     routing::DomainStrategy domain_strategy;
     const ::acpp::geo::GeoManager* geo_manager;
 };

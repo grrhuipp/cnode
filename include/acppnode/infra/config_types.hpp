@@ -22,7 +22,7 @@ namespace acpp {
 // ============================================================================
 struct LogConfig {
     std::string level = std::string(constants::logging::kDefaultLevel);  // trace/debug/info/warn/error
-    std::filesystem::path log_dir;  // 留空时使用可执行文件所在目录 / logs
+    std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
     std::filesystem::path access_path;
     std::filesystem::path error_path;
     uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）

@@ -23,6 +23,7 @@ class RequestPolicy;
 }  // namespace features::policy
 namespace app {
 class SessionTrackingState;
+class RequestLoadState;
 namespace dns {
 class DNS;
 }  // namespace dns
@@ -40,7 +41,7 @@ struct OutboundSelection;
 // DefaultDispatcher - app/dispatcher implementation
 //
 // 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。Router 和
-// outbound 表仍在 Runtime 冷路径完成绑定；热路径只消费窄 DispatchPolicy，
+// outbound 表仍在 Worker 冷路径完成绑定；热路径只消费窄 DispatchPolicy，
 // 编排强制出口、Router 规则决策、显式 fallback 和通用请求策略。
 // ============================================================================
 class DefaultDispatcher final : public routing::Dispatcher {
@@ -52,9 +53,10 @@ public:
     void BindRequestPolicy(features::policy::RequestPolicy& request_policy) noexcept;
     void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
     void BindDnsService(app::dns::DNS& dns_service) noexcept;
+    void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,
@@ -65,12 +67,12 @@ public:
 
 private:
     struct RouteResult {
-        std::shared_ptr<const Outbound> handler;
+        std::shared_ptr<Outbound> handler;
         ErrorCode error;
     };
 
     net::awaitable<void> DispatchPreparedLink(
-        net::any_io_executor executor,
+        net::io_context& io_context,
         const routing::DispatchPolicy& policy,
         std::unique_ptr<AsyncStream> inbound,
         transport::Link inbound_link,
@@ -82,12 +84,12 @@ private:
         RelayResult& result,
         AwaitableTaskGroup& request_group,
         ErrorCode& cancellation_reason);
-    [[nodiscard]] std::shared_ptr<const Outbound> ResolveOutboundHandler(
+    [[nodiscard]] std::shared_ptr<Outbound> ResolveOutboundHandler(
         std::string_view tag) const noexcept;
     [[nodiscard]] detail::OutboundSelection SelectRoute(
         session::Context& ctx,
         const routing::DispatchPolicy& policy) const;
-    [[nodiscard]] net::awaitable<RouteResult> FinishRoute(
+    [[nodiscard]] RouteResult FinishRoute(
         session::Context& ctx,
         const detail::OutboundSelection& selection) const;
     [[nodiscard]] net::awaitable<RouteResult> RouteAsync(
@@ -99,6 +101,7 @@ private:
     features::policy::RequestPolicy* request_policy_ = nullptr;
     app::SessionTrackingState* session_tracking_ = nullptr;
     app::dns::DNS* dns_service_ = nullptr;
+    app::RequestLoadState* request_load_ = nullptr;
 };
 
 }  // namespace app::dispatcher

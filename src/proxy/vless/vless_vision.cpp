@@ -274,7 +274,7 @@ bool VisionWriter::ShouldEndVision(std::span<const uint8_t> data) const noexcept
 
 bool VisionWriter::AppendVisionFrameBuffers(
     buf::MultiBuffer& header_owner,
-    memory::DataVector<net::const_buffer>& out,
+    memory::ThreadLocalVector<net::const_buffer>& out,
     std::span<const uint8_t> content,
     uint8_t command) {
     const uint16_t padding_len = PaddingLen(content.size(), is_tls_);
@@ -323,7 +323,7 @@ net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
     }
 
     buf::MultiBuffer header_owner;
-    memory::DataVector<net::const_buffer> out;
+    memory::ThreadLocalVector<net::const_buffer> out;
     out.reserve(mb.size() * 3);
     for (buf::Buffer*& buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
@@ -368,7 +368,7 @@ net::awaitable<void> VisionWriter::WriteBuffers(std::span<const net::const_buffe
     }
 
     buf::MultiBuffer header_owner;
-    memory::DataVector<net::const_buffer> out;
+    memory::ThreadLocalVector<net::const_buffer> out;
     out.reserve(buffers.size() * 3);
     for (const net::const_buffer& buffer : buffers) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());

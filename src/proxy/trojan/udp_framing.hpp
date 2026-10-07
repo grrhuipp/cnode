@@ -29,7 +29,7 @@ private:
 
     memory::ByteVector pending_;
     size_t pending_offset_ = 0;
-    memory::DataDeque<FramedUdpPacket> queue_;
+    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
     bool shrink_queue_on_drain_ = false;
 };
 
