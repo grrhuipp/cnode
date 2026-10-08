@@ -25,11 +25,11 @@ int main() {
     if (load.ActiveConnections() != 0 || load.PressureIdleTimeout() != 0) return 1;
     {
         acpp::app::RequestLoadState::PhysicalConnectionScope physical(load);
-        acpp::app::RequestLoadState::DispatchScope first(&load);
+        acpp::app::RequestLoadState::DispatchScope first(load);
         if (load.ActiveConnections() != 1 || load.PressureIdleTimeout() != 0) return 2;
         {
-            acpp::app::RequestLoadState::DispatchScope second(&load);
-            acpp::app::RequestLoadState::DispatchScope third(&load);
+            acpp::app::RequestLoadState::DispatchScope second(load);
+            acpp::app::RequestLoadState::DispatchScope third(load);
             if (load.ActiveConnections() != 3 || load.PressureIdleTimeout() != 7) return 3;
             load.Configure(2, 5);
             if (load.PressureIdleTimeout() != 5) return 4;

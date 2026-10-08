@@ -120,15 +120,15 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
 
 struct ActiveSessionScope {
     session::Context& ctx;
-    app::SessionTrackingState* session_tracking = nullptr;
+    app::SessionTrackingState& session_tracking;
     bool is_active = false;
 
     ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState* tracking)
+                       app::SessionTrackingState& tracking)
         : ctx(session_ctx)
         , session_tracking(tracking) {
-        if (session_tracking && ctx.inbound.user_id > 0) {
-            session_tracking->RegisterActiveSession(
+        if (ctx.inbound.user_id > 0) {
+            session_tracking.RegisterActiveSession(
                 ctx.conn_id,
                 ctx.inbound.tag,
                 ctx.inbound.user_id,
@@ -138,11 +138,11 @@ struct ActiveSessionScope {
     }
 
     ~ActiveSessionScope() noexcept {
-        if (!is_active || !session_tracking) {
+        if (!is_active) {
             return;
         }
 
-        session_tracking->UnregisterActiveSession(
+        session_tracking.UnregisterActiveSession(
             ctx.conn_id,
             ctx.traffic);
     }
@@ -150,40 +150,23 @@ struct ActiveSessionScope {
 
 }  // namespace
 
-void DefaultDispatcher::BindRouter(const routing::Router& router) noexcept {
-    router_ = &router;
-}
-
-void DefaultDispatcher::BindOutboundManager(
-    features::outbound::Manager& outbound_manager) noexcept {
-    outbound_manager_ = &outbound_manager;
-}
-
-void DefaultDispatcher::BindRequestPolicy(
-    features::policy::RequestPolicy& request_policy) noexcept {
-    request_policy_ = &request_policy;
-}
-
-void DefaultDispatcher::BindSessionTracking(
-    app::SessionTrackingState& session_tracking) noexcept {
-    session_tracking_ = &session_tracking;
-}
-
-void DefaultDispatcher::BindDnsService(app::dns::DNS& dns_service) noexcept {
-    dns_service_ = &dns_service;
-}
-
-void DefaultDispatcher::BindRequestLoadState(
-    app::RequestLoadState& request_load) noexcept {
-    request_load_ = &request_load;
-}
+DefaultDispatcher::DefaultDispatcher(
+    const routing::Router& router,
+    features::outbound::Manager& outbound_manager,
+    features::policy::RequestPolicy& request_policy,
+    app::SessionTrackingState& session_tracking,
+    app::dns::DNS& dns_service,
+    app::RequestLoadState& request_load) noexcept
+    : router_(router)
+    , outbound_manager_(outbound_manager)
+    , request_policy_(request_policy)
+    , session_tracking_(session_tracking)
+    , dns_service_(dns_service)
+    , request_load_(request_load) {}
 
 std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
     std::string_view tag) const noexcept {
-    if (!outbound_manager_) {
-        return nullptr;
-    }
-    return outbound_manager_->GetHandler(tag);
+    return outbound_manager_.GetHandler(tag);
 }
 
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
@@ -196,9 +179,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     StatsShard& stats,
     const TimeoutsConfig& timeouts) {
     app::RequestLoadState::DispatchScope load_scope(request_load_);
-    const uint32_t pressure_idle_timeout = request_load_
-        ? request_load_->PressureIdleTimeout()
-        : 0;
+    const uint32_t pressure_idle_timeout = request_load_.PressureIdleTimeout();
     const int64_t auth_completed_at_us = NowMicros();
     const int64_t auth_started_at_us = ctx.inbound.transport_ready_at_unix_us > 0
         ? ctx.inbound.transport_ready_at_unix_us
@@ -565,7 +546,7 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
                        ctx.outbound.target, ctx.outbound.tag);
     }
 
-    if (request_policy_ && request_policy_->Blocked(ctx)) {
+    if (request_policy_.Blocked(ctx)) {
         return RouteResult{
             .handler = {},
             .error = ErrorCode::BLOCKED,
@@ -590,8 +571,8 @@ detail::OutboundSelection DefaultDispatcher::SelectRoute(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) const {
     routing::RouteDecision decision;
-    if (router_ && detail::RequiresRouting(policy.outbound)) {
-        decision = router_->Route(ctx);
+    if (detail::RequiresRouting(policy.outbound)) {
+        decision = router_.Route(ctx);
     }
 
     return detail::SelectOutbound(policy.outbound, decision);
@@ -600,14 +581,14 @@ detail::OutboundSelection DefaultDispatcher::SelectRoute(
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) {
-    if (!router_ || !detail::RequiresRouting(policy.outbound) ||
+    if (!detail::RequiresRouting(policy.outbound) ||
         !ctx.outbound.target.IsDomain() ||
         ctx.outbound.target.resolved_addr) {
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
-    const auto strategy = router_->DomainStrategy();
-    if (strategy == routing::DomainStrategy::AsIs || !dns_service_) {
+    const auto strategy = router_.DomainStrategy();
+    if (strategy == routing::DomainStrategy::AsIs) {
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
@@ -645,14 +626,14 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
             co_return FinishRoute(ctx, initial);
         }
 
-        auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
+        auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
         if (!addresses.empty()) {
             co_return FinishRoute(ctx, select_with_addresses(addresses));
         }
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
-    auto addresses = co_await ResolveRoutingAddresses(*dns_service_, ctx);
+    auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
     if (!addresses.empty()) {
         co_return FinishRoute(ctx, select_with_addresses(addresses));
     }

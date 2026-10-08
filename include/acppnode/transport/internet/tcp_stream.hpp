@@ -46,6 +46,10 @@ public:
     int NativeHandle() const override;
     bool IsOpen() const override;
 
+    // Return bytes read ahead by a completed handshake before unread socket data.
+    // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
+    void PrependReadData(std::span<const uint8_t> data);
+
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;
     // 仅等待底层 socket 可读，不接收数据、不申请 payload Buffer。

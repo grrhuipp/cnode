@@ -12,22 +12,6 @@ file(READ "${SOURCE_DIR}/src/app/worker/udp_receive_loop.hpp"
 file(READ "${SOURCE_DIR}/src/app/bootstrap_runtime.cpp" BOOTSTRAP_RUNTIME_SOURCE)
 file(READ "${SOURCE_DIR}/src/app/bootstrap_inbounds.cpp" BOOTSTRAP_INBOUNDS_SOURCE)
 
-string(FIND "${WORKER_SOURCE}" "Worker::Worker(" WORKER_CTOR_BEGIN)
-string(FIND "${WORKER_SOURCE}" "Worker::~Worker" WORKER_CTOR_END)
-if(WORKER_CTOR_BEGIN EQUAL -1 OR WORKER_CTOR_END EQUAL -1 OR
-   NOT WORKER_CTOR_BEGIN LESS WORKER_CTOR_END)
-    message(FATAL_ERROR "could not isolate Worker constructor")
-endif()
-math(EXPR WORKER_CTOR_LENGTH "${WORKER_CTOR_END} - ${WORKER_CTOR_BEGIN}")
-string(SUBSTRING "${WORKER_SOURCE}"
-    ${WORKER_CTOR_BEGIN} ${WORKER_CTOR_LENGTH} WORKER_CTOR_SOURCE)
-if(WORKER_CTOR_SOURCE MATCHES
-       "StartCleanup[(][)]|InitOutbounds[(]|InitRouter[(]|BindOutboundManager[(]" OR
-   NOT WORKER_SOURCE MATCHES
-       "Worker::StartRuntimeTask[(][)]")
-    message(FATAL_ERROR
-        "Worker construction must not build or start Worker-local runtime state")
-endif()
 
 string(FIND "${BOOTSTRAP_RUNTIME_SOURCE}"
     "TimeoutScheduler::ForIoContext(*ctx.io_contexts[i])" SCHEDULER_START_POS)

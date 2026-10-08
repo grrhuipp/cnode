@@ -1,4 +1,4 @@
-"""HTTPUpgrade byte-stream regression: pending bytes, forwarding and EOF."""
+"""Real HTTPUpgrade forwarding: plain/TLS read-ahead, segmentation and EOF."""
 import argparse
 import asyncio
 import json
@@ -36,7 +36,7 @@ async def run(binary, output, mode):
         upgrade_port, raw_port = available_port(), available_port()
         while raw_port == upgrade_port:
             raw_port = available_port()
-        tls = mode == "chain-tls"
+        tls = mode.endswith("tls")
         inbound = {"protocol": "vless", "listen": "127.0.0.1",
                    "settings": {"clients": [{"id": str(USER)}]},
                    "sniffing": {"enabled": False}}
@@ -64,13 +64,15 @@ async def run(binary, output, mode):
                     (output / "child.log").read_text(encoding="utf-8", errors="replace"), 10)
         assert child.poll() is None, (output / "child.log").read_text(
             encoding="utf-8", errors="replace")
-        reader, writer = await resources.connect(raw_port if mode.startswith("chain") else upgrade_port)
+        chained = mode.startswith("chain")
+        reader, writer = await resources.connect(raw_port if chained else upgrade_port,
+                                                  tls=tls and not chained)
         request = (b"\0" + USER.bytes + b"\0\1" + struct.pack("!H", target_port)
                    + b"\1\x7f\0\0\1")
         async with asyncio.timeout(10):
-            if mode == "coalesced":
+            if mode.startswith("coalesced"):
                 writer.write(UPGRADE + request + PAYLOAD[:1024])
-            elif mode == "fragmented":
+            elif mode.startswith("fragmented"):
                 for part in (UPGRADE[:13], UPGRADE[13:-2], UPGRADE[-2:]):
                     writer.write(part)
                     await writer.drain()
@@ -81,13 +83,14 @@ async def run(binary, output, mode):
             else:
                 writer.write(request + PAYLOAD[:1024])
             await writer.drain()
-            if mode == "coalesced":
+            if mode.startswith("coalesced"):
                 response = await reader.readuntil(b"\r\n\r\n")
                 assert response.startswith(b"HTTP/1.1 101 "), response
             for offset in range(1024, len(PAYLOAD), 16381):
                 writer.write(PAYLOAD[offset:offset + 16381])
                 await writer.drain()
-            writer.write_eof()
+            if not tls or chained:
+                writer.write_eof()
             assert await reader.readexactly(2) == b"\0\0", "invalid VLESS response header"
             assert await reader.readexactly(len(PAYLOAD)) == PAYLOAD, "truncated download"
             assert await reader.read() == b"", "download direction did not reach EOF"
@@ -106,7 +109,8 @@ async def run(binary, output, mode):
 
 async def main(binary, output):
     results = []
-    for mode in ("coalesced", "fragmented", "chain", "chain-tls"):
+    for mode in ("coalesced", "fragmented", "coalesced-tls", "fragmented-tls",
+                 "chain", "chain-tls"):
         results.append(await run(binary.resolve(), output.resolve() / mode, mode))
     print(json.dumps(results, indent=2))
 

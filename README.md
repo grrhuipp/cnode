@@ -65,7 +65,11 @@ main
 
 每个数据 Worker 独立绑定同一组端口（Linux `SO_REUSEPORT`，Windows 降级为 `SO_REUSEADDR`），连接不跨线程迁移。面板与数据 Worker 经有界入口访问主控线程上的 DNSWorker；其他跨线程控制面经有界 mailbox 投递，不共享 live handler、会话或 allocator。
 
+数据 Worker 在开始监听前准备路由、出站与请求策略等能力，再一次性构造完整的分发器；不存在分阶段绑定或运行期重新绑定。
+
 这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
+
+HTTP 与 HTTPUpgrade 只在建链阶段处理 HTTP 握手，完成后继续使用原来的 TCP / TLS 流，不保留长期透传包装。握手提前读到的应用数据由实际读端按原顺序承接；TLS 明文残留不会进入底层 TCP 密文缓冲。残留读完或读端关闭后释放，取消、半关闭与 TLS 关闭仍沿原传输链路生效。
 
 控制面链路：
 

@@ -397,137 +397,21 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
     }
 }
 
+// HTTP handshakes run directly on TCP or TLS. Return read-ahead to that exact
+// byte layer: TLS plaintext must never enter the TCP encrypted-input queue.
+void PrependHandshakeReadData(AsyncStream& stream, std::span<const uint8_t> data) {
+    if (data.empty()) return;
+    if (auto* tls = dynamic_cast<TlsStream*>(&stream)) {
+        tls->PrependReadData(data);
+    } else if (auto* tcp = dynamic_cast<TcpStream*>(&stream)) {
+        tcp->PrependReadData(data);
+    } else {
+        throw IoSystemError(io_error::operation_not_supported,
+                            "HTTP handshake requires a TCP or TLS byte stream");
+    }
+}
+
 }  // namespace
-
-class HttpUpgradeStream final : public AsyncStream {
-public:
-    explicit HttpUpgradeStream(std::unique_ptr<AsyncStream> inner)
-        : inner_(std::move(inner)) {}
-
-    ~HttpUpgradeStream() noexcept override {
-        Close();
-    }
-
-    void SetPendingData(const uint8_t* data, size_t len) {
-        size_t offset = 0;
-        while (offset < len) {
-            buf::BufferGuard buffer{buf::Buffer::New()};
-            if (!buffer) {
-                throw std::bad_alloc();
-            }
-            const size_t n = std::min(
-                len - offset,
-                static_cast<size_t>(buffer->Available()));
-            std::memcpy(buffer->Tail().data(), data + offset, n);
-            buffer->Produce(static_cast<uint32_t>(n));
-            pending_.push_back(std::move(buffer));
-            offset += n;
-        }
-    }
-
-    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (buf::HasData(pending_)) {
-            co_return PopPendingData(buffer);
-        }
-        co_return co_await inner_->AsyncRead(buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        return inner_->AsyncWrite(buffer);
-    }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (buf::HasData(pending_)) {
-            co_return std::move(pending_);
-        }
-        co_return co_await inner_->ReadMultiBuffer();
-    }
-
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return inner_->WriteMultiBuffer(std::move(mb));
-    }
-
-    net::awaitable<void> WriteBuffers(
-        std::span<const net::const_buffer> buffers) override {
-        return inner_->WriteBuffers(buffers);
-    }
-
-    void ShutdownRead() override {
-        pending_.clear();
-        inner_->ShutdownRead();
-    }
-
-    void ShutdownWrite() override {
-        if (write_closed_) {
-            return;
-        }
-        write_closed_ = true;
-        inner_->ShutdownWrite();
-    }
-
-    net::awaitable<void> AsyncShutdownWrite() override {
-        if (write_closed_) {
-            co_return;
-        }
-        write_closed_ = true;
-        co_await inner_->AsyncShutdownWrite();
-    }
-
-    void Cancel() noexcept override {
-        NotifyCancellation();
-        inner_->Cancel();
-    }
-
-    void Close() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        pending_.clear();
-        inner_->Close();
-    }
-
-    void CloseAbortive() override {
-        NotifyClosed();
-        if (closed_) {
-            return;
-        }
-        closed_ = true;
-        pending_.clear();
-        inner_->CloseAbortive();
-    }
-
-    int NativeHandle() const override {
-        return inner_->NativeHandle();
-    }
-
-    bool IsOpen() const override {
-        return !closed_ && inner_->IsOpen();
-    }
-
-protected:
-    TcpStream* BaseTcpStream() override {
-        return BaseTcpStreamOf(*inner_);
-    }
-
-    const TcpStream* BaseTcpStream() const override {
-        return BaseTcpStreamOf(*inner_);
-    }
-
-private:
-    size_t PopPendingData(net::mutable_buffer target) noexcept {
-        return pending_.ConsumePrefixTo(
-            std::span<uint8_t>(
-                static_cast<uint8_t*>(target.data()),
-                target.size()));
-    }
-
-    std::unique_ptr<AsyncStream> inner_;
-    buf::MultiBuffer pending_;
-    bool closed_ = false;
-    bool write_closed_ = false;
-};
 
 class Http1BodyStream final : public AsyncStream {
 public:
@@ -4978,14 +4862,13 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     }
 
     const size_t header_end = request.find("\r\n\r\n") + 4;
-    auto http = std::make_unique<HttpUpgradeStream>(std::move(stream));
     if (header_end < total) {
-        http->SetPendingData(data + header_end, total - header_end);
+        PrependHandshakeReadData(*stream, {data + header_end, total - header_end});
     }
     LOG_NET_DEBUG("[HTTP:{}] server: handshake ok (path={})",
                      conn_id,
                      EffectivePath(cfg.path));
-    co_return std::unique_ptr<AsyncStream>(std::move(http));
+    co_return std::move(stream);
 }
 
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
@@ -5191,17 +5074,16 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto http = std::make_unique<HttpUpgradeStream>(std::move(stream));
     if (header_end < response_len) {
-        http->SetPendingData(
+        PrependHandshakeReadData(*stream, {
             unsafe::ptr_cast<const uint8_t>(response_data + header_end),
-            response_len - header_end);
+            response_len - header_end});
     }
     LOG_NET_DEBUG("[HTTP:{}] client: handshake ok (host={} path={})",
                      conn_id,
                      host,
                      req_path);
-    co_return std::unique_ptr<AsyncStream>(std::move(http));
+    co_return std::move(stream);
 }
 
 net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
@@ -5315,15 +5197,14 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
         co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    auto upgraded = std::make_unique<HttpUpgradeStream>(std::move(stream));
     const size_t header_end = request.find("\r\n\r\n") + 4;
     if (header_end < total) {
-        upgraded->SetPendingData(data + header_end, total - header_end);
+        PrependHandshakeReadData(*stream, {data + header_end, total - header_end});
     }
     LOG_NET_DEBUG("[HTTPUpgrade:{}] server: handshake ok (path={})",
                      conn_id,
                      EffectivePath(cfg.path));
-    co_return std::unique_ptr<AsyncStream>(std::move(upgraded));
+    co_return std::move(stream);
 }
 
 [[nodiscard]] std::string_view ExtractStatusLine(std::string_view response) {
@@ -5432,17 +5313,16 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto upgraded = std::make_unique<HttpUpgradeStream>(std::move(stream));
     if (header_end < response_len) {
-        upgraded->SetPendingData(
+        PrependHandshakeReadData(*stream, {
             unsafe::ptr_cast<const uint8_t>(response_data + header_end),
-            response_len - header_end);
+            response_len - header_end});
     }
     LOG_NET_DEBUG("[HTTPUpgrade:{}] client: handshake ok (host={} path={})",
                      conn_id,
                      host,
                      req_path);
-    co_return std::unique_ptr<AsyncStream>(std::move(upgraded));
+    co_return std::move(stream);
 }
 
 // WebSocket 服务端握手（从原始流读 HTTP 请求，回复 101，返回 WsServerStream）

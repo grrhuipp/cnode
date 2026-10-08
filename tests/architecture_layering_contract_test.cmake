@@ -292,11 +292,6 @@ if(DEFAULT_DISPATCHER_INTERFACE_SOURCE MATCHES
     message(FATAL_ERROR
         "the Dispatcher implementation header must not expose full config, stats or stream implementations")
 endif()
-if(DEFAULT_DISPATCHER_INTERFACE_SOURCE MATCHES
-       "DefaultDispatcher *[(] *app::router::Router")
-    message(FATAL_ERROR
-        "Dispatcher must be bound explicitly during Worker runtime initialization")
-endif()
 
 foreach(CHILD_DISPATCH_FILE IN ITEMS
         "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.hpp"
@@ -393,22 +388,7 @@ if(TLS_PUBLIC_SOURCE MATCHES
         "TLS PImpl public header must not pull implementation or configuration definitions")
 endif()
 
-# HTTPUpgrade contributes only read-side pending bytes after the handshake;
-# transparent writes must not add a coroutine frame to every forwarding batch.
 file(READ "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp" TRANSPORT_SOURCE)
-string(FIND "${TRANSPORT_SOURCE}" "class HttpUpgradeStream final" UPGRADE_BEGIN)
-string(FIND "${TRANSPORT_SOURCE}" "class Http1BodyStream final" UPGRADE_END)
-if(UPGRADE_BEGIN LESS 0 OR UPGRADE_END LESS_EQUAL UPGRADE_BEGIN)
-    message(FATAL_ERROR "HTTPUpgrade transport implementation boundary not found")
-endif()
-math(EXPR UPGRADE_LENGTH "${UPGRADE_END} - ${UPGRADE_BEGIN}")
-string(SUBSTRING "${TRANSPORT_SOURCE}" ${UPGRADE_BEGIN} ${UPGRADE_LENGTH} UPGRADE_SOURCE)
-foreach(UPGRADE_WRITE IN ITEMS AsyncWrite WriteMultiBuffer WriteBuffers)
-    if(NOT UPGRADE_SOURCE MATCHES "return inner_->${UPGRADE_WRITE}\\(")
-        message(FATAL_ERROR
-            "HTTPUpgrade transparent writes must directly return the underlying task: ${UPGRADE_WRITE}")
-    endif()
-endforeach()
 
 if(NOT TRANSPORT_SOURCE MATCHES
        "return WriteRawDataSerialized\\(stream_id, \\{\\}, true\\);")

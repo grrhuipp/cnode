@@ -391,6 +391,13 @@ struct TlsStream::Impl : memory::ThreadAllocated {
         Impl& owner;
     };
 
+    struct PendingReadData : memory::ThreadAllocated {
+        buf::MultiBuffer data;
+    };
+
+    // Allocated only while a completed handshake has plaintext read-ahead.
+    std::unique_ptr<PendingReadData> pending_read;
+
     SslStream stream;
     size_t active_operations = 0;
     Impl* prev = nullptr;
@@ -553,7 +560,34 @@ std::string TlsStream::NegotiatedFingerprint() const {
     return out;
 }
 
+void TlsStream::PrependReadData(std::span<const uint8_t> data) {
+    if (data.empty()) return;
+    if (!impl_ || !impl_->stream.next_layer().Tcp().TlsLayerCanRead()) {
+        throw IoSystemError(io_error::operation_aborted, "TLS read closed");
+    }
+    buf::MultiBuffer prefix;
+    if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
+        throw std::bad_alloc();
+    }
+    if (impl_->pending_read) {
+        impl_->pending_read->data.MoveTo(prefix);
+    } else {
+        impl_->pending_read = std::make_unique<Impl::PendingReadData>();
+    }
+    impl_->pending_read->data = std::move(prefix);
+}
+
 net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
+    if (!impl_ || !impl_->stream.next_layer().Tcp().TlsLayerCanRead()) {
+        co_return 0;
+    }
+    if (impl_->pending_read) {
+        impl_->Touch();
+        const size_t n = impl_->pending_read->data.ConsumePrefixTo(
+            std::span<uint8_t>(static_cast<uint8_t*>(buf.data()), buf.size()));
+        if (impl_->pending_read->data.empty()) impl_->pending_read.reset();
+        co_return n;
+    }
     if (!handshake_done_ && !co_await Handshake()) {
         ThrowTlsReadError("TLS handshake failed during read");
     }
@@ -584,6 +618,15 @@ net::awaitable<std::size_t> TlsStream::AsyncRead(net::mutable_buffer buf) {
 }
 
 net::awaitable<buf::MultiBuffer> TlsStream::ReadMultiBuffer() {
+    if (!impl_ || !impl_->stream.next_layer().Tcp().TlsLayerCanRead()) {
+        co_return buf::MultiBuffer{};
+    }
+    if (impl_->pending_read) {
+        impl_->Touch();
+        auto data = std::move(impl_->pending_read->data);
+        impl_->pending_read.reset();
+        co_return data;
+    }
     if (!handshake_done_ && !co_await Handshake()) {
         ThrowTlsReadError("TLS handshake failed during read");
     }
@@ -696,6 +739,7 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
 
 void TlsStream::ShutdownRead() {
     if (impl_) {
+        impl_->pending_read.reset();
         impl_->stream.next_layer().Tcp().ShutdownRead();
     }
 }
@@ -731,6 +775,7 @@ void TlsStream::Close() {
     NotifyClosed();
     shutdown_initiated_ = true;
     if (impl_) {
+        impl_->pending_read.reset();
         impl_->stream.next_layer().Tcp().Close();
     }
 }
@@ -739,6 +784,7 @@ void TlsStream::CloseAbortive() {
     NotifyClosed();
     shutdown_initiated_ = true;
     if (impl_) {
+        impl_->pending_read.reset();
         impl_->stream.next_layer().Tcp().SetAbortiveClose(true);
         impl_->stream.next_layer().Tcp().Close();
     }

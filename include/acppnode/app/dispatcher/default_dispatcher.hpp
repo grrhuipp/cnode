@@ -40,20 +40,19 @@ struct OutboundSelection;
 // ============================================================================
 // DefaultDispatcher - app/dispatcher implementation
 //
-// 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。Router 和
-// outbound 表仍在 Worker 冷路径完成绑定；热路径只消费窄 DispatchPolicy，
-// 编排强制出口、Router 规则决策、显式 fallback 和通用请求策略。
+// 对齐 xray-core app/dispatcher.DefaultDispatcher 的实现职责。全部依赖在
+// Worker 冷路径一次性构造；热路径只消费窄 DispatchPolicy，编排强制出口、
+// Router 规则决策、显式 fallback 和通用请求策略。
 // ============================================================================
 class DefaultDispatcher final : public routing::Dispatcher {
 public:
-    DefaultDispatcher() = default;
-
-    void BindRouter(const routing::Router& router) noexcept;
-    void BindOutboundManager(features::outbound::Manager& outbound_manager) noexcept;
-    void BindRequestPolicy(features::policy::RequestPolicy& request_policy) noexcept;
-    void BindSessionTracking(app::SessionTrackingState& session_tracking) noexcept;
-    void BindDnsService(app::dns::DNS& dns_service) noexcept;
-    void BindRequestLoadState(app::RequestLoadState& request_load) noexcept;
+    DefaultDispatcher(
+        const routing::Router& router,
+        features::outbound::Manager& outbound_manager,
+        features::policy::RequestPolicy& request_policy,
+        app::SessionTrackingState& session_tracking,
+        app::dns::DNS& dns_service,
+        app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
@@ -96,12 +95,12 @@ private:
         session::Context& ctx,
         const routing::DispatchPolicy& policy);
 
-    const routing::Router* router_ = nullptr;
-    features::outbound::Manager* outbound_manager_ = nullptr;
-    features::policy::RequestPolicy* request_policy_ = nullptr;
-    app::SessionTrackingState* session_tracking_ = nullptr;
-    app::dns::DNS* dns_service_ = nullptr;
-    app::RequestLoadState* request_load_ = nullptr;
+    const routing::Router& router_;
+    features::outbound::Manager& outbound_manager_;
+    features::policy::RequestPolicy& request_policy_;
+    app::SessionTrackingState& session_tracking_;
+    app::dns::DNS& dns_service_;
+    app::RequestLoadState& request_load_;
 };
 
 }  // namespace app::dispatcher

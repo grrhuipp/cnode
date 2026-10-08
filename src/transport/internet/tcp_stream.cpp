@@ -322,6 +322,7 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
 }
 
 void TcpStream::ShutdownRead() {
+    ReleasePendingData();
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         return;
     }
@@ -344,6 +345,7 @@ void TcpStream::ShutdownWrite() {
 }
 
 void TcpStream::Close() {
+    ReleasePendingData();
     impl_->timeouts.Stop();
     NotifyClosed();
     if (impl_->socket.is_open()) {
@@ -513,6 +515,20 @@ void TcpStream::SetPendingData(std::span<const uint8_t> data) {
         impl_->pending_data.push_back(std::move(buffer));
         offset += n;
     }
+}
+
+void TcpStream::PrependReadData(std::span<const uint8_t> data) {
+    if (data.empty()) return;
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        throw IoSystemError(io_error::operation_aborted, "TCP read closed");
+    }
+    buf::MultiBuffer prefix;
+    if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
+        throw std::bad_alloc();
+    }
+    // MoveTo reserves before transferring; allocation failure preserves old data.
+    impl_->pending_data.MoveTo(prefix);
+    impl_->pending_data = std::move(prefix);
 }
 
 void TcpStream::SetStreamLabel(std::string_view label) noexcept {

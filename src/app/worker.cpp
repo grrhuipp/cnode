@@ -145,8 +145,7 @@ struct Worker::RuntimeState {
         , session_tracking(std::make_unique<app::SessionTrackingState>())
         , dns_service(std::make_unique<app::dns::DNS>(dns_worker))
         , outbound_manager(std::make_unique<proxyman::outbound::Manager>())
-        , rule_manager(std::make_unique<rule::Manager>())
-        , dispatcher(std::make_unique<app::dispatcher::DefaultDispatcher>()) {}
+        , rule_manager(std::make_unique<rule::Manager>()) {}
 
     ~RuntimeState() {
         if (udp_association_reclaimer) udp_association_reclaimer->Stop();
@@ -276,14 +275,12 @@ void Worker::RuntimeState::Start(Worker& worker) {
     memory_reclaimer.Start(scheduler);
     udp_association_reclaimer =
         std::make_unique<worker_detail::UdpAssociationReclaimer>(scheduler);
-    dispatcher->BindRequestPolicy(*rule_manager);
-    dispatcher->BindSessionTracking(*session_tracking);
-    dispatcher->BindDnsService(*dns_service);
-    dispatcher->BindRequestLoadState(request_load);
     const auto config = Snapshot();
     InitOutbounds(worker, config->outbounds);
-    dispatcher->BindOutboundManager(*outbound_manager);
     InitRouter(worker, config->routing, geo_manager);
+    dispatcher = std::make_unique<app::dispatcher::DefaultDispatcher>(
+        *router, *outbound_manager, *rule_manager, *session_tracking,
+        *dns_service, request_load);
     started = true;
 }
 
@@ -314,7 +311,6 @@ void Worker::RuntimeState::InitRouter(
     const RoutingConfig& routing,
     geo::GeoManager* geo_manager_ref) {
     router = std::make_unique<app::router::Router>(routing, geo_manager_ref);
-    dispatcher->BindRouter(*router);
 
     LOG_DEBUG("Worker[{}]: router initialized, {} rules",
               worker.id_, routing.rules.size());

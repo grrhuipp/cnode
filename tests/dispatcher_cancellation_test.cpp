@@ -2,6 +2,8 @@
 #include "acppnode/app/dns/dns_worker.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/request_load_state.hpp"
+#include "acppnode/app/session_tracking.hpp"
+#include "acppnode/common/rule.hpp"
 #include "acppnode/features/outbound/outbound.hpp"
 #include "acppnode/features/routing/router.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
@@ -130,21 +132,25 @@ public:
     int lookups = 0;
     HandlerPtr GetHandler(std::string_view tag) noexcept override {
         ++lookups;
-        return tag == "second" ? second : handler;
+        if (tag == "direct") return handler;
+        if (tag == "second") return second;
+        return {};
     }
 };
 
 class Router final : public routing::Router {
 public:
     mutable int calls = 0;
-    routing::RouteDecision Route(const session::Context&) const override { ++calls; return {}; }
+    routing::RouteDecision decision;
+    routing::RouteDecision Route(const session::Context&) const override { ++calls; return decision; }
     routing::DomainStrategy DomainStrategy() const noexcept override {
         return routing::DomainStrategy::IPOnDemand;
     }
 };
 
 enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
-                  Success, RelaySuccess, RelayFailure, RelayCancelled, SniffMemory, SniffLinkError };
+                  Success, RelaySuccess, RelayFailure, RelayCancelled, SniffMemory, SniffLinkError,
+                  RoutedFallback, RuleMatch, PolicyBlockedForce, PolicyBlockedRoute, PolicyAllowed };
 
 bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     net::io_context io;
@@ -166,7 +172,11 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     auto* reader = stream.get();
     Manager manager;
     Router router;
-    auto& outbound = *manager.handler;
+    if (which == Case::RuleMatch) {
+        manager.second = std::make_shared<Handler>();
+        router.decision = {.outbound_tag = "second", .matched = true, .rule_index = 7};
+    }
+    auto& outbound = which == Case::RuleMatch ? *manager.second : *manager.handler;
     outbound.state.load = &load;
     outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
@@ -174,37 +184,46 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     outbound.state.return_cancelled = which == Case::RelayCancelled;
     outbound.target_state.payload_size = 13;
     if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::RELAY_READ_FAILED;
-    app::dispatcher::DefaultDispatcher dispatcher;
-    dispatcher.BindOutboundManager(manager);
-    dispatcher.BindRequestLoadState(load);
-    dispatcher.BindRouter(router);
     routing::DispatchPolicy policy{SniffConfig{}, routing::ForceOutbound{"direct"}};
+    if (which == Case::RoutedFallback || which == Case::RuleMatch ||
+        which == Case::PolicyBlockedRoute) {
+        policy.outbound = routing::RouteWithFallback{"direct"};
+    }
     policy.sniffing.enabled = which == Case::Sniff || which == Case::SniffMemory || which == Case::SniffLinkError;
     session::Context ctx;
+    ctx.conn_id = 1;
+    ctx.inbound.tag = "dispatcher-test";
+    ctx.inbound.user_id = 42;
+    ctx.inbound.user_email = "dispatcher|42";
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
     ctx.outbound.original_target = ctx.outbound.target;
     ctx.content.network = Network::TCP;
     StatsShard stats;
     TimeoutsConfig timeouts;
-    std::optional<udp::socket> dns_peer;
-    std::optional<app::dns::DNSWorker> dns_worker;
-    std::optional<app::dns::DNS> dns;
+    udp::socket dns_peer(io, udp::endpoint(net::ip::make_address("127.0.0.42"), 0));
+    app::dns::Config dns_config{
+        .servers = {dns_peer.local_endpoint()},
+        .timeout_sec = 2,
+    };
     if (which == Case::RoutingDns) {
-        const auto address = net::ip::make_address("127.0.0.42");
-        dns_peer.emplace(io, udp::v4());
-        IoErrorCode bind_error;
-        dns_peer->bind(udp::endpoint(address, 0), bind_error);
-        if (bind_error) throw IoSystemError(bind_error);
-        app::dns::Config config;
-        config.servers = {dns_peer->local_endpoint()};
-        config.timeout_sec = 2;
-        dns_worker.emplace(io, config, 8);
-        dns.emplace(*dns_worker);
-        dispatcher.BindDnsService(*dns);
         policy.outbound = routing::RouteWithFallback{"direct"};
         ctx.outbound.target = TargetAddress("dispatcher-cancellation.example", 443);
         ctx.outbound.original_target = ctx.outbound.target;
     }
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
+    app::SessionTrackingState session_tracking;
+    rule::Manager request_policy;
+    if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
+        which == Case::PolicyAllowed) {
+        request_policy.UpdateRule(ctx.inbound.tag, {{
+            .ID = 11,
+            .Pattern = std::regex(which == Case::PolicyAllowed
+                ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
+        }});
+    }
+    app::dispatcher::DefaultDispatcher dispatcher(
+        router, manager, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
     bool triggered = false;
@@ -217,7 +236,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         trigger.expires_after(30ms);
         trigger.async_wait([&](IoErrorCode error) {
             if (error || done) return;
-            triggered = which == Case::RoutingDns ? dns_peer->available() > 0 :
+            triggered = which == Case::RoutingDns ? dns_peer.available() > 0 :
                 (source_state.active + outbound.state.active == 1);
             if (which == Case::Parent) parent.emit(net::cancellation_type::terminal);
             else if (which == Case::Pending) reader->Cancellation().CancelPending(reason);
@@ -240,10 +259,14 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         source_state.active == 0 && outbound.state.active == 0 &&
         (!controlled || source_state.destroyed);
     auto expected = reason;
-    if (which == Case::Success || which == Case::RelaySuccess) expected = ErrorCode::OK;
+    if (which == Case::Success || which == Case::RelaySuccess ||
+        which == Case::RoutedFallback || which == Case::RuleMatch ||
+        which == Case::PolicyAllowed) expected = ErrorCode::OK;
     if (which == Case::RelayFailure) expected = ErrorCode::RELAY_READ_FAILED;
     if (which == Case::RelayCancelled) expected = ErrorCode::CANCELLED;
     if (which == Case::SniffMemory || which == Case::SniffLinkError) expected = ErrorCode::RESOURCE_EXHAUSTED;
+    if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute)
+        expected = ErrorCode::BLOCKED;
     passed &= result.error == expected;
     if (controlled && which == Case::RelayFailure) {
         passed &= ctx.outbound.failure_detail_code == ErrorCodeToString(ErrorCode::RELAY_READ_FAILED);
@@ -258,8 +281,39 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         passed &= triggered && waiting.cancelled == 1 && waiting.cleanup_has_owner && outbound.state.committed == 0;
     }
     if (which == Case::RoutingDns) passed &= triggered && ctx.outbound.tag.empty();
+    const bool routed = which == Case::RoutedFallback || which == Case::RuleMatch ||
+        which == Case::PolicyBlockedRoute;
+    passed &= routed ? router.calls > 0 : router.calls == 0;
+    if (which == Case::RoutedFallback || which == Case::PolicyBlockedRoute) {
+        passed &= ctx.outbound.tag == "direct" && ctx.outbound.route_rule == "fallback";
+    }
+    if (which == Case::RuleMatch) {
+        passed &= ctx.outbound.tag == "second" && ctx.outbound.route_rule == "rule:7" &&
+            manager.handler->state.entered == 0 && outbound.state.committed == 1;
+    }
+    if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute) {
+        const auto detections = request_policy.GetDetectResult(ctx.inbound.tag);
+        passed &= manager.lookups == 0 && outbound.state.entered == 0 &&
+            detections.size() == 1 && detections.front().UID == 42 &&
+            detections.front().RuleID == 11;
+    }
+    if (which == Case::PolicyAllowed) {
+        passed &= request_policy.GetDetectResult(ctx.inbound.tag).empty() &&
+            ctx.outbound.tag == "direct" && ctx.outbound.route_rule == "fixed" &&
+            outbound.state.committed == 1;
+    }
     if (which == Case::RelaySuccess) passed &= result.bytes_up == 7 && result.bytes_down == 13 &&
         source_state.written == 13 && outbound.target_state.written == 7 && (!controlled || source_state.closed);
+    const auto traffic = session_tracking.CollectAndResetTraffic(ctx.inbound.tag);
+    if (which == Case::RelaySuccess) {
+        const auto user = traffic.users.find(42);
+        passed &= user != traffic.users.end() &&
+            user->second.upload == 7 && user->second.download == 13;
+    }
+    // Completed requests must no longer contribute live traffic to reporting.
+    ++ctx.traffic.bytes_up;
+    ++ctx.traffic.bytes_down;
+    passed &= session_tracking.CollectAndResetTraffic(ctx.inbound.tag).empty();
     if (!controlled && done) {
         // Borrowed logical inputs may outlive Dispatcher and notify again.
         // No callback may retain its completed task group or stack context.
@@ -286,9 +340,15 @@ bool SiblingIsolation(bool controlled) {
         handler->state.block = true;
         handler->state.load = &load;
     }
-    app::dispatcher::DefaultDispatcher dispatcher;
-    dispatcher.BindOutboundManager(manager);
-    dispatcher.BindRequestLoadState(load);
+    Router router;
+    rule::Manager request_policy;
+    app::SessionTrackingState session_tracking;
+    udp::socket dns_peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
+    app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
+    app::dns::DNSWorker dns_worker(io, dns_config, 8);
+    app::dns::DNS dns(dns_worker);
+    app::dispatcher::DefaultDispatcher dispatcher(
+        router, manager, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;
@@ -338,7 +398,9 @@ int main() {
         for (bool controlled : {false, true}) {
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake, Case::RoutingDns,
                 Case::Parent, Case::Pending, Case::Success, Case::RelaySuccess, Case::RelayFailure,
-                Case::SniffMemory, Case::SniffLinkError}) passed &= Run(which, controlled);
+                Case::SniffMemory, Case::SniffLinkError, Case::RoutedFallback, Case::RuleMatch,
+                Case::PolicyBlockedForce, Case::PolicyBlockedRoute, Case::PolicyAllowed})
+                passed &= Run(which, controlled);
             if (controlled) passed &= Run(Case::RelayCancelled, true);
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake})
                 passed &= Run(which, controlled, ErrorCode::RESOURCE_EXHAUSTED);

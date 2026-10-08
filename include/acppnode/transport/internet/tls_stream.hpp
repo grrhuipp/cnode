@@ -117,6 +117,10 @@ public:
     int NativeHandle() const override;
     bool IsOpen() const override;
 
+    // Return decrypted handshake read-ahead before OpenSSL's unread plaintext.
+    // Never forwards these bytes to the TCP ciphertext layer.
+    void PrependReadData(std::span<const uint8_t> data);
+
 protected:
     TcpStream* BaseTcpStream() override;
     const TcpStream* BaseTcpStream() const override;

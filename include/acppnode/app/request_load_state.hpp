@@ -54,17 +54,13 @@ public:
 
     class DispatchScope final {
     public:
-        explicit DispatchScope(RequestLoadState* state) noexcept
+        explicit DispatchScope(RequestLoadState& state) noexcept
             : state_(state) {
-            if (state_) {
-                ++state_->active_dispatches_;
-            }
+            ++state_.active_dispatches_;
         }
 
         ~DispatchScope() noexcept {
-            if (state_) {
-                --state_->active_dispatches_;
-            }
+            --state_.active_dispatches_;
         }
 
         DispatchScope(const DispatchScope&) = delete;
@@ -73,7 +69,7 @@ public:
         DispatchScope& operator=(DispatchScope&&) = delete;
 
     private:
-        RequestLoadState* state_;
+        RequestLoadState& state_;
     };
 
 private:

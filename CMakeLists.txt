@@ -2006,8 +2006,20 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_worker_udp_retirement_runtime_test
         ${CNODE_UDP_LISTENER_RUNTIME_SOURCES}
         tests/worker_udp_retirement_runtime_test.cpp)
+    set(CNODE_HTTP_HANDSHAKE_TEST_SOURCES ${CNODE_SOURCES})
+    list(FILTER CNODE_HTTP_HANDSHAKE_TEST_SOURCES INCLUDE REGEX
+        "^src/(transport/|common/(error|session)\\.cpp$|infra/(json[^/]*|http2_initial_window|log)\\.cpp$)")
+    list(REMOVE_ITEM CNODE_HTTP_HANDSHAKE_TEST_SOURCES
+        src/transport/internet/datagram_socket.cpp
+        src/transport/internet/transport_dialer.cpp
+        src/transport/internet/outbound_target_builder.cpp
+        src/transport/internet/outbound_bind.cpp)
+    add_executable(cnode_http_handshake_read_ahead_test
+        tests/http_handshake_read_ahead_test.cpp
+        ${CNODE_HTTP_HANDSHAKE_TEST_SOURCES})
     foreach(runtime_test IN ITEMS cnode_worker_udp_listener_runtime_test
-            cnode_worker_udp_retirement_runtime_test)
+            cnode_worker_udp_retirement_runtime_test
+            cnode_http_handshake_read_ahead_test)
         foreach(property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS
                 COMPILE_OPTIONS LINK_LIBRARIES LINK_OPTIONS PRECOMPILE_HEADERS)
             get_target_property(value cnode ${property})
@@ -2019,6 +2031,12 @@ if(CNODE_BUILD_TESTS)
             add_dependencies(${runtime_test} cnode_liburing_static)
         endif()
     endforeach()
+    target_compile_definitions(cnode_http_handshake_read_ahead_test PRIVATE
+        ACPP_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        CNODE_TEST_ALLOCATOR_FAULT CNODE_TEST_BUFFER_STATS)
+    add_test(NAME cnode_http_handshake_read_ahead_test
+        COMMAND cnode_http_handshake_read_ahead_test)
+    set_tests_properties(cnode_http_handshake_read_ahead_test PROPERTIES TIMEOUT 30)
     add_test(NAME cnode_worker_udp_retirement_runtime_test
         COMMAND cnode_worker_udp_retirement_runtime_test)
     add_test(NAME cnode_worker_udp_delayed_retirement_runtime_test
@@ -2406,6 +2424,7 @@ if(CNODE_BUILD_TESTS)
         src/sniff/quic_sniffer.cpp
         src/common/error.cpp
         src/common/session.cpp
+        src/common/rule.cpp
         src/infra/log.cpp)
     target_include_directories(cnode_dispatcher_cancellation_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${concurrentqueue_SOURCE_DIR})
