@@ -217,14 +217,17 @@ acpp::net::awaitable<void> ObserveCancelledJoin(
 }
 
 acpp::proxyman::inbound::ReceiverSettings MakeReceiver() {
-    return acpp::proxyman::inbound::ReceiverSettings{
+    auto receiver = acpp::proxyman::inbound::ReceiverSettings{
         .inbound_tag = "receiver-tag",
         .inbound_tags = {"route-tag"},
         .protocol = "native-test",
-        .stream_settings = {.security = "tls"},
+        .stream_settings = {},
         .dispatch_policy = {
+            .sniffing = {},
             .outbound = acpp::routing::ForceOutbound{"loopback"}},
         .has_route_inbound_tags = true};
+    receiver.stream_settings.security = "tls";
+    return receiver;
 }
 
 void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {

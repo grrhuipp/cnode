@@ -477,7 +477,7 @@ int main() {
         Fail("failed to attach sockets for CloseAllSockets reentry test");
     }
     auto all_session = MakeSession(first, io, "all-a", "client", now, 0s);
-    ReenterOnCancel all_reentry{.ingress = &first, .close_all = true};
+    ReenterOnCancel all_reentry{.ingress = &first, .key = {}, .close_all = true};
     acpp::transport::CancellationSubscription all_subscription(
         all_session->Cancellation(), &ReenterOnCancel::Cancel, &all_reentry);
     first.CloseAllSockets();

@@ -142,6 +142,7 @@ std::unique_ptr<acpp::Inbound> MakeUdp(
 void RegisterFixtureProtocol() {
     static const bool registered = [] {
         acpp::proxyman::inbound::RegisterProxy(kProtocol, {
+            .user_protocol = std::nullopt,
             .create_runtime = MakeRuntime,
             .create_tcp_handler = MakeTcp,
             .create_datagram_handler = MakeUdp,
@@ -188,8 +189,11 @@ acpp::proxyman::inbound::BuildRequest BuildRequest(unsigned token, bool associat
 
 acpp::proxyman::inbound::ReceiverSettings BuildReceiver() {
     return {.inbound_tag = std::string(kTag),
+            .inbound_tags = {},
             .protocol = std::string(kProtocol),
+            .stream_settings = {},
             .dispatch_policy = {
+                .sniffing = {},
                 .outbound = acpp::routing::ForceOutbound{"unused-fixture-target"}}};
 }
 

@@ -297,7 +297,6 @@ std::expected<acpp::InboundDatagramResult, acpp::ErrorCode>
 proxy::shadowsocks::inbound::Handler::Process(
     const InboundDatagramRequest& request) {
     const auto tag = request.tag;
-    const auto client_ip = request.client_ip;
 
     auto users = validator_.FindUsersForTag(tag);
     if (users.empty()) {
