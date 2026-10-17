@@ -163,8 +163,12 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             }
             raw->PrependReadData(Bytes(retained));
         }
-        auto built = outbound ? co_await acpp::BuildOutboundTransport(std::move(raw), settings)
-                              : co_await acpp::BuildInboundTransport(io, std::move(raw), settings);
+        acpp::TransportBuildResult built;
+        if (outbound) {
+            built = co_await acpp::BuildOutboundTransport(std::move(raw), settings);
+        } else {
+            built = co_await acpp::BuildInboundTransport(io, std::move(raw), settings);
+        }
         Require(built.has_value(), "HTTP transport handshake failed");
         stream = std::move(*built);
         Require(stream->NativeHandle() == native, "handshake changed underlying socket ownership");

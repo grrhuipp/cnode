@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import socket
 import struct
+import time
 import traceback
 
 from anytls_fin_integration import Resources, USER, available_port, configure, tls_settings, until
@@ -129,6 +130,26 @@ class Peer:
         assert (6, 1, 0, token) in self.frames, f'connection lost PING: {self.error}'
 
 
+async def wait_for_backpressure(state, timeout=5, quiet_period=0.3):
+    # Loopback TCP buffers can absorb megabytes after the peer stops reading.
+    # Observe sustained blocked progress instead of assuming they fill within a
+    # fixed startup delay. A flood that drains or closes never meets this test.
+    deadline = time.monotonic() + timeout
+    stable_since = time.monotonic()
+    previous = state['sent']
+    while time.monotonic() < deadline:
+        buffered = state['writer'].transport.get_write_buffer_size()
+        if state['drained'] or state['closed']:
+            break
+        if state['sent'] != previous or buffered == 0:
+            previous = state['sent']
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= quiet_period:
+            return buffered
+        await asyncio.sleep(0.01)
+    raise AssertionError('fixture did not produce sustained backpressure')
+
+
 async def scenario(args, mode, tls, output, result, resources):
     states = {}
 
@@ -175,13 +196,9 @@ async def scenario(args, mode, tls, output, result, resources):
     if mode == 'blocked-reset':
         writer.transport.pause_reading()
         states[b'A']['go'].set()
-        await asyncio.sleep(0.3)
-        before = states[b'A']['sent']
-        await asyncio.sleep(0.15)
-        buffered = states[b'A']['writer'].transport.get_write_buffer_size()
+        buffered = await wait_for_backpressure(states[b'A'])
         result.update(target_sent=states[b'A']['sent'], target_pending_bytes=buffered)
-        result['target_backpressured'] = not states[b'A']['drained'] and before == states[b'A']['sent'] and buffered > 0
-        assert result['target_backpressured'], 'fixture did not produce backpressure'
+        result['target_backpressured'] = True
     if mode != 'half-close':
         writer.write(h2frame(3, 0, 1, struct.pack('!I', 8)) * 3)
         await writer.drain()
