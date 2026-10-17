@@ -344,8 +344,9 @@ acpp::net::awaitable<void> WorkerJob(
         .tag = std::string(kTag), .protocol = std::string(kProtocol),
         .settings = std::make_shared<Settings>()};
     acpp::proxyman::inbound::ReceiverSettings receiver{
-        .inbound_tag = std::string(kTag), .protocol = std::string(kProtocol),
-        .dispatch_policy = {.outbound = acpp::routing::ForceOutbound{"native-test"}}};
+        .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
+        .stream_settings = {},
+        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"native-test"}}};
     if (!co_await worker.RegisterInboundTask({}, request, receiver))
         Fail("real native inbound registration failed");
     const auto listen = acpp::InboundListen::Parse("127.0.0.1");

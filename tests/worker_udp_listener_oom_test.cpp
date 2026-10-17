@@ -34,10 +34,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#  include <mstcpip.h>
-#endif
-
 namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
@@ -189,19 +185,6 @@ public:
     }
 };
 
-bool EnableUdpConnectionResetNotifications(acpp::udp::socket& socket) noexcept {
-#ifdef _WIN32
-    BOOL enabled = TRUE;
-    DWORD returned = 0;
-    return ::WSAIoctl(
-        socket.native_handle(), SIO_UDP_CONNRESET,
-        &enabled, sizeof(enabled), nullptr, 0, &returned, nullptr, nullptr) == 0;
-#else
-    (void)socket;
-    return true;
-#endif
-}
-
 acpp::udp::endpoint LoopbackEndpoint() {
     return {acpp::net::ip::address_v4::loopback(), 0};
 }
@@ -288,7 +271,9 @@ struct Fixture {
     TestDispatcher dispatcher;
     TestReplySink reply_sink;
     acpp::proxyman::inbound::ReceiverSettings receiver_settings{
-        .dispatch_policy = {.outbound = acpp::routing::ForceOutbound{"loopback"}}};
+        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {},
+        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"loopback"}}};
     acpp::StatsShard stats;
     acpp::TimeoutsConfig timeouts;
     std::unique_ptr<acpp::worker_detail::UdpIngress> ingress;
@@ -380,7 +365,6 @@ acpp::udp::endpoint MakeClosedPeer(Fixture& fixture) {
 
 bool ObserveClosedPeerIcmp(Fixture& fixture,
                            const acpp::udp::endpoint& peer) {
-    if (!EnableUdpConnectionResetNotifications(*fixture.receiver)) return false;
     const std::array<uint8_t, 1> probe{0x7f};
     Send(*fixture.receiver, peer, probe);
     const auto deadline = std::chrono::steady_clock::now() +

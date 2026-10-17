@@ -145,7 +145,11 @@ void TestInboundMetadataOwnershipAndRouting() {
                 Context copy;
                 {
                     acpp::proxyman::inbound::ReceiverSettings receiver{
-                        .dispatch_policy = {.outbound = acpp::routing::ForceOutbound{"metadata-test"}}};
+                        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+                        .stream_settings = {},
+                        .dispatch_policy = {
+                            .sniffing = {},
+                            .outbound = acpp::routing::ForceOutbound{"metadata-test"}}};
                     receiver.inbound_tag = std::string(96, 'm');
                     receiver.inbound_tags = {receiver.inbound_tag, std::string(112, 'x')};
                     receiver.protocol = std::string(104, 'p');

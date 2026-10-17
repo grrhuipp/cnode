@@ -378,7 +378,9 @@ int main() {
     acpp::StatsShard request_stats;
     acpp::TimeoutsConfig packet_timeouts;
     acpp::proxyman::inbound::ReceiverSettings request_receiver{
-        .dispatch_policy = {.outbound = acpp::routing::ForceOutbound{"loopback"}}};
+        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {},
+        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"loopback"}}};
     auto request_socket = Ingress::MakeSocket(io);
     request_socket->open(acpp::udp::v4(), ec);
     if (ec || !request_ingress.AttachSocket("request", request_socket))

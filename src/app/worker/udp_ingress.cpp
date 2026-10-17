@@ -921,7 +921,10 @@ bool UdpIngress::CompleteReplySend(
 }
 
 void UdpIngress::ClearReplyQueue(std::string_view socket_key) {
-    impl_->reply_queues.erase(socket_key);
+    const auto it = impl_->reply_queues.find(socket_key);
+    if (it != impl_->reply_queues.end()) {
+        impl_->reply_queues.erase(it);
+    }
     MaybeShrinkHashContainer(impl_->reply_queues, 8);
 }
 
@@ -968,7 +971,7 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     if (session_it == sessions.end()) {
         auto [inserted_it, inserted] = sessions.try_emplace(
             memory::ThreadLocalString{std::string_view(client_key)},
-            UdpClientSession{.link = session, .last_active = now});
+            UdpClientSession{.link = session, .last_active = now, .reclaim_hook = {}});
         if (inserted) {
             impl_->reclaimer.Register(inserted_it->second.reclaim_hook, *this,
                 sessions_it->first, inserted_it->first, idle_timeout);
