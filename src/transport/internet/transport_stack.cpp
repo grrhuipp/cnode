@@ -31,6 +31,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -58,7 +59,8 @@ constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
 constexpr size_t kHttp2MaxConcurrentStreams = 256;
 
 using TlsContextMap =
-    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<SslContext>>;
+    std::unordered_map<std::string, std::unique_ptr<SslContext>>;
+// These thread-exit caches can outlive a scoped Worker/test PMR resource.
 using TlsContextCache = transport::internet::BoundedTlsContextCache<
     SslContext, TlsContextMap>;
 
@@ -1380,7 +1382,14 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
 net::awaitable<bool> WriteBuffersFullToStream(
     AsyncStream& stream,
     std::span<const net::const_buffer> buffers) {
-    co_await stream.WriteBuffers(buffers);
+    try {
+        co_await stream.WriteBuffers(buffers);
+    } catch (...) {
+        // A failed physical write may have emitted a partial frame. Retire the
+        // connection before another stream can append bytes to that frame.
+        stream.CloseAbortive();
+        throw;
+    }
     co_return true;
 }
 
@@ -2899,7 +2908,11 @@ public:
         , response_headers_(std::move(response_headers))
         , http_config_(std::move(http_config))
         , xhttp_config_(std::move(xhttp_config))
-        , conn_id_(conn_id) {}
+        , conn_id_(conn_id) {
+        if (!stream_ || !stream_->DeferWriteCancellation()) {
+            throw std::invalid_argument("HTTP/2 requires a physical transport with deferred write cancellation");
+        }
+    }
 
     ~Http2ServerSession() noexcept {
         CancelAll();

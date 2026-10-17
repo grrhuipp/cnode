@@ -199,6 +199,9 @@ public:
     void SetWriteTimeout(std::chrono::seconds timeout);
     void SetStreamLabel(std::string_view label) noexcept;
     void SetAbortiveClose(bool enable = true) noexcept;
+    // Shared byte transports can finish a started write when a logical caller
+    // is cancelled. Explicit socket cancellation, closure and timeouts still act.
+    [[nodiscard]] bool DeferWriteCancellation() noexcept;
 
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept;
     [[nodiscard]] bool ConsumeReadTimeout() noexcept;

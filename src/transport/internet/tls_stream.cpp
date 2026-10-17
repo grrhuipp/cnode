@@ -685,9 +685,13 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buf) {
 
     impl_->Touch();
     Impl::Operation operation(*impl_);
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = impl_->stream.next_layer().Tcp().IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buf,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred))));
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -705,9 +709,13 @@ net::awaitable<void> TlsStream::WriteBuffers(
 
     impl_->Touch();
     Impl::Operation operation(*impl_);
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = impl_->stream.next_layer().Tcp().IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
         impl_->stream, buffers,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred))));
     (void)n;
     if (ec) {
         throw IoSystemError(ec);
@@ -727,9 +735,13 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     out.AppendMultiBuffer(mb);
     if (!out.empty()) {
         Impl::Operation operation(*impl_);
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        const auto slot = impl_->stream.next_layer().Tcp().IsWriteCancellationDeferred()
+            ? net::cancellation_slot{} : cancellation.slot();
         auto [ec, n] = co_await net::async_write(
             impl_->stream, out.Span(),
-            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred)));
+            net::bind_cancellation_slot(slot, net::bind_allocator(
+                memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::deferred))));
         (void)n;
         if (ec) {
             throw IoSystemError(ec);

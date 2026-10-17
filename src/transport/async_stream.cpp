@@ -104,6 +104,14 @@ void AsyncStream::SetAbortiveClose(bool enable) noexcept {
     }
 }
 
+bool AsyncStream::DeferWriteCancellation() noexcept {
+    if (auto* tcp = BaseTcpStream()) {
+        tcp->SetWriteCancellationDeferred();
+        return true;
+    }
+    return false;
+}
+
 void AsyncStream::CloseAbortive() {
     SetAbortiveClose(true);
     Close();

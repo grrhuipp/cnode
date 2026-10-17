@@ -13,19 +13,14 @@
 #include <asio/connect.hpp>
 #include <asio/buffer.hpp>
 #include <asio/bind_allocator.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <mstcpip.h>
-#else
 #include <sys/socket.h>
 #include <netinet/tcp.h>
-#endif
 
 namespace acpp {
 
@@ -87,6 +82,7 @@ enum Flag : uint8_t {
     kReadShutdown           = 1u << 1,
     kWriteShutdown          = 1u << 2,
     kCountedActive          = 1u << 3,
+    kDeferWriteCancellation = 1u << 4,
 };
 
 struct TcpStream::Impl : memory::ThreadAllocated {
@@ -269,9 +265,13 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     if (out.empty()) co_return;
 
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
 
     if (ec) {
         throw IoSystemError(ec);
@@ -293,9 +293,13 @@ net::awaitable<void> TcpStream::WriteBuffers(
     }
 
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
         impl_->socket, out.Span(),
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
     (void)n;
 
     if (ec) {
@@ -310,8 +314,12 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
     }
 
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(impl_->socket, buf,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
 
     if (ec) {
         throw IoSystemError(ec);
@@ -555,6 +563,14 @@ std::string_view TcpStream::StreamLabel() const noexcept {
 
 void TcpStream::SetAbortiveClose(bool enable) noexcept {
     impl_->SetFlag(kAbortiveClose, enable);
+}
+
+void TcpStream::SetWriteCancellationDeferred() noexcept {
+    impl_->SetFlag(kDeferWriteCancellation);
+}
+
+bool TcpStream::IsWriteCancellationDeferred() const noexcept {
+    return impl_->HasFlag(kDeferWriteCancellation);
 }
 
 tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
@@ -834,42 +850,21 @@ void SetupConnectedSocket(tcp::socket& sock) {
     // 启用 TCP KeepAlive
     sock.set_option(net::socket_base::keep_alive(true), ec);
 
-#ifdef _WIN32
-    // Windows: 使用 tcp_keepalive 结构设置 KeepAlive 参数
-    DWORD bytes_returned = 0;
-    tcp_keepalive ka{};
-    ka.onoff = 1;
-    ka.keepalivetime = 60000;     // 60秒空闲后开始探测 (毫秒)
-    ka.keepaliveinterval = 10000; // 探测间隔 10秒 (毫秒)
-    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes_returned, nullptr, nullptr);
-#else
-    // TCP keepalive 参数按平台能力设置；Linux 与 macOS 的宏名不同。
+    // Linux TCP keepalive: 60 seconds idle, then six probes 10 seconds apart.
     int keepidle = 60;
-#if defined(TCP_KEEPIDLE)
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-#elif defined(TCP_KEEPALIVE)
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
-#endif
 
     // TCP_KEEPINTVL: 探测间隔 (10秒)
-#if defined(TCP_KEEPINTVL)
     int keepintvl = 10;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-#endif
 
     // TCP_KEEPCNT: 探测次数 (6次)
-#if defined(TCP_KEEPCNT)
     int keepcnt = 6;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-#endif
 
     // TCP_QUICKACK - 立即发送 ACK，降低延迟 (Linux 特有)
-#if defined(TCP_QUICKACK)
     int quickack = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
-#endif
-
-#endif
 }
 }  // namespace
 
