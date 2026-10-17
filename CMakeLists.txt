@@ -2601,13 +2601,7 @@ if(CNODE_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/service/controller)
     target_link_libraries(cnode_node_transaction_test PRIVATE asio::asio Threads::Threads)
-    if(WIN32)
-        target_link_libraries(cnode_node_transaction_test PRIVATE ws2_32)
-        target_compile_definitions(cnode_node_transaction_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_node_transaction_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+    target_compile_options(cnode_node_transaction_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME cnode_node_transaction_test COMMAND cnode_node_transaction_test)
     set_tests_properties(cnode_node_transaction_test PROPERTIES TIMEOUT 10)
 
@@ -2846,15 +2840,7 @@ if(CNODE_BUILD_TESTS)
         asio::asio
         Threads::Threads
     )
-    if(WIN32)
-        target_link_libraries(cnode_runtime_exit_test PRIVATE ws2_32)
-        target_compile_definitions(
-            cnode_runtime_exit_test PRIVATE _WIN32_WINNT=0x0A00)
-    endif()
-    target_compile_options(cnode_runtime_exit_test PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
+    target_compile_options(cnode_runtime_exit_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(
         NAME cnode_forced_shutdown_test
         COMMAND cnode_runtime_exit_test
@@ -3022,6 +3008,12 @@ if(CNODE_BUILD_TESTS)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME cnode_panel_user_sync_integration_test
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/panel_user_sync_integration.py
+                --binary $<TARGET_FILE:cnode>
+                --output ${CMAKE_CURRENT_BINARY_DIR}/panel_user_sync_integration_test)
+        set_tests_properties(cnode_panel_user_sync_integration_test PROPERTIES TIMEOUT 120)
         add_test(NAME cnode_udp_relay_integration_test
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/udp_relay_integration.py

@@ -22,10 +22,10 @@ endif()
 
 if(CONTROLLER_SOURCE MATCHES "UserStore::ApplyUsers|removeInbound|clearUsers|co_await rollback" OR
    NOT CONTROLLER_SOURCE MATCHES "controller::ApplyNodeChange" OR
-   NOT CONTROLLER_SOURCE MATCHES "controller::RemoveNode" OR
+   CONTROLLER_SOURCE MATCHES "config_result.missing|controller::RemoveNode" OR
    NOT TRANSACTION_HEADER MATCHES "CleanPendingNodeRuntime")
     message(FATAL_ERROR "node mutation and rollback orchestration must belong to the shared private transaction")
 endif()
 
-# Mutation ordering, partial effects, incomplete rollback, removal and recovery
+# Mutation ordering, partial effects, incomplete rollback, cleanup and recovery
 # are exercised by cnode_node_transaction_test with concrete operation failures.

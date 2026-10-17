@@ -16,6 +16,7 @@ namespace acpp::controller {
 struct NodeSnapshot {
     api::NodeInfo config;
     std::vector<api::UserInfo> users;
+    std::string users_etag;
     std::vector<api::DetectRule> rules;
     std::string protocol;
     std::string tag;

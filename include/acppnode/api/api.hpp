@@ -103,7 +103,6 @@ using DetectResult = ::acpp::rule::DetectResult;
 
 struct NodeInfoFetchResult : ResultStatus {
     std::optional<api::NodeInfo> node_info;
-    bool missing = false;
 
     [[nodiscard]] bool Ok() const noexcept {
         return ResultStatus::Ok() && node_info.has_value();
@@ -112,12 +111,6 @@ struct NodeInfoFetchResult : ResultStatus {
     [[nodiscard]] static NodeInfoFetchResult Success(api::NodeInfo node_info) {
         NodeInfoFetchResult result;
         result.node_info = std::move(node_info);
-        return result;
-    }
-
-    [[nodiscard]] static NodeInfoFetchResult Missing() {
-        NodeInfoFetchResult result;
-        result.missing = true;
         return result;
     }
 
@@ -130,15 +123,18 @@ struct NodeInfoFetchResult : ResultStatus {
 
 struct UserListFetchResult : ResultStatus {
     std::vector<api::UserInfo> users;
+    std::string etag;
     bool not_modified = false;
 
     [[nodiscard]] bool Ok() const noexcept {
         return ResultStatus::Ok();
     }
 
-    [[nodiscard]] static UserListFetchResult Success(std::vector<api::UserInfo> value) {
+    [[nodiscard]] static UserListFetchResult Success(
+        std::vector<api::UserInfo> value, std::string etag) {
         UserListFetchResult result;
         result.users = std::move(value);
+        result.etag = std::move(etag);
         return result;
     }
 
@@ -194,8 +190,9 @@ public:
     virtual net::awaitable<NodeInfoFetchResult>
     GetNodeInfo() = 0;
 
+    // The validator belongs to the last successfully published user snapshot.
     virtual net::awaitable<UserListFetchResult>
-    GetUserList() = 0;
+    GetUserList(std::string committed_etag) = 0;
 
     virtual net::awaitable<bool>
     ReportNodeStatus(const api::NodeStatus& node_status) = 0;

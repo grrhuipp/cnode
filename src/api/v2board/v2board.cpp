@@ -28,29 +28,6 @@
 #include <vector>
 #include <openssl/x509_vfy.h>
 
-#ifdef _WIN32
-#include <openssl/x509.h>
-#include <wincrypt.h>
-#pragma comment(lib, "crypt32.lib")
-// 将 Windows 系统根证书库导入 OpenSSL SSL_CTX
-static void LoadWindowsCACerts(asio::ssl::context& ctx) {
-    HCERTSTORE h = CertOpenSystemStoreA(0, "ROOT");
-    if (!h) return;
-    X509_STORE* store = SSL_CTX_get_cert_store(ctx.native_handle());
-    for (PCCERT_CONTEXT c = CertEnumCertificatesInStore(h, nullptr);
-         c != nullptr;
-         c = CertEnumCertificatesInStore(h, c)) {
-        const unsigned char* der = c->pbCertEncoded;
-        X509* x = d2i_X509(nullptr, &der, static_cast<long>(c->cbCertEncoded));
-        if (x) {
-            X509_STORE_add_cert(store, x);
-            X509_free(x);
-        }
-    }
-    CertCloseStore(h, 0);
-}
-#endif
-
 namespace acpp::api::v2board {
 
 namespace ssl = net::ssl;
@@ -65,7 +42,7 @@ public:
     GetNodeInfo() override;
 
     net::awaitable<UserListFetchResult>
-    GetUserList() override;
+    GetUserList(std::string committed_etag) override;
 
     net::awaitable<bool>
     ReportNodeStatus(const ::acpp::api::NodeStatus& node_status) override;
@@ -285,7 +262,7 @@ struct APIClient::Impl {
                  const std::string& if_none_match);
 
     net::awaitable<NodeInfoFetchResult> GetNodeInfo();
-    net::awaitable<UserListFetchResult> GetUserList();
+    net::awaitable<UserListFetchResult> GetUserList(std::string committed_etag);
     net::awaitable<bool> ReportNodeStatus(const ::acpp::api::NodeStatus& node_status);
     net::awaitable<bool> ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users);
     net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
@@ -298,7 +275,6 @@ struct APIClient::Impl {
     ::acpp::app::dns::DNS& dns_service_;
 
     std::string config_etag_;
-    std::string users_etag_;
 
     std::optional<::acpp::api::NodeInfo> cached_config_;
     std::vector<::acpp::api::DetectRule> cached_route_rules_;
@@ -434,11 +410,7 @@ net::ssl::context* APIClient::Impl::GetOrCreateHttpsContext() {
     }
 
     auto ctx = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
-#ifdef _WIN32
-    LoadWindowsCACerts(*ctx);
-#else
     ctx->set_default_verify_paths();
-#endif
     ctx->set_verify_mode(ssl::verify_peer);
     https_context_ = std::move(ctx);
     return https_context_.get();
@@ -643,14 +615,6 @@ APIClient::Impl::GetNodeInfo() {
             "received 304 without cached node config");
     }
 
-    if (resp.status == 404) {
-        LOG_DEBUG("V2Board[{}]: node {} config not found", config_.Name, node_id);
-        config_etag_.clear();
-        cached_config_.reset();
-        cached_route_rules_.clear();
-        co_return NodeInfoFetchResult::Missing();
-    }
-
     if (resp.status != 200) {
         const auto error_message = FormatHttpFailure(resp);
         LOG_DEBUG("V2Board[{}]: GetNodeInfo failed: {}", config_.Name,
@@ -677,9 +641,7 @@ APIClient::Impl::GetNodeInfo() {
         cached_route_rules_ = ExtractBlockDetectRules(j, config_.Name);
 
         // 保存 ETag 和缓存
-        if (!resp.etag.empty()) {
-            config_etag_ = resp.etag;
-        }
+        config_etag_ = resp.etag;
         cached_config_ = config;
 
         LOG_DEBUG("V2Board[{}]: node {} config: protocol={}, port={}, network={}",
@@ -694,18 +656,24 @@ APIClient::Impl::GetNodeInfo() {
 }
 
 net::awaitable<UserListFetchResult>
-APIClient::Impl::GetUserList() {
+APIClient::Impl::GetUserList(std::string committed_etag) {
     const int node_id = config_.NodeID;
 
     // GET /api/v1/server/UniProxy/user?node_id=X&node_type=Y
     std::string path = std::format("/api/v1/server/UniProxy/user?node_id={}&node_type={}",
                                    node_id, ApiNodeType());
 
-    // 使用存储的 ETag
-    auto resp = co_await HttpGet(path, users_etag_);
+    // Only the owner of a committed user snapshot may supply its validator.
+    // A successful fetch alone must not acknowledge a failed runtime update.
+    auto resp = co_await HttpGet(path, committed_etag);
 
     // 304 Not Modified - 交给上层直接跳过用户重建，避免额外常驻缓存和拷贝
     if (resp.not_modified) {
+        if (committed_etag.empty()) {
+            co_return UserListFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                "received 304 without a committed user ETag");
+        }
         LOG_DEBUG("V2Board[{}]: node {} users not modified (304)",
                  config_.Name, node_id);
         co_return UserListFetchResult::NotModified();
@@ -733,14 +701,9 @@ APIClient::Impl::GetUserList() {
                 std::move(users.error()));
         }
 
-        // 保存 ETag
-        if (!resp.etag.empty()) {
-            users_etag_ = resp.etag;
-        }
-
         LOG_DEBUG("V2Board[{}]: fetched {} users for node {}",
                  config_.Name, users->size(), node_id);
-        co_return UserListFetchResult::Success(std::move(*users));
+        co_return UserListFetchResult::Success(std::move(*users), std::move(resp.etag));
 
     } catch (const std::exception& e) {
         LOG_ERROR("V2Board[{}]: parse users error: {}", config_.Name, e.what());
@@ -828,8 +791,8 @@ APIClient::GetNodeInfo() {
 }
 
 net::awaitable<UserListFetchResult>
-APIClient::GetUserList() {
-    return impl_->GetUserList();
+APIClient::GetUserList(std::string committed_etag) {
+    return impl_->GetUserList(std::move(committed_etag));
 }
 
 net::awaitable<bool>

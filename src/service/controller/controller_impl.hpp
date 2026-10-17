@@ -58,7 +58,6 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         Connecting,
         Ready,
         Degraded,
-        Missing,
         Unavailable,
     };
 

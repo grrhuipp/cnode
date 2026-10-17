@@ -231,21 +231,6 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             // unavailable panel cannot indefinitely retain orphan resources.
             co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
             auto config_result = co_await panel.client->GetNodeInfo();
-            if (config_result.missing) {
-                const bool removed = panel.node.committed || panel.node.HasPendingCleanup();
-                const auto previous = panel.node.committed;
-                co_await controller::RemoveNode(runtime, panel.node);
-                panel.stats = {};
-                if (removed) {
-                    LOG_CONSOLE("Panel {}/{} config: removed | inbound {}",
-                        panel_name, node_id, previous ? previous->tag : "uncommitted");
-                }
-                panel.state = PanelState::Missing;
-                LOG_CONSOLE("Panel {}/{} sync: missing | {}",
-                    panel_name, node_id, removed ? "removed" : "unchanged");
-                co_return;
-            }
-
             if (!config_result.Ok()) {
                 throw std::runtime_error(ErrorMessage(config_result.error, config_result.error_msg));
             }
@@ -298,7 +283,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
                 next_rules = std::move(rules_result.rules);
             }
 
-            auto users_result = co_await panel.client->GetUserList();
+            auto users_result = co_await panel.client->GetUserList(
+                old_state ? old_state->users_etag : std::string{});
             std::optional<std::vector<api::UserInfo>> next_users;
             if (!users_result.Ok()) {
                 if (transitioning) {
@@ -330,6 +316,8 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
             candidate->protocol = protocol;
             candidate->tag = tag;
             candidate->users = next_users ? std::move(*next_users) : old_state->users;
+            candidate->users_etag = next_users
+                ? std::move(users_result.etag) : old_state->users_etag;
             candidate->rules = next_rules ? std::move(*next_rules) : old_state->rules;
 
             controller::PreparedNodeChange change;
@@ -393,7 +381,6 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
             case PanelState::Connecting: return "connecting";
             case PanelState::Ready: return "ready";
             case PanelState::Degraded: return "degraded";
-            case PanelState::Missing: return "missing";
             case PanelState::Unavailable: return "unavailable";
         }
         return "unavailable";

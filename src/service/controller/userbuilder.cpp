@@ -7,6 +7,7 @@
 
 #include <format>
 #include <utility>
+#include <variant>
 
 namespace acpp {
 
@@ -53,6 +54,11 @@ std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound
     auto result = proxyman::inbound::BuildUsers(protocol, *req, users);
     if (!result) {
         LOG_WARN("BuildUsersForInbound: unsupported user builder for protocol '{}'", protocol);
+    } else if (std::visit([](const auto& prepared) { return prepared.size(); }, *result) != api_users.size()) {
+        // Invalid credentials must not turn a non-empty panel response into a
+        // partial or empty authentication snapshot.
+        LOG_WARN("BuildUsersForInbound: incomplete user snapshot for protocol '{}'", protocol);
+        return std::nullopt;
     }
     return result;
 }

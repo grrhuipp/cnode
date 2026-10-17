@@ -31,16 +31,6 @@ net::awaitable<void> CleanPendingNodeRuntime(Runtime& runtime, NodeState& state)
 }
 
 template <typename Runtime>
-net::awaitable<void> RemoveNode(Runtime& runtime, NodeState& state) {
-    if (!state.HasPendingCleanup() && state.phase != NodeRuntimePhase::Stopped) {
-        state.pending_cleanup = {state.committed, {}};
-    }
-    co_await CleanPendingNodeRuntime(runtime, state);
-    state.committed.reset();
-    state.phase = NodeRuntimePhase::Stopped;
-}
-
-template <typename Runtime>
 net::awaitable<void> ApplyNodeChange(
     Runtime& runtime, NodeState& state, PreparedNodeChange change) {
     const auto old = state.committed;

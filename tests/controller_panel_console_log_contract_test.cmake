@@ -23,7 +23,6 @@ endif()
 
 foreach(REQUIRED_STATUS
         [=[case PanelState::Connecting: return "connecting"]=]
-        [=[sync: missing]=]
         [=[sync: unavailable | pull]=]
         [=[case PanelState::Ready: return "ready"]=]
         [=[case PanelState::Degraded: return "degraded"]=]

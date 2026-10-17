@@ -36,6 +36,7 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->protocol = snapshot->config.NodeType;
     snapshot->tag = Tag(snapshot->config);
     snapshot->users.resize(version);
+    snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->rules.resize(version);
     return snapshot;
 }
@@ -174,12 +175,15 @@ void TestSuccessAndRefresh() {
     Require(!Run(ApplyNodeChange(runtime, state, Change(first, state))), "create failed");
     auto refresh = std::make_shared<NodeSnapshot>(*first);
     refresh->users.resize(2);
+    refresh->users_etag = "users-2";
     refresh->rules.resize(2);
     Require(!Run(ApplyNodeChange(runtime, state, Change(refresh, state))), "refresh failed");
     Require(state.committed == refresh && state.phase == NodeRuntimePhase::Ready &&
         !state.HasPendingCleanup() && Matches(runtime, *refresh), "refresh must publish the complete new snapshot");
     Require(runtime.counts["add-in:" + first->tag] == 1, "refresh must preserve the existing listener");
     Require(first->users.size() == 1 && first->rules.size() == 1, "published old snapshots must remain immutable");
+    Require(state.committed->users_etag == "users-2" && first->users_etag == "users-1",
+        "user validators must be published with their immutable snapshot");
 }
 
 void TestFailureMatrix() {
@@ -204,6 +208,8 @@ void TestFailureMatrix() {
             Require(state.committed == old && state.phase == NodeRuntimePhase::Ready &&
                 !state.HasPendingCleanup() && Matches(runtime, *old) && Empty(runtime, next->tag),
                 "every single transition failure must restore the old runtime and remove the candidate");
+            Require(state.committed->users_etag == "users-1",
+                "a failed update must not acknowledge the fetched user validator");
         }
     }
     for (const auto& operation : {"add-in:" + next->tag, "add-out:" + next->tag}) {
@@ -276,20 +282,21 @@ void TestOrphanCleanupAndBlockedRetry() {
         state.committed == later && !state.HasPendingCleanup(), "recovery must remove both old and orphan candidate resources");
 }
 
-void TestRemovalFailureRecovery() {
+void TestCleanupFailureRecovery() {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
     Seed(runtime, state, old);
+    state.pending_cleanup = {old, {}};
     runtime.faults = {{"remove-out:" + old->tag, 1, true}};
-    Require(static_cast<bool>(Run(RemoveNode(runtime, state))), "partial removal must fail");
+    Require(static_cast<bool>(Run(CleanPendingNodeRuntime(runtime, state))), "partial cleanup must fail");
     Require(state.committed == old && state.phase == NodeRuntimePhase::RecoveryRequired &&
         state.HasPendingCleanup() && !runtime.resources.at(old->tag).inbound, "partial removal must preserve recovery data");
     runtime.faults.clear();
     Require(!Run(ApplyNodeChange(runtime, state, Change(old, state))) && Matches(runtime, *old),
-        "a node that reappears after partial removal must be rebuilt");
-    Require(!Run(RemoveNode(runtime, state)) && !state.committed && !state.HasPendingCleanup() &&
-        state.phase == NodeRuntimePhase::Stopped && Empty(runtime, old->tag), "complete removal must clear ownership and resources");
+        "a node must be rebuilt after partial cleanup");
+    Require(state.committed->users_etag == "users-1",
+        "cleanup and recovery must retain the last committed user validator");
 }
 
 void TestUncommittedCandidateCleanup() {
@@ -300,8 +307,8 @@ void TestUncommittedCandidateCleanup() {
     Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))) &&
         !state.committed && state.HasPendingCleanup(), "failed initial creation must retain cleanup without a committed node");
     runtime.faults.clear();
-    Require(!Run(RemoveNode(runtime, state)) && !state.HasPendingCleanup() && Empty(runtime, next->tag),
-        "a missing node must also remove an uncommitted orphan candidate");
+    Require(!Run(CleanPendingNodeRuntime(runtime, state)) && !state.HasPendingCleanup() && Empty(runtime, next->tag),
+        "local cleanup must remove an uncommitted orphan candidate");
 }
 
 void TestReservationBeforeFirstSuspend() {
@@ -361,8 +368,9 @@ void TestCancellationKeepsRecoveryState() {
         Empty(runtime, next->tag), "a fresh attempt must repair the state left by a cancelled transaction");
     Require(state.ReservesPort(1000) && !state.ReservesPort(2000),
         "completed recovery must release the abandoned candidate endpoint");
-    Require(!Run(RemoveNode(runtime, state)) && !state.ReservesPort(1000),
-        "completed removal must release the original endpoint");
+    state.pending_cleanup = {old, {}};
+    Require(!Run(CleanPendingNodeRuntime(runtime, state)) && !state.ReservesPort(1000),
+        "completed cleanup must release the original endpoint");
 }
 }  // namespace
 
@@ -373,7 +381,7 @@ int main() {
         TestRefreshRollbackFailure();
         TestFailedRollbackForcesRebuild();
         TestOrphanCleanupAndBlockedRetry();
-        TestRemovalFailureRecovery();
+        TestCleanupFailureRecovery();
         TestUncommittedCandidateCleanup();
         TestReservationBeforeFirstSuspend();
         TestCancellationKeepsRecoveryState();
