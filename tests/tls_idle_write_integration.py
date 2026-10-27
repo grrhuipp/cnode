@@ -42,7 +42,7 @@ async def main(args):
         child = resources.spawn([args.binary, '--config-dir', args.output], args.output / 'child.log')
         reader, writer = await resources.connect(front_port, tls=True)
         sock = writer.get_extra_info('socket')
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
         # Pause ciphertext reads, not only SSLProtocol's application delivery.
         raw_transport = writer.transport._ssl_protocol._transport
         raw_transport.pause_reading()

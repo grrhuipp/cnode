@@ -89,7 +89,7 @@ struct Outbound {
     uint32_t dns_answer_count = 0;
     uint64_t dial_ms = 0;
     uint32_t dial_attempt_count = 0;
-    std::vector<net::ip::address> dial_addresses;
+    memory::ThreadLocalVector<net::ip::address> dial_addresses;
     int32_t os_error_code = 0;
     memory::ThreadLocalString failure_detail_code;
     std::string_view tag;
@@ -129,7 +129,6 @@ struct Context {
 
     Inbound inbound;
     Outbound outbound;
-    memory::ThreadLocalVector<Outbound> outbounds;
     Content content;
     Traffic traffic;
     std::optional<Sockopt> sockopt;

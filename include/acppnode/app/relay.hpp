@@ -239,7 +239,8 @@ bool WriteShutdownClosesLink(const Writer& writer) noexcept {
 inline void ObserveUdpRelayTarget(
     session::Context& ctx,
     const buf::MultiBuffer& payload) noexcept {
-    if (ctx.content.network != Network::UDP) {
+    if (ctx.content.network != Network::UDP ||
+        ctx.traffic.distinct_target_count >= ctx.traffic.distinct_target_hashes.size()) {
         return;
     }
     const auto datagram = buf::InspectUdpDatagram(payload);

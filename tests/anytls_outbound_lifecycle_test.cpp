@@ -29,7 +29,12 @@ thread_local size_t failed_allocation_size = 0;
 thread_local size_t fail_allocation_bytes = 0;
 static_assert(alignof(acpp::buf::Buffer) <= alignof(std::max_align_t));
 }
-void* operator new(std::size_t size) {
+#if defined(__GNUC__) || defined(__clang__)
+#define CNODE_TEST_NOINLINE __attribute__((noinline))
+#else
+#define CNODE_TEST_NOINLINE
+#endif
+CNODE_TEST_NOINLINE void* operator new(std::size_t size) {
     if (fail_next_allocation) {
         fail_next_allocation = false;
         ++allocation_failures; failed_allocation_size = size; throw std::bad_alloc();
@@ -37,12 +42,12 @@ void* operator new(std::size_t size) {
     if (auto* result = std::malloc(size ? size : 1)) return result;
     throw std::bad_alloc();
 }
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+CNODE_TEST_NOINLINE void operator delete(void* value) noexcept { std::free(value); }
+CNODE_TEST_NOINLINE void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
+CNODE_TEST_NOINLINE void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
     try { return ::operator new(size); } catch (...) { return nullptr; }
 }
-void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
+CNODE_TEST_NOINLINE void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
 namespace {
 using namespace acpp;

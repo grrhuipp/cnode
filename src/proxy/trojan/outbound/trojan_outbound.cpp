@@ -397,16 +397,17 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [trojan_config = std::move(trojan_config)](
-                std::string_view tag,
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            acpp::TrojanOutboundConfig,
+            +[](std::string_view tag,
+                const acpp::TrojanOutboundConfig& cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = trojan_config;
+                auto runtime_config = cfg_state;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
                     std::string(tag), runtime_config, dns);
-            }};
+            }>(std::move(trojan_config));
     }), true);
 }  // namespace

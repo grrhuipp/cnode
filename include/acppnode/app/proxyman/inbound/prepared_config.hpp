@@ -84,7 +84,6 @@ struct PreparedVmessUser {
 };
 
 struct PreparedVlessUser {
-    std::string uuid;
     std::array<uint8_t, 16> uuid_bytes{};
     std::string flow;
     ::acpp::UserProfile profile;

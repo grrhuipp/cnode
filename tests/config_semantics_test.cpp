@@ -5,8 +5,8 @@
 
 namespace {
 
-acpp::proxyman::outbound::PreparedOutboundConfig Outbound(const char* tag) {
-    acpp::proxyman::outbound::PreparedOutboundConfig outbound;
+acpp::infra::OutboundSourceConfig Outbound(const char* tag) {
+    acpp::infra::OutboundSourceConfig outbound;
     outbound.tag = tag;
     outbound.protocol = "test";
     return outbound;
@@ -35,7 +35,7 @@ int main() {
     using acpp::ConfigSemanticError;
     using acpp::StaticInboundSemanticError;
 
-    std::vector<acpp::proxyman::outbound::PreparedOutboundConfig> outbounds;
+    std::vector<acpp::infra::OutboundSourceConfig> outbounds;
     std::vector<acpp::RouteRuleConfig> rules;
 
     auto result = acpp::ValidateOutboundSelectionSemantics(outbounds, rules, {});

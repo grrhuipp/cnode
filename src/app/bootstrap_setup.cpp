@@ -9,6 +9,7 @@
 #include "acppnode/infra/config.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "proxyman/outbound/registration.hpp"
 #include "acppnode/app/worker.hpp"
 #include "acppnode/app/worker_runtime_config.hpp"
 #include "acppnode/infra/log.hpp"
@@ -128,8 +129,26 @@ uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
         : 0;
 }
 
+std::vector<proxyman::outbound::PreparedOutboundConfig> PrepareStartupOutbounds(
+    std::span<const infra::OutboundSourceConfig> sources) {
+    std::vector<proxyman::outbound::PreparedOutboundConfig> prepared;
+    prepared.reserve(sources.size());
+    for (const auto& raw_config : sources) {
+        auto item = proxyman::outbound::PrepareOutboundConfig(raw_config);
+        if (!item) {
+            throw std::invalid_argument(
+                "outbound '" + raw_config.tag + "' protocol '" +
+                raw_config.protocol + "' is unsupported or invalid");
+        }
+        prepared.push_back(std::move(*item));
+    }
+    return prepared;
+}
+
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
-    const Config& config, const std::vector<PreparedStartupInbound>& inbounds) {
+    const Config& config,
+    const std::vector<PreparedStartupInbound>& inbounds,
+    std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds) {
     WorkerRuntimeConfig runtime_config;
     runtime_config.timeouts = config.GetTimeouts();
     runtime_config.limits = config.GetLimits();
@@ -138,7 +157,7 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     for (const auto& inbound : inbounds) {
         runtime_config.static_inbounds.push_back(inbound.runtime);
     }
-    runtime_config.outbounds = config.GetPreparedOutbounds();
+    runtime_config.outbounds = std::move(outbounds);
     runtime_config.workers = config.GetWorkers();
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
     runtime_config.pressure_idle_timeout = ComputePressureIdleTimeout(runtime_config);
@@ -175,6 +194,7 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     BootstrapEnvironment env;
     const bool enable_test_mode =
         test_mode || (config.GetPanels().empty() && config.GetStaticInbounds().empty());
+    auto outbounds = PrepareStartupOutbounds(config.GetOutbounds());
     const auto inbounds = PrepareStartupInbounds(config.GetStaticInbounds(), enable_test_mode);
     env.main_ctx = std::make_unique<net::io_context>();
     env.dns_worker = std::make_unique<app::dns::DNSWorker>(
@@ -183,7 +203,8 @@ BootstrapEnvironment CreateBootstrapEnvironment(
     env.geo_manager = CreateGeoManager(config);
     env.stats = std::make_unique<ShardedStats>(config.GetWorkers());
     env.connection_limiters = CreateConnectionLimiters(config);
-    const WorkerRuntimeConfig worker_runtime_config = MakeWorkerRuntimeConfig(config, inbounds);
+    const WorkerRuntimeConfig worker_runtime_config =
+        MakeWorkerRuntimeConfig(config, inbounds, std::move(outbounds));
     env.worker_pool = CreateWorkerPool(
         worker_runtime_config, *env.stats, env.geo_manager.get(), *env.dns_worker);
     env.controller = std::make_unique<Controller>(

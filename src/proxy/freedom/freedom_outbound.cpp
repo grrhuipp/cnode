@@ -528,14 +528,15 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             settings.send_through = *cfg.send_through;
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [settings = std::move(settings)](
-                std::string_view tag,
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            acpp::proxy::freedom::outbound::FreedomSettings,
+            +[](std::string_view tag,
+                const acpp::proxy::freedom::outbound::FreedomSettings& s,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
-                    std::string(tag), settings, dns, timeout);
-            }};
+                    std::string(tag), s, dns, timeout);
+            }>(std::move(settings));
     }), true);
 }  // namespace

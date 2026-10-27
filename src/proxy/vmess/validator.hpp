@@ -42,9 +42,6 @@ public:
     TimedUserValidator(TimedUserValidator&&) noexcept;
     TimedUserValidator& operator=(TimedUserValidator&&) noexcept;
 
-    size_t Size() const;
-    size_t SizeForTag(std::string_view tag) const;
-
     // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
     FindByAuthIDForTag(std::string_view tag,

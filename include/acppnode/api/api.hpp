@@ -34,37 +34,22 @@ struct UserInfo {
     int64_t UID = 0;
     std::string Email;
     std::string Passwd;
-    int Port = 0;
-    std::string Method;
     uint64_t SpeedLimit = 0;  // Bps, 0 = unlimited
     uint32_t DeviceLimit = 0;
-    std::string Protocol;
-    std::string ProtocolParam;
-    std::string Obfs;
-    std::string ObfsParam;
     std::string UUID;
     std::string Flow;
-    int AlterID = 0;
-    bool Enabled = true;
 };
 
 struct NodeInfo {
     std::string NodeType = std::string(constants::protocol::kDefaultNodeProtocol);
     int NodeID = 0;
     uint16_t Port = 0;
-    uint64_t SpeedLimit = 0;  // Bps
-    int AlterID = 0;
     std::string TransportProtocol = std::string(constants::protocol::kTcp);
-    std::string FakeType;
     std::string Host;
     std::string Path;
     bool EnableTLS = false;
-    std::string TLSType;
-    bool EnableVless = false;
     std::string CypherMethod = std::string(constants::protocol::kAes256Gcm);
     std::string ShadowsocksServerKey;
-    std::string ServiceName;
-
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
     bool SniffEnabled = true;

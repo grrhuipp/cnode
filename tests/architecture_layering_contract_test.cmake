@@ -424,3 +424,25 @@ foreach(PROTOCOL_VALIDATOR IN ITEMS
             "validators must be read-only UserStore consumers: ${PROTOCOL_VALIDATOR}")
     endif()
 endforeach()
+
+file(READ "${SOURCE_DIR}/include/acppnode/infra/config.hpp" INFRA_CONFIG_HEADER)
+file(READ "${SOURCE_DIR}/src/infra/config_loader.cpp" INFRA_CONFIG_LOADER_SOURCE)
+file(READ "${SOURCE_DIR}/src/infra/config_semantics.hpp" INFRA_CONFIG_SEMANTICS_HEADER)
+if(INFRA_CONFIG_HEADER MATCHES "acppnode/app/" OR
+   INFRA_CONFIG_LOADER_SOURCE MATCHES "app/proxyman" OR
+   INFRA_CONFIG_SEMANTICS_HEADER MATCHES "acppnode/app/")
+    message(FATAL_ERROR
+        "infra must normalize pure source configuration and must not depend on app/proxyman")
+endif()
+
+file(READ "${SOURCE_DIR}/include/acppnode/app/proxyman/outbound/prepared_config.hpp"
+     OUTBOUND_PREPARED_CONFIG_HEADER)
+if(OUTBOUND_PREPARED_CONFIG_HEADER MATCHES "std::function")
+    message(FATAL_ERROR
+        "PreparedOutboundCreator must use shared immutable protocol settings and a captureless function pointer, not std::function")
+endif()
+
+if(TLS_PUBLIC_SOURCE MATCHES "shared_ptr<void>")
+    message(FATAL_ERROR
+        "TLS public types must not use shared_ptr<void> type erasure")
+endif()

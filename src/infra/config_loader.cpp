@@ -3,7 +3,6 @@
 
 #include "acppnode/infra/json.hpp"
 #include "acppnode/infra/outbound_source_config.hpp"
-#include "../app/proxyman/outbound/registration.hpp"
 #include "config_semantics.hpp"
 
 #include <fstream>
@@ -58,41 +57,6 @@ void LoadConfigItems(const json::value& value, AddFn&& add) {
     }
 }
 
-const json::value& SelectConfigList(const json::value& value, std::string_view key) {
-    if (value.is_object()) {
-        if (const auto* nested = value.as_object().if_contains(key); nested) {
-            if (!nested->is_array()) {
-                throw std::invalid_argument(
-                    std::string(key) + " wrapper field must be an array");
-            }
-            return *nested;
-        }
-    }
-    return value;
-}
-
-RoutingConfig ParseRoutingConfigValue(const json::value& value) {
-    const auto& obj = value.as_object();
-    if (auto* routing = obj.if_contains("routing")) {
-        if (!routing->is_object()) {
-            throw std::invalid_argument("routing wrapper field must be an object");
-        }
-        return RoutingConfig::FromJson(routing->as_object());
-    }
-    return RoutingConfig::FromJson(obj);
-}
-
-proxyman::outbound::PreparedOutboundConfig PrepareOutboundForLoad(
-    infra::OutboundSourceConfig raw_config) {
-    auto prepared = proxyman::outbound::PrepareOutboundConfig(raw_config);
-    if (!prepared) {
-        throw std::invalid_argument(
-            "outbound '" + raw_config.tag + "' protocol '" +
-            raw_config.protocol + "' is unsupported or invalid");
-    }
-    return std::move(*prepared);
-}
-
 void LoadInboundItems(
     std::vector<StaticInboundConfig>& inbounds,
     const json::value& value,
@@ -107,13 +71,12 @@ void LoadInboundItems(
 }
 
 void LoadOutboundItems(
-    std::vector<proxyman::outbound::PreparedOutboundConfig>& outbounds,
+    std::vector<infra::OutboundSourceConfig>& outbounds,
     const json::value& value,
     std::string_view source_name) {
     size_t count_before = outbounds.size();
     LoadConfigItems(value, [&](const json::object& item) {
-        outbounds.push_back(PrepareOutboundForLoad(
-            infra::OutboundSourceConfig::FromJson(item)));
+        outbounds.push_back(infra::OutboundSourceConfig::FromJson(item));
     });
     LOG_CONSOLE("config.sidecar loaded file={} outbounds={}",
                 source_name,
@@ -192,9 +155,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             return std::nullopt;
         }
         try {
+            if (j->is_object() && j->as_object().contains("inbounds")) {
+                throw std::invalid_argument("inbounds sidecar must not use outer wrapper");
+            }
             LoadInboundItems(
                 cfg.static_inbounds_,
-                SelectConfigList(*j, "inbounds"),
+                *j,
                 constants::paths::kInboundFile);
         } catch (const std::exception& e) {
             LOG_ERROR("config.sidecar_parse_failed file={} error={}",
@@ -212,9 +178,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             return std::nullopt;
         }
         try {
+            if (j->is_object() && j->as_object().contains("outbounds")) {
+                throw std::invalid_argument("outbounds sidecar must not use outer wrapper");
+            }
             LoadOutboundItems(
-                cfg.prepared_outbounds_,
-                SelectConfigList(*j, "outbounds"),
+                cfg.outbounds_,
+                *j,
                 constants::paths::kOutboundFile);
         } catch (const std::exception& e) {
             LOG_ERROR("config.sidecar_parse_failed file={} error={}",
@@ -232,7 +201,10 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             return std::nullopt;
         }
         try {
-            cfg.routing_ = ParseRoutingConfigValue(*j);
+            if (!j->is_object() || j->as_object().contains("routing")) {
+                throw std::invalid_argument("routing sidecar must be a direct routing object");
+            }
+            cfg.routing_ = RoutingConfig::FromJson(j->as_object());
             LOG_CONSOLE("config.sidecar loaded file={} rules={}",
                         constants::paths::kRouteFile,
                         cfg.routing_.rules.size());
@@ -245,7 +217,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 
     bool has_direct = false;
     bool has_blackhole = false;
-    for (const auto& ob : cfg.prepared_outbounds_) {
+    for (const auto& ob : cfg.outbounds_) {
         if (ob.tag == constants::protocol::kDirect) has_direct = true;
         if (ob.tag == constants::protocol::kBlackhole) has_blackhole = true;
     }
@@ -254,13 +226,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         infra::OutboundSourceConfig direct;
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
-        auto prepared = proxyman::outbound::PrepareOutboundConfig(direct);
-        if (!prepared) {
-            LOG_ERROR("config.outbound builtin_prepare_failed tag={} protocol={}",
-                      direct.tag, direct.protocol);
-            return std::nullopt;
-        }
-        cfg.prepared_outbounds_.insert(cfg.prepared_outbounds_.begin(), std::move(*prepared));
+        cfg.outbounds_.insert(cfg.outbounds_.begin(), std::move(direct));
         LOG_CONSOLE("config.outbound builtin tag={} sendThrough={}",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
@@ -269,18 +235,12 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         infra::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
-        auto prepared = proxyman::outbound::PrepareOutboundConfig(blackhole);
-        if (!prepared) {
-            LOG_ERROR("config.outbound builtin_prepare_failed tag={} protocol={}",
-                      blackhole.tag, blackhole.protocol);
-            return std::nullopt;
-        }
-        cfg.prepared_outbounds_.push_back(std::move(*prepared));
+        cfg.outbounds_.push_back(std::move(blackhole));
         LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
     }
 
     for (const auto& ignored : IgnoreUnknownRoutingRules(
-             cfg.prepared_outbounds_, cfg.routing_.rules)) {
+             cfg.outbounds_, cfg.routing_.rules)) {
         LOG_WARN("config.routing ignored rule={} unknown_outbound={}",
                  ignored.index, ignored.tag);
     }
@@ -297,10 +257,10 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
     LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} default_outbound={} panels={}",
                 cfg.workers_,
                 cfg.static_inbounds_.size(),
-                cfg.prepared_outbounds_.size(),
+                cfg.outbounds_.size(),
                 cfg.routing_.rules.size(),
-                cfg.prepared_outbounds_.empty() ? std::string(constants::protocol::kDirect)
-                                                : cfg.prepared_outbounds_.front().tag,
+                cfg.outbounds_.empty() ? std::string(constants::protocol::kDirect)
+                                       : cfg.outbounds_.front().tag,
                 cfg.panels_.size());
 
     return cfg;

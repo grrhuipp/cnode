@@ -52,17 +52,31 @@ public:
                std::chrono::steady_clock::time_point now);
 
 private:
+    using TicketArray = std::array<uint8_t, kVlessEncryptionTicketSize>;
+    using NfsKeyArray = std::array<uint8_t, kVlessMlKem768SharedSecretSize>;
+
+    struct ByteArrayHash {
+        template <size_t N>
+        [[nodiscard]] size_t operator()(const std::array<uint8_t, N>& value) const noexcept {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < N; ++i) {
+                h ^= value[i];
+                h *= 1099511628211ull;
+            }
+            return static_cast<size_t>(h);
+        }
+    };
+
     struct Session {
-        std::array<uint8_t, kVlessEncryptionTicketSize> ticket{};
         memory::ByteVector pfs_key;
         std::chrono::steady_clock::time_point expires_at{};
-        std::vector<std::array<uint8_t, kVlessMlKem768SharedSecretSize>>
-            seen_nfs_keys;
+        memory::ThreadLocalUnorderedSet<NfsKeyArray, ByteArrayHash> seen_nfs_keys;
     };
 
     void Prune(std::chrono::steady_clock::time_point now);
 
-    std::vector<Session> sessions_;
+    memory::ThreadLocalUnorderedMap<TicketArray, Session, ByteArrayHash> sessions_;
+    memory::ThreadLocalDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
 };
 
 [[nodiscard]] net::awaitable<std::optional<VlessEncryptionRuntime>>

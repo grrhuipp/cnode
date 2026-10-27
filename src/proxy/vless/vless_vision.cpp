@@ -108,6 +108,17 @@ VisionReader::VisionReader(transport::MultiBufferReader& src,
 }
 
 void VisionReader::Feed(buf::MultiBuffer mb) {
+    if (pending_offset_ > 0) {
+        if (pending_offset_ >= pending_.size()) {
+            pending_.clear();
+            pending_offset_ = 0;
+        } else if (pending_offset_ >= 4096) {
+            pending_.erase(
+                pending_.begin(),
+                pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
+            pending_offset_ = 0;
+        }
+    }
     for (buf::Buffer* b : mb) {
         if (b && !b->IsEmpty()) {
             const auto bytes = b->Bytes();
@@ -119,39 +130,51 @@ void VisionReader::Feed(buf::MultiBuffer mb) {
 }
 
 bool VisionReader::TryDecode(buf::MultiBuffer& out) {
+    auto release_pending = [this]() noexcept {
+        memory::ByteVector empty{pending_.get_allocator()};
+        pending_.swap(empty);
+        pending_offset_ = 0;
+    };
+
     if (!read_process_) {
-        if (!pending_.empty()) {
-            AppendBytesToMultiBuffer(out, pending_);
-            pending_.clear();
+        if (pending_offset_ < pending_.size()) {
+            AppendBytesToMultiBuffer(
+                out,
+                std::span<const uint8_t>(
+                    pending_.data() + pending_offset_,
+                    pending_.size() - pending_offset_));
+            release_pending();
         }
         return buf::HasData(out);
     }
 
     while (true) {
+        const size_t available = pending_.size() - pending_offset_;
+        const uint8_t* base = pending_.data() + pending_offset_;
         const size_t header_len = expect_uuid_
             ? kVisionUuidHeaderLen
             : kVisionBaseHeaderLen;
-        if (pending_.size() < header_len) {
+        if (available < header_len) {
             return buf::HasData(out);
         }
 
         size_t pos = 0;
         if (expect_uuid_) {
-            if (!std::equal(user_uuid_.begin(), user_uuid_.end(), pending_.begin())) {
+            if (!std::equal(user_uuid_.begin(), user_uuid_.end(), base)) {
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision UUID mismatch");
             }
             pos += user_uuid_.size();
             expect_uuid_ = false;
         }
 
-        const uint8_t command = pending_[pos++];
-        const uint16_t content_len = ReadU16(pending_.data() + pos);
+        const uint8_t command = base[pos++];
+        const uint16_t content_len = ReadU16(base + pos);
         pos += 2;
-        const uint16_t padding_len = ReadU16(pending_.data() + pos);
+        const uint16_t padding_len = ReadU16(base + pos);
         pos += 2;
 
         const size_t frame_len = header_len + content_len + padding_len;
-        if (pending_.size() < frame_len) {
+        if (available < frame_len) {
             return buf::HasData(out);
         }
         if (command != kCommandPaddingContinue &&
@@ -163,22 +186,26 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
         if (content_len > 0) {
             AppendBytesToMultiBuffer(
                 out,
-                std::span<const uint8_t>(
-                    pending_.data() + header_len,
-                    content_len));
+                std::span<const uint8_t>(base + header_len, content_len));
         }
 
-        pending_.erase(
-            pending_.begin(),
-            pending_.begin() + static_cast<std::ptrdiff_t>(frame_len));
+        pending_offset_ += frame_len;
+        if (pending_offset_ >= pending_.size()) {
+            pending_.clear();
+            pending_offset_ = 0;
+        }
 
         if (command == kCommandPaddingEnd ||
             command == kCommandPaddingDirect) {
             read_process_ = false;
-            if (!pending_.empty()) {
-                AppendBytesToMultiBuffer(out, pending_);
-                pending_.clear();
+            if (pending_offset_ < pending_.size()) {
+                AppendBytesToMultiBuffer(
+                    out,
+                    std::span<const uint8_t>(
+                        pending_.data() + pending_offset_,
+                        pending_.size() - pending_offset_));
             }
+            release_pending();
             return buf::HasData(out);
         }
         if (buf::HasData(out)) {

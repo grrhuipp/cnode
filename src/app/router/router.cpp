@@ -177,23 +177,6 @@ private:
     return {};
 }
 
-class DomainCondition {
-public:
-    explicit DomainCondition(DomainMatcher matcher)
-        : matcher_(std::move(matcher)) {}
-
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* /*geo*/) const {
-        const auto domain = RoutingDomain(ctx);
-        if (domain.empty()) return false;
-        return matcher_.Match(domain);
-    }
-
-private:
-    DomainMatcher matcher_;
-};
-
 class GeoSiteCondition {
 public:
     GeoSiteCondition(
@@ -206,24 +189,6 @@ public:
 
 private:
     memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoSiteTagHandle> handles_;
-};
-
-class IPCondition {
-public:
-    explicit IPCondition(IPMatcher matcher)
-        : matcher_(std::move(matcher)) {}
-
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* /*geo*/) const {
-        const auto& target = ctx.outbound.target;
-        if (target.resolved_addr) return matcher_.Match(*target.resolved_addr);
-        if (target.IsDomain()) return false;
-        return false;
-    }
-
-private:
-    IPMatcher matcher_;
 };
 
 class GeoIPCondition {
@@ -239,33 +204,6 @@ public:
 private:
     memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoIPTagHandle> handles_;
 };
-
-class SourceIPCondition {
-public:
-    explicit SourceIPCondition(IPMatcher matcher)
-        : matcher_(std::move(matcher)) {}
-
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* /*geo*/) const {
-        if (ctx.inbound.source_addr.is_unspecified()) return false;
-        return matcher_.Match(ctx.inbound.source_addr);
-    }
-
-private:
-    IPMatcher matcher_;
-};
-
-using Condition = std::variant<
-    DomainCondition, GeoSiteCondition, IPCondition, GeoIPCondition,
-    SourceIPCondition>;
-
-[[nodiscard]] bool ConditionMatch(
-    const Condition& cond,
-    const session::Context& ctx,
-    const ::acpp::geo::GeoManager* geo = nullptr) {
-    return std::visit([&](const auto& c) { return c.Match(ctx, geo); }, cond);
-}
 
 struct CompoundRoutingRule {
     void SetNetworkCondition(const std::vector<std::string>& networks) {
@@ -329,10 +267,16 @@ struct CompoundRoutingRule {
         return has_network_condition || has_protocol_condition ||
                has_inbound_tag_condition || has_user_condition ||
                has_port_condition || has_source_port_condition ||
-               !conditions.empty();
+               source_ip_matcher.has_value() || ip_matcher.has_value() ||
+               domain_matcher.has_value() || geosite_condition.has_value() ||
+               geoip_condition.has_value();
     }
 
-    memory::ThreadLocalVector<Condition> conditions;
+    std::optional<IPMatcher> source_ip_matcher;
+    std::optional<IPMatcher> ip_matcher;
+    std::optional<DomainMatcher> domain_matcher;
+    std::optional<GeoSiteCondition> geosite_condition;
+    std::optional<GeoIPCondition> geoip_condition;
     std::string outbound_tag;
     bool has_network_condition = false;
     bool has_protocol_condition = false;
@@ -362,8 +306,29 @@ struct CompoundRoutingRule {
         if (has_port_condition && !MatchPortRanges(port_ranges, ctx.outbound.target.port)) {
             return false;
         }
-        for (const auto& cond : conditions) {
-            if (!ConditionMatch(cond, ctx, geo)) return false;
+        if (source_ip_matcher) {
+            if (ctx.inbound.source_addr.is_unspecified() ||
+                !source_ip_matcher->Match(ctx.inbound.source_addr)) {
+                return false;
+            }
+        }
+        if (ip_matcher) {
+            const auto& target = ctx.outbound.target;
+            if (!target.resolved_addr || !ip_matcher->Match(*target.resolved_addr)) {
+                return false;
+            }
+        }
+        if (domain_matcher) {
+            const auto domain = RoutingDomain(ctx);
+            if (domain.empty() || !domain_matcher->Match(domain)) {
+                return false;
+            }
+        }
+        if (geosite_condition && !geosite_condition->Match(ctx, geo)) {
+            return false;
+        }
+        if (geoip_condition && !geoip_condition->Match(ctx, geo)) {
+            return false;
         }
         return true;
     }
@@ -799,7 +764,7 @@ Router::Impl::Impl(
             }
             if (!source_ip_matcher.Empty()) {
                 source_ip_matcher.BuildIndex();
-                compound.conditions.push_back(SourceIPCondition{std::move(source_ip_matcher)});
+                compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
             }
         }
 
@@ -809,7 +774,7 @@ Router::Impl::Impl(
         }
         if (!ip_matcher.Empty()) {
             ip_matcher.BuildIndex();
-            compound.conditions.push_back(IPCondition{std::move(ip_matcher)});
+            compound.ip_matcher.emplace(std::move(ip_matcher));
         }
 
         DomainMatcher domain_matcher;
@@ -829,15 +794,15 @@ Router::Impl::Impl(
             domain_matcher.AddRegex(value);
         }
         if (!domain_matcher.Empty()) {
-            compound.conditions.push_back(DomainCondition{std::move(domain_matcher)});
+            compound.domain_matcher.emplace(std::move(domain_matcher));
         }
 
         if (!rc.geosite.empty()) {
-            compound.conditions.push_back(GeoSiteCondition{rc.geosite, geo_manager});
+            compound.geosite_condition.emplace(rc.geosite, geo_manager);
         }
 
         if (!rc.geoip.empty()) {
-            compound.conditions.push_back(GeoIPCondition{rc.geoip, geo_manager});
+            compound.geoip_condition.emplace(rc.geoip, geo_manager);
         }
 
         if (!compound.HasAnyCondition()) {

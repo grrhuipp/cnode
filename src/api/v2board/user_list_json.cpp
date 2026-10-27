@@ -114,7 +114,6 @@ ParseUserList(const json::object& source) {
         if (!email) return std::unexpected(std::move(email.error()));
         user.Email = std::move(*email);
         if (user.Email.empty()) user.Email = std::to_string(user.UID);
-        user.Enabled = true;
         users.push_back(std::move(user));
     }
     return users;

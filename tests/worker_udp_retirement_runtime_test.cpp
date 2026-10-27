@@ -251,19 +251,26 @@ private:
 
 acpp::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
     FixtureState& state, std::string tag) {
-    auto* owner_state = &state;
-    const std::string prepared_tag = tag;
+    struct DelayedState {
+        FixtureState* owner_state = nullptr;
+        std::string prepared_tag;
+    };
+    DelayedState delayed{.owner_state = &state, .prepared_tag = tag};
     return {
         .tag = std::move(tag),
         .protocol = "test-delayed-completion",
-        .create = [owner_state, prepared_tag](
-            std::string_view requested_tag, acpp::net::io_context&,
-            acpp::app::dns::DNS&, std::chrono::seconds) {
-            if (requested_tag != prepared_tag)
-                throw std::logic_error("prepared delayed outbound tag mismatch");
-            return std::make_unique<DelayedOutbound>(
-                std::string(requested_tag), *owner_state);
-        },
+        .create = acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            DelayedState,
+            +[](std::string_view requested_tag,
+                const DelayedState& s,
+                acpp::net::io_context&,
+                acpp::app::dns::DNS&,
+                std::chrono::seconds) -> std::unique_ptr<acpp::Outbound> {
+                if (requested_tag != s.prepared_tag)
+                    throw std::logic_error("prepared delayed outbound tag mismatch");
+                return std::make_unique<DelayedOutbound>(
+                    std::string(requested_tag), *s.owner_state);
+            }>(std::move(delayed)),
     };
 }
 

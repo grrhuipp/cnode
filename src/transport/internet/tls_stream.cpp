@@ -139,7 +139,7 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
     return false;
 }
 
-struct AutoSignContextState {
+struct AutoSignContextState final : SslContext::ContextState {
     explicit AutoSignContextState(std::string name)
         : default_name(std::move(name)) {}
 
@@ -176,7 +176,7 @@ int AutoSignCertCallback(SSL* ssl, void* arg) {
 std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
     // 默认证书优先使用配置的 server_name，避免无 SNI 时退回 localhost。
     const std::string default_name = ResolveAutoSignDefaultName(config);
-    auto state = std::make_shared<AutoSignContextState>(default_name);
+    auto state = std::make_unique<AutoSignContextState>(default_name);
     auto default_material = state->certificates.GetOrCreate(default_name);
     if (!default_material.cert || !default_material.key) {
         LOG_ERROR("默认自签证书生成失败");
@@ -433,7 +433,7 @@ TlsStream::TlsStream(TlsStream&& other) noexcept
     , is_server_(other.is_server_)
     , handshake_done_(other.handshake_done_)
     , shutdown_initiated_(other.shutdown_initiated_)
-    , app_state_(std::move(other.app_state_)) {
+    , reality_client_state_(std::move(other.reality_client_state_)) {
     other.shutdown_initiated_ = true;
 }
 
@@ -443,7 +443,7 @@ TlsStream& TlsStream::operator=(TlsStream&& other) noexcept {
         is_server_ = other.is_server_;
         handshake_done_ = other.handshake_done_;
         shutdown_initiated_ = other.shutdown_initiated_;
-        app_state_ = std::move(other.app_state_);
+        reality_client_state_ = std::move(other.reality_client_state_);
         other.shutdown_initiated_ = true;
     }
     return *this;
@@ -500,7 +500,8 @@ net::awaitable<bool> TlsStream::Handshake() {
         co_return false;
     }
 
-    if (app_state_ && !VerifyRealityClientHandshake(NativeSsl(), app_state_)) {
+    if (reality_client_state_ &&
+        !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
         co_return false;
     }
 

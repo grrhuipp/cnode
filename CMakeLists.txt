@@ -563,7 +563,7 @@ endif()
 
 if(CNODE_BUILD_TESTS)
     enable_testing()
-
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wno-mismatched-new-delete>)
     add_executable(cnode_autosign_cert_test
         tests/autosign_cert_test.cpp
         src/transport/internet/autosign_cert.cpp
@@ -1478,7 +1478,7 @@ if(CNODE_BUILD_TESTS)
     endif()
     target_compile_options(cnode_anytls_outbound_lifecycle_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Wno-mismatched-new-delete>)
     add_test(NAME cnode_anytls_outbound_lifecycle_test COMMAND cnode_anytls_outbound_lifecycle_test)
     set_tests_properties(cnode_anytls_outbound_lifecycle_test PROPERTIES TIMEOUT 20)
 
@@ -1609,6 +1609,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_config_semantics_test
         tests/config_semantics_test.cpp
         src/infra/config_semantics.cpp
+        src/infra/json.cpp
         src/transport/internet/inbound_listen.cpp
     )
     target_include_directories(cnode_config_semantics_test PRIVATE

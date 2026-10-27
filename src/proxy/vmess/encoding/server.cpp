@@ -785,12 +785,10 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
     auto user = validator.FindByAuthIDForTag(tag, auth_id, timestamp);
 
     if (!user) {
-        LOG_NET_DEBUG("VMess: user not found by auth_id (tag={}, users={})",
-                         tag, validator.SizeForTag(tag));
-        LOG_NET_TRACE("[conn={}] VMess: auth_id miss tag={} users={} auth_id={}",
+        LOG_NET_DEBUG("VMess: user not found by auth_id (tag={})", tag);
+        LOG_NET_TRACE("[conn={}] VMess: auth_id miss tag={} auth_id={}",
                          trace_conn_id,
                          tag,
-                         validator.SizeForTag(tag),
                          FormatHexPrefix(auth_id, 16, 8));
         return {std::nullopt, 0};
     }

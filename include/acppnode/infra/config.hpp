@@ -1,7 +1,7 @@
 #pragma once
 
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/infra/outbound_source_config.hpp"
 #include "acppnode/service/controller/config.hpp"
 #include <filesystem>
 #include <optional>
@@ -30,8 +30,8 @@ public:
     const RoutingConfig& GetRouting() const { return routing_; }
     const std::vector<PanelConfig>& GetPanels() const { return panels_; }
     const std::vector<StaticInboundConfig>& GetStaticInbounds() const { return static_inbounds_; }
-    const std::vector<proxyman::outbound::PreparedOutboundConfig>& GetPreparedOutbounds() const {
-        return prepared_outbounds_;
+    const std::vector<infra::OutboundSourceConfig>& GetOutbounds() const {
+        return outbounds_;
     }
 
     uint32_t GetWorkers() const { return workers_; }
@@ -54,7 +54,7 @@ private:
     RoutingConfig routing_;
     std::vector<PanelConfig> panels_;
     std::vector<StaticInboundConfig> static_inbounds_;
-    std::vector<proxyman::outbound::PreparedOutboundConfig> prepared_outbounds_;
+    std::vector<infra::OutboundSourceConfig> outbounds_;
     uint32_t workers_ = 0;  // 0 = CPU 核心数
     std::filesystem::path config_dir_;
 };

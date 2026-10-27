@@ -1,7 +1,7 @@
 #pragma once
 
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
 #include "acppnode/infra/config_types.hpp"
+#include "acppnode/infra/outbound_source_config.hpp"
 #include "acppnode/infra/runtime_config_types.hpp"
 
 #include <cstddef>
@@ -62,7 +62,7 @@ struct StaticInboundSemanticValidation {
 };
 
 [[nodiscard]] ConfigSemanticValidation ValidateOutboundSelectionSemantics(
-    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::span<const infra::OutboundSourceConfig> outbounds,
     std::span<const RouteRuleConfig> rules,
     std::span<const StaticInboundConfig> inbounds);
 
@@ -70,9 +70,8 @@ struct StaticInboundSemanticValidation {
 // rules are unusable, but must not prevent the rest of the node from starting.
 // Remove them during cold-path normalization before publishing the runtime.
 [[nodiscard]] std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
-    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::span<const infra::OutboundSourceConfig> outbounds,
     std::vector<RouteRuleConfig>& rules);
-
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);
 

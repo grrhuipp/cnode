@@ -30,7 +30,8 @@ public:
 
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
-
+    UserOnlineTracker(UserOnlineTracker&&) noexcept;
+    UserOnlineTracker& operator=(UserOnlineTracker&&) noexcept;
     void OnUserConnected(std::string_view tag,
                          uint64_t user_id,
                          std::string_view client_ip);

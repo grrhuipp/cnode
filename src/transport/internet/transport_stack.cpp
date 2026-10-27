@@ -64,18 +64,6 @@ using TlsContextMap =
 using TlsContextCache = transport::internet::BoundedTlsContextCache<
     SslContext, TlsContextMap>;
 
-[[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key) {
-    constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::string accept_src;
-    accept_src.reserve(ws_key.size() + kWsGuid.size());
-    accept_src.append(ws_key);
-    accept_src.append(kWsGuid);
-
-    uint8_t sha1[20];
-    SHA1(unsafe::ptr_cast<const uint8_t>(accept_src.data()), accept_src.size(), sha1);
-    return Base64Encode(sha1, sizeof(sha1));
-}
-
 SslContext* AcquireServerTlsContext(const TlsConfig& config) {
     thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
 
@@ -402,15 +390,7 @@ net::awaitable<size_t> ReadToMultiBufferTail(AsyncStream& stream,
 // HTTP handshakes run directly on TCP or TLS. Return read-ahead to that exact
 // byte layer: TLS plaintext must never enter the TCP encrypted-input queue.
 void PrependHandshakeReadData(AsyncStream& stream, std::span<const uint8_t> data) {
-    if (data.empty()) return;
-    if (auto* tls = dynamic_cast<TlsStream*>(&stream)) {
-        tls->PrependReadData(data);
-    } else if (auto* tcp = dynamic_cast<TcpStream*>(&stream)) {
-        tcp->PrependReadData(data);
-    } else {
-        throw IoSystemError(io_error::operation_not_supported,
-                            "HTTP handshake requires a TCP or TLS byte stream");
-    }
+    stream.PrependReadData(data);
 }
 
 }  // namespace
@@ -671,7 +651,7 @@ private:
         co_return n;
     }
 
-    net::awaitable<bool> ReadLine(std::string& out) {
+    net::awaitable<bool> ReadLine(memory::ThreadLocalString& out) {
         out.clear();
         uint8_t prev = 0;
         while (out.size() < 8192) {
@@ -704,7 +684,7 @@ private:
     }
 
     net::awaitable<bool> ConsumeTrailers() {
-        std::string line;
+        memory::ThreadLocalString line;
         while (co_await ReadLine(line)) {
             if (line.empty()) {
                 co_return true;
@@ -723,7 +703,7 @@ private:
             co_return false;
         }
         while (chunk_remaining_ == 0) {
-            std::string line;
+            memory::ThreadLocalString line;
             if (!co_await ReadLine(line)) {
                 FailChunkedRead("incomplete HTTP/1 chunk-size line");
             }
@@ -796,7 +776,7 @@ private:
     bool closed_ = false;
 };
 
-class XHttpPacketUpSession final {
+class XHttpPacketUpSession final : public memory::ThreadAllocated {
 public:
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     explicit XHttpPacketUpSession(net::io_context& io_context)
@@ -1140,24 +1120,18 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!session_) {
-            co_return 0;
-        }
-        co_return co_await session_->AsyncRead(buffer);
+        return session_->AsyncRead(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
         if (!downlink_) {
             throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
         }
-        co_return co_await downlink_->AsyncWrite(buffer);
+        return downlink_->AsyncWrite(buffer);
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!session_) {
-            co_return buf::MultiBuffer{};
-        }
-        co_return co_await session_->ReadMultiBuffer();
+        return session_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
@@ -1165,7 +1139,7 @@ public:
             mb.clear();
             throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
         }
-        co_await downlink_->WriteMultiBuffer(std::move(mb));
+        return downlink_->WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
@@ -1173,7 +1147,7 @@ public:
         if (!downlink_) {
             throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
         }
-        co_await downlink_->WriteBuffers(buffers);
+        return downlink_->WriteBuffers(buffers);
     }
 
     void ShutdownRead() override {
@@ -1189,9 +1163,7 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (downlink_) {
-            co_await downlink_->AsyncShutdownWrite();
-        }
+        return downlink_->AsyncShutdownWrite();
     }
 
     void Cancel() noexcept override {
@@ -1872,7 +1844,7 @@ struct HpackHeaderField {
     memory::ThreadLocalString value;
 };
 
-class HpackDecoder final {
+class HpackDecoder final : public memory::ThreadAllocated {
 public:
     using HeaderFields = memory::ThreadLocalVector<HpackHeaderField>;
     using DynamicTable = memory::ThreadLocalDeque<HpackHeaderField>;
@@ -2552,7 +2524,7 @@ private:
     }
 
     net::awaitable<bool> WriteGrpcMessage(std::span<const uint8_t> data) {
-        co_return co_await WriteGrpcHunkMessage(*inner_, stream_id_, data);
+        return WriteGrpcHunkMessage(*inner_, stream_id_, data);
     }
 
     net::awaitable<bool> ReadClientResponseHeaders(H2Frame frame) {
@@ -2702,7 +2674,7 @@ private:
 
 class Http2ServerSession;
 
-class Http2ServerSubStreamState final {
+class Http2ServerSubStreamState final : public memory::ThreadAllocated {
 public:
     transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
     Http2ServerSubStreamState(net::io_context& io_context,
@@ -2781,98 +2753,86 @@ public:
     }
 
     explicit Http2ServerSubStream(std::shared_ptr<Http2ServerSubStreamState> state)
-        : state_(std::move(state))
-        , state_cancel_(state_->Cancellation(), [](void* raw, transport::Cancellation cancellation) noexcept {
-            auto& self = *static_cast<Http2ServerSubStream*>(raw);
-            if (cancellation.terminal) self.cancellation_.Stop(cancellation.reason);
-            else {
-                self.state_cancel_.Resubscribe(self.state_->Cancellation());
-                self.cancellation_.CancelPending(cancellation.reason);
-            }
-        }, this) {}
+        : state_(std::move(state)) {}
 
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    transport::CancellationSource& Cancellation() noexcept override {
+        return state_->Cancellation();
+    }
 
     ~Http2ServerSubStream() noexcept override {
         Close();
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!state_) {
-            co_return 0;
-        }
-        co_return co_await state_->AsyncRead(buffer);
+        return state_->AsyncRead(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (!state_) {
+        if (closed_ || !state_) {
             ThrowHttp2StreamError("gRPC write on closed stream");
         }
-        co_return co_await state_->AsyncWrite(buffer);
+        return state_->AsyncWrite(buffer);
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!state_) {
-            co_return buf::MultiBuffer{};
-        }
-        co_return co_await state_->ReadMultiBuffer();
+        return state_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        if (!state_) {
+        if (closed_ || !state_) {
             mb.clear();
             ThrowHttp2StreamError("gRPC WriteMultiBuffer on closed stream");
         }
-        co_await state_->WriteMultiBuffer(std::move(mb));
+        return state_->WriteMultiBuffer(std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        if (!state_) {
+        if (closed_ || !state_) {
             ThrowHttp2StreamError("gRPC WriteBuffers on closed stream");
         }
-        co_await state_->WriteBuffers(buffers);
+        return state_->WriteBuffers(buffers);
     }
 
     void ShutdownRead() override {
-        if (state_) {
+        if (!closed_ && state_) {
             state_->ShutdownRead();
         }
     }
 
     void ShutdownWrite() override {
-        if (state_) {
+        if (!closed_ && state_) {
             state_->ShutdownWrite();
         }
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (state_) {
-            co_await state_->AsyncShutdownWrite();
-        }
+        return state_->AsyncShutdownWrite();
     }
 
     void Cancel() noexcept override {
-        NotifyCancellation();
         if (state_) {
             state_->CancelPendingOperations();
         }
     }
 
     void Close() override {
-        NotifyClosed();
-        if (!state_) {
+        if (closed_) {
             return;
         }
-        state_->CloseLocal();
-        state_.reset();
+        closed_ = true;
+        if (state_) {
+            state_->CloseLocal();
+        }
     }
 
     void CloseAbortive() override {
-        NotifyClosed();
+        if (closed_) {
+            return;
+        }
+        closed_ = true;
         if (state_) {
             state_->AbortLocal();
-            state_.reset();
         }
     }
 
@@ -2885,12 +2845,12 @@ protected:
 
 private:
     std::shared_ptr<Http2ServerSubStreamState> state_;
-    transport::CancellationSource cancellation_;
-    transport::CancellationSubscription state_cancel_;
+    bool closed_ = false;
 };
 
 class Http2ServerSession final
-    : public std::enable_shared_from_this<Http2ServerSession> {
+    : public memory::ThreadAllocated
+    , public std::enable_shared_from_this<Http2ServerSession> {
 public:
     Http2ServerSession(net::io_context& io_context,
                       std::unique_ptr<AsyncStream> stream,
@@ -3904,7 +3864,7 @@ net::awaitable<size_t> Http2ServerSubStreamState::AsyncReadRaw(
 }
 
 int Http2ServerSubStream::NativeHandle() const {
-    if (!state_) {
+    if (closed_ || !state_) {
         return -1;
     }
     auto session = state_->LockSession();
@@ -3913,7 +3873,7 @@ int Http2ServerSubStream::NativeHandle() const {
 }
 
 bool Http2ServerSubStream::IsOpen() const {
-    if (!state_) {
+    if (closed_ || !state_) {
         return false;
     }
     auto session = state_->LockSession();
@@ -3922,7 +3882,7 @@ bool Http2ServerSubStream::IsOpen() const {
 }
 
 TcpStream* Http2ServerSubStream::BaseTcpStream() {
-    if (!state_) {
+    if (closed_ || !state_) {
         return nullptr;
     }
     auto session = state_->LockSession();
@@ -3931,7 +3891,7 @@ TcpStream* Http2ServerSubStream::BaseTcpStream() {
 }
 
 const TcpStream* Http2ServerSubStream::BaseTcpStream() const {
-    if (!state_) {
+    if (closed_ || !state_) {
         return nullptr;
     }
     auto session = state_->LockSession();
@@ -5466,7 +5426,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     }
 
     // 计算 Sec-WebSocket-Accept
-    std::string accept = ComputeWsAccept(ws_key);
+    std::string accept = ws::ComputeWsAccept(ws_key);
 
     // 发送 101
     std::string resp = std::format(

@@ -397,16 +397,21 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [vmess_config = std::move(vmess_config), user = std::move(*user)](
-                std::string_view tag,
+        struct PreparedVmessState {
+            acpp::VMessOutboundConfig config;
+            acpp::vmess::MemoryAccount user;
+        };
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            PreparedVmessState,
+            +[](std::string_view tag,
+                const PreparedVmessState& state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = vmess_config;
+                auto runtime_config = state.config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
-                    std::string(tag), runtime_config, user, dns);
-            }};
+                    std::string(tag), runtime_config, state.user, dns);
+            }>(PreparedVmessState{std::move(vmess_config), std::move(*user)});
     }), true);
 }  // namespace

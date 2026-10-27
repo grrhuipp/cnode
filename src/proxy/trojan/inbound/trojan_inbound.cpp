@@ -220,12 +220,10 @@ proxy::trojan::inbound::Handler::Process(
 
     auto user_info = validator_.FindUser(tag, request->password_hash);
     if (!user_info) {
-        LOG_NET_WARN("[{}] Trojan auth failed from {} hash={}...{} store_size={} tag_size={}",
+        LOG_NET_WARN("[{}] Trojan auth failed from {} hash={}...{}",
                       tag, client_ip,
                       request->password_hash.substr(0, 8),
-                      request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0),
-                      validator_.Size(),
-                      validator_.SizeForTag(tag));
+                      request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0));
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }

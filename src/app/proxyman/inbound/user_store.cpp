@@ -3,6 +3,7 @@
 #include "acppnode/app/proxyman/inbound/prepared_config.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <utility>
 
 namespace acpp::proxyman::inbound {
@@ -102,7 +103,6 @@ BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
 UserStore::VlessCredential
 BuildVlessCredential(const PreparedVlessUser& user) {
     return UserStore::VlessCredential{
-        .uuid = user.uuid,
         .uuid_bytes = user.uuid_bytes,
         .flow = user.flow,
         .profile = ShareProfile(user.profile),
@@ -179,15 +179,25 @@ BuildAnyTlsUsers(const std::vector<PreparedAnyTlsUser>& users) {
     return map;
 }
 
+template <typename TagMap>
+void EraseByTag(TagMap& map, std::string_view tag) {
+    if (auto it = map.find(tag); it != map.end()) {
+        map.erase(it);
+    }
+}
+
 template <typename TagMap, typename ContainerPtr>
 void SetOrErase(TagMap& map, std::string_view tag, ContainerPtr users) {
     if (!users || users->empty()) {
-        map.erase(std::string(tag));
+        EraseByTag(map, tag);
         return;
     }
-    map[std::string(tag)] = std::move(users);
+    if (auto it = map.find(tag); it != map.end()) {
+        it->second = std::move(users);
+        return;
+    }
+    map.emplace(std::string(tag), std::move(users));
 }
-
 template <typename TagMap>
 size_t TagSize(const TagMap& map, std::string_view tag) {
     auto it = map.find(tag);
@@ -205,21 +215,28 @@ bool SameShadowsocksIdentity(const UserStore::ShadowsocksCredential& a,
 }  // namespace
 
 size_t UserStore::Array16Hash::operator()(const std::array<uint8_t, 16>& value) const noexcept {
-    size_t out = 1469598103934665603ull;
-    for (uint8_t byte : value) {
-        out ^= byte;
-        out *= 1099511628211ull;
-    }
-    return out;
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    std::memcpy(&lo, value.data(), sizeof(lo));
+    std::memcpy(&hi, value.data() + sizeof(lo), sizeof(hi));
+    uint64_t h = lo ^ (hi + 0x9e3779b97f4a7c15ull + (lo << 6) + (lo >> 2));
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return static_cast<size_t>(h);
 }
 
 size_t UserStore::Array32Hash::operator()(const std::array<uint8_t, 32>& value) const noexcept {
-    size_t out = 1469598103934665603ull;
-    for (uint8_t byte : value) {
-        out ^= byte;
-        out *= 1099511628211ull;
-    }
-    return out;
+    uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    std::memcpy(&w0, value.data(), 8);
+    std::memcpy(&w1, value.data() + 8, 8);
+    std::memcpy(&w2, value.data() + 16, 8);
+    std::memcpy(&w3, value.data() + 24, 8);
+    uint64_t h = w0 ^ (w1 * 0x9e3779b97f4a7c15ull) ^ (w2 * 0xbf58476d1ce4e5b9ull) ^ (w3 * 0x94d049bb133111ebull);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return static_cast<size_t>(h);
 }
 
 void UserStore::ApplyUsers(std::string_view tag,
@@ -371,19 +388,19 @@ void UserStore::ClearUsers(UserProtocol protocol,
     Publish([&](Snapshot& snapshot) {
         switch (protocol) {
             case UserProtocol::Vmess:
-                snapshot.vmess.erase(std::string(tag));
+                EraseByTag(snapshot.vmess, tag);
                 break;
             case UserProtocol::Vless:
-                snapshot.vless.erase(std::string(tag));
+                EraseByTag(snapshot.vless, tag);
                 break;
             case UserProtocol::Trojan:
-                snapshot.trojan.erase(std::string(tag));
+                EraseByTag(snapshot.trojan, tag);
                 break;
             case UserProtocol::Shadowsocks:
-                snapshot.shadowsocks.erase(std::string(tag));
+                EraseByTag(snapshot.shadowsocks, tag);
                 break;
             case UserProtocol::AnyTls:
-                snapshot.anytls.erase(std::string(tag));
+                EraseByTag(snapshot.anytls, tag);
                 break;
         }
     });

@@ -13,7 +13,7 @@
 namespace acpp {
 
 ConfigSemanticValidation ValidateOutboundSelectionSemantics(
-    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::span<const infra::OutboundSourceConfig> outbounds,
     std::span<const RouteRuleConfig> rules,
     std::span<const StaticInboundConfig> inbounds) {
     if (outbounds.empty()) {
@@ -84,7 +84,7 @@ ConfigSemanticValidation ValidateOutboundSelectionSemantics(
 }
 
 std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
-    std::span<const proxyman::outbound::PreparedOutboundConfig> outbounds,
+    std::span<const infra::OutboundSourceConfig> outbounds,
     std::vector<RouteRuleConfig>& rules) {
     std::unordered_set<std::string_view> tags;
     tags.reserve(outbounds.size());

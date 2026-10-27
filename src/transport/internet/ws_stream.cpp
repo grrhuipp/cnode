@@ -8,20 +8,31 @@
 
 namespace acpp {
 
-namespace {
+namespace ws {
 
-[[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key) {
+std::string ComputeWsAccept(std::string_view ws_key) {
     constexpr std::string_view kWsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::string accept_src;
-    accept_src.reserve(ws_key.size() + kWsGuid.size());
-    accept_src.append(ws_key);
-    accept_src.append(kWsGuid);
-
+    std::array<char, 256> inline_buf;
     uint8_t sha1[20];
-    SHA1(unsafe::ptr_cast<const uint8_t>(accept_src.data()), accept_src.size(), sha1);
+    if (ws_key.size() + kWsGuid.size() <= inline_buf.size()) {
+        std::memcpy(inline_buf.data(), ws_key.data(), ws_key.size());
+        std::memcpy(inline_buf.data() + ws_key.size(), kWsGuid.data(), kWsGuid.size());
+        SHA1(unsafe::ptr_cast<const uint8_t>(inline_buf.data()),
+             ws_key.size() + kWsGuid.size(),
+             sha1);
+    } else {
+        std::string accept_src;
+        accept_src.reserve(ws_key.size() + kWsGuid.size());
+        accept_src.append(ws_key);
+        accept_src.append(kWsGuid);
+        SHA1(unsafe::ptr_cast<const uint8_t>(accept_src.data()), accept_src.size(), sha1);
+    }
     return Base64Encode(sha1, sizeof(sha1));
 }
 
+}  // namespace ws
+
+namespace {
 [[nodiscard]] char LowerAsciiChar(char ch) {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 }
@@ -216,7 +227,7 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const std::string expected_accept = ComputeWsAccept(ws_key);
+    const std::string expected_accept = ws::ComputeWsAccept(ws_key);
     if (accept != expected_accept) {
         LOG_NET_DEBUG("[conn={}] WS client: invalid Sec-WebSocket-Accept", conn_id_);
         co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

@@ -407,16 +407,21 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             LOG_ERROR("shadowsocks outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [ss_config = std::move(ss_config), credentials = std::move(*credentials)](
-                std::string_view tag,
+        struct PreparedSsState {
+            acpp::SsOutboundConfig config;
+            acpp::proxy::shadowsocks::outbound::Credentials credentials;
+        };
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            PreparedSsState,
+            +[](std::string_view tag,
+                const PreparedSsState& state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = ss_config;
+                auto runtime_config = state.config;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
-                    std::string(tag), runtime_config, credentials, dns_service);
-            }};
+                    std::string(tag), runtime_config, state.credentials, dns_service);
+            }>(PreparedSsState{std::move(ss_config), std::move(*credentials)});
     }), true);
 }  // namespace

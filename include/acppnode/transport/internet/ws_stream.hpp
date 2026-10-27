@@ -150,6 +150,8 @@ inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
     }
 }
 
+[[nodiscard]] std::string ComputeWsAccept(std::string_view ws_key);
+
 }  // namespace ws
 
 // ============================================================================
@@ -312,7 +314,7 @@ public:
         }
 
         if (total_len <= kSmallFrameThreshold) {
-            std::array<uint8_t, kSmallFrameThreshold + 14> frame{};
+            std::array<uint8_t, kSmallFrameThreshold + 14> frame;
             std::memcpy(frame.data(), header.bytes.data(), header.size);
             size_t offset = header.size;
             for (const auto& buffer : buffers) {

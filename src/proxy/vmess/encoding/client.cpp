@@ -772,29 +772,12 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
 
     // 加密长度（使用 AAD = auth_id）
     uint8_t len_enc[18];
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        co_return fail(ErrorCode::INTERNAL);
-    }
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, len_key.data(), len_iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    if (!AES128GCMEncrypt(len_key.data(), len_iv,
+                          auth_id.data(), auth_id.size(),
+                          len_plain, sizeof(len_plain),
+                          len_enc, len_enc + 2)) {
         co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-
-    // AAD = auth_id
-    int out_len;
-    if (EVP_EncryptUpdate(ctx, nullptr, &out_len, auth_id.data(),
-                          static_cast<int>(auth_id.size())) != 1 ||
-        EVP_EncryptUpdate(ctx, len_enc, &out_len, len_plain,
-                          static_cast<int>(sizeof(len_plain))) != 1 ||
-        EVP_EncryptFinal_ex(ctx, len_enc + out_len, &out_len) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, len_enc + 2) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    EVP_CIPHER_CTX_free(ctx);
 
     // 加密请求头
     const std::array<std::string_view, 3> header_key_path{
@@ -815,29 +798,12 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
     // 加密头部（使用 AAD = auth_id）
     std::array<uint8_t, kVMessHandshakeHeaderEncMax> header_enc{};
     const size_t header_enc_len = header_len + 16;
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        co_return fail(ErrorCode::INTERNAL);
-    }
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, header_key.data(), header_iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    if (!AES128GCMEncrypt(header_key.data(), header_iv,
+                          auth_id.data(), auth_id.size(),
+                          header.data(), header_len,
+                          header_enc.data(), header_enc.data() + header_len)) {
         co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-
-    // AAD = auth_id
-    if (EVP_EncryptUpdate(ctx, nullptr, &out_len, auth_id.data(),
-                          static_cast<int>(auth_id.size())) != 1 ||
-        EVP_EncryptUpdate(ctx, header_enc.data(), &out_len, header.data(),
-                          static_cast<int>(header_len)) != 1 ||
-        EVP_EncryptFinal_ex(ctx, header_enc.data() + out_len, &out_len) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16,
-                            header_enc.data() + header_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    EVP_CIPHER_CTX_free(ctx);
 
     // 发送: AuthID (16) + EncLen (18) + ConnectionNonce (8) + EncHeader
     std::array<uint8_t, kVMessHandshakePacketMax> packet{};
@@ -886,18 +852,12 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
 
     // 解密长度
     uint8_t len_dec[2];
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, len_key, len_iv);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, len_enc + 2);
-
-    int out_len;
-    EVP_DecryptUpdate(ctx, len_dec, &out_len, len_enc, 2);
-    int ret = EVP_DecryptFinal_ex(ctx, len_dec + out_len, &out_len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (ret <= 0) {
+    size_t len_dec_len = 0;
+    if (!AES128GCMDecryptTo(len_key, len_iv, sizeof(len_iv),
+                            len_enc, sizeof(len_enc),
+                            nullptr, 0,
+                            len_dec, sizeof(len_dec), len_dec_len) ||
+        len_dec_len != sizeof(len_dec)) {
         co_return false;
     }
 
@@ -925,17 +885,12 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
     KDF(state.response_iv.data(), 16, resp_header_iv_path, header_iv, 12);
 
     std::array<uint8_t, kVMessResponseHeaderMax> header_dec{};
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, header_key, header_iv);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, header_enc.data() + header_len);
-
-    EVP_DecryptUpdate(ctx, header_dec.data(), &out_len, header_enc.data(), static_cast<int>(header_len));
-    ret = EVP_DecryptFinal_ex(ctx, header_dec.data() + out_len, &out_len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (ret <= 0) {
+    size_t header_dec_len = 0;
+    if (!AES128GCMDecryptTo(header_key, header_iv, sizeof(header_iv),
+                            header_enc.data(), static_cast<size_t>(header_len) + 16,
+                            nullptr, 0,
+                            header_dec.data(), header_dec.size(), header_dec_len) ||
+        header_dec_len != header_len) {
         co_return false;
     }
 

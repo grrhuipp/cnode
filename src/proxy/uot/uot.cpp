@@ -1,4 +1,5 @@
 #include "uot.hpp"
+#include "../socks5_address.hpp"
 
 #include "acppnode/common/buffer_util.hpp"
 
@@ -40,7 +41,11 @@ size_t EncodeAddressTo(const TargetAddress& target,
     if (!target.IsValid() || !out || capacity < 1 + 2) {
         return 0;
     }
-
+    if (socks_address) {
+        return (!target.IsDomain() || !target.host.empty())
+            ? proxy::EncodeSocks5AddressTo(target, out, capacity)
+            : 0;
+    }
     size_t pos = 0;
     if (target.IsIPv4() && target.resolved_addr && target.resolved_addr->is_v4()) {
         if (capacity < 1 + 4 + 2) {

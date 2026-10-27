@@ -51,7 +51,6 @@ public:
     };
 
     struct VlessCredential {
-        std::string uuid;
         std::array<uint8_t, 16> uuid_bytes{};
         std::string flow;
         std::shared_ptr<const Profile> profile;

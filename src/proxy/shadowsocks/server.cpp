@@ -1,7 +1,7 @@
 #include "shadowsocks_crypto.hpp"
 #include "stream_crypto.hpp"
 #include "server.hpp"
-
+#include "../socks5_address.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 
@@ -72,50 +72,8 @@ SsCipherType ToSsCipher(proxyman::inbound::PreparedAeadCipher type) {
     return SsCipherType::AES_256_GCM;
 }
 
-struct SsAddress {
-    TargetAddress target;
-    size_t consumed = 0;
-};
-
-std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
-    if (len < 1) return std::nullopt;
-
-    SsAddress result;
-    size_t idx = 0;
-
-    const uint8_t atyp = data[idx++];
-    if (atyp == 0x01) {
-        if (idx + 4 + 2 > len) return std::nullopt;
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), data + idx, bytes.size());
-        idx += 4;
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(net::ip::make_address_v4(bytes), port);
-    } else if (atyp == 0x03) {
-        if (idx + 1 > len) return std::nullopt;
-        const size_t name_len = data[idx++];
-        if (idx + name_len + 2 > len) return std::nullopt;
-        std::string domain(reinterpret_cast<const char*>(data + idx), name_len);
-        idx += name_len;
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(std::string_view(domain.data(), domain.size()), port);
-    } else if (atyp == 0x04) {
-        if (idx + 16 + 2 > len) return std::nullopt;
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), data + idx, bytes.size());
-        idx += bytes.size();
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(net::ip::make_address_v6(bytes), port);
-    } else {
-        return std::nullopt;
-    }
-
-    result.consumed = idx;
-    return result;
-}
+using SsAddress = proxy::ParsedSocks5Address;
+using proxy::ParseSocks5Address;
 
 class RequestBodyReader final
     : public memory::ThreadAllocated

@@ -439,8 +439,7 @@ proxy::vless::inbound::Handler::Process(
     }
     auto user_info = validator_.FindUser(tag, request->uuid);
     if (!user_info) {
-        LOG_NET_WARN("[VLESS][{}] auth failed from {} store_size={} tag_size={}",
-                      tag, client_ip, validator_.Size(), validator_.SizeForTag(tag));
+        LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
@@ -705,7 +704,6 @@ const bool kVlessInboundRegistered = [] {
                     return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedVlessUser info;
-                info.uuid = std::move(uuid);
                 info.uuid_bytes = *uuid_bytes;
                 info.flow = acpp::vless::NormalizeFlow(client.flow);
                 info.profile.email = client.email;
@@ -728,7 +726,6 @@ const bool kVlessInboundRegistered = [] {
                     continue;
                 }
                 acpp::proxyman::inbound::PreparedVlessUser info;
-                info.uuid = uuid;
                 info.uuid_bytes = *uuid_bytes;
                 info.flow = acpp::vless::NormalizeFlow(runtime_user.flow);
                 info.profile.email = runtime_user.email;

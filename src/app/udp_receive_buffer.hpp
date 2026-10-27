@@ -18,8 +18,10 @@ public:
 
     void Release() noexcept {
         small_ = buf::BufferGuard{};
-        memory::ByteVector empty{large_.get_allocator()};
-        large_.swap(empty);
+        if (large_.capacity() != 0) {
+            memory::ByteVector empty{large_.get_allocator()};
+            large_.swap(empty);
+        }
     }
 
     [[nodiscard]] net::mutable_buffer Prepare(size_t available_bytes) {

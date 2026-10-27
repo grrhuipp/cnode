@@ -62,7 +62,7 @@ struct X509Deleter {
 using UniqueEvpPkey = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
 using UniqueX509 = std::unique_ptr<X509, X509Deleter>;
 
-struct RealityServerState {
+struct RealityServerState final : SslContext::ContextState {
     std::array<uint8_t, kRealityX25519KeySize> private_key{};
     std::vector<std::string> server_names;
     std::vector<transport::internet::RealityShortId> short_ids;
@@ -310,20 +310,13 @@ BuildRealityClientAuthPlain(
     return plain;
 }
 
-struct RealityClientState {
-    std::array<uint8_t, kRealityX25519KeySize> server_public{};
-    transport::internet::RealityShortId short_id{};
-    std::array<uint8_t, 32> auth_key{};
-    bool auth_key_ready = false;
-};
-
-[[nodiscard]] std::shared_ptr<RealityClientState> BuildRealityClientState(
+[[nodiscard]] std::unique_ptr<RealityClientState> BuildRealityClientState(
     const RealityConfig& config) {
     if (!config.public_key) {
         LOG_ERROR("REALITY client publicKey is empty");
-        return {};
+        return nullptr;
     }
-    auto state = memory::AllocateShared<RealityClientState>();
+    auto state = std::make_unique<RealityClientState>();
     state->server_public = *config.public_key;
     state->short_id = config.short_id;
     return state;
@@ -607,7 +600,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     return ssl_select_cert_success;
 }
 
-[[nodiscard]] std::shared_ptr<RealityServerState> BuildRealityServerState(
+[[nodiscard]] std::unique_ptr<RealityServerState> BuildRealityServerState(
     const RealityConfig& config) {
     if (!config.private_key) {
         LOG_ERROR("REALITY server privateKey is empty");
@@ -622,7 +615,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return {};
     }
 
-    auto state = memory::AllocateShared<RealityServerState>();
+    auto state = std::make_unique<RealityServerState>();
     state->private_key = *config.private_key;
     state->server_names = config.server_names;
     state->max_time_diff_ms = config.max_time_diff;
@@ -690,7 +683,7 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
     SSL_CTX_set_select_certificate_cb(ctx, RealitySelectCertificateCallback);
 
     auto out = std::unique_ptr<SslContext>(
-        new SslContext(ctx, std::static_pointer_cast<void>(state)));
+        new SslContext(ctx, std::move(state)));
     if (!out->ConfigureServerAlpn(tls_config.alpn)) {
         LOG_ERROR("Invalid REALITY server ALPN policy");
         return nullptr;
@@ -758,15 +751,14 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         ssl,
         RealityClientHelloCallback,
         state.get());
-    app_state_ = std::static_pointer_cast<void>(state);
+    reality_client_state_ = std::move(state);
     return true;
 }
 
 bool VerifyRealityClientHandshake(
     SSL* ssl,
-    const std::shared_ptr<void>& app_state) {
-    auto state = std::static_pointer_cast<RealityClientState>(app_state);
-    return state && VerifyRealityPeerCertificate(ssl, *state);
+    const RealityClientState& state) {
+    return VerifyRealityPeerCertificate(ssl, state);
 }
 
 }  // namespace acpp

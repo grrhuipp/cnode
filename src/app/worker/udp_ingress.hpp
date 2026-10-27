@@ -36,7 +36,7 @@ public:
     virtual ~UdpReplySink() noexcept = default;
 
     [[nodiscard]] virtual bool EnqueueUdpReply(
-        const std::string& socket_key,
+        std::string_view socket_key,
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
@@ -113,39 +113,39 @@ public:
     void ProcessDatagram(const UdpDatagramContext& datagram);
 
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
-        const std::string& socket_key,
+        std::string_view socket_key,
         udp::endpoint endpoint,
         buf::MultiBuffer payload);
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
-        const std::string& socket_key,
+        std::string_view socket_key,
         udp::endpoint endpoint,
         buf::BufferGuard payload);
-    [[nodiscard]] PendingUdpReplyPtr BeginReplySend(const std::string& socket_key);
+    [[nodiscard]] PendingUdpReplyPtr BeginReplySend(std::string_view socket_key);
     [[nodiscard]] static std::span<const net::const_buffer>
     ReplySendBuffers(const PendingUdpReply& reply) noexcept;
     [[nodiscard]] static const udp::endpoint&
     ReplyEndpoint(const PendingUdpReply& reply) noexcept;
     [[nodiscard]] bool CompleteReplySend(
-        const std::string& socket_key,
+        std::string_view socket_key,
         const PendingUdpReply& completed_reply);
     void ClearReplyQueue(std::string_view socket_key);
 
-    [[nodiscard]] bool HasClientSession(const std::string& socket_key,
-                                        const std::string& client_key) const noexcept;
+    [[nodiscard]] bool HasClientSession(std::string_view socket_key,
+                                        std::string_view client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr FindClientSession(
-        const std::string& socket_key,
-        const std::string& client_key) const noexcept;
+        std::string_view socket_key,
+        std::string_view client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr CreateClientSession(
-        const std::string& socket_key,
-        const std::string& client_key,
+        std::string_view socket_key,
+        std::string_view client_key,
         net::io_context& io_context,
         ReplyCallback reply_callback,
         udp::endpoint reply_endpoint,
         ::acpp::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point now,
         std::chrono::seconds idle_timeout);
-    [[nodiscard]] bool PushClientPayload(const std::string& socket_key,
-                                         const std::string& client_key,
+    [[nodiscard]] bool PushClientPayload(std::string_view socket_key,
+                                         std::string_view client_key,
                                          const TargetAddress& target,
                                          udp::endpoint reply_endpoint,
                                          const ::acpp::InboundDatagramOwner& session_owner,
@@ -160,13 +160,13 @@ public:
     // A socket key belongs to one receive loop. Duplicate attachment is
     // rejected instead of cancelling and replacing the live socket.
     [[nodiscard]] SocketPtr AttachSocket(
-        const std::string& socket_key,
+        std::string_view socket_key,
         SocketPtr socket);
-    [[nodiscard]] SocketPtr FindSocket(const std::string& socket_key) noexcept;
+    [[nodiscard]] SocketPtr FindSocket(std::string_view socket_key) noexcept;
     [[nodiscard]] std::shared_ptr<const udp::socket> FindSocket(
-        const std::string& socket_key) const noexcept;
+        std::string_view socket_key) const noexcept;
     [[nodiscard]] bool OwnsSocket(
-        const std::string& socket_key,
+        std::string_view socket_key,
         const udp::socket* socket) const noexcept;
     void CloseSocket(std::string_view socket_key) noexcept;
     void CloseAllSockets() noexcept;

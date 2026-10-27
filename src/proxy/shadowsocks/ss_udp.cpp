@@ -1,5 +1,6 @@
 #include "ss_udp.hpp"
 #include "shadowsocks_crypto.hpp"
+#include "../socks5_address.hpp"
 #include "acppnode/common/allocator.hpp"
 
 #include <openssl/evp.h>
@@ -26,115 +27,16 @@ constexpr uint8_t kSs2022ServerPacket = 1;
 
 static std::array<uint8_t, 12> kZeroNonce{};
 
-struct SsAddress {
-    TargetAddress target;
-    size_t consumed = 0;
-};
-
+using SsAddress = proxy::ParsedSocks5Address;
 struct Parsed2022Body {
     TargetAddress target;
     std::span<const uint8_t> payload;
     std::array<uint8_t, 8> client_session_id{};
 };
 
-std::optional<SsAddress> ParseSocks5Address(const uint8_t* data, size_t len) {
-    if (len < 1) return std::nullopt;
-
-    SsAddress result;
-    size_t idx = 0;
-
-    const uint8_t atyp = data[idx++];
-
-    if (atyp == 0x01) {
-        if (idx + 4 + 2 > len) return std::nullopt;
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), data + idx, bytes.size());
-        idx += 4;
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(net::ip::make_address_v4(bytes), port);
-
-    } else if (atyp == 0x03) {
-        if (idx + 1 > len) return std::nullopt;
-        const size_t name_len = data[idx++];
-        if (idx + name_len + 2 > len) return std::nullopt;
-        std::string domain(reinterpret_cast<const char*>(data + idx), name_len);
-        idx += name_len;
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(std::string_view(domain.data(), domain.size()), port);
-
-    } else if (atyp == 0x04) {
-        if (idx + 16 + 2 > len) return std::nullopt;
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), data + idx, bytes.size());
-        idx += bytes.size();
-        const uint16_t port = static_cast<uint16_t>((data[idx] << 8) | data[idx + 1]);
-        idx += 2;
-        result.target = TargetAddress(net::ip::make_address_v6(bytes), port);
-    } else {
-        return std::nullopt;
-    }
-
-    result.consumed = idx;
-    return result;
-}
-
-size_t Socks5AddressEncodedSize(const TargetAddress& addr) {
-    if (addr.IsDomain()) {
-        if (addr.host.size() > 255) {
-            return 0;
-        }
-        return 1 + 1 + addr.host.size() + 2;
-    }
-
-    if (addr.resolved_addr) {
-        if (addr.resolved_addr->is_v4()) {
-            return 1 + 4 + 2;
-        }
-        if (addr.resolved_addr->is_v6()) {
-            return 1 + 16 + 2;
-        }
-    }
-
-    return 0;
-}
-
-size_t EncodeSocks5AddressTo(const TargetAddress& addr,
-                             uint8_t* output,
-                             size_t output_size) {
-    const size_t needed = Socks5AddressEncodedSize(addr);
-    if (needed == 0 || needed > output_size) {
-        return 0;
-    }
-
-    size_t pos = 0;
-    if (addr.IsDomain()) {
-        if (addr.host.size() > 255) return 0;
-        output[pos++] = 0x03;
-        output[pos++] = static_cast<uint8_t>(addr.host.size());
-        std::memcpy(output + pos, addr.host.data(), addr.host.size());
-        pos += addr.host.size();
-    } else {
-        if (addr.resolved_addr && addr.resolved_addr->is_v4()) {
-            output[pos++] = 0x01;
-            auto bytes = addr.resolved_addr->to_v4().to_bytes();
-            std::memcpy(output + pos, bytes.data(), bytes.size());
-            pos += bytes.size();
-        } else if (addr.resolved_addr && addr.resolved_addr->is_v6()) {
-            output[pos++] = 0x04;
-            auto bytes = addr.resolved_addr->to_v6().to_bytes();
-            std::memcpy(output + pos, bytes.data(), bytes.size());
-            pos += bytes.size();
-        } else {
-            return 0;
-        }
-    }
-
-    output[pos++] = static_cast<uint8_t>(addr.port >> 8);
-    output[pos++] = static_cast<uint8_t>(addr.port & 0xFF);
-    return pos;
-}
+using proxy::ParseSocks5Address;
+using proxy::Socks5AddressEncodedSize;
+using proxy::EncodeSocks5AddressTo;
 
 [[nodiscard]] bool RandomBytes(std::span<uint8_t> out) {
     return out.empty() ||

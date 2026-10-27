@@ -67,14 +67,20 @@ struct Worker::ListenerSlot {
 };
 
 struct Worker::ListenerState : worker_detail::UdpReplySink {
-    using ListenerSlotMap =
-        memory::ThreadLocalUnorderedMap<std::string, ListenerSlot>;
+    using ListenerSlotMap = memory::ThreadLocalUnorderedMap<
+        std::string, ListenerSlot, TransparentStringHash, TransparentStringEq>;
     using ListenerKeys = memory::ThreadLocalVector<std::string>;
 
-    memory::ThreadLocalUnorderedMap<std::string, std::string> tcp_listener_tags;
+    memory::ThreadLocalUnorderedMap<
+        std::string, std::string, TransparentStringHash, TransparentStringEq>
+        tcp_listener_tags;
     ListenerSlotMap listener_slots;
-    memory::ThreadLocalUnorderedMap<std::string, std::string> udp_socket_tags;
-    memory::ThreadLocalUnorderedMap<std::string, std::unique_ptr<worker_detail::UdpIngress>>
+    memory::ThreadLocalUnorderedMap<
+        std::string, std::string, TransparentStringHash, TransparentStringEq>
+        udp_socket_tags;
+    memory::ThreadLocalUnorderedMap<
+        std::string, std::unique_ptr<worker_detail::UdpIngress>,
+        TransparentStringHash, TransparentStringEq>
         udp_workers;
     uint64_t udp_resource_drops = 0;
     size_t udp_receive_loops = 0;
@@ -111,17 +117,17 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         ListenerSlot* listener_slot);
 
     [[nodiscard]] worker_detail::UdpIngress*
-    FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept;
+    FindUdpWorkerBySocketKey(std::string_view socket_key) noexcept;
     [[nodiscard]] const worker_detail::UdpIngress*
-    FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept;
+    FindUdpWorkerBySocketKey(std::string_view socket_key) const noexcept;
 
     [[nodiscard]] bool EnqueueUdpReply(
-        const std::string& tag,
+        std::string_view tag,
         udp::socket* sock,
         udp::endpoint endpoint,
         buf::MultiBuffer payload,
         uint32_t worker_id) override;
-    void StartUdpReplySend(const std::string& tag,
+    void StartUdpReplySend(std::string_view tag,
                            worker_detail::UdpIngress::SocketPtr sock,
                            uint32_t worker_id);
 };
@@ -513,7 +519,7 @@ void Worker::ListenerState::StopListening(
 }
 
 worker_detail::UdpIngress*
-Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) noexcept {
+Worker::ListenerState::FindUdpWorkerBySocketKey(std::string_view socket_key) noexcept {
     auto tag_it = udp_socket_tags.find(socket_key);
     if (tag_it == udp_socket_tags.end()) {
         return nullptr;
@@ -526,7 +532,7 @@ Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) n
 }
 
 const worker_detail::UdpIngress*
-Worker::ListenerState::FindUdpWorkerBySocketKey(const std::string& socket_key) const noexcept {
+Worker::ListenerState::FindUdpWorkerBySocketKey(std::string_view socket_key) const noexcept {
     auto tag_it = udp_socket_tags.find(socket_key);
     if (tag_it == udp_socket_tags.end()) {
         return nullptr;
@@ -585,7 +591,7 @@ net::awaitable<void> Worker::ListenerState::RetireUdpListening(
 }
 
 bool Worker::ListenerState::EnqueueUdpReply(
-    const std::string& tag,
+    std::string_view tag,
     udp::socket* sock,
     udp::endpoint endpoint,
     buf::MultiBuffer payload,
@@ -607,7 +613,7 @@ bool Worker::ListenerState::EnqueueUdpReply(
     return true;
 }
 
-void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
+void Worker::ListenerState::StartUdpReplySend(std::string_view tag,
                                               worker_detail::UdpIngress::SocketPtr sock,
                                               uint32_t worker_id) {
     auto* udp_worker = FindUdpWorkerBySocketKey(tag);
@@ -629,7 +635,7 @@ void Worker::ListenerState::StartUdpReplySend(const std::string& tag,
     sock->async_send_to(
         send_buffers,
         endpoint,
-        [this, tag, sock, packet = std::move(packet), worker_id](IoErrorCode ec, size_t /*bytes_sent*/) {
+        [this, tag = std::string(tag), sock, packet = std::move(packet), worker_id](IoErrorCode ec, size_t /*bytes_sent*/) {
             auto* udp_worker = FindUdpWorkerBySocketKey(tag);
             if (!udp_worker) {
                 return;

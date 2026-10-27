@@ -77,14 +77,15 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 }
             }
         }
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [settings = std::move(settings)](
-                std::string_view tag,
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            acpp::proxy::blackhole::outbound::BlackholeSettings,
+            +[](std::string_view tag,
+                const acpp::proxy::blackhole::outbound::BlackholeSettings& s,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& /*dns*/,
                 std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(
-                    std::string(tag), settings);
-            }};
+                    std::string(tag), s);
+            }>(std::move(settings));
     }), true);
 }  // namespace

@@ -48,7 +48,7 @@ public:
 
     // Return bytes read ahead by a completed handshake before unread socket data.
     // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
-    void PrependReadData(std::span<const uint8_t> data);
+    void PrependReadData(std::span<const uint8_t> data) override;
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;

@@ -1,7 +1,7 @@
 #include "shadowsocks_crypto.hpp"
 #include "stream_crypto.hpp"
 #include "client.hpp"
-
+#include "../socks5_address.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 
@@ -52,47 +52,7 @@ net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
     return nonce;
 }
 
-size_t EncodeSocks5AddressTo(const TargetAddress& addr,
-                            uint8_t* output,
-                            size_t output_size) {
-    const size_t needed = addr.IsDomain()
-        ? (1 + 1 + addr.host.size() + 2)
-        : (addr.resolved_addr && addr.resolved_addr->is_v4()
-               ? (1 + 4 + 2)
-               : addr.resolved_addr && addr.resolved_addr->is_v6()
-                     ? (1 + 16 + 2)
-                     : 0);
-    if (needed == 0 || needed > output_size) {
-        return 0;
-    }
-
-    size_t pos = 0;
-    if (addr.IsDomain()) {
-        if (addr.host.size() > 255) return 0;
-        output[pos++] = 0x03;
-        output[pos++] = static_cast<uint8_t>(addr.host.size());
-        std::memcpy(output + pos, addr.host.data(), addr.host.size());
-        pos += addr.host.size();
-    } else {
-        if (addr.resolved_addr && addr.resolved_addr->is_v4()) {
-            output[pos++] = 0x01;
-            auto bytes = addr.resolved_addr->to_v4().to_bytes();
-            std::memcpy(output + pos, bytes.data(), bytes.size());
-            pos += bytes.size();
-        } else if (addr.resolved_addr && addr.resolved_addr->is_v6()) {
-            output[pos++] = 0x04;
-            auto bytes = addr.resolved_addr->to_v6().to_bytes();
-            std::memcpy(output + pos, bytes.data(), bytes.size());
-            pos += bytes.size();
-        } else {
-            return 0;
-        }
-    }
-
-    output[pos++] = static_cast<uint8_t>(addr.port >> 8);
-    output[pos++] = static_cast<uint8_t>(addr.port & 0xFF);
-    return pos;
-}
+using proxy::EncodeSocks5AddressTo;
 
 class RequestBodyWriter final
     : public memory::ThreadAllocated

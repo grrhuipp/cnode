@@ -23,6 +23,19 @@ public:
 private:
     bool success_;
 };
+EVP_CIPHER_CTX* GetThreadLocalGcmCtx() noexcept {
+    struct Holder {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        ~Holder() {
+            if (ctx) EVP_CIPHER_CTX_free(ctx);
+        }
+    };
+    thread_local Holder holder;
+    if (holder.ctx) {
+        EVP_CIPHER_CTX_reset(holder.ctx);
+    }
+    return holder.ctx;
+}
 }  // namespace
 
 bool AES128GCMDecryptTo(
@@ -39,7 +52,7 @@ bool AES128GCMDecryptTo(
     const size_t data_len = len - GCM_TAG_SIZE;
     if (data_len > plaintext_capacity) return false;
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* ctx = GetThreadLocalGcmCtx();
     if (!ctx) return false;
 
     int out_len = 0, final_len = 0;
@@ -64,7 +77,6 @@ bool AES128GCMDecryptTo(
         ok = true;
     } while (0);
 
-    EVP_CIPHER_CTX_free(ctx);
 
     if (!ok) return false;
 
@@ -79,7 +91,7 @@ bool AES128GCMEncrypt(
     const uint8_t* plaintext, size_t len,
     uint8_t* ciphertext, uint8_t* tag) {
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* ctx = GetThreadLocalGcmCtx();
     if (!ctx) return false;
 
     int out_len = 0, final_len = 0;
@@ -101,7 +113,6 @@ bool AES128GCMEncrypt(
         ok = true;
     } while (0);
 
-    EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
 

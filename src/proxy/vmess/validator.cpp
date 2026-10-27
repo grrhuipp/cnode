@@ -27,15 +27,16 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
 
     struct SessionKeyHash {
         [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
-            size_t h = 1469598103934665603ull;
-            auto mix = [&h](uint8_t byte) noexcept {
-                h ^= static_cast<size_t>(byte);
+            uint64_t words[6]{};
+            std::memcpy(&words[0], value.user.data(), 16);
+            std::memcpy(&words[2], value.key.data(), 16);
+            std::memcpy(&words[4], value.iv.data(), 16);
+            uint64_t h = 1469598103934665603ull;
+            for (uint64_t word : words) {
+                h ^= word;
                 h *= 1099511628211ull;
-            };
-            for (uint8_t byte : value.user) mix(byte);
-            for (uint8_t byte : value.key) mix(byte);
-            for (uint8_t byte : value.iv) mix(byte);
-            return h;
+            }
+            return static_cast<size_t>(h);
         }
     };
 
@@ -78,7 +79,6 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
             const int64_t expires_at = now + kTtlSeconds;
             entries[key] = expires_at;
             order.emplace_back(std::move(key), expires_at);
-            Cleanup(now);
             return true;
         }
 
@@ -167,15 +167,6 @@ TimedUserValidator::TimedUserValidator()
 TimedUserValidator::~TimedUserValidator() = default;
 TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
 TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
-
-size_t TimedUserValidator::Size() const {
-    return proxyman::inbound::UserStore::GetStats().vmess_accounts;
-}
-
-size_t TimedUserValidator::SizeForTag(std::string_view tag) const {
-    return proxyman::inbound::UserStore::SizeForProtocolTag(
-        proxyman::inbound::UserProtocol::Vmess, tag);
-}
 
 std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
 TimedUserValidator::FindByAuthIDForTag(

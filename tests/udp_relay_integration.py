@@ -16,10 +16,72 @@ import subprocess
 import time
 import uuid
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import ctypes
+import hmac
 
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+except ModuleNotFoundError:
+    hashes = None
+    HKDF = None
+    _libcrypto = ctypes.CDLL('libcrypto.so.3')
+    _libcrypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    _libcrypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+    _libcrypto.EVP_aes_128_gcm.restype = ctypes.c_void_p
+    _libcrypto.EVP_CipherInit_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    _libcrypto.EVP_CIPHER_CTX_ctrl.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    _libcrypto.EVP_CipherUpdate.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int]
+    _libcrypto.EVP_CipherFinal_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+
+    class AESGCM:
+        def __init__(self, key: bytes):
+            self._key = key
+
+        def encrypt(self, nonce: bytes, data: bytes, aad):
+            ctx = _libcrypto.EVP_CIPHER_CTX_new()
+            try:
+                assert _libcrypto.EVP_CipherInit_ex(ctx, _libcrypto.EVP_aes_128_gcm(), None, None, None, 1) == 1
+                assert _libcrypto.EVP_CIPHER_CTX_ctrl(ctx, 0x9, len(nonce), None) == 1
+                assert _libcrypto.EVP_CipherInit_ex(ctx, None, None, self._key, nonce, 1) == 1
+                out = ctypes.create_string_buffer(len(data))
+                out_len = ctypes.c_int(0)
+                assert _libcrypto.EVP_CipherUpdate(ctx, out, ctypes.byref(out_len), data, len(data)) == 1
+                final_len = ctypes.c_int(0)
+                assert _libcrypto.EVP_CipherFinal_ex(ctx, ctypes.byref(out, out_len.value), ctypes.byref(final_len)) == 1
+                tag = ctypes.create_string_buffer(16)
+                assert _libcrypto.EVP_CIPHER_CTX_ctrl(ctx, 0x10, 16, tag) == 1
+                return out.raw[:out_len.value + final_len.value] + tag.raw
+            finally:
+                _libcrypto.EVP_CIPHER_CTX_free(ctx)
+
+        def decrypt(self, nonce: bytes, data: bytes, aad):
+            if len(data) < 16:
+                raise ValueError('ciphertext too short')
+            body, tag = data[:-16], data[-16:]
+            ctx = _libcrypto.EVP_CIPHER_CTX_new()
+            try:
+                assert _libcrypto.EVP_CipherInit_ex(ctx, _libcrypto.EVP_aes_128_gcm(), None, None, None, 0) == 1
+                assert _libcrypto.EVP_CIPHER_CTX_ctrl(ctx, 0x9, len(nonce), None) == 1
+                assert _libcrypto.EVP_CipherInit_ex(ctx, None, None, self._key, nonce, 0) == 1
+                out = ctypes.create_string_buffer(len(body))
+                out_len = ctypes.c_int(0)
+                assert _libcrypto.EVP_CipherUpdate(ctx, out, ctypes.byref(out_len), body, len(body)) == 1
+                tag_buf = ctypes.create_string_buffer(tag, 16)
+                assert _libcrypto.EVP_CIPHER_CTX_ctrl(ctx, 0x11, 16, tag_buf) == 1
+                final_len = ctypes.c_int(0)
+                if _libcrypto.EVP_CipherFinal_ex(ctx, ctypes.byref(out, out_len.value), ctypes.byref(final_len)) != 1:
+                    raise ValueError('GCM tag mismatch')
+                return out.raw[:out_len.value + final_len.value]
+            finally:
+                _libcrypto.EVP_CIPHER_CTX_free(ctx)
 USER = uuid.UUID('b831381d-6324-4d53-ad4f-8cda48b30811')
 SECOND_USER = uuid.UUID('c942492e-7435-5e64-be5f-9ddb59c41922')
 
@@ -75,9 +137,12 @@ class EchoPeer(asyncio.DatagramProtocol):
     @staticmethod
     def cipher(salt):
         master = hashlib.md5(b'secret').digest()
-        key = HKDF(algorithm=hashes.SHA1(), length=16, salt=salt, info=b'ss-subkey').derive(master)
+        if HKDF is not None:
+            key = HKDF(algorithm=hashes.SHA1(), length=16, salt=salt, info=b'ss-subkey').derive(master)
+        else:
+            prk = hmac.new(salt, master, hashlib.sha1).digest()
+            key = hmac.new(prk, b'ss-subkey\x01', hashlib.sha1).digest()[:16]
         return AESGCM(key)
-
     def datagram_received(self, data, peer):
         try:
             if self.protocol == 'shadowsocks':

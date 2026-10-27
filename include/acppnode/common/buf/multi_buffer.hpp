@@ -183,6 +183,7 @@ public:
         if (this != &other) {
             ReleaseOwnedBuffers();
             spill_.clear();
+            inline_start_ = 0;
             size_ = 0;
             using_spill_ = false;
             total_bytes_ = 0;
@@ -206,13 +207,13 @@ public:
         if (empty()) {
             return nullptr;
         }
-        return using_spill_ ? spill_.back() : inline_buffers_[size_ - 1];
+        return using_spill_ ? spill_.back() : inline_buffers_[inline_start_ + size_ - 1];
     }
     [[nodiscard]] const Buffer* back() const noexcept {
         if (empty()) {
             return nullptr;
         }
-        return using_spill_ ? spill_.back() : inline_buffers_[size_ - 1];
+        return using_spill_ ? spill_.back() : inline_buffers_[inline_start_ + size_ - 1];
     }
 
     void reserve(size_t n) {
@@ -239,7 +240,10 @@ public:
         if (bytes > std::numeric_limits<size_t>::max() - total_bytes_)
             throw std::length_error("MultiBuffer byte size overflow");
         if (!using_spill_ && size_ < kInlineCapacity) {
-            inline_buffers_[size_++] = buffer.release();
+            if (inline_start_ + size_ >= kInlineCapacity) {
+                CompactInline();
+            }
+            inline_buffers_[inline_start_ + size_++] = buffer.release();
             total_bytes_ += bytes;
             return;
         }
@@ -264,14 +268,14 @@ public:
             return BufferGuard{out};
         }
 
-        Buffer* out = inline_buffers_[0];
+        Buffer* out = inline_buffers_[inline_start_];
         if (out) {
             total_bytes_ -= std::min(total_bytes_, static_cast<size_t>(out->Len()));
         }
-        for (size_t i = 1; i < size_; ++i) {
-            inline_buffers_[i - 1] = inline_buffers_[i];
+        inline_buffers_[inline_start_++] = nullptr;
+        if (--size_ == 0) {
+            inline_start_ = 0;
         }
-        inline_buffers_[--size_] = nullptr;
         return BufferGuard{out};
     }
 
@@ -302,21 +306,20 @@ public:
             return;
         }
         for (size_t i = 0; i < n; ++i) {
-            if (inline_buffers_[i]) {
+            Buffer*& slot = inline_buffers_[inline_start_ + i];
+            if (slot) {
                 total_bytes_ -= std::min(
                     total_bytes_,
-                    static_cast<size_t>(inline_buffers_[i]->Len()));
+                    static_cast<size_t>(slot->Len()));
             }
-            Buffer::Free(inline_buffers_[i]);
+            Buffer::Free(slot);
+            slot = nullptr;
         }
-        const size_t rest = size_ - n;
-        for (size_t i = 0; i < rest; ++i) {
-            inline_buffers_[i] = inline_buffers_[i + n];
+        inline_start_ += n;
+        size_ -= n;
+        if (size_ == 0) {
+            inline_start_ = 0;
         }
-        for (size_t i = rest; i < size_; ++i) {
-            inline_buffers_[i] = nullptr;
-        }
-        size_ = rest;
     }
 
     size_t DropPrefixBytes(size_t bytes) noexcept {
@@ -512,8 +515,9 @@ public:
             spill_start_ = 0;
         } else {
             for (size_t i = 0; i < size_; ++i) {
-                inline_buffers_[i] = nullptr;
+                inline_buffers_[inline_start_ + i] = nullptr;
             }
+            inline_start_ = 0;
         }
         size_ = 0;
         total_bytes_ = 0;
@@ -573,7 +577,7 @@ public:
     Buffer** begin() noexcept {
         return using_spill_ && size() > 0
             ? spill_.data() + spill_start_
-            : inline_buffers_;
+            : inline_buffers_ + inline_start_;
     }
     Buffer** end() noexcept {
         return begin() + size();
@@ -581,7 +585,7 @@ public:
     Buffer* const* begin() const noexcept {
         return using_spill_ && size() > 0
             ? spill_.data() + spill_start_
-            : inline_buffers_;
+            : inline_buffers_ + inline_start_;
     }
     Buffer* const* end() const noexcept {
         return begin() + size();
@@ -604,9 +608,22 @@ private:
             return;
         }
         for (size_t i = 0; i < size_; ++i) {
-            Buffer::Free(inline_buffers_[i]);
+            Buffer::Free(inline_buffers_[inline_start_ + i]);
+            inline_buffers_[inline_start_ + i] = nullptr;
+        }
+    }
+
+    void CompactInline() noexcept {
+        if (inline_start_ == 0) {
+            return;
+        }
+        for (size_t i = 0; i < size_; ++i) {
+            inline_buffers_[i] = inline_buffers_[inline_start_ + i];
+        }
+        for (size_t i = size_; i < inline_start_ + size_; ++i) {
             inline_buffers_[i] = nullptr;
         }
+        inline_start_ = 0;
     }
 
     void EnsureSpill(size_t capacity = kInlineCapacity * 2) {
@@ -615,11 +632,12 @@ private:
         }
         spill_.reserve(std::max(capacity, kInlineCapacity * 2));
         for (size_t i = 0; i < size_; ++i) {
-            spill_.push_back(inline_buffers_[i]);
-            inline_buffers_[i] = nullptr;
+            spill_.push_back(inline_buffers_[inline_start_ + i]);
+            inline_buffers_[inline_start_ + i] = nullptr;
         }
         using_spill_ = true;
         spill_start_ = 0;
+        inline_start_ = 0;
         size_ = 0;
     }
 
@@ -647,12 +665,14 @@ private:
             spill_ = std::move(other.spill_);
             spill_start_ = other.spill_start_;
         } else {
+            inline_start_ = 0;
             size_ = other.size_;
             for (size_t i = 0; i < size_; ++i) {
-                inline_buffers_[i] = other.inline_buffers_[i];
-                other.inline_buffers_[i] = nullptr;
+                inline_buffers_[i] = other.inline_buffers_[other.inline_start_ + i];
+                other.inline_buffers_[other.inline_start_ + i] = nullptr;
             }
         }
+        other.inline_start_ = 0;
         other.size_ = 0;
         other.using_spill_ = false;
         other.spill_start_ = 0;
@@ -661,6 +681,7 @@ private:
     }
 
     Buffer* inline_buffers_[kInlineCapacity]{};
+    size_t inline_start_ = 0;
     size_t size_ = 0;
     size_t total_bytes_ = 0;
     bool using_spill_ = false;

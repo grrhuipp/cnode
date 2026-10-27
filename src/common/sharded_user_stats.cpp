@@ -7,13 +7,7 @@
 
 namespace acpp {
 
-struct UserOnlineTracker::Impl {
-    using UserConnectionMap = memory::ThreadLocalUnorderedMap<uint64_t, uint32_t>;
-    using TagConnectionMap =
-        memory::ThreadLocalUnorderedMap<std::string,
-                                        UserConnectionMap,
-                                        TransparentStringHash,
-                                        TransparentStringEq>;
+struct UserOnlineTracker::Impl : memory::ThreadAllocated {
     using DeviceIpMap =
         memory::ThreadLocalUnorderedMap<std::string,
                                         uint32_t,
@@ -26,40 +20,37 @@ struct UserOnlineTracker::Impl {
                                         TransparentStringHash,
                                         TransparentStringEq>;
 
-    TagConnectionMap connections;
     TagDeviceMap devices;
 };
 
 UserOnlineTracker::UserOnlineTracker() : impl_(std::make_unique<Impl>()) {}
 
 UserOnlineTracker::~UserOnlineTracker() = default;
+UserOnlineTracker::UserOnlineTracker(UserOnlineTracker&&) noexcept = default;
+UserOnlineTracker& UserOnlineTracker::operator=(UserOnlineTracker&&) noexcept = default;
 
 void UserOnlineTracker::OnUserConnected(std::string_view tag,
                                         uint64_t user_id,
                                         std::string_view client_ip) {
-    auto& user_connections = impl_->connections[std::string(tag)];
-    user_connections[user_id]++;
-
-    if (!client_ip.empty()) {
-        auto& user_devices = impl_->devices[std::string(tag)][user_id];
-        user_devices[std::string(client_ip)]++;
+    if (client_ip.empty()) {
+        return;
+    }
+    auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) {
+        tag_it = impl_->devices.try_emplace(std::string(tag)).first;
+    }
+    auto& user_devices = tag_it->second[user_id];
+    auto ip_it = user_devices.find(client_ip);
+    if (ip_it == user_devices.end()) {
+        user_devices.try_emplace(std::string(client_ip), 1u);
+    } else {
+        ++ip_it->second;
     }
 }
 
 void UserOnlineTracker::OnUserDisconnected(std::string_view tag,
                                            uint64_t user_id,
                                            std::string_view client_ip) {
-    auto tag_it = impl_->connections.find(tag);
-    if (tag_it != impl_->connections.end()) {
-        auto user_it = tag_it->second.find(user_id);
-        if (user_it != tag_it->second.end() && --user_it->second == 0) {
-            tag_it->second.erase(user_it);
-            if (tag_it->second.empty()) {
-                impl_->connections.erase(tag_it);
-            }
-        }
-    }
-
     if (client_ip.empty()) {
         return;
     }

@@ -189,6 +189,7 @@ public:
      * @return true 如果连接仍然有效
      */
     virtual bool IsOpen() const = 0;
+    virtual void PrependReadData(std::span<const uint8_t> data);
 
     // ========================================================================
     // Tcp 能力透传

@@ -51,7 +51,7 @@ bool Config::Validate() const {
     }
 
     const auto semantic = ValidateOutboundSelectionSemantics(
-        prepared_outbounds_, routing_.rules, static_inbounds_);
+        outbounds_, routing_.rules, static_inbounds_);
     switch (semantic.error) {
         case ConfigSemanticError::None:
             break;

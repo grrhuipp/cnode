@@ -10,14 +10,18 @@
 
 namespace acpp {
 
+struct RealityClientState;
 struct RealityConfig;
 struct TlsConfig;
-
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
 // ============================================================================
 class SslContext {
 public:
+    struct ContextState {
+        virtual ~ContextState() noexcept = default;
+    };
+
     // 创建服务端上下文（从文件加载证书）
     static std::unique_ptr<SslContext> CreateServer(const TlsConfig& config);
 
@@ -50,14 +54,14 @@ public:
     SslContext& operator=(const SslContext&) = delete;
 
 private:
-    explicit SslContext(SSL_CTX* ctx, std::shared_ptr<void> app_state = {})
+    explicit SslContext(SSL_CTX* ctx, std::unique_ptr<ContextState> context_state = nullptr)
         : ctx_(ctx)
-        , app_state_(std::move(app_state)) {}
+        , context_state_(std::move(context_state)) {}
     [[nodiscard]] bool ConfigureServerAlpn(
         const std::vector<std::string>& protocols);
 
     SSL_CTX* ctx_ = nullptr;
-    std::shared_ptr<void> app_state_;
+    std::unique_ptr<ContextState> context_state_;
     std::vector<unsigned char> server_alpn_wire_;
 };
 
@@ -119,7 +123,7 @@ public:
 
     // Return decrypted handshake read-ahead before OpenSSL's unread plaintext.
     // Never forwards these bytes to the TCP ciphertext layer.
-    void PrependReadData(std::span<const uint8_t> data);
+    void PrependReadData(std::span<const uint8_t> data) override;
 
 protected:
     TcpStream* BaseTcpStream() override;
@@ -135,7 +139,7 @@ private:
     bool is_server_ = false;
     bool handshake_done_ = false;
     bool shutdown_initiated_ = false;  // 防止多次 SSL_shutdown
-    std::shared_ptr<void> app_state_;
+    std::unique_ptr<RealityClientState> reality_client_state_;
 };
 
 // ============================================================================

@@ -24,6 +24,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
+#include <charconv>
 #include <chrono>
 #include <limits>
 #include <new>
@@ -530,10 +531,21 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
         case detail::SelectionSource::Forced:
             ctx.outbound.route_rule = "fixed";
             break;
-        case detail::SelectionSource::Rule:
-            ctx.outbound.route_rule =
-                "rule:" + std::to_string(selection.rule_index);
+        case detail::SelectionSource::Rule: {
+            char rule_buf[24] = "rule:";
+            const auto [ptr, ec] = std::to_chars(
+                rule_buf + 5,
+                rule_buf + sizeof(rule_buf),
+                selection.rule_index);
+            if (ec == std::errc{}) {
+                ctx.outbound.route_rule.assign(
+                    rule_buf,
+                    static_cast<size_t>(ptr - rule_buf));
+            } else {
+                ctx.outbound.route_rule = "rule:0";
+            }
             break;
+        }
         case detail::SelectionSource::Fallback:
             ctx.outbound.route_rule = "fallback";
             break;

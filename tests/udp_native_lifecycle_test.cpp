@@ -170,7 +170,7 @@ public:
 
 class ReplySink final : public acpp::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(const std::string&, acpp::udp::socket*,
+    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
                          acpp::udp::endpoint, acpp::buf::MultiBuffer,
                          uint32_t) override { return true; }
 };

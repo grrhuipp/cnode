@@ -1,8 +1,8 @@
 #include "trojan_codec.hpp"
+#include "../socks5_address.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/unsafe.hpp"
-
 namespace acpp::trojan {
 
 using acpp::AddressType;
@@ -51,41 +51,16 @@ std::optional<TargetAddress> ReadSocksAddress(ByteReader& reader, uint8_t atype)
 }
 
 size_t SocksAddressSize(const TargetAddress& target) {
-    if (target.IsDomain()) {
-        return target.host.size() <= 255 ? 1 + 1 + target.host.size() : 0;
-    }
-
-    if (target.resolved_addr) {
-        if (target.resolved_addr->is_v4()) return 1 + 4;
-        if (target.resolved_addr->is_v6()) return 1 + 16;
-    }
-
-    return 0;
+    return proxy::Socks5AddressBodySize(target);
 }
 
 bool WriteSocksAddress(ByteWriter& writer, const TargetAddress& target) {
-    if (target.IsDomain()) {
-        if (target.host.size() > 255) return false;
-        writer.WriteU8(0x03);
-        writer.WriteU8(static_cast<uint8_t>(target.host.size()));
-        writer.WriteString(target.host);
-        return true;
+    std::array<uint8_t, 1 + 1 + 255> encoded{};
+    const size_t n = proxy::EncodeSocks5AddressBodyTo(target, encoded.data(), encoded.size());
+    if (n == 0) {
+        return false;
     }
-
-    if (target.resolved_addr && target.resolved_addr->is_v4()) {
-        writer.WriteU8(0x01);
-        auto bytes = target.resolved_addr->to_v4().to_bytes();
-        writer.WriteBytes(bytes.data(), bytes.size());
-        return true;
-    }
-    if (target.resolved_addr && target.resolved_addr->is_v6()) {
-        writer.WriteU8(0x04);
-        auto bytes = target.resolved_addr->to_v6().to_bytes();
-        writer.WriteBytes(bytes.data(), bytes.size());
-        return true;
-    }
-
-    return false;
+    return writer.WriteBytes(encoded.data(), n);
 }
 
 }  // namespace

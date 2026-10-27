@@ -37,7 +37,7 @@ class ShadowsocksOnlineSession {
 public:
     ShadowsocksOnlineSession(ss::Validator& validator,
                              std::string_view tag,
-                             int64_t user_id,
+                             uint64_t user_id,
                              std::string_view client_ip)
         : validator_(&validator)
         , tag_(tag)
@@ -62,7 +62,7 @@ public:
 private:
     ss::Validator* validator_;
     memory::ThreadLocalString tag_;
-    int64_t user_id_;
+    uint64_t user_id_;
     memory::ThreadLocalString client_ip_;
 };
 
@@ -189,7 +189,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
 
-        int64_t uid = profile.user_id;
+        const auto uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
             LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),

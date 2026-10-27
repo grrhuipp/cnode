@@ -116,6 +116,14 @@ void AsyncStream::CloseAbortive() {
     SetAbortiveClose(true);
     Close();
 }
+void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
+    if (data.empty()) {
+        return;
+    }
+    throw IoSystemError(
+        io_error::operation_not_supported,
+        "HTTP handshake requires a TCP or TLS byte stream");
+}
 
 transport::CancellationSource& AsyncStream::Cancellation() noexcept {
     if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)

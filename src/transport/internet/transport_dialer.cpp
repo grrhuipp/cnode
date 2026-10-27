@@ -403,10 +403,7 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!downlink_) {
-            co_return 0;
-        }
-        co_return co_await downlink_->AsyncRead(buffer);
+        return downlink_->AsyncRead(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
@@ -422,10 +419,7 @@ public:
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!downlink_) {
-            co_return buf::MultiBuffer{};
-        }
-        co_return co_await downlink_->ReadMultiBuffer();
+        return downlink_->ReadMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {

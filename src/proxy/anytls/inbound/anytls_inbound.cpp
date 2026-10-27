@@ -71,16 +71,15 @@ public:
 
 private:
     Validator* validator_;
-    std::string tag_;
+    memory::ThreadLocalString tag_;
     uint64_t user_id_;
-    std::string client_ip_;
+    memory::ThreadLocalString client_ip_;
 };
 
 void CopySessionContext(const session::Context& source, session::Context& target) {
     target.conn_id = session::NewID(source.worker_id);
     target.inbound = source.inbound;
     target.outbound = source.outbound;
-    target.outbounds = source.outbounds;
     target.content = source.content;
     target.traffic = {};
     target.sockopt = source.sockopt;

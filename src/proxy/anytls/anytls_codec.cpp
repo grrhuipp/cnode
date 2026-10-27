@@ -1,7 +1,7 @@
 #include "anytls_codec.hpp"
 #include "padding.hpp"
+#include "../socks5_address.hpp"
 #include "../uot/uot.hpp"
-
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/transport/async_stream.hpp"
 
@@ -231,37 +231,16 @@ std::string ClientSettings(const PaddingScheme& scheme) {
 }
 
 std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target) {
-    if (!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target)) {
+    if ((!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target)) ||
+        (target.IsDomain() && target.host.empty())) {
         return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
-
-    std::string out;
-    if (target.IsDomain()) {
-        if (target.host.empty() || target.host.size() > 255) {
-            return std::unexpected(ErrorCode::INVALID_ARGUMENT);
-        }
-        out.reserve(1 + 1 + target.host.size() + 2);
-        out.push_back(static_cast<char>(0x03));
-        out.push_back(static_cast<char>(target.host.size()));
-        out.append(target.host);
-    } else if (target.resolved_addr && target.resolved_addr->is_v4()) {
-        out.reserve(1 + 4 + 2);
-        out.push_back(static_cast<char>(0x01));
-        const auto bytes = target.resolved_addr->to_v4().to_bytes();
-        out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    } else if (target.resolved_addr && target.resolved_addr->is_v6()) {
-        out.reserve(1 + 16 + 2);
-        out.push_back(static_cast<char>(0x04));
-        const auto bytes = target.resolved_addr->to_v6().to_bytes();
-        out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    } else {
+    std::array<uint8_t, 1 + 1 + 255 + 2> buf{};
+    const size_t n = proxy::EncodeSocks5AddressTo(target, buf.data(), buf.size());
+    if (n == 0) {
         return std::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
-
-    uint8_t port[2];
-    WriteU16BE(port, target.port);
-    out.append(reinterpret_cast<const char*>(port), sizeof(port));
-    return out;
+    return std::string(reinterpret_cast<const char*>(buf.data()), n);
 }
 
 std::expected<void, ErrorCode> AppendFrameBytesTo(

@@ -32,6 +32,7 @@ private:
     transport::MultiBufferReader& src_;
     std::array<uint8_t, 16> user_uuid_{};
     memory::ByteVector pending_;
+    size_t pending_offset_ = 0;
     bool read_process_ = true;
     bool expect_uuid_ = true;
 

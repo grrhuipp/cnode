@@ -641,8 +641,11 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
                 std::move(value), "full"));
         }
     }
-    if (j.contains("domainRegex") || j.contains("domainRegexp")) {
-        auto arr = jstr_array(j, {"domainRegex", "domainRegexp"});
+    if (j.contains("domainRegexp")) {
+        throw std::invalid_argument("domainRegexp is not supported; use domainRegex");
+    }
+    if (j.contains("domainRegex")) {
+        auto arr = jstr_array(j, {"domainRegex"});
         for (auto& value : arr) {
             rule.domain_regex.push_back(RequireRoutingDomainRegexp(
                 std::move(value)));
@@ -870,6 +873,10 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
     cfg.real_ip_header = jstr(j, {"realIpHeader"}, "");
     require_http_header_name(cfg.real_ip_header, "http realIpHeader");
     cfg.force_http2 = jbool(j, {"forceHttp2"}, false);
+    if (j.contains("initial_windows_size") || j.contains("initial_window_size")) {
+        throw std::invalid_argument(
+            "initial_windows_size/initial_window_size is not supported; use initialWindowSize");
+    }
     auto initial_window = ParseHttp2InitialWindow(j);
     if (!initial_window) {
         throw std::invalid_argument(std::move(initial_window.error()));
@@ -890,9 +897,9 @@ GrpcConfig GrpcConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "grpc userAgent contains invalid control characters");
     }
-    if (j.contains("initial_windows_size")) {
+    if (j.contains("initial_windows_size") || j.contains("initial_window_size")) {
         throw std::invalid_argument(
-            "initial_windows_size is not supported; use initial_window_size");
+            "initial_windows_size/initial_window_size is not supported; use initialWindowSize");
     }
     auto initial_window = ParseHttp2InitialWindow(j);
     if (!initial_window) {
@@ -1289,28 +1296,28 @@ StreamSettings StreamSettings::FromJson(
     }
 
     // WS 配置
-    if (const auto* ws = optional_object(
-            j, {"wsSettings", "websocketSettings"})) {
+    if (j.contains("websocketSettings") || j.contains("httpUpgradeSettings") ||
+        j.contains("h2Settings") || j.contains("splithttpSettings")) {
+        throw std::invalid_argument(
+            "legacy streamSettings key alias is not supported; use wsSettings, httpupgradeSettings, httpSettings, or xhttpSettings");
+    }
+    if (const auto* ws = optional_object(j, {"wsSettings"})) {
         cfg.ws = WsConfig::FromJson(*ws);
     }
 
-    if (const auto* http_upgrade = optional_object(
-            j, {"httpupgradeSettings", "httpUpgradeSettings"})) {
+    if (const auto* http_upgrade = optional_object(j, {"httpupgradeSettings"})) {
         cfg.http_upgrade = HttpUpgradeConfig::FromJson(*http_upgrade);
     }
 
-    if (const auto* http = optional_object(
-            j, {"httpSettings", "h2Settings"})) {
+    if (const auto* http = optional_object(j, {"httpSettings"})) {
         cfg.http = HttpConfig::FromJson(*http);
     }
 
-    if (const auto* grpc = optional_object(
-            j, {"grpcSettings"})) {
+    if (const auto* grpc = optional_object(j, {"grpcSettings"})) {
         cfg.grpc = GrpcConfig::FromJson(*grpc);
     }
 
-    if (const auto* xhttp = optional_object(j, {
-            "xhttpSettings", "splithttpSettings"})) {
+    if (const auto* xhttp = optional_object(j, {"xhttpSettings"})) {
         cfg.xhttp = XHttpConfig::FromJson(*xhttp);
     }
 

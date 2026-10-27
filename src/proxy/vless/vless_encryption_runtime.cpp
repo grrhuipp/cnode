@@ -307,9 +307,19 @@ void VlessEncryptionClientTicketCache::Clear() noexcept {
 
 void VlessEncryptionServerTicketStore::Prune(
     std::chrono::steady_clock::time_point now) {
-    std::erase_if(sessions_, [now](const Session& session) {
-        return session.expires_at <= now;
-    });
+    while (!order_.empty()) {
+        const auto& [ticket, expires_at] = order_.front();
+        auto it = sessions_.find(ticket);
+        if (it == sessions_.end() || it->second.expires_at != expires_at) {
+            order_.pop_front();
+            continue;
+        }
+        if (expires_at > now) {
+            break;
+        }
+        sessions_.erase(it);
+        order_.pop_front();
+    }
 }
 
 std::optional<memory::ByteVector> VlessEncryptionServerTicketStore::Lookup(
@@ -320,21 +330,19 @@ std::optional<memory::ByteVector> VlessEncryptionServerTicketStore::Lookup(
         return std::nullopt;
     }
     Prune(now);
-    auto it = std::ranges::find_if(sessions_, [&](const Session& session) {
-        return std::ranges::equal(session.ticket, ticket);
-    });
-    if (it == sessions_.end()) {
+    TicketArray ticket_array{};
+    std::copy(ticket.begin(), ticket.end(), ticket_array.begin());
+    auto it = sessions_.find(ticket_array);
+    if (it == sessions_.end() || it->second.expires_at <= now) {
         return std::nullopt;
     }
 
-    std::array<uint8_t, kVlessMlKem768SharedSecretSize> nfs_key_array{};
+    NfsKeyArray nfs_key_array{};
     std::copy(nfs_key.begin(), nfs_key.end(), nfs_key_array.begin());
-    if (std::ranges::find(it->seen_nfs_keys, nfs_key_array) !=
-        it->seen_nfs_keys.end()) {
+    if (!it->second.seen_nfs_keys.insert(nfs_key_array).second) {
         return std::nullopt;
     }
-    it->seen_nfs_keys.push_back(nfs_key_array);
-    return it->pfs_key;
+    return it->second.pfs_key;
 }
 
 void VlessEncryptionServerTicketStore::Store(
@@ -346,14 +354,22 @@ void VlessEncryptionServerTicketStore::Store(
         return;
     }
     Prune(now);
-    if (sessions_.size() >= 1024) {
-        sessions_.erase(sessions_.begin());
+    while (sessions_.size() >= 1024 && !order_.empty()) {
+        const auto& [oldest_ticket, oldest_expiry] = order_.front();
+        auto it = sessions_.find(oldest_ticket);
+        if (it != sessions_.end() && it->second.expires_at == oldest_expiry) {
+            sessions_.erase(it);
+        }
+        order_.pop_front();
     }
+    TicketArray ticket_array{};
+    std::copy(ticket.begin(), ticket.end(), ticket_array.begin());
+    const auto expires_at = now + std::chrono::seconds(seconds);
     Session session;
-    std::copy(ticket.begin(), ticket.end(), session.ticket.begin());
     session.pfs_key.assign(pfs_key.begin(), pfs_key.end());
-    session.expires_at = now + std::chrono::seconds(seconds);
-    sessions_.push_back(std::move(session));
+    session.expires_at = expires_at;
+    sessions_[ticket_array] = std::move(session);
+    order_.emplace_back(ticket_array, expires_at);
 }
 
 net::awaitable<std::optional<VlessEncryptionRuntime>>

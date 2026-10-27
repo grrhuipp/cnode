@@ -25,8 +25,7 @@ std::span<const uint8_t> Bytes(std::string_view value) {
     return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
 }
 void Prepend(acpp::AsyncStream& stream, std::string_view value) {
-    if (auto* tls = dynamic_cast<acpp::TlsStream*>(&stream)) tls->PrependReadData(Bytes(value));
-    else static_cast<acpp::TcpStream&>(stream).PrependReadData(Bytes(value));
+    stream.PrependReadData(Bytes(value));
 }
 std::string Flatten(const acpp::buf::MultiBuffer& data) {
     std::string result;

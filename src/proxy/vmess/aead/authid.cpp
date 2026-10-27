@@ -8,24 +8,38 @@
 namespace acpp {
 namespace vmess {
 
+namespace {
+EVP_CIPHER_CTX* GetThreadLocalEcbCtx() noexcept {
+    struct Holder {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        ~Holder() {
+            if (ctx) EVP_CIPHER_CTX_free(ctx);
+        }
+    };
+    thread_local Holder holder;
+    if (holder.ctx) {
+        EVP_CIPHER_CTX_reset(holder.ctx);
+    }
+    return holder.ctx;
+}
+}  // namespace
+
 void AES128ECBEncrypt(const uint8_t* key, const uint8_t* plaintext, uint8_t* ciphertext) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* ctx = GetThreadLocalEcbCtx();
     if (!ctx) return;
     EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr);
     EVP_CIPHER_CTX_set_padding(ctx, 0);
     int out_len = 0;
     EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, 16);
-    EVP_CIPHER_CTX_free(ctx);
 }
 
 void AES128ECBDecrypt(const uint8_t* key, const uint8_t* ciphertext, uint8_t* plaintext) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* ctx = GetThreadLocalEcbCtx();
     if (!ctx) return;
     EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr);
     EVP_CIPHER_CTX_set_padding(ctx, 0);
     int out_len = 0;
     EVP_DecryptUpdate(ctx, plaintext, &out_len, ciphertext, 16);
-    EVP_CIPHER_CTX_free(ctx);
 }
 
 uint32_t CRC32(const uint8_t* data, size_t len) {
