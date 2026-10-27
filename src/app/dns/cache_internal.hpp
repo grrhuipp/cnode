@@ -25,6 +25,7 @@ public:
     DnsCache& operator=(const DnsCache&) = delete;
 
     std::optional<DnsCacheEntry> Get(std::string_view domain);
+    std::optional<DnsResult> GetResult(std::string_view domain);
     void Store(std::string_view domain, const DnsResult& result);
     DnsCacheStats GetStats() const;
 

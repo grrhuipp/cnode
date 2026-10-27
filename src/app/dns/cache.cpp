@@ -38,6 +38,38 @@ std::optional<DnsCacheEntry> DnsCache::Get(std::string_view domain) {
     return result;
 }
 
+std::optional<DnsResult> DnsCache::GetResult(std::string_view domain) {
+    const auto found = entries_.find(domain);
+    if (found == entries_.end()) {
+        ++misses_;
+        return std::nullopt;
+    }
+    const auto node = found->second;
+    const auto now = steady_clock::now();
+    if (now >= node->entry.expire_time) {
+        entries_.erase(found);
+        order_.erase(node);
+        ++expired_;
+        ++misses_;
+        return std::nullopt;
+    }
+
+    const DnsCacheEntry& entry = node->entry;
+    DnsResult result;
+    if (entry.negative) {
+        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error_msg = "NXDOMAIN (cached)";
+    } else {
+        result.addresses.assign(entry.addresses.begin(), entry.addresses.end());
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+        entry.expire_time - now);
+    result.ttl = static_cast<uint32_t>(std::max<int64_t>(remaining.count(), 1));
+    result.from_cache = true;
+    ++hits_;
+    return result;
+}
+
 void DnsCache::Store(std::string_view domain, const DnsResult& result) {
     if (capacity_ == 0 || (!result.Ok() && result.error != ErrorCode::DNS_NO_RECORD)) {
         return;

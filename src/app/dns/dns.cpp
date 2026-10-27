@@ -32,19 +32,6 @@ namespace {
 
 constexpr size_t kAddressQueryAttempts = 3;
 
-DnsResult MakeCachedResult(const DnsCacheEntry& entry) {
-    DnsResult result;
-    if (entry.negative) {
-        result.error = ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "NXDOMAIN (cached)";
-    } else {
-        result.addresses.assign(entry.addresses.begin(), entry.addresses.end());
-    }
-    result.ttl = entry.ttl;
-    result.from_cache = true;
-    return result;
-}
-
 void AppendUniqueAddresses(
     std::vector<net::ip::address>& out,
     std::span<const net::ip::address> addresses) {
@@ -69,10 +56,10 @@ struct DNSWorker::Impl {
         DatagramExchange& server,
         std::string_view domain,
         bool query_aaaa);
-    void BuildQueryTo(memory::ByteVector& query,
-                      std::string_view domain,
-                      uint16_t txid,
-                      bool query_aaaa);
+    static size_t BuildQueryTo(std::span<uint8_t, 280> query,
+                               std::string_view domain,
+                               uint16_t txid,
+                               bool query_aaaa) noexcept;
     DnsResult ParseResponse(std::span<const uint8_t> response, uint16_t expected_txid);
 
     net::io_context& io_context;
@@ -118,12 +105,11 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
         co_return result;
     }
 
-    memory::ThreadLocalString canonical(domain);
-    if (canonical.back() == '.') canonical.pop_back();
-    for (char& c : canonical) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-    domain = canonical;
-    if (auto cached = cache.Get(domain)) {
-        co_return MakeCachedResult(*cached);
+    if (owned_domain.back() == '.') owned_domain.pop_back();
+    for (char& c : owned_domain) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    domain = owned_domain;
+    if (auto cached = cache.GetResult(domain)) {
+        co_return std::move(*cached);
     }
 
     co_return co_await inflight_resolves.Run(domain, [this, domain] {
@@ -230,9 +216,11 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
     std::string_view domain,
     bool query_aaaa) {
     DnsResult result;
-    memory::ByteVector query;
-    BuildQueryTo(query, domain, 0, query_aaaa);
-    auto response = co_await server.Exchange(query, std::chrono::seconds(config.timeout_sec));
+    std::array<uint8_t, 280> query{};
+    const size_t query_size = BuildQueryTo(query, domain, 0, query_aaaa);
+    auto response = co_await server.Exchange(
+        std::span<uint8_t>(query.data(), query_size),
+        std::chrono::seconds(config.timeout_sec));
     if (response.error) {
         result.error = response.error == io_error::timed_out ? ErrorCode::DNS_TIMEOUT :
             response.error == io_error::operation_aborted ? ErrorCode::CANCELLED :
@@ -241,59 +229,44 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
         result.error_msg = response.error.message();
         co_return result;
     }
-    const uint16_t txid = (query[0] << 8) | query[1];
+    const uint16_t txid = (static_cast<uint16_t>(query[0]) << 8) | query[1];
     co_return ParseResponse(std::span<const uint8_t>(response.bytes.data(), response.size), txid);
 }
 
-void DNSWorker::Impl::BuildQueryTo(
-    memory::ByteVector& query,
+size_t DNSWorker::Impl::BuildQueryTo(
+    std::span<uint8_t, 280> query,
     std::string_view domain,
     uint16_t txid,
-    bool query_aaaa) {
-    query.clear();
-    query.reserve(18 + domain.size());
+    bool query_aaaa) noexcept {
+    query[0] = static_cast<uint8_t>(txid >> 8);
+    query[1] = static_cast<uint8_t>(txid & 0xFF);
+    query[2] = 0x01;
+    query[3] = 0x00;
+    query[4] = 0x00;
+    query[5] = 0x01;
+    std::memset(query.data() + 6, 0, 6);
 
-    query.push_back(static_cast<uint8_t>(txid >> 8));
-    query.push_back(static_cast<uint8_t>(txid & 0xFF));
-
-    query.push_back(0x01);
-    query.push_back(0x00);
-
-    query.push_back(0x00);
-    query.push_back(0x01);
-
-    query.push_back(0x00);
-    query.push_back(0x00);
-
-    query.push_back(0x00);
-    query.push_back(0x00);
-
-    query.push_back(0x00);
-    query.push_back(0x00);
-
+    size_t out = 12;
     size_t pos = 0;
     while (pos < domain.size()) {
         size_t dot = domain.find('.', pos);
-        if (dot == std::string::npos) {
+        if (dot == std::string_view::npos) {
             dot = domain.size();
         }
-
         const size_t len = dot - pos;
-        query.push_back(static_cast<uint8_t>(len));
-        for (size_t i = pos; i < dot; ++i) {
-            query.push_back(static_cast<uint8_t>(domain[i]));
-        }
-
+        query[out++] = static_cast<uint8_t>(len);
+        std::memcpy(query.data() + out, domain.data() + pos, len);
+        out += len;
         pos = dot + 1;
     }
-    query.push_back(0x00);
+    query[out++] = 0x00;
 
     const uint16_t qtype = query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A;
-    query.push_back(static_cast<uint8_t>(qtype >> 8));
-    query.push_back(static_cast<uint8_t>(qtype & 0xFF));
-
-    query.push_back(0x00);
-    query.push_back(0x01);
+    query[out++] = static_cast<uint8_t>(qtype >> 8);
+    query[out++] = static_cast<uint8_t>(qtype & 0xFF);
+    query[out++] = 0x00;
+    query[out++] = 0x01;
+    return out;
 }
 
 DnsResult DNSWorker::Impl::ParseResponse(

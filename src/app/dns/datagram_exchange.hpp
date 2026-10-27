@@ -1,5 +1,6 @@
 #pragma once
 
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
 
@@ -13,7 +14,6 @@
 #include <memory>
 #include <openssl/rand.h>
 #include <span>
-#include <unordered_map>
 
 namespace acpp::app::dns {
 
@@ -185,7 +185,7 @@ private:
     udp::socket socket_;
     udp::endpoint endpoint_;
     TimeoutScheduler& scheduler_;
-    std::unordered_map<uint16_t, Pending*> pending_;
+    memory::ThreadLocalUnorderedMap<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
     size_t issued_ = 0;
