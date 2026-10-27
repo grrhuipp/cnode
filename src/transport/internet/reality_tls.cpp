@@ -1062,27 +1062,27 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         return false;
     }
 
-    const char* groups = "X25519:P-256:P-384";
+    const char* groups = "X25519MLKEM768:X25519:P-256:P-384";
     const char* sigalgs =
         "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
         "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:"
         "rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
     if (reality.fingerprint == "firefox") {
-        groups = "X25519:P-256:P-384:P-521";
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
         sigalgs =
             "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:"
             "ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:"
             "rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:"
             "rsa_pkcs1_sha512";
     } else if (reality.fingerprint == "safari" || reality.fingerprint == "ios") {
-        groups = "X25519:P-256:P-384:P-521";
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
         sigalgs =
             "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:"
             "ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:"
             "rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:"
             "rsa_pkcs1_sha512:rsa_pkcs1_sha1";
     } else if (reality.fingerprint == "random" || reality.fingerprint == "randomized") {
-        groups = "X25519:P-256:P-384:P-521";
+        groups = "X25519MLKEM768:X25519:P-256:P-384:P-521";
     }
     if (SSL_set1_groups_list(ssl, groups) != 1) {
         LOG_ERROR("REALITY client failed to configure key share groups");
