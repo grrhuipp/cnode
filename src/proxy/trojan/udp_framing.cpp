@@ -57,7 +57,7 @@ void UdpFramer::Parse() {
         }
 
         FramedUdpPacket packet;
-        packet.target = parsed.packet->target;
+        packet.target = std::move(parsed.packet->target);
         if (!parsed.packet->payload.empty() &&
             !buf::AppendSpanToMultiBuffer(parsed.packet->payload, packet.payload)) {
             throw std::bad_alloc();

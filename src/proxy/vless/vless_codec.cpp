@@ -218,7 +218,7 @@ std::optional<RequestHeader> Codec::ParseRequestHeader(
     size_t len,
     size_t& consumed) {
     consumed = 0;
-    if (len < 1 + 16 + 1 + 1 + 2 + 1) {
+    if (len < 1 + 16 + 1 + 1) {
         return std::nullopt;
     }
 
@@ -238,29 +238,27 @@ std::optional<RequestHeader> Codec::ParseRequestHeader(
     if (!reader.Ok()) {
         return std::nullopt;
     }
+
+    const uint8_t command = reader.ReadU8();
+    if (!reader.Ok()) {
+        return std::nullopt;
+    }
+    req.command = static_cast<Command>(command);
+    if (req.command == Command::MUX) {
+        req.target = TargetAddress("v1.mux.cool", 9527);
+    } else if (req.command == Command::TCP || req.command == Command::UDP) {
+        auto target = ReadAddress(reader);
+        if (!target) {
+            return std::nullopt;
+        }
+        req.target = std::move(*target);
+    } else {
+        return std::nullopt;
+    }
+
     if (!ParseHeaderAddons(addons, req)) {
         return std::nullopt;
     }
-
-    const uint8_t command = reader.ReadU8();
-    req.command = static_cast<Command>(command);
-    if (req.command != Command::TCP &&
-        req.command != Command::UDP &&
-        req.command != Command::MUX) {
-        return std::nullopt;
-    }
-
-    if (req.command == Command::MUX) {
-        req.target = TargetAddress("v1.mux.cool", 9527);
-        consumed = reader.Position();
-        return req;
-    }
-
-    auto target = ReadAddress(reader);
-    if (!target) {
-        return std::nullopt;
-    }
-    req.target = std::move(*target);
 
     consumed = reader.Position();
     return req;

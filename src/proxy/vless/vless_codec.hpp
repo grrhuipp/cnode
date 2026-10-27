@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
 #include <array>
@@ -8,7 +9,6 @@
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 
 namespace acpp::vless {
@@ -25,7 +25,7 @@ struct RequestHeader {
     uint8_t version = kVersion;
     std::array<uint8_t, 16> uuid{};
     uint8_t addons_len = 0;
-    std::string flow;
+    memory::ThreadLocalString flow;
     Command command = Command::TCP;
     TargetAddress target;
 };

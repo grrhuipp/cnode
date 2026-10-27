@@ -73,30 +73,6 @@ private:
     memory::ThreadLocalString client_ip_;
 };
 
-class VlessPendingReader final : public transport::MultiBufferReader {
-public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
-
-    VlessPendingReader(transport::MultiBufferReader& src,
-                       std::span<const uint8_t> first_packet)
-        : src_(src) {
-        if (!buf::AppendSpanToMultiBuffer(first_packet, pending_)) throw std::bad_alloc();
-    }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (!buf::HasData(pending_)) {
-            co_return co_await src_.ReadMultiBuffer();
-        }
-
-        co_return std::move(pending_);
-    }
-
-private:
-    transport::MultiBufferReader& src_;
-    buf::MultiBuffer pending_;
-};
-
 class VlessUdpReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
@@ -290,6 +266,105 @@ private:
     size_t header_len_ = 0;
 };
 
+
+net::awaitable<std::expected<::acpp::vless::RequestHeader, ErrorCode>>
+ReadVlessRequestHeader(VlessBufferedReader& active_reader,
+                       AsyncStream& stream,
+                       session::Context& ctx,
+                       std::string_view tag,
+                       std::string_view client_ip) {
+    std::array<uint8_t, 536> handshake{};
+    size_t total_read = 0;
+
+    auto read_exact = [&](size_t count) -> net::awaitable<std::expected<void, ErrorCode>> {
+        bool read_ok = false;
+        try {
+            read_ok = co_await active_reader.ReadExact(
+                handshake.data() + total_read,
+                count);
+        } catch (const IoSystemError&) {
+            if (stream.ConsumePhaseDeadline()) {
+                LOG_CONN_WARN(ctx, "[VLESS][{}] handshake phase deadline from {}",
+                              tag, client_ip);
+                co_return std::unexpected(ErrorCode::TIMEOUT);
+            }
+            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        }
+        if (!read_ok && stream.ConsumePhaseDeadline()) {
+            co_return std::unexpected(ErrorCode::TIMEOUT);
+        }
+        if (!read_ok && stream.ConsumeIdleTimeout()) {
+            co_return std::unexpected(ErrorCode::TIMEOUT);
+        }
+        if (!read_ok) {
+            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+        }
+        total_read += count;
+        co_return std::expected<void, ErrorCode>{};
+    };
+
+    if (auto ok = co_await read_exact(1); !ok) {
+        co_return std::unexpected(ok.error());
+    }
+    if (handshake[0] != ::acpp::vless::kVersion) {
+        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
+    }
+
+    if (auto ok = co_await read_exact(17); !ok) {
+        co_return std::unexpected(ok.error());
+    }
+    const uint8_t addons_len = handshake[17];
+    if (auto ok = co_await read_exact(static_cast<size_t>(addons_len) + 1); !ok) {
+        co_return std::unexpected(ok.error());
+    }
+
+    const uint8_t cmd = handshake[18 + addons_len];
+    if (cmd == static_cast<uint8_t>(::acpp::vless::Command::TCP) ||
+        cmd == static_cast<uint8_t>(::acpp::vless::Command::UDP)) {
+        if (auto ok = co_await read_exact(3); !ok) {
+            co_return std::unexpected(ok.error());
+        }
+        const uint8_t atype = handshake[total_read - 1];
+        if (atype == 0x01) {
+            if (auto ok = co_await read_exact(4); !ok) {
+                co_return std::unexpected(ok.error());
+            }
+        } else if (atype == 0x03) {
+            if (auto ok = co_await read_exact(16); !ok) {
+                co_return std::unexpected(ok.error());
+            }
+        } else if (atype == 0x02) {
+            if (auto ok = co_await read_exact(1); !ok) {
+                co_return std::unexpected(ok.error());
+            }
+            const uint8_t domain_len = handshake[total_read - 1];
+            if (domain_len == 0 || domain_len > 253) {
+                LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
+                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            if (auto ok = co_await read_exact(domain_len); !ok) {
+                co_return std::unexpected(ok.error());
+            }
+        } else {
+            LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
+            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+    } else if (cmd != static_cast<uint8_t>(::acpp::vless::Command::MUX)) {
+        LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    size_t consumed = 0;
+    auto request = ::acpp::vless::Codec::ParseRequestHeader(
+        handshake.data(),
+        total_read,
+        consumed);
+    if (!request || consumed != total_read) {
+        LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
+        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    co_return std::move(*request);
+}
 }  // namespace
 
 proxy::vless::inbound::Handler::Handler(
@@ -343,9 +418,6 @@ proxy::vless::inbound::Handler::Process(
     }
 
     std::optional<VlessOnlineSession> user_session;
-    std::array<uint8_t, 1024> handshake{};
-    size_t total_read = 0;
-    size_t consumed = 0;
     std::optional<::acpp::vless::RequestHeader> request;
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter* protocol_writer = stream.get();
@@ -400,43 +472,12 @@ proxy::vless::inbound::Handler::Process(
         }
     }
 
-    while (!request && total_read < handshake.size()) {
-        bool read_ok = false;
-        try {
-            read_ok = co_await active_reader->ReadExact(
-                handshake.data() + total_read,
-                1);
-        } catch (const IoSystemError&) {
-            if (stream->ConsumePhaseDeadline()) {
-                LOG_CONN_WARN(ctx, "[VLESS][{}] handshake phase deadline from {}",
-                                  tag, client_ip);
-                co_return fail_abortive(ErrorCode::TIMEOUT);
-            }
-            co_return fail_abortive(ErrorCode::SOCKET_READ_FAILED);
-        }
-        if (!read_ok && stream->ConsumePhaseDeadline()) {
-            co_return fail_abortive(ErrorCode::TIMEOUT);
-        }
-        if (!read_ok && stream->ConsumeIdleTimeout()) {
-            co_return fail_abortive(ErrorCode::TIMEOUT);
-        }
-        if (!read_ok) {
-            co_return fail_abortive(ErrorCode::SOCKET_EOF);
-        }
-        ++total_read;
-        request = ::acpp::vless::Codec::ParseRequestHeader(
-            handshake.data(),
-            total_read,
-            consumed);
-        if (total_read >= 1 && handshake[0] != ::acpp::vless::kVersion) {
-            co_return fail_abortive(ErrorCode::PROTOCOL_INVALID_VERSION);
-        }
+    auto parsed_request = co_await ReadVlessRequestHeader(
+        *active_reader, *stream, ctx, tag, client_ip);
+    if (!parsed_request) {
+        co_return fail_abortive(parsed_request.error());
     }
-
-    if (!request) {
-        LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
-        co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
+    request.emplace(std::move(*parsed_request));
     auto user_info = validator_.FindUser(tag, request->uuid);
     if (!user_info) {
         LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
@@ -451,7 +492,7 @@ proxy::vless::inbound::Handler::Process(
     }
     const bool use_vision = ::acpp::vless::IsVisionFlow(request->flow);
     if (!request->flow.empty()) {
-        if (request->flow != user_info->flow) {
+        if (std::string_view(request->flow) != user_info->flow) {
             LOG_NET_WARN("[VLESS][{}] request flow '{}' not allowed for user",
                           tag, request->flow);
             co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
@@ -536,18 +577,10 @@ proxy::vless::inbound::Handler::Process(
     }
     active_writer = &*response_writer;
 
-    std::span<const uint8_t> leftover;
-    if (consumed < total_read) {
-        leftover = std::span<const uint8_t>(
-            handshake.data() + consumed,
-            total_read - consumed);
-    }
-
     if (net == Network::MUX) {
-        VlessPendingReader mux_reader(*active_reader, leftover);
         co_return co_await mux::ProcessInbound(
             io_context,
-            transport::Link{&mux_reader, active_writer},
+            transport::Link{active_reader, active_writer},
             *stream,
             dispatcher,
             receiver.dispatch_policy,
@@ -559,7 +592,7 @@ proxy::vless::inbound::Handler::Process(
 
     if (net == Network::UDP) {
         VlessUdpReader udp_reader(
-            *active_reader, ctx.outbound.target, leftover, packet_addr_udp);
+            *active_reader, ctx.outbound.target, {}, packet_addr_udp);
         VlessUdpWriter udp_writer(*active_writer, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -572,16 +605,11 @@ proxy::vless::inbound::Handler::Process(
             timeouts);
     }
 
-    InitialPayload first_packet;
-    if (!leftover.empty()) {
-        first_packet.assign(leftover);
-    }
-
     if (use_vision) {
         ::acpp::vless::VisionReader vision_reader(
             *active_reader,
             request->uuid,
-            leftover);
+            {});
         ::acpp::vless::VisionWriter vision_writer(*active_writer, request->uuid);
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -599,7 +627,7 @@ proxy::vless::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{active_reader, active_writer},
-        std::move(first_packet),
+        InitialPayload{},
         ctx,
         *stats_,
         timeouts);

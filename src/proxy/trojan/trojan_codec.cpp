@@ -8,48 +8,13 @@ namespace acpp::trojan {
 using acpp::AddressType;
 using acpp::TargetAddress;
 
-const uint8_t TrojanCodec::CRLF[2] = {0x0D, 0x0A};
-
 namespace {
 
-std::optional<TargetAddress> ReadSocksAddress(ByteReader& reader, uint8_t atype) {
-    if (atype == 0x01) {
-        auto ipv4_bytes = reader.ReadBytes(4);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return std::nullopt;
-
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), ipv4_bytes.data(), bytes.size());
-        return TargetAddress(net::ip::make_address_v4(bytes), port);
-    }
-
-    if (atype == 0x03) {
-        uint8_t domain_len = reader.ReadU8();
-        if (!reader.Ok()) return std::nullopt;
-        if (domain_len == 0 || domain_len > 253) {
-            LOG_NET_DEBUG("Invalid domain length: {}", domain_len);
-            return std::nullopt;
-        }
-
-        std::string_view domain = reader.ReadStringView(domain_len);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return std::nullopt;
-        return TargetAddress(domain, port);
-    }
-
-    if (atype == 0x04) {
-        auto ipv6_bytes = reader.ReadBytes(16);
-        uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return std::nullopt;
-
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), ipv6_bytes.data(), bytes.size());
-        return TargetAddress(net::ip::make_address_v6(bytes), port);
-    }
-
-    return std::nullopt;
+[[nodiscard]] constexpr bool IsHexDigit(uint8_t ch) noexcept {
+    return (ch >= '0' && ch <= '9') ||
+           (ch >= 'a' && ch <= 'f') ||
+           (ch >= 'A' && ch <= 'F');
 }
-
 size_t SocksAddressSize(const TargetAddress& target) {
     return proxy::Socks5AddressBodySize(target);
 }
@@ -87,15 +52,12 @@ std::optional<TrojanRequest> TrojanCodec::ParseRequest(
     // 解析密码哈希（56 字节十六进制）
     auto hash_span = reader.ReadBytes(56);
     if (!reader.Ok()) return std::nullopt;
-    req.password_hash.assign(unsafe::ptr_cast<const char>(hash_span.data()), 56);
-
-    // 验证哈希格式
-    for (char c : req.password_hash) {
-        if (!std::isxdigit(c)) {
+    for (uint8_t ch : hash_span) {
+        if (!IsHexDigit(ch)) {
             return std::nullopt;
         }
     }
-
+    std::memcpy(req.password_hash.data(), hash_span.data(), req.password_hash.size());
     // CRLF
     uint8_t cr = reader.ReadU8();
     uint8_t lf = reader.ReadU8();
@@ -111,16 +73,12 @@ std::optional<TrojanRequest> TrojanCodec::ParseRequest(
         return std::nullopt;
     }
 
-    // 地址类型
-    uint8_t atype = reader.ReadU8();
-    if (!reader.Ok()) return std::nullopt;
-
-    auto target = ReadSocksAddress(reader, atype);
-    if (!target) {
+    auto parsed_addr = proxy::ParseSocks5Address(
+        data + reader.Position(), reader.Remaining(), 253, true);
+    if (!parsed_addr || !reader.Skip(parsed_addr->consumed)) {
         return std::nullopt;
     }
-    req.target = std::move(*target);
-
+    req.target = std::move(parsed_addr->target);
     // CRLF
     cr = reader.ReadU8();
     lf = reader.ReadU8();
@@ -208,39 +166,11 @@ size_t TrojanCodec::EncodeUdpPacketHeaderTo(
     return writer.Position();
 }
 
-size_t TrojanCodec::EncodeUdpPacketTo(
-    const TargetAddress& target,
-    const uint8_t* payload,
-    size_t payload_len,
-    uint8_t* output,
-    size_t output_size) {
-
-    const size_t header_len = EncodeUdpPacketHeaderTo(
-        target,
-        payload_len,
-        output,
-        output_size);
-    if (header_len == 0 || header_len + payload_len > output_size) {
-        return 0;
-    }
-
-    ByteWriter writer(output + header_len, output_size - header_len);
-    if (payload && payload_len > 0) {
-        writer.WriteBytes(payload, payload_len);
-    }
-
-    return header_len + writer.Position();
-}
-
 TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
     const uint8_t* data,
     size_t len) {
     UdpParseOutput output;
-    output.result = UdpParseResult::INCOMPLETE;
-    output.consumed = 0;
-
     if (len < 8) {
-        output.error_reason = "buffer too short (< 8 bytes)";
         return output;
     }
 
@@ -250,7 +180,6 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
     const uint8_t atype = reader.ReadU8();
     if (atype == 0x01) {
         if (reader.Remaining() < 6) {
-            output.error_reason = "incomplete IPv4 address";
             return output;
         }
         auto ipv4_bytes = reader.ReadBytes(4);
@@ -260,17 +189,14 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
         pkt.target = TargetAddress(net::ip::make_address_v4(bytes), port);
     } else if (atype == 0x03) {
         if (reader.Remaining() < 1) {
-            output.error_reason = "incomplete domain length";
             return output;
         }
         const uint8_t domain_len = reader.ReadU8();
         if (domain_len == 0 || domain_len > 253) {
             output.result = UdpParseResult::INVALID;
-            output.error_reason = "invalid domain length";
             return output;
         }
         if (reader.Remaining() < static_cast<size_t>(domain_len) + 2) {
-            output.error_reason = "incomplete domain address";
             return output;
         }
         const std::string_view domain = reader.ReadStringView(domain_len);
@@ -278,7 +204,6 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
         pkt.target = TargetAddress(domain, port);
     } else if (atype == 0x04) {
         if (reader.Remaining() < 18) {
-            output.error_reason = "incomplete IPv6 address";
             return output;
         }
         auto ipv6_bytes = reader.ReadBytes(16);
@@ -288,37 +213,32 @@ TrojanCodec::UdpParseOutput TrojanCodec::ParseUdpPacket(
         pkt.target = TargetAddress(net::ip::make_address_v6(bytes), port);
     } else {
         output.result = UdpParseResult::INVALID;
-        output.error_reason = "invalid address type";
         return output;
     }
 
     const uint16_t payload_len = reader.ReadU16BE();
     if (!reader.Ok()) {
-        output.error_reason = "incomplete payload length";
         return output;
     }
 
     const uint8_t cr = reader.ReadU8();
     const uint8_t lf = reader.ReadU8();
     if (!reader.Ok()) {
-        output.error_reason = "incomplete CRLF";
         return output;
     }
     if (cr != 0x0D || lf != 0x0A) {
         output.result = UdpParseResult::INVALID;
-        output.error_reason = "CRLF mismatch";
         return output;
     }
 
     auto payload = reader.ReadBytes(payload_len);
     if (!reader.Ok()) {
-        output.error_reason = "incomplete payload";
         return output;
     }
 
     pkt.payload = payload;
     output.result = UdpParseResult::SUCCESS;
-    output.packet = pkt;
+    output.packet = std::move(pkt);
     output.consumed = reader.Position();
     return output;
 }

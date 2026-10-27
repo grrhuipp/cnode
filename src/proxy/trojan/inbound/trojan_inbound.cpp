@@ -218,12 +218,13 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    auto user_info = validator_.FindUser(tag, request->password_hash);
+    const std::string_view password_hash = request->PasswordHashView();
+    auto user_info = validator_.FindUser(tag, password_hash);
     if (!user_info) {
         LOG_NET_WARN("[{}] Trojan auth failed from {} hash={}...{}",
                       tag, client_ip,
-                      request->password_hash.substr(0, 8),
-                      request->password_hash.substr(request->password_hash.size() > 8 ? request->password_hash.size() - 4 : 0));
+                      password_hash.substr(0, 8),
+                      password_hash.substr(password_hash.size() > 8 ? password_hash.size() - 4 : 0));
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
@@ -272,11 +273,8 @@ proxy::trojan::inbound::Handler::Process(
     }
 
     if (net == Network::UDP) {
-        // UDP：封帧下沉到入站 reader/writer helper，dispatcher 拿到的是携带逐包
-        // 目标的 Link；relay 协议无关。reader/writer 是本协程局部对象，
-        // 在 co_await Dispatch 期间有效；stream 被 Dispatch 接管但堆对象稳定，
-        // 引用持续有效。首帧 leftover 在构造时喂入 reader 的 framer。
         TrojanUdpReader udp_reader(*stream, leftover);
+        handshake_guard = buf::BufferGuard{};
         TrojanUdpWriter udp_writer(*stream);
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -290,10 +288,18 @@ proxy::trojan::inbound::Handler::Process(
     }
 
     InitialPayload first_packet;
-    if (!leftover.empty()) {
+    if (leftover.empty()) {
+        handshake_guard = buf::BufferGuard{};
+    } else if (leftover.size() <= InitialPayload::kInlineSize) {
         first_packet.assign(leftover);
+        handshake_guard = buf::BufferGuard{};
+    } else {
+        handshake_guard->Produce(static_cast<uint32_t>(total_read));
+        handshake_guard->Advance(static_cast<uint32_t>(consumed));
+        buf::MultiBuffer mb;
+        mb.push_back(std::move(handshake_guard));
+        first_packet = InitialPayload(std::move(mb));
     }
-
     auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
         io_context,

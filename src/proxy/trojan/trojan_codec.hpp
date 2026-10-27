@@ -7,24 +7,14 @@
 // ============================================================================
 
 #include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
 #include "acppnode/common/target_address.hpp"
 
+#include <array>
+#include <optional>
 #include <span>
+#include <string_view>
 
 namespace acpp::trojan {
-
-// ============================================================================
-// 握手失败原因
-// ============================================================================
-enum class HandshakeFailReason {
-    NONE,              // 无错误
-    TIMEOUT,           // 超时
-    CONNECTION_CLOSED, // 连接关闭
-    INVALID_PROTOCOL,  // 协议格式错误
-    AUTH_FAILED,       // 认证失败（密码错误）
-    UNKNOWN_ERROR,     // 未知错误
-};
 
 // ============================================================================
 // Trojan 命令类型
@@ -38,27 +28,14 @@ enum class TrojanCommand : uint8_t {
 // Trojan 请求
 // ============================================================================
 struct TrojanRequest {
-    memory::ThreadLocalString password_hash;  // SHA224 密码哈希（十六进制，56字节）
-    TrojanCommand             command;        // 命令
-    TargetAddress             target;         // 目标地址
+    std::array<char, 56> password_hash{};  // SHA224 密码哈希（十六进制，56字节）
+    TrojanCommand        command = TrojanCommand::CONNECT;
+    TargetAddress        target;
 
-    bool IsValid() const {
-        return password_hash.size() == 56 &&
-               (command == TrojanCommand::CONNECT || command == TrojanCommand::UDP_ASSOCIATE);
+    [[nodiscard]] std::string_view PasswordHashView() const noexcept {
+        return {password_hash.data(), password_hash.size()};
     }
 };
-
-// ============================================================================
-// 握手结果
-// ============================================================================
-struct HandshakeResult {
-    std::optional<TrojanRequest> request;
-    HandshakeFailReason fail_reason = HandshakeFailReason::NONE;
-
-    bool Ok() const { return request.has_value(); }
-    bool IsAuthFailed() const { return fail_reason == HandshakeFailReason::AUTH_FAILED; }
-};
-
 // ============================================================================
 // Trojan 协议编解码
 // ============================================================================
@@ -96,10 +73,9 @@ public:
 
     // UDP 解析输出
     struct UdpParseOutput {
-        UdpParseResult result;
+        UdpParseResult result = UdpParseResult::INCOMPLETE;
         std::optional<UdpPacket> packet;
         size_t consumed = 0;
-        std::string error_reason;  // 用于调试和日志
     };
 
     // 解析单个 UDP 包。SUCCESS 时 consumed 表示完整 frame 长度；
@@ -108,23 +84,12 @@ public:
         const uint8_t* data,
         size_t len);
 
-    // 编码 UDP 包（in-place 版本，避免内存分配）
+    // 编码 UDP 包头部（in-place 版本，避免内存分配）
     // 返回实际写入字节数，0 表示失败（缓冲区太小）
     static size_t EncodeUdpPacketHeaderTo(
         const TargetAddress& target,
         size_t payload_len,
         uint8_t* output,
         size_t output_size);
-
-    static size_t EncodeUdpPacketTo(
-        const TargetAddress& target,
-        const uint8_t* payload,
-        size_t payload_len,
-        uint8_t* output,
-        size_t output_size);
-
-private:
-    static const uint8_t CRLF[2];
 };
-
 }  // namespace acpp::trojan
