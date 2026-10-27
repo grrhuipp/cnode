@@ -5,8 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string>
-
 namespace acpp {
 
 enum class ProxyProtocolParseStatus : uint8_t {
@@ -76,6 +76,13 @@ public:
 
     // 解析 v2（二进制格式）
     [[nodiscard]] static ProxyProtocolResult ParseV2(const uint8_t* data, size_t len);
+
+    // 编码 PROXY Protocol v1 (version=1) 或 v2 (version=2) 头部
+    [[nodiscard]] static size_t Encode(
+        uint8_t version,
+        const tcp::endpoint& src,
+        const tcp::endpoint& dst,
+        std::span<uint8_t, 108> out) noexcept;
 };
 
 }  // namespace acpp

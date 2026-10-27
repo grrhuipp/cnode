@@ -568,36 +568,45 @@ expect_rejected(missing_reality_inbound_short_id "{}" "inbounds.json"
 expect_started(valid_reality_missing_sni_allowlist
     [=[{"workers":1}]=] "inbounds.json"
     [=[[{"tag":"reality-without-sni","protocol":"vless","listen":"127.0.0.1","port":12107,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":[""],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=])
-expect_rejected(unsupported_reality_target_fallback "{}" "inbounds.json"
-    [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
-    "target fallback")
+expect_started(valid_reality_target_fallback
+    [=[{"workers":1}]=] "inbounds.json"
+    [=[[{"tag":"valid-reality-target","protocol":"vless","listen":"127.0.0.1","port":12108,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com:443","xver":1,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=])
+expect_rejected(invalid_reality_target_fallback "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"example.com","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "REALITY dest is invalid")
 expect_rejected(unsupported_reality_target_alias "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"target":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
-    "dest/target is not supported")
-expect_rejected(unsupported_reality_fingerprint "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-fingerprint","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"chrome"}}}]]=]
-    "ClientHello fingerprint")
-expect_rejected(unsupported_reality_spider "{}" "outbounds.json"
-    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spiderX":"/"}}}]]=]
-    "REALITY crawler")
+    "REALITY target is not supported; use dest")
+expect_started(valid_reality_fingerprint
+    [=[{"workers":1}]=] "outbounds.json"
+    [=[[{"tag":"valid-reality-fingerprint","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"chrome","spiderX":"/news"}}}]]=])
+expect_rejected(invalid_reality_fingerprint "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-fingerprint","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"invalid-fp"}}}]]=]
+    "REALITY fingerprint is invalid")
+expect_rejected(invalid_reality_spider "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spiderX":"relative"}}}]]=]
+    "REALITY spiderX must be a valid HTTP path starting with '/'")
 expect_rejected(unsupported_reality_spider_alias "{}" "outbounds.json"
     [=[[{"tag":"bad-reality-spider","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","spider_x":"/"}}}]]=]
-    "spiderX/spider_x is not supported")
+    "REALITY spider_x is not supported; use spiderX")
 expect_started(valid_native_reality_client
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-native-reality","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef"}}}]]=])
-expect_rejected(unsupported_reality_mldsa_seed "{}" "inbounds.json"
+expect_started(valid_reality_mldsa_seed
+    [=[{"workers":1}]=] "inbounds.json"
+    [=[[{"tag":"valid-reality-mldsa","protocol":"vless","listen":"127.0.0.1","port":12109,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"],"mldsa65Seed":"unused-before-handshake"}}}]]=])
+expect_rejected(invalid_reality_mldsa_seed "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"],"mldsa65Seed":"configured-but-unused"}}}]]=]
-    "ML-DSA-65")
+    "REALITY mldsa65Seed is invalid")
 expect_rejected(unsupported_reality_mldsa_seed_alias "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"],"mldsa65_seed":"configured-but-unused"}}}]]=]
-    "ML-DSA-65")
-expect_rejected(unsupported_reality_mldsa_verify "{}" "outbounds.json"
+    "mldsa65_seed/mldsa65_verify is not supported")
+expect_rejected(invalid_reality_mldsa_verify "{}" "outbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65Verify":"configured-but-unused"}}}]]=]
-    "signing and verification are not supported")
+    "REALITY mldsa65Verify is invalid")
 expect_rejected(unsupported_reality_mldsa_verify_alias "{}" "outbounds.json"
     [=[[{"tag":"bad-reality-mldsa","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","mldsa65_verify":"configured-but-unused"}}}]]=]
-    "signing and verification are not supported")
+    "mldsa65_seed/mldsa65_verify is not supported")
 expect_rejected(unsupported_reality_proxy_protocol "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-xver","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"xver":1,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "PROXY protocol forwarding")

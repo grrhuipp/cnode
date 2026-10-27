@@ -823,6 +823,9 @@ if(CNODE_BUILD_TESTS)
     target_include_directories(cnode_reality_key_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    target_link_libraries(cnode_reality_key_test PRIVATE
+        crypto
+    )
     target_compile_options(cnode_reality_key_test PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /EHsc /Zc:preprocessor>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
@@ -1284,6 +1287,8 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_v2board_node_info_json_test
         tests/v2board_node_info_json_test.cpp
         src/api/v2board/node_info_json.cpp
+        src/transport/internet/reality_key.cpp
+        src/transport/internet/reality_short_id.cpp
         src/infra/json.cpp
     )
     target_include_directories(cnode_v2board_node_info_json_test PRIVATE
@@ -1293,6 +1298,7 @@ if(CNODE_BUILD_TESTS)
     target_link_libraries(cnode_v2board_node_info_json_test PRIVATE
         asio::asio
         Threads::Threads
+        crypto
     )
     if(WIN32)
         target_link_libraries(cnode_v2board_node_info_json_test PRIVATE ws2_32)
@@ -3021,7 +3027,7 @@ if(CNODE_BUILD_TESTS)
                 --binary $<TARGET_FILE:cnode>
                 --output ${CMAKE_CURRENT_BINARY_DIR}/udp_relay_integration_test)
         set_tests_properties(cnode_udp_relay_integration_test PROPERTIES TIMEOUT 90)
-        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream)
+        foreach(integration IN ITEMS dns_endpoint tls_cancellation http_upgrade grpc_eof grpc_substream reality)
             add_test(NAME cnode_${integration}_integration_test
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py

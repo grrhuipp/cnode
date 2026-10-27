@@ -153,22 +153,54 @@ struct RealityConfig {
     // 服务端字段
     bool show = false;
     std::string type;
+    std::string dest_host;
+    uint16_t dest_port = 0;
+    uint8_t xver = 0;
     std::vector<std::string> server_names;
     std::optional<transport::internet::RealityKey> private_key;
     std::vector<transport::internet::RealityShortId> short_ids;
     std::optional<transport::internet::RealityClientVersion> min_client_version;
     std::optional<transport::internet::RealityClientVersion> max_client_version;
     uint64_t max_time_diff = 0;
+    std::optional<transport::internet::RealityKey> mldsa65_seed;
 
     // 客户端字段
+    std::string fingerprint;
     std::string server_name;
     std::optional<transport::internet::RealityKey> public_key;
     transport::internet::RealityShortId short_id{};
+    std::string spider_x;
+    std::shared_ptr<const transport::internet::RealityMldsa65PublicKey> mldsa65_verify;
 
     // 调试/兼容字段
     std::string master_key_log;
 
     [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
+    [[nodiscard]] bool HasDest() const noexcept { return !dest_host.empty() && dest_port != 0; }
+    [[nodiscard]] bool operator==(const RealityConfig& other) const noexcept {
+        const bool verify_equal =
+            (mldsa65_verify == nullptr) == (other.mldsa65_verify == nullptr) &&
+            (!mldsa65_verify || *mldsa65_verify == *other.mldsa65_verify);
+        return show == other.show &&
+               type == other.type &&
+               dest_host == other.dest_host &&
+               dest_port == other.dest_port &&
+               xver == other.xver &&
+               server_names == other.server_names &&
+               private_key == other.private_key &&
+               short_ids == other.short_ids &&
+               min_client_version == other.min_client_version &&
+               max_client_version == other.max_client_version &&
+               max_time_diff == other.max_time_diff &&
+               mldsa65_seed == other.mldsa65_seed &&
+               fingerprint == other.fingerprint &&
+               server_name == other.server_name &&
+               public_key == other.public_key &&
+               short_id == other.short_id &&
+               spider_x == other.spider_x &&
+               verify_equal &&
+               master_key_log == other.master_key_log;
+    }
 
     static RealityConfig FromJson(const json::object& j);
 };

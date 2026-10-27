@@ -47,10 +47,21 @@ index c2c04bb5e..cf644700c 100644
  // The |privatekey| argument must be the private key of the certificate |x509|.
  // If the override argument is 0, then |x509|, |privatekey|, and |chain| are
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index b4c799eb5..d81061fae 100644
+index b4c799eb5..558a51f10 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -4065,6 +4065,11 @@ bool tls1_choose_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t *out) {
+@@ -347,6 +347,10 @@ bool tls12_add_verify_sigalgs(const SSL_HANDSHAKE *hs, CBB *out) {
+ 
+ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
+                              uint16_t sigalg) {
++  if (hs->config && hs->config->reality_client_hello_cb != nullptr &&
++      sigalg == SSL_SIGN_ED25519) {
++    return true;
++  }
+   for (uint16_t verify_sigalg : tls12_get_verify_sigalgs(hs)) {
+     if (verify_sigalg == sigalg) {
+       return true;
+@@ -4065,6 +4069,11 @@ bool tls1_choose_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t *out) {
      // through our available private keys to check for support.
      if (ssl_public_key_supports_signature_algorithm(hs, sigalg) ||
          ssl_cert_private_keys_supports_signature_algorithm(hs, sigalg)) {
@@ -62,7 +73,6 @@ index b4c799eb5..d81061fae 100644
        // Check if peer supports negotiated signature algorithms.
        for (uint16_t peer_sigalg : peer_sigalgs) {
          if (sigalg == peer_sigalg) {
-diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
 index eb4acb8dd..a0db8c383 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc

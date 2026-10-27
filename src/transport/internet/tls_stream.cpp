@@ -502,6 +502,37 @@ net::awaitable<bool> TlsStream::Handshake() {
 
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
+        if (!reality_client_state_->spider_x.empty()) {
+            const std::string_view host = reality_client_state_->server_name.empty()
+                ? std::string_view("localhost")
+                : std::string_view(reality_client_state_->server_name);
+            const std::string request = std::format(
+                "GET {} HTTP/1.1\r\n"
+                "Host: {}\r\n"
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                "Connection: close\r\n\r\n",
+                reality_client_state_->spider_x,
+                host);
+            auto [write_ec, written] = co_await net::async_write(
+                impl_->stream,
+                net::buffer(request.data(), request.size()),
+                net::bind_allocator(
+                    memory::ThreadLocalAllocator<std::byte>{},
+                    net::as_tuple(net::deferred)));
+            (void)written;
+            if (!write_ec) {
+                std::array<uint8_t, 1024> drain{};
+                auto [read_ec, read_n] = co_await impl_->stream.async_read_some(
+                    net::buffer(drain.data(), drain.size()),
+                    net::bind_allocator(
+                        memory::ThreadLocalAllocator<std::byte>{},
+                        net::as_tuple(net::deferred)));
+                (void)read_ec;
+                (void)read_n;
+            }
+        }
         co_return false;
     }
 

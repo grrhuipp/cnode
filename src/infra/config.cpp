@@ -1,6 +1,8 @@
 #include "acppnode/infra/config.hpp"
 #include "acppnode/common/ip_address.hpp"
 #include "acppnode/common/domain_name.hpp"
+#include "acppnode/common/ip_utils.hpp"
+#include "acppnode/common/target_address.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/infra/outbound_bind_config.hpp"
@@ -955,19 +957,31 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
     RealityConfig cfg;
     cfg.show = jbool(j, "show", false);
     cfg.type = lower_ascii_copy(jstr(j, "type", ""));
-    if (j.contains("dest") || j.contains("target")) {
+    if (j.contains("target")) {
         throw std::invalid_argument(
-            "REALITY dest/target is not supported; target fallback for "
-            "unauthenticated handshakes is not implemented");
+            "REALITY target is not supported; use dest");
+    }
+    const std::string dest_str = jstr(j, "dest", "");
+    if (!dest_str.empty()) {
+        const auto parsed_dest = TargetAddress::Parse(dest_str);
+        if (!parsed_dest) {
+            throw std::invalid_argument("REALITY dest is invalid");
+        }
+        cfg.dest_host = parsed_dest->IsIP()
+            ? iputil::NormalizeAddressString(*parsed_dest->resolved_addr)
+            : std::string(parsed_dest->host);
+        cfg.dest_port = parsed_dest->port;
+    } else if (j.contains("dest")) {
+        throw std::invalid_argument("REALITY dest is invalid");
     }
     auto xver = ParseJsonUint64(j, "xver", 2);
     if (!xver) {
         throw std::invalid_argument(std::move(xver.error()));
     }
-    if (xver->value_or(0) != 0) {
+    cfg.xver = static_cast<uint8_t>(xver->value_or(0));
+    if (cfg.xver != 0 && !cfg.HasDest()) {
         throw std::invalid_argument(
-            "REALITY xver 1 and 2 are not supported; PROXY protocol forwarding "
-            "to the REALITY target is not implemented");
+            "REALITY xver 1 and 2 require dest for PROXY protocol forwarding");
     }
     cfg.server_names = jstr_array(j, "serverNames");
     const std::string private_key =
@@ -1015,16 +1029,42 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(std::move(max_time_diff.error()));
     }
     cfg.max_time_diff = max_time_diff->value_or(0);
-    if (j.contains("mldsa65Seed") || j.contains("mldsa65_seed") ||
-        j.contains("mldsa65Verify") || j.contains("mldsa65_verify")) {
+    if (j.contains("mldsa65_seed") || j.contains("mldsa65_verify")) {
         throw std::invalid_argument(
-            "REALITY ML-DSA-65 certificate signing and verification are not "
-            "supported");
+            "REALITY mldsa65_seed/mldsa65_verify is not supported; use "
+            "mldsa65Seed/mldsa65Verify");
     }
-    if (j.contains("fingerprint")) {
-        throw std::invalid_argument(
-            "REALITY fingerprint is not supported; ClientHello fingerprint "
-            "emulation is not implemented");
+    const std::string mldsa65_seed = jstr(j, "mldsa65Seed", "");
+    if (!mldsa65_seed.empty()) {
+        auto parsed = transport::internet::ParseRealityMldsa65Seed(mldsa65_seed);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY mldsa65Seed is invalid");
+        }
+        cfg.mldsa65_seed = *parsed;
+    } else if (j.contains("mldsa65Seed")) {
+        throw std::invalid_argument("REALITY mldsa65Seed is invalid");
+    }
+    const std::string mldsa65_verify = jstr(j, "mldsa65Verify", "");
+    if (!mldsa65_verify.empty()) {
+        auto parsed =
+            transport::internet::ParseRealityMldsa65PublicKey(mldsa65_verify);
+        if (!parsed) {
+            throw std::invalid_argument("REALITY mldsa65Verify is invalid");
+        }
+        cfg.mldsa65_verify =
+            std::make_shared<const transport::internet::RealityMldsa65PublicKey>(
+                *parsed);
+    } else if (j.contains("mldsa65Verify")) {
+        throw std::invalid_argument("REALITY mldsa65Verify is invalid");
+    }
+    const std::string fingerprint = jstr(j, "fingerprint", "");
+    if (!fingerprint.empty()) {
+        auto normalized =
+            transport::internet::NormalizeRealityFingerprint(fingerprint);
+        if (!normalized) {
+            throw std::invalid_argument("REALITY fingerprint is invalid");
+        }
+        cfg.fingerprint = std::move(*normalized);
     }
     cfg.server_name = jstr(j, "serverName", "");
     const std::string public_key = jstr(
@@ -1042,10 +1082,16 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("REALITY shortId is invalid");
     }
     cfg.short_id = *short_id;
-    if (j.contains("spiderX") || j.contains("spider_x")) {
+    if (j.contains("spider_x")) {
         throw std::invalid_argument(
-            "REALITY spiderX/spider_x is not supported; the REALITY crawler "
-            "is not implemented");
+            "REALITY spider_x is not supported; use spiderX");
+    }
+    cfg.spider_x = jstr(j, "spiderX", "");
+    if (!cfg.spider_x.empty() &&
+        (cfg.spider_x.front() != '/' ||
+         !transport::internet::IsValidHttpRequestTarget(cfg.spider_x))) {
+        throw std::invalid_argument(
+            "REALITY spiderX must be a valid HTTP path starting with '/'");
     }
     cfg.master_key_log = jstr(
         j, "masterKeyLog", "");

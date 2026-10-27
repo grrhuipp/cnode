@@ -27,7 +27,10 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
 
     build.proxy_protocol = panel_config.ProxyProtocol;
 
-    if (tls_enable) {
+    if (node_config.EnableReality) {
+        build.stream_settings.security = std::string(constants::protocol::kReality);
+        build.stream_settings.reality = node_config.Reality;
+    } else if (tls_enable) {
         build.stream_settings.security = std::string(constants::protocol::kTls);
         build.stream_settings.tls.cert_file = panel_config.TLSCert;
         build.stream_settings.tls.key_file = panel_config.TLSKey;
@@ -50,6 +53,22 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
             : node_config.Path;
         if (!node_config.Host.empty()) {
             build.stream_settings.http_upgrade.host = node_config.Host;
+        }
+    }
+    if (build.stream_settings.IsGrpc()) {
+        build.stream_settings.grpc.service_name = !node_config.ServiceName.empty()
+            ? node_config.ServiceName
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.grpc.authority = node_config.Host;
+        }
+    }
+    if (build.stream_settings.IsXHttp()) {
+        build.stream_settings.xhttp.path = node_config.Path.empty()
+            ? std::string(constants::binding::kRootPath)
+            : node_config.Path;
+        if (!node_config.Host.empty()) {
+            build.stream_settings.xhttp.host = node_config.Host;
         }
     }
     build.sniff.enabled = node_config.SniffEnabled;

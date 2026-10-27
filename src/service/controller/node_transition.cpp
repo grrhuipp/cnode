@@ -24,6 +24,10 @@ bool NodeConfigChanged(const api::NodeInfo& current,
         || current.Path != candidate.Path
         || current.Host != candidate.Host
         || current.EnableTLS != candidate.EnableTLS
+        || current.EnableReality != candidate.EnableReality
+        || current.Flow != candidate.Flow
+        || current.ServiceName != candidate.ServiceName
+        || current.Reality != candidate.Reality
         || current.TLSServerName != candidate.TLSServerName
         || current.CypherMethod != candidate.CypherMethod
         || current.ShadowsocksServerKey != candidate.ShadowsocksServerKey

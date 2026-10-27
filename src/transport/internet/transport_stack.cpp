@@ -4,6 +4,7 @@
 #include "grpc_hunk.hpp"
 #include "http_path_match.hpp"
 #include "tls_context_cache.hpp"
+#include "reality_tls.hpp"
 #include "tls_context_cache_key.hpp"
 #include "xhttp_packet_queue.hpp"
 #include "xhttp_packet_session_key.hpp"
@@ -22,6 +23,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #include <array>
 #include <charconv>
 #include <cctype>
@@ -5461,6 +5463,101 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
 
+
+net::awaitable<void> RunRealityFallbackProxy(
+    net::io_context& io_context,
+    std::unique_ptr<TcpStream> client_tcp,
+    const RealityConfig& reality,
+    memory::ByteVector initial_bytes) {
+    if (!client_tcp || !reality.HasDest()) {
+        co_return;
+    }
+
+    std::unique_ptr<AsyncStream> dest_stream;
+    constexpr auto kFallbackDialTimeout = std::chrono::seconds(10);
+    if (const auto literal = iputil::ParseLiteral(reality.dest_host)) {
+        auto dial = co_await TcpStream::Connect(
+            io_context,
+            tcp::endpoint(iputil::NormalizeAddress(*literal), reality.dest_port),
+            kFallbackDialTimeout);
+        if (dial.Ok()) {
+            dest_stream = std::move(dial.stream);
+        }
+    } else {
+        tcp::resolver resolver(io_context);
+        auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
+            reality.dest_host,
+            std::to_string(reality.dest_port),
+            net::as_tuple(net::use_awaitable));
+        if (!resolve_ec) {
+            for (const auto& entry : endpoints) {
+                auto dial = co_await TcpStream::Connect(
+                    io_context, entry.endpoint(), kFallbackDialTimeout);
+                if (dial.Ok()) {
+                    dest_stream = std::move(dial.stream);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!dest_stream) {
+        client_tcp->Close();
+        co_return;
+    }
+
+    client_tcp->ClearPhaseDeadline();
+    client_tcp->SetIdleTimeout(std::chrono::seconds(60));
+    dest_stream->SetIdleTimeout(std::chrono::seconds(60));
+
+    std::array<uint8_t, 108> proxy_header{};
+    size_t proxy_header_len = 0;
+    if (reality.xver == 1 || reality.xver == 2) {
+        proxy_header_len = ProxyProtocolParser::Encode(
+            reality.xver,
+            client_tcp->RemoteEndpoint(),
+            client_tcp->LocalEndpoint(),
+            proxy_header);
+    }
+
+    bool initial_write_ok = false;
+    if (proxy_header_len > 0) {
+        std::array<net::const_buffer, 2> buffers{
+            net::const_buffer(proxy_header.data(), proxy_header_len),
+            net::const_buffer(initial_bytes.data(), initial_bytes.size()),
+        };
+        initial_write_ok = co_await WriteBuffersFullToStream(*dest_stream, buffers);
+    } else {
+        initial_write_ok = co_await WriteFullToStream(
+            *dest_stream, initial_bytes.data(), initial_bytes.size());
+    }
+    memory::ByteVector{}.swap(initial_bytes);
+    if (!initial_write_ok) {
+        dest_stream->Close();
+        client_tcp->Close();
+        co_return;
+    }
+
+    auto forward_half = [](AsyncStream& from, AsyncStream& to) -> net::awaitable<void> {
+        try {
+            for (;;) {
+                buf::MultiBuffer mb = co_await from.ReadMultiBuffer();
+                if (!buf::HasData(mb)) {
+                    to.ShutdownWrite();
+                    co_return;
+                }
+                co_await to.WriteMultiBuffer(std::move(mb));
+            }
+        } catch (...) {
+            to.Cancel();
+        }
+    };
+    using net::experimental::awaitable_operators::operator&&;
+    co_await (forward_half(*client_tcp, *dest_stream) &&
+              forward_half(*dest_stream, *client_tcp));
+    dest_stream->Close();
+    client_tcp->Close();
+}
 }  // namespace
 
 static std::unique_ptr<TcpStream> TakeOwnedTcpStream(
@@ -5513,6 +5610,55 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         if (!tcp) {
             LOG_ERROR("[Transport] BuildInbound: TLS-like security requested but base stream is not TcpStream");
             co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
+        }
+        if (s.IsReality() && s.reality.HasDest()) {
+            memory::ByteVector initial_bytes(4096);
+            size_t total = 0;
+            try {
+                total = co_await tcp->AsyncRead(
+                    net::buffer(initial_bytes.data(), initial_bytes.size()));
+                if (total >= 5 && initial_bytes[0] == 0x16) {
+                    const size_t record_len =
+                        (static_cast<size_t>(initial_bytes[3]) << 8) |
+                        initial_bytes[4];
+                    if (record_len <= 16384 && 5 + record_len > total) {
+                        const size_t needed = 5 + record_len;
+                        if (initial_bytes.size() < needed) {
+                            initial_bytes.resize(needed);
+                        }
+                        while (total < needed) {
+                            const size_t n = co_await tcp->AsyncRead(
+                                net::buffer(
+                                    initial_bytes.data() + total,
+                                    needed - total));
+                            if (n == 0) {
+                                break;
+                            }
+                            total += n;
+                        }
+                    }
+                }
+            } catch (...) {
+                co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+            }
+            if (total == 0) {
+                co_return std::unexpected(ErrorCode::SOCKET_EOF);
+            }
+            initial_bytes.resize(total);
+            if (!VerifyRealityClientHelloRecord(initial_bytes, s.reality)) {
+                LOG_NET_DEBUG(
+                    "[Transport] BuildInbound: REALITY unauthenticated handshake, falling back to {}:{}",
+                    s.reality.dest_host,
+                    s.reality.dest_port);
+                co_await RunRealityFallbackProxy(
+                    io_context,
+                    std::move(tcp),
+                    s.reality,
+                    std::move(initial_bytes));
+                co_return std::unique_ptr<AsyncStream>{};
+            }
+            tcp->PrependReadData(initial_bytes);
+            memory::ByteVector{}.swap(initial_bytes);
         }
         auto tls = co_await WrapTlsServer(std::move(tcp), *ctx);
         if (!tls) {

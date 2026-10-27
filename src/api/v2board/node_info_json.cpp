@@ -1,9 +1,14 @@
 #include "node_info_json.hpp"
 
+#include "acppnode/common/target_address.hpp"
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
+#include "acppnode/transport/internet/reality_key.hpp"
+#include "acppnode/transport/internet/reality_server_name.hpp"
+#include "acppnode/transport/internet/reality_short_id.hpp"
 
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -62,6 +67,13 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                     "networkSettings path must be a valid HTTP request target");
             }
         }
+        if (const auto* service_name = settings.if_contains("serviceName")) {
+            if (!service_name->is_string()) {
+                return std::unexpected(
+                    "networkSettings serviceName must be a string");
+            }
+            config.ServiceName = std::string(service_name->as_string());
+        }
         if (const auto* headers = settings.if_contains("headers")) {
             if (!headers->is_object()) {
                 return std::unexpected(
@@ -100,10 +112,24 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
     if (const auto* tls = source.if_contains(constants::protocol::kTls);
         tls && !tls->is_null()) {
         if (tls->is_int64()) {
-            config.EnableTLS = tls->as_int64() != 0;
+            const auto mode = tls->as_int64();
+            config.EnableTLS = (mode == 1);
+            config.EnableReality = (mode == 2);
+        } else if (tls->is_uint64()) {
+            const auto mode = tls->as_uint64();
+            config.EnableTLS = (mode == 1);
+            config.EnableReality = (mode == 2);
         } else if (tls->is_bool()) {
             config.EnableTLS = tls->as_bool();
         }
+    }
+
+    if (const auto* flow = source.if_contains("flow");
+        flow && !flow->is_null()) {
+        if (!flow->is_string()) {
+            return std::unexpected("flow must be a string");
+        }
+        config.Flow = std::string(flow->as_string());
     }
 
     if (const auto* server_name = source.if_contains("server_name");
@@ -119,6 +145,163 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
         config.ShadowsocksServerKey = std::string(server_key->as_string());
     }
 
+    if (config.EnableReality) {
+        const auto* tls_settings_val = source.if_contains("tls_settings");
+        if (!tls_settings_val) {
+            tls_settings_val = source.if_contains("tlsSettings");
+        }
+        if (!tls_settings_val || !tls_settings_val->is_object()) {
+            return std::unexpected(
+                "REALITY node requires tls_settings object");
+        }
+        const auto& rs = tls_settings_val->as_object();
+
+        const auto* priv_val = rs.if_contains("private_key");
+        if (!priv_val) {
+            priv_val = rs.if_contains("privateKey");
+        }
+        if (!priv_val || !priv_val->is_string() || priv_val->as_string().empty()) {
+            return std::unexpected("REALITY tls_settings requires private_key");
+        }
+        const auto parsed_priv =
+            transport::internet::ParseRealityKey(priv_val->as_string());
+        if (!parsed_priv) {
+            return std::unexpected("REALITY private_key is invalid");
+        }
+        config.Reality.private_key = *parsed_priv;
+
+        auto append_server_name = [&](std::string_view name) -> bool {
+            if (!name.empty() &&
+                !domain::IsValidDnsHostname(name, domain::TrailingDotPolicy::Forbid)) {
+                return false;
+            }
+            config.Reality.server_names.emplace_back(name);
+            return true;
+        };
+        if (const auto* sn_list = rs.if_contains("server_names")
+                ? rs.if_contains("server_names")
+                : rs.if_contains("serverNames")) {
+            if (!sn_list->is_array()) {
+                return std::unexpected("REALITY server_names must be an array");
+            }
+            for (const auto& item : sn_list->as_array()) {
+                if (!item.is_string() || !append_server_name(item.as_string())) {
+                    return std::unexpected("REALITY server_names contains an invalid hostname");
+                }
+            }
+        } else if (const auto* sn = rs.if_contains("server_name")
+                       ? rs.if_contains("server_name")
+                       : rs.if_contains("serverName")) {
+            if (!sn->is_string() || !append_server_name(sn->as_string())) {
+                return std::unexpected("REALITY server_name is invalid");
+            }
+        } else if (!config.TLSServerName.empty()) {
+            if (!append_server_name(config.TLSServerName)) {
+                return std::unexpected("REALITY server_name is invalid");
+            }
+        }
+        if (config.Reality.server_names.empty()) {
+            return std::unexpected("REALITY node requires server_name");
+        }
+
+        auto append_short_id = [&](std::string_view sid) -> bool {
+            auto parsed = transport::internet::ParseRealityShortId(sid);
+            if (!parsed) {
+                return false;
+            }
+            config.Reality.short_ids.push_back(*parsed);
+            return true;
+        };
+        if (const auto* sid_list = rs.if_contains("short_ids")
+                ? rs.if_contains("short_ids")
+                : rs.if_contains("shortIds")) {
+            if (!sid_list->is_array()) {
+                return std::unexpected("REALITY short_ids must be an array");
+            }
+            for (const auto& item : sid_list->as_array()) {
+                if (!item.is_string() || !append_short_id(item.as_string())) {
+                    return std::unexpected("REALITY short_ids contains an invalid value");
+                }
+            }
+        } else if (const auto* sid = rs.if_contains("short_id")
+                       ? rs.if_contains("short_id")
+                       : rs.if_contains("shortId")) {
+            if (sid->is_array()) {
+                for (const auto& item : sid->as_array()) {
+                    if (!item.is_string() || !append_short_id(item.as_string())) {
+                        return std::unexpected("REALITY short_id contains an invalid value");
+                    }
+                }
+            } else if (sid->is_string()) {
+                if (!append_short_id(sid->as_string())) {
+                    return std::unexpected("REALITY short_id is invalid");
+                }
+            } else if (!sid->is_null()) {
+                return std::unexpected("REALITY short_id must be a string or array");
+            }
+        }
+        if (config.Reality.short_ids.empty()) {
+            config.Reality.short_ids.push_back(transport::internet::RealityShortId{});
+        }
+
+        if (const auto* dest_val = rs.if_contains("dest")) {
+            if (!dest_val->is_string() || dest_val->as_string().empty()) {
+                return std::unexpected("REALITY dest must be a non-empty string");
+            }
+            const auto parsed_dest = TargetAddress::Parse(dest_val->as_string());
+            if (!parsed_dest) {
+                return std::unexpected("REALITY dest is invalid");
+            }
+            config.Reality.dest_host = parsed_dest->IsIP()
+                ? iputil::NormalizeAddressString(*parsed_dest->resolved_addr)
+                : std::string(parsed_dest->host);
+            config.Reality.dest_port = parsed_dest->port;
+        } else if (rs.contains("server_port")) {
+            const auto dest_port = ReadJsonPort(rs, "server_port");
+            if (dest_port.error != JsonPortError::None) {
+                return std::unexpected("REALITY tls_settings.server_port is invalid");
+            }
+            const std::string& fallback_host = config.Reality.server_names.front();
+            if (!fallback_host.empty()) {
+                config.Reality.dest_host = fallback_host;
+                config.Reality.dest_port = dest_port.value;
+            }
+        }
+
+        if (const auto* xver_val = rs.if_contains("xver");
+            xver_val && !xver_val->is_null()) {
+            uint64_t xver = 0;
+            if (xver_val->is_int64() && xver_val->as_int64() >= 0) {
+                xver = static_cast<uint64_t>(xver_val->as_int64());
+            } else if (xver_val->is_uint64()) {
+                xver = xver_val->as_uint64();
+            } else {
+                return std::unexpected("REALITY xver must be an integer between 0 and 2");
+            }
+            if (xver > 2) {
+                return std::unexpected("REALITY xver must be between 0 and 2");
+            }
+            config.Reality.xver = static_cast<uint8_t>(xver);
+            if (config.Reality.xver != 0 && !config.Reality.HasDest()) {
+                return std::unexpected("REALITY xver requires dest");
+            }
+        }
+
+        if (const auto* mldsa_val = rs.if_contains("mldsa65_seed")
+                ? rs.if_contains("mldsa65_seed")
+                : rs.if_contains("mldsa65Seed");
+            mldsa_val && !mldsa_val->is_null()) {
+            if (!mldsa_val->is_string() || mldsa_val->as_string().empty()) {
+                return std::unexpected("REALITY mldsa65_seed must be a non-empty string");
+            }
+            auto parsed_seed =
+                transport::internet::ParseRealityMldsa65Seed(mldsa_val->as_string());
+            if (!parsed_seed) {
+                return std::unexpected("REALITY mldsa65_seed is invalid");
+            }
+            config.Reality.mldsa65_seed = *parsed_seed;
+        }
+    }
     if (const auto* base_config = source.if_contains("base_config");
         base_config && base_config->is_object()) {
         const auto& base = base_config->as_object();

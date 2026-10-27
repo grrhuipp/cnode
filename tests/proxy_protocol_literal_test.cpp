@@ -1,5 +1,6 @@
 #include "acppnode/transport/internet/proxy_protocol.hpp"
 
+#include <array>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -24,5 +25,24 @@ int main() {
             return 1;
         }
     }
-    std::puts("PROXY v1 source literal and family cases passed");
+    for (const uint8_t version : {uint8_t{1}, uint8_t{2}}) {
+        for (const char* ip_text : {"192.0.2.10", "2001:db8::10"}) {
+            const auto addr = acpp::net::ip::make_address(ip_text);
+            const acpp::tcp::endpoint src(addr, 45678);
+            const acpp::tcp::endpoint dst(addr, 443);
+            std::array<uint8_t, 108> encoded{};
+            const size_t n = acpp::ProxyProtocolParser::Encode(
+                version, src, dst, encoded);
+            const auto parsed = acpp::ProxyProtocolParser::Parse(
+                encoded.data(), n);
+            if (n == 0 || !parsed.success() || parsed.consumed != n ||
+                !parsed.src_addr || *parsed.src_addr != addr ||
+                parsed.src_port != 45678) {
+                std::fprintf(stderr, "PROXY v%u encode/parse round-trip failed\n",
+                             static_cast<unsigned>(version));
+                return 2;
+            }
+        }
+    }
+    std::puts("PROXY v1/v2 source literal, family, and encode round-trip cases passed");
 }

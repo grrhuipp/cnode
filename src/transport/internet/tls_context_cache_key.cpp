@@ -43,6 +43,14 @@ public:
         for (const uint8_t value : *key) AppendByte(value);
     }
 
+    void AppendRealityMldsa65PublicKey(
+        const std::shared_ptr<const RealityMldsa65PublicKey>& key) {
+        AppendByte(key ? 1 : 0);
+        if (!key) return;
+        key_.append(
+            reinterpret_cast<const char*>(key->data()),
+            key->size());
+    }
     void AppendByte(uint8_t value) {
         key_.push_back(static_cast<char>(value));
     }
@@ -85,6 +93,10 @@ std::string MakeRealityServerContextCacheKey(
     CacheKeyBuilder key;
     key.AppendString(MakeTlsContextCacheKey("server-reality", tls_config));
     key.AppendRealityKey(reality.private_key);
+    key.AppendRealityKey(reality.mldsa65_seed);
+    key.AppendString(reality.dest_host);
+    key.AppendUint64(reality.dest_port);
+    key.AppendByte(reality.xver);
     key.AppendRealityVersion(reality.min_client_version);
     key.AppendRealityVersion(reality.max_client_version);
     key.AppendUint64(reality.max_time_diff);
@@ -101,6 +113,9 @@ std::string MakeRealityClientContextCacheKey(
     key.AppendRealityKey(reality.public_key);
     key.AppendString(reality.server_name);
     key.AppendRealityShortId(reality.short_id);
+    key.AppendString(reality.fingerprint);
+    key.AppendString(reality.spider_x);
+    key.AppendRealityMldsa65PublicKey(reality.mldsa65_verify);
     return std::move(key).Finish();
 }
 

@@ -260,4 +260,91 @@ ProxyProtocolResult ProxyProtocolParser::ParseV2(const uint8_t* data, size_t len
     return r;
 }
 
+size_t ProxyProtocolParser::Encode(
+    uint8_t version,
+    const tcp::endpoint& src,
+    const tcp::endpoint& dst,
+    std::span<uint8_t, 108> out) noexcept {
+    const auto src_addr = iputil::NormalizeAddress(src.address());
+    const auto dst_addr = iputil::NormalizeAddress(dst.address());
+    const uint16_t src_port = src.port();
+    const uint16_t dst_port = dst.port();
+
+    if (version == 1) {
+        if (src_addr.is_v4() && dst_addr.is_v4()) {
+            const std::string src_str = src_addr.to_string();
+            const std::string dst_str = dst_addr.to_string();
+            const int written = std::snprintf(
+                reinterpret_cast<char*>(out.data()),
+                out.size(),
+                "PROXY TCP4 %s %s %u %u\r\n",
+                src_str.c_str(),
+                dst_str.c_str(),
+                static_cast<unsigned int>(src_port),
+                static_cast<unsigned int>(dst_port));
+            return (written > 0 && static_cast<size_t>(written) < out.size())
+                ? static_cast<size_t>(written)
+                : 0;
+        }
+        const auto src_v6 = src_addr.is_v6()
+            ? src_addr.to_v6()
+            : net::ip::make_address_v6(net::ip::v4_mapped, src_addr.to_v4());
+        const auto dst_v6 = dst_addr.is_v6()
+            ? dst_addr.to_v6()
+            : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
+        const std::string src_str = src_v6.to_string();
+        const std::string dst_str = dst_v6.to_string();
+        const int written = std::snprintf(
+            reinterpret_cast<char*>(out.data()),
+            out.size(),
+            "PROXY TCP6 %s %s %u %u\r\n",
+            src_str.c_str(),
+            dst_str.c_str(),
+            static_cast<unsigned int>(src_port),
+            static_cast<unsigned int>(dst_port));
+        return (written > 0 && static_cast<size_t>(written) < out.size())
+            ? static_cast<size_t>(written)
+            : 0;
+    }
+
+    if (version == 2) {
+        std::memcpy(out.data(), kSignatureV2, sizeof(kSignatureV2));
+        out[12] = 0x21;  // v2 + PROXY command
+        if (src_addr.is_v4() && dst_addr.is_v4()) {
+            out[13] = 0x11;  // AF_INET + STREAM
+            out[14] = 0x00;
+            out[15] = 12;
+            const auto src_bytes = src_addr.to_v4().to_bytes();
+            const auto dst_bytes = dst_addr.to_v4().to_bytes();
+            std::memcpy(out.data() + 16, src_bytes.data(), 4);
+            std::memcpy(out.data() + 20, dst_bytes.data(), 4);
+            out[24] = static_cast<uint8_t>(src_port >> 8);
+            out[25] = static_cast<uint8_t>(src_port & 0xff);
+            out[26] = static_cast<uint8_t>(dst_port >> 8);
+            out[27] = static_cast<uint8_t>(dst_port & 0xff);
+            return 28;
+        }
+        const auto src_v6 = src_addr.is_v6()
+            ? src_addr.to_v6()
+            : net::ip::make_address_v6(net::ip::v4_mapped, src_addr.to_v4());
+        const auto dst_v6 = dst_addr.is_v6()
+            ? dst_addr.to_v6()
+            : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
+        out[13] = 0x21;  // AF_INET6 + STREAM
+        out[14] = 0x00;
+        out[15] = 36;
+        const auto src_bytes = src_v6.to_bytes();
+        const auto dst_bytes = dst_v6.to_bytes();
+        std::memcpy(out.data() + 16, src_bytes.data(), 16);
+        std::memcpy(out.data() + 32, dst_bytes.data(), 16);
+        out[48] = static_cast<uint8_t>(src_port >> 8);
+        out[49] = static_cast<uint8_t>(src_port & 0xff);
+        out[50] = static_cast<uint8_t>(dst_port >> 8);
+        out[51] = static_cast<uint8_t>(dst_port & 0xff);
+        return 52;
+    }
+
+    return 0;
+}
+
 }  // namespace acpp

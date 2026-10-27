@@ -5,6 +5,7 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/rule_types.hpp"
 #include "acppnode/core/constants.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
 #include <optional>
@@ -48,6 +49,10 @@ struct NodeInfo {
     std::string Host;
     std::string Path;
     bool EnableTLS = false;
+    bool EnableReality = false;
+    std::string Flow;
+    std::string ServiceName;
+    RealityConfig Reality;
     std::string CypherMethod = std::string(constants::protocol::kAes256Gcm);
     std::string ShadowsocksServerKey;
     // cnode local runtime extensions that are normalized from panel/config cold path.

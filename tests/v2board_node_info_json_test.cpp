@@ -95,12 +95,37 @@ void TestInvalidNetworkHostIsRejected() {
           "lowercase panel Host header was not normalized");
 }
 
+void TestRealityNodeResponseIsNormalized() {
+    const auto parsed = acpp::json::parse(
+        R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"gun"},"tls":2,"flow":"xtls-rprx-vision","server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef",""],"dest":"www.apple.com:443","xver":1,"mldsa65_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})");
+    auto result = ParseNodeInfo(parsed.as_object(), 9, "vless");
+    Check(result.has_value(), "valid REALITY node response was rejected");
+    Check(result->EnableReality && !result->EnableTLS, "REALITY mode flag mismatch");
+    Check(result->Flow == "xtls-rprx-vision", "node flow mismatch");
+    Check(result->ServiceName == "gun", "grpc serviceName mismatch");
+    Check(result->Reality.private_key.has_value(), "REALITY private key missing");
+    Check(result->Reality.server_names.size() == 1 &&
+              result->Reality.server_names[0] == "www.apple.com",
+          "REALITY server_name mismatch");
+    Check(result->Reality.short_ids.size() == 2, "REALITY short_ids count mismatch");
+    Check(result->Reality.HasDest() &&
+              result->Reality.dest_host == "www.apple.com" &&
+              result->Reality.dest_port == 443 &&
+              result->Reality.xver == 1,
+          "REALITY dest/xver mismatch");
+    Check(result->Reality.mldsa65_seed.has_value(), "REALITY mldsa65_seed missing");
+
+    CheckInvalid(R"({"server_port":443,"tls":2})", "requires tls_settings");
+    CheckInvalid(R"({"server_port":443,"tls":2,"tls_settings":{}})", "requires private_key");
+}
+
 }  // namespace
 
 int main() {
     TestValidResponseIsNormalized();
     TestInvalidPortsAreRejected();
     TestInvalidNetworkHostIsRejected();
+    TestRealityNodeResponseIsNormalized();
     std::cout << "v2board_node_info_json_test: ok\n";
     return 0;
 }
