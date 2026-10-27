@@ -15,7 +15,7 @@ namespace acpp {
 
 // 空闲缓冲区归还当前线程 PMR 池。用完不保留容量。
 template <class ByteContainer>
-inline void ReleaseIdleBuffer(ByteContainer& buf, size_t /*keep_capacity*/ = 0) {
+inline void ReleaseIdleBuffer(ByteContainer& buf) {
     if (buf.empty()) {
         ByteContainer().swap(buf);
     }

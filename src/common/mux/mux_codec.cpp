@@ -103,18 +103,6 @@ public:
         return out;
     }
 
-    [[nodiscard]] std::string ReadString(size_t len) {
-        std::string out(len, '\0');
-        if (len == 0) {
-            return out;
-        }
-        if (!ReadBytes(std::span<uint8_t>(
-                reinterpret_cast<uint8_t*>(out.data()), out.size()))) {
-            return {};
-        }
-        return out;
-    }
-
     [[nodiscard]] bool ReadBytes(std::span<uint8_t> out) noexcept {
         if (!CanRead(out.size())) {
             return false;
@@ -178,11 +166,15 @@ static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& targe
         return target.IsValid();
     }
     if (addr_raw == 2) {
-        uint8_t domain_len = r.ReadU8();
+        const uint8_t domain_len = r.ReadU8();
         if (!r.Ok()) return false;
-        std::string domain = r.ReadString(domain_len);
-        if (!r.Ok()) return false;
-        target = TargetAddress(std::string_view(domain), port);
+        std::array<char, 255> domain_buf{};
+        if (domain_len > 0 &&
+            !r.ReadBytes(std::span<uint8_t>(
+                reinterpret_cast<uint8_t*>(domain_buf.data()), domain_len))) {
+            return false;
+        }
+        target = TargetAddress(std::string_view(domain_buf.data(), domain_len), port);
         return target.IsValid();
     }
     if (addr_raw == 3) {
@@ -657,7 +649,7 @@ static bool EncodeKeepDataHeaderToImpl(
         out.clear();
         return false;
     }
-    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, payload_len);
+    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, 2);
     return FinalizeFrameHeader(out, payload_len, true);
 }
 
@@ -719,10 +711,14 @@ static bool EncodeKeepUDPHeaderToImpl(
         out.clear();
         return false;
     }
-    // 预估地址字节数
-    size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
+    size_t addr_reserve = 1 + 2 + 1 + 16;
+    if (src.IsDomain()) {
+        addr_reserve = 1 + 2 + 1 + 1 + src.host.size();
+    } else if (src.resolved_addr && src.resolved_addr->is_v4()) {
+        addr_reserve = 1 + 2 + 1 + 4;
+    }
     InitFrameBase(out, session_id, SessionStatus::KEEP,
-                  kOptionData, addr_reserve + payload_len);
+                  kOptionData, addr_reserve + 2);
 
     // NetworkType = UDP
     out.push_back(static_cast<uint8_t>(NetworkType::UDP));

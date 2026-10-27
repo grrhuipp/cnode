@@ -505,7 +505,6 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
                 eof_crypto = PrepareScratch(eof_buf, chunk_len);
             }
             const bool ok = co_await DecodeRequestBodyReadFull(state, stream, eof_crypto, chunk_len);
-            ReleaseIdleBuffer(eof_buf, 0);
             if (!ok) {
                 state.eof = true;
                 co_return buf::MultiBuffer{};
@@ -555,7 +554,6 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
     }
 
     if (!co_await DecodeRequestBodyReadFull(state, stream, read_crypto, chunk_len)) {
-        ReleaseIdleBuffer(read_crypto_buf, 0);
         LOG_NET_DEBUG("VMess encoding: DecodeRequestBody ReadFull failed chunk#{} chunk_len={} "
                          "(TCP 连接在 chunk body 传输中断开)",
                          state.chunk_count, chunk_len);
@@ -564,57 +562,27 @@ net::awaitable<buf::MultiBuffer> DecodeRequestBody(DecodeRequestBodyState& state
     }
 
     const size_t data_len = chunk_len - padding_len;
-    const size_t expected_plain_len = data_len - overhead;
-
-    if (read_crypto_pool && expected_plain_len <= buf::Buffer::kSize) {
-        ssize_t dec_len = state.cipher->Decrypt(read_crypto, data_len, read_crypto);
-        if (dec_len < 0) {
-            ReleaseIdleBuffer(read_crypto_buf, 0);
-            state.eof = true;
-            throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
-        }
+    const ssize_t dec_len = state.cipher->Decrypt(read_crypto, data_len, read_crypto);
+    if (dec_len < 0) {
+        state.eof = true;
+        throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
+    }
+    if (read_crypto_pool) {
         read_crypto_pool->Produce(static_cast<uint32_t>(dec_len));
         ++state.chunk_count;
         co_return buf::MultiBuffer{std::move(read_crypto_pool)};
     }
 
-    memory::ByteVector plain_buf;
-    uint8_t* plain = PrepareScratch(plain_buf, expected_plain_len);
-    ssize_t dec_len = state.cipher->Decrypt(read_crypto, data_len, plain);
-    if (dec_len < 0) {
-        ReleaseIdleBuffer(read_crypto_buf, 0);
-        ReleaseIdleBuffer(plain_buf, 0);
-        state.eof = true;
-        throw IoSystemError(io_error::connection_reset, "VMess encoding read error");
-    }
-    ReleaseIdleBuffer(read_crypto_buf, 0);
-
-    buf::BufferGuard out{buf::Buffer::New()};
-    if (!out) {
-        ReleaseIdleBuffer(plain_buf, 0);
-        co_return buf::MultiBuffer{};
-    }
-
     const size_t dec_size = static_cast<size_t>(dec_len);
-    const size_t first_copy = std::min<size_t>(dec_size, out->Available());
-    std::memcpy(out->Tail().data(), plain, first_copy);
-    out->Produce(static_cast<uint32_t>(first_copy));
-
     buf::MultiBuffer out_mb;
     out_mb.reserve((dec_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    out_mb.push_back(std::move(out));
-    if (first_copy < dec_size &&
-        !buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(plain + first_copy, dec_size - first_copy),
+    if (!buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(read_crypto, dec_size),
             out_mb)) {
-        ReleaseIdleBuffer(plain_buf, 0);
         co_return buf::MultiBuffer{};
     }
-    ReleaseIdleBuffer(plain_buf, 0);
     ++state.chunk_count;
-    buf::MultiBuffer result = std::move(out_mb);
-    out_mb.clear();
-    co_return result;
+    co_return out_mb;
 }
 
 net::awaitable<buf::MultiBuffer> DecodeRequestBodyMultiBuffer(DecodeRequestBodyState& state,
