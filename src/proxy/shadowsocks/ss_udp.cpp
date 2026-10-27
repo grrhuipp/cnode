@@ -56,65 +56,54 @@ using proxy::EncodeSocks5AddressTo;
     return out;
 }
 
-[[nodiscard]] bool BuildClassicUdpPlaintext(const TargetAddress& target,
+[[nodiscard]] bool WriteClassicUdpPlaintext(const TargetAddress& target,
                                             const uint8_t* payload,
                                             size_t payload_len,
-                                            memory::ByteVector& plaintext) {
+                                            std::span<uint8_t> plaintext) noexcept {
     const size_t addr_size = Socks5AddressEncodedSize(target);
-    if (addr_size == 0) {
-        return false;
-    }
-    plaintext.resize(addr_size + payload_len);
-    const size_t encoded = EncodeSocks5AddressTo(
-        target, plaintext.data(), plaintext.size());
-    if (encoded != addr_size) {
+    if (addr_size == 0 || plaintext.size() != addr_size + payload_len) {
         return false;
     }
     if (payload_len > 0) {
-        std::memcpy(plaintext.data() + addr_size, payload, payload_len);
+        std::memmove(plaintext.data() + addr_size, payload, payload_len);
     }
-    return true;
+    return EncodeSocks5AddressTo(target, plaintext.data(), addr_size) == addr_size;
 }
 
-[[nodiscard]] bool Build2022ClientBodyPlaintext(const TargetAddress& target,
+[[nodiscard]] bool Write2022ClientBodyPlaintext(const TargetAddress& target,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
-                                                memory::ByteVector& plaintext) {
+                                                std::span<uint8_t> plaintext) noexcept {
     const size_t addr_size = Socks5AddressEncodedSize(target);
-    if (addr_size == 0) {
+    constexpr size_t kHeaderSize = 1 + 8 + 2;
+    if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
     }
-    constexpr size_t kHeaderSize = 1 + 8 + 2;
-    plaintext.resize(kHeaderSize + addr_size + payload_len);
+    if (payload_len > 0) {
+        std::memmove(plaintext.data() + kHeaderSize + addr_size, payload, payload_len);
+    }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ClientPacket;
     PutU64BE(plaintext.data() + pos, UnixSecondsNow());
     pos += 8;
     PutU16BE(plaintext.data() + pos, 0);
     pos += 2;
-    const size_t encoded = EncodeSocks5AddressTo(
-        target, plaintext.data() + pos, plaintext.size() - pos);
-    if (encoded != addr_size) {
-        return false;
-    }
-    pos += encoded;
-    if (payload_len > 0) {
-        std::memcpy(plaintext.data() + pos, payload, payload_len);
-    }
-    return true;
+    return EncodeSocks5AddressTo(target, plaintext.data() + pos, addr_size) == addr_size;
 }
 
-[[nodiscard]] bool Build2022ServerBodyPlaintext(const TargetAddress& target,
+[[nodiscard]] bool Write2022ServerBodyPlaintext(const TargetAddress& target,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<const uint8_t, 8> client_session_id,
-                                                memory::ByteVector& plaintext) {
+                                                std::span<uint8_t> plaintext) noexcept {
     const size_t addr_size = Socks5AddressEncodedSize(target);
-    if (addr_size == 0) {
+    constexpr size_t kHeaderSize = 1 + 8 + 8 + 2;
+    if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
     }
-    constexpr size_t kHeaderSize = 1 + 8 + 8 + 2;
-    plaintext.resize(kHeaderSize + addr_size + payload_len);
+    if (payload_len > 0) {
+        std::memmove(plaintext.data() + kHeaderSize + addr_size, payload, payload_len);
+    }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ServerPacket;
     PutU64BE(plaintext.data() + pos, UnixSecondsNow());
@@ -123,16 +112,7 @@ using proxy::EncodeSocks5AddressTo;
     pos += client_session_id.size();
     PutU16BE(plaintext.data() + pos, 0);
     pos += 2;
-    const size_t encoded = EncodeSocks5AddressTo(
-        target, plaintext.data() + pos, plaintext.size() - pos);
-    if (encoded != addr_size) {
-        return false;
-    }
-    pos += encoded;
-    if (payload_len > 0) {
-        std::memcpy(plaintext.data() + pos, payload, payload_len);
-    }
-    return true;
+    return EncodeSocks5AddressTo(target, plaintext.data() + pos, addr_size) == addr_size;
 }
 
 [[nodiscard]] std::optional<Parsed2022Body> Parse2022ClientBodyPlaintext(
@@ -334,44 +314,9 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
 
     std::array<uint8_t, 12> ietf_nonce{};
     std::memcpy(ietf_nonce.data() + 4, nonce.data() + 16, 8);
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        return false;
-    }
-
-    const EVP_CIPHER* cipher = EVP_chacha20_poly1305();
-    int out_len = 0;
-    int final_len = 0;
-    bool ok = false;
-    if (encrypt) {
-        ok =
-            EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) == 1 &&
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
-                                static_cast<int>(ietf_nonce.size()), nullptr) == 1 &&
-            EVP_EncryptInit_ex(ctx, nullptr, nullptr, subkey.data(), ietf_nonce.data()) == 1 &&
-            EVP_EncryptUpdate(ctx, output, &out_len,
-                              input.data(), static_cast<int>(input.size())) == 1 &&
-            EVP_EncryptFinal_ex(ctx, output + out_len, &final_len) == 1 &&
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16,
-                                output + input.size()) == 1;
-    } else if (input.size() >= SsAeadCipher::kTagSize) {
-        const size_t data_len = input.size() - SsAeadCipher::kTagSize;
-        const uint8_t* tag = input.data() + data_len;
-        ok =
-            EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) == 1 &&
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
-                                static_cast<int>(ietf_nonce.size()), nullptr) == 1 &&
-            EVP_DecryptInit_ex(ctx, nullptr, nullptr, subkey.data(), ietf_nonce.data()) == 1 &&
-            EVP_DecryptUpdate(ctx, output, &out_len,
-                              input.data(), static_cast<int>(data_len)) == 1 &&
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
-                                const_cast<uint8_t*>(tag)) == 1 &&
-            EVP_DecryptFinal_ex(ctx, output + out_len, &final_len) == 1;
-    }
-
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+    return encrypt
+        ? AeadEncrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output)
+        : AeadDecrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output);
 }
 
 [[nodiscard]] bool XChaCha20Poly1305Encrypt(std::span<const uint8_t> key,
@@ -440,6 +385,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     std::span<const uint8_t> previous_identity_key;
     std::array<uint8_t, 16> previous_separate{};
     std::array<uint8_t, 16> previous_identity{};
+    memory::ByteVector plaintext;
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
         const bool has_identity = !user.identity_key.empty();
@@ -492,7 +438,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
         if (ciphertext_len < SsAeadCipher::kTagSize) {
             continue;
         }
-        memory::ByteVector plaintext(ciphertext_len - SsAeadCipher::kTagSize);
+        plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
         std::array<uint8_t, 32> subkey{};
         if (!Derive2022Subkey(user.derived_key.data(), user.derived_key.size,
                               separate.data(), kSs2022UdpSessionIdSize,
@@ -545,12 +491,12 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     const uint8_t* ciphertext = datagram + nonce.size();
     const size_t ciphertext_len = datagram_len - nonce.size();
 
+    memory::ByteVector plaintext(ciphertext_len - SsAeadCipher::kTagSize);
     for (size_t i = 0; i < users.size(); ++i) {
         const auto& user = users[i];
         if (user.derived_key.size != 32) {
             continue;
         }
-        memory::ByteVector plaintext(ciphertext_len - SsAeadCipher::kTagSize);
         if (!XChaCha20Poly1305Decrypt(
                 user.derived_key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
@@ -589,26 +535,27 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     uint8_t* output,
     size_t output_size) {
 
-    if (key_size > 64 || salt_size > 64) {
-        return 0;
-    }
-    if (master_key.size() < key_size) {
-        return 0;
-    }
-
-    memory::ByteVector plaintext;
-    if (!BuildClassicUdpPlaintext(target, payload, payload_len, plaintext)) {
+    if (key_size > 64 || salt_size > 64 || master_key.size() < key_size ||
+        (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    const size_t total_size = salt_size + plaintext.size() + SsAeadCipher::kTagSize;
+    const size_t addr_size = Socks5AddressEncodedSize(target);
+    if (addr_size == 0) {
+        return 0;
+    }
+    const size_t plain_size = addr_size + payload_len;
+    const size_t total_size = salt_size + plain_size + SsAeadCipher::kTagSize;
     if (output == nullptr || total_size > output_size) {
         return total_size;
     }
 
     uint8_t* salt = output;
     uint8_t* ciphertext = output + salt_size;
-
+    if (!WriteClassicUdpPlaintext(target, payload, payload_len,
+                                  std::span<uint8_t>(ciphertext, plain_size))) {
+        return 0;
+    }
     if (!RandomBytes(std::span<uint8_t>(salt, salt_size))) {
         return 0;
     }
@@ -623,7 +570,7 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     if (!AeadEncrypt(cipher_type,
                      std::span<const uint8_t>(subkey.data(), key_size),
                      kZeroNonce,
-                     plaintext,
+                     std::span<const uint8_t>(ciphertext, plain_size),
                      ciphertext)) {
         return 0;
     }
@@ -645,31 +592,38 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     if (!response && !psk_chain.empty()) {
         body_key = &psk_chain.back();
     }
-    if (body_key->empty()) {
+    if (body_key->empty() || (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    memory::ByteVector body_plain;
-    if (response) {
-        if (!Build2022ServerBodyPlaintext(
-                target, payload, payload_len, state.client_session_id, body_plain)) {
-            return 0;
-        }
-    } else if (!Build2022ClientBodyPlaintext(
-                   target, payload, payload_len, body_plain)) {
+    const size_t addr_size = Socks5AddressEncodedSize(target);
+    if (addr_size == 0) {
         return 0;
     }
-
+    const size_t body_header_size = response ? (1 + 8 + 8 + 2) : (1 + 8 + 2);
+    const size_t body_plain_size = body_header_size + addr_size + payload_len;
     const size_t identity_count = response || psk_chain.size() < 2
         ? 0
         : psk_chain.size() - 1;
-    const size_t total_size =
+    const size_t header_bytes =
         kSs2022UdpSeparateHeaderSize +
-        identity_count * kSs2022UdpSeparateHeaderSize +
-        body_plain.size() +
-        SsAeadCipher::kTagSize;
+        identity_count * kSs2022UdpSeparateHeaderSize;
+    const size_t total_size =
+        header_bytes + body_plain_size + SsAeadCipher::kTagSize;
     if (output == nullptr || total_size > output_size) {
         return total_size;
+    }
+
+    uint8_t* body_out = output + header_bytes;
+    const bool wrote_body = response
+        ? Write2022ServerBodyPlaintext(
+              target, payload, payload_len, state.client_session_id,
+              std::span<uint8_t>(body_out, body_plain_size))
+        : Write2022ClientBodyPlaintext(
+              target, payload, payload_len,
+              std::span<uint8_t>(body_out, body_plain_size));
+    if (!wrote_body) {
+        return 0;
     }
 
     std::array<uint8_t, 16> separate{};
@@ -722,8 +676,8 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     if (!AeadEncrypt(state.cipher_info.type,
                      std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
                      nonce,
-                     body_plain,
-                     output + pos)) {
+                     std::span<const uint8_t>(body_out, body_plain_size),
+                     body_out)) {
         return 0;
     }
 
@@ -740,35 +694,41 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     uint8_t* output,
     size_t output_size) {
 
-    if (state.key.size != 32) {
+    if (state.key.size != 32 || (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    memory::ByteVector body_plain;
-    if (response) {
-        if (!Build2022ServerBodyPlaintext(
-                target, payload, payload_len, state.client_session_id, body_plain)) {
-            return 0;
-        }
-    } else if (!Build2022ClientBodyPlaintext(
-                   target, payload, payload_len, body_plain)) {
+    const size_t addr_size = Socks5AddressEncodedSize(target);
+    if (addr_size == 0) {
         return 0;
     }
-
-    memory::ByteVector plaintext;
-    plaintext.resize(kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + body_plain.size());
-    std::memcpy(plaintext.data(),
-                response ? state.server_session_id.data() : state.client_session_id.data(),
-                kSs2022UdpSessionIdSize);
-    PutU64BE(plaintext.data() + kSs2022UdpSessionIdSize, state.next_packet_id);
-    std::memcpy(plaintext.data() + kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize,
-                body_plain.data(), body_plain.size());
-
+    const size_t body_header_size = response ? (1 + 8 + 8 + 2) : (1 + 8 + 2);
+    const size_t body_plain_size = body_header_size + addr_size + payload_len;
+    const size_t plain_size =
+        kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + body_plain_size;
     const size_t total_size =
-        kSs2022UdpNonceSize + plaintext.size() + SsAeadCipher::kTagSize;
+        kSs2022UdpNonceSize + plain_size + SsAeadCipher::kTagSize;
     if (output == nullptr || total_size > output_size) {
         return total_size;
     }
+
+    uint8_t* cipher_out = output + kSs2022UdpNonceSize;
+    uint8_t* body_out =
+        cipher_out + kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize;
+    const bool wrote_body = response
+        ? Write2022ServerBodyPlaintext(
+              target, payload, payload_len, state.client_session_id,
+              std::span<uint8_t>(body_out, body_plain_size))
+        : Write2022ClientBodyPlaintext(
+              target, payload, payload_len,
+              std::span<uint8_t>(body_out, body_plain_size));
+    if (!wrote_body) {
+        return 0;
+    }
+    std::memcpy(cipher_out,
+                response ? state.server_session_id.data() : state.client_session_id.data(),
+                kSs2022UdpSessionIdSize);
+    PutU64BE(cipher_out + kSs2022UdpSessionIdSize, state.next_packet_id);
 
     std::array<uint8_t, 24> nonce{};
     if (!RandomBytes(nonce)) {
@@ -776,7 +736,10 @@ void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noex
     }
     std::memcpy(output, nonce.data(), nonce.size());
     if (!XChaCha20Poly1305Encrypt(
-            state.key.span(), nonce, plaintext, output + nonce.size())) {
+            state.key.span(),
+            nonce,
+            std::span<const uint8_t>(cipher_out, plain_size),
+            cipher_out)) {
         return 0;
     }
 
@@ -1114,6 +1077,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     }
 
     memory::ByteVector plaintext;
+    std::span<const uint8_t> body_span;
     std::array<uint8_t, kSs2022UdpSessionIdSize> server_session_id{};
     uint64_t packet_id = 0;
     if (Is2022AesCipher(state.cipher_info.type)) {
@@ -1150,6 +1114,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
                          plaintext.data())) {
             return std::nullopt;
         }
+        body_span = plaintext;
     } else if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
         constexpr size_t kMinPlain =
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 8 + 2 + 1 + 4 + 2;
@@ -1160,25 +1125,24 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         std::memcpy(nonce.data(), datagram, nonce.size());
         const uint8_t* ciphertext = datagram + nonce.size();
         const size_t ciphertext_len = datagram_len - nonce.size();
-        memory::ByteVector decoded(ciphertext_len - SsAeadCipher::kTagSize);
+        plaintext.resize(ciphertext_len - SsAeadCipher::kTagSize);
         if (!XChaCha20Poly1305Decrypt(
                 state.key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
-                decoded.data())) {
+                plaintext.data())) {
             return std::nullopt;
         }
         std::memcpy(
-            server_session_id.data(), decoded.data(), server_session_id.size());
+            server_session_id.data(), plaintext.data(), server_session_id.size());
         packet_id = GetU64BE(
-            decoded.data() + kSs2022UdpSessionIdSize);
-        plaintext.assign(
-            decoded.begin() + kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize,
-            decoded.end());
+            plaintext.data() + kSs2022UdpSessionIdSize);
+        body_span = std::span<const uint8_t>(plaintext).subspan(
+            kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
     } else {
         return std::nullopt;
     }
 
-    auto parsed = Parse2022ServerBodyPlaintext(plaintext, state.client_session_id);
+    auto parsed = Parse2022ServerBodyPlaintext(body_span, state.client_session_id);
     if (!parsed) {
         return std::nullopt;
     }
