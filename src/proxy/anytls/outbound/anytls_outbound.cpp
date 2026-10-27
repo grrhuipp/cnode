@@ -316,10 +316,16 @@ struct Handler::ClientSession {
         logical.CheckWrite();
 
         try {
-            auto scheme_snapshot = padding_state_->scheme;
             const uint32_t this_packet = NextPacketIndex();
-            auto ok = co_await WriteMultiBufferAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+            std::expected<void, ErrorCode> ok;
+            if (padding_state_->scheme->RecordFor(this_packet).empty()) {
+                ok = co_await WriteMultiBufferAsFrameBatch(
+                    *stream, kCmdPSH, sid, std::move(mb));
+            } else {
+                auto scheme_snapshot = padding_state_->scheme;
+                ok = co_await WriteMultiBufferAsFramesWithPadding(
+                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+            }
             if (!ok) {
                 CloseAll(ok.error());
                 co_return std::unexpected(ok.error());
@@ -353,10 +359,16 @@ struct Handler::ClientSession {
         logical.CheckWrite();
 
         try {
-            auto scheme_snapshot = padding_state_->scheme;
             const uint32_t this_packet = NextPacketIndex();
-            auto ok = co_await WriteBuffersAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
+            std::expected<void, ErrorCode> ok;
+            if (padding_state_->scheme->RecordFor(this_packet).empty()) {
+                ok = co_await WriteBuffersAsFramesWithPadding(
+                    *stream, *padding_state_->scheme, this_packet, kCmdPSH, sid, buffers);
+            } else {
+                auto scheme_snapshot = padding_state_->scheme;
+                ok = co_await WriteBuffersAsFramesWithPadding(
+                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
+            }
             if (!ok) {
                 CloseAll(ok.error());
                 co_return std::unexpected(ok.error());

@@ -310,14 +310,14 @@ public:
                        const session::Context& base_ctx,
                        StatsShard& stats,
                        const TimeoutsConfig& timeouts,
-                       std::shared_ptr<const PaddingScheme> padding_scheme)
+                       const PaddingScheme* padding_scheme)
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
         , policy_(policy)
         , io_context_(io_context)
         , stats_(stats)
         , timeouts_(timeouts)
-        , padding_scheme_(std::move(padding_scheme))
+        , padding_scheme_(padding_scheme)
         , write_gate_(io_context) {
         CopySessionContext(base_ctx, base_ctx_);
     }
@@ -474,7 +474,7 @@ private:
     session::Context base_ctx_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
-    std::shared_ptr<const PaddingScheme> padding_scheme_;
+    const PaddingScheme* padding_scheme_ = nullptr;
     transport::internet::AsyncWriteGate write_gate_;
     memory::ThreadLocalUnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     uint32_t last_stream_id_ = 0;
@@ -920,7 +920,7 @@ Handler::Process(
         ctx,
         *stats_,
         timeouts,
-        padding_scheme_);
+        padding_scheme_.get());
     co_return co_await demux.Run();
 }
 

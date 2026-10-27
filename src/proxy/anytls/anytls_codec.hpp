@@ -60,6 +60,8 @@ public:
     FrameBatch& operator=(const FrameBatch&) = delete;
     [[nodiscard]] std::expected<void, ErrorCode> Encode(
         uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload);
+    [[nodiscard]] std::expected<void, ErrorCode> Encode(
+        uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> buffers);
     [[nodiscard]] std::span<const net::const_buffer> Buffers() const noexcept {
         return spilled_ ? std::span<const net::const_buffer>(spill_buffers_)
                         : std::span<const net::const_buffer>(buffers_.data(), count_);

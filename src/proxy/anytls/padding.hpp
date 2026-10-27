@@ -49,6 +49,6 @@ private:
 };
 
 [[nodiscard]] std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
-[[nodiscard]] std::shared_ptr<const PaddingScheme> DefaultPaddingScheme();
+[[nodiscard]] const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme();
 
 } // namespace acpp::anytls

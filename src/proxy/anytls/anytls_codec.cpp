@@ -9,6 +9,7 @@
 #include <array>
 #include <charconv>
 #include <cstring>
+#include <format>
 #include <utility>
 
 namespace acpp::anytls {
@@ -89,55 +90,12 @@ WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              std::span<const net::const_buffer> input) {
-    static constexpr size_t kStackFrames = buf::MultiBuffer::kInlineCapacity;
-    std::array<std::array<uint8_t, kFrameHeaderSize>, kStackFrames> stack_headers{};
-    std::array<net::const_buffer, kStackFrames * 2> stack_buffers{};
-    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers;
-    memory::ThreadLocalVector<net::const_buffer> spill_buffers;
-
-    size_t non_empty_count = 0;
-    for (const net::const_buffer& buffer : input) {
-        if (buffer.data() && buffer.size() > 0) {
-            ++non_empty_count;
-        }
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, input);
+    if (!encoded) {
+        co_return encoded;
     }
-
-    const bool use_spill = non_empty_count > kStackFrames;
-    if (use_spill) {
-        spill_headers.reserve(non_empty_count);
-        spill_buffers.reserve(non_empty_count * 2);
-    }
-
-    size_t stack_frame_count = 0;
-    size_t stack_buffer_count = 0;
-    for (const net::const_buffer& buffer : input) {
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        if (!data || buffer.size() == 0) {
-            continue;
-        }
-        if (buffer.size() > kMaxFramePayload) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        if (use_spill) {
-            auto& header =
-                spill_headers.emplace_back(BuildFrameHeaderBytes(cmd, sid, buffer.size()));
-            spill_buffers.emplace_back(header.data(), header.size());
-            spill_buffers.emplace_back(data, buffer.size());
-            continue;
-        }
-
-        auto& header = stack_headers[stack_frame_count++];
-        header = BuildFrameHeaderBytes(cmd, sid, buffer.size());
-        stack_buffers[stack_buffer_count++] =
-            net::const_buffer(header.data(), header.size());
-        stack_buffers[stack_buffer_count++] =
-            net::const_buffer(data, buffer.size());
-    }
-
-    const auto buffers = use_spill
-        ? std::span<const net::const_buffer>(spill_buffers.data(), spill_buffers.size())
-        : std::span<const net::const_buffer>(stack_buffers.data(), stack_buffer_count);
-
+    const auto buffers = batch.Buffers();
     if (!buffers.empty()) {
         try {
             co_await stream.WriteBuffers(buffers);
@@ -145,7 +103,6 @@ WriteBuffersAsFrameBatchImpl(AsyncStream& stream,
             co_return std::unexpected(MapAsioError(e.code()));
         }
     }
-
     co_return std::expected<void, ErrorCode>{};
 }
 
@@ -179,6 +136,45 @@ std::expected<void, ErrorCode> FrameBatch::Encode(
             header = BuildFrameHeaderBytes(cmd, sid, bytes.size());
             buffers_[count_++] = net::const_buffer(header.data(), header.size());
             buffers_[count_++] = net::const_buffer(bytes.data(), bytes.size());
+        }
+    }
+    return {};
+}
+
+std::expected<void, ErrorCode> FrameBatch::Encode(
+    uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> input) {
+    count_ = 0;
+    spill_headers_.clear();
+    spill_buffers_.clear();
+    size_t non_empty_count = 0;
+    for (const net::const_buffer& buffer : input) {
+        if (buffer.data() && buffer.size() > 0) {
+            ++non_empty_count;
+        }
+    }
+    spilled_ = non_empty_count > kInlineFrames;
+    if (spilled_) {
+        spill_headers_.reserve(non_empty_count);
+        spill_buffers_.reserve(non_empty_count * 2);
+    }
+    for (const net::const_buffer& buffer : input) {
+        const auto* data = static_cast<const uint8_t*>(buffer.data());
+        if (!data || buffer.size() == 0) continue;
+        if (buffer.size() > kMaxFramePayload) {
+            count_ = 0;
+            spill_buffers_.clear();
+            return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        if (spilled_) {
+            auto& header = spill_headers_.emplace_back(
+                BuildFrameHeaderBytes(cmd, sid, buffer.size()));
+            spill_buffers_.emplace_back(header.data(), header.size());
+            spill_buffers_.emplace_back(data, buffer.size());
+        } else {
+            auto& header = headers_[count_ / 2];
+            header = BuildFrameHeaderBytes(cmd, sid, buffer.size());
+            buffers_[count_++] = net::const_buffer(header.data(), header.size());
+            buffers_[count_++] = net::const_buffer(data, buffer.size());
         }
     }
     return {};
@@ -227,7 +223,7 @@ std::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) 
 }
 
 std::string ClientSettings(const PaddingScheme& scheme) {
-    return "v=" + std::to_string(kProtocolVersion) + "\nclient=cnode\npadding-md5=" + std::string(scheme.Digest());
+    return std::format("v={}\nclient=cnode\npadding-md5={}", kProtocolVersion, scheme.Digest());
 }
 
 std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target) {

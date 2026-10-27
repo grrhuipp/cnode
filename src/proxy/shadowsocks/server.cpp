@@ -737,7 +737,7 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession202
                 fixed_plain)) {
             return false;
         }
-        result.SetUser(users.Share(user));
+        result.user = users.Share(user);
         last_matched_index = index;
         return true;
     };
@@ -884,12 +884,12 @@ net::awaitable<std::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
     std::array<uint8_t, 64> read_subkey{};
     const size_t hint = last_matched_index;
     if (hint < users.size() && try_user(users[hint], read_subkey)) {
-        result.SetUser(users.Share(users[hint]));
+        result.user = users.Share(users[hint]);
     } else {
         for (size_t i = 0; i < users.size(); ++i) {
             if (i == hint) continue;
             if (try_user(users[i], read_subkey)) {
-                result.SetUser(users.Share(users[i]));
+                result.user = users.Share(users[i]);
                 last_matched_index = i;
                 break;
             }

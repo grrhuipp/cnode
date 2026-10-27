@@ -147,7 +147,7 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
     return scheme;
 }
 
-std::shared_ptr<const PaddingScheme> DefaultPaddingScheme() {
+const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme() {
     static const auto scheme = std::make_shared<const PaddingScheme>(ParsePaddingScheme(
         "stop=8\n"
         "0=30-30\n"

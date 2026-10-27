@@ -30,7 +30,7 @@ public:
 
 private:
     const TimedUserValidator* validator_ = nullptr;
-    std::string tag_;
+    std::string_view tag_;
     VMessRequest request_;
     bool request_set_ = false;
 };

@@ -226,7 +226,7 @@ proxy::vmess::inbound::Handler::Process(
 
     // Header authentication and replay checks are finished. Body/response keys
     // are already owned by request; do not move a user-table owner into Session.
-    request->SetUser({});
+    request->user.reset();
 
     // 在 move 之前提取所有需要的字段
     TargetAddress target = request->target;

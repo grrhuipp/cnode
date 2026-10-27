@@ -175,7 +175,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     auto request_reader = std::move(session_result->body_reader);
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
     {
-        const auto* matched = session_result->user;
+        const auto* matched = session_result->user.get();
         if (!matched) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
             if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
@@ -219,7 +219,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     }
     // Both directions now own their cipher/key state, including the lazy
     // response header. Authentication ownership must end before UoT/relay waits.
-    session_result->SetUser({});
+    session_result->user.reset();
 
     if (const auto uot_version = proxy::uot::VersionFromMagicAddress(
             ctx.outbound.target)) {

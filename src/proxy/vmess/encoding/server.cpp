@@ -837,9 +837,9 @@ std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
                      16 + consumed,
                      len > (16 + consumed) ? (len - (16 + consumed)) : 0);
 
-    request.SetUser(std::move(user));
+    request.user = std::move(user);
 
-    return {request, 16 + consumed};
+    return {std::move(request), 16 + consumed};
 }
 
 bool ParseRequestHeader(const uint8_t* data,

@@ -15,18 +15,11 @@
 namespace acpp::ss {
 
 struct ReadTCPSessionResult {
-    std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user_ref;
-    const proxyman::inbound::UserStore::ShadowsocksCredential* user = nullptr;
+    std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user;
     TargetAddress target;
     InitialPayload initial_payload;
     std::unique_ptr<transport::MultiBufferReader> body_reader;
     KeyBytes request_salt;
-
-    void SetUser(
-        std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> value) noexcept {
-        user_ref = std::move(value);
-        user = user_ref.get();
-    }
 };
 
 // xray-core proxy/shadowsocks/server.go 对应的服务器端握手与 body reader/writer 入口。
