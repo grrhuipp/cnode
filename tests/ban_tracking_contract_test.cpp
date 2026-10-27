@@ -38,24 +38,24 @@ int main() {
     acpp::session::Inbound inbound;
     inbound.source_ip = ip;
     record_auth_failure(inbound, ip);  // socket peer must not count
-    if (limiter->GetLimiter().IsBanned(tag, ip)) return 1;
+    if (limiter->IsBanned(tag, ip)) return 1;
 
     inbound.client_ip_source = "http_header";
     record_auth_failure(inbound, ip);  // forwarded header must not count
-    if (limiter->GetLimiter().IsBanned(tag, ip)) return 2;
+    if (limiter->IsBanned(tag, ip)) return 2;
 
     inbound.client_ip_source = "proxy_protocol";
     inbound.source_ip.clear();
     if (inbound.HasProxyProtocolClientIP()) return 3;  // no usable PP source
     record_auth_failure(inbound, ip);
-    if (limiter->GetLimiter().IsBanned(tag, ip)) return 4;
+    if (limiter->IsBanned(tag, ip)) return 4;
 
     inbound.source_ip = ip;
     if (!inbound.HasProxyProtocolClientIP()) return 5;
-    if (limiter->GetLimiter().IsBanned(tag, ip)) return 6;
+    if (limiter->IsBanned(tag, ip)) return 6;
     record_auth_failure(inbound, ip);
-    if (!limiter->GetLimiter().IsBanned(tag, ip)) return 7;
-    if (limiter->GetLimiter().IsBanned(other_tag, ip)) return 8;
+    if (!limiter->IsBanned(tag, ip)) return 7;
+    if (limiter->IsBanned(other_tag, ip)) return 8;
     if (limiter->TryAcceptIP(tag, ip)
         != acpp::ConnectionLimiter::RejectReason::IP_BANNED) {
         return 9;

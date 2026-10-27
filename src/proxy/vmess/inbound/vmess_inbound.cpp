@@ -115,7 +115,7 @@ proxy::vmess::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[VMess][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);

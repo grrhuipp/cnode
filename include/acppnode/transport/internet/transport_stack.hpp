@@ -19,13 +19,13 @@ public:
 };
 
 struct InboundTransportMetadata {
-    std::string http_host;
-    std::string real_ip;
-    std::string real_ip_header;
-    std::string tls_sni;
-    std::string tls_alpn;
-    std::string tls_version;
-    std::string tls_fingerprint;
+    memory::ThreadLocalString http_host;
+    memory::ThreadLocalString real_ip;
+    memory::ThreadLocalString real_ip_header;
+    memory::ThreadLocalString tls_sni;
+    memory::ThreadLocalString tls_alpn;
+    memory::ThreadLocalString tls_version;
+    memory::ThreadLocalString tls_fingerprint;
 };
 
 // Consume an optional PROXY protocol prefix from a raw accepted transport.
@@ -41,7 +41,6 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
-    std::string* out_real_ip = nullptr,
     uint64_t trace_conn_id = 0,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
     InboundTransportMetadata* metadata = nullptr);

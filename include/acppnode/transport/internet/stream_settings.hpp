@@ -215,11 +215,6 @@ struct StreamSettings {
         return network_mode == NetworkMode::Unsupported ||
                security_mode == SecurityMode::Unsupported;
     }
-    bool NeedsHttpRealIpExtraction() const noexcept {
-        return (IsWs() && !ws.real_ip_header.empty()) ||
-               (IsHttpUpgrade() && !http_upgrade.real_ip_header.empty()) ||
-               (IsHttp() && !http.real_ip_header.empty());
-    }
 
     static StreamSettings FromJson(
         const json::object& j, StreamEndpointRole role);

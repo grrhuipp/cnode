@@ -97,7 +97,7 @@ class Dispatcher final : public routing::Dispatcher {
 // production accepted-TCP and logical-transport ownership/error boundaries.
 namespace acpp {
 net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
-    std::unique_ptr<AsyncStream> raw, const StreamSettings&, std::string*, uint64_t,
+    std::unique_ptr<AsyncStream> raw, const StreamSettings&, uint64_t,
     std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*) {
     if (streams) { streams->OnInboundTransportStream(std::move(raw)); co_return std::unique_ptr<AsyncStream>{}; }
     co_return std::move(raw);

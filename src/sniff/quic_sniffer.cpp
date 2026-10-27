@@ -1,17 +1,16 @@
 #include "acppnode/sniff/sniffer.hpp"
+#include "acppnode/common/allocator.hpp"
 #include "acppnode/core/constants.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-#include <openssl/kdf.h>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
-#include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 namespace {
@@ -20,7 +19,9 @@ struct QuicVersion {
     uint32_t ver = 0;
     uint8_t type_initial = 0;
     std::array<uint8_t, 20> salt{};
-    std::string_view label_prefix;
+    std::string_view hp_label;
+    std::string_view key_label;
+    std::string_view iv_label;
 };
 
 constexpr QuicVersion kDraft29{
@@ -28,21 +29,27 @@ constexpr QuicVersion kDraft29{
     0,
     {0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97,
      0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99},
-    "quic",
+    "quic hp",
+    "quic key",
+    "quic iv",
 };
 constexpr QuicVersion kV1{
     0x1,
     0,
     {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
      0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a},
-    "quic",
+    "quic hp",
+    "quic key",
+    "quic iv",
 };
 constexpr QuicVersion kV2{
     0x6b3343cf,
     1,
     {0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93,
      0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9},
-    "quicv2",
+    "quicv2 hp",
+    "quicv2 key",
+    "quicv2 iv",
 };
 
 [[nodiscard]] const QuicVersion* LookupVersion(uint32_t ver) noexcept {
@@ -77,86 +84,103 @@ constexpr QuicVersion kV2{
 
 bool HkdfExtract(std::span<const uint8_t> salt,
                  std::span<const uint8_t> ikm,
-                 std::array<uint8_t, 32>& out) {
+                 std::array<uint8_t, 32>& out) noexcept {
     unsigned int out_len = 0;
     return HMAC(EVP_sha256(), salt.data(), static_cast<int>(salt.size()),
                 ikm.data(), ikm.size(), out.data(), &out_len) != nullptr &&
            out_len == out.size();
 }
 
+// TLS 1.3 HKDF-Expand-Label with SHA-256 for L <= 32 (single HMAC block T(1)).
 bool HkdfExpandLabel(std::span<const uint8_t> secret,
                      std::string_view label,
-                     std::span<uint8_t> out) {
-    std::array<uint8_t, 2 + 1 + 6 + 16 + 1> info_buf{};
-    const auto label_size = static_cast<uint8_t>(6 + label.size());
-    const size_t info_bytes =
-        static_cast<size_t>(2) + 1 + static_cast<size_t>(label_size) + 1;
-    if (label.size() > 16 || info_bytes > info_buf.size()) {
+                     std::span<uint8_t> out) noexcept {
+    if (out.empty() || out.size() > 32 || label.size() > 16) {
         return false;
     }
+    std::array<uint8_t, 2 + 1 + 6 + 16 + 1 + 1> info_buf{};
+    const auto label_size = static_cast<uint8_t>(6 + label.size());
     info_buf[0] = static_cast<uint8_t>((out.size() >> 8) & 0xff);
     info_buf[1] = static_cast<uint8_t>(out.size() & 0xff);
     info_buf[2] = label_size;
     std::memcpy(info_buf.data() + 3, "tls13 ", 6);
     std::memcpy(info_buf.data() + 9, label.data(), label.size());
-    const size_t info_len = 3 + label_size + 1;
+    const size_t info_len = 3 + static_cast<size_t>(label_size) + 1;
+    info_buf[info_len] = 0x01;
 
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
-    if (!ctx) return false;
-    bool ok = EVP_PKEY_derive_init(ctx) == 1 &&
-              EVP_PKEY_CTX_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) == 1 &&
-              EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) == 1 &&
-              EVP_PKEY_CTX_set1_hkdf_key(ctx, secret.data(),
-                                         static_cast<int>(secret.size())) == 1 &&
-              EVP_PKEY_CTX_add1_hkdf_info(ctx, info_buf.data(),
-                                          static_cast<int>(info_len)) == 1;
-    size_t out_len = out.size();
-    ok = ok && EVP_PKEY_derive(ctx, out.data(), &out_len) == 1 &&
-         out_len == out.size();
-    EVP_PKEY_CTX_free(ctx);
-    return ok;
+    std::array<uint8_t, 32> digest{};
+    unsigned int digest_len = 0;
+    if (HMAC(EVP_sha256(),
+             secret.data(),
+             static_cast<int>(secret.size()),
+             info_buf.data(),
+             info_len + 1,
+             digest.data(),
+             &digest_len) == nullptr ||
+        digest_len != digest.size()) {
+        return false;
+    }
+    std::memcpy(out.data(), digest.data(), out.size());
+    return true;
+}
+
+EVP_CIPHER_CTX* ThreadLocalQuicCipherCtx() noexcept {
+    struct Holder {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        ~Holder() {
+            if (ctx) EVP_CIPHER_CTX_free(ctx);
+        }
+    };
+    thread_local Holder holder;
+    if (holder.ctx) {
+        EVP_CIPHER_CTX_reset(holder.ctx);
+    }
+    return holder.ctx;
 }
 
 bool AesEcbEncrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 16> in,
-                   std::span<uint8_t, 16> out) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+                   std::span<uint8_t, 16> out) noexcept {
+    EVP_CIPHER_CTX* ctx = ThreadLocalQuicCipherCtx();
     if (!ctx) return false;
     int out_len = 0;
-    const bool ok =
-        EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key.data(), nullptr) == 1 &&
-        EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
-        EVP_EncryptUpdate(ctx, out.data(), &out_len, in.data(), 16) == 1 &&
-        out_len == 16;
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+    return EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key.data(), nullptr) == 1 &&
+           EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
+           EVP_EncryptUpdate(ctx, out.data(), &out_len, in.data(), 16) == 1 &&
+           out_len == 16;
 }
 
 bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 12> nonce,
-                   std::span<const uint8_t> aad,
+                   uint8_t unmasked_first_byte,
+                   std::span<const uint8_t> aad_middle,
+                   std::span<const uint8_t> unmasked_pn,
                    std::span<const uint8_t> ciphertext,
-                   std::vector<uint8_t>& plaintext) {
+                   memory::ByteVector& plaintext) {
     if (ciphertext.size() < 16) return false;
     const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
     const auto body = ciphertext.first(ciphertext.size() - 16);
     plaintext.resize(body.size());
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX* ctx = ThreadLocalQuicCipherCtx();
     if (!ctx) return false;
+    int aad_len = 0;
     int out_len = 0;
     int final_len = 0;
-    bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1 &&
-              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
-              EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) == 1 &&
-              EVP_DecryptUpdate(ctx, nullptr, &out_len, aad.data(),
-                                static_cast<int>(aad.size())) == 1 &&
-              EVP_DecryptUpdate(ctx, plaintext.data(), &out_len, body.data(),
-                                static_cast<int>(body.size())) == 1 &&
-              EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
-                                  const_cast<uint8_t*>(tag.data())) == 1 &&
-              EVP_DecryptFinal_ex(ctx, plaintext.data() + out_len, &final_len) == 1;
-    EVP_CIPHER_CTX_free(ctx);
+    const bool ok =
+        EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) == 1 &&
+        EVP_DecryptUpdate(ctx, nullptr, &aad_len, &unmasked_first_byte, 1) == 1 &&
+        EVP_DecryptUpdate(ctx, nullptr, &aad_len, aad_middle.data(),
+                          static_cast<int>(aad_middle.size())) == 1 &&
+        EVP_DecryptUpdate(ctx, nullptr, &aad_len, unmasked_pn.data(),
+                          static_cast<int>(unmasked_pn.size())) == 1 &&
+        EVP_DecryptUpdate(ctx, plaintext.data(), &out_len, body.data(),
+                          static_cast<int>(body.size())) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
+                            const_cast<uint8_t*>(tag.data())) == 1 &&
+        EVP_DecryptFinal_ex(ctx, plaintext.data() + out_len, &final_len) == 1;
     if (!ok) {
         plaintext.clear();
         return false;
@@ -173,15 +197,15 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         return result;
     }
 
-    std::vector<uint8_t> packet(data.begin(), data.end());
-    std::vector<uint8_t> crypto;
+    memory::ByteVector crypto;
+    memory::ByteVector decrypted;
     bool decrypted_initial = false;
 
     size_t offset = 0;
-    while (offset < packet.size()) {
-        auto remaining = std::span<uint8_t>(packet).subspan(offset);
+    while (offset < data.size()) {
+        const auto remaining = data.subspan(offset);
         if (remaining.size() < 6) break;
-        uint8_t type_byte = remaining[0];
+        const uint8_t type_byte = remaining[0];
         if ((type_byte & 0x80) == 0 || (type_byte & 0x40) == 0) {
             return result;
         }
@@ -234,18 +258,9 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         std::array<uint8_t, 16> hp_key{};
         std::array<uint8_t, 16> key{};
         std::array<uint8_t, 12> iv{};
-        std::string hp_label;
-        hp_label.append(spec->label_prefix);
-        hp_label.append(" hp");
-        std::string key_label;
-        key_label.append(spec->label_prefix);
-        key_label.append(" key");
-        std::string iv_label;
-        iv_label.append(spec->label_prefix);
-        iv_label.append(" iv");
-        if (!HkdfExpandLabel(client_secret, hp_label, hp_key) ||
-            !HkdfExpandLabel(client_secret, key_label, key) ||
-            !HkdfExpandLabel(client_secret, iv_label, iv)) {
+        if (!HkdfExpandLabel(client_secret, spec->hp_label, hp_key) ||
+            !HkdfExpandLabel(client_secret, spec->key_label, key) ||
+            !HkdfExpandLabel(client_secret, spec->iv_label, iv)) {
             return result;
         }
 
@@ -253,26 +268,32 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         std::array<uint8_t, 16> mask{};
         std::memcpy(sample.data(), remaining.data() + hdr_len + 4, 16);
         if (!AesEcbEncrypt(hp_key, sample, mask)) return result;
-        remaining[0] ^= mask[0] & 0x0f;
-        const int pn_len = (remaining[0] & 0x03) + 1;
-        for (int i = 0; i < pn_len; ++i) {
-            remaining[hdr_len + static_cast<size_t>(i)] ^= mask[static_cast<size_t>(i) + 1];
-        }
-
+        const uint8_t unmasked_first_byte =
+            static_cast<uint8_t>(type_byte ^ (mask[0] & 0x0f));
+        const int pn_len = (unmasked_first_byte & 0x03) + 1;
+        std::array<uint8_t, 4> unmasked_pn{};
         std::array<uint8_t, 12> nonce = iv;
         for (int i = 0; i < pn_len; ++i) {
-            nonce[12 - pn_len + i] ^= remaining[hdr_len + static_cast<size_t>(i)];
+            const uint8_t pn_byte = static_cast<uint8_t>(
+                remaining[hdr_len + static_cast<size_t>(i)] ^
+                mask[static_cast<size_t>(i) + 1]);
+            unmasked_pn[static_cast<size_t>(i)] = pn_byte;
+            nonce[12 - pn_len + i] ^= pn_byte;
         }
         const size_t ext_hdr_len = hdr_len + static_cast<size_t>(pn_len);
         const auto ciphertext = remaining.subspan(
             ext_hdr_len, static_cast<size_t>(packet_len) - static_cast<size_t>(pn_len));
-        const auto aad = remaining.first(ext_hdr_len);
-        std::vector<uint8_t> decrypted;
-        if (!AesGcmDecrypt(key, nonce, aad, ciphertext, decrypted)) {
+        if (!AesGcmDecrypt(
+                key,
+                nonce,
+                unmasked_first_byte,
+                remaining.subspan(1, hdr_len - 1),
+                std::span<const uint8_t>(unmasked_pn.data(), static_cast<size_t>(pn_len)),
+                ciphertext,
+                decrypted)) {
             return result;
         }
         decrypted_initial = true;
-
         size_t frame = 0;
         while (frame < decrypted.size()) {
             uint8_t frame_type = decrypted[frame++];

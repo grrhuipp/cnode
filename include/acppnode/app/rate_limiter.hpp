@@ -23,29 +23,17 @@ namespace acpp {
 // 配置
 // ============================================================================
 struct RateLimitConfig {
-    uint32_t max_connections = 0;              // 全局最大连接数 (0=不限制)
-    uint32_t max_conn_per_ip = 0;              // 单 IP 最大并发连接 (0=不限制)
-    uint32_t max_rate_per_ip = 0;              // 单 IP 每秒最大新连接 (0=不限制)
-    uint32_t auth_fail_limit = 10;             // 认证失败阈值 (屏蔽源 IP)
-    uint32_t auth_fail_window = 60;            // 认证失败计数窗口（秒），超过此时间重置计数
-    uint32_t auth_ban_seconds = 180;           // 认证失败屏蔽秒数
-};
-
-// ============================================================================
-// 拒绝原因
-// ============================================================================
-enum class Reject : uint8_t {
-    None = 0,
-    GlobalLimit,      // 全局连接超限
-    IPConnLimit,      // IP 连接超限
-    IPRateLimit,      // IP 速率超限
-    IPBanned,         // IP 被屏蔽（认证失败）
+    uint32_t max_connections = 0;      // 全局最大连接数 (0=不限制)
+    uint32_t max_conn_per_ip = 0;      // 单 IP 最大并发连接 (0=不限制)
+    uint32_t auth_fail_limit = 10;     // 认证失败阈值 (屏蔽源 IP)
+    uint32_t auth_fail_window = 60;    // 认证失败计数窗口（秒），超过此时间重置计数
+    uint32_t auth_ban_seconds = 180;   // 认证失败屏蔽秒数
 };
 
 // ============================================================================
 // 时间戳（秒）
 // ============================================================================
-inline uint32_t Now() {
+[[nodiscard]] inline uint32_t Now() noexcept {
     using namespace std::chrono;
     return static_cast<uint32_t>(
         duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
@@ -54,20 +42,21 @@ inline uint32_t Now() {
 // ============================================================================
 // IP 哈希 (FNV-1a)
 // ============================================================================
-inline uint64_t Hash(const char* s, size_t len) {
+[[nodiscard]] constexpr uint64_t Hash(const char* s, size_t len) noexcept {
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < len; ++i) {
         h ^= static_cast<uint8_t>(s[i]);
         h *= 1099511628211ULL;
     }
-    return h;
+    return h == 0 ? 1ULL : h;
 }
 
-inline uint64_t Hash(std::string_view s) {
+[[nodiscard]] constexpr uint64_t Hash(std::string_view s) noexcept {
     return Hash(s.data(), s.size());
 }
 
-inline uint64_t HashPair(std::string_view a, std::string_view b) {
+[[nodiscard]] constexpr uint64_t HashPair(
+    std::string_view a, std::string_view b) noexcept {
     uint64_t h = 14695981039346656037ULL;
     for (char ch : a) {
         h ^= static_cast<uint8_t>(ch);
@@ -79,205 +68,161 @@ inline uint64_t HashPair(std::string_view a, std::string_view b) {
         h ^= static_cast<uint8_t>(ch);
         h *= 1099511628211ULL;
     }
-    return h;
+    return h == 0 ? 1ULL : h;
 }
 
 // ============================================================================
-// IP 槽位（64 字节，cache line 对齐）
+// ConnectionLimiter — Worker 私有无锁连接与认证屏蔽限制器
 // ============================================================================
-struct alignas(64) Slot {
-    uint64_t hash = 0;                       // IP 哈希 (0=空槽)
-    uint32_t conns = 0;                      // 当前连接数
-    uint32_t rate = 0;                       // 当前秒连接数
-    uint32_t rate_ts = 0;                    // rate 的时间戳
-    uint32_t auth_fails = 0;                 // 认证失败计数
-    uint32_t auth_ts = 0;                    // 最后认证失败时间
-    uint32_t ban_until = 0;                  // 屏蔽解除时间
-    uint32_t _pad[8];                        // 填充到 64 字节
+class ConnectionLimiter {
+    static constexpr size_t kSlotCount = 16384;
+    static_assert((kSlotCount & (kSlotCount - 1)) == 0,
+                  "kSlotCount must be power of 2");
+    static constexpr size_t kMask = kSlotCount - 1;
+    static constexpr size_t kProbe = 32;
 
-    bool Match(uint64_t h) const {
-        return hash == h;
-    }
+    struct Slot {
+        uint64_t hash = 0;        // IP 或 tag:IP 哈希 (0=空槽)
+        uint32_t conns = 0;       // 当前连接数
+        uint32_t auth_fails = 0;  // 认证失败计数
+        uint32_t auth_ts = 0;     // 最后认证失败时间
+        uint32_t ban_until = 0;   // 屏蔽解除时间
 
-    bool Empty() const {
-        return hash == 0;
-    }
-
-    bool Idle(uint32_t now) const {
-        return conns == 0 && ban_until <= now;
-    }
-
-    bool TryAcquire(uint64_t h) {
-        if (hash != 0) return false;
-        hash = h;
-        return true;
-    }
-
-    void Clear() {
-        conns = 0;
-        rate = 0;
-        rate_ts = 0;
-        auth_fails = 0;
-        auth_ts = 0;
-        ban_until = 0;
-    }
-};
-
-static_assert(sizeof(Slot) == 64, "Slot must be 64 bytes");
-
-// ============================================================================
-// 统一限制器
-// ============================================================================
-template<size_t N = 16384>  // Worker 私有槽位数量，必须是 2 的幂
-class RateLimiter {
-    static_assert((N & (N - 1)) == 0, "N must be power of 2");
-    static constexpr size_t kMask = N - 1;
-    static constexpr size_t kProbe = 32;  // 最大探测长度（增加以应对高冲突场景如 NAT）
+        [[nodiscard]] bool Match(uint64_t h) const noexcept { return hash == h; }
+        [[nodiscard]] bool Empty() const noexcept { return hash == 0; }
+        [[nodiscard]] bool Idle(uint32_t now) const noexcept {
+            return conns == 0 && ban_until <= now;
+        }
+        void Reset(uint64_t h) noexcept {
+            hash = h;
+            conns = 0;
+            auth_fails = 0;
+            auth_ts = 0;
+            ban_until = 0;
+        }
+    };
+    static_assert(sizeof(Slot) == 24, "Slot must remain compact (24 bytes)");
 
 public:
-    explicit RateLimiter(const RateLimitConfig& cfg = {}) : cfg_(cfg) {}
+    enum class RejectReason : uint8_t {
+        NONE = 0,
+        MAX_CONNECTIONS,
+        MAX_CONNECTIONS_PER_IP,
+        IP_BANNED,
+    };
 
-    // ========================================================================
-    // 阶段1: 全局检查 (accept 时调用)
-    // ========================================================================
-    Reject CheckGlobal() {
+    [[nodiscard]] static const char* RejectReasonToString(
+        RejectReason r) noexcept {
+        static constexpr const char* kNames[] = {
+            "NONE", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "IP_BANNED"};
+        return kNames[static_cast<size_t>(r)];
+    }
+
+    ConnectionLimiter() = default;
+    explicit ConnectionLimiter(const RateLimitConfig& cfg) noexcept
+        : cfg_(cfg) {}
+
+    [[nodiscard]] RejectReason TryAcceptGlobal() noexcept {
         if (cfg_.max_connections == 0) {
-            return Reject::None;
+            return RejectReason::NONE;
         }
-
-        if (total_ >= cfg_.max_connections) return Reject::GlobalLimit;
+        if (total_ >= cfg_.max_connections) {
+            return RejectReason::MAX_CONNECTIONS;
+        }
         ++total_;
-        return Reject::None;
+        return RejectReason::NONE;
     }
 
-    void UndoGlobal() {
-        if (cfg_.max_connections == 0) {
-            return;
-        }
-        if (total_ > 0) --total_;
-    }
-
-    // ========================================================================
-    // 阶段2: IP 检查 (获取真实 IP 后调用)
-    // tag: 入站标签，用于区分不同节点的 banned 状态
-    // ========================================================================
-    Reject CheckIP(
+    [[nodiscard]] RejectReason TryAcceptIP(
         std::string_view tag,
         std::string_view ip,
-        bool check_auth_ban = true) {
-        uint64_t h = Hash(ip);
-        uint32_t now = Now();
-
-        // 1. 检查屏蔽（按 tag+ip 检查，不同节点独立）
+        bool check_auth_ban = true) noexcept {
+        const uint32_t now = Now();
         if (check_auth_ban && cfg_.auth_fail_limit > 0) {
-            uint64_t ban_h = HashPair(tag, ip);
+            const uint64_t ban_h = HashPair(tag, ip);
             if (const Slot* ban_s = FindConst(ban_h)) {
                 if (ban_s->ban_until > now) {
-                    return Reject::IPBanned;
+                    return RejectReason::IP_BANNED;
                 }
             }
         }
 
-        if (cfg_.max_conn_per_ip == 0 && cfg_.max_rate_per_ip == 0) {
-            return Reject::None;
+        if (cfg_.max_conn_per_ip == 0) {
+            return RejectReason::NONE;
         }
 
+        const uint64_t h = Hash(ip);
         Slot* s = FindOrCreate(h, now);
-        if (!s) return Reject::None;  // 槽位满，降级放行
-
-        // 2. 连接数限制（按 IP 全局限制）
-        if (cfg_.max_conn_per_ip > 0) {
-            if (s->conns >= cfg_.max_conn_per_ip) return Reject::IPConnLimit;
-            ++s->conns;
+        if (!s) {
+            return RejectReason::NONE;
         }
+        if (s->conns >= cfg_.max_conn_per_ip) {
+            return RejectReason::MAX_CONNECTIONS_PER_IP;
+        }
+        ++s->conns;
+        return RejectReason::NONE;
+    }
 
-        // 3. 速率限制
-        if (cfg_.max_rate_per_ip > 0) {
-            if (s->rate_ts != now) {
-                s->rate = 1;
-                s->rate_ts = now;
-            } else {
-                ++s->rate;
-                if (s->rate > cfg_.max_rate_per_ip) {
-                    if (cfg_.max_conn_per_ip > 0) {
-                        --s->conns;
-                    }
-                    return Reject::IPRateLimit;
+    void ReleaseGlobal() noexcept {
+        if (cfg_.max_connections > 0 && total_ > 0) {
+            --total_;
+        }
+    }
+
+    void ReleaseHash(uint64_t ip_hash) noexcept {
+        if (cfg_.max_conn_per_ip > 0 && ip_hash != 0) {
+            if (Slot* s = Find(ip_hash)) {
+                if (s->conns > 0) {
+                    --s->conns;
                 }
             }
         }
-
-        return Reject::None;
+        ReleaseGlobal();
     }
 
-    // ========================================================================
-    // 释放连接
-    // ========================================================================
-    void Release(std::string_view ip) {
-        if (cfg_.max_conn_per_ip > 0) {
-            uint64_t h = Hash(ip);
-            if (Slot* s = Find(h)) {
-                if (s->conns > 0) --s->conns;
-            }
-        }
-        UndoGlobal();
+    void Release(std::string_view ip) noexcept {
+        ReleaseHash(cfg_.max_conn_per_ip > 0 ? Hash(ip) : 0);
     }
 
-    // ========================================================================
-    // 记录认证失败（屏蔽源 IP）
-    // 注意：tag 用于区分不同的入站节点，同一 IP 在不同节点独立计数
-    // ========================================================================
-    void OnAuthFailTracked(std::string_view tag, std::string_view ip) {
+    void OnAuthFailTracked(std::string_view tag, std::string_view ip) noexcept {
         if (cfg_.auth_fail_limit == 0) return;
 
-        // 使用 tag+ip 的组合哈希，不同节点独立计数
-        uint64_t h = HashPair(tag, ip);
-        uint32_t now = Now();
+        const uint64_t h = HashPair(tag, ip);
+        const uint32_t now = Now();
         Slot* s = FindOrCreate(h, now);
-        if (!s) return;
+        if (!s || s->ban_until > now) return;
 
-        // 已被屏蔽则跳过
-        if (s->ban_until > now) return;
-
-        uint32_t last = s->auth_ts;
-
-        // 1 秒内去重：同一秒内多次失败只算 1 次（防止客户端重试导致快速累积）
+        const uint32_t last = s->auth_ts;
         if (last == now) return;
 
-        // 超时重置计数（使用独立的失败计数窗口）
         if (last > 0 && now - last > cfg_.auth_fail_window) {
             s->auth_fails = 0;
         }
-
-        // 更新时间戳（必须在计数之前，确保去重生效）
         s->auth_ts = now;
 
-        uint32_t cnt = ++s->auth_fails;
-
-        // 达到阈值则屏蔽
+        const uint32_t cnt = ++s->auth_fails;
         if (cnt >= cfg_.auth_fail_limit) {
             s->ban_until = now + cfg_.auth_ban_seconds;
             LOG_NET_WARN("[{}] IP {} banned for {}s (auth failures: {})",
                          tag, ip, cfg_.auth_ban_seconds, cnt);
-            // 重置失败计数，ban 解除后重新开始计数
             s->auth_fails = 0;
         }
     }
 
-    bool IsBanned(std::string_view tag, std::string_view ip) const {
-        uint64_t h = HashPair(tag, ip);
-        uint32_t now = Now();
+    [[nodiscard]] bool IsBanned(
+        std::string_view tag, std::string_view ip) const noexcept {
+        if (cfg_.auth_fail_limit == 0) return false;
+        const uint64_t h = HashPair(tag, ip);
+        const uint32_t now = Now();
         if (const Slot* s = FindConst(h)) {
             return s->ban_until > now;
         }
         return false;
     }
 
-    const RateLimitConfig& Config() const { return cfg_; }
-
 private:
-    Slot* Find(uint64_t h) {
-        size_t idx = h & kMask;
+    [[nodiscard]] Slot* Find(uint64_t h) noexcept {
+        const size_t idx = h & kMask;
         for (size_t i = 0; i < kProbe; ++i) {
             Slot& s = slots_[(idx + i) & kMask];
             if (s.Match(h)) return &s;
@@ -286,8 +231,8 @@ private:
         return nullptr;
     }
 
-    const Slot* FindConst(uint64_t h) const {
-        size_t idx = h & kMask;
+    [[nodiscard]] const Slot* FindConst(uint64_t h) const noexcept {
+        const size_t idx = h & kMask;
         for (size_t i = 0; i < kProbe; ++i) {
             const Slot& s = slots_[(idx + i) & kMask];
             if (s.Match(h)) return &s;
@@ -296,95 +241,30 @@ private:
         return nullptr;
     }
 
-    Slot* FindOrCreate(uint64_t h, uint32_t now) {
-        size_t idx = h & kMask;
+    [[nodiscard]] Slot* FindOrCreate(uint64_t h, uint32_t now) noexcept {
+        const size_t idx = h & kMask;
         Slot* idle = nullptr;
-
         for (size_t i = 0; i < kProbe; ++i) {
             Slot& s = slots_[(idx + i) & kMask];
-
             if (s.Match(h)) return &s;
-
-            uint64_t sh = s.hash;
-            if (sh == 0) {
-                if (s.TryAcquire(h)) return &s;
-                if (s.Match(h)) return &s;
-            } else if (!idle && s.Idle(now)) {
+            if (s.Empty()) {
+                s.hash = h;
+                return &s;
+            }
+            if (!idle && s.Idle(now)) {
                 idle = &s;
             }
         }
-
-        // 回收空闲槽
         if (idle) {
-            if (idle->hash != 0 && idle->Idle(now)) {
-                idle->Clear();
-                idle->hash = h;
-                return idle;
-            }
+            idle->Reset(h);
+            return idle;
         }
-
         return nullptr;
     }
 
     RateLimitConfig cfg_;
-    alignas(64) uint32_t total_ = 0;
-    alignas(64) std::array<Slot, N> slots_{};
-};
-
-// 默认类型
-using DefaultRateLimiter = RateLimiter<16384>;
-
-// ============================================================================
-// ConnectionLimiter — 协议无关的连接限制器（包装 DefaultRateLimiter）
-// ============================================================================
-class ConnectionLimiter {
-public:
-
-    enum class RejectReason {
-        NONE = 0,
-        MAX_CONNECTIONS,
-        MAX_CONNECTIONS_PER_IP,
-        IP_BANNED
-    };
-
-    static const char* RejectReasonToString(RejectReason r) {
-        static const char* s[] = {"NONE", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "IP_BANNED"};
-        return s[static_cast<int>(r)];
-    }
-
-    ConnectionLimiter() = default;
-    explicit ConnectionLimiter(const RateLimitConfig& c)
-        : lim_(c) {}
-
-    RejectReason TryAcceptGlobal() {
-        return lim_.CheckGlobal() == Reject::None ?
-               RejectReason::NONE : RejectReason::MAX_CONNECTIONS;
-    }
-
-    RejectReason TryAcceptIP(
-        std::string_view tag,
-        std::string_view ip,
-        bool check_auth_ban = true) {
-        auto r = lim_.CheckIP(tag, ip, check_auth_ban);
-        switch (r) {
-            case Reject::IPConnLimit: return RejectReason::MAX_CONNECTIONS_PER_IP;
-            case Reject::IPBanned:
-            case Reject::IPRateLimit: return RejectReason::IP_BANNED;
-            default: return RejectReason::NONE;
-        }
-    }
-
-    void ReleaseGlobal() { lim_.UndoGlobal(); }
-    void Release(std::string_view ip) { lim_.Release(ip); }
-
-    void OnAuthFailTracked(std::string_view tag, std::string_view ip) {
-        lim_.OnAuthFailTracked(tag, ip);
-    }
-
-    DefaultRateLimiter& GetLimiter() { return lim_; }
-
-private:
-    DefaultRateLimiter lim_;
+    uint32_t total_ = 0;
+    std::array<Slot, kSlotCount> slots_{};
 };
 
 }  // namespace acpp
