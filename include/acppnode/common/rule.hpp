@@ -24,12 +24,8 @@ public:
     void UpdateRule(std::string_view tag, const std::vector<DetectRule>& new_rule_list);
     [[nodiscard]] bool HasRule(std::string_view tag) const noexcept;
     [[nodiscard]] std::vector<DetectResult> GetDetectResult(std::string_view tag);
-    [[nodiscard]] bool Detect(std::string_view tag,
-                              std::string_view destination,
-                              std::string_view email);
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
-
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

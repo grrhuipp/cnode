@@ -113,32 +113,23 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
 }
 
 struct ActiveSessionScope {
-    session::Context& ctx;
     app::SessionTrackingState& session_tracking;
-    bool is_active = false;
+    app::SessionTrackingState::ActiveSession node{};
 
     ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState& tracking)
-        : ctx(session_ctx)
-        , session_tracking(tracking) {
-        if (ctx.inbound.user_id > 0) {
+                       app::SessionTrackingState& tracking) noexcept
+        : session_tracking(tracking) {
+        if (session_ctx.inbound.user_id > 0) {
             session_tracking.RegisterActiveSession(
-                ctx.conn_id,
-                ctx.inbound.tag,
-                ctx.inbound.user_id,
-                ctx.traffic);
-            is_active = true;
+                node,
+                session_ctx.inbound.tag,
+                session_ctx.inbound.user_id,
+                session_ctx.traffic);
         }
     }
 
     ~ActiveSessionScope() noexcept {
-        if (!is_active) {
-            return;
-        }
-
-        session_tracking.UnregisterActiveSession(
-            ctx.conn_id,
-            ctx.traffic);
+        session_tracking.UnregisterActiveSession(node);
     }
 };
 

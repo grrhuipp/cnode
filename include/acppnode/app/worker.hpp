@@ -124,10 +124,6 @@ public:
     net::awaitable<std::vector<rule::DetectResult>>
         GetDetectResultTask(std::string tag);
 
-    // Worker 热路径写入（仅 Worker 线程调用）
-    void AddUserTraffic(std::string_view tag, int64_t user_id,
-                        uint64_t upload, uint64_t download);
-
     // ── 运行时统计（通过 CollectRuntimeStatsTask 投递到 Worker 线程读取）──
 
     using MemoryStats = WorkerMemoryStats;

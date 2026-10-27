@@ -945,17 +945,6 @@ Worker::GetTrafficTask(std::string tag) {
     co_return runtime_->session_tracking->CollectAndResetTraffic(tag);
 }
 
-void Worker::AddUserTraffic(std::string_view tag,
-                            int64_t user_id,
-                            uint64_t upload,
-                            uint64_t download) {
-    runtime_->session_tracking->AddUserTraffic(
-        tag,
-        user_id,
-        upload,
-        download);
-}
-
 net::awaitable<std::vector<OnlineDevice>>
 Worker::GetOnlineDeviceTask(std::string tag) {
     auto handler = runtime_->inbound_manager->GetHandler(tag);

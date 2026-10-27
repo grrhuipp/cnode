@@ -16,6 +16,17 @@ namespace app {
 
 class SessionTrackingState {
 public:
+    struct ActiveSession {
+        ActiveSession* prev = nullptr;
+        ActiveSession* next = nullptr;
+        std::string_view tag;
+        int64_t user_id = 0;
+        session::Traffic* traffic = nullptr;
+        uint64_t last_reported_up = 0;
+        uint64_t last_reported_down = 0;
+        bool linked = false;
+    };
+
     SessionTrackingState();
     ~SessionTrackingState();
 
@@ -24,18 +35,12 @@ public:
     SessionTrackingState(SessionTrackingState&&) noexcept;
     SessionTrackingState& operator=(SessionTrackingState&&) noexcept;
 
-    void AddUserTraffic(std::string_view tag,
-                        int64_t user_id,
-                        uint64_t upload,
-                        uint64_t download);
-
-    void RegisterActiveSession(uint64_t conn_id,
+    void RegisterActiveSession(ActiveSession& node,
                                std::string_view tag,
                                int64_t user_id,
-                               session::Traffic& traffic);
+                               session::Traffic& traffic) noexcept;
 
-    void UnregisterActiveSession(uint64_t conn_id,
-                                 const session::Traffic& traffic) noexcept;
+    void UnregisterActiveSession(ActiveSession& node) noexcept;
 
     [[nodiscard]] UserTrafficSnapshot CollectAndResetTraffic(std::string_view tag);
 

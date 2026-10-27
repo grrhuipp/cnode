@@ -20,7 +20,7 @@ int main() {
     acpp::session::Context ctx;
     ctx.inbound.tag = tag;
     ctx.inbound.user_id = 42;
-    ctx.inbound.user_email = "node|user|42";
+    ctx.inbound.user_email = "alice@example.com";
     ctx.outbound.target = acpp::TargetAddress("blocked.example", 443);
     acpp::features::policy::RequestPolicy& policy = manager;
     if (!policy.Blocked(ctx)) return 2;
@@ -28,7 +28,6 @@ int main() {
     const auto results = manager.GetDetectResult(tag);
     if (results.size() != 1 || results.front().UID != 42 ||
         results.front().RuleID != 7) return 3;
-
     manager.UpdateRule(tag, {});
     if (manager.HasRule(tag)) return 4;
     if (policy.Blocked(ctx)) return 5;
