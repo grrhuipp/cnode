@@ -862,7 +862,7 @@ Handler::Process(
         co_return result;
     }
 
-    auto control_idle_timeout = timeouts.StreamIdleTimeout();
+    auto control_idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         control_idle_timeout = std::min(
             control_idle_timeout,

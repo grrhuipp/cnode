@@ -52,11 +52,7 @@ struct TimeoutsConfig {
         return std::chrono::seconds(write);
     }
 
-    [[nodiscard]] std::chrono::seconds StreamIdleTimeout() const noexcept {
-        return std::chrono::seconds(idle);
-    }
-
-    [[nodiscard]] std::chrono::seconds SessionIdleTimeout() const noexcept {
+    [[nodiscard]] std::chrono::seconds IdleTimeout() const noexcept {
         return std::chrono::seconds(idle);
     }
 

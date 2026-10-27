@@ -446,3 +446,10 @@ if(TLS_PUBLIC_SOURCE MATCHES "shared_ptr<void>")
     message(FATAL_ERROR
         "TLS public types must not use shared_ptr<void> type erasure")
 endif()
+
+file(READ "${SOURCE_DIR}/include/acppnode/infra/json_object.hpp" JSON_OBJECT_HEADER)
+if(JSON_OBJECT_HEADER MATCHES "ParseAliasedJson" OR
+   JSON_CONFIG_SOURCE MATCHES "ParseAliasedJson")
+    message(FATAL_ERROR
+        "JSON config helpers must accept a single canonical key, not multi-alias lists")
+endif()

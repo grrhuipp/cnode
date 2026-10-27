@@ -338,7 +338,7 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
         auto read_ss_server = [&](const acpp::json::object& obj,
                                   acpp::SsOutboundConfig& config) {
             config.address = json_string(obj, "address");
-            const auto port = acpp::ReadJsonPort(obj, {"port"});
+            const auto port = acpp::ReadJsonPort(obj, "port");
             if (port.Invalid()) {
                 return false;
             }

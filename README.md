@@ -226,7 +226,7 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 静态 inbound 未指定 `outboundTag` 时参与 routing，未命中回落内置 `direct`；指定 `"outboundTag": "出口标签"` 时强制使用该出口，不经过分流（即使规则可命中）。标签必须指向已配置或内置的静态 outbound；不存在或为空会拒绝启动。旧字段 `routingEnabled` 已移除，原先设置 `false` 的入站如需保持直连，请改为 `"outboundTag": "direct"`。
 - 面板创建的 direct outbound 是 routing 未命中时的 fallback，命中规则始终优先生效。
 - 出口列表顺序不表达默认出口；动态增删 outbound 不会改变其他 receiver 的选择。明确的 forced / fallback tag 不存在时请求失败，不隐式切换到第一个 outbound。
-- AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.users` 和 `settings.paddingScheme` 配置。
+- AnyTLS 使用 TLS session pool、单物理 session read loop、按 sid demux、共享 session 串行写，以及 `settings.clients` 和 `settings.paddingScheme` 配置。
 
 AnyTLS FIN 关闭整个逻辑流：远端 FIN 之前的已接收数据按有界队列排空，同时停止新的反向写入且不回复 FIN；本地关闭只发送一次 FIN。请求的两个方向结束后，完整且正常的物理会话可供新流复用；物理帧写入中断则关闭会话。第四十八轮已通过固定提交官方实现对照、双向直接互通和提前 FIN 检查，验证范围及当前环境限制见[架构审查记录](docs/architecture-review-20260909.md#第四十八轮anytls-完整关闭与-tls-取消传递)。
 - REALITY 当前只实现原生 TLS 1.3 + Ed25519 认证握手，不实现未认证连接的 `dest` / `target` 回落、uTLS `fingerprint` 模拟、`spiderX` 爬虫或 ML-DSA-65 证书附加签名/验证；配置这些字段或启用非零 `xver` 会在启动时明确拒绝。

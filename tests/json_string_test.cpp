@@ -17,14 +17,14 @@ void Check(bool condition, std::string_view message) {
 
 auto Parse(std::string_view body) {
     const auto parsed = acpp::json::parse(body);
-    return acpp::ParseAliasedJsonString(
-        parsed.as_object(), {"camelText", "snake_text"});
+    return acpp::ParseJsonString(
+        parsed.as_object(), "camelText");
 }
 
 auto ParseArray(std::string_view body) {
     const auto parsed = acpp::json::parse(body);
-    return acpp::ParseAliasedJsonStringArray(
-        parsed.as_object(), {"camelList", "snake_list"});
+    return acpp::ParseJsonStringArray(
+        parsed.as_object(), "camelList");
 }
 
 void CheckInvalid(std::string_view body, std::string_view cause) {
@@ -60,19 +60,12 @@ int main() {
     Check(empty.has_value() && empty->has_value() && (**empty).empty(),
           "explicit empty string was lost");
 
-    auto value = Parse(R"({"snake_text":"value"})");
+    auto value = Parse(R"({"camelText":"value"})");
     Check(value.has_value() && **value == "value", "string value mismatch");
-
-    auto equal_aliases = Parse(
-        R"({"camelText":"same","snake_text":"same"})");
-    Check(equal_aliases.has_value() && **equal_aliases == "same",
-          "equal string aliases were rejected");
 
     CheckInvalid(R"({"camelText":123})", "must be a string");
     CheckInvalid(R"({"camelText":null})", "must be a string");
     CheckInvalid(R"({"camelText":false})", "must be a string");
-    CheckInvalid(
-        R"({"camelText":"one","snake_text":"two"})", "must match");
 
     auto absent_array = ParseArray(R"({})");
     Check(absent_array.has_value() && !*absent_array,
@@ -83,21 +76,13 @@ int main() {
               (**empty_array).empty(),
           "explicit empty string array was lost");
 
-    auto array = ParseArray(R"({"snake_list":["one","two"]})");
+    auto array = ParseArray(R"({"camelList":["one","two"]})");
     Check(array.has_value() && **array ==
               std::vector<std::string>({"one", "two"}),
           "string array value mismatch");
 
-    auto equal_array_aliases = ParseArray(
-        R"({"camelList":["same"],"snake_list":["same"]})");
-    Check(equal_array_aliases.has_value() &&
-              **equal_array_aliases == std::vector<std::string>({"same"}),
-          "equal string array aliases were rejected");
-
     CheckInvalidArray(R"({"camelList":"one"})", "array of strings");
     CheckInvalidArray(R"({"camelList":["one",2]})", "only strings");
-    CheckInvalidArray(
-        R"({"camelList":["one"],"snake_list":["two"]})", "must match");
 
     const auto supplementary = acpp::json::parse(R"("\uD83D\uDE00")");
     Check(supplementary.as_string() == "\xF0\x9F\x98\x80",

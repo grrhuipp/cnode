@@ -20,7 +20,7 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     cfg.tag = read_string("tag");
     cfg.protocol = read_string("protocol");
 
-    auto settings = ParseAliasedJsonObject(j, {"settings"});
+    auto settings = ParseJsonObject(j, "settings");
     if (!settings) {
         throw std::invalid_argument(std::move(settings.error()));
     }
@@ -28,8 +28,8 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
         cfg.settings = **settings;
     }
 
-    auto stream_settings = ParseAliasedJsonObject(
-        j, {"streamSettings"});
+    auto stream_settings = ParseJsonObject(
+        j, "streamSettings");
     if (!stream_settings) {
         throw std::invalid_argument(std::move(stream_settings.error()));
     }

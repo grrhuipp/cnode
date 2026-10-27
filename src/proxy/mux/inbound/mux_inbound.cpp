@@ -1010,7 +1010,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
     (void)client_control.ConsumePhaseDeadline();
     client_control.ClearPhaseDeadline();
-    auto relay_idle_timeout = timeouts.StreamIdleTimeout();
+    auto relay_idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         relay_idle_timeout = std::min(
             relay_idle_timeout, std::chrono::seconds(pressure_idle_timeout));

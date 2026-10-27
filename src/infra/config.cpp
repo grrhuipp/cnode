@@ -140,37 +140,22 @@ namespace {
 
 [[nodiscard]] routing::DomainStrategy ParseRoutingDomainStrategy(
     const json::object& object) {
-    std::optional<routing::DomainStrategy> parsed;
-    std::string_view first_key;
-    for (const std::string_view key : {"domainStrategy"}) {
-        const auto* value = object.if_contains(key);
-        if (!value) {
-            continue;
-        }
-        if (!value->is_string()) {
-            throw std::invalid_argument(std::format(
-                "{} must be a string", key));
-        }
-        const auto candidate = RequireRoutingDomainStrategy(
-            std::string(value->as_string()));
-        if (parsed && *parsed != candidate) {
-            throw std::invalid_argument(std::format(
-                "{} and {} must match", first_key, key));
-        }
-        if (!parsed) {
-            parsed = candidate;
-            first_key = key;
-        }
+    const auto* value = object.if_contains("domainStrategy");
+    if (!value) {
+        return routing::DomainStrategy::AsIs;
     }
-    return parsed.value_or(routing::DomainStrategy::AsIs);
+    if (!value->is_string()) {
+        throw std::invalid_argument("domainStrategy must be a string");
+    }
+    return RequireRoutingDomainStrategy(std::string(value->as_string()));
 }
 
 // 从 object 中取 string，不存在则返回默认值
 inline std::string jstr(
     const json::object& obj,
-    std::initializer_list<std::string_view> aliases,
+    std::string_view key,
     std::string_view def = "") {
-    auto parsed = ParseAliasedJsonString(obj, aliases);
+    auto parsed = ParseJsonString(obj, key);
     if (!parsed) {
         throw std::invalid_argument(std::move(parsed.error()));
     }
@@ -180,19 +165,12 @@ inline std::string jstr(
     return std::move(**parsed);
 }
 
-inline std::string jstr(
-    const json::object& obj,
-    std::string_view key,
-    std::string_view def = "") {
-    return jstr(obj, {key}, def);
-}
-
 // 从 object 中取 bool，不存在则返回默认值
 inline bool jbool(
     const json::object& obj,
-    std::initializer_list<std::string_view> aliases,
+    std::string_view key,
     bool def = false) {
-    auto parsed = ParseAliasedJsonBool(obj, aliases);
+    auto parsed = ParseJsonBool(obj, key);
     if (!parsed) {
         throw std::invalid_argument(std::move(parsed.error()));
     }
@@ -201,10 +179,10 @@ inline bool jbool(
 
 uint32_t juint32(
     const json::object& obj,
-    std::initializer_list<std::string_view> aliases,
+    std::string_view key,
     uint32_t def) {
-    auto parsed = ParseAliasedJsonUint64(
-        obj, aliases, std::numeric_limits<uint32_t>::max());
+    auto parsed = ParseJsonUint64(
+        obj, key, std::numeric_limits<uint32_t>::max());
     if (!parsed) {
         throw std::invalid_argument(std::move(parsed.error()));
     }
@@ -213,8 +191,8 @@ uint32_t juint32(
 
 const json::object* optional_object(
     const json::object& obj,
-    std::initializer_list<std::string_view> aliases) {
-    auto parsed = ParseAliasedJsonObject(obj, aliases);
+    std::string_view key) {
+    auto parsed = ParseJsonObject(obj, key);
     if (!parsed) {
         throw std::invalid_argument(std::move(parsed.error()));
     }
@@ -222,7 +200,7 @@ const json::object* optional_object(
 }
 
 uint16_t required_port(const json::object& obj, std::string_view key) {
-    const auto result = ReadJsonPort(obj, {key});
+    const auto result = ReadJsonPort(obj, key);
     switch (result.error) {
         case JsonPortError::None:
             return result.value;
@@ -239,8 +217,8 @@ uint16_t required_port(const json::object& obj, std::string_view key) {
 
 inline std::vector<std::string> jstr_array(
     const json::object& obj,
-    std::initializer_list<std::string_view> aliases) {
-    auto parsed = ParseAliasedJsonStringArray(obj, aliases);
+    std::string_view key) {
+    auto parsed = ParseJsonStringArray(obj, key);
     if (!parsed) {
         throw std::invalid_argument(std::move(parsed.error()));
     }
@@ -426,37 +404,6 @@ void AppendRoutingPortField(const json::object& object,
     AppendRoutingPortValue(out, *value, key);
 }
 
-void AppendAliasedRoutingPortField(
-    const json::object& object,
-    std::initializer_list<std::string_view> aliases,
-    std::vector<RoutingPortRange>& out) {
-    std::optional<std::vector<RoutingPortRange>> parsed;
-    std::string_view first_key;
-    for (const std::string_view key : aliases) {
-        if (!object.contains(key)) {
-            continue;
-        }
-        std::vector<RoutingPortRange> candidate;
-        AppendRoutingPortField(object, key, candidate);
-        const auto equal = [](const RoutingPortRange& lhs,
-                              const RoutingPortRange& rhs) {
-            return lhs.start == rhs.start && lhs.end == rhs.end;
-        };
-        if (parsed && (parsed->size() != candidate.size() ||
-                       !std::ranges::equal(*parsed, candidate, equal))) {
-            throw std::invalid_argument(std::format(
-                "{} and {} must match", first_key, key));
-        }
-        if (!parsed) {
-            parsed = std::move(candidate);
-            first_key = key;
-        }
-    }
-    if (parsed) {
-        out.insert(out.end(), parsed->begin(), parsed->end());
-    }
-}
-
 
 } // anonymous namespace
 
@@ -477,15 +424,15 @@ LogConfig LogConfig::FromJson(const json::object& j) {
     auto error_path = jstr(j, "error");
     if (!error_path.empty()) cfg.error_path = error_path;
 
-    auto days = ParseAliasedJsonUint64(
-        j, {"maxDays"}, std::numeric_limits<uint16_t>::max());
+    auto days = ParseJsonUint64(
+        j, "maxDays", std::numeric_limits<uint16_t>::max());
     if (!days) {
         throw std::invalid_argument(std::move(days.error()));
     }
     cfg.max_days = static_cast<uint16_t>(days->value_or(cfg.max_days));
 
-    cfg.rotate_daily = jbool(j, {"rotateDaily"}, cfg.rotate_daily);
-    cfg.gzip = jbool(j, {"gzip"}, cfg.gzip);
+    cfg.rotate_daily = jbool(j, "rotateDaily", cfg.rotate_daily);
+    cfg.gzip = jbool(j, "gzip", cfg.gzip);
     return cfg;
 }
 
@@ -551,10 +498,10 @@ DnsConfig DnsConfig::FromJson(const json::object& j) {
             cfg.servers.push_back(ParseDnsServer(server.as_string()));
         }
     }
-    cfg.timeout    = juint32(j, {"timeout"}, cfg.timeout);
-    cfg.cache_size = juint32(j, {"cacheSize"}, cfg.cache_size);
-    cfg.min_ttl    = juint32(j, {"minTTL"}, cfg.min_ttl);
-    cfg.max_ttl    = juint32(j, {"maxTTL"}, cfg.max_ttl);
+    cfg.timeout    = juint32(j, "timeout", cfg.timeout);
+    cfg.cache_size = juint32(j, "cacheSize", cfg.cache_size);
+    cfg.min_ttl    = juint32(j, "minTTL", cfg.min_ttl);
+    cfg.max_ttl    = juint32(j, "maxTTL", cfg.max_ttl);
     return cfg;
 }
 
@@ -564,9 +511,9 @@ DnsConfig DnsConfig::FromJson(const json::object& j) {
 LimitsConfig LimitsConfig::FromJson(const json::object& j) {
     LimitsConfig cfg;
     cfg.max_connections = juint32(
-        j, {"maxConnections"}, cfg.max_connections);
+        j, "maxConnections", cfg.max_connections);
     cfg.max_connections_per_ip = juint32(
-        j, {"maxConnectionsPerIP"}, cfg.max_connections_per_ip);
+        j, "maxConnectionsPerIP", cfg.max_connections_per_ip);
     return cfg;
 }
 
@@ -575,13 +522,13 @@ LimitsConfig LimitsConfig::FromJson(const json::object& j) {
 // ============================================================================
 TimeoutsConfig TimeoutsConfig::FromJson(const json::object& j) {
     TimeoutsConfig cfg;
-    cfg.handshake = juint32(j, {"handshake"}, cfg.handshake);
-    cfg.dial = juint32(j, {"dial"}, cfg.dial);
-    cfg.read = juint32(j, {"read"}, cfg.read);
-    cfg.write = juint32(j, {"write"}, cfg.write);
-    cfg.idle = juint32(j, {"connIdle"}, cfg.idle);
-    cfg.uplink_only = juint32(j, {"uplinkOnly"}, cfg.uplink_only);
-    cfg.downlink_only = juint32(j, {"downlinkOnly"}, cfg.downlink_only);
+    cfg.handshake = juint32(j, "handshake", cfg.handshake);
+    cfg.dial = juint32(j, "dial", cfg.dial);
+    cfg.read = juint32(j, "read", cfg.read);
+    cfg.write = juint32(j, "write", cfg.write);
+    cfg.idle = juint32(j, "connIdle", cfg.idle);
+    cfg.uplink_only = juint32(j, "uplinkOnly", cfg.uplink_only);
+    cfg.downlink_only = juint32(j, "downlinkOnly", cfg.downlink_only);
     return cfg;
 }
 
@@ -593,7 +540,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 域名匹配 - 处理 xray 格式 (domain 数组可能包含 geosite:xxx, full:xxx 等)
     if (j.contains("domain")) {
-        for (std::string val : jstr_array(j, {"domain"})) {
+        for (std::string val : jstr_array(j, "domain")) {
 
             // 解析前缀
             if (val.substr(0, 8) == "geosite:") {
@@ -621,21 +568,21 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 独立的域名字段
     if (j.contains("domainSuffix")) {
-        auto arr = jstr_array(j, {"domainSuffix"});
+        auto arr = jstr_array(j, "domainSuffix");
         for (auto& value : arr) {
             rule.domain_suffix.push_back(RequireRoutingDomainName(
                 std::move(value), "suffix"));
         }
     }
     if (j.contains("domainKeyword")) {
-        auto arr = jstr_array(j, {"domainKeyword"});
+        auto arr = jstr_array(j, "domainKeyword");
         for (auto& value : arr) {
             rule.domain_keyword.push_back(RequireRoutingDomainKeyword(
                 std::move(value)));
         }
     }
     if (j.contains("domainFull")) {
-        auto arr = jstr_array(j, {"domainFull"});
+        auto arr = jstr_array(j, "domainFull");
         for (auto& value : arr) {
             rule.domain_full.push_back(RequireRoutingDomainName(
                 std::move(value), "full"));
@@ -645,14 +592,14 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("domainRegexp is not supported; use domainRegex");
     }
     if (j.contains("domainRegex")) {
-        auto arr = jstr_array(j, {"domainRegex"});
+        auto arr = jstr_array(j, "domainRegex");
         for (auto& value : arr) {
             rule.domain_regex.push_back(RequireRoutingDomainRegexp(
                 std::move(value)));
         }
     }
     if (j.contains("geosite")) {
-        auto arr = jstr_array(j, {"geosite"});
+        auto arr = jstr_array(j, "geosite");
         if (arr.empty()) {
             throw std::invalid_argument(
                 "routing geosite tag must not be empty");
@@ -665,7 +612,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // IP 匹配 - 处理 xray 格式 (ip 数组可能包含 geoip:xxx)
     if (j.contains("ip")) {
-        for (std::string val : jstr_array(j, {"ip"})) {
+        for (std::string val : jstr_array(j, "ip")) {
 
             if (val.substr(0, 6) == "geoip:") {
                 rule.geoip.push_back(RequireRoutingSelector(
@@ -676,7 +623,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
         }
     }
     if (j.contains("geoip")) {
-        auto arr = jstr_array(j, {"geoip"});
+        auto arr = jstr_array(j, "geoip");
         if (arr.empty()) {
             throw std::invalid_argument(
                 "routing geoip tag must not be empty");
@@ -710,37 +657,25 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     };
 
     // 辅助：解析字符串/数组字段，支持逗号分隔字符串（Xray 格式）
-    auto parse_str_or_array = [&](std::initializer_list<std::string_view> aliases) {
-        std::optional<std::vector<std::string>> parsed;
-        std::string_view first_key;
-        for (const std::string_view key : aliases) {
-            const auto* value = j.if_contains(key);
-            if (!value) {
-                continue;
-            }
-            std::vector<std::string> candidate;
-            if (value->is_array()) {
-                candidate = jstr_array(j, {key});
-            } else if (value->is_string()) {
-                candidate = split_comma(std::string(value->as_string()));
-            } else {
-                throw std::invalid_argument(std::format(
-                    "routing {} must be a string or array of strings", key));
-            }
-            if (candidate.empty()) {
-                throw std::invalid_argument(std::format(
-                    "routing {} must not be empty", key));
-            }
-            if (parsed && *parsed != candidate) {
-                throw std::invalid_argument(std::format(
-                    "{} and {} must match", first_key, key));
-            }
-            if (!parsed) {
-                parsed = std::move(candidate);
-                first_key = key;
-            }
+    auto parse_str_or_array = [&](std::string_view key) {
+        const auto* value = j.if_contains(key);
+        if (!value) {
+            return std::vector<std::string>{};
         }
-        return std::move(parsed).value_or(std::vector<std::string>{});
+        std::vector<std::string> candidate;
+        if (value->is_array()) {
+            candidate = jstr_array(j, key);
+        } else if (value->is_string()) {
+            candidate = split_comma(std::string(value->as_string()));
+        } else {
+            throw std::invalid_argument(std::format(
+                "routing {} must be a string or array of strings", key));
+        }
+        if (candidate.empty()) {
+            throw std::invalid_argument(std::format(
+                "routing {} must not be empty", key));
+        }
+        return candidate;
     };
 
     // 端口（支持 Xray 格式: "53,443,1000-2000"）
@@ -748,7 +683,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 网络类型（支持 Xray 格式: "tcp,udp"）
     {
-        auto vals = parse_str_or_array({"network"});
+        auto vals = parse_str_or_array("network");
         for (auto& value : vals) {
             rule.network.push_back(RequireRoutingNetwork(std::move(value)));
         }
@@ -756,7 +691,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 入站标签
     {
-        auto vals = parse_str_or_array({"inboundTag"});
+        auto vals = parse_str_or_array("inboundTag");
         for (auto& value : vals) {
             rule.inbound_tag.push_back(RequireRoutingSelector(
                 std::move(value), "inboundTag", false));
@@ -765,7 +700,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 用户 email（Xray user 字段）
     {
-        auto vals = parse_str_or_array({"user"});
+        auto vals = parse_str_or_array("user");
         for (auto& value : vals) {
             rule.user.push_back(RequireRoutingSelector(
                 std::move(value), "user", false));
@@ -774,23 +709,22 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
 
     // 来源 IP/CIDR（Xray source 字段）
     if (j.contains("source") && j.at("source").is_array()) {
-        for (const auto& value : jstr_array(j, {"source"})) {
+        for (const auto& value : jstr_array(j, "source")) {
             rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
         }
     } else {
-        auto vals = parse_str_or_array({"source"});
+        auto vals = parse_str_or_array("source");
         for (const auto& value : vals) {
             rule.source.push_back(RequireRoutingIpNetwork(value, "source"));
         }
     }
 
     // 来源端口（Xray sourcePort 字段）
-    AppendAliasedRoutingPortField(
-        j, {"sourcePort"}, rule.source_port);
+    AppendRoutingPortField(j, "sourcePort", rule.source_port);
 
     // 嗅探协议（Xray protocol 字段）
     {
-        auto vals = parse_str_or_array({"protocol"});
+        auto vals = parse_str_or_array("protocol");
         for (auto& value : vals) {
             rule.protocol.push_back(RequireRoutingSelector(
                 std::move(value), "protocol", true));
@@ -798,7 +732,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     }
 
     // 目标出站
-    rule.outbound_tag = jstr(j, {"outboundTag"});
+    rule.outbound_tag = jstr(j, "outboundTag");
 
     const bool has_condition =
         !rule.domain.empty() || !rule.domain_suffix.empty() ||
@@ -839,7 +773,7 @@ WsConfig WsConfig::FromJson(const json::object& j) {
     cfg.path = jstr(j, "path", std::string(constants::binding::kRootPath));
     require_http_request_target(cfg.path, "ws path");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, {"realIpHeader"}, cfg.real_ip_header);
+    cfg.real_ip_header = jstr(j, "realIpHeader", cfg.real_ip_header);
     require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
 }
@@ -851,10 +785,10 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     require_http_request_target(cfg.path, "http upgrade path");
     require_http_authority(cfg.host, "http upgrade host");
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, {"realIpHeader"}, "");
+    cfg.real_ip_header = jstr(j, "realIpHeader", "");
     require_http_header_name(
         cfg.real_ip_header, "http upgrade realIpHeader");
-    cfg.accept_proxy_protocol = jbool(j, {"acceptProxyProtocol"}, false);
+    cfg.accept_proxy_protocol = jbool(j, "acceptProxyProtocol", false);
     return cfg;
 }
 
@@ -870,9 +804,9 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("http method must be a valid HTTP token");
     }
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = jstr(j, {"realIpHeader"}, "");
+    cfg.real_ip_header = jstr(j, "realIpHeader", "");
     require_http_header_name(cfg.real_ip_header, "http realIpHeader");
-    cfg.force_http2 = jbool(j, {"forceHttp2"}, false);
+    cfg.force_http2 = jbool(j, "forceHttp2", false);
     if (j.contains("initial_windows_size") || j.contains("initial_window_size")) {
         throw std::invalid_argument(
             "initial_windows_size/initial_window_size is not supported; use initialWindowSize");
@@ -887,10 +821,10 @@ HttpConfig HttpConfig::FromJson(const json::object& j) {
 
 GrpcConfig GrpcConfig::FromJson(const json::object& j) {
     GrpcConfig cfg;
-    cfg.authority = jstr(j, {"authority"}, "");
-    cfg.service_name = jstr(j, {"serviceName"}, "");
-    cfg.user_agent = jstr(j, {"userAgent"}, "");
-    cfg.multi_mode = jbool(j, {"multiMode"}, false);
+    cfg.authority = jstr(j, "authority", "");
+    cfg.service_name = jstr(j, "serviceName", "");
+    cfg.user_agent = jstr(j, "userAgent", "");
+    cfg.multi_mode = jbool(j, "multiMode", false);
     require_http_authority(cfg.authority, "grpc authority");
     require_http_request_target(cfg.RequestPath(), "grpc serviceName path");
     if (!transport::internet::IsValidHttpHeaderValue(cfg.user_agent)) {
@@ -913,54 +847,29 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     const json::object& j) {
     auto settings = std::make_shared<XHttpDownloadSettings>();
 
-    std::optional<std::string> address;
-    std::string_view address_key;
-    for (const std::string_view key : {"address"}) {
-        const auto* value = j.if_contains(key);
-        if (!value) continue;
-        if (!value->is_string() || value->as_string().empty()) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} must be a non-empty string", key));
-        }
-        const std::string parsed(value->as_string());
-        if (address && *address != parsed) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} and {} must match", address_key, key));
-        }
-        if (!address) {
-            address = parsed;
-            address_key = key;
-        }
-    }
-    if (!address) {
+    const auto* address_val = j.if_contains("address");
+    if (!address_val) {
         throw std::invalid_argument("xhttp download address is required");
     }
-    if (!iputil::ParseLiteral(*address) && !domain::IsValidDnsHostname(
-            *address, domain::TrailingDotPolicy::Allow)) {
+    if (!address_val->is_string() || address_val->as_string().empty()) {
+        throw std::invalid_argument("xhttp download address must be a non-empty string");
+    }
+    std::string address(address_val->as_string());
+    if (!iputil::ParseLiteral(address) && !domain::IsValidDnsHostname(
+            address, domain::TrailingDotPolicy::Allow)) {
         throw std::invalid_argument("xhttp download address must be an IP literal or DNS hostname");
     }
-    settings->address = std::move(*address);
+    settings->address = std::move(address);
 
-    std::optional<uint16_t> port;
-    std::string_view port_key;
-    for (const std::string_view key : {"port"}) {
-        if (!j.contains(key)) continue;
-        const auto parsed = ReadJsonPort(j, {key});
-        if (!parsed.Valid()) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} must be an integer between 1 and 65535", key));
-        }
-        if (port && *port != parsed.value) {
-            throw std::invalid_argument(std::format(
-                "xhttp download {} and {} must match", port_key, key));
-        }
-        if (!port) {
-            port = parsed.value;
-            port_key = key;
-        }
+    if (!j.contains("port")) {
+        throw std::invalid_argument("xhttp download port is required");
     }
-    if (!port) throw std::invalid_argument("xhttp download port is required");
-    settings->port = *port;
+    const auto parsed_port = ReadJsonPort(j, "port");
+    if (!parsed_port.Valid()) {
+        throw std::invalid_argument(
+            "xhttp download port must be an integer between 1 and 65535");
+    }
+    settings->port = parsed_port.value;
 
     if (j.contains("send_through") || j.contains("send_through_strategy")) {
         throw std::invalid_argument("xhttp download binding must use sendThrough/sendThroughStrategy");
@@ -1005,25 +914,13 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
     require_http_request_target(cfg.path, "xhttp path");
     require_http_authority(cfg.host, "xhttp host");
     parse_http_headers(j, cfg.headers);
-    cfg.no_grpc_header = jbool(j, {"noGRPCHeader"}, false);
-    cfg.no_sse_header = jbool(j, {"noSSEHeader"}, false);
+    cfg.no_grpc_header = jbool(j, "noGRPCHeader", false);
+    cfg.no_sse_header = jbool(j, "noSSEHeader", false);
     auto parse_download_settings = [&](const json::object& source) {
-        const json::value* declaration = nullptr;
-        std::string_view declaration_key;
-        for (const std::string_view key : {"downloadSettings"}) {
-            const auto* value = source.if_contains(key);
-            if (!value) continue;
-            if (declaration) {
-                throw std::invalid_argument(
-                    "xhttp downloadSettings must be declared only once");
-            }
-            declaration = value;
-            declaration_key = key;
-        }
+        const auto* declaration = source.if_contains("downloadSettings");
         if (!declaration) return;
         if (!declaration->is_object()) {
-            throw std::invalid_argument(std::format(
-                "xhttp {} must be an object", declaration_key));
+            throw std::invalid_argument("xhttp downloadSettings must be an object");
         }
         if (cfg.download_settings) {
             throw std::invalid_argument(
@@ -1033,12 +930,12 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
             ParseXHttpDownloadSettings(declaration->as_object());
     };
     parse_download_settings(j);
-    if (const auto* extra = optional_object(j, {"extra"})) {
+    if (const auto* extra = optional_object(j, "extra")) {
         parse_http_headers(*extra, cfg.headers);
         cfg.no_grpc_header = jbool(
-            *extra, {"noGRPCHeader"}, cfg.no_grpc_header);
+            *extra, "noGRPCHeader", cfg.no_grpc_header);
         cfg.no_sse_header = jbool(
-            *extra, {"noSSEHeader"}, cfg.no_sse_header);
+            *extra, "noSSEHeader", cfg.no_sse_header);
         parse_download_settings(*extra);
     }
     if (cfg.download_settings) {
@@ -1056,14 +953,14 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
 
 RealityConfig RealityConfig::FromJson(const json::object& j) {
     RealityConfig cfg;
-    cfg.show = jbool(j, {"show"}, false);
+    cfg.show = jbool(j, "show", false);
     cfg.type = lower_ascii_copy(jstr(j, "type", ""));
     if (j.contains("dest") || j.contains("target")) {
         throw std::invalid_argument(
             "REALITY dest/target is not supported; target fallback for "
             "unauthenticated handshakes is not implemented");
     }
-    auto xver = ParseAliasedJsonUint64(j, {"xver"}, 2);
+    auto xver = ParseJsonUint64(j, "xver", 2);
     if (!xver) {
         throw std::invalid_argument(std::move(xver.error()));
     }
@@ -1072,9 +969,9 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "REALITY xver 1 and 2 are not supported; PROXY protocol forwarding "
             "to the REALITY target is not implemented");
     }
-    cfg.server_names = jstr_array(j, {"serverNames"});
+    cfg.server_names = jstr_array(j, "serverNames");
     const std::string private_key =
-        jstr(j, {"privateKey"}, "");
+        jstr(j, "privateKey", "");
     if (!private_key.empty()) {
         auto parsed = transport::internet::ParseRealityKey(private_key);
         if (!parsed) {
@@ -1082,7 +979,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         }
         cfg.private_key = *parsed;
     }
-    const auto short_ids = jstr_array(j, {"shortIds"});
+    const auto short_ids = jstr_array(j, "shortIds");
     cfg.short_ids.reserve(short_ids.size());
     for (const auto& short_id : short_ids) {
         auto parsed = transport::internet::ParseRealityShortId(short_id);
@@ -1093,14 +990,14 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         cfg.short_ids.push_back(*parsed);
     }
     const auto min_client_version = transport::internet::ParseRealityClientVersion(
-        jstr(j, {"minClientVer"}, ""));
+        jstr(j, "minClientVer", ""));
     if (!min_client_version) {
         throw std::invalid_argument("REALITY minClientVer is invalid");
     }
     cfg.min_client_version = *min_client_version;
 
     const auto max_client_version = transport::internet::ParseRealityClientVersion(
-        jstr(j, {"maxClientVer"}, ""));
+        jstr(j, "maxClientVer", ""));
     if (!max_client_version) {
         throw std::invalid_argument("REALITY maxClientVer is invalid");
     }
@@ -1112,8 +1009,8 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "REALITY minClientVer must not exceed maxClientVer");
     }
-    auto max_time_diff = ParseAliasedJsonUint64(
-        j, {"maxTimeDiff"});
+    auto max_time_diff = ParseJsonUint64(
+        j, "maxTimeDiff");
     if (!max_time_diff) {
         throw std::invalid_argument(std::move(max_time_diff.error()));
     }
@@ -1129,9 +1026,9 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "REALITY fingerprint is not supported; ClientHello fingerprint "
             "emulation is not implemented");
     }
-    cfg.server_name = jstr(j, {"serverName"}, "");
+    cfg.server_name = jstr(j, "serverName", "");
     const std::string public_key = jstr(
-        j, {"publicKey"}, "");
+        j, "publicKey", "");
     if (!public_key.empty()) {
         auto parsed = transport::internet::ParseRealityKey(public_key);
         if (!parsed) {
@@ -1140,7 +1037,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         cfg.public_key = *parsed;
     }
     auto short_id = transport::internet::ParseRealityShortId(
-        jstr(j, {"shortId"}, ""));
+        jstr(j, "shortId", ""));
     if (!short_id) {
         throw std::invalid_argument("REALITY shortId is invalid");
     }
@@ -1151,7 +1048,7 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
             "is not implemented");
     }
     cfg.master_key_log = jstr(
-        j, {"masterKeyLog"}, "");
+        j, "masterKeyLog", "");
     return cfg;
 }
 
@@ -1167,24 +1064,24 @@ StreamSettings StreamSettings::FromJson(
         jstr(j, "security", std::string(constants::protocol::kNone)));
 
     // TLS 配置
-    if (const auto* tls = optional_object(j, {"tlsSettings"})) {
+    if (const auto* tls = optional_object(j, "tlsSettings")) {
         min_version_declared =
             tls->contains("minVersion");
         max_version_declared =
             tls->contains("maxVersion");
         cfg.tls.min_version = ParseTlsVersion(
-            jstr(*tls, {"minVersion"}, "1.2"),
+            jstr(*tls, "minVersion", "1.2"),
             "minVersion");
         cfg.tls.max_version = ParseTlsVersion(
-            jstr(*tls, {"maxVersion"}, "1.3"),
+            jstr(*tls, "maxVersion", "1.3"),
             "maxVersion");
         if (cfg.tls.min_version > cfg.tls.max_version) {
             throw std::invalid_argument(
                 "tls minVersion must not exceed maxVersion");
         }
         cfg.tls.server_name = jstr(*tls, "serverName", "");
-        cfg.tls.allow_insecure = jbool(*tls, {"allowInsecure"}, false);
-        cfg.tls.ca_file = jstr(*tls, {"caFile"}, "");
+        cfg.tls.allow_insecure = jbool(*tls, "allowInsecure", false);
+        cfg.tls.ca_file = jstr(*tls, "caFile", "");
         if (role == StreamEndpointRole::Inbound &&
             cfg.tls.allow_insecure) {
             throw std::invalid_argument(
@@ -1200,7 +1097,7 @@ StreamSettings StreamSettings::FromJson(
                 "tls caFile cannot be used with allowInsecure");
         }
         // ALPN
-        cfg.tls.alpn = jstr_array(*tls, {"alpn"});
+        cfg.tls.alpn = jstr_array(*tls, "alpn");
         if (!IsValidTlsAlpn(cfg.tls.alpn)) {
             throw std::invalid_argument(
                 "tls alpn entries must contain between 1 and 255 bytes "
@@ -1258,7 +1155,7 @@ StreamSettings StreamSettings::FromJson(
     }
 
     if (const auto* reality = optional_object(
-            j, {"realitySettings"})) {
+            j, "realitySettings")) {
         cfg.reality = RealityConfig::FromJson(*reality);
     }
     if (cfg.security == constants::protocol::kReality) {
@@ -1301,23 +1198,23 @@ StreamSettings StreamSettings::FromJson(
         throw std::invalid_argument(
             "legacy streamSettings key alias is not supported; use wsSettings, httpupgradeSettings, httpSettings, or xhttpSettings");
     }
-    if (const auto* ws = optional_object(j, {"wsSettings"})) {
+    if (const auto* ws = optional_object(j, "wsSettings")) {
         cfg.ws = WsConfig::FromJson(*ws);
     }
 
-    if (const auto* http_upgrade = optional_object(j, {"httpupgradeSettings"})) {
+    if (const auto* http_upgrade = optional_object(j, "httpupgradeSettings")) {
         cfg.http_upgrade = HttpUpgradeConfig::FromJson(*http_upgrade);
     }
 
-    if (const auto* http = optional_object(j, {"httpSettings"})) {
+    if (const auto* http = optional_object(j, "httpSettings")) {
         cfg.http = HttpConfig::FromJson(*http);
     }
 
-    if (const auto* grpc = optional_object(j, {"grpcSettings"})) {
+    if (const auto* grpc = optional_object(j, "grpcSettings")) {
         cfg.grpc = GrpcConfig::FromJson(*grpc);
     }
 
-    if (const auto* xhttp = optional_object(j, {"xhttpSettings"})) {
+    if (const auto* xhttp = optional_object(j, "xhttpSettings")) {
         cfg.xhttp = XHttpConfig::FromJson(*xhttp);
     }
 
@@ -1340,42 +1237,27 @@ StaticUserConfig ParseStaticUserConfig(
             "decryption",
             std::string(constants::protocol::kNone));
     }
-    std::optional<std::string> padding_scheme;
-    std::string_view padding_key;
-    for (const std::string_view key : {"paddingScheme"}) {
-        const auto* padding = settings.if_contains(key);
-        if (!padding) continue;
-
-        std::string parsed;
+    if (const auto* padding = settings.if_contains("paddingScheme")) {
         if (padding->is_string()) {
-            parsed = std::string(padding->as_string());
+            config.padding_scheme = std::string(padding->as_string());
         } else if (padding->is_array()) {
             bool first = true;
             for (const auto& item : padding->as_array()) {
                 if (!item.is_string()) {
-                    throw std::invalid_argument(std::format(
-                        "{} must contain only strings", key));
+                    throw std::invalid_argument(
+                        "paddingScheme must contain only strings");
                 }
                 if (!first) {
-                    parsed.push_back('\n');
+                    config.padding_scheme.push_back('\n');
                 }
-                parsed.append(item.as_string());
+                config.padding_scheme.append(item.as_string());
                 first = false;
             }
         } else {
-            throw std::invalid_argument(std::format(
-                "{} must be a string or array of strings", key));
-        }
-        if (padding_scheme && *padding_scheme != parsed) {
-            throw std::invalid_argument(std::format(
-                "{} and {} must match", padding_key, key));
-        }
-        if (!padding_scheme) {
-            padding_scheme = std::move(parsed);
-            padding_key = key;
+            throw std::invalid_argument(
+                "paddingScheme must be a string or array of strings");
         }
     }
-    config.padding_scheme = std::move(padding_scheme).value_or("");
 
     const bool ss2022_method = config.method.rfind("2022-", 0) == 0;
     StaticUser top_level_user;
@@ -1389,66 +1271,30 @@ StaticUserConfig ParseStaticUserConfig(
         top_level_user.email = jstr(settings, "email", "");
     }
 
-    auto parse_user_arrays = [&](std::initializer_list<std::string_view> aliases)
-            -> std::optional<std::vector<StaticUser>> {
-        std::optional<std::vector<StaticUser>> parsed;
-        std::string_view first_key;
-        for (const std::string_view key : aliases) {
-            const auto* users = settings.if_contains(key);
-            if (!users) continue;
-            if (!users->is_array()) {
-                throw std::invalid_argument(std::format(
-                    "{} must be an array", key));
-            }
-
-            std::vector<StaticUser> candidates;
-            candidates.reserve(users->as_array().size());
-            for (const auto& client : users->as_array()) {
-                if (!client.is_object()) {
-                    throw std::invalid_argument(std::format(
-                        "{} entries must be objects", key));
-                }
-                const auto& client_obj = client.as_object();
-
-                StaticUser user;
-                user.id = jstr(client_obj, {"id"}, "");
-                user.password = jstr(client_obj, "password", "");
-                user.email = jstr(client_obj, "email", "");
-                user.flow = jstr(client_obj, "flow", "");
-                candidates.push_back(std::move(user));
-            }
-
-            auto users_match = [](const StaticUser& lhs, const StaticUser& rhs) {
-                return lhs.id == rhs.id &&
-                       lhs.password == rhs.password &&
-                       lhs.email == rhs.email &&
-                       lhs.flow == rhs.flow;
-            };
-            if (parsed &&
-                (parsed->size() != candidates.size() ||
-                 !std::ranges::equal(*parsed, candidates, users_match))) {
-                throw std::invalid_argument(std::format(
-                    "{} and {} must match", first_key, key));
-            }
-            if (!parsed) {
-                parsed = std::move(candidates);
-                first_key = key;
-            }
-        }
-        return parsed;
-    };
-
-    std::optional<std::vector<StaticUser>> users;
-    if (protocol == constants::protocol::kAnyTLS) {
-        users = parse_user_arrays({"users", "clients"});
-    } else if (protocol == constants::protocol::kVless) {
-        users = parse_user_arrays({"clients", "users"});
-    } else {
-        users = parse_user_arrays({"clients"});
+    if (settings.contains("users")) {
+        throw std::invalid_argument(
+            "static inbound settings.users is not supported; use settings.clients");
     }
-    const bool saw_user_array = users && !users->empty();
-    if (users) {
-        config.clients = std::move(*users);
+
+    bool saw_user_array = false;
+    if (const auto* clients = settings.if_contains("clients")) {
+        if (!clients->is_array()) {
+            throw std::invalid_argument("clients must be an array");
+        }
+        config.clients.reserve(clients->as_array().size());
+        for (const auto& client : clients->as_array()) {
+            if (!client.is_object()) {
+                throw std::invalid_argument("clients entries must be objects");
+            }
+            const auto& client_obj = client.as_object();
+            StaticUser user;
+            user.id = jstr(client_obj, "id", "");
+            user.password = jstr(client_obj, "password", "");
+            user.email = jstr(client_obj, "email", "");
+            user.flow = jstr(client_obj, "flow", "");
+            config.clients.push_back(std::move(user));
+        }
+        saw_user_array = !config.clients.empty();
     }
 
     if (protocol == constants::protocol::kShadowsocks &&
@@ -1471,23 +1317,26 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
     StaticInboundConfig cfg;
 
     // tag 支持字符串或数组（多标签匹配任一）
-    auto parse_tag = [&](std::string_view key) {
-        auto* p = j.if_contains(key);
-        if (!p) return;
+    if (const auto* p = j.if_contains("tag")) {
         if (p->is_string()) {
             cfg.tags.push_back(std::string(p->as_string()));
         } else if (p->is_array()) {
             for (const auto& item : p->as_array()) {
-                if (item.is_string()) {
-                    cfg.tags.push_back(std::string(item.as_string()));
+                if (!item.is_string()) {
+                    throw std::invalid_argument("static inbound tag array must contain only strings");
                 }
+                cfg.tags.push_back(std::string(item.as_string()));
             }
+        } else {
+            throw std::invalid_argument("static inbound tag must be a string or array of strings");
         }
-    };
-    parse_tag("tag");
+    }
 
-    if (j.contains("protocol")) {
-        cfg.protocol = std::string(j.at("protocol").as_string());
+    if (const auto* proto = j.if_contains("protocol")) {
+        if (!proto->is_string()) {
+            throw std::invalid_argument("static inbound protocol must be a string");
+        }
+        cfg.protocol = std::string(proto->as_string());
     }
 
     if (j.contains("listen")) {
@@ -1505,25 +1354,25 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 
     cfg.port = required_port(j, "port");
 
-    if (const auto* settings = optional_object(j, {"settings"})) {
+    if (const auto* settings = optional_object(j, "settings")) {
         cfg.static_users = ParseStaticUserConfig(cfg.protocol, *settings);
     }
 
     if (const auto* stream_settings = optional_object(
-            j, {"streamSettings"})) {
+            j, "streamSettings")) {
         cfg.stream_settings = StreamSettings::FromJson(
             *stream_settings, StreamEndpointRole::Inbound);
     }
 
     // Xray sniffing 配置
-    if (const auto* sniffing = optional_object(j, {"sniffing"})) {
-        cfg.sniffing.enabled = jbool(*sniffing, {"enabled"}, true);
-        cfg.sniffing.metadata_only = jbool(*sniffing, {"metadataOnly"}, false);
-        cfg.sniffing.route_only = jbool(*sniffing, {"routeOnly"}, true);
+    if (const auto* sniffing = optional_object(j, "sniffing")) {
+        cfg.sniffing.enabled = jbool(*sniffing, "enabled", true);
+        cfg.sniffing.metadata_only = jbool(*sniffing, "metadataOnly", false);
+        cfg.sniffing.route_only = jbool(*sniffing, "routeOnly", true);
         cfg.sniffing.dest_override =
-            jstr_array(*sniffing, {"destOverride"});
+            jstr_array(*sniffing, "destOverride");
         cfg.sniffing.domains_excluded =
-            jstr_array(*sniffing, {"domainsExcluded"});
+            jstr_array(*sniffing, "domainsExcluded");
         for (auto& protocol : cfg.sniffing.dest_override) {
             for (char& ch : protocol) {
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -1570,25 +1419,25 @@ std::optional<Config> Config::LoadFromJson(const json::object& j) {
     Config cfg;
 
     try {
-        if (const auto* log = optional_object(j, {"log"})) {
+        if (const auto* log = optional_object(j, "log")) {
             cfg.log_ = LogConfig::FromJson(*log);
         }
 
-        cfg.workers_ = juint32(j, {"workers"}, cfg.workers_);
+        cfg.workers_ = juint32(j, "workers", cfg.workers_);
         if (cfg.workers_ > defaults::kMaxWorkers) {
             throw std::invalid_argument(std::format(
                 "workers must be between 0 and {}", defaults::kMaxWorkers));
         }
 
-        if (const auto* dns = optional_object(j, {"dns"})) {
+        if (const auto* dns = optional_object(j, "dns")) {
             cfg.dns_ = DnsConfig::FromJson(*dns);
         }
 
-        if (const auto* limits = optional_object(j, {"limits"})) {
+        if (const auto* limits = optional_object(j, "limits")) {
             cfg.limits_ = LimitsConfig::FromJson(*limits);
         }
 
-        if (const auto* timeouts = optional_object(j, {"timeouts"})) {
+        if (const auto* timeouts = optional_object(j, "timeouts")) {
             cfg.timeouts_ = TimeoutsConfig::FromJson(*timeouts);
         }
 

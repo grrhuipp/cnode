@@ -332,7 +332,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         auto read_trojan_server = [&](const acpp::json::object& obj,
                                       acpp::TrojanOutboundConfig& config) {
             config.address = json_string(obj, "address");
-            const auto port = acpp::ReadJsonPort(obj, {"port"});
+            const auto port = acpp::ReadJsonPort(obj, "port");
             if (port.Invalid()) {
                 return false;
             }
@@ -341,12 +341,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             password = json_string(obj, "password");
             server_name = json_string(obj, "serverName");
-            if (server_name.empty()) {
-                server_name = json_string(obj, "server_name");
-            }
-            if (server_name.empty()) {
-                server_name = json_string(obj, "sni");
-            }
             allow_insecure = json_bool(
                 obj,
                 "allowInsecure",

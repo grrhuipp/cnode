@@ -76,7 +76,7 @@ void ApplySniffOverride(
 std::chrono::seconds ResolveRelayIdleTimeout(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    auto idle_timeout = timeouts.StreamIdleTimeout();
+    auto idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         idle_timeout = std::min(
             idle_timeout, std::chrono::seconds(pressure_idle_timeout));
@@ -454,10 +454,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(
         timeouts, pressure_idle_timeout);
     if (pressure_idle_timeout > 0 &&
-        relay_idle_timeout < timeouts.StreamIdleTimeout()) {
+        relay_idle_timeout < timeouts.IdleTimeout()) {
         LOG_CONN_DEBUG(ctx,
                        "[Session] Pressure mode: relay_idle={}s -> {}s",
-                       timeouts.StreamIdleTimeout().count(),
+                       timeouts.IdleTimeout().count(),
                        relay_idle_timeout.count());
     }
     const auto relay_write_timeout =

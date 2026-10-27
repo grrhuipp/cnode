@@ -707,7 +707,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         auto client_session = CreateClientSession(
             socket_key, client_session_key, datagram.io_context,
             std::move(reply_cb), datagram.client_endpoint,
-            decoded->session_owner, now, datagram.timeouts.SessionIdleTimeout());
+            decoded->session_owner, now, datagram.timeouts.IdleTimeout());
         if (!client_session) return;
         packet_session = client_session;
         preparation_session = client_session;

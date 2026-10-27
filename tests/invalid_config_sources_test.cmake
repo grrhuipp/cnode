@@ -365,12 +365,12 @@ expect_rejected(non_string_static_user_id "{}" "inbounds.json"
 expect_rejected(non_string_static_cipher_method "{}" "inbounds.json"
     [=[[{"tag":"bad-static-method","protocol":"shadowsocks","listen":"127.0.0.1","port":12100,"settings":{"method":42,"password":"secret"},"streamSettings":{"network":"tcp","security":"none"}}]]=]
     "method must be a string")
-expect_rejected(conflicting_static_user_array_aliases "{}" "inbounds.json"
-    [=[[{"tag":"bad-static-user-alias","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"users":[{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=]
-    "clients and users must match")
-expect_started(equal_static_user_array_aliases
-    [=[{"workers":1}]=] "inbounds.json"
-    [=[[{"tag":"valid-static-user-alias","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=])
+expect_rejected(legacy_static_users_key "{}" "inbounds.json"
+    [=[[{"tag":"bad-static-user-alias","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}}]]=]
+    "settings.users is not supported; use settings.clients")
+expect_rejected(legacy_anytls_static_users_key "{}" "inbounds.json"
+    [=[[{"tag":"bad-anytls-user-alias","protocol":"anytls","listen":"127.0.0.1","port":12100,"settings":{"users":[{"password":"secret"}]},"streamSettings":{"network":"tcp","security":"tls"}}]]=]
+    "settings.users is not supported; use settings.clients")
 expect_rejected(duplicate_panel_node_ids
     [=[{"panels":[{"Name":"bad-node","Type":"V2board","APIHost":"http://127.0.0.1","Key":"secret","NodeIDs":[1,1],"NodeType":"vmess"}]}]=]
     "" "")

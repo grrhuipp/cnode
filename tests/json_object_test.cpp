@@ -21,8 +21,8 @@ struct ParsedObject {
 
     explicit ParsedObject(std::string_view body)
         : source(acpp::json::parse(body)),
-          result(acpp::ParseAliasedJsonObject(
-              source.as_object(), {"camelObject", "snake_object"})) {}
+          result(acpp::ParseJsonObject(
+              source.as_object(), "camelObject")) {}
 };
 
 void CheckInvalid(std::string_view body, std::string_view cause) {
@@ -39,30 +39,17 @@ int main() {
     Check(absent.result.has_value() && *absent.result == nullptr,
           "absent object became configured");
 
-    ParsedObject object(R"({"snake_object":{"value":1}})");
+    ParsedObject object(R"({"camelObject":{"value":1}})");
     Check(object.result.has_value() && *object.result != nullptr &&
               (*object.result)->at("value").as_int64() == 1,
           "object value mismatch");
 
-    ParsedObject equal_aliases(
-        R"({"camelObject":{"value":1},"snake_object":{"value":1}})");
-    Check(equal_aliases.result.has_value() && *equal_aliases.result != nullptr,
-          "equal object aliases were rejected");
-
-    ParsedObject equal_nested_aliases(
-        R"({"camelObject":{"nested":[true,{"text":"same"}]},"snake_object":{"nested":[true,{"text":"same"}]}})");
-    Check(equal_nested_aliases.result.has_value() &&
-              *equal_nested_aliases.result != nullptr,
-          "equal nested object aliases were rejected");
+    ParsedObject ignored_other(R"({"otherObject":{"value":1}})");
+    Check(ignored_other.result.has_value() && *ignored_other.result == nullptr,
+          "unrelated object key was matched");
 
     CheckInvalid(R"({"camelObject":[]})", "must be an object");
     CheckInvalid(R"({"camelObject":null})", "must be an object");
-    CheckInvalid(
-        R"({"camelObject":{"value":1},"snake_object":{"value":2}})",
-        "must match");
-    CheckInvalid(
-        R"({"camelObject":{"nested":[1,2]},"snake_object":{"nested":[1,3]}})",
-        "must match");
 
     std::cout << "json_object_test: ok\n";
     return 0;

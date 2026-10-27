@@ -332,7 +332,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                     users_p->as_array()[0].is_object()) {
                 const auto& user = users_p->as_array()[0].as_object();
                 vmess_config.address = json_string(server, "address");
-                const auto port = acpp::ReadJsonPort(server, {"port"});
+                const auto port = acpp::ReadJsonPort(server, "port");
                 if (port.Invalid()) {
                     return std::nullopt;
                 }
@@ -354,7 +354,7 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
 
         if (!parsed_xray) {
             vmess_config.address = json_string(s, "address");
-            const auto port = acpp::ReadJsonPort(s, {"port"});
+            const auto port = acpp::ReadJsonPort(s, "port");
             if (port.Invalid()) {
                 return std::nullopt;
             }

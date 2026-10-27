@@ -7,7 +7,6 @@
 
 #include <chrono>
 #include <format>
-#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <string_view>
@@ -17,43 +16,26 @@ namespace acpp::proxy::anytls::outbound {
 
 namespace {
 
-struct AliasedUnsigned {
-    std::optional<uint64_t> value;
-};
-
-std::expected<AliasedUnsigned, std::string> ReadAliasedUnsigned(
+std::expected<std::optional<uint64_t>, std::string> ReadOptionalUnsigned(
     const json::object& source,
-    std::initializer_list<std::string_view> aliases) {
-    AliasedUnsigned result;
-    std::string_view first_key;
-    for (const auto key : aliases) {
-        const auto* raw = source.if_contains(key);
-        if (!raw) continue;
-
-        uint64_t value = 0;
-        if (raw->is_int64()) {
-            const int64_t signed_value = raw->as_int64();
-            if (signed_value < 0) {
-                return std::unexpected(std::format(
-                    "{} must not be negative", key));
-            }
-            value = static_cast<uint64_t>(signed_value);
-        } else if (raw->is_uint64()) {
-            value = raw->as_uint64();
-        } else {
-            return std::unexpected(std::format("{} must be an integer", key));
-        }
-
-        if (result.value && *result.value != value) {
-            return std::unexpected(std::format(
-                "{} and {} must match", first_key, key));
-        }
-        if (!result.value) {
-            result.value = value;
-            first_key = key;
-        }
+    std::string_view key) {
+    const auto* raw = source.if_contains(key);
+    if (!raw) {
+        return std::optional<uint64_t>{};
     }
-    return result;
+
+    if (raw->is_int64()) {
+        const int64_t signed_value = raw->as_int64();
+        if (signed_value < 0) {
+            return std::unexpected(std::format(
+                "{} must not be negative", key));
+        }
+        return std::optional<uint64_t>{static_cast<uint64_t>(signed_value)};
+    }
+    if (raw->is_uint64()) {
+        return std::optional<uint64_t>{raw->as_uint64()};
+    }
+    return std::unexpected(std::format("{} must be an integer", key));
 }
 
 std::string ReadString(const json::object& source, std::string_view key) {
@@ -65,27 +47,27 @@ std::string ReadString(const json::object& source, std::string_view key) {
 
 std::expected<std::chrono::seconds, std::string> ReadPositiveSeconds(
     const json::object& source,
-    std::initializer_list<std::string_view> aliases,
+    std::string_view key,
     std::chrono::seconds fallback) {
-    auto parsed = ReadAliasedUnsigned(source, aliases);
+    auto parsed = ReadOptionalUnsigned(source, key);
     if (!parsed) return std::unexpected(std::move(parsed.error()));
-    if (!parsed->value) return fallback;
-    if (*parsed->value == 0) {
+    if (!*parsed) return fallback;
+    if (**parsed == 0) {
         return std::unexpected(std::format(
-            "{} must be positive", *aliases.begin()));
+            "{} must be positive", key));
     }
     using Rep = std::chrono::seconds::rep;
-    if (*parsed->value > static_cast<uint64_t>(std::numeric_limits<Rep>::max())) {
+    if (**parsed > static_cast<uint64_t>(std::numeric_limits<Rep>::max())) {
         return std::unexpected(std::format(
-            "{} exceeds the seconds range", *aliases.begin()));
+            "{} exceeds the seconds range", key));
     }
     const auto clock_seconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::duration::max()).count();
-    if (*parsed->value > static_cast<uint64_t>(clock_seconds)) {
+    if (**parsed > static_cast<uint64_t>(clock_seconds)) {
         return std::unexpected(std::format(
-            "{} exceeds the steady clock range", *aliases.begin()));
+            "{} exceeds the steady clock range", key));
     }
-    return std::chrono::seconds(static_cast<Rep>(*parsed->value));
+    return std::chrono::seconds(static_cast<Rep>(**parsed));
 }
 
 }  // namespace
@@ -95,7 +77,7 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     result.address = ReadString(source, "address");
 
-    const auto port = ReadJsonPort(source, {"port"});
+    const auto port = ReadJsonPort(source, "port");
     if (port.Invalid()) {
         return std::unexpected("AnyTLS server port must be between 1 and 65535");
     }
@@ -106,7 +88,7 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     auto check_interval = ReadPositiveSeconds(
         source,
-        {"idleSessionCheckInterval"},
+        "idleSessionCheckInterval",
         result.idle_session_check_interval);
     if (!check_interval) {
         return std::unexpected(std::move(check_interval.error()));
@@ -115,19 +97,19 @@ std::expected<Settings, std::string> ParseSettings(const json::object& source) {
 
     auto idle_timeout = ReadPositiveSeconds(
         source,
-        {"idleSessionTimeout"},
+        "idleSessionTimeout",
         result.idle_session_timeout);
     if (!idle_timeout) return std::unexpected(std::move(idle_timeout.error()));
     result.idle_session_timeout = *idle_timeout;
 
-    auto min_idle = ReadAliasedUnsigned(
-        source, {"minIdleSession"});
+    auto min_idle = ReadOptionalUnsigned(
+        source, "minIdleSession");
     if (!min_idle) return std::unexpected(std::move(min_idle.error()));
-    if (min_idle->value) {
-        if (*min_idle->value > std::numeric_limits<size_t>::max()) {
+    if (*min_idle) {
+        if (**min_idle > std::numeric_limits<size_t>::max()) {
             return std::unexpected("minIdleSession exceeds the size range");
         }
-        result.min_idle_sessions = static_cast<size_t>(*min_idle->value);
+        result.min_idle_sessions = static_cast<size_t>(**min_idle);
     }
 
     if (result.address.empty()) return std::unexpected("AnyTLS address is required");

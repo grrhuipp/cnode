@@ -12,7 +12,7 @@ namespace acpp::api::v2board {
 namespace {
 
 std::expected<uint16_t, std::string> ParseServerPort(const json::object& source) {
-    const auto result = ReadJsonPort(source, {"server_port"});
+    const auto result = ReadJsonPort(source, "server_port");
     switch (result.error) {
         case JsonPortError::None:
             return result.value;

@@ -3,17 +3,15 @@
 #include "acppnode/infra/json.hpp"
 
 #include <expected>
-#include <initializer_list>
 #include <string>
 #include <string_view>
 
 namespace acpp {
 
-// The returned object aliases source and is valid only while source remains
-// alive and unmodified.
+// The returned object borrows from source and is valid only while source
+// remains alive and unmodified.
 [[nodiscard]] std::expected<const json::object*, std::string>
-ParseAliasedJsonObject(
+ParseJsonObject(
     const json::object& source,
-    std::initializer_list<std::string_view> aliases);
-
+    std::string_view key);
 }  // namespace acpp
