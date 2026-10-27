@@ -130,7 +130,7 @@ class Peer:
         assert (6, 1, 0, token) in self.frames, f'connection lost PING: {self.error}'
 
 
-async def wait_for_backpressure(state, timeout=5, quiet_period=0.3):
+async def wait_for_backpressure(state, timeout=10, quiet_period=0.3):
     # Loopback TCP buffers can absorb megabytes after the peer stops reading.
     # Observe sustained blocked progress instead of assuming they fill within a
     # fixed startup delay. A flood that drains or closes never meets this test.

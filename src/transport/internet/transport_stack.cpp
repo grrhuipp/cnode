@@ -2050,6 +2050,30 @@ private:
         27, 28, 27, 27, 27, 27, 27, 26,
     }};
 
+    struct HuffmanTrieNode {
+        uint16_t child[2];
+        uint16_t symbol_plus_one;
+    };
+
+    static constexpr auto kHpackHuffmanTrie = []() consteval {
+        std::array<HuffmanTrieNode, 520> trie{};
+        uint16_t next_node = 1;
+        for (size_t sym = 0; sym < kHpackHuffmanCodes.size(); ++sym) {
+            const uint32_t code = kHpackHuffmanCodes[sym];
+            const uint8_t len = kHpackHuffmanCodeLen[sym];
+            uint16_t node = 0;
+            for (int bit = static_cast<int>(len) - 1; bit >= 0; --bit) {
+                const uint8_t b = static_cast<uint8_t>((code >> bit) & 0x1u);
+                if (trie[node].child[b] == 0) {
+                    trie[node].child[b] = next_node++;
+                }
+                node = trie[node].child[b];
+            }
+            trie[node].symbol_plus_one = static_cast<uint16_t>(sym + 1);
+        }
+        return trie;
+    }();
+
     static std::optional<uint32_t> ReadInteger(std::span<const uint8_t> block,
                                                size_t& offset,
                                                uint8_t prefix_bits) {
@@ -2081,24 +2105,25 @@ private:
         std::span<const uint8_t> data) {
         memory::ThreadLocalString out;
         out.reserve(data.size());
+        uint16_t node = 0;
         uint32_t code = 0;
         uint8_t bits = 0;
         for (uint8_t byte : data) {
             for (int bit = 7; bit >= 0; --bit) {
-                code = (code << 1) | ((byte >> bit) & 0x1u);
+                const uint8_t b = static_cast<uint8_t>((byte >> bit) & 0x1u);
+                code = (code << 1) | b;
                 ++bits;
-                bool matched = false;
-                for (size_t sym = 0; sym < kHpackHuffmanCodes.size(); ++sym) {
-                    if (kHpackHuffmanCodeLen[sym] == bits &&
-                        kHpackHuffmanCodes[sym] == code) {
-                        out.push_back(static_cast<char>(sym));
-                        code = 0;
-                        bits = 0;
-                        matched = true;
-                        break;
-                    }
+                node = kHpackHuffmanTrie[node].child[b];
+                if (node == 0) {
+                    return std::nullopt;
                 }
-                (void)matched;
+                if (kHpackHuffmanTrie[node].symbol_plus_one != 0) {
+                    out.push_back(static_cast<char>(
+                        kHpackHuffmanTrie[node].symbol_plus_one - 1));
+                    node = 0;
+                    code = 0;
+                    bits = 0;
+                }
             }
         }
         if (bits > 7) {
@@ -2152,11 +2177,19 @@ private:
     }
 
     std::optional<memory::ThreadLocalString> IndexedName(uint32_t index) const {
-        auto field = Indexed(index);
-        if (!field) {
+        if (index == 0) {
             return std::nullopt;
         }
-        return std::move(field->name);
+        if (index <= kStaticTable.size()) {
+            const auto& field = kStaticTable[index - 1];
+            return memory::ThreadLocalString(field.name.data(), field.name.size());
+        }
+        const uint32_t dynamic_index =
+            index - static_cast<uint32_t>(kStaticTable.size()) - 1;
+        if (dynamic_index >= dynamic_table_.size()) {
+            return std::nullopt;
+        }
+        return dynamic_table_[dynamic_index].name;
     }
 
     std::optional<HpackHeaderField> ReadLiteral(std::span<const uint8_t> block,
@@ -2235,13 +2268,13 @@ struct H2RequestHeaders {
         return std::nullopt;
     }
     H2RequestHeaders request;
-    for (const auto& field : *fields) {
+    for (auto& field : *fields) {
         if (field.name == ":method") {
-            request.method = field.value;
+            request.method = std::move(field.value);
         } else if (field.name == ":path") {
-            request.path = field.value;
+            request.path = std::move(field.value);
         } else if (field.name == ":authority" || field.name == "host") {
-            request.authority = field.value;
+            request.authority = std::move(field.value);
         }
     }
     if (request.method.empty() || request.path.empty()) {
@@ -2534,26 +2567,30 @@ private:
             ThrowHttp2StreamError("invalid HTTP/2 response header block");
         }
 
-        memory::ByteVector header_block(
-            first_fragment->begin(),
-            first_fragment->end());
-        while ((frame.flags & 0x4) == 0) {
-            auto continuation = co_await ReadH2Frame(*inner_);
-            if (!continuation ||
-                continuation->type != H2FrameType::CONTINUATION ||
-                continuation->stream_id != stream_id_ ||
-                continuation->payload.size() >
-                    kHttp2MaxHeaderBlockSize - header_block.size()) {
-                ThrowHttp2StreamError("invalid HTTP/2 response continuation");
+        std::optional<HpackDecoder::HeaderFields> fields;
+        if ((frame.flags & 0x4) != 0) {
+            fields = response_decoder_.Decode(*first_fragment);
+        } else {
+            memory::ByteVector header_block(
+                first_fragment->begin(),
+                first_fragment->end());
+            while ((frame.flags & 0x4) == 0) {
+                auto continuation = co_await ReadH2Frame(*inner_);
+                if (!continuation ||
+                    continuation->type != H2FrameType::CONTINUATION ||
+                    continuation->stream_id != stream_id_ ||
+                    continuation->payload.size() >
+                        kHttp2MaxHeaderBlockSize - header_block.size()) {
+                    ThrowHttp2StreamError("invalid HTTP/2 response continuation");
+                }
+                header_block.insert(
+                    header_block.end(),
+                    continuation->payload.begin(),
+                    continuation->payload.end());
+                frame = std::move(*continuation);
             }
-            header_block.insert(
-                header_block.end(),
-                continuation->payload.begin(),
-                continuation->payload.end());
-            frame = std::move(*continuation);
+            fields = response_decoder_.Decode(header_block);
         }
-
-        auto fields = response_decoder_.Decode(header_block);
         if (!fields) {
             ThrowHttp2StreamError("failed to decode HTTP/2 response headers");
         }
@@ -3120,27 +3157,31 @@ private:
             first_fragment->size() > kHttp2MaxHeaderBlockSize) {
             co_return false;
         }
-        memory::ByteVector header_block(
-            first_fragment->begin(),
-            first_fragment->end());
-        while ((frame.flags & 0x4) == 0) {
-            auto cont = co_await ReadH2Frame(*stream_);
-            if (!cont ||
-                cont->type != H2FrameType::CONTINUATION ||
-                cont->stream_id != stream_id ||
-                cont->payload.size() >
-                    kHttp2MaxHeaderBlockSize - header_block.size()) {
-                co_return false;
-            }
-            header_block.insert(
-                header_block.end(),
-                cont->payload.begin(),
-                cont->payload.end());
-            frame = std::move(*cont);
-        }
-
         // Decode even rejected streams to preserve connection-wide HPACK state.
-        auto request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
+        std::optional<H2RequestHeaders> request;
+        if ((frame.flags & 0x4) != 0) {
+            request = DecodeH2RequestHeaders(hpack_decoder_, *first_fragment);
+        } else {
+            memory::ByteVector header_block(
+                first_fragment->begin(),
+                first_fragment->end());
+            while ((frame.flags & 0x4) == 0) {
+                auto cont = co_await ReadH2Frame(*stream_);
+                if (!cont ||
+                    cont->type != H2FrameType::CONTINUATION ||
+                    cont->stream_id != stream_id ||
+                    cont->payload.size() >
+                        kHttp2MaxHeaderBlockSize - header_block.size()) {
+                    co_return false;
+                }
+                header_block.insert(
+                    header_block.end(),
+                    cont->payload.begin(),
+                    cont->payload.end());
+                frame = std::move(*cont);
+            }
+            request = DecodeH2RequestHeaders(hpack_decoder_, header_block);
+        }
         if (!request) {
             co_return false;
         }
