@@ -51,12 +51,10 @@ public:
     bool MatchGeoSite(GeoSiteTagHandle handle, std::string_view domain) const;
 
     struct Stats {
-        size_t geoip_tags_loaded;
-        size_t geosite_tags_loaded;
-        size_t geoip_total_cidrs;
-        size_t geosite_total_entries;
+        size_t geoip_tags_loaded = 0;
+        size_t geosite_tags_loaded = 0;
     };
-    Stats GetStats() const;
+    Stats GetStats() const noexcept;
 
 private:
     struct Impl;
