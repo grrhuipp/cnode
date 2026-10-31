@@ -484,6 +484,17 @@ net::awaitable<bool> TlsStream::Handshake() {
         co_return true;
     }
 
+    struct RealityHandshakeCleanup {
+        TlsStream& self;
+        ~RealityHandshakeCleanup() noexcept {
+            SSL* ssl = self.NativeSsl();
+            ClearRealityClientState(ssl, self.reality_client_state_);
+            if (self.is_server_) {
+                ClearRealityServerConnState(ssl);
+            }
+        }
+    } reality_cleanup{*this};
+
     Impl::Operation operation(*impl_);
     auto [ec] = co_await impl_->stream.async_handshake(
         is_server_ ? net::ssl::stream_base::server
@@ -506,18 +517,24 @@ net::awaitable<bool> TlsStream::Handshake() {
             const std::string_view host = reality_client_state_->server_name.empty()
                 ? std::string_view("localhost")
                 : std::string_view(reality_client_state_->server_name);
-            const std::string request = std::format(
-                "GET {} HTTP/1.1\r\n"
-                "Host: {}\r\n"
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            static constexpr std::string_view kReqPrefix = "GET ";
+            static constexpr std::string_view kReqMid = " HTTP/1.1\r\nHost: ";
+            static constexpr std::string_view kReqSuffix =
+                "\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
                 "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                "Connection: close\r\n\r\n",
-                reality_client_state_->spider_x,
-                host);
+                "Connection: close\r\n\r\n";
+            const std::array<net::const_buffer, 5> request_buffers{
+                net::buffer(kReqPrefix.data(), kReqPrefix.size()),
+                net::buffer(reality_client_state_->spider_x.data(),
+                            reality_client_state_->spider_x.size()),
+                net::buffer(kReqMid.data(), kReqMid.size()),
+                net::buffer(host.data(), host.size()),
+                net::buffer(kReqSuffix.data(), kReqSuffix.size()),
+            };
             auto [write_ec, written] = co_await net::async_write(
                 impl_->stream,
-                net::buffer(request.data(), request.size()),
+                request_buffers,
                 net::bind_allocator(
                     memory::ThreadLocalAllocator<std::byte>{},
                     net::as_tuple(net::deferred)));

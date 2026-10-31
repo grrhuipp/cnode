@@ -9,6 +9,7 @@
 #include "xhttp_packet_queue.hpp"
 #include "xhttp_packet_session_key.hpp"
 #include "xhttp_upload_stream_slot.hpp"
+#include "acppnode/app/dns/dns.hpp"
 #include "acppnode/transport/internet/tcp_stream.hpp"
 #include "acppnode/transport/internet/tls_stream.hpp"
 #include "acppnode/transport/internet/ws_stream.hpp"
@@ -5466,6 +5467,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
 
 net::awaitable<void> RunRealityFallbackProxy(
     net::io_context& io_context,
+    app::dns::DNS* dns_service,
     std::unique_ptr<TcpStream> client_tcp,
     const RealityConfig& reality,
     memory::ByteVector initial_bytes) {
@@ -5483,16 +5485,14 @@ net::awaitable<void> RunRealityFallbackProxy(
         if (dial.Ok()) {
             dest_stream = std::move(dial.stream);
         }
-    } else {
-        tcp::resolver resolver(io_context);
-        auto [resolve_ec, endpoints] = co_await resolver.async_resolve(
-            reality.dest_host,
-            std::to_string(reality.dest_port),
-            net::as_tuple(net::use_awaitable));
-        if (!resolve_ec) {
-            for (const auto& entry : endpoints) {
+    } else if (dns_service) {
+        auto dns_result = co_await dns_service->Resolve(reality.dest_host);
+        if (dns_result.Ok()) {
+            for (const auto& addr : dns_result.addresses) {
                 auto dial = co_await TcpStream::Connect(
-                    io_context, entry.endpoint(), kFallbackDialTimeout);
+                    io_context,
+                    tcp::endpoint(iputil::NormalizeAddress(addr), reality.dest_port),
+                    kFallbackDialTimeout);
                 if (dial.Ok()) {
                     dest_stream = std::move(dial.stream);
                     break;
@@ -5579,7 +5579,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     const StreamSettings& s,
     uint64_t trace_conn_id,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    InboundTransportMetadata* metadata)
+    InboundTransportMetadata* metadata,
+    app::dns::DNS* dns_service)
 {
     std::unique_ptr<AsyncStream> stream = std::move(raw);
 
@@ -5611,6 +5612,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             LOG_ERROR("[Transport] BuildInbound: TLS-like security requested but base stream is not TcpStream");
             co_return std::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
+        std::unique_ptr<RealityServerConnState> reality_conn_state;
         if (s.IsReality() && s.reality.HasDest()) {
             memory::ByteVector initial_bytes(4096);
             size_t total = 0;
@@ -5645,13 +5647,15 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
                 co_return std::unexpected(ErrorCode::SOCKET_EOF);
             }
             initial_bytes.resize(total);
-            if (!VerifyRealityClientHelloRecord(initial_bytes, s.reality)) {
+            reality_conn_state = VerifyRealityClientHelloRecord(initial_bytes, *ctx);
+            if (!reality_conn_state) {
                 LOG_NET_DEBUG(
                     "[Transport] BuildInbound: REALITY unauthenticated handshake, falling back to {}:{}",
                     s.reality.dest_host,
                     s.reality.dest_port);
                 co_await RunRealityFallbackProxy(
                     io_context,
+                    dns_service,
                     std::move(tcp),
                     s.reality,
                     std::move(initial_bytes));
@@ -5660,7 +5664,21 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             tcp->PrependReadData(initial_bytes);
             memory::ByteVector{}.swap(initial_bytes);
         }
-        auto tls = co_await WrapTlsServer(std::move(tcp), *ctx);
+        std::unique_ptr<TlsStream> tls;
+        if (reality_conn_state) {
+            tls = std::make_unique<TlsStream>(std::move(tcp), ctx->Native(), true);
+            const bool attached =
+                tls->SetRealityServerPreverified(std::move(reality_conn_state));
+            if (!attached) {
+                co_return std::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+            }
+            const bool hs_ok = co_await tls->Handshake();
+            if (!hs_ok) {
+                tls.reset();
+            }
+        } else {
+            tls = co_await WrapTlsServer(std::move(tcp), *ctx);
+        }
         if (!tls) {
             LOG_NET_DEBUG("[Transport] BuildInbound: {} server handshake failed",
                              s.IsReality() ? "REALITY" : "TLS");

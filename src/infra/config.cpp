@@ -955,8 +955,11 @@ XHttpConfig XHttpConfig::FromJson(const json::object& j) {
 
 RealityConfig RealityConfig::FromJson(const json::object& j) {
     RealityConfig cfg;
-    cfg.show = jbool(j, "show", false);
-    cfg.type = lower_ascii_copy(jstr(j, "type", ""));
+    if (j.contains("show") || j.contains("type") ||
+        j.contains("masterKeyLog") || j.contains("master_key_log")) {
+        throw std::invalid_argument(
+            "REALITY show, type, and masterKeyLog are not supported");
+    }
     if (j.contains("target")) {
         throw std::invalid_argument(
             "REALITY target is not supported; use dest");
@@ -1093,8 +1096,6 @@ RealityConfig RealityConfig::FromJson(const json::object& j) {
         throw std::invalid_argument(
             "REALITY spiderX must be a valid HTTP path starting with '/'");
     }
-    cfg.master_key_log = jstr(
-        j, "masterKeyLog", "");
     return cfg;
 }
 

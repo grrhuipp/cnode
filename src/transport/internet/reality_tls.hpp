@@ -13,25 +13,39 @@
 
 namespace acpp {
 
+class SslContext;
+
 struct RealityClientState : memory::ThreadAllocated {
     std::array<uint8_t, 32> server_public{};
     transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
-    std::string server_name;
-    std::string spider_x;
-    std::shared_ptr<const transport::internet::RealityMldsa65PublicKey> mldsa65_verify;
+    memory::ThreadLocalString server_name;
+    memory::ThreadLocalString spider_x;
+    EVP_PKEY* mldsa65_verify_key = nullptr;
     memory::ByteVector client_hello_raw;
     memory::ByteVector server_hello_raw;
     bool auth_key_ready = false;
+};
+
+struct RealityServerConnState : memory::ThreadAllocated {
+    std::array<uint8_t, 32> auth_key{};
+    memory::ByteVector client_hello_raw;
+    bool authenticated = false;
 };
 
 [[nodiscard]] bool VerifyRealityClientHandshake(
     SSL* ssl,
     const RealityClientState& state);
 
-[[nodiscard]] bool VerifyRealityClientHelloRecord(
-    std::span<const uint8_t> record,
-    const RealityConfig& config,
-    std::string* out_sni = nullptr);
+void ClearRealityClientState(
+    SSL* ssl,
+    std::unique_ptr<RealityClientState>& state) noexcept;
 
+void ClearRealityServerConnState(SSL* ssl) noexcept;
+
+[[nodiscard]] std::unique_ptr<RealityServerConnState>
+VerifyRealityClientHelloRecord(
+    std::span<const uint8_t> record,
+    const SslContext& ctx,
+    std::string* out_sni = nullptr);
 }  // namespace acpp

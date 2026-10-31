@@ -151,8 +151,6 @@ struct XHttpConfig {
 // ============================================================================
 struct RealityConfig {
     // 服务端字段
-    bool show = false;
-    std::string type;
     std::string dest_host;
     uint16_t dest_port = 0;
     uint8_t xver = 0;
@@ -172,18 +170,13 @@ struct RealityConfig {
     std::string spider_x;
     std::shared_ptr<const transport::internet::RealityMldsa65PublicKey> mldsa65_verify;
 
-    // 调试/兼容字段
-    std::string master_key_log;
-
     [[nodiscard]] bool IsClient() const noexcept { return public_key.has_value(); }
     [[nodiscard]] bool HasDest() const noexcept { return !dest_host.empty() && dest_port != 0; }
     [[nodiscard]] bool operator==(const RealityConfig& other) const noexcept {
         const bool verify_equal =
             (mldsa65_verify == nullptr) == (other.mldsa65_verify == nullptr) &&
             (!mldsa65_verify || *mldsa65_verify == *other.mldsa65_verify);
-        return show == other.show &&
-               type == other.type &&
-               dest_host == other.dest_host &&
+        return dest_host == other.dest_host &&
                dest_port == other.dest_port &&
                xver == other.xver &&
                server_names == other.server_names &&
@@ -198,8 +191,7 @@ struct RealityConfig {
                public_key == other.public_key &&
                short_id == other.short_id &&
                spider_x == other.spider_x &&
-               verify_equal &&
-               master_key_log == other.master_key_log;
+               verify_equal;
     }
 
     static RealityConfig FromJson(const json::object& j);

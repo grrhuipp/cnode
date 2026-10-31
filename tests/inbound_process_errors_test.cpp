@@ -98,9 +98,10 @@ class Dispatcher final : public routing::Dispatcher {
 namespace acpp {
 net::awaitable<TransportBuildResult> BuildInboundTransport(net::io_context&,
     std::unique_ptr<AsyncStream> raw, const StreamSettings&, uint64_t,
-    std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*) {
+    std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*,
+    app::dns::DNS*) {
     if (streams) { streams->OnInboundTransportStream(std::move(raw)); co_return std::unique_ptr<AsyncStream>{}; }
-    co_return std::move(raw);
+    co_return raw;
 }
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(AsyncStream&, std::chrono::seconds) {
     throw std::logic_error("unexpected proxy protocol"); co_return ProxyProtocolReadResult{};

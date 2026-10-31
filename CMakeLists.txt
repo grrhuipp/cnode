@@ -1287,6 +1287,7 @@ if(CNODE_BUILD_TESTS)
     add_executable(cnode_v2board_node_info_json_test
         tests/v2board_node_info_json_test.cpp
         src/api/v2board/node_info_json.cpp
+        src/transport/internet/reality_client_version.cpp
         src/transport/internet/reality_key.cpp
         src/transport/internet/reality_short_id.cpp
         src/infra/json.cpp

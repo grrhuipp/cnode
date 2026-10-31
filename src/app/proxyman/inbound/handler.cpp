@@ -360,7 +360,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     app::RequestLoadState& request_load,
     const TimeoutsConfig& timeouts,
     std::unique_ptr<AsyncStream> raw_conn,
-    session::Context& ctx) {
+    session::Context& ctx,
+    app::dns::DNS* dns_service) {
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
@@ -474,7 +475,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         listener.stream_settings,
         ctx.conn_id,
         std::move(logical_stream_handler),
-        transport_metadata);
+        transport_metadata,
+        dns_service);
     const int64_t transport_ended_at_us = NowMicros();
     if (transport_ended_at_us > transport_started_at_us) {
         ctx.inbound.transport_handshake_ms = static_cast<uint64_t>(

@@ -577,6 +577,12 @@ expect_rejected(invalid_reality_target_fallback "{}" "inbounds.json"
 expect_rejected(unsupported_reality_target_alias "{}" "inbounds.json"
     [=[[{"tag":"bad-reality-target","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"target":"example.com:443","serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
     "REALITY target is not supported; use dest")
+expect_rejected(unsupported_reality_show "{}" "inbounds.json"
+    [=[[{"tag":"bad-reality-show","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"decryption":"none","clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":true,"serverNames":["example.com"],"privateKey":"unused-before-handshake","shortIds":["0123456789abcdef"]}}}]]=]
+    "REALITY show, type, and masterKeyLog are not supported")
+expect_rejected(unsupported_reality_master_key_log "{}" "outbounds.json"
+    [=[[{"tag":"bad-reality-keylog","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","masterKeyLog":"/tmp/keys.log"}}}]]=]
+    "REALITY show, type, and masterKeyLog are not supported")
 expect_started(valid_reality_fingerprint
     [=[{"workers":1}]=] "outbounds.json"
     [=[[{"tag":"valid-reality-fingerprint","protocol":"vless","settings":{"address":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"example.com","publicKey":"unused-before-dial","shortId":"0123456789abcdef","fingerprint":"chrome","spiderX":"/news"}}}]]=])

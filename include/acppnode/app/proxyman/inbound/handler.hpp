@@ -13,7 +13,10 @@
 
 namespace acpp::app {
 class RequestLoadState;
-}
+namespace dns {
+class DNS;
+}  // namespace dns
+}  // namespace acpp::app
 
 namespace acpp::proxyman::inbound {
 
@@ -50,7 +53,8 @@ public:
         app::RequestLoadState& request_load,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> raw_conn,
-        session::Context& ctx);
+        session::Context& ctx,
+        app::dns::DNS* dns_service = nullptr);
 
 private:
     class LogicalTransportStreamSink;

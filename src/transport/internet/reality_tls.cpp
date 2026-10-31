@@ -104,10 +104,8 @@ struct RealityServerState final : SslContext::ContextState {
     UniqueEvpPkey mldsa65_key;
 };
 
-struct RealityServerConnState {
-    std::array<uint8_t, 32> auth_key{};
-    std::vector<uint8_t> client_hello_raw;
-    bool authenticated = false;
+struct RealityClientContextState final : SslContext::ContextState {
+    UniqueEvpPkey mldsa65_verify_key;
 };
 
 void FreeRealityServerConnState(void* /*parent*/,
@@ -124,6 +122,12 @@ void FreeRealityServerConnState(void* /*parent*/,
         0, nullptr, nullptr, nullptr, nullptr);
     return index;
 }
+[[nodiscard]] int RealityClientContextStateExIndex() {
+    static const int index = SSL_CTX_get_ex_new_index(
+        0, nullptr, nullptr, nullptr, nullptr);
+    return index;
+}
+
 
 [[nodiscard]] int RealityConnStateExIndex() {
     static const int index = SSL_get_ex_new_index(
@@ -179,9 +183,9 @@ ParseRealityPeerPublicKey(const SSL_CLIENT_HELLO& hello) noexcept {
     return *parsed;
 }
 
-[[nodiscard]] std::vector<uint8_t> BuildRealityClientHelloAad(
+[[nodiscard]] memory::ByteVector BuildRealityClientHelloAad(
     const SSL_CLIENT_HELLO& hello) {
-    std::vector<uint8_t> aad;
+    memory::ByteVector aad;
     const bool has_handshake_header =
         hello.client_hello_len >= 4 &&
         hello.client_hello[0] == 0x01 &&
@@ -363,7 +367,8 @@ BuildRealityClientAuthPlain(
 }
 
 [[nodiscard]] std::unique_ptr<RealityClientState> BuildRealityClientState(
-    const RealityConfig& config) {
+    const RealityConfig& config,
+    EVP_PKEY* mldsa65_verify_key) {
     if (!config.public_key) {
         LOG_ERROR("REALITY client publicKey is empty");
         return nullptr;
@@ -371,9 +376,9 @@ BuildRealityClientAuthPlain(
     auto state = std::make_unique<RealityClientState>();
     state->server_public = *config.public_key;
     state->short_id = config.short_id;
-    state->server_name = config.server_name;
-    state->spider_x = config.spider_x;
-    state->mldsa65_verify = config.mldsa65_verify;
+    state->server_name.assign(config.server_name.data(), config.server_name.size());
+    state->spider_x.assign(config.spider_x.data(), config.spider_x.size());
+    state->mldsa65_verify_key = mldsa65_verify_key;
     return state;
 }
 
@@ -506,7 +511,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
         return false;
     }
 
-    if (state.mldsa65_verify) {
+    if (state.mldsa65_verify_key) {
         if (X509_get_ext_count(cert.get()) <= 0 ||
             state.client_hello_raw.empty() ||
             state.server_hello_raw.empty()) {
@@ -548,15 +553,10 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
             return false;
         }
 
-        UniqueEvpPkey verify_key(EVP_PKEY_pqdsa_new_raw_public_key(
-            NID_MLDSA65,
-            state.mldsa65_verify->data(),
-            state.mldsa65_verify->size()));
         UniqueEvpMdCtx md_ctx(EVP_MD_CTX_new());
-        if (!verify_key ||
-            !md_ctx ||
+        if (!md_ctx ||
             EVP_DigestVerifyInit(
-                md_ctx.get(), nullptr, nullptr, nullptr, verify_key.get()) != 1 ||
+                md_ctx.get(), nullptr, nullptr, nullptr, state.mldsa65_verify_key) != 1 ||
             EVP_DigestVerify(
                 md_ctx.get(),
                 ASN1_STRING_get0_data(ext_data),
@@ -703,6 +703,12 @@ void RealityServerMsgCallback(int is_write,
     if (!state || !state->mldsa65_key || !conn_state || !conn_state->authenticated) {
         return;
     }
+    struct ConnStateCleanup {
+        SSL* ssl;
+        ~ConnStateCleanup() noexcept {
+            ClearRealityServerConnState(ssl);
+        }
+    } cleanup{ssl};
 
     HMAC_CTX hmac_ctx;
     HMAC_CTX_init(&hmac_ctx);
@@ -769,6 +775,28 @@ void RealityServerMsgCallback(int is_write,
         SSL_CTX_get_ex_data(ssl_ctx, RealityStateExIndex()));
     if (!state) {
         return fail("missing server state");
+    }
+
+    if (auto* preverified = static_cast<RealityServerConnState*>(
+            SSL_get_ex_data(hello->ssl, RealityConnStateExIndex()));
+        preverified && preverified->authenticated) {
+        auto cert = BuildRealityCertificate(
+            *state,
+            std::span<const uint8_t, 32>(
+                preverified->auth_key.data(),
+                preverified->auth_key.size()));
+        if (!cert) {
+            return fail("ephemeral Ed25519 certificate build failed");
+        }
+        if (SSL_use_certificate(hello->ssl, cert.get()) != 1 ||
+            SSL_use_PrivateKey(hello->ssl, state->ed25519_key.get()) != 1) {
+            return fail("failed to install REALITY certificate on SSL connection");
+        }
+        if (!state->mldsa65_key) {
+            ClearRealityServerConnState(hello->ssl);
+        }
+        LOG_NET_DEBUG("REALITY server handshake authenticated");
+        return ssl_select_cert_success;
     }
 
     std::string_view sni;
@@ -1039,8 +1067,28 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     ConfigureRealityClientFingerprint(ctx, reality.fingerprint);
 
+    std::unique_ptr<RealityClientContextState> state;
+    if (reality.mldsa65_verify) {
+        state = std::make_unique<RealityClientContextState>();
+        state->mldsa65_verify_key.reset(EVP_PKEY_pqdsa_new_raw_public_key(
+            NID_MLDSA65,
+            reality.mldsa65_verify->data(),
+            reality.mldsa65_verify->size()));
+        if (!state->mldsa65_verify_key) {
+            LOG_ERROR("REALITY client ML-DSA-65 public key initialization failed");
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        if (SSL_CTX_set_ex_data(
+                ctx, RealityClientContextStateExIndex(), state.get()) != 1) {
+            LOG_ERROR("Failed to attach REALITY client state to SSL_CTX");
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+    }
+
     (void)tls_config;
-    return std::unique_ptr<SslContext>(new SslContext(ctx));
+    return std::unique_ptr<SslContext>(new SslContext(ctx, std::move(state)));
 }
 
 bool TlsStream::SetRealityClient(const RealityConfig& reality) {
@@ -1049,7 +1097,19 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         return false;
     }
 
-    auto state = BuildRealityClientState(reality);
+    SSL_CTX* ssl_ctx = SSL_get_SSL_CTX(ssl);
+    const auto* ctx_state = ssl_ctx
+        ? static_cast<const RealityClientContextState*>(
+              SSL_CTX_get_ex_data(ssl_ctx, RealityClientContextStateExIndex()))
+        : nullptr;
+    EVP_PKEY* verify_key =
+        ctx_state ? ctx_state->mldsa65_verify_key.get() : nullptr;
+    if (reality.mldsa65_verify && !verify_key) {
+        LOG_ERROR("REALITY client missing prebuilt ML-DSA-65 verification key");
+        return false;
+    }
+
+    auto state = BuildRealityClientState(reality, verify_key);
     if (!state) {
         return false;
     }
@@ -1093,8 +1153,10 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
         return false;
     }
 
-    SSL_set_msg_callback(ssl, RealityClientMsgCallback);
-    SSL_set_msg_callback_arg(ssl, state.get());
+    if (state->mldsa65_verify_key) {
+        SSL_set_msg_callback(ssl, RealityClientMsgCallback);
+        SSL_set_msg_callback_arg(ssl, state.get());
+    }
     SSL_set_reality_client_hello_cb(
         ssl,
         RealityClientHelloCallback,
@@ -1109,42 +1171,46 @@ bool VerifyRealityClientHandshake(
     return VerifyRealityPeerCertificate(ssl, state);
 }
 
-bool VerifyRealityClientHelloRecord(
+std::unique_ptr<RealityServerConnState> VerifyRealityClientHelloRecord(
     std::span<const uint8_t> record,
-    const RealityConfig& config,
+    const SslContext& ctx,
     std::string* out_sni) {
-    if (!config.private_key || config.server_names.empty() ||
-        config.short_ids.empty()) {
-        return false;
+    const SSL_CTX* ssl_ctx = ctx.Native();
+    const auto* state = ssl_ctx
+        ? static_cast<const RealityServerState*>(
+              SSL_CTX_get_ex_data(ssl_ctx, RealityStateExIndex()))
+        : nullptr;
+    if (!state || state->server_names.empty() || state->short_ids.empty()) {
+        return nullptr;
     }
     // TLS record header (5B) + Handshake header (4B) + Version (2B) +
     // Random (32B) + SessionIdLen (1B) + SessionId (32B)
     if (record.size() < 5 + 4 + 2 + 32 + 1 + 32 || record[0] != 0x16) {
-        return false;
+        return nullptr;
     }
     const size_t record_len =
         (static_cast<size_t>(record[3]) << 8) | record[4];
     if (record.size() < 5 + record_len || record_len < 4 + 2 + 32 + 1 + 32) {
-        return false;
+        return nullptr;
     }
 
     const auto handshake = record.subspan(5, record_len);
     if (handshake[0] != 0x01) {
-        return false;
+        return nullptr;
     }
     const size_t hello_len =
         (static_cast<size_t>(handshake[1]) << 16) |
         (static_cast<size_t>(handshake[2]) << 8) |
         handshake[3];
     if (hello_len + 4 != handshake.size()) {
-        return false;
+        return nullptr;
     }
 
     const auto body = handshake.subspan(4);
     const auto random = body.subspan(2, kRealityRandomSize);
     const size_t session_id_len = body[34];
     if (session_id_len != kRealitySessionIdSize || body.size() < 35 + session_id_len + 2) {
-        return false;
+        return nullptr;
     }
     const auto session_id = body.subspan(35, kRealitySessionIdSize);
     size_t pos = 35 + kRealitySessionIdSize;
@@ -1154,13 +1220,13 @@ bool VerifyRealityClientHelloRecord(
     pos += 2;
     if (cipher_suites_len == 0 || (cipher_suites_len & 1u) != 0 ||
         pos + cipher_suites_len + 1 > body.size()) {
-        return false;
+        return nullptr;
     }
     pos += cipher_suites_len;
 
     const size_t comp_methods_len = body[pos++];
     if (comp_methods_len == 0 || pos + comp_methods_len + 2 > body.size()) {
-        return false;
+        return nullptr;
     }
     pos += comp_methods_len;
 
@@ -1168,7 +1234,7 @@ bool VerifyRealityClientHelloRecord(
         (static_cast<size_t>(body[pos]) << 8) | body[pos + 1];
     pos += 2;
     if (pos + extensions_len != body.size()) {
-        return false;
+        return nullptr;
     }
 
     std::string_view sni;
@@ -1180,7 +1246,7 @@ bool VerifyRealityClientHelloRecord(
     size_t ext_pos = pos;
     while (ext_pos < body.size()) {
         if (ext_pos + 4 > body.size()) {
-            return false;
+            return nullptr;
         }
         const uint16_t ext_type =
             static_cast<uint16_t>((body[ext_pos] << 8) | body[ext_pos + 1]);
@@ -1188,7 +1254,7 @@ bool VerifyRealityClientHelloRecord(
             (static_cast<size_t>(body[ext_pos + 2]) << 8) | body[ext_pos + 3];
         ext_pos += 4;
         if (ext_pos + ext_len > body.size()) {
-            return false;
+            return nullptr;
         }
         const auto ext_data = body.subspan(ext_pos, ext_len);
         ext_pos += ext_len;
@@ -1222,28 +1288,25 @@ bool VerifyRealityClientHelloRecord(
     }
 
     if (sni_invalid || !supports_tls13 || !peer_public) {
-        return false;
+        return nullptr;
     }
     if (!transport::internet::IsRealityServerNameAllowed(
-            config.server_names, has_sni ? sni : std::string_view{})) {
-        return false;
+            state->server_names, has_sni ? sni : std::string_view{})) {
+        return nullptr;
     }
     if (out_sni && has_sni) {
         out_sni->assign(sni);
     }
 
-    std::array<uint8_t, kRealityX25519KeySize> shared{};
-    if (X25519(shared.data(), config.private_key->data(), peer_public->data()) != 1) {
-        return false;
-    }
-    auto auth_key = DeriveRealityAuthKey(
-        shared,
+    auto auth_key = ComputeRealityAuthKey(
+        *state,
+        *peer_public,
         std::span<const uint8_t, 20>(random.data(), 20));
     if (!auth_key) {
-        return false;
+        return nullptr;
     }
 
-    std::vector<uint8_t> aad(handshake.begin(), handshake.end());
+    memory::ByteVector aad(handshake.begin(), handshake.end());
     std::fill_n(aad.data() + 4 + 35, kRealitySessionIdSize, uint8_t{0});
     auto plain = OpenRealitySessionId(
         *auth_key,
@@ -1252,15 +1315,55 @@ bool VerifyRealityClientHelloRecord(
         std::span<const uint8_t, kRealitySessionIdSize>(
             session_id.data(), session_id.size()),
         aad);
-    if (!plain) {
-        return false;
+    if (!plain || !IsRealityClientAuthAllowed(*state, *plain)) {
+        return nullptr;
     }
 
-    RealityServerState temp_state;
-    temp_state.min_client_version = config.min_client_version;
-    temp_state.max_client_version = config.max_client_version;
-    temp_state.max_time_diff_ms = config.max_time_diff;
-    temp_state.short_ids = config.short_ids;
-    return IsRealityClientAuthAllowed(temp_state, *plain);
+    auto conn_state = std::make_unique<RealityServerConnState>();
+    conn_state->auth_key = *auth_key;
+    conn_state->authenticated = true;
+    if (state->mldsa65_key) {
+        conn_state->client_hello_raw.assign(handshake.begin(), handshake.end());
+    }
+    return conn_state;
+}
+
+bool TlsStream::SetRealityServerPreverified(
+    std::unique_ptr<RealityServerConnState> state) noexcept {
+    SSL* ssl = NativeSsl();
+    if (!ssl || !state) {
+        return false;
+    }
+    if (SSL_set_ex_data(ssl, RealityConnStateExIndex(), state.get()) != 1) {
+        return false;
+    }
+    (void)state.release();
+    return true;
+}
+
+void ClearRealityClientState(
+    SSL* ssl,
+    std::unique_ptr<RealityClientState>& state) noexcept {
+    if (!state) {
+        return;
+    }
+    if (ssl) {
+        SSL_set_msg_callback(ssl, nullptr);
+        SSL_set_msg_callback_arg(ssl, nullptr);
+        SSL_set_reality_client_hello_cb(ssl, nullptr, nullptr);
+    }
+    state.reset();
+}
+
+void ClearRealityServerConnState(SSL* ssl) noexcept {
+    if (!ssl) {
+        return;
+    }
+    const int idx = RealityConnStateExIndex();
+    auto* state = static_cast<RealityServerConnState*>(SSL_get_ex_data(ssl, idx));
+    if (state) {
+        (void)SSL_set_ex_data(ssl, idx, nullptr);
+        delete state;
+    }
 }
 }  // namespace acpp

@@ -781,7 +781,7 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         worker.runtime_->io_context, *worker.runtime_->dispatcher,
         worker.runtime_->stats, worker.runtime_->request_load,
         runtime_snapshot->timeouts,
-        std::move(tcp_stream), ctx);
+        std::move(tcp_stream), ctx, worker.runtime_->dns_service.get());
 }
 
 // ============================================================================

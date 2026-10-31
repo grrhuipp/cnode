@@ -7,8 +7,22 @@ function(cnode_patch_aws_lc_reality aws_lc_source_dir)
         message(FATAL_ERROR "AWS-LC ssl.h not found at ${header}")
     endif()
 
+    set(extensions_file "${aws_lc_source_dir}/ssl/extensions.cc")
     file(READ "${header}" header_text)
     if(header_text MATCHES "${marker}")
+        if(EXISTS "${extensions_file}")
+            file(READ "${extensions_file}" extensions_text)
+            if(NOT extensions_text MATCHES "reality_client_hello_cb")
+                string(REPLACE
+                    "bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,\n                             uint16_t sigalg) {\n  for (uint16_t verify_sigalg : tls12_get_verify_sigalgs(hs)) {"
+                    "bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,\n                             uint16_t sigalg) {\n  if (hs->config && hs->config->reality_client_hello_cb != nullptr &&\n      sigalg == SSL_SIGN_ED25519) {\n    return true;\n  }\n  for (uint16_t verify_sigalg : tls12_get_verify_sigalgs(hs)) {"
+                    extensions_text
+                    "${extensions_text}")
+                file(WRITE "${extensions_file}" "${extensions_text}")
+                message(STATUS "Upgraded AWS-LC REALITY signature algorithm patch in ssl/extensions.cc")
+                return()
+            endif()
+        endif()
         message(STATUS "AWS-LC REALITY signature algorithm patch already applied")
         return()
     endif()

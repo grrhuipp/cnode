@@ -4,6 +4,7 @@
 #include "acppnode/core/constants.hpp"
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/transport/internet/http_headers.hpp"
+#include "acppnode/transport/internet/reality_client_version.hpp"
 #include "acppnode/transport/internet/reality_key.hpp"
 #include "acppnode/transport/internet/reality_server_name.hpp"
 #include "acppnode/transport/internet/reality_short_id.hpp"
@@ -300,6 +301,57 @@ std::expected<::acpp::api::NodeInfo, std::string> ParseNodeInfo(
                 return std::unexpected("REALITY mldsa65_seed is invalid");
             }
             config.Reality.mldsa65_seed = *parsed_seed;
+        }
+
+        if (const auto* min_ver_val = rs.if_contains("min_client_ver")
+                ? rs.if_contains("min_client_ver")
+                : rs.if_contains("minClientVer");
+            min_ver_val && !min_ver_val->is_null()) {
+            if (!min_ver_val->is_string()) {
+                return std::unexpected("REALITY min_client_ver must be a string");
+            }
+            const auto parsed_min =
+                transport::internet::ParseRealityClientVersion(min_ver_val->as_string());
+            if (!parsed_min) {
+                return std::unexpected("REALITY min_client_ver is invalid");
+            }
+            config.Reality.min_client_version = *parsed_min;
+        }
+
+        if (const auto* max_ver_val = rs.if_contains("max_client_ver")
+                ? rs.if_contains("max_client_ver")
+                : rs.if_contains("maxClientVer");
+            max_ver_val && !max_ver_val->is_null()) {
+            if (!max_ver_val->is_string()) {
+                return std::unexpected("REALITY max_client_ver must be a string");
+            }
+            const auto parsed_max =
+                transport::internet::ParseRealityClientVersion(max_ver_val->as_string());
+            if (!parsed_max) {
+                return std::unexpected("REALITY max_client_ver is invalid");
+            }
+            config.Reality.max_client_version = *parsed_max;
+        }
+
+        if (config.Reality.min_client_version && config.Reality.max_client_version &&
+            transport::internet::RealityClientVersionValue(*config.Reality.min_client_version) >
+                transport::internet::RealityClientVersionValue(*config.Reality.max_client_version)) {
+            return std::unexpected("REALITY min_client_ver must not exceed max_client_ver");
+        }
+
+        if (const auto* max_time_val = rs.if_contains("max_time_diff")
+                ? rs.if_contains("max_time_diff")
+                : rs.if_contains("maxTimeDiff");
+            max_time_val && !max_time_val->is_null()) {
+            if (max_time_val->is_int64() && max_time_val->as_int64() >= 0) {
+                config.Reality.max_time_diff =
+                    static_cast<uint64_t>(max_time_val->as_int64());
+            } else if (max_time_val->is_uint64()) {
+                config.Reality.max_time_diff = max_time_val->as_uint64();
+            } else {
+                return std::unexpected(
+                    "REALITY max_time_diff must be a non-negative integer");
+            }
         }
     }
     if (const auto* base_config = source.if_contains("base_config");

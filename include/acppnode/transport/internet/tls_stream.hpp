@@ -11,6 +11,7 @@
 namespace acpp {
 
 struct RealityClientState;
+struct RealityServerConnState;
 struct RealityConfig;
 struct TlsConfig;
 // ============================================================================
@@ -94,6 +95,8 @@ public:
 
     // 设置 REALITY 客户端认证（客户端调用）
     bool SetRealityClient(const RealityConfig& reality);
+    [[nodiscard]] bool SetRealityServerPreverified(
+        std::unique_ptr<RealityServerConnState> state) noexcept;
 
     // 执行 TLS 握手
     net::awaitable<bool> Handshake();

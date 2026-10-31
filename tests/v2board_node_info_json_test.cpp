@@ -97,7 +97,7 @@ void TestInvalidNetworkHostIsRejected() {
 
 void TestRealityNodeResponseIsNormalized() {
     const auto parsed = acpp::json::parse(
-        R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"gun"},"tls":2,"flow":"xtls-rprx-vision","server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef",""],"dest":"www.apple.com:443","xver":1,"mldsa65_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})");
+        R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"gun"},"tls":2,"flow":"xtls-rprx-vision","server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef",""],"dest":"www.apple.com:443","xver":1,"mldsa65_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","min_client_ver":"1.8.0","max_client_ver":"26.1.31","max_time_diff":60000}})");
     auto result = ParseNodeInfo(parsed.as_object(), 9, "vless");
     Check(result.has_value(), "valid REALITY node response was rejected");
     Check(result->EnableReality && !result->EnableTLS, "REALITY mode flag mismatch");
@@ -114,9 +114,25 @@ void TestRealityNodeResponseIsNormalized() {
               result->Reality.xver == 1,
           "REALITY dest/xver mismatch");
     Check(result->Reality.mldsa65_seed.has_value(), "REALITY mldsa65_seed missing");
+    Check(result->Reality.min_client_version.has_value() &&
+              *result->Reality.min_client_version ==
+                  acpp::transport::internet::RealityClientVersion{1, 8, 0, 0},
+          "REALITY min_client_version mismatch");
+    Check(result->Reality.max_client_version.has_value() &&
+              *result->Reality.max_client_version ==
+                  acpp::transport::internet::RealityClientVersion{26, 1, 31, 0},
+          "REALITY max_client_version mismatch");
+    Check(result->Reality.max_time_diff == 60000,
+          "REALITY max_time_diff mismatch");
 
     CheckInvalid(R"({"server_port":443,"tls":2})", "requires tls_settings");
     CheckInvalid(R"({"server_port":443,"tls":2,"tls_settings":{}})", "requires private_key");
+    CheckInvalid(
+        R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","min_client_ver":"2.0.0","max_client_ver":"1.0.0"}})",
+        "min_client_ver must not exceed max_client_ver");
+    CheckInvalid(
+        R"({"server_port":443,"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","max_time_diff":-1}})",
+        "max_time_diff must be a non-negative integer");
 }
 
 }  // namespace

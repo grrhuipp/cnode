@@ -9,6 +9,10 @@
 #include <string_view>
 
 namespace acpp {
+namespace app::dns {
+class DNS;
+}  // namespace app::dns
+
 
 using TransportBuildResult = std::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
 
@@ -36,14 +40,14 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
     std::chrono::seconds timeout);
 
 // 根据 StreamSettings 将原始 TCP 流包装成最终传输流。
-// 协议层调用 Process()/Handshake() 前，传入的流已经完成 TLS/WS。
 net::awaitable<TransportBuildResult> BuildInboundTransport(
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
     uint64_t trace_conn_id = 0,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
-    InboundTransportMetadata* metadata = nullptr);
+    InboundTransportMetadata* metadata = nullptr,
+    app::dns::DNS* dns_service = nullptr);
 
 net::awaitable<TransportBuildResult> BuildOutboundTransport(
     std::unique_ptr<AsyncStream> raw,

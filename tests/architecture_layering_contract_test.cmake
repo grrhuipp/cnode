@@ -453,3 +453,17 @@ if(JSON_OBJECT_HEADER MATCHES "ParseAliasedJson" OR
     message(FATAL_ERROR
         "JSON config helpers must accept a single canonical key, not multi-alias lists")
 endif()
+
+file(READ "${SOURCE_DIR}/include/acppnode/transport/internet/stream_settings.hpp"
+     STREAM_SETTINGS_HEADER)
+if(STREAM_SETTINGS_HEADER MATCHES "master_key_log|bool show =")
+    message(FATAL_ERROR
+        "RealityConfig must not retain unread show/master_key_log dead fields")
+endif()
+
+file(READ "${SOURCE_DIR}/src/transport/internet/tls_stream.cpp" TLS_STREAM_SOURCE)
+if(NOT TLS_STREAM_SOURCE MATCHES "ClearRealityClientState" OR
+   NOT TLS_STREAM_SOURCE MATCHES "ClearRealityServerConnState")
+    message(FATAL_ERROR
+        "TlsStream::Handshake must release REALITY per-handshake state upon completion")
+endif()
