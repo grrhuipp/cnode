@@ -1025,6 +1025,10 @@ if(CNODE_BUILD_TESTS)
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # --wrap runs after LTO: keep unresolved EVP calls in these test objects
+        # so optimization cannot bypass the allocation/error injectors.
+        set_property(TARGET cnode_vmess_cipher_test
+            PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
         target_compile_definitions(cnode_vmess_cipher_test PRIVATE CNODE_TEST_CRYPTO_FAULT)
         target_link_options(cnode_vmess_cipher_test PRIVATE
             -Wl,--wrap=EVP_MD_CTX_new
@@ -1205,6 +1209,8 @@ if(CNODE_BUILD_TESTS)
         NAME cnode_shadowsocks_stream_crypto_test
         COMMAND cnode_shadowsocks_stream_crypto_test)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set_property(TARGET cnode_shadowsocks_stream_crypto_test
+            PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
         target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE CNODE_WRAP_MALLOC)
         target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
             -Wl,--wrap=malloc -Wl,--wrap=EVP_CIPHER_CTX_new)

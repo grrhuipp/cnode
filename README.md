@@ -33,6 +33,8 @@ ctest --test-dir build -C Release --no-tests=error --output-on-failure --paralle
 
 `cnode_tests` 构建主程序和全部测试，CTest 统一执行单元、契约及集成测试。Linux glibc 可在配置时添加 `-DCNODE_TEST_SANITIZERS=ON`，将内存池和调度器的 ASan/UBSan 回归纳入同一次 CTest。CI 的 musl/glibc 共用这一流程；默认发布产物仍为静态 musl。
 
+发布回归应使用 `Release`：默认启用 LTO，`RelWithDebInfo` 不覆盖这条优化路径，不能替代发布配置的验证。Linux 的密码学故障注入测试单独保留链接器可拦截的调用边界，主程序与依赖仍使用 Release LTO。
+
 ## 架构总览
 
 所有 TCP / UDP 请求最终只能经过一条数据链路：
