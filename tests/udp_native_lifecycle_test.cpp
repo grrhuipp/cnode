@@ -81,19 +81,17 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    std::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
+    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest& request) override {
         acpp::InboundDatagramResult result;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
-            return std::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
-        result.session_key = request.payload.front() == 0x63
-            ? "client-b" : "client-a";
-        result.response = acpp::memory::AllocateShared<Response>();
+            return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+        result.session_id = request.payload.front() == 0x63 ? 2 : 1;
         result.target = acpp::TargetAddress(
             acpp::net::ip::address_v4::loopback(), 53);
         auto buffer = acpp::buf::BufferGuard{acpp::buf::Buffer::New()};
-        if (!buffer) return std::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+        if (!buffer) return tl::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
         buffer->Tail()[0] = request.payload.front();
         buffer->Produce(1);
         result.payload.push_back(std::move(buffer));
@@ -103,6 +101,10 @@ public:
         }
         return result;
     }
+    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
+    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
+        return acpp::memory::AllocateShared<Response>();
+    }
 
 private:
     LongMetadataFaultResource* fault_ = nullptr;
@@ -110,6 +112,19 @@ private:
 };
 
 class GateDispatcher final : public acpp::routing::Dispatcher {
+    struct RequestCancellation final : acpp::transport::CancellationSubscription {
+        explicit RequestCancellation(GateDispatcher& owner) noexcept : owner(owner) {}
+        GateDispatcher& owner;
+    private:
+        void OnCancellation(acpp::transport::Cancellation) noexcept override {
+            ++owner.cancellations;
+            if (owner.reenter_stop && !owner.stop_reentered) {
+                owner.stop_reentered = true;
+                owner.ingress->RequestStop();
+            }
+        }
+    };
+
 public:
     explicit GateDispatcher(acpp::net::io_context& io) : gate(io) {
         gate.expires_after(10s);
@@ -141,8 +156,8 @@ public:
             first_byte = buffer->Bytes()[0];
         }
         ++packets_read;
-        acpp::transport::CancellationSubscription cancellation(
-            link.reader->Cancellation(), &OnCancel, this);
+        RequestCancellation cancellation(*this);
+        cancellation.Resubscribe(link.reader->Cancellation());
         auto [ec] = co_await gate.async_wait(
             acpp::net::as_tuple(acpp::net::use_awaitable));
         (void)ec;
@@ -150,14 +165,6 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    static void OnCancel(void* owner, acpp::transport::Cancellation) noexcept {
-        auto& self = *static_cast<GateDispatcher*>(owner);
-        ++self.cancellations;
-        if (self.reenter_stop && !self.stop_reentered) {
-            self.stop_reentered = true;
-            self.ingress->RequestStop();
-        }
-    }
 
     acpp::net::steady_timer gate;
     Ingress* ingress = nullptr;
@@ -240,8 +247,9 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
         std::pmr::memory_resource* previous;
     } pmr_scope(&fault_resource);
 
+    acpp::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-oom", std::make_unique<NativeInbound>(&fault_resource),
-                    reclaimer, io);
+                    reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
     acpp::IoErrorCode ec;
     socket->open(acpp::udp::v4(), ec);
@@ -291,8 +299,8 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
     if (!maintenance_owner.Assign(maintenance_owner_bytes))
         Fail("failed to prepare maintenance-only session owner");
     auto maintenance_session = ingress.CreateClientSession(
-        "maintenance-socket", "held-open", io,
-        [](acpp::UDPPacketView, const acpp::udp::endpoint&) {},
+        "maintenance-socket", acpp::worker_detail::ClientSessionKey{maintenance_owner, 1}, io,
+        {},
         {acpp::net::ip::address_v4::loopback(), 48123},
         maintenance_owner, std::chrono::steady_clock::now(), 0s);
     if (!maintenance_session)
@@ -338,7 +346,7 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
         io.run_for(160ms);
         io.restart();
         if (ingress.GetResourceStats().associations != 1 ||
-            ingress.FindClientSession("maintenance-socket", "held-open") !=
+            ingress.FindClientSession("maintenance-socket", acpp::worker_detail::ClientSessionKey{maintenance_owner, 1}) !=
                 maintenance_session)
             Fail("spawn-failed native association did not reach natural GC");
     };
@@ -386,7 +394,10 @@ void VerifyPreparationOom(acpp::net::io_context& io, Reclaimer& reclaimer) {
 void VerifySocketIdentityRecycle(
     acpp::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
-    Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, io);
+    acpp::worker_detail::UdpResourceBudget budget({
+        .associations = 2, .datagrams = 8, .payload_capacity = 64 * 1024});
+    Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, budget, io);
+    Ingress other("native-other", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto old_socket = Ingress::MakeSocket(io);
     acpp::IoErrorCode ec;
     old_socket->open(acpp::udp::v4(), ec);
@@ -423,7 +434,7 @@ void VerifySocketIdentityRecycle(
     acpp::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 1> owner_bytes{0x47};
     if (!owner.Assign(owner_bytes)) Fail("failed to create socket identity owner");
-    const auto client_key = owner.ScopeSessionKey("client-a");
+    const acpp::worker_detail::ClientSessionKey client_key{owner, 1};
     auto old_session = ingress.FindClientSession("identity-socket", client_key);
     if (!old_session) Fail("old socket session was not created");
     ingress.CloseSocket("identity-socket");
@@ -447,6 +458,15 @@ void VerifySocketIdentityRecycle(
         dispatcher.dispatches != 2 || dispatcher.packets_read != 2 ||
         ingress.GetResourceStats().native_dispatches != 2)
         Fail("replacement socket did not create an independent native job");
+    old_session.reset();
+    const auto create_other = [&] {
+        return other.CreateClientSession("other-socket", client_key, io,
+            {},
+            {acpp::net::ip::address_v4::loopback(), 47124}, owner,
+            std::chrono::steady_clock::now(), 0s);
+    };
+    if (budget.GetUsage().associations != 2 || create_other())
+        Fail("retired dispatcher ownership bypassed the shared association limit");
 
     replacement_session->Close();
     bool joined = false;
@@ -457,12 +477,17 @@ void VerifySocketIdentityRecycle(
         !ingress.OwnsSocket("identity-socket", replacement_socket.get()) ||
         !replacement_socket->is_open())
         Fail("old job completion damaged the replacement socket identity");
+    auto recovered = create_other();
+    if (!recovered || budget.GetUsage().associations != 2)
+        Fail("dispatcher completion did not return its association lease");
+    other.RequestStop();
     ingress.RequestStop();
 }
 
 void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
-    Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, io);
+    acpp::worker_detail::UdpResourceBudget budget;
+    Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
     acpp::IoErrorCode ec;
     socket->open(acpp::udp::v4(), ec);
@@ -501,7 +526,7 @@ void VerifyUplinkRefresh(acpp::net::io_context& io, Reclaimer& reclaimer) {
     acpp::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 1> owner_bytes{0x47};
     if (!owner.Assign(owner_bytes)) Fail("failed to create refresh session owner");
-    const auto client_key = owner.ScopeSessionKey("client-a");
+    const acpp::worker_detail::ClientSessionKey client_key{owner, 1};
     auto session = ingress.FindClientSession("refresh-socket", client_key);
     if (!session) Fail("UDP refresh session row is missing");
 
@@ -550,8 +575,9 @@ int main() {
     } resource_scope{std::pmr::set_default_resource(&owner_resource)};
     acpp::net::io_context io;
     auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    Reclaimer reclaimer(scheduler);
-    Ingress ingress("native-test", std::make_unique<NativeInbound>(), reclaimer, io);
+    Reclaimer reclaimer(scheduler, [](std::exception_ptr) { std::terminate(); });
+    acpp::worker_detail::UdpResourceBudget budget;
+    Ingress ingress("native-test", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
     acpp::IoErrorCode ec;
     socket->open(acpp::udp::v4(), ec);
@@ -606,14 +632,14 @@ int main() {
     constexpr std::array<uint8_t, 1> owner_bytes{0x47};
     if (!owner.Assign(owner_bytes)) Fail("failed to prepare test owner");
     auto session_a = ingress.FindClientSession(
-        "native-socket", owner.ScopeSessionKey("client-a"));
+        "native-socket", acpp::worker_detail::ClientSessionKey{owner, 1});
     auto session_b = ingress.FindClientSession(
-        "native-socket", owner.ScopeSessionKey("client-b"));
+        "native-socket", acpp::worker_detail::ClientSessionKey{owner, 2});
     if (!session_a || !session_b)
         Fail("native UDP associations were not installed");
     if (!ingress.ReplaceHandler(std::make_unique<NativeInbound>()) ||
-        ingress.FindClientSession("native-socket", owner.ScopeSessionKey("client-a")) != session_a ||
-        ingress.FindClientSession("native-socket", owner.ScopeSessionKey("client-b")) != session_b ||
+        ingress.FindClientSession("native-socket", acpp::worker_detail::ClientSessionKey{owner, 1}) != session_a ||
+        ingress.FindClientSession("native-socket", acpp::worker_detail::ClientSessionKey{owner, 2}) != session_b ||
         ingress.GetResourceStats().native_dispatches != 2)
         Fail("same-socket handler replacement disturbed active native jobs");
 

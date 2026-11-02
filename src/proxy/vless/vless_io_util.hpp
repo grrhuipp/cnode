@@ -38,8 +38,7 @@ public:
             buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
             const bool received = buf::HasData(mb);
             if (received) AppendToPending(std::move(mb));
-            // TcpStream returns an empty result for a cancelled read. Keep it
-            // distinct from EOF, and retain any concurrently received bytes.
+            // Retain concurrently received bytes before observing cancellation.
             if ((co_await net::this_coro::cancellation_state).cancelled() !=
                 net::cancellation_type::none) {
                 throw IoSystemError(io_error::operation_aborted);

@@ -1,5 +1,7 @@
 #include "acppnode/common/target_address.hpp"
 
+#include <array>
+#include <format>
 #include <cstdio>
 
 namespace {
@@ -61,5 +63,39 @@ int main() {
         if (!Require(!acpp::TargetAddress::Parse(text),
                      "endpoint brackets must contain exactly an IPv6 literal")) return 11;
     }
+    struct NumericCase {
+        acpp::net::ip::address address;
+        std::string_view text;
+        std::string_view endpoint;
+    };
+    const NumericCase numeric_cases[] = {
+        {acpp::net::ip::make_address("255.255.255.255"), "255.255.255.255", "255.255.255.255:65535"},
+        {acpp::net::ip::make_address("::"), "::", "[::]:65535"},
+        {acpp::net::ip::make_address("2001:db8::1"), "2001:db8::1", "[2001:db8::1]:65535"},
+        {acpp::net::ip::make_address("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+         "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"},
+        {acpp::net::ip::make_address("::ffff:192.0.2.1"), "::ffff:192.0.2.1", "192.0.2.1:65535"},
+        {acpp::net::ip::address_v6(acpp::net::ip::make_address_v6("fe80::1").to_bytes(), 0xffffffffUL),
+         "fe80::1%4294967295", "[fe80::1%4294967295]:65535"},
+        {acpp::net::ip::address_v6(acpp::net::ip::make_address_v6("ff02::1").to_bytes(), 0xffffffffUL),
+         "ff02::1%4294967295", "[ff02::1%4294967295]:65535"},
+    };
+    for (const auto& test : numeric_cases) {
+        const acpp::iputil::AddressText text(test.address);
+        if (!Require(text.View() == test.text, "numeric IP text or scope changed")) return 12;
+        const acpp::TargetAddress target(test.address, 65535);
+        acpp::memory::ThreadLocalString destination;
+        target.ToStringInto(destination);
+        std::array<char, 128> logged;
+        const auto end = std::format_to(logged.begin(), "{}", target);
+        if (!Require(destination == test.endpoint &&
+                         std::string_view(logged.data(), end - logged.begin()) == test.endpoint,
+                     "routing and logging must preserve normalized endpoint text")) return 13;
+    }
+    const acpp::net::ip::address_v6 named_scope(
+        acpp::net::ip::make_address_v6("fe80::1").to_bytes(), 1);
+    const acpp::iputil::AddressText scoped_text(named_scope);
+    if (!Require(scoped_text.View() == named_scope.to_string(),
+                 "interface-name scope formatting must match the platform")) return 14;
     return 0;
 }

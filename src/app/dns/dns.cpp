@@ -68,6 +68,7 @@ struct DNSWorker::Impl {
     InflightResolves inflight_resolves;
     std::vector<std::shared_ptr<DatagramExchange>> upstreams;
     WorkerMailbox mailbox;
+    bool stopping = false;
 };
 
 DNSWorker::Impl::Impl(net::io_context& io_context, const Config& config,
@@ -92,6 +93,11 @@ DNSWorker::Impl::Impl(net::io_context& io_context, const Config& config,
 net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain) {
     // The only lookup entry owns input throughout cache/inflight/upstream I/O.
     std::string_view domain = owned_domain;
+    if (stopping) {
+        DnsResult cancelled;
+        cancelled.error = ErrorCode::CANCELLED;
+        co_return cancelled;
+    }
     if (const auto address = iputil::ParseLiteral(domain)) {
         DnsResult result;
         result.addresses.reserve(1);
@@ -121,6 +127,9 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
     DnsResult result;
     try {
         result = co_await DoResolve(domain);
+    } catch (const IoSystemError& error) {
+        result.error = error.code() == io_error::operation_aborted
+            ? ErrorCode::CANCELLED : ErrorCode::DNS_RESOLVE_FAILED;
     } catch (const std::exception& e) {
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = e.what();
@@ -128,6 +137,12 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
         result.error = ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = "DNS resolve exception";
     }
+
+    if (stopping) {
+        result = {};
+        result.error = ErrorCode::CANCELLED;
+    }
+    if (result.error == ErrorCode::CANCELLED) co_return result;
 
     try {
         cache.Store(domain, result);
@@ -144,6 +159,10 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
     last_result.error_msg = "DNS server unavailable";
 
     for (const auto& server : upstreams) {
+        if (stopping) {
+            last_result.error = ErrorCode::CANCELLED;
+            co_return last_result;
+        }
         // Preserve three A samples (round-robin answer collection), but do not
         // serialize their RTTs or hold AAAA behind them. Join all children before
         // returning or moving to another upstream, including cancellation/OOM.
@@ -154,6 +173,13 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
             for (size_t i = 0; i < answers.size(); ++i) group.Spawn(collect(i));
         });
+        if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
+                return answer.error == ErrorCode::CANCELLED;
+            })) {
+            DnsResult cancelled;
+            cancelled.error = ErrorCode::CANCELLED;
+            co_return cancelled;
+        }
         DnsResult a_result;
         a_result.error = ErrorCode::DNS_RESOLVE_FAILED;
         a_result.error_msg = "DNS A query failed";
@@ -439,6 +465,23 @@ DNSWorker::DNSWorker(net::io_context& main_context,
 
 DNSWorker::~DNSWorker() = default;
 
+void DNSWorker::RequestStop() noexcept {
+    impl_->mailbox.CloseAdmission();
+    impl_->stopping = true;
+    impl_->inflight_resolves.RequestStop();
+    for (const auto& upstream : impl_->upstreams) upstream->RequestStop();
+}
+
+net::awaitable<void> DNSWorker::AsyncJoin() {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    co_await net::this_coro::throw_if_cancelled(false);
+    RequestStop();
+    co_await impl_->mailbox.AsyncJoinAccepted();
+    // A query can finish before its shared socket's cancelled receive callback.
+    // Both boundaries must pass while the DNS executor and scheduler still live.
+    for (const auto& upstream : impl_->upstreams) co_await upstream->AsyncJoin();
+}
+
 net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
     try {
         co_return co_await impl_->mailbox.Post(impl_->ResolveOwned(std::move(domain)));
@@ -446,6 +489,11 @@ net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
         DnsResult rejected;
         rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
         co_return rejected;
+    } catch (const IoSystemError& error) {
+        if (error.code() != io_error::operation_aborted) throw;
+        DnsResult cancelled;
+        cancelled.error = ErrorCode::CANCELLED;
+        co_return cancelled;
     }
 }
 

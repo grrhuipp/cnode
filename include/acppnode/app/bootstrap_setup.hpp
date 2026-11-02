@@ -10,8 +10,7 @@
 #include <vector>
 
 namespace acpp {
-class Config;
-class ConnectionLimiter;
+struct Config;
 class ShardedStats;
 class Controller;
 class Worker;
@@ -32,7 +31,7 @@ struct WorkerPool {
     // Cold construction failure unwinds in reverse declaration order:
     // work guards release first, then Workers destroy every socket/service
     // while its io_context is still alive; io_contexts are destroyed last.
-    // After runtime handoff these owners live until immediate process exit.
+    // Runtime releases live state and each io_context on its data thread.
     std::vector<std::unique_ptr<net::io_context>> io_contexts;
     std::vector<std::unique_ptr<Worker>> workers;
     std::vector<net::executor_work_guard<net::io_context::executor_type>> work_guards;
@@ -51,7 +50,6 @@ struct BootstrapEnvironment {
     std::unique_ptr<app::dns::DNS> panel_dns_service;
     std::unique_ptr<geo::GeoManager> geo_manager;
     std::unique_ptr<ShardedStats> stats;
-    std::vector<std::unique_ptr<ConnectionLimiter>> connection_limiters;
     WorkerPool worker_pool;
     std::unique_ptr<Controller> controller;
     InboundStartup inbound_startup;

@@ -23,6 +23,16 @@ bool InboundListen::Overlaps(const InboundListen& other) const noexcept {
     return false;
 }
 
+bool InboundListen::operator==(const InboundListen& other) const noexcept {
+    const auto addresses = Candidates();
+    const auto candidates = other.Candidates();
+    if (addresses.size() != candidates.size()) return false;
+    for (size_t index = 0; index < addresses.size(); ++index) {
+        if (addresses[index] != candidates[index]) return false;
+    }
+    return true;
+}
+
 std::optional<InboundListen> InboundListen::Parse(std::string_view value) {
     if (value.empty() || value == constants::network::kDualStackAuto) {
         return InboundListen{};

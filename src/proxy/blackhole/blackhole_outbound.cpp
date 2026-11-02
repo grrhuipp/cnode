@@ -25,10 +25,10 @@ constexpr std::string_view kHttp403Response =
 // Handler 实现
 // ============================================================================
 
-Handler::Handler(const std::string& tag,
+Handler::Handler(std::string_view tag,
                  const BlackholeSettings& settings)
     : tag_(tag)
-    , settings_(settings) {
+    , http_response_(IsHttpResponse(settings.response)) {
 }
 
 net::awaitable<OutboundProcessResult> Handler::Process(
@@ -43,7 +43,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     std::chrono::seconds /*relay_idle_timeout*/,
     std::chrono::seconds /*relay_write_timeout*/) {
     first_payload.clear();
-    if (IsHttpResponse(settings_.response) && inbound.writer) {
+    if (http_response_ && inbound.writer) {
         net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
         try {
             co_await inbound.writer->WriteBuffers(
@@ -53,8 +53,9 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             LOG_CONN_DEBUG(ctx, "[Blackhole][{}] failed to write http response", tag_);
         }
     }
-    LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}", tag_, settings_.response);
-    co_return std::unexpected(ErrorCode::BLOCKED);
+    LOG_CONN_DEBUG(ctx, "[Blackhole][{}] blocked before relay response={}",
+                   tag_, http_response_ ? "http" : "none");
+    co_return tl::unexpected(ErrorCode::BLOCKED);
 }
 
 }  // namespace acpp::proxy::blackhole::outbound
@@ -80,12 +81,12 @@ const bool kBlackholeRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             acpp::proxy::blackhole::outbound::BlackholeSettings,
             +[](std::string_view tag,
-                const acpp::proxy::blackhole::outbound::BlackholeSettings& s,
+                std::shared_ptr<const acpp::proxy::blackhole::outbound::BlackholeSettings> s,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& /*dns*/,
                 std::chrono::seconds /*dial_timeout*/) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::blackhole::outbound::Handler>(
-                    std::string(tag), s);
+                    tag, *s);
             }>(std::move(settings));
     }), true);
 }  // namespace

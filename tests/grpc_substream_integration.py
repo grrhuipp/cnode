@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import socket
+import ssl
 import struct
 import time
 import traceback
@@ -181,12 +182,104 @@ async def scenario(args, mode, tls, output, result, resources):
     configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': front_port,
               'settings': {'clients': [{'id': str(USER)}]}, 'streamSettings': transport},
               {'protocol': 'freedom', 'settings': {}})
+    if mode in ('slow-handshake', 'quota-one'):
+        config_path = output / 'config.json'
+        config = json.loads(config_path.read_text())
+        if mode == 'slow-handshake':
+            config['timeouts']['handshake'] = 1
+        else:
+            config['limits'] = {'maxConnections': 1, 'maxConnectionsPerIP': 1}
+        config_path.write_text(json.dumps(config), encoding='utf-8')
     resources.spawn([args.binary, '--config-dir', output], output / 'child.log')
     reader, writer = await resources.connect(front_port, tls=tls)
     writer.get_extra_info('socket').setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
     writer.write(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + h2frame(4))
     await writer.drain()
     peer = Peer(resources, reader, writer)
+    if mode == 'slow-handshake':
+        writer.write(h2frame(1, 4, 1, headers(tls)) + h2frame(0, 0, 1, grpc(b'\0')))
+        await writer.drain()
+        await peer.open(3, target_port, b'S', tls)
+        await peer.wait_message(3, b'\0\0' + READY)
+        await until(lambda: peer.closed or any(sid == 1 and
+                    (kind == 3 or (kind in (0, 1) and flags & 1))
+                    for kind, flags, sid, _ in peer.frames), 4)
+        assert not peer.closed, 'slow logical handshake cancelled the physical connection'
+        writer.write(h2frame(0, 0, 3, grpc(ECHO)))
+        await writer.drain()
+        await peer.wait_message(3, b'\0\0' + READY + ECHO)
+        await peer.open(5, target_port, b'N', tls)
+        await peer.wait_message(5, b'\0\0' + READY)
+        await peer.ping(b'deadline')
+        result.update(passed=not peer.error, slow_handshake_terminated=True,
+                      sibling_survived=True, recovered_stream=5)
+        return
+    if mode == 'quota-one':
+        await peer.open(1, target_port, b'V', tls)
+        await peer.wait_message(1, b'\0\0' + READY)
+        await peer.open(3, target_port, b'S', tls)
+        await until(lambda: peer.closed or any(sid == 3 and
+                    (kind == 3 or (kind in (0, 1) and flags & 1))
+                    for kind, flags, sid, _ in peer.frames), 3)
+        assert not peer.closed and b'S' not in states, 'concurrent request bypassed quota=1'
+        writer.write(h2frame(0, 0, 1, grpc(ECHO)))
+        await writer.drain()
+        await peer.wait_message(1, b'\0\0' + READY + ECHO)
+        writer.write(h2frame(3, 0, 1, struct.pack('!I', 8)))
+        await writer.drain()
+        await until(lambda: states[b'V']['closed'], 3)
+        await peer.ping(b'now-idle')
+        # A demux with no active requests must retain its physical admission
+        # slot. A second physical socket is refused before a TLS handshake.
+        context = None
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        rejected_writer = None
+        try:
+            rejected_reader, rejected_writer = await asyncio.wait_for(
+                asyncio.open_connection('127.0.0.1', front_port, ssl=context), 3)
+            resources.writers.add(rejected_writer)
+            rejected_writer.write(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + h2frame(4))
+            await rejected_writer.drain()
+            assert await asyncio.wait_for(rejected_reader.read(1), 3) == b'', \
+                'idle demux released its admission floor'
+        except (ConnectionError, ssl.SSLError):
+            pass
+        finally:
+            if rejected_writer is not None:
+                rejected_writer.close()
+        await peer.open(5, target_port, b'N', tls)
+        await peer.wait_message(5, b'\0\0' + READY)
+        assert not peer.error, peer.error
+        writer.close()
+        await until(lambda: peer.closed and states[b'N']['closed'], 3)
+        recovered = None
+        for attempt in range(20):
+            fresh_reader, fresh_writer = await resources.connect(front_port, tls=tls)
+            fresh_writer.write(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + h2frame(4))
+            try:
+                await fresh_writer.drain()
+                candidate = Peer(resources, fresh_reader, fresh_writer)
+                await until(lambda: candidate.closed or any(
+                    kind == 4 and not flags & 1 for kind, flags, _, _ in candidate.frames), 3)
+                if not candidate.closed:
+                    recovered = candidate
+                    break
+            except ConnectionError:
+                pass
+            fresh_writer.close()
+            await asyncio.sleep(0.01)
+        assert recovered is not None, 'physical close did not restore admission quota'
+        await recovered.open(1, target_port, b'R', tls)
+        await recovered.wait_message(1, b'\0\0' + READY)
+        await recovered.ping(b'quota-ok')
+        result.update(passed=not recovered.error,
+                      first_request_admitted=True, concurrent_request_rejected=True,
+                      idle_admission_retained=True, same_connection_reused=True,
+                      final_admission_recovered=True)
+        return
     await peer.open(1, target_port, b'A' if mode == 'blocked-reset' else b'V', tls,
                     end=mode == 'half-close')
     await peer.open(3, target_port, b'S', tls)
@@ -235,7 +328,7 @@ async def main(args):
     digest = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     results = []
     for tls in (False, True):
-        for mode in ('idle-reset', 'blocked-reset', 'half-close'):
+        for mode in ('idle-reset', 'blocked-reset', 'half-close', 'slow-handshake', 'quota-one'):
             output = args.output / (mode + ('-tls' if tls else '-tcp'))
             if args.case and output.name != args.case:
                 continue

@@ -30,10 +30,7 @@ struct WorkerResourceStats {
     size_t udp_reply_senders = 0;
     size_t udp_native_dispatches = 0;
     size_t timeout_events = 0;
-    size_t timeout_heap_entries = 0;
     size_t timeout_heap_capacity = 0;
-    size_t timeout_event_buckets = 0;
-    size_t timeout_ready_events = 0;
     size_t timeout_waiters = 0;
 };
 

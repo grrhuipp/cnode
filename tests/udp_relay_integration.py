@@ -1,11 +1,13 @@
 """Owned loopback VLESS/native Shadowsocks UDP integration tests.
 
 Requires Python and cryptography for independent AES-GCM peers and authenticated
-QUIC Initial generation. DNS timeout cases use an owned silent UDP listener on
-a dynamically assigned loopback port. No external server or credentials are involved.
+QUIC Initial generation; native_ss2022_isolation additionally requires blake3.
+DNS timeout cases use an owned silent UDP listener on a dynamically assigned
+loopback port. No external server or credentials are involved.
 """
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -210,8 +212,8 @@ class EchoPeer(asyncio.DatagramProtocol):
         self.transport = transport
 
     @staticmethod
-    def cipher(salt):
-        master = hashlib.md5(b'secret').digest()
+    def cipher(salt, password=b'secret'):
+        master = hashlib.md5(password).digest()
         if HKDF is not None:
             key = HKDF(algorithm=hashes.SHA1(), length=16, salt=salt, info=b'ss-subkey').derive(master)
         else:
@@ -286,29 +288,82 @@ class Client:
 
 
 class NativeClient:
-    def __init__(self, sock, target_port):
+    def __init__(self, sock, target_port, password=b'secret'):
         self.sock = sock
+        self.password = password
         self.target = b'\1\x7f\0\0\1' + struct.pack('!H', target_port)
         self.writer = None
 
     @classmethod
-    async def connect(cls, port, target_host, target_port):
+    async def connect(cls, port, target_host, target_port, user=USER):
         assert target_host == '127.0.0.1'
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         sock.connect(('127.0.0.1', port))
-        return cls(sock, target_port)
+        return cls(sock, target_port, b'secret' if user == USER else b'second-secret')
 
     async def send(self, payload):
         salt = os.urandom(16)
-        packet = salt + EchoPeer.cipher(salt).encrypt(b'\0' * 12, self.target + payload, None)
+        packet = salt + EchoPeer.cipher(salt, self.password).encrypt(b'\0' * 12, self.target + payload, None)
         await asyncio.get_running_loop().sock_sendall(self.sock, packet)
 
     async def receive(self, expected):
         packet = await asyncio.wait_for(asyncio.get_running_loop().sock_recv(self.sock, 65536), 4)
-        plain = EchoPeer.cipher(packet[:16]).decrypt(b'\0' * 12, packet[16:], None)
+        plain = EchoPeer.cipher(packet[:16], self.password).decrypt(b'\0' * 12, packet[16:], None)
         if plain != self.target + expected:
             raise AssertionError('native UDP target or datagram boundary changed')
+
+
+class Native2022Client(NativeClient):
+    """Independent SIP022 AES peer; same session ID deliberately crosses users."""
+    def __init__(self, sock, target_port, password=b'secret'):
+        super().__init__(sock, target_port, password)
+        if HKDF is None:
+            raise RuntimeError('SS2022 integration requires Python cryptography and blake3')
+        from blake3 import blake3
+        self.blake3 = blake3
+        self.key = bytes(range(16)) if password == b'secret' else bytes(range(16, 32))
+        self.session_id = bytes.fromhex('00123456789abcde')
+        self.packet_id = 0
+        self.server_session_id = None
+        self.server_packet_id = None
+
+    def subkey(self, session_id):
+        return self.blake3(self.key + session_id,
+                           derive_key_context='shadowsocks 2022 session subkey').digest(16)
+
+    def header(self, header, encrypt):
+        cipher = Cipher(algorithms.AES(self.key), modes.ECB())
+        operation = cipher.encryptor() if encrypt else cipher.decryptor()
+        return operation.update(header) + operation.finalize()
+
+    async def send(self, payload):
+        header = self.session_id + struct.pack('!Q', self.packet_id)
+        self.packet_id += 1
+        body = b'\0' + struct.pack('!QH', int(time.time()), 0) + self.target + payload
+        packet = self.header(header, True) + AESGCM(self.subkey(self.session_id)).encrypt(
+            header[4:], body, None)
+        await asyncio.get_running_loop().sock_sendall(self.sock, packet)
+
+    async def receive(self, expected):
+        packet = await asyncio.wait_for(asyncio.get_running_loop().sock_recv(self.sock, 65536), 4)
+        header = self.header(packet[:16], False)
+        plain = AESGCM(self.subkey(header[:8])).decrypt(header[4:], packet[16:], None)
+        if (len(plain) < 19 or plain[0] != 1 or plain[9:17] != self.session_id or
+                abs(int(time.time()) - int.from_bytes(plain[1:9], 'big')) > 30):
+            raise AssertionError('invalid SS2022 response session header')
+        padding = int.from_bytes(plain[17:19], 'big')
+        if plain[19 + padding:] != self.target + expected:
+            raise AssertionError('SS2022 response crossed an owner or datagram boundary')
+        server_session_id = header[:8]
+        server_packet_id = int.from_bytes(header[8:], 'big')
+        if self.server_session_id is not None:
+            if server_session_id != self.server_session_id:
+                raise AssertionError('SS2022 response session changed within a live association')
+            if server_packet_id <= self.server_packet_id:
+                raise AssertionError('SS2022 response packet ID did not advance')
+        self.server_session_id = server_session_id
+        self.server_packet_id = server_packet_id
 
 
 async def exercise_quic(client, mode, result):
@@ -366,7 +421,8 @@ async def run_case(binary, output, protocol, mode):
             lambda: dns, local_addr=('127.0.0.1' if quic_case else '127.77.0.2', 0))
     dns_address = dns_transport.get_extra_info('sockname') if dns_transport else None
     dns_server = f'{dns_address[0]}:{dns_address[1]}' if dns_address else '127.77.0.2'
-    isolated = mode in ('isolation', 'isolation_cancel')
+    isolated = mode in ('isolation', 'isolation_cancel', 'native_isolation',
+                        'native_ss2022_isolation')
     peer = GatedReplyPeer() if isolated else EchoPeer(protocol, mode)
     peer_transport, _ = await loop.create_datagram_endpoint(lambda: peer, local_addr=('127.0.0.1', 0))
     peer_port = peer_transport.get_extra_info('sockname')[1]
@@ -414,6 +470,14 @@ async def run_case(binary, output, protocol, mode):
         configs['inbounds.json'][0]['protocol'] = 'shadowsocks'
         configs['inbounds.json'][0]['settings'] = {
             'method': 'aes-128-gcm', 'clients': [{'password': 'secret'}]}
+        if isolated:
+            configs['inbounds.json'][0]['settings']['clients'].append(
+                {'password': 'second-secret'})
+        if mode == 'native_ss2022_isolation':
+            configs['inbounds.json'][0]['settings'] = {
+                'method': '2022-blake3-aes-128-gcm',
+                'clients': [{'password': base64.b64encode(bytes(range(start, start + 16))).decode()}
+                            for start in (0, 16)]}
     for name, config in configs.items():
         (output / name).write_text(json.dumps(config), encoding='utf-8')
     clients = []
@@ -451,8 +515,15 @@ async def run_case(binary, output, protocol, mode):
                     await survivor.receive(payload)
                     result['survivor_after_cancel'] = len(payload)
             elif isolated:
-                first = await Client.connect(inbound_port, '127.0.0.1', peer_port)
-                second = await Client.connect(inbound_port, '127.0.0.1', peer_port, SECOND_USER)
+                client_type = (Native2022Client if mode == 'native_ss2022_isolation' else
+                               NativeClient if mode == 'native_isolation' else Client)
+                first = await client_type.connect(inbound_port, '127.0.0.1', peer_port)
+                second = await client_type.connect(inbound_port, '127.0.0.1', peer_port, SECOND_USER)
+                if mode.startswith('native_'):
+                    # Identical endpoint (and SS2022 ID) leaves only authenticated
+                    # owner identity to distinguish the two associations.
+                    second.sock.close()
+                    second.sock = first.sock
                 clients.extend((first, second))
                 first_payload, second_payload = b'client-one-round-one', b'client-two-round-one'
                 await asyncio.gather(first.send(first_payload), second.send(second_payload))
@@ -470,6 +541,13 @@ async def run_case(binary, output, protocol, mode):
                 # Interleave a second round while both associations are alive;
                 # each must retain its own source port and have no stale packet.
                 next_first = b'client-one-round-two'
+                if mode == 'native_ss2022_isolation':
+                    # SIP022 session identity survives NAT rebinding without
+                    # allocating a new relay association or stealing user two.
+                    moved = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    moved.setblocking(False)
+                    moved.connect(('127.0.0.1', inbound_port))
+                    first.sock = moved
                 next_second = b'client-two-round-two'
                 await second.send(next_second)
                 await first.send(next_first)
@@ -538,7 +616,7 @@ async def run_case(binary, output, protocol, mode):
             result['peer_errors'] = peer.errors
             expected = ([] if mode == 'dns_timeout' else
                         [20, 20, 20, 20, 23] if mode == 'isolation_cancel' else
-                        [20, 20, 20, 20] if mode == 'isolation' else [4] if mode == 'late_reply'
+                        [20, 20, 20, 20] if isolated else [4] if mode == 'late_reply'
                         else [13, 20480] if mode == 'shared_cancel'
                         else [14, 20480, 14] if sniffing else [14, 20480])
             result['passed'] = (True if quic_case else
@@ -583,6 +661,7 @@ async def main(args):
              ('freedom', 'native_sniff_echo'), ('shadowsocks', 'native_sniff_echo'),
              ('freedom', 'sniff_burst'), ('shadowsocks', 'sniff_burst'),
              ('freedom', 'native_sniff_burst'), ('shadowsocks', 'native_sniff_burst')]
+    cases.extend(('freedom', mode) for mode in ('native_isolation', 'native_ss2022_isolation'))
     cases.extend(('shadowsocks', mode) for mode in QUIC_MODES)
     if args.case:
         selected = set(args.case)

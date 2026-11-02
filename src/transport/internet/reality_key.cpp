@@ -27,14 +27,14 @@ int Base64UrlValue(char value) noexcept {
 }
 
 template <std::size_t N>
-std::expected<std::array<uint8_t, N>, RealityKeyError>
+tl::expected<std::array<uint8_t, N>, RealityKeyError>
 DecodeFixedBase64Url(std::string_view value) noexcept {
     while (!value.empty() && value.back() == '=') {
         value.remove_suffix(1);
     }
     constexpr std::size_t kEncodedSize = (N * 8 + 5) / 6;
     if (value.size() != kEncodedSize) {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
 
     std::array<uint8_t, N> decoded{};
@@ -43,66 +43,66 @@ DecodeFixedBase64Url(std::string_view value) noexcept {
     unsigned int bit_count = 0;
     for (const char character : value) {
         if (character == '+' || character == '/') {
-            return std::unexpected(RealityKeyError::InvalidFormat);
+            return tl::unexpected(RealityKeyError::InvalidFormat);
         }
         const int digit = Base64UrlValue(character);
         if (digit < 0) {
-            return std::unexpected(RealityKeyError::InvalidFormat);
+            return tl::unexpected(RealityKeyError::InvalidFormat);
         }
         accumulator = (accumulator << 6) | static_cast<uint32_t>(digit);
         bit_count += 6;
         if (bit_count >= 8) {
             bit_count -= 8;
             if (output >= decoded.size()) {
-                return std::unexpected(RealityKeyError::InvalidFormat);
+                return tl::unexpected(RealityKeyError::InvalidFormat);
             }
             decoded[output++] = static_cast<uint8_t>(accumulator >> bit_count);
             accumulator &= bit_count == 0 ? 0u : (uint32_t{1} << bit_count) - 1;
         }
     }
     if (output != decoded.size() || accumulator != 0) {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return decoded;
 }
 
 }  // namespace
 
-std::expected<RealityKey, RealityKeyError>
+tl::expected<RealityKey, RealityKeyError>
 ParseRealityKey(std::string_view value) noexcept {
     if (!value.empty() && value.back() == '=') {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return DecodeFixedBase64Url<kRealityKeySize>(value);
 }
 
-std::expected<RealityKey, RealityKeyError>
+tl::expected<RealityKey, RealityKeyError>
 ParseRealityMldsa65Seed(std::string_view value) noexcept {
     auto seed = ParseRealityKey(value);
     if (!seed) {
-        return std::unexpected(seed.error());
+        return tl::unexpected(seed.error());
     }
     UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_private_key(
         NID_MLDSA65, seed->data(), seed->size()));
     if (!pkey) {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return *seed;
 }
 
-std::expected<RealityMldsa65PublicKey, RealityKeyError>
+tl::expected<RealityMldsa65PublicKey, RealityKeyError>
 ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
     if (!value.empty() && value.back() == '=') {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     auto pub = DecodeFixedBase64Url<kRealityMldsa65PublicKeySize>(value);
     if (!pub) {
-        return std::unexpected(pub.error());
+        return tl::unexpected(pub.error());
     }
     UniquePkey pkey(EVP_PKEY_pqdsa_new_raw_public_key(
         NID_MLDSA65, pub->data(), pub->size()));
     if (!pkey) {
-        return std::unexpected(RealityKeyError::InvalidFormat);
+        return tl::unexpected(RealityKeyError::InvalidFormat);
     }
     return *pub;
 }

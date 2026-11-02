@@ -2,7 +2,7 @@
 #include "../../../common/awaitable_task_group.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
-#include "xudp_packet_buffer.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/stats.hpp"
@@ -661,7 +661,13 @@ public:
             return;
         }
         if (xudp_packet_mode_) {
-            FeedXudpPackets(std::move(mb));
+            try {
+                FeedXudpPackets(std::move(mb));
+            } catch (const IoSystemError&) {
+                Cancel(ErrorCode::PROTOCOL_DECODE_FAILED);
+            } catch (const std::bad_alloc&) {
+                Cancel(ErrorCode::RESOURCE_EXHAUSTED);
+            }
             return;
         }
         StampDefaultTarget(mb);
@@ -677,6 +683,14 @@ public:
     void CloseClientInput() {
         if (input_done_) {
             return;
+        }
+        if (xudp_packet_mode_) {
+            try {
+                xudp_packets_.Finish();
+            } catch (const IoSystemError&) {
+                Cancel(ErrorCode::PROTOCOL_DECODE_FAILED);
+                return;
+            }
         }
         input_done_ = true;
         WakeInputReader();
@@ -842,7 +856,7 @@ private:
     uint64_t parent_conn_id_ = 0;
     TargetAddress default_target_;
     bool xudp_packet_mode_ = false;
-    detail::XudpPacketBuffer xudp_packets_;
+    buf::LengthPrefixedPacketBuffer xudp_packets_;
     struct QueuedInput {
         QueuedInput(buf::MultiBuffer p, size_t n) noexcept
             : payload(std::move(p))
@@ -899,10 +913,10 @@ private:
         while (!cancelled_) {
             buf::MultiBuffer payload;
             const auto result = xudp_packets_.Pop(payload);
-            if (result == detail::XudpPacketBuffer::PopResult::NeedMore) {
+            if (result == buf::LengthPrefixedPacketBuffer::PopResult::NeedMore) {
                 return;
             }
-            if (result == detail::XudpPacketBuffer::PopResult::Invalid) {
+            if (result == buf::LengthPrefixedPacketBuffer::PopResult::Invalid) {
                 Cancel();
                 return;
             }

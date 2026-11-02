@@ -3,7 +3,6 @@
 #include "registration.hpp"
 
 #include <map>
-#include <ranges>
 #include <stdexcept>
 
 namespace acpp::proxyman::outbound {
@@ -85,14 +84,5 @@ bool HasProxy(std::string_view protocol) {
     return Proxies().contains(protocol);
 }
 
-std::vector<std::string> RegisteredProtocols() {
-    auto& proxies = Proxies();
-    std::vector<std::string> result;
-    result.reserve(proxies.size());
-    for (const auto& name : proxies | std::views::keys) {
-        result.push_back(name);
-    }
-    return result;
-}
 
 }  // namespace acpp::proxyman::outbound

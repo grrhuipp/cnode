@@ -1,4 +1,5 @@
 #include "anytls_outbound.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "anytls_outbound_settings.hpp"
 #include "session_pool.hpp"
 
@@ -6,7 +7,7 @@
 #include "../padding.hpp"
 #include "../payload_queue.hpp"
 #include "../../uot/uot.hpp"
-#include "../../../transport/internet/async_write_gate.hpp"
+#include "acppnode/transport/internet/async_write_gate.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/app/relay.hpp"
 #include "acppnode/app/stats.hpp"
@@ -117,16 +118,21 @@ struct Handler::ClientSession {
             WakeOpenWaiter();
         }
 
-        net::awaitable<std::expected<void, ErrorCode>> WaitOpenResult(std::chrono::seconds timeout) {
+        net::awaitable<tl::expected<void, ErrorCode>> WaitOpenResult(std::chrono::seconds timeout) {
             auto result = OpenResult();
             if (!result) {
                 // The finite wait owns its deadline. ACK, FIN and errors are
                 // persistent state; a channel notification is only a wakeup.
-                const auto timeout_token = timeout_scheduler_.ScheduleAfter(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-                    [this]() {
-                        if (!OpenResult()) Close(ErrorCode::TIMEOUT);
-                    });
+                struct OpenDeadline final : TimeoutEvent {
+                    explicit OpenDeadline(LogicalStream& owner) noexcept : owner(owner) {}
+                    void OnTimeout() override {
+                        if (!owner.OpenResult()) owner.Close(ErrorCode::TIMEOUT);
+                    }
+                    LogicalStream& owner;
+                } deadline(*this);
+                if (!timeout_scheduler_.ScheduleAfter(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), deadline))
+                    co_return tl::unexpected(ErrorCode::CANCELLED);
                 do {
                     const auto [ec] = co_await syn_signal_.async_receive(
                         net::as_tuple(net::use_awaitable));
@@ -134,16 +140,16 @@ struct Handler::ClientSession {
                     result = OpenResult();
                 } while (!result);
             }
-            if (*result != ErrorCode::OK) co_return std::unexpected(*result);
-            co_return std::expected<void, ErrorCode>{};
+            if (*result != ErrorCode::OK) co_return tl::unexpected(*result);
+            co_return tl::expected<void, ErrorCode>{};
         }
 
-        net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
+        net::awaitable<tl::expected<buf::MultiBuffer, ErrorCode>> ReadPayload() {
             while (queued_payload_.empty() && !closed_) {
                 auto [ec] = co_await payload_signal_.async_receive(
                     net::as_tuple(net::use_awaitable));
                 if (ec) {
-                    co_return std::unexpected(ErrorCode::CANCELLED);
+                    co_return tl::unexpected(ErrorCode::CANCELLED);
                 }
             }
             if (!queued_payload_.empty()) {
@@ -153,7 +159,7 @@ struct Handler::ClientSession {
                 co_return payload;
             }
             queued_payload_.ReleaseIfIdle();
-            co_return std::unexpected(error_);
+            co_return tl::unexpected(error_);
         }
 
     private:
@@ -262,12 +268,12 @@ struct Handler::ClientSession {
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteOpenPacket(memory::ByteVector packet) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         try {
@@ -283,7 +289,7 @@ struct Handler::ClientSession {
                     std::span<const uint8_t>(
                         reinterpret_cast<const uint8_t*>(settings.data()), settings.size()));
                 if (!settings_frame) {
-                    co_return std::unexpected(settings_frame.error());
+                    co_return tl::unexpected(settings_frame.error());
                 }
                 with_settings.insert(with_settings.end(), packet.begin(), packet.end());
                 packet = std::move(with_settings);
@@ -294,30 +300,30 @@ struct Handler::ClientSession {
                 *stream, *scheme_snapshot, this_packet, std::move(packet));
             if (!ok) {
                 CloseAll(ok.error());
-                co_return std::unexpected(ok.error());
+                co_return tl::unexpected(ok.error());
             }
             opening_scheme_.reset();
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
             CloseAll(SessionExceptionError(std::current_exception()));
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WritePayloadFrames(uint32_t sid, LogicalStream& logical, buf::MultiBuffer mb) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
             mb.clear();
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         logical.CheckWrite();
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            std::expected<void, ErrorCode> ok;
+            tl::expected<void, ErrorCode> ok;
             if (padding_state_->scheme->RecordFor(this_packet).empty()) {
                 ok = co_await WriteMultiBufferAsFrameBatch(
                     *stream, kCmdPSH, sid, std::move(mb));
@@ -328,16 +334,16 @@ struct Handler::ClientSession {
             }
             if (!ok) {
                 CloseAll(ok.error());
-                co_return std::unexpected(ok.error());
+                co_return tl::unexpected(ok.error());
             }
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
             CloseAll(SessionExceptionError(std::current_exception()));
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WritePayloadBuffers(uint32_t sid, LogicalStream& logical, std::span<const net::const_buffer> buffers) {
         bool has_data = false;
         for (const net::const_buffer& buffer : buffers) {
@@ -347,20 +353,20 @@ struct Handler::ClientSession {
             }
         }
         if (!has_data) {
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         }
 
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         logical.CheckWrite();
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            std::expected<void, ErrorCode> ok;
+            tl::expected<void, ErrorCode> ok;
             if (padding_state_->scheme->RecordFor(this_packet).empty()) {
                 ok = co_await WriteBuffersAsFramesWithPadding(
                     *stream, *padding_state_->scheme, this_packet, kCmdPSH, sid, buffers);
@@ -371,27 +377,27 @@ struct Handler::ClientSession {
             }
             if (!ok) {
                 CloseAll(ok.error());
-                co_return std::unexpected(ok.error());
+                co_return tl::unexpected(ok.error());
             }
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
             CloseAll(SessionExceptionError(std::current_exception()));
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
         if (cmd == kCmdFIN) {
             const auto found = logical_streams.find(sid);
             if (found != logical_streams.end()) {
                 if (auto logical = found->second.lock(); logical && logical->RemoteClosed())
-                    co_return std::expected<void, ErrorCode>{};
+                    co_return tl::expected<void, ErrorCode>{};
             }
         }
 
@@ -399,9 +405,9 @@ struct Handler::ClientSession {
             auto ok = co_await WriteFrame(*stream, cmd, sid, payload);
             if (!ok) {
                 CloseAll(ok.error());
-                co_return std::unexpected(ok.error());
+                co_return tl::unexpected(ok.error());
             }
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         } catch (...) {
             CloseAll(SessionExceptionError(std::current_exception()));
             throw;
@@ -426,7 +432,7 @@ struct Handler::ClientSession {
                 co_return;
             }
 
-            auto discard_current = [&]() -> net::awaitable<std::expected<void, ErrorCode>> {
+            auto discard_current = [&]() -> net::awaitable<tl::expected<void, ErrorCode>> {
                 return DiscardFramePayload(*stream, header->length);
             };
 
@@ -603,21 +609,19 @@ private:
     }
 };
 
-Handler::Handler(std::string tag,
+Handler::Handler(std::string_view tag,
                  net::io_context& io_context,
-                 Settings settings,
-                 StreamSettings stream_settings,
+                 std::shared_ptr<const PreparedSettings> prepared,
                  std::chrono::seconds dial_timeout,
                  app::dns::DNS& dns_service)
-    : tag_(std::move(tag))
-    , settings_(std::move(settings))
-    , stream_settings_(std::move(stream_settings))
+    : tag_(tag)
+    , prepared_(std::move(prepared))
     , dial_timeout_(dial_timeout)
     , dns_service_(dns_service)
     , padding_(memory::AllocateShared<PaddingState>())
     , pool_(std::make_unique<SessionPool<ClientSession>>(
-          io_context, settings_.idle_session_check_interval,
-          settings_.idle_session_timeout, settings_.min_idle_sessions, tag_)) {}
+          io_context, prepared_->settings.idle_session_check_interval,
+          prepared_->settings.idle_session_timeout, prepared_->settings.min_idle_sessions, tag_)) {}
 
 Handler::~Handler() noexcept = default;
 
@@ -633,16 +637,16 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const bool ordered_bind = settings_.send_through.GetMode() == OutboundBind::Mode::Ordered;
+    const bool ordered_bind = prepared_->settings.send_through.GetMode() == OutboundBind::Mode::Ordered;
     const auto selected_v4 = ordered_bind
-        ? settings_.send_through.Select(net::ip::address_v4::any(),
+        ? prepared_->settings.send_through.Select(net::ip::address_v4::any(),
             ctx.inbound.source_ip, ctx.inbound.source_port)
         : OutboundBind::Selection{};
     const auto selected_v6 = ordered_bind
-        ? settings_.send_through.Select(net::ip::address_v6::any(),
+        ? prepared_->settings.send_through.Select(net::ip::address_v6::any(),
             ctx.inbound.source_ip, ctx.inbound.source_port)
         : OutboundBind::Selection{};
     auto transport_lease = ordered_bind
@@ -661,12 +665,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     if (!session) {
         auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
             .dns_service = &dns_service_,
-            .address = settings_.address,
-            .literal_address = settings_.literal_address,
-            .port = settings_.port,
-            .stream_settings = &stream_settings_,
+            .address = prepared_->settings.address,
+            .literal_address = prepared_->settings.literal_address,
+            .port = prepared_->settings.port,
+            .stream_settings = &prepared_->stream_settings,
             .timeout = dial_timeout_,
-            .send_through = &settings_.send_through,
+            .send_through = &prepared_->settings.send_through,
             .inbound_local_addr = inbound_local_addr,
             .inbound_source_ip = ctx.inbound.source_ip,
             .inbound_source_port = ctx.inbound.source_port,
@@ -675,14 +679,14 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             .ordered_bind_v6 = ordered_bind
                 ? std::optional{selected_v6} : std::nullopt,
             .tls_server_name = ResolveOutboundTlsServerName(
-                stream_settings_, settings_.address),
-            .ws_host = settings_.address,
+                prepared_->stream_settings, prepared_->settings.address),
+            .ws_host = prepared_->settings.address,
         });
         if (!transport_target) {
             if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-                LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", settings_.address);
+                LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", prepared_->settings.address);
             }
-            co_return std::unexpected(transport_target.error());
+            co_return tl::unexpected(transport_target.error());
         }
 
         auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
@@ -690,7 +694,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
                               ctx.outbound.tag, dial_result.error_msg);
-            co_return std::unexpected(dial_result.error);
+            co_return tl::unexpected(dial_result.error);
         }
 
         auto new_stream = std::move(dial_result.stream);
@@ -707,7 +711,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         auto opening_scheme = padding_->scheme;
         const uint16_t auth_padding_size = opening_scheme->SampleAuthPaddingSize();
         memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
-        std::copy(settings_.password_hash.begin(), settings_.password_hash.end(), auth_packet.begin());
+        std::copy(prepared_->settings.password_hash.begin(), prepared_->settings.password_hash.end(), auth_packet.begin());
         auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
         auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
 
@@ -717,7 +721,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                     auth_packet.data(),
                     auth_packet.size())); !ok) {
             new_stream->Cancel();
-            co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
+            co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
         session = memory::AllocateShared<ClientSession>(io_context, std::move(new_stream),
             padding_, std::move(opening_scheme));
@@ -727,7 +731,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     if (!session || !session->stream) {
-        co_return std::unexpected(ErrorCode::INTERNAL);
+        co_return tl::unexpected(ErrorCode::INTERNAL);
     }
 
     auto& stream = *session->stream;
@@ -746,30 +750,33 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const TargetAddress stream_target = is_udp
         ? TargetAddress(proxy::uot::kMagicAddress, 0)
         : ctx.outbound.target;
-    auto target = EncodeSocksAddress(stream_target);
-    if (!target) {
+    std::array<uint8_t, kMaxEncodedAddressSize> target{};
+    const size_t target_size = (stream_target.IsValid() ||
+        proxy::uot::VersionFromMagicAddress(stream_target))
+        ? EncodeAddressTo(stream_target, target.data(), target.size(),
+                          AddressWireFormat::Socks5) : 0;
+    if (target_size == 0) {
         stream.Cancel();
-        co_return std::unexpected(target.error());
+        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     }
 
     memory::ByteVector open_packet;
-    open_packet.reserve((kFrameHeaderSize * 3) + target->size() + 128);
+    open_packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
     auto syn_frame = AppendFrameBytesTo(open_packet, kCmdSYN, sid, {});
     auto target_frame = AppendFrameBytesTo(
         open_packet,
         kCmdPSH,
         sid,
-        std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(target->data()), target->size()));
+        std::span<const uint8_t>(target.data(), target_size));
     if (!syn_frame || !target_frame) {
         stream.Cancel();
-        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     if (is_udp) {
         auto request = proxy::uot::EncodeRequest(true, original_target);
         if (!request) {
             stream.Cancel();
-            co_return std::unexpected(request.error());
+            co_return tl::unexpected(request.error());
         }
         auto request_frame = AppendFrameBytesTo(
             open_packet,
@@ -778,18 +785,18 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             request->span());
         if (!request_frame) {
             stream.Cancel();
-            co_return std::unexpected(request_frame.error());
+            co_return tl::unexpected(request_frame.error());
         }
     }
     if (auto ok = co_await session->WriteOpenPacket(std::move(open_packet)); !ok) {
         stream.Cancel();
         logical->Close(ok.error());
-        co_return std::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
+        co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
     }
     if (sid >= 2 && session->session_version == SessionVersion::V2) {
         if (auto ok = co_await logical->WaitOpenResult(std::chrono::seconds(3)); !ok) {
             session->CloseAll(ok.error());
-            co_return std::unexpected(ok.error());
+            co_return tl::unexpected(ok.error());
         }
     }
 
@@ -980,24 +987,20 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .allow_insecure = false,
                 .alpn = {},
             });
-        struct PreparedAnyTlsState {
-            acpp::proxy::anytls::outbound::Settings settings;
-            acpp::StreamSettings stream_settings;
-        };
+        using PreparedSettings = acpp::proxy::anytls::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            PreparedAnyTlsState,
+            PreparedSettings,
             +[](std::string_view tag,
-                const PreparedAnyTlsState& state,
+                std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& io_context,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds dial_timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
-                    std::string(tag),
+                    tag,
                     io_context,
-                    state.settings,
-                    state.stream_settings,
+                    std::move(state),
                     dial_timeout,
                     dns);
-            }>(PreparedAnyTlsState{std::move(*settings), std::move(prepared_stream_settings)});
+            }>(PreparedSettings{std::move(*settings), std::move(prepared_stream_settings)});
     }), true);
 }  // namespace

@@ -11,7 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -46,18 +46,21 @@ struct EncodedRequest {
 [[nodiscard]] std::optional<Version> VersionFromMagicAddress(
     const TargetAddress& target) noexcept;
 
-[[nodiscard]] std::expected<EncodedRequest, ErrorCode> EncodeRequest(
+[[nodiscard]] tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
     const TargetAddress& destination);
 
-[[nodiscard]] net::awaitable<std::expected<Request, ErrorCode>> ReadRequest(
+[[nodiscard]] net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending);
 
 class PacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
+    // A UDP association has no write-half-close to propagate to its peer.
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::CloseLink;
+    }
 
     PacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,

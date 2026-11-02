@@ -83,33 +83,6 @@ ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     return {};
 }
 
-std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
-    std::span<const infra::OutboundSourceConfig> outbounds,
-    std::vector<RouteRuleConfig>& rules) {
-    std::unordered_set<std::string_view> tags;
-    tags.reserve(outbounds.size());
-    for (const auto& outbound : outbounds) {
-        tags.insert(outbound.tag);
-    }
-
-    std::vector<IgnoredRouteRule> ignored;
-    ignored.reserve(rules.size());
-    size_t index = 0;
-    std::erase_if(rules, [&](const RouteRuleConfig& rule) {
-        const bool unknown = !rule.outbound_tag.empty() &&
-                             !tags.contains(rule.outbound_tag);
-        if (unknown) {
-            ignored.push_back(IgnoredRouteRule{
-                .index = index,
-                .tag = rule.outbound_tag,
-            });
-        }
-        ++index;
-        return unknown;
-    });
-    return ignored;
-}
-
 std::string StaticInboundSemanticValidation::Message() const {
     switch (error) {
         case StaticInboundSemanticError::None: return {};

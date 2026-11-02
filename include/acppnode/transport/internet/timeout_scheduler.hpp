@@ -4,108 +4,81 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <functional>
 #include <memory>
-#include <utility>
 
 namespace acpp {
 
 class TimeoutSchedulerService;
 class TimeoutScheduler;
 
-// ============================================================================
-// TimeoutToken - 共享定时调度器句柄
-// ============================================================================
-class TimeoutToken {
+// An owner-thread event embedded in its owner, never separately allocated.
+// Its address is stable from scheduling through cancellation/completion. An
+// expiry detaches it before calling OnTimeout, which may rearm or destroy it.
+class TimeoutEvent {
 public:
-    TimeoutToken() noexcept = default;
-    ~TimeoutToken() noexcept;
-    TimeoutToken(const TimeoutToken&) = delete;
-    TimeoutToken& operator=(const TimeoutToken&) = delete;
+    TimeoutEvent() noexcept = default;
+    TimeoutEvent(const TimeoutEvent&) = delete;
+    TimeoutEvent& operator=(const TimeoutEvent&) = delete;
+    TimeoutEvent(TimeoutEvent&&) = delete;
+    TimeoutEvent& operator=(TimeoutEvent&&) = delete;
 
-    TimeoutToken(TimeoutToken&& other) noexcept
-        : id_(std::exchange(other.id_, 0))
-        , owner_(std::exchange(other.owner_, nullptr)) {}
+    [[nodiscard]] bool Valid() const noexcept { return owner_ != nullptr; }
+    void Cancel() noexcept;
 
-    // Assignment replaces ownership: a still-live destination event is
-    // cancelled before the source handle is adopted.
-    TimeoutToken& operator=(TimeoutToken&& other) noexcept;
-
-    [[nodiscard]] bool Valid() const noexcept {
-        return id_ != 0 && owner_ != nullptr;
-    }
-    void Reset() noexcept {
-        id_ = 0;
-        owner_ = nullptr;
-    }
+protected:
+    ~TimeoutEvent() noexcept;
+    virtual void OnTimeout() = 0;
 
 private:
     friend class TimeoutScheduler;
-
-    uint64_t id_ = 0;
     TimeoutScheduler* owner_ = nullptr;
+    std::chrono::steady_clock::time_point deadline_{};
+    std::size_t index_ = 0;
 };
 
-// ============================================================================
-// TimeoutScheduler - 按 executor 分片的共享超时调度器
-//
-// 目标：
-//   - 用每分片 1 个 steady_timer 承载大量连接的 deadline/timeout
-//   - 避免 TcpStream 每连接常驻多个 timer 对象
-//   - 始终只保留一个在途等待，更早 deadline 唤醒它，由完成回调统一重挂
-//   - 分片内 Schedule/Cancel/OnTimer 在对应 io_context 线程执行，不做热路径锁同步
-// ============================================================================
+// The allocator's one maintenance wakeup must not inspect the scheduler's heap:
+// it can be updated reentrantly while that heap's PMR storage is reallocating.
+class TimeoutMaintenance {
+protected:
+    TimeoutMaintenance() noexcept = default;
+    ~TimeoutMaintenance() = default;
+    virtual void OnMaintenance() noexcept = 0;
+
+private:
+    friend class TimeoutScheduler;
+};
+
+// One owner-thread indexed heap and one outstanding timer per io_context.
+// Heap entries borrow embedded events; cancellation removes an entry in place,
+// with no event-map nodes, stale indices, callback allocations or ready list.
 class TimeoutScheduler {
 public:
-    using Callback = std::move_only_function<void()>;
-
     struct ResourceStats {
         std::size_t active_events = 0;
-        std::size_t heap_entries = 0;
         std::size_t heap_capacity = 0;
-        std::size_t event_buckets = 0;
-        std::size_t ready_events = 0;
         bool wait_pending = false;
     };
 
-    // 获取 io_context 对应的分片（同一 io_context 复用同一调度器）。
-    // Worker 线程命中 thread_local 缓存后不走全局锁。
     [[nodiscard]] static TimeoutScheduler& ForIoContext(net::io_context& io_context);
-
-    // 在所属 io_context 析构前释放分片，避免进程静态析构阶段 timer
-    // 访问已销毁的 reactor。仅在对应 io_context 停止且线程已退出后调用。
+    // Call on the owner after all users join; drain cancellation before
+    // destroying the io_context and its PMR-backed scheduler service.
     static void ReleaseForIoContext(net::io_context& io_context);
 
-    // Callback exceptions are isolated inside the scheduler: one failed
-    // timeout must not unwind the owning Worker io_context or skip its batch.
-    [[nodiscard]] TimeoutToken ScheduleAfter(
-        std::chrono::milliseconds delay,
-        Callback cb);
+    // Rearming an existing event reuses its heap slot. False means released.
+    // Failure leaves this event unarmed; unrelated events remain scheduled.
+    [[nodiscard]] bool ScheduleAfter(std::chrono::milliseconds delay, TimeoutEvent& event);
+    void Cancel(TimeoutEvent& event) noexcept;
 
-    // One owner-thread maintenance deadline, independent of connection events.
-    // Stored inline: no callback allocation, map node, or second timer.
-    // May be called during a PMR container mutation: neither entry point
-    // inspects the event map or deadline heap. Reconciliation is deferred.
-    // False means the scheduler has already been released. Arming may throw.
     [[nodiscard]] bool SetMaintenanceDeadline(
-        void* owner, void (*callback)(void*) noexcept,
-        std::chrono::steady_clock::time_point deadline);
-    void CancelMaintenance(void* owner) noexcept;
+        TimeoutMaintenance& owner, std::chrono::steady_clock::time_point deadline);
+    void CancelMaintenance(TimeoutMaintenance& owner) noexcept;
 
-    // Erases the callback without allocating or re-arming the timer. Safe for
-    // owner destruction and reentrant cancellation within a callback batch.
-    void Cancel(TimeoutToken& token) noexcept;
-
-    // Cold-path, owner-thread-only observation. No synchronization or allocation.
     [[nodiscard]] ResourceStats GetResourceStats() const noexcept;
 
 private:
     friend class TimeoutSchedulerService;
-
     explicit TimeoutScheduler(net::io_context& io_context);
     void Release() noexcept;
-
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

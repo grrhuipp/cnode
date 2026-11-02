@@ -5,75 +5,60 @@
 #include <variant>
 
 namespace {
-
 using namespace acpp::proxyman::inbound;
-
 static_assert(std::variant_size_v<UserSet> == 5);
-static_assert(std::is_same_v<
-              std::variant_alternative_t<0, UserSet>,
-              PreparedVmessUsers>);
+static_assert(std::is_same_v<std::variant_alternative_t<0, UserSet>, PreparedVmessUsers>);
 
-PreparedVmessUser Vmess(std::string uuid, int64_t user_id) {
-    PreparedVmessUser user;
-    user.uuid = std::move(uuid);
-    user.profile.user_id = user_id;
-    return user;
+void Commit(UserStore::PublishedSnapshot snapshot) {
+    auto view = UserStore::PrepareWorkerView(snapshot);
+    UserStore::CommitSnapshot(std::move(snapshot));
+    UserStore::InstallWorkerView(std::move(view));
 }
 
-PreparedTrojanUser Trojan(std::string hash, int64_t user_id) {
+PreparedVmessUser Vmess(std::string uuid, int64_t id) {
+    PreparedVmessUser user;
+    user.uuid = std::move(uuid);
+    user.profile.user_id = id;
+    return user;
+}
+PreparedTrojanUser Trojan(std::string hash, int64_t id) {
     PreparedTrojanUser user;
     user.password_hash = std::move(hash);
-    user.profile.user_id = user_id;
+    user.profile.user_id = id;
     return user;
 }
 
 bool TestTypedUpdatesStayProtocolLocal() {
-    constexpr std::string_view kTag = "shared-tag";
+    constexpr std::string_view tag = "shared-tag";
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess-1", 1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}}));
+    if (UserStore::VmessUsers(tag).size() != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
 
-    UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess-1", 1)}});
-    UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}});
+    auto old = UserStore::VmessUsers(tag);
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess-2", 3)}}));
+    if (UserStore::VmessUsers(tag).users->contains("vmess-1") ||
+        !UserStore::VmessUsers(tag).users->contains("vmess-2") ||
+        !old.users->contains("vmess-1") || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
 
-    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 1 ||
-        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 1) {
-        return false;
-    }
-
-    UserStore::AddUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess-2", 3)}});
-    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 2 ||
-        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 1) {
-        return false;
-    }
-
-    UserStore::RemoveUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}});
-    if (UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) != 2 ||
-        UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) != 0) {
-        return false;
-    }
-
-    UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{}});
-    return UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) == 0;
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{}}));
+    if (UserStore::FindTrojanUser(tag, "hash-1") || UserStore::VmessUsers(tag).size() != 1) return false;
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{}}));
+    return UserStore::VmessUsers(tag).empty();
 }
 
 bool TestTypedClearStaysProtocolLocal() {
-    constexpr std::string_view kTag = "clear-tag";
-    UserStore::ApplyUsers(kTag, UserSet{PreparedVmessUsers{Vmess("vmess", 1)}});
-    UserStore::ApplyUsers(kTag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}});
-
-    UserStore::ClearUsers(UserProtocol::Vmess, kTag);
-    return UserStore::SizeForProtocolTag(UserProtocol::Vmess, kTag) == 0 &&
-           UserStore::SizeForProtocolTag(UserProtocol::Trojan, kTag) == 1;
+    constexpr std::string_view tag = "clear-tag";
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess", 1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}}));
+    Commit(UserStore::PrepareClearUsers(UserProtocol::Vmess, tag));
+    return UserStore::VmessUsers(tag).empty() && UserStore::FindTrojanUser(tag, "hash");
 }
-
 }  // namespace
 
 int main() {
-    if (!TestTypedUpdatesStayProtocolLocal()) {
-        std::cerr << "typed user updates crossed protocol storage boundaries\n";
+    if (!TestTypedUpdatesStayProtocolLocal() || !TestTypedClearStaysProtocolLocal()) {
+        std::cerr << "typed replacement/clear crossed protocol storage boundaries\n";
         return 1;
     }
-    if (!TestTypedClearStaysProtocolLocal()) {
-        std::cerr << "typed user clear crossed protocol storage boundaries\n";
-        return 2;
-    }
-    return 0;
+    UserStore::ClearWorkerView();
 }

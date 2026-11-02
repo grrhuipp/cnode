@@ -4,9 +4,6 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
-#include <cstring>
-#include <limits>
-#include <utility>
 
 namespace acpp::vless {
 namespace {
@@ -22,9 +19,6 @@ namespace {
     return nullptr;
 }
 
-[[nodiscard]] bool FitsEvpInt(size_t value) noexcept {
-    return value <= static_cast<size_t>(std::numeric_limits<int>::max());
-}
 
 [[nodiscard]] std::array<uint8_t, kVlessEncryptionAeadKeySize>
 DeriveAeadKey(std::span<const uint8_t> context,
@@ -42,134 +36,6 @@ DeriveAeadKey(std::span<const uint8_t> context,
     return out;
 }
 
-[[nodiscard]] bool AeadEncrypt(EVP_CIPHER_CTX* ctx,
-                               const EVP_CIPHER* cipher,
-                               std::span<const uint8_t> key,
-                               std::span<const uint8_t, kVlessEncryptionNonceSize> nonce,
-                               std::span<const uint8_t> plaintext,
-                               std::span<const uint8_t> additional_data,
-                               std::span<uint8_t> output) noexcept {
-    if (!ctx || !cipher ||
-        key.size() != kVlessEncryptionAeadKeySize ||
-        output.size() < plaintext.size() + kVlessEncryptionTagSize ||
-        !FitsEvpInt(plaintext.size()) ||
-        !FitsEvpInt(additional_data.size())) {
-        return false;
-    }
-
-    EVP_CIPHER_CTX_reset(ctx);
-    int out_len = 0;
-    int final_len = 0;
-
-    if (EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_AEAD_SET_IVLEN,
-            static_cast<int>(nonce.size()),
-            nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1) {
-        return false;
-    }
-    if (!additional_data.empty() &&
-        EVP_EncryptUpdate(
-            ctx,
-            nullptr,
-            &out_len,
-            additional_data.data(),
-            static_cast<int>(additional_data.size())) != 1) {
-        return false;
-    }
-    if (!plaintext.empty() &&
-        EVP_EncryptUpdate(
-            ctx,
-            output.data(),
-            &out_len,
-            plaintext.data(),
-            static_cast<int>(plaintext.size())) != 1) {
-        return false;
-    }
-    if (EVP_EncryptFinal_ex(ctx, output.data() + out_len, &final_len) != 1) {
-        return false;
-    }
-    out_len += final_len;
-    return out_len == static_cast<int>(plaintext.size()) &&
-           EVP_CIPHER_CTX_ctrl(
-               ctx,
-               EVP_CTRL_AEAD_GET_TAG,
-               static_cast<int>(kVlessEncryptionTagSize),
-               output.data() + out_len) == 1;
-}
-
-[[nodiscard]] std::optional<size_t> AeadDecrypt(
-    EVP_CIPHER_CTX* ctx,
-    const EVP_CIPHER* cipher,
-    std::span<const uint8_t> key,
-    std::span<const uint8_t, kVlessEncryptionNonceSize> nonce,
-    std::span<const uint8_t> ciphertext,
-    std::span<const uint8_t> additional_data,
-    std::span<uint8_t> output) noexcept {
-    if (!ctx || !cipher ||
-        key.size() != kVlessEncryptionAeadKeySize ||
-        ciphertext.size() < kVlessEncryptionTagSize ||
-        !FitsEvpInt(ciphertext.size() - kVlessEncryptionTagSize) ||
-        !FitsEvpInt(additional_data.size())) {
-        return std::nullopt;
-    }
-    const size_t plaintext_len = ciphertext.size() - kVlessEncryptionTagSize;
-    if (output.size() < plaintext_len) {
-        return std::nullopt;
-    }
-
-    EVP_CIPHER_CTX_reset(ctx);
-    int out_len = 0;
-    int final_len = 0;
-
-    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_AEAD_SET_IVLEN,
-            static_cast<int>(nonce.size()),
-            nullptr) != 1 ||
-        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1) {
-        return std::nullopt;
-    }
-    if (!additional_data.empty() &&
-        EVP_DecryptUpdate(
-            ctx,
-            nullptr,
-            &out_len,
-            additional_data.data(),
-            static_cast<int>(additional_data.size())) != 1) {
-        return std::nullopt;
-    }
-    if (plaintext_len > 0 &&
-        EVP_DecryptUpdate(
-            ctx,
-            output.data(),
-            &out_len,
-            ciphertext.data(),
-            static_cast<int>(plaintext_len)) != 1) {
-        return std::nullopt;
-    }
-    uint8_t final_dummy = 0;
-    uint8_t* final_output = plaintext_len == 0
-        ? &final_dummy
-        : output.data() + out_len;
-    if (EVP_CIPHER_CTX_ctrl(
-            ctx,
-            EVP_CTRL_AEAD_SET_TAG,
-            static_cast<int>(kVlessEncryptionTagSize),
-            const_cast<uint8_t*>(ciphertext.data() + plaintext_len)) != 1 ||
-        EVP_DecryptFinal_ex(ctx, final_output, &final_len) != 1) {
-        return std::nullopt;
-    }
-
-    out_len += final_len;
-    if (out_len != static_cast<int>(plaintext_len)) {
-        return std::nullopt;
-    }
-    return static_cast<size_t>(out_len);
-}
 
 }  // namespace
 
@@ -234,31 +100,6 @@ bool IsVlessEncryptionMaxNonce(
     });
 }
 
-VlessEncryptionAead::~VlessEncryptionAead() noexcept {
-    Close();
-}
-
-VlessEncryptionAead::VlessEncryptionAead(
-    VlessEncryptionAead&& other) noexcept
-    : key_(other.key_)
-    , nonce_(other.nonce_)
-    , cipher_(other.cipher_)
-    , enc_ctx_(std::exchange(other.enc_ctx_, nullptr))
-    , dec_ctx_(std::exchange(other.dec_ctx_, nullptr)) {}
-
-VlessEncryptionAead& VlessEncryptionAead::operator=(
-    VlessEncryptionAead&& other) noexcept {
-    if (this == &other) {
-        return *this;
-    }
-    Close();
-    key_ = other.key_;
-    nonce_ = other.nonce_;
-    cipher_ = other.cipher_;
-    enc_ctx_ = std::exchange(other.enc_ctx_, nullptr);
-    dec_ctx_ = std::exchange(other.dec_ctx_, nullptr);
-    return *this;
-}
 
 std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     std::span<const uint8_t> context,
@@ -269,11 +110,13 @@ std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     }
 
     VlessEncryptionAead aead;
-    aead.key_ = DeriveAeadKey(context, key);
+    const auto derived = DeriveAeadKey(context, key);
     aead.cipher_ = cipher;
-    aead.enc_ctx_ = EVP_CIPHER_CTX_new();
-    aead.dec_ctx_ = EVP_CIPHER_CTX_new();
-    if (!aead.enc_ctx_ || !aead.dec_ctx_) {
+    try {
+        if (!aead.encryptor_.Configure(ResolveCipher(cipher), derived) ||
+            !aead.decryptor_.Configure(ResolveCipher(cipher), derived))
+            return std::nullopt;
+    } catch (const std::bad_alloc&) {
         return std::nullopt;
     }
     return aead;
@@ -292,18 +135,7 @@ std::optional<size_t> VlessEncryptionAead::SealWithNonce(
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    const EVP_CIPHER* cipher = ResolveCipher(cipher_);
-    if (!AeadEncrypt(
-            static_cast<EVP_CIPHER_CTX*>(enc_ctx_),
-            cipher,
-            key_,
-            nonce,
-            plaintext,
-            additional_data,
-            output)) {
-        return std::nullopt;
-    }
-    return plaintext.size() + kVlessEncryptionTagSize;
+    return encryptor_.Process(nonce, plaintext, additional_data, output);
 }
 
 std::optional<size_t> VlessEncryptionAead::Open(
@@ -319,26 +151,9 @@ std::optional<size_t> VlessEncryptionAead::OpenWithNonce(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    return AeadDecrypt(
-        static_cast<EVP_CIPHER_CTX*>(dec_ctx_),
-        ResolveCipher(cipher_),
-        key_,
-        nonce,
-        ciphertext,
-        additional_data,
-        output);
+    return decryptor_.Process(nonce, ciphertext, additional_data, output);
 }
 
-void VlessEncryptionAead::Close() noexcept {
-    if (enc_ctx_) {
-        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(enc_ctx_));
-        enc_ctx_ = nullptr;
-    }
-    if (dec_ctx_) {
-        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(dec_ctx_));
-        dec_ctx_ = nullptr;
-    }
-}
 
 std::optional<size_t> SealVlessEncryptionRecord(
     VlessEncryptionAead& aead,

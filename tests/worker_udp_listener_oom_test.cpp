@@ -109,7 +109,7 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    std::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
+    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest& request) override {
         if (request.payload.size() == 1 && request.payload[0] == 0x42) {
             acpp::InboundDatagramResult result;
@@ -123,7 +123,7 @@ public:
         }
         if (request.payload.size() > acpp::buf::Buffer::kSize &&
             request.payload[0] == 0x43) {
-            return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+            return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         }
         if (request.payload.size() == 1 && request.payload[0] == 0x44) {
             acpp::InboundDatagramResult result;
@@ -137,14 +137,17 @@ public:
         if (request.payload.size() == 1 && request.payload[0] == 0x46) {
             state_.after_peer_error_processed = true;
         }
-        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+        return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
+    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
+        return std::make_shared<TestResponse>();
     }
 
 private:
     static void SetAuthenticatedResult(acpp::InboundDatagramResult& result) {
         const std::array<uint8_t, 1> owner{0x01};
         if (!result.session_owner.Assign(owner)) throw std::bad_alloc();
-        result.response = std::make_shared<TestResponse>();
         result.target = acpp::TargetAddress(
             acpp::net::ip::address_v4::loopback(), 53);
     }
@@ -198,7 +201,8 @@ void Send(acpp::udp::socket& sender, const acpp::udp::endpoint& target,
 
 struct Fixture {
     explicit Fixture(TargetedPmrResource& resource)
-        : pmr(resource), reclaimer(acpp::TimeoutScheduler::ForIoContext(io)),
+        : pmr(resource), reclaimer(acpp::TimeoutScheduler::ForIoContext(io),
+              [](std::exception_ptr) { std::terminate(); }),
           receiver(std::make_shared<acpp::udp::socket>(io)),
           sender(io, acpp::udp::v4()), dispatcher(state) {
         acpp::IoErrorCode ec;
@@ -212,7 +216,7 @@ struct Fixture {
         if (ec) Fail("failed to query receiver endpoint");
         ingress = std::make_unique<acpp::worker_detail::UdpIngress>(
             "udp-test", std::unique_ptr<acpp::Inbound>(new TestInbound(state)), reclaimer,
-            io);
+            budget, io);
         if (!ingress->AttachSocket(socket_key, receiver))
             Fail("failed to register loopback receiver with its real ingress owner");
         rejected_before = acpp::memory::rejected_pmr_allocations;
@@ -264,6 +268,7 @@ struct Fixture {
     TargetedPmrResource& pmr;
     acpp::net::io_context io;
     acpp::worker_detail::UdpAssociationReclaimer reclaimer;
+    acpp::worker_detail::UdpResourceBudget budget;
     std::shared_ptr<acpp::udp::socket> receiver;
     acpp::udp::socket sender;
     acpp::udp::endpoint target;

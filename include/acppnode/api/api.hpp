@@ -51,7 +51,7 @@ struct NodeInfo {
     std::string Flow;
     std::string ServiceName;
     RealityConfig Reality;
-    std::string CypherMethod = std::string(constants::protocol::kAes256Gcm);
+    std::string CypherMethod;
     std::string ShadowsocksServerKey;
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
@@ -76,26 +76,37 @@ struct OnlineUser {
     std::string IP;
 };
 
-using DetectRule = ::acpp::rule::DetectRule;
 
 }  // namespace api
 
 struct NodeInfoFetchResult : ResultStatus {
     std::optional<api::NodeInfo> node_info;
+    std::vector<rule::DetectRule> rules;
+    std::string etag;
+    bool not_modified = false;
 
     [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok() && node_info.has_value();
+        return ResultStatus::Ok() && (not_modified || node_info.has_value());
     }
 
-    [[nodiscard]] static NodeInfoFetchResult Success(api::NodeInfo node_info) {
+    [[nodiscard]] static NodeInfoFetchResult Success(
+        api::NodeInfo node_info, std::vector<rule::DetectRule> rules, std::string etag) {
         NodeInfoFetchResult result;
         result.node_info = std::move(node_info);
+        result.rules = std::move(rules);
+        result.etag = std::move(etag);
         return result;
     }
 
     [[nodiscard]] static NodeInfoFetchResult Fail(ErrorCode code, std::string msg = {}) {
         NodeInfoFetchResult result;
         result.SetError(code, msg);
+        return result;
+    }
+
+    [[nodiscard]] static NodeInfoFetchResult NotModified() {
+        NodeInfoFetchResult result;
+        result.not_modified = true;
         return result;
     }
 };
@@ -130,32 +141,6 @@ struct UserListFetchResult : ResultStatus {
     }
 };
 
-struct RuleListFetchResult : ResultStatus {
-    std::vector<api::DetectRule> rules;
-    bool not_modified = false;
-
-    [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok();
-    }
-
-    [[nodiscard]] static RuleListFetchResult Success(std::vector<api::DetectRule> value) {
-        RuleListFetchResult result;
-        result.rules = std::move(value);
-        return result;
-    }
-
-    [[nodiscard]] static RuleListFetchResult Fail(ErrorCode code, std::string msg = {}) {
-        RuleListFetchResult result;
-        result.SetError(code, msg);
-        return result;
-    }
-
-    [[nodiscard]] static RuleListFetchResult NotModified() {
-        RuleListFetchResult result;
-        result.not_modified = true;
-        return result;
-    }
-};
 
 namespace api {
 
@@ -167,7 +152,7 @@ public:
     virtual ~API() noexcept = default;
 
     virtual net::awaitable<NodeInfoFetchResult>
-    GetNodeInfo() = 0;
+    GetNodeInfo(std::string committed_etag) = 0;
 
     // The validator belongs to the last successfully published user snapshot.
     virtual net::awaitable<UserListFetchResult>
@@ -178,9 +163,6 @@ public:
 
     virtual net::awaitable<bool>
     ReportUserTraffic(const std::vector<api::UserTraffic>& data) = 0;
-
-    virtual net::awaitable<RuleListFetchResult>
-    GetNodeRule() = 0;
 
 };
 

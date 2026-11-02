@@ -3,7 +3,7 @@
 #include "acppnode/common/asio_types.hpp"
 
 namespace acpp {
-class Config;
+struct Config;
 class Controller;
 namespace app::dns {
 class DNS;

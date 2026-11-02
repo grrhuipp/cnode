@@ -19,7 +19,6 @@
 
 namespace acpp {
 
-class ConnectionLimiter;
 class Worker;
 struct PanelConfig;
 
@@ -30,8 +29,7 @@ class API;
 class Controller {
 public:
     Controller(net::io_context& io_context,
-               const std::vector<std::unique_ptr<Worker>>& workers,
-               const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
+               const std::vector<std::unique_ptr<Worker>>& workers);
     ~Controller();
 
     Controller(const Controller&) = delete;
@@ -41,6 +39,9 @@ public:
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
     void Start();
+    // Main-executor only. Stop is terminal; join waits every started loop.
+    void RequestStop() noexcept;
+    net::awaitable<void> AsyncJoin();
 
     struct NodeStatsInfo {
         std::string panel_name;

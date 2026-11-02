@@ -3,6 +3,7 @@
 #include "acppnode/common/buf/contiguous_buffer_view.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/unsafe.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/infra/log.hpp"
 #include "../vmess_cipher.hpp"
 #include "../udp_datagram.hpp"
@@ -77,7 +78,7 @@ bool ParseRequestHeader(const uint8_t* data,
                         size_t len,
                         const proxyman::inbound::UserStore::VmessCredential* user,
                         const uint8_t* auth_id,
-                        const uint8_t* connection_nonce,
+                        size_t header_len,
                         uint64_t trace_conn_id,
                         VMessRequest& request,
                         size_t& consumed);
@@ -739,119 +740,55 @@ void InitResponseBodyState(EncodeResponseBodyState& state, const VMessRequest& r
 
 }  // namespace
 
-namespace {
-
-std::string FormatHexPrefixServer(const uint8_t* data, size_t len, size_t max_bytes = 16) {
-    if (!data || len == 0) {
-        return "-";
-    }
-
-    const size_t limit = std::min(len, max_bytes);
-    std::string out;
-    out.reserve(limit * 3 + 8);
-    static constexpr char kHex[] = "0123456789abcdef";
-
-    for (size_t i = 0; i < limit; ++i) {
-        if (i > 0) out.push_back(' ');
-        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
-        out.push_back(kHex[data[i] & 0x0F]);
-    }
-
-    if (len > limit) {
-        out.append(" ...");
-    }
-    return out;
-}
-
-}  // namespace
-
-#define FormatHexPrefix FormatHexPrefixServer
-
-std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
-    const TimedUserValidator& validator,
-    std::string_view tag,
-    const uint8_t* data,
-    size_t len,
-    uint64_t trace_conn_id) {
-    // VMess AEAD 请求格式：
-    // AuthID (16) + LengthEncrypted (2+16) + ConnectionNonce (8) + HeaderEncrypted (N+16)
-
-    LOG_NET_TRACE("[conn={}] VMess: ParseRequest start len={} tag={} prefix={}",
-                     trace_conn_id,
-                     len,
-                     tag,
-                     FormatHexPrefix(data, len, 24));
-
-    if (len < 16 + 18 + 8) {
-        LOG_NET_DEBUG("VMess: data too short, len={}", len);
-        LOG_NET_TRACE("[conn={}] VMess: ParseRequest short packet len={} min={} prefix={}",
-                         trace_conn_id,
-                         len,
-                         16 + 18 + 8,
-                         FormatHexPrefix(data, len, 24));
+std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeader(
+    const uint8_t* data, size_t len, uint64_t trace_conn_id) {
+    if (len < 42) {
+        required_header_bytes_ = 42;
         return {std::nullopt, 0};
     }
-
     const uint8_t* auth_id = data;
-
-    int64_t timestamp;
-    auto user = validator.FindByAuthIDForTag(tag, auth_id, timestamp);
-
-    if (!user) {
-        LOG_NET_DEBUG("VMess: user not found by auth_id (tag={})", tag);
-        LOG_NET_TRACE("[conn={}] VMess: auth_id miss tag={} auth_id={}",
-                         trace_conn_id,
-                         tag,
-                         FormatHexPrefix(auth_id, 16, 8));
-        return {std::nullopt, 0};
+    const uint8_t* connection_nonce = data + 34;
+    if (!header_user_) {
+        int64_t timestamp = 0;
+        header_user_ = validator_->FindByAuthIDForTag(tag_, auth_id, timestamp);
+        if (!header_user_) {
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
+        const std::string_view auth_id_sv(unsafe::ptr_cast<const char>(auth_id), 16);
+        const std::string_view nonce_sv(unsafe::ptr_cast<const char>(connection_nonce), 8);
+        const std::array<std::string_view, 3> key_path{
+            KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, auth_id_sv, nonce_sv};
+        const auto key = KDF16(header_user_->cmd_key.data(), 16, key_path);
+        const std::array<std::string_view, 3> iv_path{
+            KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV, auth_id_sv, nonce_sv};
+        std::array<uint8_t, 12> iv{};
+        KDF(header_user_->cmd_key.data(), 16, iv_path, iv.data(), iv.size());
+        std::array<uint8_t, 2> plain{};
+        size_t written = 0;
+        if (!AES128GCMDecryptTo(key.data(), iv.data(), iv.size(),
+                data + 16, 18, auth_id, 16, plain.data(), plain.size(), written) ||
+            written != plain.size()) {
+            header_user_.reset();
+            required_header_bytes_ = 0;
+            return {std::nullopt, 0};
+        }
+        header_length_ = (static_cast<uint16_t>(plain[0]) << 8) | plain[1];
+        required_header_bytes_ = 42 + static_cast<size_t>(header_length_) + 16;
     }
-
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    const int64_t skew = now - timestamp;
-
-    const auto& profile = *user->profile;
-    LOG_NET_DEBUG("VMess: found user {} by auth_id", profile.email);
-    LOG_NET_TRACE("[conn={}] VMess: auth ok user={} tag={} ts={} skew={}s auth_id={}",
-                     trace_conn_id,
-                     profile.email,
-                     tag,
-                     timestamp,
-                     skew,
-                     FormatHexPrefix(auth_id, 16, 8));
-
-    const uint8_t* connection_nonce = data + 16 + 18;
+    if (len < required_header_bytes_) return {std::nullopt, 0};
 
     VMessRequest request;
     size_t consumed = 0;
-
-    if (!ParseRequestHeader(data + 16, len - 16, user.get(), auth_id, connection_nonce,
-                        trace_conn_id, request, consumed)) {
-        LOG_NET_DEBUG("VMess: failed to parse request header");
-        LOG_NET_TRACE("[conn={}] VMess: ParseRequestHeader failed user={} nonce={}",
-                         trace_conn_id,
-                         profile.email,
-                         FormatHexPrefix(connection_nonce, 8, 8));
+    required_header_bytes_ = 0;
+    if (!ParseRequestHeader(data + 16, len - 16, header_user_.get(), auth_id,
+            header_length_, trace_conn_id, request, consumed) ||
+        !validator_->RegisterSessionIfNew(*header_user_, request.body_key, request.body_iv)) {
+        header_user_.reset();
+        LOG_NET_DEBUG("VMess: invalid authenticated request header or replay");
         return {std::nullopt, 0};
     }
-
-    if (!validator.RegisterSessionIfNew(*user, request.body_key, request.body_iv)) {
-        LOG_NET_DEBUG("VMess: duplicated AEAD session id");
-        LOG_NET_TRACE("[conn={}] VMess: duplicated AEAD session user={} tag={}",
-                         trace_conn_id,
-                         profile.email,
-                         tag);
-        return {std::nullopt, 0};
-    }
-
-    LOG_NET_TRACE("[conn={}] VMess: request parsed user={} consumed={} remaining={}",
-                     trace_conn_id,
-                     profile.email,
-                     16 + consumed,
-                     len > (16 + consumed) ? (len - (16 + consumed)) : 0);
-
-    request.user = std::move(user);
-
+    request.user = std::move(header_user_);
     return {std::move(request), 16 + consumed};
 }
 
@@ -859,121 +796,32 @@ bool ParseRequestHeader(const uint8_t* data,
                         size_t len,
                         const proxyman::inbound::UserStore::VmessCredential* user,
                         const uint8_t* auth_id,
-                        const uint8_t* connection_nonce,
+                        size_t header_len,
                         uint64_t trace_conn_id,
                         VMessRequest& request,
                         size_t& consumed) {
-    if (len < 18 + 8) {
-        LOG_NET_TRACE("[conn={}] VMess: ParseRequestHeader short len={} min={}",
-                         trace_conn_id,
-                         len,
-                         18 + 8);
-        return false;
-    }
-
-    const uint8_t* len_enc = data;
-    connection_nonce = data + 18;
-
+    const size_t needed = 26 + header_len + 16;
+    if (len < needed) return false;
+    const uint8_t* connection_nonce = data + 18;
     const std::string_view auth_id_sv(unsafe::ptr_cast<const char>(auth_id), 16);
     const std::string_view nonce_sv(unsafe::ptr_cast<const char>(connection_nonce), 8);
-
-    const std::array<std::string_view, 3> len_key_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
-        auth_id_sv,
-        nonce_sv
-    };
-    auto len_key = KDF16(user->cmd_key.data(), 16, len_key_path);
-
-    std::array<uint8_t, 12> len_iv;
-    const std::array<std::string_view, 3> len_iv_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
-        auth_id_sv,
-        nonce_sv
-    };
-    KDF(user->cmd_key.data(), 16, len_iv_path, len_iv.data(), 12);
-
-    std::array<uint8_t, 2> len_dec{};
-    size_t len_dec_size = 0;
-    const bool len_ok = AES128GCMDecryptTo(
-        len_key.data(), len_iv.data(), 12,
-        len_enc, 18, auth_id, 16,
-        len_dec.data(), len_dec.size(), len_dec_size);
-
-    if (!len_ok || len_dec_size != len_dec.size()) {
-        LOG_NET_DEBUG("VMess: header length decrypt failed");
-        LOG_NET_TRACE("[conn={}] VMess: header length decrypt failed user={} auth_id={} nonce={}",
-                         trace_conn_id,
-                         user && user->profile ? user->profile->email : "",
-                         FormatHexPrefix(auth_id, 16, 8),
-                         FormatHexPrefix(connection_nonce, 8, 8));
+    const std::array<std::string_view, 3> key_path{
+        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY, auth_id_sv, nonce_sv};
+    const auto key = KDF16(user->cmd_key.data(), 16, key_path);
+    const std::array<std::string_view, 3> iv_path{
+        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_IV, auth_id_sv, nonce_sv};
+    std::array<uint8_t, 12> iv{};
+    KDF(user->cmd_key.data(), 16, iv_path, iv.data(), iv.size());
+    memory::ByteVector plain(header_len);
+    size_t written = 0;
+    if (!AES128GCMDecryptTo(key.data(), iv.data(), iv.size(),
+            data + 26, header_len + 16, auth_id, 16,
+            plain.data(), plain.size(), written)) {
+        LOG_NET_DEBUG("VMess: request header authentication failed");
         return false;
     }
-
-    uint16_t header_len = (static_cast<uint16_t>(len_dec[0]) << 8) | len_dec[1];
-    LOG_NET_DEBUG("VMess: header length = {}", header_len);
-    LOG_NET_TRACE("[conn={}] VMess: header_len={} user={} nonce={}",
-                     trace_conn_id,
-                     header_len,
-                     user && user->profile ? user->profile->email : "",
-                     FormatHexPrefix(connection_nonce, 8, 8));
-
-    size_t needed = 18 + 8 + static_cast<size_t>(header_len) + 16;
-    if (len < needed) {
-        LOG_NET_DEBUG("VMess: not enough data for header, need {}, have {}", needed, len);
-        LOG_NET_TRACE("[conn={}] VMess: incomplete header need={} have={} header_len={}",
-                         trace_conn_id,
-                         needed,
-                         len,
-                         header_len);
-        return false;
-    }
-
-    const uint8_t* header_enc = data + 18 + 8;
-
-    const std::array<std::string_view, 3> header_key_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY,
-        auth_id_sv,
-        nonce_sv
-    };
-    auto header_key = KDF16(user->cmd_key.data(), 16, header_key_path);
-
-    std::array<uint8_t, 12> header_iv;
-    const std::array<std::string_view, 3> header_iv_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_IV,
-        auth_id_sv,
-        nonce_sv
-    };
-    KDF(user->cmd_key.data(), 16, header_iv_path, header_iv.data(), 12);
-
-    memory::ByteVector header_dec(header_len);
-    size_t header_dec_len = 0;
-    const bool header_ok = AES128GCMDecryptTo(
-        header_key.data(), header_iv.data(), 12,
-        header_enc, header_len + 16, auth_id, 16,
-        header_dec.data(), header_dec.size(), header_dec_len);
-
-    if (!header_ok) {
-        LOG_NET_DEBUG("VMess: header decrypt failed");
-        LOG_NET_TRACE("[conn={}] VMess: header decrypt failed user={} header_len={} nonce={} enc_prefix={}",
-                         trace_conn_id,
-                         user && user->profile ? user->profile->email : "",
-                         header_len,
-                         FormatHexPrefix(connection_nonce, 8, 8),
-                         FormatHexPrefix(header_enc, header_len + 16, 16));
-        return false;
-    }
-    header_dec.resize(header_dec_len);
-
-    if (!ParseDecryptedHeader(header_dec.data(), header_dec.size(), trace_conn_id, request)) {
-        LOG_NET_DEBUG("VMess: parse decrypted header failed");
-        LOG_NET_TRACE("[conn={}] VMess: ParseDecryptedHeader failed plain_len={} prefix={}",
-                         trace_conn_id,
-                         header_dec.size(),
-                         FormatHexPrefix(header_dec.data(), header_dec.size(), 24));
-        return false;
-    }
-
-    consumed = 18 + 8 + header_len + 16;
+    if (!ParseDecryptedHeader(plain.data(), written, trace_conn_id, request)) return false;
+    consumed = needed;
     return true;
 }
 
@@ -994,10 +842,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     request.version = reader.ReadU8();
     if (!reader.Ok() || request.version != VERSION) {
         LOG_NET_DEBUG("VMess: unsupported version {}", request.version);
-        LOG_NET_TRACE("[conn={}] VMess: unsupported version={} prefix={}",
-                         trace_conn_id,
-                         request.version,
-                         FormatHexPrefix(data, len, 24));
+        LOG_NET_TRACE("[conn={}] VMess: unsupported version={}", trace_conn_id, request.version);
         return false;
     }
 
@@ -1026,49 +871,16 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     if (request.command == Command::Mux) {
         target = TargetAddress("v1.mux.cool", 0);
     } else if (request.command == Command::TCP || request.command == Command::UDP) {
-        uint16_t port = reader.ReadU16BE();
-        uint8_t addr_type = reader.ReadU8();
-        if (!reader.Ok()) return false;
-
-        switch (addr_type) {
-            case 1: {
-                auto ipv4_span = reader.ReadBytes(4);
-                if (!reader.Ok()) return false;
-                net::ip::address_v4::bytes_type bytes{};
-                std::memcpy(bytes.data(), ipv4_span.data(), bytes.size());
-                target = TargetAddress(net::ip::make_address_v4(bytes), port);
-                break;
-            }
-            case 2: {
-                uint8_t domain_len = reader.ReadU8();
-                if (!reader.Ok()) return false;
-                std::string_view host = reader.ReadStringView(domain_len);
-                if (!reader.Ok()) return false;
-                target = TargetAddress(host, port);
-                break;
-            }
-            case 3: {
-                auto ipv6_span = reader.ReadBytes(16);
-                if (!reader.Ok()) return false;
-                net::ip::address_v6::bytes_type bytes{};
-                std::memcpy(bytes.data(), ipv6_span.data(), bytes.size());
-                target = TargetAddress(net::ip::make_address_v6(bytes), port);
-                break;
-            }
-            default:
-                LOG_NET_DEBUG("VMess: unsupported address type {}", addr_type);
-                LOG_NET_TRACE("[conn={}] VMess: unsupported address type={} prefix={}",
-                                 trace_conn_id,
-                                 addr_type,
-                                 FormatHexPrefix(data, len, 24));
-                return false;
-        }
+        auto address = DecodeAddress(
+            std::span(data + reader.Position(), reader.Remaining()),
+            AddressWireFormat::PortFirst);
+        if (address.status != AddressDecodeStatus::Complete) return false;
+        reader.Skip(address.consumed);
+        target = std::move(address.target);
     } else {
         LOG_NET_DEBUG("VMess: unsupported command {}", static_cast<int>(request.command));
-        LOG_NET_TRACE("[conn={}] VMess: unsupported command={} prefix={}",
-                         trace_conn_id,
-                         static_cast<int>(request.command),
-                         FormatHexPrefix(data, len, 24));
+        LOG_NET_TRACE("[conn={}] VMess: unsupported command={}",
+                      trace_conn_id, static_cast<int>(request.command));
         return false;
     }
 
@@ -1085,31 +897,21 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
 
     if (!reader.Ok() || expected_fnv != actual_fnv) {
         LOG_NET_DEBUG("VMess: FNV1a checksum mismatch");
-        LOG_NET_TRACE("[conn={}] VMess: checksum mismatch expected={:#010x} actual={:#010x} target={} padding={} options={:#04x} security={} command={}",
-                         trace_conn_id,
-                         expected_fnv,
-                         actual_fnv,
-                         request.target,
-                         request.padding_len,
-                         static_cast<int>(request.options),
-                         static_cast<int>(request.security),
-                         static_cast<int>(request.command));
+        LOG_NET_TRACE("[conn={}] VMess: request header checksum mismatch", trace_conn_id);
         return false;
     }
 
-    LOG_NET_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={} response_header={:#04x}",
+    LOG_NET_TRACE("[conn={}] VMess: header ok target={} command={} security={} options={:#04x} padding={}",
                      trace_conn_id,
                      request.target,
                      static_cast<int>(request.command),
                      static_cast<int>(request.security),
                      static_cast<int>(request.options),
-                     request.padding_len,
-                     static_cast<int>(request.response_header));
+                     request.padding_len);
 
     return true;
 }
 
-#undef FormatHexPrefix
 
 namespace {
 
@@ -1227,14 +1029,6 @@ ServerSession::ServerSession(const TimedUserValidator& validator, std::string_vi
     : validator_(&validator)
     , tag_(tag) {}
 
-std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeader(
-    const uint8_t* data,
-    size_t len,
-    uint64_t trace_conn_id) {
-    auto result = ::acpp::vmess::encoding::DecodeRequestHeader(
-        *validator_, tag_, data, len, trace_conn_id);
-    return result;
-}
 
 void ServerSession::SetRequest(VMessRequest request) {
     request_ = std::move(request);

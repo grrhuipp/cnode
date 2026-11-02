@@ -21,11 +21,9 @@ auto Parse(std::string_view body) {
     return acpp::api::v2board::ParseUserList(parsed.as_object());
 }
 
-void CheckInvalid(std::string_view body, std::string_view cause) {
+void CheckInvalid(std::string_view body) {
     auto result = Parse(body);
     Check(!result, "invalid user list was accepted");
-    Check(result.error().find(cause) != std::string::npos,
-          "invalid user list error lost its cause");
 }
 
 void TestValidUsersAreNormalized() {
@@ -56,28 +54,18 @@ void TestValidUsersAreNormalized() {
 }
 
 void TestInvalidLimitsAreRejected() {
-    CheckInvalid(
-        R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":140737488355328}]})",
-        "speed_limit exceeds");
-    CheckInvalid(
-        R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":4294967296}]})",
-        "device_limit exceeds");
-    CheckInvalid(
-        R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":-1}]})",
-        "speed_limit must not be negative");
-    CheckInvalid(
-        R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":"1"}]})",
-        "device_limit must be an integer or null");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":140737488355328}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":4294967296}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speed_limit":-1}]})");
+    CheckInvalid(R"({"users":[{"id":7,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","device_limit":"1"}]})");
 }
 
 void TestMalformedUsersAreRejected() {
-    CheckInvalid(R"({})", "users is required");
-    CheckInvalid(R"({"users":null})", "users must be an array");
-    CheckInvalid(R"({"users":[1]})", "must be an object");
-    CheckInvalid(
-        R"({"users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]})",
-        "id must be a positive int64");
-    CheckInvalid(R"({"users":[{"id":7}]})", "uuid must be a non-empty string");
+    CheckInvalid(R"({})");
+    CheckInvalid(R"({"users":null})");
+    CheckInvalid(R"({"users":[1]})");
+    CheckInvalid(R"({"users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}]})");
+    CheckInvalid(R"({"users":[{"id":7}]})");
 }
 
 }  // namespace

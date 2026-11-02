@@ -26,6 +26,12 @@ public:
     net::awaitable<DnsResult> Resolve(std::string domain);
     net::awaitable<DnsCacheStats> GetCacheStats();
 
+    // Main/control executor only. Both operations are idempotent. AsyncJoin
+    // requests stop and waits for admitted requests and actual upstream I/O
+    // completion; keep this owner and its executor alive until it returns.
+    void RequestStop() noexcept;
+    net::awaitable<void> AsyncJoin();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

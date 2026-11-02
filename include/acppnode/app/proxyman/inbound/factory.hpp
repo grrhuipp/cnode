@@ -93,7 +93,6 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 
 [[nodiscard]] bool HasProxy(std::string_view protocol);
 
-[[nodiscard]] std::vector<std::string> RegisteredProtocols();
 
 [[nodiscard]] std::optional<UserProtocol> RegisteredUserProtocol(
     std::string_view protocol);

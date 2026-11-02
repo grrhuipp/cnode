@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace acpp::trojan {
@@ -16,21 +17,18 @@ struct FramedUdpPacket {
     buf::MultiBuffer payload;
 };
 
-// Trojan UDP wire frames are contiguous on the stream but their logical
-// payload may span many internal 8KB Buffers.
+// Owns stream fragments until one complete datagram can be transferred.
 class UdpFramer {
 public:
-    void Feed(const uint8_t* data, size_t len);
+    void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
+    void Finish() const;
 
 private:
-    void Parse();
-    void CompactPending();
-
-    memory::ByteVector pending_;
-    size_t pending_offset_ = 0;
-    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
-    bool shrink_queue_on_drain_ = false;
+    buf::MultiBuffer pending_;
+    std::optional<TargetAddress> target_;
+    size_t payload_size_ = 0;
+    bool failed_ = false;
 };
 
 net::awaitable<void> WriteUdpDatagram(

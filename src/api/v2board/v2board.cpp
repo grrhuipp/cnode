@@ -39,7 +39,7 @@ public:
     ~APIClient() override;
 
     net::awaitable<NodeInfoFetchResult>
-    GetNodeInfo() override;
+    GetNodeInfo(std::string committed_etag) override;
 
     net::awaitable<UserListFetchResult>
     GetUserList(std::string committed_etag) override;
@@ -49,9 +49,6 @@ public:
 
     net::awaitable<bool>
     ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) override;
-
-    net::awaitable<RuleListFetchResult>
-    GetNodeRule() override;
 
 private:
     struct Impl;
@@ -170,9 +167,9 @@ std::string JoinRouteMatches(const json::array& matches) {
     return pattern;
 }
 
-std::vector<::acpp::api::DetectRule>
+std::vector<rule::DetectRule>
 ExtractBlockDetectRules(const json::object& config, std::string_view panel_name) {
-    std::vector<::acpp::api::DetectRule> rules;
+    std::vector<rule::DetectRule> rules;
     const auto* routes_value = config.if_contains("routes");
     if (!routes_value || !routes_value->is_array()) {
         return rules;
@@ -203,8 +200,7 @@ ExtractBlockDetectRules(const json::object& config, std::string_view panel_name)
         }
 
         try {
-            ::acpp::api::DetectRule rule;
-            rule.ID = static_cast<int>(i);
+            rule::DetectRule rule;
             rule.Pattern = std::regex(pattern);
             rules.push_back(std::move(rule));
         } catch (const std::regex_error& e) {
@@ -255,21 +251,16 @@ struct APIClient::Impl {
                  const std::optional<json::value>& body,
                  const std::string& if_none_match);
 
-    net::awaitable<NodeInfoFetchResult> GetNodeInfo();
+    net::awaitable<NodeInfoFetchResult> GetNodeInfo(std::string committed_etag);
     net::awaitable<UserListFetchResult> GetUserList(std::string committed_etag);
     net::awaitable<bool> ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& online_users);
     net::awaitable<bool> ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data);
-    net::awaitable<RuleListFetchResult> GetNodeRule();
 
     net::io_context& io_context_;
     ::acpp::api::Config config_;
     UrlParts url_parts_;
     ::acpp::app::dns::DNS& dns_service_;
 
-    std::string config_etag_;
-
-    std::optional<::acpp::api::NodeInfo> cached_config_;
-    std::vector<::acpp::api::DetectRule> cached_route_rules_;
     std::unique_ptr<net::ssl::context> https_context_;
 };
 
@@ -586,25 +577,21 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
 }
 
 net::awaitable<NodeInfoFetchResult>
-APIClient::Impl::GetNodeInfo() {
+APIClient::Impl::GetNodeInfo(std::string committed_etag) {
     const int node_id = config_.NodeID;
 
     // GET /api/v1/server/UniProxy/config?node_id=X&node_type=Y
     std::string path = std::format("/api/v1/server/UniProxy/config?node_id={}&node_type={}",
                                    node_id, ApiNodeType());
 
-    // 使用存储的 ETag
-    auto resp = co_await HttpGet(path, config_etag_);
-
-    // 304 Not Modified - 返回缓存
+    auto resp = co_await HttpGet(path, committed_etag);
     if (resp.not_modified) {
-        if (cached_config_) {
-            LOG_DEBUG("V2Board[{}]: node {} config not modified (304)", config_.Name, node_id);
-            co_return NodeInfoFetchResult::Success(*cached_config_);
+        if (committed_etag.empty()) {
+            co_return NodeInfoFetchResult::Fail(
+                ErrorCode::PANEL_INVALID_RESPONSE,
+                "received 304 without a committed node ETag");
         }
-        co_return NodeInfoFetchResult::Fail(
-            ErrorCode::PANEL_INVALID_RESPONSE,
-            "received 304 without cached node config");
+        co_return NodeInfoFetchResult::NotModified();
     }
 
     if (resp.status != 200) {
@@ -630,16 +617,13 @@ APIClient::Impl::GetNodeInfo() {
         }
         auto config = std::move(*parsed_config);
 
-        cached_route_rules_ = ExtractBlockDetectRules(j, config_.Name);
-
-        // 保存 ETag 和缓存
-        config_etag_ = resp.etag;
-        cached_config_ = config;
+        auto rules = ExtractBlockDetectRules(j, config_.Name);
 
         LOG_DEBUG("V2Board[{}]: node {} config: protocol={}, port={}, network={}",
                  config_.Name, node_id, config.NodeType, config.Port, config.TransportProtocol);
 
-        co_return NodeInfoFetchResult::Success(std::move(config));
+        co_return NodeInfoFetchResult::Success(
+            std::move(config), std::move(rules), std::move(resp.etag));
 
     } catch (const std::exception& e) {
         LOG_ERROR("V2Board[{}]: parse config error: {}", config_.Name, e.what());
@@ -752,11 +736,6 @@ APIClient::Impl::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser
     co_return true;
 }
 
-net::awaitable<RuleListFetchResult>
-APIClient::Impl::GetNodeRule() {
-    co_return RuleListFetchResult::Success(cached_route_rules_);
-}
-
 APIClient::APIClient(net::io_context& io_context,
                      const ::acpp::api::Config& config,
                      ::acpp::app::dns::DNS& dns_service)
@@ -766,8 +745,8 @@ APIClient::~APIClient() = default;
 
 
 net::awaitable<NodeInfoFetchResult>
-APIClient::GetNodeInfo() {
-    return impl_->GetNodeInfo();
+APIClient::GetNodeInfo(std::string committed_etag) {
+    return impl_->GetNodeInfo(std::move(committed_etag));
 }
 
 net::awaitable<UserListFetchResult>
@@ -783,11 +762,6 @@ APIClient::ReportNodeOnlineUsers(const std::vector<::acpp::api::OnlineUser>& onl
 net::awaitable<bool>
 APIClient::ReportUserTraffic(const std::vector<::acpp::api::UserTraffic>& data) {
     return impl_->ReportUserTraffic(data);
-}
-
-net::awaitable<RuleListFetchResult>
-APIClient::GetNodeRule() {
-    return impl_->GetNodeRule();
 }
 
 }  // namespace acpp::api::v2board

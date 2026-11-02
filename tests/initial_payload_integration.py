@@ -159,10 +159,15 @@ async def run_case(binary, output, protocol, prefix_size, key_transform=None):
             assert await asyncio.wait_for(reader.readexactly(2 + len(BANNER)), 5) == b'\0\0' + BANNER, 'server-first greeting failed'
             client.write(TAIL)
             await client.drain()
-            if protocol != 'anytls':
+            # asyncio's TLS server closes the whole connection on close_notify;
+            # it cannot model TLS 1.3's independent write-half closure. Exercise
+            # that contract with the independent memory-BIO record peer instead.
+            if protocol not in ('anytls', 'trojan'):
                 client.write_eof()
             echoed = await asyncio.wait_for(reader.readexactly(len(expected)), 5)
             assert echoed == expected, 'client received reordered/duplicate payload'
+            if protocol == 'trojan':
+                client.write_eof()
             assert not await asyncio.wait_for(reader.read(), 5), 'unexpected extra response bytes'
             assert peer.received == expected and not peer.errors, 'peer payload validation failed'
             result.update(received_bytes=len(peer.received), sha256=hashlib.sha256(peer.received).hexdigest(), passed=True)

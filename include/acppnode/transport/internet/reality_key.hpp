@@ -3,7 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -22,13 +22,13 @@ enum class RealityKeyError {
     InvalidFormat,
 };
 
-[[nodiscard]] std::expected<RealityKey, RealityKeyError>
+[[nodiscard]] tl::expected<RealityKey, RealityKeyError>
 ParseRealityKey(std::string_view value) noexcept;
 
-[[nodiscard]] std::expected<RealityKey, RealityKeyError>
+[[nodiscard]] tl::expected<RealityKey, RealityKeyError>
 ParseRealityMldsa65Seed(std::string_view value) noexcept;
 
-[[nodiscard]] std::expected<RealityMldsa65PublicKey, RealityKeyError>
+[[nodiscard]] tl::expected<RealityMldsa65PublicKey, RealityKeyError>
 ParseRealityMldsa65PublicKey(std::string_view value) noexcept;
 
 [[nodiscard]] std::optional<RealityMldsa65PublicKey>

@@ -74,6 +74,7 @@ void CheckClassic(const TargetAddress& target,
     Check(decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source,
           "classic Shadowsocks split one MultiBuffer datagram");
+    Check(!decoded->session_id, "classic UDP unexpectedly supplied a protocol session ID");
 
     // Cross-check the one-shot AEAD API against the existing streaming EVP
     // implementation, rather than only round-tripping through the new path.
@@ -81,7 +82,8 @@ void CheckClassic(const TargetAddress& target,
     std::array<uint8_t, 12> nonce{};
     Check(ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
                           subkey.data()), "reference subkey derivation failed");
-    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size);
+    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size,
+                               proxy::AeadDirection::Decrypt);
     const auto body = std::span<const uint8_t>(encoded).subspan(cipher.salt_size);
     std::vector<uint8_t> plaintext(body.size() - ss::SsAeadCipher::kTagSize);
     Check(reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()),
@@ -89,7 +91,9 @@ void CheckClassic(const TargetAddress& target,
     Check(std::equal(source.begin(), source.end(), plaintext.end() - source.size()),
           "reference AEAD plaintext mismatch");
     std::vector<uint8_t> reference_ciphertext(body.size());
-    Check(reference.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
+    ss::SsAeadCipher encoder(cipher.type, subkey.data(), cipher.key_size,
+                             proxy::AeadDirection::Encrypt);
+    Check(encoder.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
           std::equal(body.begin(), body.end(), reference_ciphertext.begin()),
           "AEAD ciphertext/tag differ from streaming EVP");
     encoded.back() ^= 1;
@@ -127,6 +131,7 @@ void Check2022(const TargetAddress& target,
     ss::Ss2022UdpSessionState encoder;
     Check(ss::Init2022UdpSessionState(encoder, cipher, key),
           "failed to initialize Shadowsocks 2022 UDP state");
+    encoder.client_session_id = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
     const size_t encoded_size = ss::Encode2022UdpRequestPacketTo(
         target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
     Check(encoded_size > source.size(),
@@ -195,10 +200,45 @@ void Check2022(const TargetAddress& target,
     Check(decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source,
           "Shadowsocks 2022 split one MultiBuffer datagram");
+    Check(decoded->session_id == 0x00123456789abcdeULL,
+          "Shadowsocks 2022 session ID lost byte order or leading zeros");
     Check(!ss::DecodeUdpPacket(
               encoded.data(), encoded.size(), users,
               cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
           "Shadowsocks 2022 accepted a replayed request packet");
+    // Distinct authenticated users may independently choose identical session
+    // and packet IDs. Authentication must scope the replay window too.
+    ss::KeyBytes second_key = key;
+    second_key.bytes[0] ^= 0x5a;
+    auto second_user = user_list->back();
+    Check(second_user.derived_key.assign(second_key.span()), "failed to prepare second user's key");
+    if (identity)
+        Check(ss::Hash2022Psk(second_key.span(), second_user.psk_hash),
+              "failed to prepare second identity credential");
+    user_list->push_back(std::move(second_user));
+    ss::Ss2022UdpSessionState second_encoder;
+    Check(ss::Init2022UdpSessionState(second_encoder, cipher, second_key),
+          "failed to prepare second user's UDP session");
+    second_encoder.client_session_id = encoder.client_session_id;
+    if (identity) chain[1] = second_key;
+    const size_t second_size = ss::Encode2022UdpRequestPacketTo(
+        target, payload.data(), payload.size(), second_encoder, psk_chain, nullptr, 0);
+    std::vector<uint8_t> second_packet(second_size);
+    Check(second_size != 0 && ss::Encode2022UdpRequestPacketTo(
+              target, payload.data(), payload.size(), second_encoder, psk_chain,
+              second_packet.data(), second_packet.size()) == second_size,
+          "failed to encode second user's UDP packet");
+    auto second_decoded = ss::DecodeUdpPacket(
+        second_packet.data(), second_packet.size(), users,
+        cipher.type, cipher.key_size, cipher.salt_size, replay_cache);
+    Check(second_decoded && second_decoded->session_id == decoded->session_id &&
+          second_decoded->user_index != decoded->user_index &&
+          Flatten(second_decoded->payload) == source,
+          "SS2022 replay state crossed authenticated users with identical session and packet IDs");
+    Check(!ss::DecodeUdpPacket(
+              second_packet.data(), second_packet.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
+          "SS2022 second user accepted its own repeated packet");
 
     auto make_response_state = [&]() {
         ss::Ss2022UdpSessionState state;
@@ -248,17 +288,20 @@ void Check2022ReplayWindow() {
     ss::Ss2022UdpReplayCache cache;
     const std::array<uint8_t, 8> session_id{1, 2, 3, 4, 5, 6, 7, 8};
     const auto started = std::chrono::steady_clock::time_point{};
-    Check(cache.Accept(session_id, 7, started) &&
-          !cache.Accept(session_id, 7, started + std::chrono::seconds(64)) &&
-          cache.Accept(session_id, 7, started + std::chrono::seconds(66)),
+    ss::KeyBytes owner;
+    const std::array<uint8_t, 16> owner_bytes{1};
+    Check(owner.assign(owner_bytes), "failed to prepare replay test credential");
+    Check(cache.Accept(owner.span(), session_id, 7, started) &&
+          !cache.Accept(owner.span(), session_id, 7, started + std::chrono::seconds(64)) &&
+          cache.Accept(owner.span(), session_id, 7, started + std::chrono::seconds(66)),
           "Shadowsocks 2022 replay cache retention is incorrect");
 
     ss::Ss2022UdpReplayCache previous_cache;
-    Check(previous_cache.Accept(session_id, 9, started),
+    Check(previous_cache.Accept(owner.span(), session_id, 9, started),
           "failed to seed Shadowsocks 2022 replay cache");
     ss::Ss2022UdpReplayCache adopted_cache = std::move(previous_cache);
     Check(!adopted_cache.Accept(
-              session_id, 9, started + std::chrono::seconds(1)),
+              owner.span(), session_id, 9, started + std::chrono::seconds(1)),
           "Shadowsocks 2022 replay cache lost state during handler adoption");
 }
 

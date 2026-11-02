@@ -195,10 +195,12 @@ bool RunPinnedChunks() {
 
 bool RunIdleQueue() {
     Pool pool;
-    int wakeups = 0;
-    if (!pool.BindIdleWakeup(&wakeups, [](void* owner) noexcept { ++*static_cast<int*>(owner); })) return false;
-    int other = 0;
-    if (pool.BindIdleWakeup(&other, [](void*) noexcept {})) return false;
+    struct Observer final : Pool::IdleWakeup {
+        int wakeups = 0;
+        void OnPoolIdle() noexcept override { ++wakeups; }
+    } observer, other;
+    if (!pool.BindIdleWakeup(observer)) return false;
+    if (pool.BindIdleWakeup(other)) return false;
     std::array<void*, 3> blocks{};
     constexpr std::array<size_t, 3> sizes{64, 256, 8192};
     size_t idle_bytes = 0;
@@ -208,7 +210,7 @@ bool RunIdleQueue() {
         idle_bytes += Pool::Describe(sizes[i], 16).map_bytes;
     }
     for (auto* p : blocks) pool.Deallocate(p);
-    if (wakeups != 1 || pool.GetFootprint().idle_bytes != idle_bytes) return false;
+    if (observer.wakeups != 1 || pool.GetFootprint().idle_bytes != idle_bytes) return false;
     for (size_t i : {1, 0, 2}) {
         blocks[i] = pool.Allocate(sizes[i], 8);
         idle_bytes -= Pool::Describe(sizes[i], 16).map_bytes;
@@ -225,12 +227,18 @@ bool RunIdleQueue() {
     std::this_thread::sleep_until(pool.NextPurgeDeadline() + kThreadPoolPurgeDelay);
     pool.Purge();
     if (pool.GetFootprint().chunks || pool.GetFootprint().idle_bytes) return false;
-    pool.UnbindIdleWakeup(&wakeups);
+    pool.UnbindIdleWakeup(observer);
     // A scheduling-OOM fallback may immediately destroy the just-freed chunk.
-    if (!pool.BindIdleWakeup(&pool, [](void* p) noexcept { static_cast<Pool*>(p)->PurgeIdle(); })) return false;
+    struct ImmediatePurge final : Pool::IdleWakeup {
+        explicit ImmediatePurge(Pool& pool) : pool(pool) {}
+        void OnPoolIdle() noexcept override { pool.PurgeIdle(); }
+        Pool& pool;
+    } immediate(pool);
+    if (!pool.BindIdleWakeup(immediate)) return false;
     void* p = pool.Allocate(256, 16);
     if (!p) return false;
     pool.Deallocate(p);
+    pool.UnbindIdleWakeup(immediate);
     return !pool.GetFootprint().mapped_bytes;
 }
 

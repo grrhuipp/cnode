@@ -1,8 +1,13 @@
 #include "udp_framing.hpp"
-#include "vless_codec.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/post.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <array>
@@ -88,6 +93,102 @@ buf::MultiBuffer MakeDatagram(const std::vector<uint8_t>& source,
     }
     return payload;
 }
+buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
+    buf::MultiBuffer input;
+    Check(buf::AppendSpanToMultiBuffer(bytes, input), "input allocation failed");
+    return input;
+}
+
+template <typename Fn>
+void CheckRejected(Fn&& fn, std::string_view message) {
+    bool rejected = false;
+    try { fn(); } catch (const IoSystemError&) { rejected = true; }
+    Check(rejected, message);
+}
+
+void CheckFrameBoundaries() {
+    const std::array<uint8_t, 9> wire{0, 0, 0, 2, 0x11, 0x22, 0, 1, 0x33};
+    for (size_t split = 0; split <= wire.size(); ++split) {
+        vless::UdpFramer framer(false);
+        vless::FramedUdpPacket packet;
+        std::vector<uint8_t> decoded;
+        framer.Feed(MakeInput(std::span(wire).first(split)));
+        while (framer.Next(packet)) {
+            auto bytes = Flatten(packet.payload);
+            decoded.insert(decoded.end(), bytes.begin(), bytes.end());
+        }
+        framer.Feed(MakeInput(std::span(wire).subspan(split)));
+        while (framer.Next(packet)) {
+            auto bytes = Flatten(packet.payload);
+            decoded.insert(decoded.end(), bytes.begin(), bytes.end());
+        }
+        framer.Finish();
+        Check(decoded == std::vector<uint8_t>({0x11, 0x22, 0x33}),
+              "zero length frame damaged a following frame");
+    }
+    for (size_t cut : {size_t{1}, size_t{2}, size_t{3}}) {
+        vless::UdpFramer framer(false);
+        framer.Feed(MakeInput(std::span(wire).subspan(2, cut)));
+        vless::FramedUdpPacket packet;
+        (void)framer.Next(packet);
+        CheckRejected([&] { framer.Finish(); }, "truncated frame accepted as EOF");
+    }
+    vless::UdpFramer invalid(true);
+    const std::array<uint8_t, 6> malformed{0, 1, 0xff, 0, 1, 0x42};
+    invalid.Feed(MakeInput(malformed));
+    vless::FramedUdpPacket packet;
+    CheckRejected([&] { (void)invalid.Next(packet); }, "invalid address accepted");
+    CheckRejected([&] { (void)invalid.Next(packet); }, "invalid stream resynchronized");
+
+    vless::UdpFramer bounded(false);
+    const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
+    CheckRejected([&] { bounded.Feed(MakeInput(excess)); }, "unbounded retained input");
+    CheckRejected([&] { (void)bounded.Next(packet); }, "overflow stream recovered");
+
+    const std::vector<uint8_t> maximum(65535, 0x71);
+    std::vector<uint8_t> large{0xff, 0xff};
+    large.insert(large.end(), maximum.begin(), maximum.end());
+    vless::UdpFramer fragmented(false);
+    for (const auto byte : large) {
+        fragmented.Feed(MakeInput(std::span<const uint8_t>(&byte, 1)));
+    }
+    Check(fragmented.Next(packet) && Flatten(packet.payload) == maximum,
+          "one-byte fragments failed at maximum wire length");
+    fragmented.Finish();
+}
+
+void CheckCancelledReadPreservesFrame() {
+    net::io_context io;
+    tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
+    tcp::socket sender(io);
+    sender.connect(listener.local_endpoint());
+    tcp::socket receiver = listener.accept();
+    const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
+    net::write(sender, net::buffer(wire.data(), 1));
+    vless::UdpFramer framer(false);
+    auto future = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        std::array<uint8_t, 5> bytes{};
+        co_await net::async_read(receiver, net::buffer(bytes.data(), 1), net::use_awaitable);
+        framer.Feed(MakeInput(std::span(bytes).first(1)));
+        vless::FramedUdpPacket packet;
+        Check(!framer.Next(packet), "partial frame delivered before cancellation");
+        net::post(io, [&] { receiver.cancel(); });
+        IoErrorCode ec;
+        (void)co_await receiver.async_read_some(
+            net::buffer(bytes), net::redirect_error(net::use_awaitable, ec));
+        Check(ec == net::error::operation_aborted, "socket read was not cancelled");
+        net::write(sender, net::buffer(wire.data() + 1, wire.size() - 1));
+        co_await net::async_read(receiver, net::buffer(bytes.data(), 4), net::use_awaitable);
+        framer.Feed(MakeInput(std::span(bytes).first(4)));
+        Check(framer.Next(packet) &&
+                  Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}),
+              "cancelled read lost retained VLESS bytes");
+        Check(!framer.Next(packet), "cancelled read duplicated VLESS bytes");
+        framer.Finish();
+    }, net::use_future);
+    io.run();
+    future.get();
+}
 
 void CheckDecoded(const std::vector<uint8_t>& wire,
                   bool packet_addr,
@@ -101,11 +202,11 @@ void CheckDecoded(const std::vector<uint8_t>& wire,
             break;
         }
         const size_t size = std::min(fragment, wire.size() - offset);
-        framer.Feed(wire.data() + offset, size);
+        framer.Feed(MakeInput(std::span(wire).subspan(offset, size)));
         offset += size;
     }
     if (offset < wire.size()) {
-        framer.Feed(wire.data() + offset, wire.size() - offset);
+        framer.Feed(MakeInput(std::span(wire).subspan(offset)));
     }
 
     vless::FramedUdpPacket decoded;
@@ -120,11 +221,14 @@ void CheckDecoded(const std::vector<uint8_t>& wire,
           "VLESS UDP framer truncated multi-buffer payload");
     Check(!framer.Next(decoded),
           "one VLESS UDP datagram produced multiple logical packets");
+    framer.Finish();
 }
 
 }  // namespace
 
 int main() {
+    CheckFrameBoundaries();
+    CheckCancelledReadPreservesFrame();
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
 
@@ -134,14 +238,10 @@ int main() {
         co_await vless::WriteUdpDatagram(
             fixed_capture, std::move(fixed_payload), false);
     });
-    const auto fixed_parsed = vless::Codec::ParseUdpPacket(
-        fixed_capture.bytes.data(), fixed_capture.bytes.size());
-    Check(fixed_parsed.result == vless::Codec::UdpParseResult::SUCCESS &&
-          fixed_parsed.packet &&
-          fixed_parsed.consumed == fixed_capture.bytes.size() &&
-          fixed_parsed.packet->payload.size() == source.size() &&
-          std::equal(fixed_parsed.packet->payload.begin(),
-                     fixed_parsed.packet->payload.end(), source.begin()),
+    Check(fixed_capture.bytes.size() == source.size() + 2 &&
+              fixed_capture.bytes[0] == static_cast<uint8_t>(source.size() >> 8) &&
+              fixed_capture.bytes[1] == static_cast<uint8_t>(source.size()) &&
+              std::equal(source.begin(), source.end(), fixed_capture.bytes.begin() + 2),
           "large VLESS UDP datagram was split or malformed");
     CheckDecoded(fixed_capture.bytes, false, target, source);
 
@@ -164,15 +264,19 @@ int main() {
         co_await vless::WriteUdpDatagram(
             scatter_capture, target, false, scatter);
     });
-    const auto scatter_parsed = vless::Codec::ParseUdpPacket(
-        scatter_capture.bytes.data(), scatter_capture.bytes.size());
-    Check(scatter_parsed.result == vless::Codec::UdpParseResult::SUCCESS &&
-          scatter_parsed.packet &&
-          scatter_parsed.consumed == scatter_capture.bytes.size() &&
-          scatter_parsed.packet->payload.size() == source.size() &&
-          std::equal(scatter_parsed.packet->payload.begin(),
-                     scatter_parsed.packet->payload.end(), source.begin()),
+    Check(scatter_capture.bytes == fixed_capture.bytes,
           "scatter VLESS UDP payload was split into multiple frames");
+
+    const std::vector<uint8_t> oversized(65536, 0x42);
+    const std::array<net::const_buffer, 1> oversized_buffers{net::buffer(oversized)};
+    CaptureWriter rejected_capture;
+    CheckRejected([&] {
+        Run([&]() -> net::awaitable<void> {
+            co_await vless::WriteUdpDatagram(
+                rejected_capture, target, false, oversized_buffers);
+        });
+    }, "oversized VLESS datagram accepted");
+    Check(rejected_capture.bytes.empty(), "oversized VLESS datagram partially written");
 
     return 0;
 }

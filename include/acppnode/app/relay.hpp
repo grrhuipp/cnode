@@ -548,12 +548,37 @@ net::awaitable<RelayResult> DoRelayLink(
     if (config.speed_limit != 0)
         limits = std::make_unique<relay_detail::RelayRateLimits>(io_context, config.speed_limit);
     struct CancellationContext {
+        struct ClientCancellation final : transport::CancellationSubscription {
+            explicit ClientCancellation(CancellationContext& owner) noexcept : owner(owner) {}
+            CancellationContext& owner;
+        private:
+            void OnCancellation(transport::Cancellation cancellation) noexcept override {
+                owner.Cancel(cancellation.reason);
+            }
+        };
+        struct TargetCancellation final : transport::CancellationSubscription {
+            explicit TargetCancellation(CancellationContext& owner) noexcept : owner(owner) {}
+            CancellationContext& owner;
+        private:
+            void OnCancellation(transport::Cancellation cancellation) noexcept override {
+                owner.Cancel(cancellation.reason);
+            }
+        };
         ClientControl& client;
         TargetEndpoint& target;
         relay_detail::RelayDirectionState& client_state;
         relay_detail::RelayDirectionState& target_state;
         relay_detail::RelayRateLimits* limits;
         bool notifying = false;
+        ClientCancellation client_cancel{*this};
+        TargetCancellation target_cancel{*this};
+
+        CancellationContext(ClientControl& client, TargetEndpoint& target,
+                            relay_detail::RelayDirectionState& client_state,
+                            relay_detail::RelayDirectionState& target_state,
+                            relay_detail::RelayRateLimits* limits) noexcept
+            : client(client), target(target), client_state(client_state),
+              target_state(target_state), limits(limits) {}
 
         void Cancel(ErrorCode reason) noexcept {
             if (notifying) return;
@@ -568,12 +593,9 @@ net::awaitable<RelayResult> DoRelayLink(
             relay_detail::CancelIfSupported(target);
             notifying = false;
         }
-    } cancellation_context{client_control, target, client_state, target_state, limits.get()};
-    const auto cancel = [](void* raw, transport::Cancellation cancellation) noexcept {
-        static_cast<CancellationContext*>(raw)->Cancel(cancellation.reason);
-    };
-    transport::CancellationSubscription client_cancel(client_reader.Cancellation(), cancel, &cancellation_context);
-    transport::CancellationSubscription target_cancel(target.Cancellation(), cancel, &cancellation_context);
+    } cancellation_context(client_control, target, client_state, target_state, limits.get());
+    cancellation_context.client_cancel.Resubscribe(client_reader.Cancellation());
+    cancellation_context.target_cancel.Resubscribe(target.Cancellation());
 
     std::pair<uint64_t, ErrorCode> up_result;
     std::pair<uint64_t, ErrorCode> down_result;
@@ -740,30 +762,44 @@ net::awaitable<RelayResult> DoRelayLink(
     // The watchdog participates in the same joined coroutine group. Its
     // completion cancels reader/writer awaits even when no client control exists.
     struct StopState {
+        struct TargetCancellation final : transport::CancellationSubscription {
+            explicit TargetCancellation(StopState& owner) noexcept : owner(owner) {}
+            StopState& owner;
+        private:
+            void OnCancellation(transport::Cancellation cancellation) noexcept override {
+                owner.Request(relay_detail::ConsumeRelayTimeoutSignals(owner.target, owner.target)
+                    ? ErrorCode::RELAY_TIMEOUT : cancellation.reason);
+            }
+        };
+        struct ClientCancellation final : transport::CancellationSubscription {
+            explicit ClientCancellation(StopState& owner) noexcept : owner(owner) {}
+            StopState& owner;
+        private:
+            void OnCancellation(transport::Cancellation cancellation) noexcept override {
+                owner.Request(cancellation.reason);
+                relay_detail::CancelIfSupported(owner.target);
+            }
+        };
         relay_detail::RelayRateLimits* limits;
         relay_detail::RelayCloseState& close;
+        TargetEndpoint& target;
         ErrorCode reason = ErrorCode::OK;
 
-        StopState(relay_detail::RelayCloseState& close, relay_detail::RelayRateLimits* value)
-            : limits(value), close(close) {}
+        TargetCancellation target_cancel{*this};
+        ClientCancellation client_cancel{*this};
+
+        StopState(relay_detail::RelayCloseState& close, relay_detail::RelayRateLimits* value,
+                  TargetEndpoint& target) noexcept
+            : limits(value), close(close), target(target) {}
         void Request(ErrorCode error) noexcept {
             if (reason == ErrorCode::OK ||
                 (reason == ErrorCode::CANCELLED && error != ErrorCode::CANCELLED)) reason = error;
             if (limits) limits->Cancel(error);
             close.wake.close();
         }
-    } stop(close_state, limits.get());
-    struct CancelContext { StopState& stop; TargetEndpoint& target; } cancel_context{stop, target};
-    transport::CancellationSubscription target_cancel(target.Cancellation(), [](void* raw, transport::Cancellation cancellation) noexcept {
-        auto& context = *static_cast<CancelContext*>(raw);
-        context.stop.Request(relay_detail::ConsumeRelayTimeoutSignals(context.target, context.target)
-            ? ErrorCode::RELAY_TIMEOUT : cancellation.reason);
-    }, &cancel_context);
-    transport::CancellationSubscription client_cancel(client_reader.Cancellation(), [](void* raw, transport::Cancellation cancellation) noexcept {
-        auto& context = *static_cast<CancelContext*>(raw);
-        context.stop.Request(cancellation.reason);
-        relay_detail::CancelIfSupported(context.target);
-    }, &cancel_context);
+    } stop(close_state, limits.get(), target);
+    stop.target_cancel.Resubscribe(target.Cancellation());
+    stop.client_cancel.Resubscribe(client_reader.Cancellation());
 
     auto cancel_target = [&]() noexcept {
         stop.Request(ErrorCode::CANCELLED);

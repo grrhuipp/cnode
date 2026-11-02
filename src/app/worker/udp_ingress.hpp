@@ -5,9 +5,14 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/proxy/inbound.hpp"
 #include "acppnode/transport/link.hpp"
+#include "udp_client_session_key.hpp"
+#include "udp_resource_budget.hpp"
 
+#include <array>
+#include <cstdint>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -64,10 +69,33 @@ public:
     // across their own asynchronous cancellation boundary.
     using SocketPtr = std::shared_ptr<udp::socket>;
 
-    class PendingUdpReply;
+    struct PendingUdpReply {
+        uint64_t id = 0;
+        udp::endpoint endpoint;
+        buf::MultiBuffer payload;
+        size_t payload_size = 0;
+        UdpResourceBudget::PayloadReservation reservation;
+        std::array<net::const_buffer, buf::MultiBuffer::kInlineCapacity> inline_send_buffers{};
+        memory::ThreadLocalVector<net::const_buffer> spill_send_buffers;
+        size_t send_buffer_count = 0;
+
+        void PrepareSendBuffers();
+        [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
+    };
     class ClientSession;
     using ClientSessionPtr = std::shared_ptr<ClientSession>;
-    using ReplyCallback = ::acpp::RoutedPacketCallback;
+    // The native response path has one concrete owner, not an erased callback.
+    // sink is Worker-local and outlives all joined session/reply operations.
+    struct ReplyRoute {
+        memory::ThreadLocalString socket_key;
+        SocketPtr socket;
+        std::shared_ptr<::acpp::InboundDatagramResponse> response;
+        UdpReplySink* sink = nullptr;
+        uint32_t worker_id = 0;
+
+        [[nodiscard]] bool Valid() const noexcept { return response && sink; }
+        [[nodiscard]] bool Send(UDPPacketView packet, const udp::endpoint& endpoint);
+    };
 
     enum class ReplyEnqueueResult : uint8_t {
         Rejected,
@@ -86,14 +114,10 @@ public:
         size_t native_dispatches = 0;
     };
 
-    struct PendingUdpReplyDeleter {
-        void operator()(PendingUdpReply* reply) const noexcept;
-    };
-    using PendingUdpReplyPtr =
-        std::unique_ptr<PendingUdpReply, PendingUdpReplyDeleter>;
 
-    UdpIngress(std::string tag, std::unique_ptr<::acpp::Inbound> proxy,
-               UdpAssociationReclaimer& reclaimer, net::io_context& io_context);
+    UdpIngress(std::string_view tag, std::unique_ptr<::acpp::Inbound> proxy,
+               UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
+               net::io_context& io_context);
     ~UdpIngress() noexcept;
 
     UdpIngress(const UdpIngress&) = delete;
@@ -118,32 +142,28 @@ public:
         std::string_view socket_key,
         udp::endpoint endpoint,
         buf::BufferGuard payload);
-    [[nodiscard]] PendingUdpReplyPtr BeginReplySend(std::string_view socket_key);
-    [[nodiscard]] static std::span<const net::const_buffer>
-    ReplySendBuffers(const PendingUdpReply& reply) noexcept;
-    [[nodiscard]] static const udp::endpoint&
-    ReplyEndpoint(const PendingUdpReply& reply) noexcept;
+    [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(std::string_view socket_key);
     [[nodiscard]] bool CompleteReplySend(
         std::string_view socket_key,
-        const PendingUdpReply& completed_reply);
+        uint64_t completed_id);
     void ClearReplyQueue(std::string_view socket_key);
 
     [[nodiscard]] bool HasClientSession(std::string_view socket_key,
-                                        std::string_view client_key) const noexcept;
+                                        const ClientSessionKey& client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr FindClientSession(
         std::string_view socket_key,
-        std::string_view client_key) const noexcept;
+        const ClientSessionKey& client_key) const noexcept;
     [[nodiscard]] ClientSessionPtr CreateClientSession(
         std::string_view socket_key,
-        std::string_view client_key,
+        const ClientSessionKey& client_key,
         net::io_context& io_context,
-        ReplyCallback reply_callback,
+        ReplyRoute reply,
         udp::endpoint reply_endpoint,
         ::acpp::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point now,
         std::chrono::seconds idle_timeout);
     [[nodiscard]] bool PushClientPayload(std::string_view socket_key,
-                                         std::string_view client_key,
+                                         const ClientSessionKey& client_key,
                                          const TargetAddress& target,
                                          udp::endpoint reply_endpoint,
                                          const ::acpp::InboundDatagramOwner& session_owner,
@@ -188,9 +208,11 @@ public:
     transport::CancellationSource& Cancellation() noexcept override;
 
     ClientSession(net::io_context& io_context,
-                  ReplyCallback reply_callback,
+                  ReplyRoute reply,
                   udp::endpoint reply_endpoint,
-                  ::acpp::InboundDatagramOwner session_owner);
+                  ::acpp::InboundDatagramOwner session_owner,
+                  UdpResourceBudget& budget,
+                  UdpResourceBudget::AssociationLease association);
     ~ClientSession() noexcept override;
 
     ClientSession(const ClientSession&) = delete;

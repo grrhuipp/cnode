@@ -7,7 +7,7 @@
 #include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/proxy/inbound_datagram.hpp"
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <cstdint>
 
@@ -65,9 +65,14 @@ public:
     // Native datagrams enter through the same protocol handler abstraction.
     // The owning UDP runtime performs the dispatcher handoff after protocol
     // parsing and authentication.
-    [[nodiscard]] virtual std::expected<InboundDatagramResult, ErrorCode>
+    [[nodiscard]] virtual tl::expected<InboundDatagramResult, ErrorCode>
     Process(const InboundDatagramRequest&) {
-        return std::unexpected(ErrorCode::NOT_SUPPORTED);
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    // Prepared only when the authenticated datagram starts an association.
+    [[nodiscard]] virtual tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>
+    CreateDatagramResponse(const InboundDatagramResult&) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     }
 };
 

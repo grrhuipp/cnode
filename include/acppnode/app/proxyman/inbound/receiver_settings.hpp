@@ -8,28 +8,24 @@
 #include <utility>
 #include <vector>
 
-namespace acpp {
-class ConnectionLimiter;
-}
-
 namespace acpp::proxyman::inbound {
 
 // ============================================================================
 // ReceiverSettings - xray-style proxyman receiver settings
 //
 // 对齐 xray-core app/proxyman ReceiverConfig 的职责：监听、传输、嗅探、
-// 出站选择策略和 limiter 这些 receiver 语义。冷路径构建；inbound Handler
+// 出站选择策略这些 receiver 语义。冷路径构建；inbound Handler
 // 热路径只读，Dispatcher 只接收其中的窄 DispatchPolicy。
 // ============================================================================
 struct ReceiverSettings {
     std::string      inbound_tag;             // 主标签（map key）
     std::vector<std::string> inbound_tags;   // 所有标签（路由匹配任一）
     std::string      protocol;          // "vmess" / "trojan" 等协议名
+    std::string      accounting_key{};  // Opaque stable reporting identity; empty disables per-user reporting.
     StreamSettings   stream_settings;  // 传输层配置（network/security）
     routing::DispatchPolicy dispatch_policy;
     ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto; // PROXY Protocol 处理模式
     bool             has_route_inbound_tags = false;  // 构建期归一化，热入口只读位
-    ConnectionLimiter* limiter = nullptr;      // Worker 私有 limiter，非拥有指针。
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
         return has_route_inbound_tags ? &inbound_tags : nullptr;
@@ -42,9 +38,9 @@ struct ReceiverSettings {
     std::string protocol,
     StreamSettings stream_settings,
     SniffConfig sniff_config,
-    ConnectionLimiter* limiter,
     ProxyProtocolMode proxy_protocol,
-    routing::OutboundSelectionPolicy outbound_policy) {
+    routing::OutboundSelectionPolicy outbound_policy,
+    std::string accounting_key) {
     sniff_config.RefreshHotPathFields();
     const bool has_route_inbound_tags =
         !inbound_tags.empty() &&
@@ -53,6 +49,7 @@ struct ReceiverSettings {
         .inbound_tag = std::move(inbound_tag),
         .inbound_tags = std::move(inbound_tags),
         .protocol = std::move(protocol),
+        .accounting_key = std::move(accounting_key),
         .stream_settings = std::move(stream_settings),
         .dispatch_policy = {
             .sniffing = std::move(sniff_config),
@@ -60,7 +57,6 @@ struct ReceiverSettings {
         },
         .proxy_protocol = proxy_protocol,
         .has_route_inbound_tags = has_route_inbound_tags,
-        .limiter = limiter,
     };
 }
 

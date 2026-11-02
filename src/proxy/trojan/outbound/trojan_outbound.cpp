@@ -63,14 +63,10 @@ public:
 
             buf::MultiBuffer raw = co_await stream_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
+                framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
-            for (buf::Buffer* buffer : raw) {
-                if (buffer && !buffer->IsEmpty()) {
-                    framer_.Feed(buffer->Bytes().data(), buffer->Len());
-                }
-            }
-            raw.clear();
+            framer_.Feed(std::move(raw));
         }
     }
 
@@ -146,12 +142,11 @@ private:
 // proxy/trojan/outbound.Handler 实现
 // ============================================================================
 
-proxy::trojan::outbound::Handler::Handler(std::string tag,
-                                          const TrojanOutboundConfig& config,
-                                          ::acpp::app::dns::DNS& dns_service)
-    : tag_(std::move(tag))
-    , config_(config)
-    , dns_service_(dns_service) {}
+proxy::trojan::outbound::Handler::Handler(
+    std::string_view tag, std::shared_ptr<const TrojanOutboundConfig> config,
+    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
+    : tag_(tag), config_(std::move(config)), dial_timeout_(dial_timeout),
+      dns_service_(dns_service) {}
 
 proxy::trojan::outbound::Handler::~Handler() = default;
 
@@ -168,31 +163,31 @@ proxy::trojan::outbound::Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto& target = ctx.outbound.target;
 
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_service_,
-        .address = config_.address,
-        .literal_address = config_.literal_address,
-        .port = config_.port,
-        .stream_settings = &config_.stream_settings,
-        .timeout = config_.timeout,
-        .send_through = &config_.send_through,
+        .address = config_->address,
+        .literal_address = config_->literal_address,
+        .port = config_->port,
+        .stream_settings = &config_->stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &config_->send_through,
         .inbound_local_addr = inbound_local_addr,
         .inbound_source_ip = ctx.inbound.source_ip,
         .inbound_source_port = ctx.inbound.source_port,
         .tls_server_name = ResolveOutboundTlsServerName(
-            config_.stream_settings, config_.address),
-        .ws_host = config_.address,
+            config_->stream_settings, config_->address),
+        .ws_host = config_->address,
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_.address);
+            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_->address);
         }
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
@@ -200,7 +195,7 @@ proxy::trojan::outbound::Handler::Process(
         LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -214,7 +209,7 @@ proxy::trojan::outbound::Handler::Process(
         if (stream) {
             stream->CloseAbortive();
         }
-        return std::unexpected(error);
+        return tl::unexpected(error);
     };
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
@@ -225,7 +220,7 @@ proxy::trojan::outbound::Handler::Process(
 
     std::array<uint8_t, 512> header{};
     size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
-        config_.password_hash,
+        config_->password_hash,
         is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
                : ::acpp::trojan::TrojanCommand::CONNECT,
         target,
@@ -393,14 +388,12 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             acpp::TrojanOutboundConfig,
             +[](std::string_view tag,
-                const acpp::TrojanOutboundConfig& cfg_state,
+                std::shared_ptr<const acpp::TrojanOutboundConfig> cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = cfg_state;
-                runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
-                    std::string(tag), runtime_config, dns);
+                    tag, std::move(cfg_state), dns, timeout);
             }>(std::move(trojan_config));
     }), true);
 }  // namespace

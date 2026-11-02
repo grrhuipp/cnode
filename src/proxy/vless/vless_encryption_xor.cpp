@@ -78,7 +78,7 @@ bool VlessEncryptionCtr::Xor(std::span<const uint8_t> input,
 
     int out_len = 0;
     return EVP_EncryptUpdate(
-               static_cast<EVP_CIPHER_CTX*>(ctx_),
+               ctx_,
                output.data(),
                &out_len,
                input.data(),
@@ -88,7 +88,7 @@ bool VlessEncryptionCtr::Xor(std::span<const uint8_t> input,
 
 void VlessEncryptionCtr::Close() noexcept {
     if (ctx_) {
-        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(ctx_));
+        EVP_CIPHER_CTX_free(ctx_);
         ctx_ = nullptr;
     }
 }

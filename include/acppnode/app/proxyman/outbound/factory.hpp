@@ -5,8 +5,6 @@
 
 #include <chrono>
 #include <memory>
-#include <string>
-#include <vector>
 
 namespace acpp::proxyman::outbound {
 
@@ -20,6 +18,5 @@ namespace acpp::proxyman::outbound {
 
 [[nodiscard]] bool HasProxy(std::string_view protocol);
 
-[[nodiscard]] std::vector<std::string> RegisteredProtocols();
 
 }  // namespace acpp::proxyman::outbound

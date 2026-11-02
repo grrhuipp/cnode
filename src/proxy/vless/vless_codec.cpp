@@ -1,7 +1,7 @@
 #include "vless_codec.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include "acppnode/common/byte_reader.hpp"
-#include "acppnode/infra/log.hpp"
 
 #include <array>
 #include <cstring>
@@ -131,85 +131,6 @@ bool WriteHeaderAddons(ByteWriter& writer, std::string_view flow) noexcept {
            writer.WriteString(flow);
 }
 
-std::optional<TargetAddress> ReadAddress(ByteReader& reader) {
-    const uint16_t port = reader.ReadU16BE();
-    const uint8_t atype = reader.ReadU8();
-    if (!reader.Ok()) {
-        return std::nullopt;
-    }
-
-    if (atype == 0x01) {
-        auto ipv4_bytes = reader.ReadBytes(4);
-        if (!reader.Ok()) return std::nullopt;
-
-        net::ip::address_v4::bytes_type bytes{};
-        std::memcpy(bytes.data(), ipv4_bytes.data(), bytes.size());
-        return TargetAddress(net::ip::make_address_v4(bytes), port);
-    }
-
-    if (atype == 0x02) {
-        const uint8_t domain_len = reader.ReadU8();
-        if (!reader.Ok() || domain_len == 0 || domain_len > 253) {
-            return std::nullopt;
-        }
-        const std::string_view domain = reader.ReadStringView(domain_len);
-        if (!reader.Ok()) return std::nullopt;
-        return TargetAddress(domain, port);
-    }
-
-    if (atype == 0x03) {
-        auto ipv6_bytes = reader.ReadBytes(16);
-        if (!reader.Ok()) return std::nullopt;
-
-        net::ip::address_v6::bytes_type bytes{};
-        std::memcpy(bytes.data(), ipv6_bytes.data(), bytes.size());
-        return TargetAddress(net::ip::make_address_v6(bytes), port);
-    }
-
-    return std::nullopt;
-}
-
-size_t VlessAddressSize(const TargetAddress& target) {
-    if (target.IsDomain()) {
-        return target.host.size() <= 253 ? 1 + 1 + target.host.size() : 0;
-    }
-
-    if (target.resolved_addr) {
-        if (target.resolved_addr->is_v4()) return 1 + 4;
-        if (target.resolved_addr->is_v6()) return 1 + 16;
-    }
-
-    return 0;
-}
-
-bool WriteAddress(ByteWriter& writer, const TargetAddress& target) {
-    writer.WriteU16BE(target.port);
-    if (target.IsDomain()) {
-        if (target.host.empty() || target.host.size() > 253) {
-            return false;
-        }
-        writer.WriteU8(0x02);
-        writer.WriteU8(static_cast<uint8_t>(target.host.size()));
-        writer.WriteString(target.host);
-        return writer.Ok();
-    }
-
-    if (target.resolved_addr && target.resolved_addr->is_v4()) {
-        writer.WriteU8(0x01);
-        auto bytes = target.resolved_addr->to_v4().to_bytes();
-        writer.WriteBytes(bytes.data(), bytes.size());
-        return writer.Ok();
-    }
-
-    if (target.resolved_addr && target.resolved_addr->is_v6()) {
-        writer.WriteU8(0x03);
-        auto bytes = target.resolved_addr->to_v6().to_bytes();
-        writer.WriteBytes(bytes.data(), bytes.size());
-        return writer.Ok();
-    }
-
-    return false;
-}
 
 }  // namespace
 
@@ -247,11 +168,12 @@ std::optional<RequestHeader> Codec::ParseRequestHeader(
     if (req.command == Command::MUX) {
         req.target = TargetAddress("v1.mux.cool", 9527);
     } else if (req.command == Command::TCP || req.command == Command::UDP) {
-        auto target = ReadAddress(reader);
-        if (!target) {
-            return std::nullopt;
-        }
-        req.target = std::move(*target);
+        auto address = DecodeAddress(std::span<const uint8_t>(
+            data + reader.Position(), reader.Remaining()),
+            AddressWireFormat::PortFirst, {253, true});
+        if (address.status != AddressDecodeStatus::Complete ||
+            !reader.Skip(address.consumed)) return std::nullopt;
+        req.target = std::move(address.target);
     } else {
         return std::nullopt;
     }
@@ -275,7 +197,9 @@ size_t Codec::EncodeRequestHeaderTo(
     if (addons_len > std::numeric_limits<uint8_t>::max()) {
         return 0;
     }
-    const size_t addr_size = command == Command::MUX ? 0 : VlessAddressSize(target);
+    const size_t addr_size = command == Command::MUX ? 0
+        : (target.IsDomain() && (target.host.empty() || target.host.size() > 253))
+            ? 0 : AddressEncodedSize(target, AddressWireFormat::PortFirst);
     if (addr_size == 0) {
         if (command == Command::MUX) {
             const size_t total = 1 + uuid.size() + 1 + addons_len + 1;
@@ -294,7 +218,7 @@ size_t Codec::EncodeRequestHeaderTo(
         return 0;
     }
 
-    const size_t total = 1 + uuid.size() + 1 + addons_len + 1 + 2 + addr_size;
+    const size_t total = 1 + uuid.size() + 1 + addons_len + 1 + addr_size;
     if (total > output_size) {
         return 0;
     }
@@ -306,10 +230,9 @@ size_t Codec::EncodeRequestHeaderTo(
         return 0;
     }
     writer.WriteU8(static_cast<uint8_t>(command));
-    if (!WriteAddress(writer, target)) {
-        return 0;
-    }
-    return writer.Ok() ? writer.Position() : 0;
+    const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
+        output_size - writer.Position(), AddressWireFormat::PortFirst);
+    return encoded == 0 ? 0 : writer.Position() + encoded;
 }
 
 size_t Codec::EncodeResponseHeaderTo(uint8_t* output,
@@ -322,40 +245,6 @@ size_t Codec::EncodeResponseHeaderTo(uint8_t* output,
     return 2;
 }
 
-size_t Codec::EncodeUdpPacketTo(const uint8_t* payload,
-                                size_t payload_len,
-                                uint8_t* output,
-                                size_t output_size) noexcept {
-    if (payload_len == 0 || payload_len > 0xFFFF || output_size < payload_len + 2) {
-        return 0;
-    }
-    output[0] = static_cast<uint8_t>((payload_len >> 8) & 0xFF);
-    output[1] = static_cast<uint8_t>(payload_len & 0xFF);
-    std::memcpy(output + 2, payload, payload_len);
-    return payload_len + 2;
-}
 
-Codec::UdpParseOutput Codec::ParseUdpPacket(const uint8_t* data,
-                                            size_t len) noexcept {
-    UdpParseOutput out;
-    if (len < 2) {
-        out.result = UdpParseResult::INCOMPLETE;
-        return out;
-    }
-    const size_t payload_len =
-        (static_cast<size_t>(data[0]) << 8) | static_cast<size_t>(data[1]);
-    if (payload_len == 0) {
-        out.result = UdpParseResult::INVALID;
-        return out;
-    }
-    if (len < payload_len + 2) {
-        out.result = UdpParseResult::INCOMPLETE;
-        return out;
-    }
-    out.result = UdpParseResult::SUCCESS;
-    out.packet = UdpPacket{std::span<const uint8_t>{data + 2, payload_len}};
-    out.consumed = payload_len + 2;
-    return out;
-}
 
 }  // namespace acpp::vless

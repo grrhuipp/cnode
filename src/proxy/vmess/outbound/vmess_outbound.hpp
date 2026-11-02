@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -33,8 +34,6 @@ struct VMessOutboundConfig {
     StreamSettings stream_settings;
     OutboundBind send_through;
 
-    // 传输层拨号/握手超时
-    std::chrono::seconds timeout{defaults::kDialTimeout};
 };
 
 // ============================================================================
@@ -42,12 +41,17 @@ struct VMessOutboundConfig {
 // ============================================================================
 namespace proxy::vmess::outbound {
 
+struct PreparedSettings {
+    VMessOutboundConfig config;
+    ::acpp::vmess::MemoryAccount user;
+};
+
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::VMessOutboundConfig& config,
-            const ::acpp::vmess::MemoryAccount& user,
-            ::acpp::app::dns::DNS& dns_service);
+    Handler(std::string_view tag,
+            std::shared_ptr<const PreparedSettings> prepared,
+            ::acpp::app::dns::DNS& dns_service,
+            std::chrono::seconds dial_timeout);
 
     // Outbound 接口
     ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
@@ -64,9 +68,9 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    const ::acpp::VMessOutboundConfig config_;
-    const ::acpp::vmess::MemoryAccount user_;
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const PreparedSettings> prepared_;
+    std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
 };
 

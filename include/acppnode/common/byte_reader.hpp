@@ -19,7 +19,6 @@
  * └─────────────────────────────────────────────────────────────────────────┘
  */
 
-#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -88,11 +87,9 @@ public:
      */
     [[nodiscard]] uint16_t ReadU16BE() noexcept {
         if (!CanRead(2)) return 0;
-        uint16_t result;
-        std::memcpy(&result, data_ + pos_, 2);
+        const uint16_t result = static_cast<uint16_t>(
+            (static_cast<uint16_t>(data_[pos_]) << 8) | data_[pos_ + 1]);
         pos_ += 2;
-        if constexpr (std::endian::native == std::endian::little)
-            result = std::byteswap(result);
         return result;
     }
 
@@ -101,11 +98,12 @@ public:
      */
     [[nodiscard]] uint32_t ReadU32BE() noexcept {
         if (!CanRead(4)) return 0;
-        uint32_t result;
-        std::memcpy(&result, data_ + pos_, 4);
+        const uint32_t result =
+            (static_cast<uint32_t>(data_[pos_]) << 24) |
+            (static_cast<uint32_t>(data_[pos_ + 1]) << 16) |
+            (static_cast<uint32_t>(data_[pos_ + 2]) << 8) |
+            static_cast<uint32_t>(data_[pos_ + 3]);
         pos_ += 4;
-        if constexpr (std::endian::native == std::endian::little)
-            result = std::byteswap(result);
         return result;
     }
 
@@ -207,18 +205,18 @@ public:
 
     bool WriteU16BE(uint16_t value) noexcept {
         if (!CanWrite(2)) return false;
-        if constexpr (std::endian::native == std::endian::little)
-            value = std::byteswap(value);
-        std::memcpy(data_ + pos_, &value, 2);
+        data_[pos_] = static_cast<uint8_t>(value >> 8);
+        data_[pos_ + 1] = static_cast<uint8_t>(value);
         pos_ += 2;
         return true;
     }
 
     bool WriteU32BE(uint32_t value) noexcept {
         if (!CanWrite(4)) return false;
-        if constexpr (std::endian::native == std::endian::little)
-            value = std::byteswap(value);
-        std::memcpy(data_ + pos_, &value, 4);
+        data_[pos_] = static_cast<uint8_t>(value >> 24);
+        data_[pos_ + 1] = static_cast<uint8_t>(value >> 16);
+        data_[pos_ + 2] = static_cast<uint8_t>(value >> 8);
+        data_[pos_ + 3] = static_cast<uint8_t>(value);
         pos_ += 4;
         return true;
     }

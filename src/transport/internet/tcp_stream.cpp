@@ -18,9 +18,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <functional>
 
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#endif
 
 namespace acpp {
 
@@ -42,17 +45,36 @@ struct OperationTimeoutScope {
     Timeouts& timeouts;
 };
 
-struct PendingOperationState {
-    bool timed_out = false;
-    bool active = true;
-
-    bool TakeActive() noexcept {
-        if (!active) {
-            return false;
-        }
-        active = false;
-        return true;
+// socket.cancel() cannot retract a successful completion already queued in the
+// executor. Stop the composed write before it starts the next native write.
+class WriteCompletion final : private transport::CancellationSubscription {
+public:
+    explicit WriteCompletion(transport::CancellationSource& source) noexcept {
+        Resubscribe(source);
     }
+
+    size_t operator()(const IoErrorCode& error, size_t transferred) const noexcept {
+        return cancelled_ ? 0 : net::transfer_all()(error, transferred);
+    }
+
+    bool Cancelled() const noexcept { return cancelled_; }
+
+private:
+    void OnCancellation(transport::Cancellation) noexcept override { cancelled_ = true; }
+    bool cancelled_ = false;
+};
+
+struct ConnectTimeout final : TimeoutEvent {
+    explicit ConnectTimeout(tcp::socket& socket) : socket(socket) {}
+
+    void OnTimeout() override {
+        timed_out = true;
+        IoErrorCode ignored;
+        socket.close(ignored);
+    }
+
+    tcp::socket& socket;
+    bool timed_out = false;
 };
 
 net::io_context& SocketIoContext(tcp::socket& socket) {
@@ -179,9 +201,6 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
             LOG_NET_DEBUG("AsyncRead: {} (fd={})", ec.message(), NativeHandle());
             co_return 0;
         }
-        if (ec == io_error::operation_aborted) {
-            co_return 0;  // 被取消（可能是 idle timeout）
-        }
         throw IoSystemError(ec);
     }
 
@@ -210,8 +229,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 
     const IoErrorCode wait_ec = co_await WaitReadable();
     if (wait_ec) {
-        if (wait_ec == io_error::eof ||
-            wait_ec == io_error::operation_aborted) {
+        if (wait_ec == io_error::eof) {
             co_return buf::MultiBuffer{};
         }
         if (wait_ec == io_error::connection_reset ||
@@ -225,7 +243,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
 
     buf::BufferGuard buffer{buf::Buffer::New()};
     if (!buffer) {
-        co_return buf::MultiBuffer{};
+        throw std::bad_alloc();
     }
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
     auto [ec, n] = co_await impl_->socket.async_read_some(
@@ -233,8 +251,7 @@ net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
         net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
 
     if (ec || n == 0) {
-        if (!ec || ec == io_error::eof ||
-            ec == io_error::operation_aborted)
+        if (!ec || ec == io_error::eof)
             co_return buf::MultiBuffer{};
         if (ec == io_error::connection_reset ||
             ec == io_error::broken_pipe) {
@@ -264,15 +281,17 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     out.AppendMultiBuffer(mb);
     if (out.empty()) co_return;
 
+    WriteCompletion completion(Cancellation());
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const auto slot = IsWriteCancellationDeferred()
         ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, out.Span(),
+        impl_->socket, out.Span(), std::ref(completion),
         net::bind_cancellation_slot(slot, net::bind_allocator(
             memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
 
+    if (completion.Cancelled()) ec = io_error::operation_aborted;
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -292,16 +311,18 @@ net::awaitable<void> TcpStream::WriteBuffers(
         co_return;
     }
 
+    WriteCompletion completion(Cancellation());
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const auto slot = IsWriteCancellationDeferred()
         ? net::cancellation_slot{} : cancellation.slot();
     auto [ec, n] = co_await net::async_write(
-        impl_->socket, out.Span(),
+        impl_->socket, out.Span(), std::ref(completion),
         net::bind_cancellation_slot(slot, net::bind_allocator(
             memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
     (void)n;
 
+    if (completion.Cancelled()) ec = io_error::operation_aborted;
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -313,14 +334,16 @@ net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
         co_return 0;
     }
 
+    WriteCompletion completion(Cancellation());
     OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const auto slot = IsWriteCancellationDeferred()
         ? net::cancellation_slot{} : cancellation.slot();
-    auto [ec, n] = co_await net::async_write(impl_->socket, buf,
+    auto [ec, n] = co_await net::async_write(impl_->socket, buf, std::ref(completion),
         net::bind_cancellation_slot(slot, net::bind_allocator(
             memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
 
+    if (completion.Cancelled()) ec = io_error::operation_aborted;
     if (ec) {
         throw IoSystemError(ec);
     }
@@ -577,7 +600,7 @@ tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
     return impl_->socket.get_executor();
 }
 
-net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
+net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cancellation) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         co_return io_error::eof;
     }
@@ -586,48 +609,40 @@ net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
     }
 
     OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    if (!cancellation.is_connected())
+        cancellation = (co_await net::this_coro::cancellation_state).slot();
     auto [ec] = co_await impl_->socket.async_wait(
         tcp::socket::wait_read,
-        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+        net::bind_cancellation_slot(cancellation, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
     co_return ec;
 }
 
-tcp::socket& TcpStream::TlsLayerSocket() noexcept {
-    return impl_->socket;
+void TcpStream::PrepareTlsIo() {
+    // Asio's synchronous read_some otherwise waits internally even if an earlier
+    // asynchronous operation has made the native descriptor nonblocking.
+    impl_->socket.non_blocking(true);
 }
 
-bool TcpStream::TlsLayerCanRead() const noexcept {
+bool TcpStream::CanRead() const noexcept {
     return impl_->socket.is_open() && !impl_->HasFlag(kReadShutdown);
 }
 
-bool TcpStream::TlsLayerCanWrite() const noexcept {
+bool TcpStream::CanWrite() const noexcept {
     return impl_->socket.is_open() && !impl_->HasFlag(kWriteShutdown);
 }
 
-size_t TcpStream::ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcept {
-    return ConsumePendingData(target);
-}
-
-void TcpStream::BeginTlsLayerRead() {
-    impl_->timeouts.BeginRead();
-}
-
-void TcpStream::EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept {
-    impl_->timeouts.EndRead();
-    if (!ec && n > 0) {
-        TouchActivity();
+std::size_t TcpStream::ReadAvailable(
+    net::mutable_buffer target, IoErrorCode& error) noexcept {
+    error.clear();
+    if (!CanRead()) {
+        error = io_error::eof;
+        return 0;
     }
-}
-
-void TcpStream::BeginTlsLayerWrite() {
-    impl_->timeouts.BeginWrite();
-}
-
-void TcpStream::EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept {
-    impl_->timeouts.EndWrite();
-    if (!ec && n > 0) {
-        TouchActivity();
-    }
+    std::size_t n = ConsumePendingData(target);
+    if (n == 0) n = impl_->socket.read_some(target, error);
+    if (n != 0) TouchActivity();
+    return n;
 }
 
 tcp::endpoint TcpStream::LocalEndpoint() const {
@@ -662,18 +677,11 @@ net::awaitable<DialResult> TcpStream::Connect(
     }
 
     tcp::socket socket(io_context);
-    PendingOperationState op_state;
-
+    ConnectTimeout deadline(socket);
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
-    TimeoutToken token = scheduler.ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [&socket, &op_state]() {
-            if (op_state.TakeActive()) {
-                op_state.timed_out = true;
-                IoErrorCode close_ec;
-                socket.close(close_ec);
-            }
-        });
+    if (!scheduler.ScheduleAfter(
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeout), deadline))
+        co_return DialResult::Fail(ErrorCode::CANCELLED, "connection cancelled");
 
     IoErrorCode connect_ec;
 
@@ -684,13 +692,9 @@ net::awaitable<DialResult> TcpStream::Connect(
         connect_ec = e.code();
     }
 
-    if (op_state.TakeActive()) {
-        scheduler.Cancel(token);
-    } else {
-        token.Reset();
-    }
+    deadline.Cancel();
 
-    if (op_state.timed_out) {
+    if (deadline.timed_out) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
@@ -713,7 +717,7 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
     }
 
     tcp::socket socket(io_context);
-    PendingOperationState op_state;
+    ConnectTimeout deadline(socket);
 
     // 打开 socket
     IoErrorCode ec;
@@ -732,15 +736,9 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
     }
 
     auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
-    TimeoutToken token = scheduler.ScheduleAfter(
-        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-        [&socket, &op_state]() {
-            if (op_state.TakeActive()) {
-                op_state.timed_out = true;
-                IoErrorCode close_ec;
-                socket.close(close_ec);
-            }
-        });
+    if (!scheduler.ScheduleAfter(
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeout), deadline))
+        co_return DialResult::Fail(ErrorCode::CANCELLED, "connection cancelled");
 
     IoErrorCode connect_ec;
 
@@ -751,13 +749,9 @@ net::awaitable<DialResult> TcpStream::ConnectWithBind(
         connect_ec = e.code();
     }
 
-    if (op_state.TakeActive()) {
-        scheduler.Cancel(token);
-    } else {
-        token.Reset();
-    }
+    deadline.Cancel();
 
-    if (op_state.timed_out) {
+    if (deadline.timed_out) {
         co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
 
@@ -853,28 +847,33 @@ void SetupConnectedSocket(tcp::socket& sock) {
     // 60 seconds idle, then six probes 10 seconds apart where supported.
 #if defined(__APPLE__) && defined(TCP_KEEPALIVE)
     int keepidle = 60;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
+               reinterpret_cast<const char*>(&keepidle), sizeof(keepidle));
 #elif defined(TCP_KEEPIDLE)
     int keepidle = 60;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,
+               reinterpret_cast<const char*>(&keepidle), sizeof(keepidle));
 #endif
 
     // TCP_KEEPINTVL: 探测间隔 (10秒)
 #if defined(TCP_KEEPINTVL)
     int keepintvl = 10;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
+               reinterpret_cast<const char*>(&keepintvl), sizeof(keepintvl));
 #endif
 
     // TCP_KEEPCNT: 探测次数 (6次)
 #if defined(TCP_KEEPCNT)
     int keepcnt = 6;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,
+               reinterpret_cast<const char*>(&keepcnt), sizeof(keepcnt));
 #endif
 
     // TCP_QUICKACK - 立即发送 ACK，降低延迟 (Linux 特有)
 #if defined(TCP_QUICKACK)
     int quickack = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK,
+               reinterpret_cast<const char*>(&quickack), sizeof(quickack));
 #endif
 }
 }  // namespace

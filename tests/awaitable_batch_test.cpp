@@ -6,6 +6,7 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
+#include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_future.hpp>
 
@@ -77,6 +78,37 @@ void TestFailureBarrier() {
 
     if (!saw_failure || peak_active != 3 || active != 0 || completed != 3) {
         throw std::runtime_error("a failed batch must still join every task");
+    }
+}
+
+acpp::net::awaitable<void> OrderedFailure(bool cancel_first, bool& completed) {
+    if (cancel_first) {
+        throw acpp::IoSystemError(acpp::net::error::operation_aborted);
+    }
+    co_await acpp::net::post(
+        co_await acpp::net::this_coro::executor, acpp::net::use_awaitable);
+    completed = true;
+    throw acpp::IoSystemError(acpp::net::error::address_in_use);
+}
+
+void TestFailureOutranksCancellation() {
+    acpp::net::io_context io_context;
+    bool failed_child_completed = false;
+    std::vector<acpp::net::awaitable<void>> tasks;
+    tasks.push_back(OrderedFailure(true, failed_child_completed));
+    tasks.push_back(OrderedFailure(false, failed_child_completed));
+    auto result = acpp::net::co_spawn(io_context,
+        acpp::RunAwaitableBatch(io_context.get_executor(), std::move(tasks)),
+        acpp::net::use_future);
+    io_context.run();
+    acpp::IoErrorCode reported;
+    try {
+        result.get();
+    } catch (const acpp::IoSystemError& error) {
+        reported = error.code();
+    }
+    if (!failed_child_completed || reported != acpp::net::error::address_in_use) {
+        throw std::runtime_error("a cancelled child must not mask a joined child's real failure");
     }
 }
 
@@ -253,6 +285,7 @@ int main() {
     try {
         TestFailureBarrier();
         TestCancellationBarrier();
+        TestFailureOutranksCancellation();
         TestAllocationFailureBarrier();
         TestExecutorOwnership();
     } catch (const std::exception& error) {

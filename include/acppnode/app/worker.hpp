@@ -1,10 +1,12 @@
 #pragma once
 
-#include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/app/worker_mailbox.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/asio_types.hpp"
 
 #include <cstdint>
+#include <atomic>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -72,8 +74,19 @@ public:
     }
 
     // Static startup transaction. Must run on this Worker's executor before
-    // inbound registration; failures propagate through the startup future.
+    // inbound registration; failures propagate to the awaiting startup owner.
     net::awaitable<void> StartRuntimeTask();
+
+    // Lifecycle notification has one reserved pending slot, independent of
+    // ordinary admission. The shell remains alive through the global join.
+    void RequestStop() noexcept;
+    // After RequestStop, one observer awaits all accepted work and live state.
+    // Repeated joins after completion are harmless.
+    net::awaitable<void> AsyncJoin();
+    void SetFailureHandler(std::function<void(std::exception_ptr)> handler);
+    // Called exactly once on the data thread; catches loop failures, requests
+    // global cancellation, and keeps driving completion until live teardown.
+    void RunEventLoop() noexcept;
 
     // ── 监听管理（必须在所属 Worker 上执行；跨线程经 PostTask）──────────
 
@@ -82,7 +95,6 @@ public:
 
     // 注册 receiver settings + 协议处理器。Task 必须在 Worker executor 上执行。
     net::awaitable<bool> RegisterInboundTask(
-        ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req,
         proxyman::inbound::ReceiverSettings receiver);
 
@@ -90,7 +102,6 @@ public:
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
     net::awaitable<bool> AddUdpListenerTask(
         PortBinding binding,
-        ConnectionLimiterPtr limiter,
         proxyman::inbound::BuildRequest req);
 
     // 动态出站：XrayR Controller 面板节点 addOutbound/removeOutbound。
@@ -104,6 +115,8 @@ public:
     net::awaitable<void> UpdateRuleTask(
         std::string tag,
         std::vector<rule::DetectRule> rules);
+    net::awaitable<void> InstallUserViewTask(
+        proxyman::inbound::UserStore::WorkerView view);
 
     // ── Per-Worker 流量统计（无锁，仅 Worker 线程写）────────────────────────
 
@@ -134,9 +147,11 @@ private:
     struct ListenerSlot;
     struct ListenerState;
     struct RuntimeState;
+    void BeginStopOnWorker() noexcept;
+    net::awaitable<void> StopRuntimeTask();
+    void ReportFailure(std::exception_ptr error) noexcept;
 
     [[nodiscard]] bool RegisterInboundOnWorkerThread(
-        ConnectionLimiterPtr limiter,
         const proxyman::inbound::BuildRequest& req,
         proxyman::inbound::ReceiverSettings receiver);
 
@@ -149,6 +164,11 @@ private:
     // ── 成员 ────────────────────────────────────────────────────────────────
 
     uint32_t              id_;
+    net::io_context& io_context_;
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> joined_{false};
+    bool stop_notification_delivered_ = false; // owner executor only
+    std::function<void(std::exception_ptr)> failure_handler_;
     std::unique_ptr<RuntimeState> runtime_;
     std::unique_ptr<WorkerMailbox> mailbox_;
 

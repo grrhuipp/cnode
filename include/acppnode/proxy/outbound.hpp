@@ -8,7 +8,7 @@
 #include "acppnode/transport/link.hpp"
 
 #include <chrono>
-#include <expected>
+#include <tl/expected.hpp>
 #include <string>
 #include <string_view>
 
@@ -22,7 +22,7 @@ namespace session {
 struct Context;
 }
 
-using OutboundProcessResult = std::expected<RelayResult, ErrorCode>;
+using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
 
 // ============================================================================
 // Outbound - 出站接口

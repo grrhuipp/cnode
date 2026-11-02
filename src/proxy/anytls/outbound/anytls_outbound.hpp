@@ -39,6 +39,11 @@ struct Settings {
     size_t min_idle_sessions = 0;
 };
 
+struct PreparedSettings {
+    Settings settings;
+    StreamSettings stream_settings;
+};
+
 // ============================================================================
 // Handler - AnyTLS outbound proxy
 //
@@ -48,10 +53,9 @@ struct Settings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(std::string tag,
+    Handler(std::string_view tag,
             net::io_context& io_context,
-            Settings settings,
-            StreamSettings stream_settings,
+            std::shared_ptr<const PreparedSettings> prepared,
             std::chrono::seconds dial_timeout,
             app::dns::DNS& dns_service);
     ~Handler() noexcept override;
@@ -77,9 +81,8 @@ private:
     struct ClientSession;
     struct LogicalStreamLease;
 
-    std::string tag_;
-    const Settings settings_;
-    const StreamSettings stream_settings_;
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const PreparedSettings> prepared_;
     std::chrono::seconds dial_timeout_;
     app::dns::DNS& dns_service_;
     std::shared_ptr<PaddingState> padding_;

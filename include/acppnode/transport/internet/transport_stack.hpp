@@ -3,7 +3,7 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/proxy_protocol.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -14,18 +14,20 @@ class DNS;
 }  // namespace app::dns
 
 
-using TransportBuildResult = std::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
-
-class InboundTransportStreamHandler {
-public:
-    virtual ~InboundTransportStreamHandler() noexcept = default;
-    virtual void OnInboundTransportStream(std::unique_ptr<AsyncStream> stream) = 0;
-};
+using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
 
 struct InboundTransportMetadata {
     memory::ThreadLocalString real_ip;
     memory::ThreadLocalString real_ip_header;
 };
+class InboundTransportStreamHandler {
+public:
+    virtual ~InboundTransportStreamHandler() noexcept = default;
+    virtual net::awaitable<void> OnInboundTransportStream(
+        std::unique_ptr<AsyncStream> stream, InboundTransportMetadata metadata) = 0;
+    virtual void OnInboundTransportReady(AsyncStream&) {}
+};
+
 
 // Consume an optional PROXY protocol prefix from a raw accepted transport.
 // Parsing, timeout handling and preservation of non-PROXY bytes stay entirely

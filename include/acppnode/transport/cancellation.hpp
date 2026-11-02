@@ -33,26 +33,22 @@ private:
     ErrorCode terminal_reason_ = ErrorCode::OK;
 };
 
-// One-shot, scoped subscription. Subscribing to a stopped source invokes the
-// callback synchronously; its context must already be fully initialized.
+// One-shot listener embedded at a stable address. Derived state must be fully
+// initialized before Resubscribe: a stopped source delivers synchronously.
 class CancellationSubscription {
 public:
-    using Callback = void (*)(void*, Cancellation) noexcept;
-
-    CancellationSubscription(CancellationSource& source, Callback callback, void* context) noexcept
-        : callback_(callback), context_(context) {
-        Resubscribe(source);
-    }
-    ~CancellationSubscription() noexcept { Unlink(); }
+    CancellationSubscription() noexcept = default;
     CancellationSubscription(const CancellationSubscription&) = delete;
     CancellationSubscription& operator=(const CancellationSubscription&) = delete;
+    CancellationSubscription(CancellationSubscription&&) = delete;
+    CancellationSubscription& operator=(CancellationSubscription&&) = delete;
 
     // A transport composing multiple sources can listen for the next operation
     // from inside its callback. The source's current batch remains detached.
     void Resubscribe(CancellationSource& source) noexcept {
-        Unlink();
+        Unsubscribe();
         if (source.terminal_reason_ != ErrorCode::OK) {
-            callback_(context_, {source.terminal_reason_, true});
+            OnCancellation({source.terminal_reason_, true});
             return;
         }
         next_ = source.head_;
@@ -61,9 +57,7 @@ public:
         source.head_ = this;
     }
 
-private:
-    friend class CancellationSource;
-    void Unlink() noexcept {
+    void Unsubscribe() noexcept {
         if (!previous_) return;
         *previous_ = next_;
         if (next_) next_->previous_ = previous_;
@@ -71,14 +65,19 @@ private:
         next_ = nullptr;
     }
 
+protected:
+    ~CancellationSubscription() noexcept { Unsubscribe(); }
+    virtual void OnCancellation(Cancellation cancellation) noexcept = 0;
+
+private:
+    friend class CancellationSource;
+
     CancellationSubscription* next_ = nullptr;
     CancellationSubscription** previous_ = nullptr;
-    Callback callback_;
-    void* context_;
 };
 
 inline CancellationSource::~CancellationSource() noexcept {
-    while (head_) head_->Unlink();
+    while (head_) head_->Unsubscribe();
 }
 
 inline void CancellationSource::CancelPending(ErrorCode reason) noexcept {
@@ -98,10 +97,8 @@ inline void CancellationSource::Notify(Cancellation cancellation) noexcept {
     if (batch) batch->previous_ = &batch;
     while (batch) {
         auto* subscription = batch;
-        subscription->Unlink();
-        const auto callback = subscription->callback_;
-        void* const context = subscription->context_;
-        callback(context, cancellation);
+        subscription->Unsubscribe();
+        subscription->OnCancellation(cancellation);
     }
 }
 

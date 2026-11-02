@@ -23,7 +23,7 @@ struct BlackholeSettings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(const std::string& tag, const BlackholeSettings& settings);
+    Handler(std::string_view tag, const BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
         net::io_context& io_context,
@@ -40,8 +40,8 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    BlackholeSettings settings_;
+    memory::ThreadLocalString tag_;
+    bool http_response_;
 };
 
 }  // namespace acpp::proxy::blackhole::outbound

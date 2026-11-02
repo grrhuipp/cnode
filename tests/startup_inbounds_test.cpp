@@ -52,7 +52,14 @@ int main() {
     registration.build_static_users = &BuildUsers;
     RegisterProxy("vmess", registration);
 
-    UserStore::ApplyUsers("static-owner", UserSet{PreparedVmessUsers{PreparedVmessUser{.uuid = "sentinel", .profile = {}}}});
+    {
+        auto snapshot = UserStore::PrepareUsers(
+            "static-owner", UserSet{PreparedVmessUsers{
+                PreparedVmessUser{.uuid = "sentinel", .profile = {}}}});
+        auto view = UserStore::PrepareWorkerView(snapshot);
+        UserStore::CommitSnapshot(std::move(snapshot));
+        UserStore::InstallWorkerView(std::move(view));
+    }
     const auto old = UserStore::VmessUsers("static-owner").users;
     if (!Rejected({Source(std::string(constants::test::kTestInboundTag), 12000)}, true) || user_builds != 0 ||
         !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0) return 1;

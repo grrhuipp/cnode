@@ -1,7 +1,5 @@
 #include "node_runtime.hpp"
 #include "../../common/awaitable_batch.hpp"
-#include "inboundbuilder.hpp"
-#include "outboundbuilder.hpp"
 
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
@@ -37,60 +35,61 @@ struct WorkerBindResult {
 };
 
 }  // namespace
+void NodeRuntime::ThrowIfStopping() const {
+    if (stopping_) throw IoSystemError(net::error::operation_aborted);
+}
+
 
 net::awaitable<void> NodeRuntime::RemoveInbound(const std::string& tag) {
+    ThrowIfStopping();
     co_await RunWorkerMutationBatch(
         io_context_.get_executor(), workers_,
-        [tag](Worker& worker, size_t) {
-            return [](Worker* current, std::string current_tag)
+        [this, tag](Worker& worker, size_t) {
+            return [](NodeRuntime* runtime, Worker* current, std::string current_tag)
                        -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
                 co_await current->PostTask(
                     current->UnregisterListenerTask(std::move(current_tag)));
-            }(&worker, tag);
+            }(this, &worker, tag);
         });
 }
 
 net::awaitable<void> NodeRuntime::RemoveOutbound(const std::string& tag) {
+    ThrowIfStopping();
     co_await RunWorkerMutationBatch(
         io_context_.get_executor(), workers_,
-        [tag](Worker& worker, size_t) {
-            return [](Worker* current, std::string current_tag)
+        [this, tag](Worker& worker, size_t) {
+            return [](NodeRuntime* runtime, Worker* current, std::string current_tag)
                        -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
                 co_await current->PostTask(
                     current->RemoveOutboundTask(std::move(current_tag)));
-            }(&worker, tag);
+            }(this, &worker, tag);
         });
 }
 
-net::awaitable<bool> NodeRuntime::AddOutbound(const std::string& tag) {
-    auto prepared = controller::OutboundBuilder(tag, config_);
-    if (!prepared) {
-        co_return false;
-    }
+net::awaitable<bool> NodeRuntime::AddOutbound(
+    const proxyman::outbound::PreparedOutboundConfig& prepared) {
+    ThrowIfStopping();
     co_await RunWorkerMutationBatch(
         io_context_.get_executor(), workers_,
-        [&prepared](Worker& worker, size_t) {
-            return [](Worker* current,
+        [this, &prepared](Worker& worker, size_t) {
+            return [](NodeRuntime* runtime, Worker* current,
                       proxyman::outbound::PreparedOutboundConfig config)
                        -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
                 co_await current->PostTask(
                     current->AddOutboundTask(std::move(config)));
-            }(&worker, *prepared);
+            }(this, &worker, prepared);
         });
     co_return true;
 }
 
-net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
+net::awaitable<bool> NodeRuntime::AddInbound(const InboundBuild& inbound) {
+    ThrowIfStopping();
     const int node_id = config_.NodeIDs.Front();
     const auto& panel_name = config_.Name;
 
-    auto inbound = controller::InboundBuilder(config_, node_config);
-
-    if (!proxyman::inbound::HasProxy(inbound.protocol)) {
-        LOG_WARN("Node {}/{}: unsupported inbound protocol '{}'",
-                 panel_name, node_id, inbound.protocol);
-        co_return false;
-    }
 
     std::exception_ptr publish_failure;
     try {
@@ -98,7 +97,6 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
         co_await RunWorkerMutationBatch(
             io_context_.get_executor(), workers_,
             [&](Worker& worker, size_t index) {
-                auto* limiter = limiters_[worker.Id()].get();
                 auto receiver = proxyman::inbound::MakeReceiverSettings(
                     inbound.tag,
                     std::vector<std::string>{
@@ -106,21 +104,19 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
                     inbound.protocol,
                     inbound.stream_settings,
                     inbound.sniff,
-                    limiter,
                     inbound.proxy_protocol,
-                    routing::RouteWithFallback(inbound.tag));
-                return [](Worker* current,
-                          ConnectionLimiterPtr current_limiter,
+                    routing::RouteWithFallback(inbound.tag),
+                    inbound.accounting_key);
+                return [](NodeRuntime* runtime, Worker* current,
                           proxyman::inbound::BuildRequest request,
                           proxyman::inbound::ReceiverSettings current_receiver,
                           uint8_t* result) -> net::awaitable<void> {
+                    runtime->ThrowIfStopping();
                     *result = co_await current->PostTask(
                         current->RegisterInboundTask(
-                            current_limiter,
                             std::move(request),
                             std::move(current_receiver)));
-                }(&worker,
-                  limiter,
+                }(this, &worker,
                   inbound.handler_request,
                   std::move(receiver),
                   &registered[index]);
@@ -133,29 +129,28 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
             co_return false;
         }
 
+        ThrowIfStopping();
         std::vector<WorkerBindResult> bound(workers_.size());
         co_await RunWorkerMutationBatch(
             io_context_.get_executor(), workers_,
             [&](Worker& worker, size_t index) {
-                auto* limiter = limiters_[worker.Id()].get();
-                return [](Worker* current,
+                return [](NodeRuntime* runtime, Worker* current,
                           PortBinding binding,
-                          ConnectionLimiterPtr current_limiter,
                           proxyman::inbound::BuildRequest request,
                           WorkerBindResult* result) -> net::awaitable<void> {
+                    runtime->ThrowIfStopping();
                     result->tcp = co_await current->PostTask(
                         current->AddListenerTask(binding));
                     if (!result->tcp) {
                         co_return;
                     }
+                    runtime->ThrowIfStopping();
                     result->udp = co_await current->PostTask(
                         current->AddUdpListenerTask(
                             std::move(binding),
-                            current_limiter,
                             std::move(request)));
-                }(&worker,
+                }(this, &worker,
                   inbound.binding,
-                  limiter,
                   inbound.handler_request,
                   &bound[index]);
             });
@@ -177,6 +172,7 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
     }
 
     if (publish_failure) {
+        if (IsStopping()) std::rethrow_exception(publish_failure);
         try {
             co_await RemoveInbound(inbound.tag);
         } catch (const std::exception& cleanup_error) {
@@ -188,43 +184,95 @@ net::awaitable<bool> NodeRuntime::AddInbound(const api::NodeInfo& node_config) {
         }
         std::rethrow_exception(publish_failure);
     }
+    ThrowIfStopping();
 
     LOG_CONSOLE("inbound ready tag={} port={} protocol={} workers={} accept=SO_REUSEPORT",
-                inbound.tag, node_config.Port, inbound.protocol, workers_.size());
+                inbound.tag, inbound.binding.port, inbound.protocol, workers_.size());
     co_return true;
 }
 
 net::awaitable<void> NodeRuntime::UpdateRules(
     const std::string& tag,
-    const std::vector<api::DetectRule>& new_rule_list) {
+    const std::vector<rule::DetectRule>& new_rule_list) {
+    ThrowIfStopping();
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(workers_.size());
     for (const auto& worker : workers_) {
         tasks.push_back(
-            [](Worker* current,
+            [](NodeRuntime* runtime, Worker* current,
                std::string current_tag,
                std::vector<rule::DetectRule> rules) -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
                 co_await current->PostTask(
                     current->UpdateRuleTask(
                         std::move(current_tag), std::move(rules)));
-            }(worker.get(), tag, new_rule_list));
+            }(this, worker.get(), tag, new_rule_list));
     }
     co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
 }
 
-void NodeRuntime::ClearUsers(const std::string& tag, const std::string& protocol) {
-    const auto user_protocol =
-        proxyman::inbound::RegisteredUserProtocol(protocol);
-    if (!user_protocol) {
-        return;
-    }
-
-    proxyman::inbound::UserStore::ClearUsers(*user_protocol, tag);
+net::awaitable<void> NodeRuntime::RecoverUsers() {
+    ThrowIfStopping();
+    if (!state_.user_recovery) co_return;
+    auto& recovery = *state_.user_recovery;
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [this, &recovery](Worker& worker, size_t index) {
+            return [](NodeRuntime* runtime, Worker* current,
+                      proxyman::inbound::UserStore::WorkerView view) -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
+                co_await current->PostTask(current->InstallUserViewTask(std::move(view)));
+            }(this, &worker, recovery.worker_views[index]);
+        });
+    ThrowIfStopping();
+    proxyman::inbound::UserStore::CommitSnapshot(recovery.previous);
+    state_.user_recovery.reset();
 }
 
-void NodeRuntime::ApplyUsers(const std::string& tag, const proxyman::inbound::UserSet& users) {
-    proxyman::inbound::UserStore::ApplyUsers(tag, users);
+net::awaitable<void> NodeRuntime::PublishUsers(
+    proxyman::inbound::UserStore::PublishedSnapshot snapshot) {
+    using Store = proxyman::inbound::UserStore;
+    ThrowIfStopping();
+    if (state_.user_recovery) {
+        throw std::logic_error("user publication requires completed compensation");
+    }
+    UserPublicationRecovery recovery;
+    recovery.previous = Store::CaptureSnapshot();
+    recovery.worker_views.reserve(workers_.size());
+    std::vector<Store::WorkerView> candidate_views;
+    candidate_views.reserve(workers_.size());
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        recovery.worker_views.push_back(Store::PrepareWorkerView(recovery.previous));
+        candidate_views.push_back(Store::PrepareWorkerView(snapshot));
+    }
+    // Retain rollback leases before any mailbox can install a candidate.
+    // The node transaction shields and joins RecoverUsers on every failure.
+    state_.user_recovery = std::move(recovery);
+    co_await RunWorkerMutationBatch(
+        io_context_.get_executor(), workers_,
+        [this, &candidate_views](Worker& worker, size_t index) {
+            return [](NodeRuntime* runtime, Worker* current, Store::WorkerView view) -> net::awaitable<void> {
+                runtime->ThrowIfStopping();
+                co_await current->PostTask(current->InstallUserViewTask(std::move(view)));
+            }(this, &worker, std::move(candidate_views[index]));
+        });
+    ThrowIfStopping();
+    Store::CommitSnapshot(std::move(snapshot));
+    state_.user_recovery.reset();
+}
+
+net::awaitable<void> NodeRuntime::ClearUsers(const std::string& tag, const std::string& protocol) {
+    co_await RecoverUsers();
+    const auto user_protocol = proxyman::inbound::RegisteredUserProtocol(protocol);
+    if (!user_protocol) throw std::logic_error("node has no registered user protocol");
+    co_await PublishUsers(proxyman::inbound::UserStore::PrepareClearUsers(*user_protocol, tag));
+}
+
+net::awaitable<void> NodeRuntime::ApplyUsers(
+    const std::string& tag, const proxyman::inbound::UserSet& users) {
+    co_await RecoverUsers();
+    co_await PublishUsers(proxyman::inbound::UserStore::PrepareUsers(tag, users));
 }
 
 }  // namespace acpp::controller

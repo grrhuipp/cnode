@@ -174,7 +174,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     Router router;
     if (which == Case::RuleMatch) {
         manager.second = std::make_shared<Handler>();
-        router.decision = {.outbound_tag = "second", .matched = true, .rule_index = 7};
+        router.decision = {.outbound_tag = "second", .matched = true};
     }
     auto& outbound = which == Case::RuleMatch ? *manager.second : *manager.handler;
     outbound.state.load = &load;
@@ -193,6 +193,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     session::Context ctx;
     ctx.conn_id = 1;
     ctx.inbound.tag = "dispatcher-test";
+    ctx.inbound.accounting_key = "panel/fixture/1/";
     ctx.inbound.user_id = 42;
     ctx.inbound.user_email = "dispatcher|42";
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
@@ -217,7 +218,6 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
         which == Case::PolicyAllowed) {
         request_policy.UpdateRule(ctx.inbound.tag, {{
-            .ID = 11,
             .Pattern = std::regex(which == Case::PolicyAllowed
                 ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
         }});
@@ -295,7 +295,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     if (which == Case::RelaySuccess) passed &= result.bytes_up == 7 && result.bytes_down == 13 &&
         source_state.written == 13 && outbound.target_state.written == 7 && (!controlled || source_state.closed);
-    const auto traffic = session_tracking.CollectAndResetTraffic(ctx.inbound.tag);
+    const auto traffic = session_tracking.CollectAndResetTraffic(ctx.inbound.accounting_key);
     if (which == Case::RelaySuccess) {
         const auto user = traffic.users.find(42);
         passed &= user != traffic.users.end() &&
@@ -304,7 +304,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     // Completed requests must no longer contribute live traffic to reporting.
     ++ctx.traffic.bytes_up;
     ++ctx.traffic.bytes_down;
-    passed &= session_tracking.CollectAndResetTraffic(ctx.inbound.tag).empty();
+    passed &= session_tracking.CollectAndResetTraffic(ctx.inbound.accounting_key).empty();
     if (!controlled && done) {
         // Borrowed logical inputs may outlive Dispatcher and notify again.
         // No callback may retain its completed task group or stack context.
@@ -381,11 +381,67 @@ bool SiblingIsolation(bool controlled) {
         passed ? "PASS" : "FAIL");
     return passed;
 }
+
+bool StableAccounting() {
+    struct Resource final : std::pmr::memory_resource {
+        std::pmr::memory_resource* upstream = std::pmr::get_default_resource();
+        bool reject = false;
+        size_t attempts = 0;
+        void* do_allocate(size_t bytes, size_t alignment) override {
+            if (reject) { ++attempts; throw std::bad_alloc(); }
+            return upstream->allocate(bytes, alignment);
+        }
+        void do_deallocate(void* p, size_t bytes, size_t alignment) override {
+            upstream->deallocate(p, bytes, alignment);
+        }
+        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+            return this == &other;
+        }
+    } resource;
+    struct Restore {
+        std::pmr::memory_resource* previous;
+        ~Restore() { std::pmr::set_default_resource(previous); }
+    } restore{std::pmr::set_default_resource(&resource)};
+    app::SessionTrackingState tracking;
+    app::SessionTrackingState::ActiveSession old_port, new_port, static_inbound;
+    session::Traffic old_traffic, new_traffic, static_traffic;
+    constexpr std::string_view key = "panel/same-node/9/";
+    tracking.RegisterActiveSession(old_port, key, 42, old_traffic);
+    tracking.RegisterActiveSession(new_port, key, 42, new_traffic);
+    tracking.RegisterActiveSession(static_inbound, {}, 42, static_traffic);
+    old_traffic.bytes_up = 7;
+    old_traffic.bytes_down = 11;
+    new_traffic.bytes_up = 13;
+    new_traffic.bytes_down = 17;
+    static_traffic.bytes_up = 1000;
+    auto first = tracking.CollectAndResetTraffic(key);
+    bool passed = first.users.at(42).upload == 20 && first.users.at(42).download == 28;
+    old_traffic.bytes_up += 19;
+    new_traffic.bytes_down += 23;
+    resource.reject = true;
+    tracking.UnregisterActiveSession(old_port);
+    tracking.UnregisterActiveSession(new_port);
+    tracking.UnregisterActiveSession(static_inbound);
+    resource.reject = false;
+    const auto remaining = tracking.CollectAndResetTraffic(key);
+    passed &= remaining.users.at(42).upload == 19 && remaining.users.at(42).download == 23 &&
+        resource.attempts == 0 && tracking.CollectAndResetTraffic(key).empty() &&
+        tracking.CollectAndResetTraffic({}).empty();
+    tracking.RegisterActiveSession(new_port, key, 42, new_traffic);
+    new_traffic.bytes_up = 3;
+    new_traffic.bytes_down = 5;
+    tracking.UnregisterActiveSession(new_port);
+    const auto reused = tracking.CollectAndResetTraffic(key);
+    passed &= reused.users.at(42).upload == 3 && reused.users.at(42).download == 5;
+    std::printf("stable accounting with retired sessions and teardown OOM: %s\n",
+                passed ? "PASS" : "FAIL");
+    return passed;
+}
 }
 
 int main() {
     try {
-        bool passed = true;
+        bool passed = StableAccounting();
         for (bool controlled : {false, true}) {
             for (const auto which : {Case::PreStopped, Case::Sniff, Case::Handshake, Case::RoutingDns,
                 Case::Parent, Case::Pending, Case::Success, Case::RelaySuccess, Case::RelayFailure,

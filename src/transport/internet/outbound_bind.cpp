@@ -79,7 +79,7 @@ std::optional<OutboundBind> OutboundBind::ParseCandidates(
     std::vector<Entry> prepared;
     prepared.reserve(entries.size());
     for (const auto text : entries) {
-        if (text.empty() || text.contains('\0')) return std::nullopt;
+        if (text.empty() || text.find('\0') != std::string_view::npos) return std::nullopt;
         Entry entry;
         const auto slash = text.find('/');
         auto address = iputil::ParseLiteral(text.substr(0, slash));

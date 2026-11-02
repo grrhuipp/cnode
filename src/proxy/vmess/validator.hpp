@@ -28,9 +28,9 @@ namespace vmess {
 // TimedUserValidator — 用户验证器
 //
 // 线程模型：
-//   - 认证用户表为进程级单份 RCU 快照，认证路径只做 atomic load
-//   - 面板/静态更新在冷路径构建新快照后无锁发布
-//   - 在线追踪为 Worker 私有状态
+//   - 认证用户表为进程级唯一只读快照；热路径仅借 Worker 独立 lease
+//   - 面板/静态更新在有界冷入口安装 Worker view 后发布
+//   - 在线追踪与热点凭据指针缓存均为 Worker 私有状态
 // ============================================================================
 class TimedUserValidator : public UserOnlineTracker {
 public:

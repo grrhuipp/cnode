@@ -8,7 +8,7 @@
 #include "acppnode/transport/internet/stream_settings.hpp"
 
 #include <chrono>
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <string_view>
 
@@ -40,7 +40,7 @@ struct OutboundTargetOptions {
     std::string_view fallback_server_name);
 
 [[nodiscard]]
-net::awaitable<std::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options);
 
 }  // namespace acpp

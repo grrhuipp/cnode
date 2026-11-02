@@ -4,11 +4,11 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/app/udp_types.hpp"
 #include "../ss_udp.hpp"
-#include "../validator.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
 
 #include <array>
 #include <memory>
-#include <expected>
+#include <tl/expected.hpp>
 #include <utility>
 
 namespace acpp {
@@ -19,7 +19,7 @@ namespace acpp::proxy::shadowsocks::inbound {
 
 class Handler final : public ::acpp::Inbound {
 public:
-    Handler(::acpp::ss::Validator& validator,
+    Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter,
             ::acpp::ss::SsCipherInfo cipher_info);
@@ -38,13 +38,17 @@ public:
         uint32_t pressure_idle_timeout) override;
 
     // 对应 xray-core proxy/shadowsocks/server.go 的 handleUDPPayload 解码路径。
-    [[nodiscard]] std::expected<
+    [[nodiscard]] tl::expected<
         ::acpp::InboundDatagramResult,
         ::acpp::ErrorCode> Process(
         const ::acpp::InboundDatagramRequest& request) override;
 
+    [[nodiscard]] tl::expected<
+        std::shared_ptr<::acpp::InboundDatagramResponse>, ::acpp::ErrorCode>
+    CreateDatagramResponse(const ::acpp::InboundDatagramResult& decoded) override;
+
 private:
-    ::acpp::ss::Validator& validator_;
+    ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
     ::acpp::ss::SsCipherInfo cipher_info_;

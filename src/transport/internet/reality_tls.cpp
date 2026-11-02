@@ -7,7 +7,6 @@
 #include "acppnode/transport/internet/tls_server_name.hpp"
 
 #include "acppnode/transport/internet/tls_stream.hpp"
-#include "acppnode/transport/internet/openssl_thread_pool.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -1019,7 +1018,6 @@ std::unique_ptr<SslContext> SslContext::CreateServerReality(
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    LimitSslReadBuffer(ctx);
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_reality_ignore_peer_signature_algorithm_prefs(ctx, 1);
 
@@ -1062,7 +1060,6 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-    LimitSslReadBuffer(ctx);
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     ConfigureRealityClientFingerprint(ctx, reality.fingerprint);

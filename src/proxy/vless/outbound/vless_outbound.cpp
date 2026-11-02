@@ -17,7 +17,7 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/error.hpp"
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/session.hpp"
@@ -46,8 +46,6 @@ namespace {
 
 using ::acpp::vless::VlessBufferedReader;
 using ::acpp::vless::WriteVlessBytes;
-
-constexpr size_t kUdpFrameQueueShrinkItems = 64;
 
 class VlessOutboundEndpoint final
     : public transport::MultiBufferReader
@@ -107,14 +105,10 @@ public:
 
             buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
+                framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
-            for (buf::Buffer* buffer : raw) {
-                if (buffer && !buffer->IsEmpty()) {
-                    framer_.Feed(buffer->Bytes().data(), buffer->Len());
-                }
-            }
-            raw.clear();
+            framer_.Feed(std::move(raw));
         }
     }
 
@@ -231,110 +225,6 @@ private:
     ::acpp::vless::UdpFramer framer_;
 };
 
-struct MuxFramePayload {
-    mux::FrameHeader header;
-    buf::MultiBuffer payload;
-};
-
-class MuxFrameFramer {
-public:
-    [[nodiscard]] bool Feed(const uint8_t* data, size_t len) {
-        if (failed_) {
-            return false;
-        }
-        if (!data || len == 0) {
-            return true;
-        }
-        CompactConsumed();
-        EnsureAppendCapacity(pending_, len, buf::Buffer::kSize);
-        pending_.insert(pending_.end(), data, data + len);
-        return Parse();
-    }
-
-    bool Next(MuxFramePayload& out) {
-        if (queue_.empty()) {
-            return false;
-        }
-        out = std::move(queue_.front());
-        queue_.pop_front();
-        if (queue_.empty() && shrink_queue_on_drain_) {
-            TryShrinkSequence(queue_);
-            shrink_queue_on_drain_ = false;
-        }
-        return true;
-    }
-
-private:
-    memory::ByteVector pending_;
-    memory::ThreadLocalDeque<MuxFramePayload> queue_;
-    size_t pending_offset_ = 0;
-    bool shrink_queue_on_drain_ = false;
-    bool failed_ = false;
-
-    [[nodiscard]] bool Parse() {
-        while (pending_offset_ < pending_.size()) {
-            const uint8_t* frame_base = pending_.data() + pending_offset_;
-            const size_t available = pending_.size() - pending_offset_;
-            auto parsed = mux::DecodeFrame(frame_base, available);
-            if (!parsed) {
-                break;
-            }
-            if (parsed->frame_size == 0) {
-                Fail();
-                return false;
-            }
-
-            MuxFramePayload packet;
-            packet.header = *parsed;
-            if (parsed->has_data && parsed->data_len > 0) {
-                const size_t payload_offset =
-                    pending_offset_ + parsed->frame_size - parsed->data_len;
-                if (!buf::AppendSpanToMultiBuffer(
-                        std::span<const uint8_t>(
-                            pending_.data() + payload_offset,
-                            parsed->data_len),
-                        packet.payload)) {
-                    Fail();
-                    return false;
-                }
-            }
-            queue_.push_back(std::move(packet));
-            if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-                shrink_queue_on_drain_ = true;
-            }
-            pending_offset_ += parsed->frame_size;
-        }
-        CompactConsumed();
-        return true;
-    }
-
-    void Fail() noexcept {
-        failed_ = true;
-        pending_.clear();
-        pending_offset_ = 0;
-        queue_.clear();
-        shrink_queue_on_drain_ = false;
-    }
-
-    void CompactConsumed() {
-        if (pending_offset_ == 0) {
-            return;
-        }
-        if (pending_offset_ >= pending_.size()) {
-            pending_.clear();
-            pending_offset_ = 0;
-            ReleaseIdleBuffer(pending_);
-            return;
-        }
-        const size_t remaining = pending_.size() - pending_offset_;
-        if (pending_offset_ >= buf::Buffer::kSize && pending_offset_ >= remaining) {
-            pending_.erase(
-                pending_.begin(),
-                pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
-            pending_offset_ = 0;
-        }
-    }
-};
 
 class VlessMuxUdpEndpoint final
     : public transport::MultiBufferReader
@@ -360,48 +250,46 @@ public:
         }
 
         while (true) {
-            MuxFramePayload frame;
-            while (framer_.Next(frame)) {
-                if (frame.header.status == mux::SessionStatus::KEEPALIVE) {
-                    continue;
+            auto header = mux::DecodeFrame(pending_, 0, pending_.byte_size());
+            if (header) {
+                if (header->frame_size == 0) {
+                    throw IoSystemError(
+                        io_error::invalid_argument, "invalid VLESS mux response frame");
                 }
-                if (frame.header.session_id != session_id_) {
+                (void)pending_.DropPrefixBytes(header->frame_size - header->data_len);
+                buf::MultiBuffer payload;
+                if (!pending_.MovePrefixTo(payload, header->data_len)) {
+                    throw std::bad_alloc();
+                }
+                pending_.ReleaseIfIdle();
+                if (header->status == mux::SessionStatus::KEEPALIVE) continue;
+                if (header->session_id != session_id_) {
                     throw IoSystemError(
                         io_error::connection_reset,
                         "VLESS mux response session id mismatch");
                 }
-                if (frame.header.status == mux::SessionStatus::END) {
+                if (header->status == mux::SessionStatus::END) {
                     co_return buf::MultiBuffer{};
                 }
-                if (!frame.header.has_data || !buf::HasData(frame.payload)) {
-                    continue;
-                }
-                const TargetAddress& src = frame.header.has_target
-                    ? frame.header.target
+                if (!buf::HasData(payload)) continue;
+                const TargetAddress& src = header->has_target
+                    ? header->target
                     : udp_target_;
-                for (buf::Buffer* buffer : frame.payload) {
-                    if (buffer && !buffer->IsEmpty()) {
-                        buffer->SetUDP(src);
-                    }
+                for (buf::Buffer* buffer : payload) {
+                    if (buffer && !buffer->IsEmpty()) buffer->SetUDP(src);
                 }
-                co_return std::move(frame.payload);
+                co_return payload;
             }
 
             buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
+                if (pending_.byte_size() != 0) {
+                    throw IoSystemError(
+                        io_error::invalid_argument, "truncated VLESS mux response frame");
+                }
                 co_return buf::MultiBuffer{};
             }
-            for (buf::Buffer* buffer : raw) {
-                if (buffer && !buffer->IsEmpty()) {
-                    if (!framer_.Feed(
-                            buffer->Bytes().data(), buffer->Len())) {
-                        throw IoSystemError(
-                            io_error::connection_reset,
-                            "invalid VLESS mux response frame");
-                    }
-                }
-            }
-            raw.clear();
+            buf::AppendPacketStreamInput(pending_, std::move(raw));
         }
     }
 
@@ -556,19 +444,18 @@ private:
     bool session_started_ = false;
     bool end_sent_ = false;
     uint16_t session_id_ = 1;
-    MuxFrameFramer framer_;
+    buf::MultiBuffer pending_;
     memory::ByteVector write_frame_;
 };
 
 }  // namespace
 
-proxy::vless::outbound::Handler::Handler(std::string tag,
-                                          const VlessOutboundConfig& config,
-                                          ::acpp::app::dns::DNS& dns_service)
-    : tag_(std::move(tag))
-    , config_(config)
-    , dns_service_(dns_service)
-    , encryption_tickets_(config_.encryption
+proxy::vless::outbound::Handler::Handler(
+    std::string_view tag, std::shared_ptr<const VlessOutboundConfig> config,
+    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
+    : tag_(tag), config_(std::move(config)), dial_timeout_(dial_timeout),
+      dns_service_(dns_service)
+    , encryption_tickets_(config_->encryption
           ? std::make_unique<::acpp::vless::VlessEncryptionClientTicketCache>()
           : nullptr) {}
 
@@ -587,33 +474,33 @@ proxy::vless::outbound::Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!config_.flow.empty() && ctx.content.network != Network::TCP) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    if (!config_->flow.empty() && ctx.content.network != Network::TCP) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const auto& target = ctx.outbound.target;
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_service_,
-        .address = config_.address,
-        .literal_address = config_.literal_address,
-        .port = config_.port,
-        .stream_settings = &config_.stream_settings,
-        .timeout = config_.timeout,
-        .send_through = &config_.send_through,
+        .address = config_->address,
+        .literal_address = config_->literal_address,
+        .port = config_->port,
+        .stream_settings = &config_->stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &config_->send_through,
         .inbound_local_addr = inbound_local_addr,
         .inbound_source_ip = ctx.inbound.source_ip,
         .inbound_source_port = ctx.inbound.source_port,
         .tls_server_name = ResolveOutboundTlsServerName(
-            config_.stream_settings, config_.address),
-        .ws_host = config_.address,
+            config_->stream_settings, config_->address),
+        .ws_host = config_->address,
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_.address);
+            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_->address);
         }
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
@@ -621,7 +508,7 @@ proxy::vless::outbound::Handler::Process(
         LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -636,7 +523,7 @@ proxy::vless::outbound::Handler::Process(
         if (stream) {
             stream->CloseAbortive();
         }
-        return std::unexpected(error);
+        return tl::unexpected(error);
     };
 
     stream->SetIdleTimeout(timeouts.HandshakeTimeout());
@@ -644,22 +531,22 @@ proxy::vless::outbound::Handler::Process(
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     const bool is_udp = ctx.content.network == Network::UDP;
-    const bool use_vision = !config_.flow.empty();
-    const bool use_xudp = is_udp && config_.packet_xudp;
-    const bool use_packet_addr = is_udp && config_.packet_addr;
+    const bool use_vision = !config_->flow.empty();
+    const bool use_xudp = is_udp && config_->packet_xudp;
+    const bool use_packet_addr = is_udp && config_->packet_addr;
     TargetAddress request_target = use_packet_addr
         ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
         : target;
     std::array<uint8_t, 512> header{};
     const size_t header_len = ::acpp::vless::Codec::EncodeRequestHeaderTo(
-        config_.uuid_bytes,
+        config_->uuid_bytes,
         use_xudp
             ? ::acpp::vless::Command::MUX
             : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
         request_target,
         header.data(),
         header.size(),
-        use_vision ? std::string_view(config_.flow) : std::string_view{});
+        use_vision ? std::string_view(config_->flow) : std::string_view{});
     if (header_len == 0) {
         co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -672,13 +559,13 @@ proxy::vless::outbound::Handler::Process(
     std::optional<::acpp::vless::VlessEncryptionWriter> encrypted_writer;
     std::optional<VlessBufferedReader> encrypted_plain_reader;
 
-    if (config_.encryption) {
+    if (config_->encryption) {
         try {
             auto runtime =
                 co_await ::acpp::vless::RunVlessEncryptionClientHandshake(
                     protocol_reader,
                     *protocol_writer,
-                    *config_.encryption,
+                    *config_->encryption,
                     encryption_tickets_.get());
             if (!runtime) {
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -752,7 +639,7 @@ proxy::vless::outbound::Handler::Process(
         target,
         use_packet_addr,
         use_vision,
-        config_.uuid_bytes);
+        config_->uuid_bytes);
     if (inbound.control) {
         co_return co_await DoRelayLink(
             io_context, *inbound.reader, *inbound.writer, *inbound.control,
@@ -864,7 +751,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                              parsed.error));
                 return std::nullopt;
             }
-            vless_config.encryption = acpp::memory::AllocateShared<const acpp::vless::VlessEncryptionConfig>(
+            vless_config.encryption = std::make_shared<const acpp::vless::VlessEncryptionConfig>(
                 std::move(*parsed.config));
         }
 
@@ -925,14 +812,12 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
             acpp::VlessOutboundConfig,
             +[](std::string_view tag,
-                const acpp::VlessOutboundConfig& cfg_state,
+                std::shared_ptr<const acpp::VlessOutboundConfig> cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = cfg_state;
-                runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vless::outbound::Handler>(
-                    std::string(tag), runtime_config, dns);
+                    tag, std::move(cfg_state), dns, timeout);
             }>(std::move(vless_config));
     }), true);
 }  // namespace

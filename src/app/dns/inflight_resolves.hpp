@@ -51,8 +51,23 @@ public:
     InflightResolves(const InflightResolves&) = delete;
     InflightResolves& operator=(const InflightResolves&) = delete;
 
+    void RequestStop() noexcept {
+        if (stopping_) return;
+        stopping_ = true;
+        for (const auto& [domain, pending] : table_) {
+            pending->result.emplace();
+            pending->result->error = ErrorCode::CANCELLED;
+            pending->completion.close();
+        }
+    }
+
     template <typename Query>
     net::awaitable<DnsResult> Run(std::string_view domain, Query query) {
+        if (stopping_) {
+            DnsResult cancelled;
+            cancelled.error = ErrorCode::CANCELLED;
+            co_return cancelled;
+        }
         if (const auto found = table_.find(domain); found != table_.end()) {
             auto pending = found->second;
             (void)co_await pending->completion.async_receive(
@@ -72,13 +87,23 @@ public:
         // Move the authoritative result once. Any failure before this point
         // still removes the entry and signals subscribers through Completion.
         static_assert(std::is_nothrow_move_constructible_v<DnsResult>);
-        pending->result.emplace(co_await query());
+        try {
+            auto result = co_await query();
+            if (!stopping_) pending->result.emplace(std::move(result));
+        } catch (const IoSystemError& error) {
+            if (error.code() == io_error::operation_aborted) {
+                pending->result.emplace();
+                pending->result->error = ErrorCode::CANCELLED;
+            }
+            throw;
+        }
         co_return *pending->result;
     }
 
 private:
     net::io_context& io_context_;
     Table table_;
+    bool stopping_ = false;
 };
 
 }  // namespace acpp::app::dns

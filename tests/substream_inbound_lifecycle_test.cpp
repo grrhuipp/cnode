@@ -3,7 +3,6 @@
 #include "../credentials.hpp"
 #include "../anytls_codec.hpp"
 #include "../padding.hpp"
-#include "../validator.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/app/stats.hpp"
@@ -48,6 +47,13 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
 void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
 namespace {
+void InstallUsers(std::span<const acpp::proxyman::inbound::UserStore::UserUpdate> updates) {
+    using acpp::proxyman::inbound::UserStore;
+    auto snapshot = UserStore::PrepareUsers(updates);
+    auto view = UserStore::PrepareWorkerView(snapshot);
+    UserStore::CommitSnapshot(std::move(snapshot));
+    UserStore::InstallWorkerView(std::move(view));
+}
 using namespace acpp;
 using namespace std::chrono_literals;
 
@@ -287,10 +293,10 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     user.profile.email = "lifecycle@test";
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"lifecycle", users}};
-    UserStore::ApplyUsers(updates);
+    InstallUsers(updates);
     std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
         UserStore::FindAnyTlsUser("lifecycle", hash);
-    anytls::Validator validator;
+    UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
@@ -321,7 +327,7 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     Check(dispatcher.active == 2 && stream.pending_reads == 1, "both logical requests must be pending");
     if (!mux && !baseline) {
         Check(!old_table.expired(), "published snapshot must still own its users");
-        UserStore::ApplyUsers(updates);
+        InstallUsers(updates);
         Check(old_table.expired(), "authenticated control transport must not retain the old user table");
         Check(context.inbound.user_id == 1 && context.inbound.user_email == "lifecycle@test",
               "session metadata must survive destruction of its authentication snapshot");
@@ -420,8 +426,8 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"handshake", users}};
-    UserStore::ApplyUsers(updates);
-    anytls::Validator validator;
+    InstallUsers(updates);
+    UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
@@ -528,8 +534,8 @@ void RunIdentityCase(int mode, bool baseline) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"identity", users}};
-    UserStore::ApplyUsers(updates);
-    anytls::Validator validator;
+    InstallUsers(updates);
+    UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     Dispatcher dispatcher(io);
@@ -665,8 +671,8 @@ void RunParsingCase(int mode) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"parsing", users}};
-    UserStore::ApplyUsers(updates);
-    anytls::Validator validator;
+    InstallUsers(updates);
+    UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     ParsingDispatcher dispatcher;
@@ -755,8 +761,8 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"queue", users}};
-    UserStore::ApplyUsers(updates);
-    anytls::Validator validator;
+    InstallUsers(updates);
+    UserOnlineTracker validator;
     StatsShard stats;
     proxy::anytls::inbound::Handler handler(validator, stats, {});
     QueueDispatcher dispatcher(io);

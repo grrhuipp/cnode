@@ -19,7 +19,6 @@ enum class SelectionSource : uint8_t {
 struct OutboundSelection {
     std::string_view outbound_tag;
     SelectionSource source = SelectionSource::Fallback;
-    uint32_t rule_index = 0;
 };
 
 [[nodiscard]] inline bool RequiresRouting(
@@ -43,7 +42,6 @@ struct OutboundSelection {
         return OutboundSelection{
             .outbound_tag = rule.outbound_tag,
             .source = SelectionSource::Rule,
-            .rule_index = rule.rule_index,
         };
     }
     return OutboundSelection{

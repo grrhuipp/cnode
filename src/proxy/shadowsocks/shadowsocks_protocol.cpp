@@ -11,6 +11,8 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <climits>
+#include <stdexcept>
 #include <vector>
 
 namespace acpp::ss {
@@ -95,26 +97,24 @@ KeyBytes DeriveKey(const std::string& password, size_t key_size) {
     const size_t pw_len = password.size();
 
     // 复用 EVP_MD_CTX，避免循环内反复 new/free
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>
+        ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx) throw std::bad_alloc();
 
     while (written < key_size) {
         // D_i = MD5(D_{i-1} || password)
-        EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
-        if (prev_len > 0) {
-            EVP_DigestUpdate(ctx, prev, prev_len);
-        }
-        EVP_DigestUpdate(ctx, pw, pw_len);
-
-        unsigned int len = 16;
-        EVP_DigestFinal_ex(ctx, prev, &len);
+        unsigned int len = 0;
+        if (EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1 ||
+            (prev_len && EVP_DigestUpdate(ctx.get(), prev, prev_len) != 1) ||
+            EVP_DigestUpdate(ctx.get(), pw, pw_len) != 1 ||
+            EVP_DigestFinal_ex(ctx.get(), prev, &len) != 1 || len != 16)
+            throw std::runtime_error("Shadowsocks key derivation failed");
         prev_len = 16;
 
         const size_t chunk = std::min<size_t>(16, key_size - written);
         std::memcpy(key.bytes.data() + written, prev, chunk);
         written += chunk;
     }
-
-    EVP_MD_CTX_free(ctx);
 
     key.size = key_size;
     return key;
@@ -262,114 +262,74 @@ bool DeriveSubkey(const uint8_t* key, size_t key_size,
 // ============================================================================
 // SsAeadCipher
 // ============================================================================
-SsAeadCipher::SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size)
-    : type_(type)
-    , key_size_(key_size <= key_.size() ? key_size : 0) {
-    if (key_size_ == 0 || !key) {
-        return;
-    }
-    std::memcpy(key_.data(), key, key_size_);
-    ctx_ = EVP_CIPHER_CTX_new();
-}
-
-SsAeadCipher::~SsAeadCipher() {
-    if (ctx_) {
-        EVP_CIPHER_CTX_free(ctx_);
-        ctx_ = nullptr;
-    }
-}
-
-SsAeadCipher::SsAeadCipher(SsAeadCipher&& other) noexcept
-    : type_(other.type_)
-    , key_(other.key_)
-    , key_size_(other.key_size_)
-    , ctx_(std::exchange(other.ctx_, nullptr)) {
-    other.key_size_ = 0;
-}
-
-SsAeadCipher& SsAeadCipher::operator=(SsAeadCipher&& other) noexcept {
-    if (this == &other) {
-        return *this;
-    }
-    if (ctx_) {
-        EVP_CIPHER_CTX_free(ctx_);
-    }
-    type_ = other.type_;
-    key_ = other.key_;
-    key_size_ = other.key_size_;
-    ctx_ = std::exchange(other.ctx_, nullptr);
-    other.key_size_ = 0;
-    return *this;
-}
-
-static const EVP_CIPHER* GetCipher(SsCipherType type) noexcept {
+namespace {
+const EVP_CIPHER* GetCipher(SsCipherType type) noexcept {
     switch (BaseCipherType(type)) {
-        case SsCipherType::AES_128_GCM:       return EVP_aes_128_gcm();
-        case SsCipherType::AES_256_GCM:       return EVP_aes_256_gcm();
-        case SsCipherType::CHACHA20_POLY1305:  return EVP_chacha20_poly1305();
-        default:                              return nullptr;
+        case SsCipherType::AES_128_GCM: return EVP_aes_128_gcm();
+        case SsCipherType::AES_256_GCM: return EVP_aes_256_gcm();
+        case SsCipherType::CHACHA20_POLY1305: return EVP_chacha20_poly1305();
+        default: return nullptr;
     }
 }
-
-bool SsAeadCipher::Encrypt(const uint8_t* nonce,
-                            const uint8_t* plaintext, size_t plaintext_len,
-                            uint8_t* output) noexcept {
-    if (!ctx_) return false;
-
-    const EVP_CIPHER* cipher = GetCipher(type_);
-    if (!cipher) return false;
-
-    EVP_CIPHER_CTX_reset(ctx_);
-
-    int out_len = 0;
-
-    if (EVP_EncryptInit_ex(ctx_, cipher, nullptr, nullptr, nullptr) != 1) return false;
-    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) return false;
-    if (EVP_EncryptInit_ex(ctx_, nullptr, nullptr, key_.data(), nonce) != 1) return false;
-
-    if (EVP_EncryptUpdate(ctx_, output, &out_len,
-                          plaintext, static_cast<int>(plaintext_len)) != 1) return false;
-
-    int final_len = 0;
-    if (EVP_EncryptFinal_ex(ctx_, output + out_len, &final_len) != 1) return false;
-
-    // 写入 GCM/Poly1305 tag
-    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_GET_TAG, 16,
-                             output + plaintext_len) != 1) return false;
-
-    return true;
 }
 
-bool SsAeadCipher::Decrypt(const uint8_t* nonce,
-                            const uint8_t* ciphertext, size_t ciphertext_len,
-                            uint8_t* output) noexcept {
-    if (!ctx_ || ciphertext_len < 16) return false;
+SsAeadCipher::SsAeadCipher(SsCipherType type, proxy::AeadDirection direction)
+    : type_(type) {
+    if (direction == proxy::AeadDirection::Decrypt)
+        context_.emplace<proxy::AeadDecryptor>();
+}
 
-    const EVP_CIPHER* cipher = GetCipher(type_);
-    if (!cipher) return false;
+SsAeadCipher::SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size,
+                         proxy::AeadDirection direction)
+    : SsAeadCipher(type, direction) {
+    if (!ResetKey(key, key_size))
+        throw std::runtime_error("Shadowsocks AEAD initialization failed");
+}
 
-    EVP_CIPHER_CTX_reset(ctx_);
+bool SsAeadCipher::ResetKey(const uint8_t* key, size_t key_size) {
+    const auto configure = [&](auto& context) {
+        return context.Configure(GetCipher(type_),
+                                  key ? std::span<const uint8_t>(key, key_size) : std::span<const uint8_t>{});
+    };
+    return std::visit(configure, context_);
+}
 
-    const size_t data_len = ciphertext_len - 16;
-    const uint8_t* tag_ptr = ciphertext + data_len;
+bool SsAeadCipher::Encrypt(const uint8_t* nonce, const uint8_t* plaintext,
+                          size_t plaintext_len, uint8_t* output) noexcept {
+    auto* context = std::get_if<proxy::AeadEncryptor>(&context_);
+    return context && nonce && output && (plaintext || plaintext_len == 0) &&
+        plaintext_len <= static_cast<size_t>(INT_MAX) &&
+        context->Process(std::span<const uint8_t, 12>(nonce, 12),
+                         {plaintext, plaintext_len}, {},
+                         {output, plaintext_len + kTagSize}).has_value();
+}
 
-    int out_len = 0;
+bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
+                          size_t ciphertext_len, uint8_t* output) noexcept {
+    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
+    return context && nonce && ciphertext && ciphertext_len >= kTagSize &&
+        (output || ciphertext_len == kTagSize) &&
+        context->Process(std::span<const uint8_t, 12>(nonce, 12),
+                         {ciphertext, ciphertext_len}, {},
+                         {output, ciphertext_len - kTagSize}).has_value();
+}
 
-    if (EVP_DecryptInit_ex(ctx_, cipher, nullptr, nullptr, nullptr) != 1) return false;
-    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) return false;
-    if (EVP_DecryptInit_ex(ctx_, nullptr, nullptr, key_.data(), nonce) != 1) return false;
+bool SsAeadCipher::BeginDecrypt(const uint8_t* nonce) noexcept {
+    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
+    return context && nonce &&
+        context->Begin(std::span<const uint8_t, 12>(nonce, 12));
+}
 
-    if (EVP_DecryptUpdate(ctx_, output, &out_len,
-                          ciphertext, static_cast<int>(data_len)) != 1) return false;
+bool SsAeadCipher::DecryptUpdate(std::span<const uint8_t> input,
+                               std::span<uint8_t> output) noexcept {
+    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
+    return context && context->Update(input, output);
+}
 
-    // 设置 tag
-    if (EVP_CIPHER_CTX_ctrl(ctx_, EVP_CTRL_AEAD_SET_TAG, 16,
-                             const_cast<uint8_t*>(tag_ptr)) != 1) return false;
-
-    int final_len = 0;
-    if (EVP_DecryptFinal_ex(ctx_, output + out_len, &final_len) != 1) return false;
-
-    return true;
+bool SsAeadCipher::FinishDecrypt(const uint8_t* tag) noexcept {
+    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
+    return context && tag &&
+        context->Finish(std::span<const uint8_t, 16>(tag, 16));
 }
 
 }  // namespace acpp::ss

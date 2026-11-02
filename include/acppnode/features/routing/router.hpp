@@ -19,7 +19,6 @@ struct RouteDecision {
     // Borrowed from the immutable Router; valid for its entire lifetime.
     std::string_view outbound_tag;
     bool matched = false;
-    uint32_t rule_index = 0;
 };
 
 // Worker-local, immutable rule lookup. Configuration and matcher construction

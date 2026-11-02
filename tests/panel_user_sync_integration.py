@@ -65,6 +65,10 @@ class Panel(http.server.ThreadingHTTPServer):
         with self.condition:
             return [etag for p, kind, etag in self.requests if p == phase and kind == "user"]
 
+    def config_headers(self, phase):
+        with self.condition:
+            return [etag for p, kind, etag in self.requests if p == phase and kind == "config"]
+
 
 class PanelHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -104,6 +108,12 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             if phase == "config-invalid":
                 self.reply(200, {"message": "not a node configuration"}, '"invalid-config"')
                 return
+            if phase == "invalid-candidate":
+                self.reply(200, {
+                    "server_port": panel.node_port, "network": "invalid-transport", "tls": 0,
+                    "base_config": {"pull_interval": 1, "push_interval": 3600},
+                }, '"invalid-candidate-config"')
+                return
             port = panel.blocked_port if phase == "rejected-update" else panel.node_port
             etag = f"config-{port}"
             if requested_etag == etag:
@@ -138,7 +148,7 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
 
         version = "v1"
         user = USER_A
-        if phase in ("rejected-update", "recovered"):
+        if phase in ("rejected-update", "invalid-candidate", "recovered"):
             version, user = "v2", USER_B
         elif phase == "restored":
             version, user = "v4", USER_B
@@ -214,10 +224,13 @@ def main(binary, root):
             assert panel.user_headers("ready")[1] == "users-v1"
             for phase in ("config404", "config503", "config-invalid", "user404",
                           "user500", "user-timeout", "user-json", "user-schema",
-                          "user-credentials", "unchanged", "rejected-update"):
+                          "user-credentials", "unchanged", "invalid-candidate", "rejected-update"):
                 panel.enter(phase)
                 panel.wait_cycles(child)
                 check_users(panel, echo.server_address[1], [USER_A], [USER_B])
+                expected_config_etag = f"config-{panel.node_port}"
+                assert all(value == expected_config_etag for value in panel.config_headers(phase)), (
+                    f"{phase}: uncommitted config ETag acknowledged: {panel.config_headers(phase)}")
                 headers = panel.user_headers(phase)
                 if not phase.startswith("config"):
                     assert headers and all(value == "users-v1" for value in headers), (

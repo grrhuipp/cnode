@@ -3,7 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <string_view>
 
 namespace acpp::transport::internet {
@@ -15,7 +15,7 @@ enum class RealityShortIdError {
     InvalidFormat,
 };
 
-[[nodiscard]] std::expected<RealityShortId, RealityShortIdError>
+[[nodiscard]] tl::expected<RealityShortId, RealityShortIdError>
 ParseRealityShortId(std::string_view value) noexcept;
 
 }  // namespace acpp::transport::internet

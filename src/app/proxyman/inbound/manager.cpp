@@ -8,14 +8,14 @@
 
 namespace acpp::proxyman::inbound {
 
-struct Manager::Impl {
+struct Manager::Impl : memory::ThreadAllocated {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
-        std::string,
+        memory::ThreadLocalString,
         std::shared_ptr<Handler>,
         TransparentStringHash,
         TransparentStringEq>;
     using RuntimeMap = memory::ThreadLocalUnorderedMap<
-        std::string,
+        memory::ThreadLocalString,
         std::unique_ptr<ProtocolRuntime>,
         TransparentStringHash,
         TransparentStringEq>;
@@ -30,7 +30,7 @@ struct Manager::Impl {
         auto runtime = NewProtocolRuntime(protocol);
         if (!runtime) return nullptr;
         auto result = runtimes.emplace(
-            std::string(protocol), std::move(runtime));
+            memory::ThreadLocalString(protocol), std::move(runtime));
         return result.first->second.get();
     }
 
@@ -82,8 +82,10 @@ Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Handler> handler) {
         return nullptr;
     }
 
-    std::string tag(handler->Tag());
-    auto shared_handler = std::shared_ptr<Handler>(std::move(handler));
+    memory::ThreadLocalString tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Handler>(
+        handler.release(), std::default_delete<Handler>{},
+        memory::ThreadLocalAllocator<Handler>{});
     auto it = impl_->handlers.find(tag);
     if (it == impl_->handlers.end()) {
         auto [inserted_it, inserted] = impl_->handlers.try_emplace(

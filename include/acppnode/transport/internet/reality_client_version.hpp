@@ -2,7 +2,7 @@
 
 #include <array>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -15,7 +15,7 @@ enum class RealityClientVersionError {
     InvalidFormat,
 };
 
-[[nodiscard]] std::expected<
+[[nodiscard]] tl::expected<
     std::optional<RealityClientVersion>, RealityClientVersionError>
 ParseRealityClientVersion(std::string_view value) noexcept;
 

@@ -12,10 +12,10 @@
 
 namespace acpp::transport::internet::detail {
 
-// Worker-thread-only aggregate deadlines for one connection. The scheduler
-// callback borrows this object; destruction cancels its sole event token.
+// Worker-thread-only aggregate deadlines. The sole scheduling event is part of
+// this object; no separately allocated callback or per-connection timer node.
 template<class Owner>
-class ConnectionTimeouts {
+class ConnectionTimeouts : private TimeoutEvent {
 public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
@@ -110,7 +110,7 @@ public:
         read_deadline_.reset();
         write_deadline_.reset();
         phase_deadline_.reset();
-        scheduler_.Cancel(token_);
+        scheduler_.Cancel(*this);
         armed_deadline_.reset();
     }
 
@@ -161,16 +161,16 @@ private:
         if (stopped_) return;
         const auto first = Earliest();
         if (first == TimePoint::max()) {
-            scheduler_.Cancel(token_);
+            scheduler_.Cancel(*this);
             armed_deadline_.reset();
             return;
         }
         // Earlier waits can safely wake later deadlines; avoid churn when idle
         // activity moves its deadline forward.
-        if (token_.Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
-        scheduler_.Cancel(token_);
+        if (Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
+        scheduler_.Cancel(*this);
         armed_deadline_.reset();
-        token_ = scheduler_.ScheduleAfter(DelayUntil(first), [this]() noexcept { OnWake(); });
+        if (!scheduler_.ScheduleAfter(DelayUntil(first), *this)) return;
         armed_deadline_ = first;
     }
     void ReconcileNoThrow() noexcept {
@@ -178,8 +178,7 @@ private:
         catch (const std::bad_alloc&) { Fail(ErrorCode::RESOURCE_EXHAUSTED); }
         catch (...) { Fail(ErrorCode::INTERNAL); }
     }
-    void OnWake() noexcept {
-        token_.Reset();
+    void OnTimeout() noexcept override {
         armed_deadline_.reset();
         if (stopped_) return;
         const auto now = Clock::now();
@@ -202,7 +201,6 @@ private:
 
     TimeoutScheduler& scheduler_;
     Owner& owner_;
-    TimeoutToken token_;
     std::optional<TimePoint> idle_deadline_, read_deadline_, write_deadline_, phase_deadline_;
     std::optional<TimePoint> armed_deadline_;
     std::chrono::seconds idle_timeout_{0}, read_timeout_{0}, write_timeout_{0};

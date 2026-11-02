@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/app/rate_limiter_fwd.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/features/routing/dispatcher.hpp"
@@ -31,7 +32,8 @@ class Handler final
     : public memory::ThreadAllocated
     , public std::enable_shared_from_this<Handler> {
 public:
-    Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy);
+    Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
+            ConnectionLimiter& limiter);
 
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
@@ -66,10 +68,12 @@ private:
         app::RequestLoadState& request_load,
         const TimeoutsConfig& timeouts,
         std::unique_ptr<AsyncStream> stream,
-        session::Context& ctx);
+        session::Context& ctx,
+        size_t& active_children);
 
     inbound::ReceiverSettings receiver_;
     std::unique_ptr<Inbound> proxy_;
+    ConnectionLimiter& limiter_;
 };
 
 }  // namespace acpp::proxyman::inbound

@@ -13,13 +13,14 @@ from grpc_substream_integration import Peer, READY, ECHO, grpc, h2frame, vless
 
 
 MODES = ('overflow', 'capacity', 'initial-end', 'reset-empty', 'reset-long', 'reset-zero', 'reset-idle',
-         'early-reset', 'early-settings', 'early-ping')
+         'early-reset', 'early-settings', 'early-ping', 'packet-reset', 'packet-capacity', 'packet-tiny')
 
 
-def request_headers(network, tls):
-    fields = [(':method', 'POST'), (':scheme', 'https' if tls else 'http'),
+def request_headers(network, tls, path=None, method='POST'):
+    fields = [(':method', method), (':scheme', 'https' if tls else 'http'),
               (':authority', 'localhost'),
-              (':path', '/fixture/Tun' if network == 'grpc' else
+              (':path', path if path is not None else
+               '/fixture/Tun' if network == 'grpc' else
                '/fixture/' if network == 'xhttp' else '/fixture')]
     if network == 'grpc':
         fields += [('content-type', 'application/grpc'), ('te', 'trailers')]
@@ -50,7 +51,8 @@ async def scenario(args, network, tls, mode, output, result, resources):
     if network == 'grpc':
         transport['grpcSettings'] = {'serviceName': 'fixture'}
     elif network == 'xhttp':
-        transport['xhttpSettings'] = {'path': '/fixture', 'mode': 'stream-one'}
+        transport['xhttpSettings'] = {'path': '/fixture',
+                                     'mode': 'packet-up' if mode.startswith('packet-') else 'stream-one'}
     else:
         transport['httpSettings'] = {'path': '/fixture', 'method': 'POST'}
     configure(output, {'protocol': 'vless', 'listen': '127.0.0.1', 'port': front_port,
@@ -84,6 +86,120 @@ async def scenario(args, network, tls, mode, output, result, resources):
         await send(peer, sid, vless(target_port, tag))
 
     peer = await connect()
+    async def down(sid, session):
+        peer.writer.write(h2frame(1, 5, sid, request_headers(
+            network, tls, f'/fixture/{session}', 'GET')))
+        await peer.writer.drain()
+
+    async def packet(sid, session, sequence, payload, end=True):
+        peer.writer.write(h2frame(1, 4, sid, request_headers(
+            network, tls, f'/fixture/{session}/{sequence}')))
+        peer.writer.write(h2frame(0, int(end), sid, payload))
+        await peer.writer.drain()
+
+    def reset(sid):
+        return any(kind == 3 and stream_id == sid for kind, _, stream_id, _ in peer.frames)
+
+    async def completed_upload(sid):
+        def ended():
+            return any(kind in (0, 1) and flags & 1 and stream_id == sid
+                       for kind, flags, stream_id, _ in peer.frames)
+        await until(lambda: peer.closed or reset(sid) or ended(), 3)
+        assert ended() and not reset(sid) and not peer.closed, f'upload {sid} did not commit'
+
+    if mode == 'packet-capacity':
+        await down(1, 'capacity')
+        await packet(3, 'capacity', 0, vless(target_port, b'S'))
+        await peer.wait_message(1, b'\0\0' + READY)
+        await completed_upload(3)
+        pending = list(range(5, 133, 2))
+        for sequence, sid in enumerate(pending, 1):
+            await packet(sid, 'capacity', sequence, b'q', end=False)
+        await peer.ping(b'uploads!')
+        await packet(133, 'capacity', 65, b'x', end=False)
+        await until(lambda: peer.closed or reset(133), 3)
+        assert reset(133) and not peer.closed, '65th incomplete upload was not rejected'
+        assert not any(reset(sid) for sid in pending), 'fewer than 64 uploads were admitted'
+        # RST releases an in-flight reservation, without committing sequence 1.
+        peer.writer.write(h2frame(3, 0, 5, struct.pack('!I', 8)))
+        await peer.writer.drain()
+        await peer.ping(b'rst-free')
+        await packet(135, 'capacity', 1, ECHO)
+        await completed_upload(135)
+        await peer.wait_message(1, b'\0\0' + READY + ECHO)
+        # A completed upload releases its slot too: refill all 64, reject the
+        # next one, finish an original upload, then successfully admit another.
+        await packet(137, 'capacity', 65, b'z', end=False)
+        await peer.ping(b'refilled')
+        await packet(139, 'capacity', 66, b'x', end=False)
+        await until(lambda: peer.closed or reset(139), 3)
+        assert reset(139) and not reset(137) and not peer.closed
+        peer.writer.write(h2frame(0, 1, 7))
+        await peer.writer.drain()
+        await completed_upload(7)
+        await peer.wait_message(1, b'\0\0' + READY + ECHO + b'q')
+        await packet(141, 'capacity', 66, b'final')
+        await completed_upload(141)
+        await peer.ping(b'capacity')
+        result.update(passed=not peer.closed and not peer.error,
+                      incomplete_uploads_admitted=64, overflow_uploads_rejected=2,
+                      rst_released_slot=True, end_stream_released_slot=True,
+                      shared_connection_survived=True)
+        return
+    if mode == 'packet-tiny':
+        await down(1, 'tiny')
+        await packet(3, 'tiny', 0, vless(target_port, b'S'))
+        await peer.wait_message(1, b'\0\0' + READY)
+        await completed_upload(3)
+        payload = bytes(index % 251 for index in range(1024))
+        peer.writer.write(h2frame(1, 4, 5, request_headers(network, tls, '/fixture/tiny/1')))
+        # Each fragment arrives in a distinct DATA frame. PING barriers keep
+        # exercising the pending-upload path, rather than only a coalesced EOF.
+        # 1024 separate 8-KiB allocations would exceed the 4-MiB upload budget.
+        for offset, byte in enumerate(payload):
+            peer.writer.write(h2frame(0, int(offset == len(payload) - 1), 5, bytes([byte])))
+            if (offset + 1) % 64 == 0:
+                await peer.writer.drain()
+                await peer.ping(struct.pack('!Q', offset))
+                assert not reset(5), 'tiny DATA fragments exhausted payload capacity'
+        await completed_upload(5)
+        await peer.wait_message(1, b'\0\0' + READY + payload)
+        await packet(7, 'tiny', 2, ECHO)
+        await completed_upload(7)
+        await peer.wait_message(1, b'\0\0' + READY + payload + ECHO)
+        result.update(passed=not peer.closed and not peer.error,
+                      one_byte_data_frames=len(payload), ordered_payload_preserved=True,
+                      fragmented_upload_committed=True, subsequent_upload_recovered=True)
+        return
+    if mode == 'packet-reset':
+
+        await down(1, 'victim')
+        await packet(3, 'victim', 0, vless(target_port, b'V'), end=False)
+        await peer.ping(b'prefix!!')
+        peer.writer.write(h2frame(3, 0, 3, struct.pack('!I', 8)))
+        await peer.writer.drain()
+        await down(5, 'sibling')
+        await packet(7, 'sibling', 0, vless(target_port, b'S'))
+        await peer.wait_message(5, b'\0\0' + READY)
+        # Reusing sequence zero with a different complete proxy request proves
+        # that RST did not commit even a valid-looking request prefix.
+        await packet(9, 'victim', 0, vless(target_port, b'R'))
+        await peer.wait_message(1, b'\0\0' + READY)
+        await until(lambda: b'R' in states, 3)
+        assert b'V' not in states, 'RST upload committed its buffered prefix'
+        peer.writer.write(h2frame(3, 0, 1, struct.pack('!I', 8)))
+        await peer.writer.drain()
+        await packet(11, 'sibling', 1, ECHO)
+        await peer.wait_message(5, b'\0\0' + READY + ECHO)
+        await peer.ping(b'split-ok')
+        await down(13, 'recovered')
+        await packet(15, 'recovered', 0, vless(target_port, b'N'))
+        await peer.wait_message(13, b'\0\0' + READY)
+        assert b'V' not in states, 'reset prefix was dispatched after a later upload'
+        result.update(passed=not peer.closed and not peer.error,
+                      reset_prefix_discarded=True, sequence_zero_reused=True,
+                      split_sibling_survived=True, recovered_stream=13)
+        return
     if mode.startswith('early-'):
         wire, code = {
             'early-reset': (h2frame(3, 0, 1, struct.pack('!I', 8)), 1),
@@ -210,6 +326,8 @@ async def main(args):
     for network in ('grpc', 'h2', 'xhttp'):
         for tls in (False, True):
             for mode in MODES:
+                if mode.startswith('packet-') and network != 'xhttp':
+                    continue
                 output = args.output / f'{network}-{mode}-{"tls" if tls else "tcp"}'
                 if args.case and output.name != args.case:
                     continue

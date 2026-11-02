@@ -9,29 +9,29 @@
 
 namespace acpp {
 
-bool Config::Validate() const {
-    if (workers_ == 0 || workers_ > defaults::kMaxWorkers) {
+bool ValidateConfig(const Config& config) {
+    if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
         LOG_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
         return false;
     }
 
-    if (dns_.servers.empty()) {
+    if (config.dns.servers.empty()) {
         LOG_ERROR("At least one DNS server is required");
         return false;
     }
 
-    if (timeouts_.handshake == 0 || timeouts_.dial == 0) {
+    if (config.timeouts.handshake == 0 || config.timeouts.dial == 0) {
         LOG_ERROR("Timeout values must be positive");
         return false;
     }
 
-    if (dns_.min_ttl > dns_.max_ttl) {
+    if (config.dns.min_ttl > config.dns.max_ttl) {
         LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
     }
 
     std::unordered_set<std::string> panel_nodes;
-    for (const auto& panel : panels_) {
+    for (const auto& panel : config.panels) {
         if (!panel.Validate()) {
             return false;
         }
@@ -44,14 +44,14 @@ bool Config::Validate() const {
         }
     }
 
-    const auto inbound_semantic = ValidateStaticInboundSemantics(static_inbounds_);
+    const auto inbound_semantic = ValidateStaticInboundSemantics(config.static_inbounds);
     if (!inbound_semantic.Ok()) {
         LOG_ERROR("Static inbound {}", inbound_semantic.Message());
         return false;
     }
 
     const auto semantic = ValidateOutboundSelectionSemantics(
-        outbounds_, routing_.rules, static_inbounds_);
+        config.outbounds, config.routing.rules, config.static_inbounds);
     switch (semantic.error) {
         case ConfigSemanticError::None:
             break;
@@ -88,11 +88,11 @@ bool Config::Validate() const {
     return true;
 }
 
-std::vector<std::string> Config::GetUsedGeoIPTags() const {
+std::vector<std::string> GetUsedGeoIPTags(const RoutingConfig& routing) {
     std::vector<std::string> tags;
-    for (const auto& rule : routing_.rules) {
+    for (const auto& rule : routing.rules) {
         for (const auto& tag : rule.geoip) {
-            if (!std::ranges::contains(tags, tag)) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
                 tags.push_back(tag);
             }
         }
@@ -100,11 +100,11 @@ std::vector<std::string> Config::GetUsedGeoIPTags() const {
     return tags;
 }
 
-std::vector<std::string> Config::GetUsedGeoSiteTags() const {
+std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
     std::vector<std::string> tags;
-    for (const auto& rule : routing_.rules) {
+    for (const auto& rule : routing.rules) {
         for (const auto& tag : rule.geosite) {
-            if (!std::ranges::contains(tags, tag)) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
                 tags.push_back(tag);
             }
         }

@@ -32,7 +32,7 @@ struct TypedOutboundProtocolSettings final : OutboundProtocolSettings {
 struct PreparedOutboundCreator {
     using CreateFn = std::unique_ptr<::acpp::Outbound> (*)(
         std::string_view tag,
-        const OutboundProtocolSettings* settings,
+        const std::shared_ptr<const OutboundProtocolSettings>& settings,
         ::acpp::net::io_context& io_context,
         ::acpp::app::dns::DNS& dns,
         std::chrono::seconds dial_timeout);
@@ -67,7 +67,7 @@ struct PreparedOutboundCreator {
         ::acpp::app::dns::DNS& dns,
         std::chrono::seconds dial_timeout) const {
         if (create_fn) {
-            return create_fn(tag, settings.get(), io_context, dns, dial_timeout);
+            return create_fn(tag, settings, io_context, dns, dial_timeout);
         }
         return stateless_fn(tag, io_context, dns, dial_timeout);
     }
@@ -80,12 +80,13 @@ template <typename State, auto Fn>
     return PreparedOutboundCreator{
         std::make_shared<const Holder>(std::move(state)),
         +[](std::string_view tag,
-            const OutboundProtocolSettings* base,
+            const std::shared_ptr<const OutboundProtocolSettings>& base,
             ::acpp::net::io_context& io_context,
             ::acpp::app::dns::DNS& dns,
             std::chrono::seconds dial_timeout) -> std::unique_ptr<::acpp::Outbound> {
-            const auto* holder = static_cast<const Holder*>(base);
-            return Fn(tag, holder->value, io_context, dns, dial_timeout);
+            const auto* holder = static_cast<const Holder*>(base.get());
+            return Fn(tag, std::shared_ptr<const Decayed>(base, &holder->value),
+                      io_context, dns, dial_timeout);
         }};
 }
 

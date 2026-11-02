@@ -15,10 +15,13 @@ class ServerSession final {
 public:
     ServerSession(const TimedUserValidator& validator, std::string_view tag);
 
+    // Re-submit the same growing prefix until complete. RequiredHeaderBytes()
+    // is the next structured boundary; zero with no request is terminal failure.
     std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
         const uint8_t* data,
         size_t len,
         uint64_t trace_conn_id = 0);
+    [[nodiscard]] size_t RequiredHeaderBytes() const noexcept { return required_header_bytes_; }
 
     void SetRequest(VMessRequest request);
 
@@ -33,6 +36,9 @@ private:
     std::string_view tag_;
     VMessRequest request_;
     bool request_set_ = false;
+    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> header_user_;
+    size_t required_header_bytes_ = 42;
+    uint16_t header_length_ = 0;
 };
 
 }  // namespace acpp::vmess::encoding

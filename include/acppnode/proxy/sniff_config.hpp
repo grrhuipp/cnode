@@ -59,24 +59,6 @@ struct SniffConfig {
         return false;
     }
 
-    std::string ToString() const {
-        if (!enabled) return "disabled";
-        std::string result = "enabled";
-        if (!dest_override.empty()) {
-            result += " override=[";
-            for (size_t i = 0; i < dest_override.size(); ++i) {
-                if (i > 0) result += ",";
-                result += dest_override[i];
-            }
-            result += "]";
-        }
-        if (!domains_excluded.empty()) {
-            result += " excluded=" + std::to_string(domains_excluded.size()) + " domains";
-        }
-        if (metadata_only) result += " metadataOnly";
-        if (route_only) result += " routeOnly";
-        return result;
-    }
 
 private:
     static constexpr uint8_t kOverrideTls = 1u << 0;

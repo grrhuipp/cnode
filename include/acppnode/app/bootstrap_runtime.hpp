@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/common/asio_types.hpp"
+#include <asio/executor_work_guard.hpp>
 
 #include <memory>
 #include <vector>
@@ -20,13 +21,14 @@ struct RuntimeContext {
     ShardedStats& stats;
     const std::vector<std::unique_ptr<Worker>>& workers;
     Controller& controller;
-    const std::vector<std::unique_ptr<net::io_context>>& io_contexts;
+    std::vector<std::unique_ptr<net::io_context>>& io_contexts;
     InboundStartup& inbound_startup;
     app::dns::DNSWorker& dns_worker;
+    std::vector<net::executor_work_guard<net::io_context::executor_type>>& work_guards;
     bool enable_controller = false;
 };
 
-// Transfers control to the process-lifetime runtime; never unwinds active Workers.
-[[noreturn]] void RunApplicationRuntime(const RuntimeContext& ctx) noexcept;
+// Returns only after every live owner and fixed data thread has completed.
+int RunApplicationRuntime(const RuntimeContext& ctx) noexcept;
 
 }  // namespace acpp

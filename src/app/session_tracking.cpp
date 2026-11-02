@@ -1,153 +1,105 @@
 #include "acppnode/app/session_tracking.hpp"
 
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/common/session.hpp"
 #include "acppnode/common/string_hash.hpp"
 
-#include <string>
-
 namespace acpp::app {
 
-namespace {
+struct SessionTrackingState::Account {
+    UserTraffic completed;
+    size_t active = 0;
+};
 
-using UserTrafficMap = memory::ThreadLocalUnorderedMap<int64_t, UserTraffic>;
-
-using LocalTrafficStore =
-    memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
-        UserTrafficMap,
-        TransparentStringHash,
-        TransparentStringEq>;
-
-void AddUserTrafficTo(LocalTrafficStore& store,
-                      std::string_view tag,
-                      int64_t user_id,
-                      uint64_t upload,
-                      uint64_t download) {
-    if (user_id <= 0) {
-        return;
-    }
-    auto it = store.find(tag);
-    if (it == store.end()) {
-        it = store.try_emplace(memory::ThreadLocalString(tag)).first;
-    }
-    auto& traffic = it->second[user_id];
-    traffic.upload += upload;
-    traffic.download += download;
-}
-
-}  // namespace
-
-struct SessionTrackingState::Impl {
-    LocalTrafficStore local_traffic;
+struct SessionTrackingState::Impl : memory::ThreadAllocated {
+    using Accounts = memory::ThreadLocalUnorderedMap<int64_t, Account>;
+    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString, Accounts,
+        TransparentStringHash, TransparentStringEq> accounts;
     ActiveSession* active_head = nullptr;
 };
 
 SessionTrackingState::SessionTrackingState()
     : impl_(std::make_unique<Impl>()) {}
-
 SessionTrackingState::~SessionTrackingState() = default;
 SessionTrackingState::SessionTrackingState(SessionTrackingState&&) noexcept = default;
 SessionTrackingState& SessionTrackingState::operator=(SessionTrackingState&&) noexcept = default;
 
 void SessionTrackingState::RegisterActiveSession(ActiveSession& node,
-                                                 std::string_view tag,
-                                                 int64_t user_id,
-                                                 session::Traffic& traffic) noexcept {
-    if (user_id <= 0 || node.linked) {
-        return;
+    std::string_view accounting_key, int64_t user_id, session::Traffic& traffic) {
+    if (accounting_key.empty() || user_id <= 0 || node.linked) return;
+    auto entry = impl_->accounts.find(accounting_key);
+    const bool inserted = entry == impl_->accounts.end();
+    if (inserted) entry = impl_->accounts.try_emplace(
+        memory::ThreadLocalString{accounting_key}).first;
+    try {
+        auto& account = entry->second.try_emplace(user_id).first->second;
+        node.account = &account;
+        ++account.active;
+    } catch (...) {
+        if (inserted) impl_->accounts.erase(entry);
+        throw;
     }
-
-    node.tag = tag;
+    node.tag = entry->first;
     node.user_id = user_id;
     node.traffic = &traffic;
     node.last_reported_up = 0;
     node.last_reported_down = 0;
     node.prev = nullptr;
     node.next = impl_->active_head;
-    if (impl_->active_head) {
-        impl_->active_head->prev = &node;
-    }
+    if (node.next) node.next->prev = &node;
     impl_->active_head = &node;
     node.linked = true;
 }
 
 void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept {
-    if (!node.linked) {
-        return;
-    }
-
-    if (node.prev) {
-        node.prev->next = node.next;
-    } else {
-        impl_->active_head = node.next;
-    }
-    if (node.next) {
-        node.next->prev = node.prev;
-    }
-    node.prev = nullptr;
-    node.next = nullptr;
-    node.linked = false;
-
-    if (!node.traffic || node.user_id <= 0) {
-        return;
-    }
-    const uint64_t remaining_up =
-        node.traffic->bytes_up > node.last_reported_up
-            ? node.traffic->bytes_up - node.last_reported_up
-            : 0;
-    const uint64_t remaining_down =
-        node.traffic->bytes_down > node.last_reported_down
-            ? node.traffic->bytes_down - node.last_reported_down
-            : 0;
-    if (remaining_up > 0 || remaining_down > 0) {
-        try {
-            AddUserTrafficTo(impl_->local_traffic,
-                             node.tag,
-                             node.user_id,
-                             remaining_up,
-                             remaining_down);
-        } catch (...) {
-        }
-    }
+    if (!node.linked) return;
+    if (node.prev) node.prev->next = node.next;
+    else impl_->active_head = node.next;
+    if (node.next) node.next->prev = node.prev;
+    auto& account = *node.account;
+    account.completed.upload += node.traffic->bytes_up - node.last_reported_up;
+    account.completed.download += node.traffic->bytes_down - node.last_reported_down;
+    --account.active;
+    node = {};
 }
 
-UserTrafficSnapshot
-SessionTrackingState::CollectAndResetTraffic(std::string_view tag) {
+UserTrafficSnapshot SessionTrackingState::CollectAndResetTraffic(std::string_view accounting_key) {
     UserTrafficSnapshot result;
+    const auto entry = impl_->accounts.find(accounting_key);
+    if (entry == impl_->accounts.end()) return result;
 
-    if (auto it = impl_->local_traffic.find(tag); it != impl_->local_traffic.end()) {
-        result.users.reserve(it->second.size());
-        for (auto& [user_id, traffic] : it->second) {
-            result.users.emplace(user_id, std::move(traffic));
-        }
-        it->second.clear();
-        MaybeShrinkHashContainer(it->second, 64);
+    // Allocate the entire result before acknowledging any bytes. A failed
+    // collection leaves both completed traffic and live cursors unchanged.
+    result.users.reserve(entry->second.size());
+    for (const auto& [user_id, account] : entry->second) {
+        if (account.completed.upload || account.completed.download)
+            result.users.emplace(user_id, account.completed);
     }
-
-    for (ActiveSession* session = impl_->active_head; session != nullptr; session = session->next) {
-        if (session->tag != tag) {
-            continue;
-        }
-        if (session->user_id <= 0 || !session->traffic) {
-            continue;
-        }
-
-        const uint64_t cur_up = session->traffic->bytes_up;
-        const uint64_t cur_down = session->traffic->bytes_down;
-        const uint64_t delta_up = cur_up - session->last_reported_up;
-        const uint64_t delta_down = cur_down - session->last_reported_down;
-        session->last_reported_up = cur_up;
-        session->last_reported_down = cur_down;
-
-        if (delta_up > 0 || delta_down > 0) {
-            auto& traffic = result.users[session->user_id];
-            traffic.upload += delta_up;
-            traffic.download += delta_down;
+    for (auto* node = impl_->active_head; node; node = node->next) {
+        if (node->tag != accounting_key) continue;
+        const auto up = node->traffic->bytes_up - node->last_reported_up;
+        const auto down = node->traffic->bytes_down - node->last_reported_down;
+        if (up || down) {
+            auto& total = result.users[node->user_id];
+            total.upload += up;
+            total.download += down;
         }
     }
 
+    for (auto* node = impl_->active_head; node; node = node->next) {
+        if (node->tag != accounting_key) continue;
+        node->last_reported_up = node->traffic->bytes_up;
+        node->last_reported_down = node->traffic->bytes_down;
+    }
+    for (auto it = entry->second.begin(); it != entry->second.end();) {
+        if (it->second.active == 0) it = entry->second.erase(it);
+        else {
+            it->second.completed = {};
+            ++it;
+        }
+    }
+    if (entry->second.empty()) impl_->accounts.erase(entry);
     return result;
 }
+
 }  // namespace acpp::app

@@ -19,72 +19,12 @@ namespace acpp::proxy::freedom::outbound {
 
 namespace {
 
-std::string LowerAscii(std::string_view value) {
-    std::string lower;
-    lower.reserve(value.size());
-    for (const auto ch : value) {
-        lower.push_back(static_cast<char>(
-            std::tolower(static_cast<unsigned char>(ch))));
-    }
-    return lower;
-}
-
-std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    const auto lower = LowerAscii(value);
-    if (lower == "asis") {
-        return DomainStrategy::AsIs;
-    }
-    if (lower == "useip") {
-        return DomainStrategy::UseIP;
-    }
-    if (lower == "useipv6v4") {
-        return DomainStrategy::UseIPv6v4;
-    }
-    if (lower == "useipv6") {
-        return DomainStrategy::UseIPv6;
-    }
-    if (lower == "useipv4v6") {
-        return DomainStrategy::UseIPv4v6;
-    }
-    if (lower == "useipv4") {
-        return DomainStrategy::UseIPv4;
-    }
-    if (lower == "forceip") {
-        return DomainStrategy::ForceIP;
-    }
-    if (lower == "forceipv6v4") {
-        return DomainStrategy::ForceIPv6v4;
-    }
-    if (lower == "forceipv6") {
-        return DomainStrategy::ForceIPv6;
-    }
-    if (lower == "forceipv4v6") {
-        return DomainStrategy::ForceIPv4v6;
-    }
-    if (lower == "forceipv4") {
-        return DomainStrategy::ForceIPv4;
-    }
-    return std::nullopt;
-}
-
 std::optional<DomainStrategy> ParseConfiguredDomainStrategy(
     const json::object& settings) {
-    DomainStrategy parsed = DomainStrategy::AsIs;
-    bool present = false;
-    for (const std::string_view key : {"domainStrategy"}) {
-        const auto* value = settings.if_contains(key);
-        if (!value || !value->is_string()) {
-            if (value) return std::nullopt;
-            continue;
-        }
-        const auto candidate = ParseDomainStrategy(value->as_string());
-        if (!candidate || (present && parsed != *candidate)) {
-            return std::nullopt;
-        }
-        parsed = *candidate;
-        present = true;
-    }
-    return parsed;
+    const auto* value = settings.if_contains("domainStrategy");
+    if (!value) return DomainStrategy::AsIs;
+    if (!value->is_string()) return std::nullopt;
+    return ParseDomainStrategy(value->as_string());
 }
 
 bool AcceptsIPv4(DomainStrategy strategy) {
@@ -129,11 +69,11 @@ bool PreservesDnsOrder(DomainStrategy strategy) {
 }
 
 net::ip::address SelectUdpBindAddress(
-    const FreedomSettings& settings,
+    const OutboundBind& send_through,
     const session::Context& ctx) {
-    const bool auto_bind = settings.send_through.GetMode() == OutboundBind::Mode::Auto;
-    if (settings.send_through.GetMode() == OutboundBind::Mode::Explicit) {
-        return *settings.send_through.ExplicitAddress();
+    const bool auto_bind = send_through.GetMode() == OutboundBind::Mode::Auto;
+    if (send_through.GetMode() == OutboundBind::Mode::Explicit) {
+        return *send_through.ExplicitAddress();
     }
 
     const auto& target = ctx.outbound.target;
@@ -179,19 +119,20 @@ OutboundTransportTarget::BindMode ToTransportBindMode(OutboundBind::Mode mode) {
 }  // namespace
 
 Handler::Handler(
-    const std::string& tag,
+    std::string_view tag,
     const FreedomSettings& settings,
     ::acpp::app::dns::DNS& dns_service,
     std::chrono::seconds dial_timeout)
     : tag_(tag)
-    , settings_(settings)
+    , send_through_(settings.send_through)
+    , domain_strategy_(settings.domain_strategy)
+    , enable_udp_(settings.enable_udp)
     , dns_service_(dns_service)
     , dial_timeout_(dial_timeout) {
-    if (!settings_.redirect.empty()) {
-        auto redir = TargetAddress::Parse(settings_.redirect);
+    if (!settings.redirect.empty()) {
+        auto redir = TargetAddress::Parse(settings.redirect);
         if (redir && redir->IsValid()) {
             redirect_target_ = std::move(*redir);
-            redirect_target_text_ = redirect_target_->ToString();
         }
     }
 
@@ -209,18 +150,18 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == Network::UDP) {
-        if (!settings_.enable_udp) {
-            co_return std::unexpected(ErrorCode::NOT_SUPPORTED);
+        if (!enable_udp_) {
+            co_return tl::unexpected(ErrorCode::NOT_SUPPORTED);
         }
-        auto bind_address = SelectUdpBindAddress(settings_, ctx);
-        if (settings_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
-            const auto selected = settings_.send_through.Select(
+        auto bind_address = SelectUdpBindAddress(send_through_, ctx);
+        if (send_through_.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto selected = send_through_.Select(
                 bind_address, ctx.inbound.source_ip, ctx.inbound.source_port);
             if (selected.address) bind_address = *selected.address;
         }
@@ -230,11 +171,11 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         } catch (const transport::LinkError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
                            ctx.outbound.target, bind_address.to_string(), e.what());
-            co_return std::unexpected(e.code());
+            co_return tl::unexpected(e.code());
         } catch (const IoSystemError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
                            ctx.outbound.target, bind_address.to_string(), e.what());
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         }
         target->SetIdleTimeout(relay_idle_timeout);
         target->SetWriteTimeout(relay_write_timeout);
@@ -250,30 +191,30 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     // redirect：替换目标地址（Xray freedom redirect 语义）
     if (redirect_target_) {
         LOG_CONN_DEBUG(ctx, "Freedom redirect {} -> {}",
-                       ctx.outbound.target, redirect_target_text_);
+                       ctx.outbound.target, *redirect_target_);
         ctx.outbound.route_target = *redirect_target_;
         ctx.outbound.target = *redirect_target_;
     }
 
     const auto& target = ctx.outbound.target;
     if (!target.IsValid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     LOG_CONN_DEBUG(ctx, "Freedom resolve target {}", target);
 
     OutboundTransportTarget transport_target;
-    transport_target.bind_mode = ToTransportBindMode(settings_.send_through.GetMode());
+    transport_target.bind_mode = ToTransportBindMode(send_through_.GetMode());
     transport_target.timeout = dial_timeout_;
     transport_target.stream_settings = &stream_settings_;
 
-    const bool ordered_bind = settings_.send_through.GetMode() == OutboundBind::Mode::Ordered;
+    const bool ordered_bind = send_through_.GetMode() == OutboundBind::Mode::Ordered;
     const auto selected_v4 = ordered_bind
-        ? settings_.send_through.Select(net::ip::address_v4::any(),
+        ? send_through_.Select(net::ip::address_v4::any(),
             ctx.inbound.source_ip, ctx.inbound.source_port)
         : OutboundBind::Selection{};
     const auto selected_v6 = ordered_bind
-        ? settings_.send_through.Select(net::ip::address_v6::any(),
+        ? send_through_.Select(net::ip::address_v6::any(),
             ctx.inbound.source_ip, ctx.inbound.source_port)
         : OutboundBind::Selection{};
     auto selected_bind = [&](const net::ip::address& remote_addr)
@@ -294,7 +235,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     } else {
         auto remote_addrs = co_await ResolveTargets(ctx);
         if (!remote_addrs || remote_addrs->empty()) {
-            co_return std::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
+            co_return tl::unexpected(remote_addrs ? ErrorCode::DNS_RESOLVE_FAILED : remote_addrs.error());
         }
 
         transport_target.candidates.reserve(remote_addrs->size());
@@ -305,7 +246,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             });
         }
         if (transport_target.candidates.empty()) {
-            co_return std::unexpected(ErrorCode::SOCKET_BIND_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_BIND_FAILED);
         }
         if (transport_target.candidates.size() == 1) {
             transport_target.single_candidate = std::move(transport_target.candidates.front());
@@ -339,7 +280,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} via {} > {}",
                        ctx.inbound.source_ip, ctx.outbound.target,
                        ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -369,29 +310,29 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
-net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
+net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
 Handler::ResolveTargets(session::Context& ctx) {
     const auto& target = ctx.outbound.target;
 
     // 如果目标已经有解析结果，直接复用 dispatcher/router 阶段的 DNS 结果。
     if (target.resolved_addr) {
-        std::vector<net::ip::address> addresses;
+        memory::ThreadLocalVector<net::ip::address> addresses;
         addresses.reserve(1);
         addresses.push_back(*target.resolved_addr);
         co_return addresses;
     }
     if (!target.IsDomain()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     // 需要 DNS 解析
     auto dns_result = co_await dns_service_.Resolve(target.host);
 
     if (!dns_result.Ok()) {
-        co_return std::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
-    std::vector<net::ip::address> addresses;
+    memory::ThreadLocalVector<net::ip::address> addresses;
     addresses.reserve(dns_result.addresses.size());
 
     auto append_family = [&](const bool want_v6) {
@@ -402,31 +343,31 @@ Handler::ResolveTargets(session::Context& ctx) {
         }
     };
 
-    if (PreservesDnsOrder(settings_.domain_strategy)) {
+    if (PreservesDnsOrder(domain_strategy_)) {
         for (const auto& dns_addr : dns_result.addresses) {
-            if ((dns_addr.is_v4() && AcceptsIPv4(settings_.domain_strategy)) ||
-                (dns_addr.is_v6() && AcceptsIPv6(settings_.domain_strategy))) {
+            if ((dns_addr.is_v4() && AcceptsIPv4(domain_strategy_)) ||
+                (dns_addr.is_v6() && AcceptsIPv6(domain_strategy_))) {
                 addresses.push_back(dns_addr);
             }
         }
-    } else if (PreferIPv6First(settings_.domain_strategy)) {
-        if (AcceptsIPv6(settings_.domain_strategy)) {
+    } else if (PreferIPv6First(domain_strategy_)) {
+        if (AcceptsIPv6(domain_strategy_)) {
             append_family(true);
         }
-        if (AcceptsIPv4(settings_.domain_strategy)) {
+        if (AcceptsIPv4(domain_strategy_)) {
             append_family(false);
         }
     } else {
-        if (AcceptsIPv4(settings_.domain_strategy)) {
+        if (AcceptsIPv4(domain_strategy_)) {
             append_family(false);
         }
-        if (AcceptsIPv6(settings_.domain_strategy)) {
+        if (AcceptsIPv6(domain_strategy_)) {
             append_family(true);
         }
     }
 
     if (addresses.empty()) {
-        co_return std::unexpected(ErrorCode::DNS_NO_RECORD);
+        co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
     }
 
     co_return addresses;
@@ -436,7 +377,7 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
     const tcp::endpoint* inbound_local_addr,
     const net::ip::address& remote_addr) {
 
-    if (settings_.send_through.GetMode() == OutboundBind::Mode::Auto) {
+    if (send_through_.GetMode() == OutboundBind::Mode::Auto) {
         // auto 模式：源进源出
         // 使用入站连接的本地 IP 作为出站绑定地址
         // 这样可以实现「哪个 IP 进哪个 IP 出」
@@ -454,7 +395,17 @@ std::optional<net::ip::address> Handler::DetermineLocalAddress(
         return std::nullopt;
     }
 
-    return settings_.send_through.ExplicitAddress();
+    return send_through_.ExplicitAddress();
+}
+
+proxyman::outbound::PreparedOutboundCreator PrepareOutbound(FreedomSettings settings) {
+    return proxyman::outbound::MakePreparedOutboundCreator<
+        FreedomSettings,
+        +[](std::string_view tag, std::shared_ptr<const FreedomSettings> config,
+            net::io_context&, app::dns::DNS& dns,
+            std::chrono::seconds timeout) -> std::unique_ptr<Outbound> {
+            return std::make_unique<Handler>(tag, *config, dns, timeout);
+        }>(std::move(settings));
 }
 
 }  // namespace acpp::proxy::freedom::outbound
@@ -498,15 +449,6 @@ const bool kFreedomRegistered = (acpp::proxyman::outbound::RegisterProxy(
             settings.send_through = *cfg.send_through;
         }
 
-        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            acpp::proxy::freedom::outbound::FreedomSettings,
-            +[](std::string_view tag,
-                const acpp::proxy::freedom::outbound::FreedomSettings& s,
-                acpp::net::io_context& /*io_context*/,
-                acpp::app::dns::DNS& dns,
-                std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                return std::make_unique<acpp::proxy::freedom::outbound::Handler>(
-                    std::string(tag), s, dns, timeout);
-            }>(std::move(settings));
+        return acpp::proxy::freedom::outbound::PrepareOutbound(std::move(settings));
     }), true);
 }  // namespace

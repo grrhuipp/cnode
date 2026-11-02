@@ -5,6 +5,31 @@
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
+#include <new>
+#include <openssl/evp.h>
+
+#ifdef CNODE_TEST_CRYPTO_FAULT
+namespace {
+bool fail_digest_allocation = false;
+bool fail_mask_output = false;
+int cipher_allocation_countdown = 0;
+size_t cipher_contexts = 0;
+}
+extern "C" EVP_MD_CTX* __real_EVP_MD_CTX_new();
+extern "C" EVP_CIPHER_CTX* __real_EVP_CIPHER_CTX_new();
+extern "C" int __real_EVP_DigestSqueeze(EVP_MD_CTX*, uint8_t*, size_t);
+extern "C" EVP_MD_CTX* __wrap_EVP_MD_CTX_new() {
+    return fail_digest_allocation ? nullptr : __real_EVP_MD_CTX_new();
+}
+extern "C" EVP_CIPHER_CTX* __wrap_EVP_CIPHER_CTX_new() {
+    ++cipher_contexts;
+    if (cipher_allocation_countdown > 0 && --cipher_allocation_countdown == 0) return nullptr;
+    return __real_EVP_CIPHER_CTX_new();
+}
+extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t size) {
+    return fail_mask_output ? 0 : __real_EVP_DigestSqueeze(ctx, out, size);
+}
+#endif
 
 namespace {
 using namespace acpp::vmess;
@@ -19,6 +44,31 @@ void Check(bool condition, std::string_view message) {
 
 int main() {
     const std::array<uint8_t, 16> key{}, iv{};
+#ifdef CNODE_TEST_CRYPTO_FAULT
+    fail_digest_allocation = true;
+    bool mask_failed = false, key_failed = false;
+    try { ShakeMask mask(iv.data()); }
+    catch (const std::bad_alloc&) { mask_failed = true; }
+    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
+    catch (const std::bad_alloc&) { key_failed = true; }
+    fail_digest_allocation = false;
+    Check(mask_failed && key_failed, "crypto allocation failure produced usable protocol state");
+    for (const int allocation : {1, 2}) {
+        cipher_allocation_countdown = allocation;
+        bool failed = false;
+        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data()); }
+        catch (const std::bad_alloc&) { failed = true; }
+        cipher_allocation_countdown = 0;
+        Check(failed, "partial AEAD context allocation did not fail construction");
+    }
+    ShakeMask mask(iv.data());
+    fail_mask_output = true;
+    bool squeeze_failed = false;
+    try { (void)mask.NextMask(); }
+    catch (const std::runtime_error&) { squeeze_failed = true; }
+    fail_mask_output = false;
+    Check(squeeze_failed, "failed SHAKE output was replaced by synthetic mask bytes");
+#endif
     const std::array<uint8_t, 16> empty_gcm_tag{
         0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
         0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a};
@@ -28,6 +78,9 @@ int main() {
                                    Security::NONE, Security::ZERO}) {
         VMessCipher encoder(security, key.data(), iv.data());
         VMessCipher decoder(security, key.data(), iv.data());
+#ifdef CNODE_TEST_CRYPTO_FAULT
+        const auto contexts = cipher_contexts;
+#endif
         for (const size_t size : {size_t{0}, size_t{1}, size_t{127}, size_t{0}, size_t{31}}) {
             std::array<uint8_t, 128> input{}, output{};
             std::array<uint8_t, 144> wire{};
@@ -45,6 +98,9 @@ int main() {
                   "chunk plaintext changed");
             ++frames;
         }
+#ifdef CNODE_TEST_CRYPTO_FAULT
+        Check(cipher_contexts == contexts, "VMess records allocated additional EVP contexts");
+#endif
         if (encoder.Overhead()) {
             VMessCipher fresh_encoder(security, key.data(), iv.data());
             VMessCipher fresh_decoder(security, key.data(), iv.data());

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include "../aead.hpp"
 
 namespace acpp::vless {
 
@@ -48,13 +49,13 @@ void IncreaseVlessEncryptionNonce(
 class VlessEncryptionAead {
 public:
     VlessEncryptionAead() noexcept = default;
-    ~VlessEncryptionAead() noexcept;
+    ~VlessEncryptionAead() noexcept = default;
 
     VlessEncryptionAead(const VlessEncryptionAead&) = delete;
     VlessEncryptionAead& operator=(const VlessEncryptionAead&) = delete;
 
-    VlessEncryptionAead(VlessEncryptionAead&& other) noexcept;
-    VlessEncryptionAead& operator=(VlessEncryptionAead&& other) noexcept;
+    VlessEncryptionAead(VlessEncryptionAead&& other) noexcept = default;
+    VlessEncryptionAead& operator=(VlessEncryptionAead&& other) noexcept = default;
 
     [[nodiscard]] static std::optional<VlessEncryptionAead> Create(
         std::span<const uint8_t> context,
@@ -92,13 +93,10 @@ public:
     }
 
 private:
-    void Close() noexcept;
-
-    std::array<uint8_t, kVlessEncryptionAeadKeySize> key_{};
     VlessEncryptionNonce nonce_{};
     VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
-    void* enc_ctx_ = nullptr;
-    void* dec_ctx_ = nullptr;
+    proxy::AeadEncryptor encryptor_;
+    proxy::AeadDecryptor decryptor_;
 };
 
 [[nodiscard]] std::optional<size_t> SealVlessEncryptionRecord(

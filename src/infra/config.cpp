@@ -441,12 +441,6 @@ LogConfig LogConfig::FromJson(const json::object& j) {
 // ============================================================================
 // DnsConfig
 // ============================================================================
-DnsConfig::DnsConfig()
-    : servers{
-        {net::ip::address_v4({8, 8, 8, 8}), 53},
-        {net::ip::address_v4({1, 1, 1, 1}), 53},
-    } {}
-
 namespace {
 
 udp::endpoint ParseDnsServer(std::string_view text) {
@@ -1462,53 +1456,49 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 // Config
 // ============================================================================
 
-std::optional<Config> Config::LoadFromJson(const json::object& j) {
+std::optional<Config> ParseConfig(const json::object& j) {
     Config cfg;
 
     try {
         if (const auto* log = optional_object(j, "log")) {
-            cfg.log_ = LogConfig::FromJson(*log);
+            cfg.log = LogConfig::FromJson(*log);
         }
 
-        cfg.workers_ = juint32(j, "workers", cfg.workers_);
-        if (cfg.workers_ > defaults::kMaxWorkers) {
+        cfg.workers = juint32(j, "workers", cfg.workers);
+        if (cfg.workers > defaults::kMaxWorkers) {
             throw std::invalid_argument(std::format(
                 "workers must be between 0 and {}", defaults::kMaxWorkers));
         }
 
         if (const auto* dns = optional_object(j, "dns")) {
-            cfg.dns_ = DnsConfig::FromJson(*dns);
+            cfg.dns = DnsConfig::FromJson(*dns);
         }
 
         if (const auto* limits = optional_object(j, "limits")) {
-            cfg.limits_ = LimitsConfig::FromJson(*limits);
+            cfg.limits = LimitsConfig::FromJson(*limits);
         }
 
         if (const auto* timeouts = optional_object(j, "timeouts")) {
-            cfg.timeouts_ = TimeoutsConfig::FromJson(*timeouts);
+            cfg.timeouts = TimeoutsConfig::FromJson(*timeouts);
         }
 
-        auto parse_panels = [&](std::string_view key) {
-            if (!j.contains(key)) return;
-            const auto& arr = j.at(key);
-            if (!arr.is_array()) {
-                throw std::invalid_argument(
-                    std::format("{} must be an array", key));
+        if (const auto* panels = j.if_contains("panels")) {
+            if (!panels->is_array()) {
+                throw std::invalid_argument("panels must be an array");
             }
-            for (const auto& panel : arr.as_array()) {
+            for (const auto& panel : panels->as_array()) {
                 if (!panel.is_object()) {
-                    throw std::runtime_error("panel entry must be an object");
+                    throw std::invalid_argument("panel entry must be an object");
                 }
-                cfg.panels_.push_back(PanelConfig::FromJson(panel.as_object()));
+                cfg.panels.push_back(PanelConfig::FromJson(panel.as_object()));
             }
-        };
-        parse_panels("panels");
+        }
 
         // Workers 默认值
-        if (cfg.workers_ == 0) {
-            cfg.workers_ = std::thread::hardware_concurrency();
-            if (cfg.workers_ == 0) {
-                cfg.workers_ = 1;  // 至少 1 个
+        if (cfg.workers == 0) {
+            cfg.workers = std::thread::hardware_concurrency();
+            if (cfg.workers == 0) {
+                cfg.workers = 1;  // 至少 1 个
             }
         }
 

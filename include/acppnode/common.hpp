@@ -94,7 +94,7 @@ namespace api {
 class API;
 }  // namespace api
 
-class Config;
+struct Config;
 class Stats;
 class Worker;
 

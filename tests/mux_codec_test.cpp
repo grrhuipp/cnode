@@ -1,9 +1,10 @@
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/common/buffer_util.hpp"
-#include "xudp_packet_buffer.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -28,7 +29,6 @@ void Check(bool condition, std::string_view message) {
 void CheckInvalidAcrossLayouts(
     std::span<const uint8_t> frame,
     std::string_view message) {
-    const auto contiguous = acpp::mux::DecodeFrame(frame.data(), frame.size());
     const auto prefix = acpp::mux::DecodeFramePrefix(
         frame.data(), frame.size(), frame.size());
 
@@ -37,8 +37,7 @@ void CheckInvalidAcrossLayouts(
           "failed to allocate fragmented Mux test input");
     const auto fragmented = acpp::mux::DecodeFrame(buffers, 0, frame.size());
 
-    Check(contiguous.has_value() && contiguous->frame_size == 0 &&
-              prefix.has_value() && prefix->frame_size == 0 &&
+    Check(prefix.has_value() && prefix->frame_size == 0 &&
               fragmented.has_value() && fragmented->frame_size == 0,
           message);
 }
@@ -62,18 +61,51 @@ int main() {
     buf::MultiBuffer xudp_input;
     Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input),
           "failed to allocate large XUDP fixture");
-    mux::detail::XudpPacketBuffer xudp_decoder;
+    buf::LengthPrefixedPacketBuffer xudp_decoder;
     xudp_decoder.Append(std::move(xudp_input));
     buf::MultiBuffer decoded_xudp_packet;
     const auto xudp_result = xudp_decoder.Pop(decoded_xudp_packet);
     std::vector<uint8_t> recovered_xudp_packet(large_xudp_packet.size());
     const size_t recovered_xudp_bytes =
         decoded_xudp_packet.CopyPrefixTo(recovered_xudp_packet);
-    Check(xudp_result == mux::detail::XudpPacketBuffer::PopResult::Packet &&
+    Check(xudp_result == buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
               recovered_xudp_bytes == large_xudp_packet.size() &&
               recovered_xudp_packet == large_xudp_packet &&
               xudp_decoder.PendingBytes() == 0,
           "XUDP packet larger than one Buffer was rejected or truncated");
+    xudp_decoder.Finish();
+    const std::array<uint8_t, 5> empty_then_packet{0, 0, 0, 1, 0x4f};
+    buf::MultiBuffer empty_input;
+    Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input),
+          "failed to allocate empty XUDP fixture");
+    xudp_decoder.Append(std::move(empty_input));
+    Check(xudp_decoder.Pop(decoded_xudp_packet) ==
+              buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
+          decoded_xudp_packet.empty() && xudp_decoder.PendingBytes() == 3,
+          "zero-length XUDP frame failed to consume exactly its header");
+    Check(xudp_decoder.Pop(decoded_xudp_packet) ==
+              buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
+          decoded_xudp_packet.byte_size() == 1,
+          "zero-length XUDP frame corrupted its successor");
+    xudp_decoder.Finish();
+    for (const auto& truncated : {std::vector<uint8_t>{0},
+                                  std::vector<uint8_t>{0, 2, 0x41}}) {
+        buf::MultiBuffer input;
+        Check(buf::AppendSpanToMultiBuffer(truncated, input),
+              "failed to allocate truncated XUDP fixture");
+        xudp_decoder.Append(std::move(input));
+        Check(xudp_decoder.Pop(decoded_xudp_packet) ==
+                  buf::LengthPrefixedPacketBuffer::PopResult::NeedMore,
+              "truncated XUDP frame was emitted");
+        bool rejected = false;
+        try {
+            xudp_decoder.Finish();
+        } catch (const IoSystemError&) {
+            rejected = true;
+        }
+        Check(rejected, "XUDP EOF accepted a partial length or payload");
+        xudp_decoder.Clear();
+    }
 
     Check(mux::EncodeNewHeaderTo(
               encoded,
@@ -84,7 +116,8 @@ int main() {
           "large Mux NEW header was rejected");
     encoded.insert(
         encoded.end(), large_xudp_packet.begin(), large_xudp_packet.end());
-    const auto large_new_frame = mux::DecodeFrame(encoded.data(), encoded.size());
+    const auto large_new_frame = mux::DecodeFramePrefix(
+        encoded.data(), encoded.size(), encoded.size());
     Check(large_new_frame.has_value() && large_new_frame->frame_size == encoded.size() &&
               large_new_frame->data_len == large_xudp_packet.size(),
           "Mux NEW header did not preserve a multi-buffer datagram length");
@@ -92,14 +125,16 @@ int main() {
     Check(mux::EncodeKeepDataTo(
               encoded, 7, maximum.data(), maximum.size()),
           "maximum Mux payload was rejected");
-    const auto decoded = mux::DecodeFrame(encoded.data(), encoded.size());
+    const auto decoded = mux::DecodeFramePrefix(
+        encoded.data(), encoded.size(), encoded.size());
     Check(decoded.has_value() && decoded->frame_size == encoded.size() &&
               decoded->data_len == kMaxPayload,
           "maximum Mux payload did not round-trip");
 
     Check(mux::EncodeKeepDataTo(encoded, 7, nullptr, 0),
           "zero-length Mux DATA frame was rejected");
-    const auto empty_decoded = mux::DecodeFrame(encoded.data(), encoded.size());
+    const auto empty_decoded = mux::DecodeFramePrefix(
+        encoded.data(), encoded.size(), encoded.size());
     Check(empty_decoded.has_value() &&
               empty_decoded->frame_size == encoded.size() &&
               empty_decoded->has_data && empty_decoded->data_len == 0,
@@ -222,7 +257,8 @@ int main() {
     const uint16_t global_meta_len = static_cast<uint16_t>(base_meta_len + 8);
     encoded[0] = static_cast<uint8_t>(global_meta_len >> 8);
     encoded[1] = static_cast<uint8_t>(global_meta_len);
-    const auto global_id_frame = mux::DecodeFrame(encoded.data(), encoded.size());
+    const auto global_id_frame = mux::DecodeFramePrefix(
+        encoded.data(), encoded.size(), encoded.size());
     Check(global_id_frame.has_value() && global_id_frame->frame_size != 0 &&
               global_id_frame->has_global_id,
           "exact eight-byte Mux GlobalID was rejected");

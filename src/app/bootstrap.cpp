@@ -43,7 +43,6 @@ std::optional<Config> LoadConfigFromCli(
             error_reported = true;
             return std::nullopt;
         }
-        return Config::LoadFromDirectory(config_path);
     }
 
     if (cli.config_mode == ConfigPathMode::File) {
@@ -56,7 +55,7 @@ std::optional<Config> LoadConfigFromCli(
         }
     }
 
-    return Config::LoadFromFile(config_path);
+    return LoadConfig(config_path);
 }
 
 constexpr std::string_view IoBackendName() noexcept {
@@ -104,13 +103,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
     const Config& config = *config_opt;
 
-    if (!Log::Init(config.GetLog().level,
-                   config.GetLog().log_dir,
-                   config.GetLog().max_days,
-                   config.GetLog().access_path,
-                   config.GetLog().error_path,
-                   config.GetLog().rotate_daily,
-                   config.GetLog().gzip)) {
+    if (!Log::Init(config.log.level,
+                   config.log.log_dir,
+                   config.log.max_days,
+                   config.log.access_path,
+                   config.log.error_path,
+                   config.log.rotate_daily,
+                   config.log.gzip)) {
         std::cerr << "Failed to initialize logging\n";
         return 1;
     }
@@ -118,26 +117,29 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
 #ifdef _WIN32
     LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEADDR allocator=thread-local",
-                config.GetWorkers(), IoBackendName());
+                config.workers, IoBackendName());
 #else
     LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
-                config.GetWorkers(), IoBackendName());
+                config.workers, IoBackendName());
 #endif
 
-    if (!config.Validate()) {
+    if (!ValidateConfig(config)) {
         std::cerr << "Invalid configuration\n";
         Log::Shutdown();
         return 1;
     }
 
+    int result = 1;
     try {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
-        RunApplicationRuntime(MakeRuntimeContext(env));
+        result = RunApplicationRuntime(MakeRuntimeContext(env));
     } catch (const std::exception& e) {
         Log::Shutdown();
         std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;
     }
+    Log::Shutdown();
+    return result;
 }
 
 }  // namespace acpp

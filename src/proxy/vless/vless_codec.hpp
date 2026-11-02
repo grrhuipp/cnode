@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <string_view>
 
 namespace acpp::vless {
@@ -48,29 +47,6 @@ public:
     static size_t EncodeResponseHeaderTo(uint8_t* output,
                                          size_t output_size) noexcept;
 
-    static size_t EncodeUdpPacketTo(const uint8_t* payload,
-                                    size_t payload_len,
-                                    uint8_t* output,
-                                    size_t output_size) noexcept;
-
-    enum class UdpParseResult {
-        SUCCESS,
-        INCOMPLETE,
-        INVALID,
-    };
-
-    struct UdpPacket {
-        std::span<const uint8_t> payload;
-    };
-
-    struct UdpParseOutput {
-        UdpParseResult result = UdpParseResult::INCOMPLETE;
-        std::optional<UdpPacket> packet;
-        size_t consumed = 0;
-    };
-
-    static UdpParseOutput ParseUdpPacket(const uint8_t* data,
-                                         size_t len) noexcept;
 };
 
 }  // namespace acpp::vless

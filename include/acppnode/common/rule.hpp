@@ -2,6 +2,7 @@
 
 #include "acppnode/common/rule_types.hpp"
 #include "acppnode/features/policy/request_policy.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <memory>
 #include <string_view>
@@ -9,9 +10,8 @@
 
 namespace acpp::rule {
 
-// XrayR common/rule.Manager counterpart.
 // Owned by one Worker and accessed only on that Worker's io_context.
-class Manager final : public features::policy::RequestPolicy {
+class Manager final : public features::policy::RequestPolicy, public memory::ThreadAllocated {
 public:
     Manager();
     ~Manager();
@@ -22,7 +22,6 @@ public:
     Manager& operator=(Manager&&) noexcept;
 
     void UpdateRule(std::string_view tag, const std::vector<DetectRule>& new_rule_list);
-    [[nodiscard]] bool HasRule(std::string_view tag) const noexcept;
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
 private:

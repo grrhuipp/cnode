@@ -12,15 +12,9 @@ namespace acpp::app {
 class RequestLoadState final {
 public:
     RequestLoadState(uint32_t pressure_threshold,
-                     uint32_t pressure_idle_timeout) noexcept {
-        Configure(pressure_threshold, pressure_idle_timeout);
-    }
-
-    void Configure(uint32_t pressure_threshold,
-                   uint32_t pressure_idle_timeout) noexcept {
-        pressure_threshold_ = std::max<uint32_t>(pressure_threshold, 1);
-        pressure_idle_timeout_ = pressure_idle_timeout;
-    }
+                     uint32_t pressure_idle_timeout) noexcept
+        : pressure_threshold_(std::max<uint32_t>(pressure_threshold, 1)),
+          pressure_idle_timeout_(pressure_idle_timeout) {}
 
     [[nodiscard]] uint32_t ActiveConnections() const noexcept {
         return std::max(physical_connections_, active_dispatches_);
@@ -75,8 +69,8 @@ public:
 private:
     uint32_t physical_connections_ = 0;
     uint32_t active_dispatches_ = 0;
-    uint32_t pressure_threshold_ = 1;
-    uint32_t pressure_idle_timeout_ = 0;
+    const uint32_t pressure_threshold_;
+    const uint32_t pressure_idle_timeout_;
 };
 
 }  // namespace acpp::app

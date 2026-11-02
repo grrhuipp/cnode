@@ -32,7 +32,6 @@ struct SsOutboundConfig {
     uint16_t               port    = 8388;
     StreamSettings         stream_settings;
     OutboundBind           send_through;
-    std::chrono::seconds   timeout{10};
     std::optional<SsUotVersion> uot_version;
 };
 
@@ -42,12 +41,17 @@ struct SsOutboundConfig {
 // ============================================================================
 namespace proxy::shadowsocks::outbound {
 
+struct PreparedSettings {
+    SsOutboundConfig config;
+    Credentials credentials;
+};
+
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::SsOutboundConfig& config,
-            const Credentials& credentials,
-            ::acpp::app::dns::DNS& dns_service);
+    Handler(std::string_view tag,
+            std::shared_ptr<const PreparedSettings> prepared,
+            ::acpp::app::dns::DNS& dns_service,
+            std::chrono::seconds dial_timeout);
 
     ~Handler() noexcept override = default;
 
@@ -66,9 +70,9 @@ public:
     [[nodiscard]] std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    const ::acpp::SsOutboundConfig config_;
-    const Credentials credentials_;
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const PreparedSettings> prepared_;
+    std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
 };
 

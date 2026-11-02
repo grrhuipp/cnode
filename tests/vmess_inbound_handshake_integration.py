@@ -1,12 +1,13 @@
-"""Exercise VMess inbound handshake success, EOF, and timeout on loopback."""
+"""Exercise segmented VMess/Trojan handshakes, EOF, and timeout on loopback."""
 import argparse
 import asyncio
+import hashlib
 import json
 import struct
 import uuid
 from pathlib import Path
 
-from anytls_fin_integration import Resources, available_port, configure, until
+from anytls_fin_integration import Resources, available_port, configure, target, tls_settings, until
 
 USER = uuid.UUID('b831381d-6324-4d53-ad4f-8cda48b30811')
 PAYLOAD = b'vmess-inbound-handshake-regression'
@@ -78,9 +79,35 @@ async def main(binary, output):
         server = resources.spawn([binary, '--config-dir', server_dir], server_dir / 'child.log')
         await wait_started(server_dir / 'child.log', server)
 
+        async def split_vmess(reader, writer):
+            upstream_reader, upstream_writer = await resources.connect(server_port)
+
+            async def forward(source, destination, fragment):
+                while data := await source.read(65536):
+                    if fragment:
+                        for byte in data:
+                            destination.write(bytes([byte]))
+                            await destination.drain()
+                            await asyncio.sleep(0.001)
+                    else:
+                        destination.write(data)
+                        await destination.drain()
+                if destination.can_write_eof():
+                    destination.write_eof()
+
+            try:
+                await asyncio.gather(
+                    forward(reader, upstream_writer, True),
+                    forward(upstream_reader, writer, False))
+            finally:
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+
+        split_port = await resources.listen(split_vmess)
+
         client_dir = output / 'vmess-client'
         client_dir.mkdir(parents=True, exist_ok=True)
-        configure(client_dir, vless_inbound(front_port), vmess_outbound(server_port))
+        configure(client_dir, vless_inbound(front_port), vmess_outbound(split_port))
         client = resources.spawn([binary, '--config-dir', client_dir], client_dir / 'child.log')
         await wait_started(client_dir / 'child.log', client)
         await probe_vless(front_port, target_port)
@@ -107,7 +134,32 @@ async def main(binary, output):
             silent_writer.close()
             await silent_writer.wait_closed()
         assert server.poll() is None and client.poll() is None
-        print('VMess inbound handshake success, first-read EOF, and silent timeout passed')
+
+        trojan_port = available_port()
+        trojan_dir = output / 'trojan-server'
+        trojan_dir.mkdir(parents=True, exist_ok=True)
+        configure(trojan_dir, {
+            'protocol': 'trojan', 'listen': '127.0.0.1', 'port': trojan_port,
+            'settings': {'clients': [{'password': 'segmented-secret'}]},
+            'streamSettings': tls_settings(True),
+        }, {'protocol': 'freedom', 'settings': {}})
+        trojan = resources.spawn([binary, '--config-dir', trojan_dir], trojan_dir / 'child.log')
+        await wait_started(trojan_dir / 'child.log', trojan)
+        reader, writer = await resources.connect(trojan_port, tls=True)
+        header = (hashlib.sha224(b'segmented-secret').hexdigest().encode() +
+                  b'\r\n\1' + target(target_port) + b'\r\n')
+        for byte in header:
+            writer.write(bytes([byte]))
+            await writer.drain()
+            await asyncio.sleep(0.001)
+        writer.write(PAYLOAD)
+        await writer.drain()
+        assert await asyncio.wait_for(reader.readexactly(len(PAYLOAD)), 6) == PAYLOAD
+        writer.close()
+        await writer.wait_closed()
+        assert received == [PAYLOAD, PAYLOAD], 'segmented handshake lost or duplicated payload'
+        assert trojan.poll() is None
+        print('byte-segmented VMess/Trojan handshakes, first-read EOF, and silent timeout passed')
     finally:
         await resources.close()
         assert not resources.errors, '; '.join(resources.errors)

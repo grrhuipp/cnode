@@ -7,6 +7,7 @@
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/inbound_listen.hpp"
 #include "acppnode/transport/internet/proxy_protocol_mode.hpp"
+#include "acppnode/proxy/freedom_domain_strategy.hpp"
 
 #include <chrono>
 #include <string>
@@ -32,7 +33,8 @@ struct PanelConfig {
     InboundListen ListenIP;
     OutboundBind SendIP = OutboundBind::Auto();
     bool EnableDNS = true;
-    std::string DNSType;
+    proxy::freedom::outbound::DomainStrategy DNSType =
+        proxy::freedom::outbound::DomainStrategy::UseIP;
     ProxyProtocolMode ProxyProtocol = ProxyProtocolMode::Auto; // off / auto / on
 
     // TLS 能力配置。

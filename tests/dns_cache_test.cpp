@@ -74,21 +74,21 @@ void TestFailedInsertion(bool negative) {
         }
         if (rejected) {
             ++failures;
-            const auto old = cache.Get(domains[0]);
+            const auto old = cache.GetResult(domains[0]);
             Require(old && old->addresses.front() == old_answer.addresses.front(),
                     "failed cache insertion must retain the existing answer");
-            Require(!cache.Get(domains[1]) && cache.GetStats().entries == 1,
+            Require(!cache.GetResult(domains[1]) && cache.GetStats().entries == 1,
                     "failed cache insertion must leave the index and count unchanged");
         } else {
             completed = true;
         }
         cache.Store(domains[1], new_answer);
-        Require(cache.GetStats().entries == 1 && !cache.Get(domains[0]) &&
-                    cache.Get(domains[1])->addresses.size() == new_answer.addresses.size(),
+        Require(cache.GetStats().entries == 1 && !cache.GetResult(domains[0]) &&
+                    cache.GetResult(domains[1])->addresses.size() == new_answer.addresses.size(),
                 "insertion after a fault must retain one indexed entry with correct ownership");
         cache.Store(domains[0], old_answer);
-        Require(cache.GetStats().entries == 1 && cache.Get(domains[0]) &&
-                    !cache.Get(domains[1]),
+        Require(cache.GetStats().entries == 1 && cache.GetResult(domains[0]) &&
+                    !cache.GetResult(domains[1]),
                 "later eviction must not encounter an orphaned cache node");
         if (completed) break;
     }
@@ -100,42 +100,42 @@ void TestCapacityAndResults() {
     const auto answer = Answer("192.0.2.3");
     cache.Store("one.example", answer);
     cache.Store("two.example", answer);
-    Require(cache.Get("one.example") && cache.Get("two.example") &&
+    Require(cache.GetResult("one.example") && cache.GetResult("two.example") &&
                 cache.GetStats().entries == 2,
             "a Worker cache must make its full capacity available to arbitrary domains");
     cache.Store("three.example", answer);
-    Require(!cache.Get("one.example") && cache.Get("two.example") &&
-                cache.Get("three.example") && cache.GetStats().entries == 2,
+    Require(!cache.GetResult("one.example") && cache.GetResult("two.example") &&
+                cache.GetResult("three.example") && cache.GetStats().entries == 2,
             "insertion must evict the oldest write only after reaching capacity");
 
     DnsResult negative;
     negative.error = acpp::ErrorCode::DNS_NO_RECORD;
     negative.ttl = 1;
     cache.Store("two.example", negative);
-    const auto cached_negative = cache.Get("two.example");
-    Require(cached_negative && cached_negative->negative &&
+    const auto cached_negative = cache.GetResult("two.example");
+    Require(cached_negative && cached_negative->error == acpp::ErrorCode::DNS_NO_RECORD &&
                 cached_negative->addresses.empty() && cached_negative->ttl <= 10,
             "negative answers must replace positives and clamp the TTL");
     auto cached_answer = answer;
     cached_answer.ttl = 1;
     cache.Store("two.example", cached_answer);
-    Require(!cache.Get("two.example")->negative && cache.Get("two.example")->ttl <= 10,
+    Require(cache.GetResult("two.example")->Ok() && cache.GetResult("two.example")->ttl <= 10,
             "positive answers must replace negatives and clamp the TTL");
 
     DnsResult temporary_failure;
     temporary_failure.error = acpp::ErrorCode::DNS_RESOLVE_FAILED;
     cache.Store("two.example", temporary_failure);
-    Require(cache.Get("two.example").has_value(),
+    Require(cache.GetResult("two.example").has_value(),
             "temporary failures must not replace valid cached data");
     DnsCache expired(1, 0, 600);
     cached_answer.ttl = 0;
     expired.Store("two.example", cached_answer);
-    Require(!expired.Get("two.example") && expired.GetStats().entries == 0,
+    Require(!expired.GetResult("two.example") && expired.GetStats().entries == 0,
             "expired entries must be removed from both ownership and statistics");
 
     DnsCache disabled(0, 10, 600);
     disabled.Store("one.example", answer);
-    Require(!disabled.Get("one.example") && disabled.GetStats().entries == 0,
+    Require(!disabled.GetResult("one.example") && disabled.GetStats().entries == 0,
             "disabled caches must retain no entries");
 }
 
@@ -153,7 +153,7 @@ void TestFailedReplacement() {
             failed = true;
         }
     }
-    Require(failed && cache.Get("same.example")->addresses.front() == original.addresses.front(),
+    Require(failed && cache.GetResult("same.example")->addresses.front() == original.addresses.front(),
             "failed replacement must retain the complete old answer");
 }
 

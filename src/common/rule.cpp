@@ -18,7 +18,7 @@ using InboundRule =
                                     TransparentStringEq>;
 }  // namespace
 
-struct Manager::Impl {
+struct Manager::Impl : memory::ThreadAllocated {
     InboundRule rules;
 };
 
@@ -43,21 +43,15 @@ void Manager::UpdateRule(std::string_view tag,
         return;
     }
 
-    auto it = impl_->rules.find(tag);
+    RuleList candidate(new_rule_list.begin(), new_rule_list.end());
+    const auto it = impl_->rules.find(tag);
     if (it == impl_->rules.end()) {
-        it = impl_->rules.try_emplace(memory::ThreadLocalString(tag)).first;
-    }
-    auto& rules = it->second;
-    rules.clear();
-    rules.reserve(new_rule_list.size());
-    for (const auto& rule : new_rule_list) {
-        rules.push_back(rule);
+        impl_->rules.try_emplace(memory::ThreadLocalString(tag), std::move(candidate));
+    } else {
+        it->second.swap(candidate);
     }
 }
 
-bool Manager::HasRule(std::string_view tag) const noexcept {
-    return impl_->rules.find(tag) != impl_->rules.end();
-}
 
 bool Manager::Blocked(const session::Context& ctx) {
     if (ctx.inbound.user_id <= 0) {
@@ -69,23 +63,16 @@ bool Manager::Blocked(const session::Context& ctx) {
         return false;
     }
 
-    // Worker-local scratch avoids a per-request destination string allocation.
-    thread_local std::string destination;
+    memory::ThreadLocalString destination;
     ctx.outbound.target.ToStringInto(destination);
 
-    int hit_rule_id = -1;
     for (const auto& rule : rules_it->second) {
         if (std::regex_search(destination.begin(), destination.end(), rule.Pattern)) {
-            hit_rule_id = rule.ID;
-            break;
+            return true;
         }
     }
 
-    if (hit_rule_id < 0) {
-        return false;
-    }
-
-    return true;
+    return false;
 }
 
 }  // namespace acpp::rule

@@ -4,7 +4,7 @@
 
 namespace acpp {
 
-std::expected<const json::object*, std::string>
+tl::expected<const json::object*, std::string>
 ParseJsonObject(
     const json::object& source,
     std::string_view key) {
@@ -13,7 +13,7 @@ ParseJsonObject(
         return nullptr;
     }
     if (!raw->is_object()) {
-        return std::unexpected(std::format("{} must be an object", key));
+        return tl::unexpected(std::format("{} must be an object", key));
     }
     return &raw->as_object();
 }

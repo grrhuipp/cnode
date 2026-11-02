@@ -1,5 +1,6 @@
 #pragma once
 #include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/common/allocator.hpp"
 // ============================================================================
 // Worker 私有连接限制器 (Per-Worker Rate Limiter)
 //
@@ -74,7 +75,7 @@ struct RateLimitConfig {
 // ============================================================================
 // ConnectionLimiter — Worker 私有无锁连接与认证屏蔽限制器
 // ============================================================================
-class ConnectionLimiter {
+class ConnectionLimiter : public memory::ThreadAllocated {
     static constexpr size_t kSlotCount = 16384;
     static_assert((kSlotCount & (kSlotCount - 1)) == 0,
                   "kSlotCount must be power of 2");
@@ -109,12 +110,14 @@ public:
         MAX_CONNECTIONS,
         MAX_CONNECTIONS_PER_IP,
         IP_BANNED,
+        TRACKING_CAPACITY,
     };
 
     [[nodiscard]] static const char* RejectReasonToString(
         RejectReason r) noexcept {
         static constexpr const char* kNames[] = {
-            "NONE", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "IP_BANNED"};
+            "NONE", "MAX_CONNECTIONS", "MAX_CONNECTIONS_PER_IP", "IP_BANNED",
+            "TRACKING_CAPACITY"};
         return kNames[static_cast<size_t>(r)];
     }
 
@@ -154,7 +157,7 @@ public:
         const uint64_t h = Hash(ip);
         Slot* s = FindOrCreate(h, now);
         if (!s) {
-            return RejectReason::NONE;
+            return RejectReason::TRACKING_CAPACITY;
         }
         if (s->conns >= cfg_.max_conn_per_ip) {
             return RejectReason::MAX_CONNECTIONS_PER_IP;
@@ -169,6 +172,7 @@ public:
         }
     }
 
+    // IP reservations are independent of physical/logical global ownership.
     void ReleaseHash(uint64_t ip_hash) noexcept {
         if (cfg_.max_conn_per_ip > 0 && ip_hash != 0) {
             if (Slot* s = Find(ip_hash)) {
@@ -177,11 +181,6 @@ public:
                 }
             }
         }
-        ReleaseGlobal();
-    }
-
-    void Release(std::string_view ip) noexcept {
-        ReleaseHash(cfg_.max_conn_per_ip > 0 ? Hash(ip) : 0);
     }
 
     void OnAuthFailTracked(std::string_view tag, std::string_view ip) noexcept {

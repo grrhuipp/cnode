@@ -6,7 +6,6 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "registration.hpp"
 
-#include <concepts>
 #include <iostream>
 #include <stdexcept>
 
@@ -15,19 +14,6 @@ class DNS {};
 }  // namespace acpp::app::dns
 
 namespace {
-
-using OutboundCreator = acpp::proxyman::outbound::PreparedOutboundCreator;
-static_assert(std::invocable<
-    OutboundCreator&,
-    std::string_view,
-    acpp::net::io_context&,
-    acpp::app::dns::DNS&,
-    std::chrono::seconds>);
-static_assert(!std::invocable<
-    OutboundCreator&,
-    acpp::net::io_context&,
-    acpp::app::dns::DNS&,
-    std::chrono::seconds>);
 
 template <typename Exception, typename Function>
 bool Throws(Function&& function) {
@@ -62,11 +48,11 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    std::expected<
+    tl::expected<
         acpp::InboundDatagramResult,
         acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest&) override {
-        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+        return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
@@ -297,12 +283,17 @@ bool TestInboundRegistration() {
         return false;
     }
     constexpr std::string_view kAliasTag = "alias-tag";
-    acpp::proxyman::inbound::UserStore::ApplyUsers(kAliasTag, *users);
-    acpp::proxyman::inbound::UserStore::ClearUsers(
-        *acpp::proxyman::inbound::RegisteredUserProtocol("vmess-alias"),
-        kAliasTag);
-    if (acpp::proxyman::inbound::UserStore::SizeForProtocolTag(
-            acpp::proxyman::inbound::UserProtocol::Vmess, kAliasTag) != 0) {
+    using acpp::proxyman::inbound::UserStore;
+    auto published = UserStore::PrepareUsers(kAliasTag, *users);
+    auto view = UserStore::PrepareWorkerView(published);
+    UserStore::CommitSnapshot(std::move(published));
+    UserStore::InstallWorkerView(std::move(view));
+    auto cleared = UserStore::PrepareClearUsers(
+        *acpp::proxyman::inbound::RegisteredUserProtocol("vmess-alias"), kAliasTag);
+    view = UserStore::PrepareWorkerView(cleared);
+    UserStore::CommitSnapshot(std::move(cleared));
+    UserStore::InstallWorkerView(std::move(view));
+    if (!UserStore::VmessUsers(kAliasTag).empty()) {
         return false;
     }
 

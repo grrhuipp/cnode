@@ -8,19 +8,19 @@
 #include "acppnode/features/routing/dispatcher.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/session.hpp"
-#include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/app/udp_types.hpp"
 #include <span>
-#include <format>
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <utility>
 
@@ -41,12 +41,7 @@ class TrojanUdpReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
 
-    TrojanUdpReader(AsyncStream& src, std::span<const uint8_t> first_packet)
-        : src_(src) {
-        if (!first_packet.empty()) {
-            framer_.Feed(first_packet.data(), first_packet.size());
-        }
-    }
+    explicit TrojanUdpReader(AsyncStream& src) : src_(src) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
@@ -61,14 +56,10 @@ public:
             }
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
+                framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
-            for (buf::Buffer* rb : raw) {
-                if (rb && !rb->IsEmpty()) {
-                    framer_.Feed(rb->Bytes().data(), rb->Len());
-                }
-            }
-            raw.clear();
+            framer_.Feed(std::move(raw));
         }
     }
 
@@ -96,7 +87,7 @@ private:
 // ============================================================================
 
 proxy::trojan::inbound::Handler::Handler(
-    ::acpp::trojan::Validator& validator,
+    ::acpp::UserOnlineTracker& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter)
     : validator_(validator)
@@ -145,37 +136,49 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
     }
     uint8_t* handshake_buf = handshake_guard->Tail().data();
-    const size_t handshake_capacity = handshake_guard->Available();
-    auto read_handshake = [&]() -> net::awaitable<std::expected<size_t, ErrorCode>> {
-        size_t n = 0;
-        try {
-            n = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
-        } catch (const IoSystemError&) {
-            if (stream->ConsumePhaseDeadline()) {
-                LOG_CONN_WARN(ctx, "[Trojan][{}] handshake phase deadline from {}",
-                                  ctx.inbound.tag, ctx.inbound.source_ip);
-                co_return std::unexpected(ErrorCode::TIMEOUT);
+    size_t total_read = 0;
+    auto read_until = [&](size_t required) -> net::awaitable<ErrorCode> {
+        if (required > handshake_guard->Available()) {
+            co_return ErrorCode::PROTOCOL_DECODE_FAILED;
+        }
+        while (total_read < required) {
+            size_t n = 0;
+            try {
+                n = co_await stream->AsyncRead(net::buffer(
+                    handshake_buf + total_read, required - total_read));
+            } catch (const IoSystemError&) {
+                co_return stream->ConsumePhaseDeadline()
+                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED;
             }
-            LOG_CONN_WARN(ctx, "[Trojan][{}] handshake read failed from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            if (n == 0) {
+                if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
+                    co_return ErrorCode::TIMEOUT;
+                }
+                co_return ErrorCode::PROTOCOL_DECODE_FAILED;
+            }
+            total_read += n;
         }
-        if (n == 0 && stream->ConsumePhaseDeadline()) {
-            LOG_CONN_WARN(ctx, "[Trojan][{}] handshake phase deadline from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
-        }
-        if (n == 0 && stream->ConsumeIdleTimeout()) {
-            LOG_CONN_WARN(ctx, "[Trojan][{}] handshake idle timeout from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return std::unexpected(ErrorCode::TIMEOUT);
-        }
-        if (n == 0) co_return std::unexpected(ErrorCode::SOCKET_EOF);
-        co_return n;
+        co_return ErrorCode::OK;
     };
-    auto read_result = co_await read_handshake();
-    if (!read_result) co_return fail_abortive(read_result.error());
-    const size_t total_read = *read_result;
+    // The credential prefix, address and terminal CRLF are independently
+    // framed. Incomplete TCP segments never reach authentication.
+    if (auto error = co_await read_until(59); error != ErrorCode::OK) {
+        co_return fail_abortive(error);
+    }
+    while (true) {
+        auto address = DecodeAddress(
+            std::span(handshake_buf + 59, total_read - 59),
+            AddressWireFormat::Socks5, {253, true});
+        if (address.status == AddressDecodeStatus::Invalid) {
+            co_return fail_abortive(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        const size_t required = 59 + (address.status == AddressDecodeStatus::Complete
+            ? address.consumed + 2 : address.required);
+        if (auto error = co_await read_until(required); error != ErrorCode::OK) {
+            co_return fail_abortive(error);
+        }
+        if (address.status == AddressDecodeStatus::Complete) break;
+    }
 
     size_t consumed = 0;
     auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
@@ -187,12 +190,9 @@ proxy::trojan::inbound::Handler::Process(
     }
 
     const std::string_view password_hash = request->PasswordHashView();
-    auto user_info = validator_.FindUser(tag, password_hash);
+    auto user_info = proxyman::inbound::UserStore::FindTrojanUser(tag, password_hash);
     if (!user_info) {
-        LOG_NET_WARN("[{}] Trojan auth failed from {} hash={}...{}",
-                      tag, client_ip,
-                      password_hash.substr(0, 8),
-                      password_hash.substr(password_hash.size() > 8 ? password_hash.size() - 4 : 0));
+        LOG_NET_WARN("[{}] Trojan auth failed from {}", tag, client_ip);
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(tag, client_ip);
         }
@@ -200,8 +200,8 @@ proxy::trojan::inbound::Handler::Process(
     }
 
     uint64_t tracked_uid = 0;
-    if (user_info->profile) {
-        const auto& profile = *user_info->profile;
+    {
+        const auto& profile = user_info->profile;
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
@@ -234,15 +234,10 @@ proxy::trojan::inbound::Handler::Process(
     ctx.outbound.target = std::move(request->target);
     ctx.content.network = net;
 
-    std::span<const uint8_t> leftover;
-    if (consumed < total_read) {
-        leftover = std::span<const uint8_t>(handshake_buf + consumed,
-                                            total_read - consumed);
-    }
+    handshake_guard = {};
 
     if (net == Network::UDP) {
-        TrojanUdpReader udp_reader(*stream, leftover);
-        handshake_guard = buf::BufferGuard{};
+        TrojanUdpReader udp_reader(*stream);
         TrojanUdpWriter udp_writer(*stream);
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -255,26 +250,13 @@ proxy::trojan::inbound::Handler::Process(
             timeouts);
     }
 
-    InitialPayload first_packet;
-    if (leftover.empty()) {
-        handshake_guard = buf::BufferGuard{};
-    } else if (leftover.size() <= InitialPayload::kInlineSize) {
-        first_packet.assign(leftover);
-        handshake_guard = buf::BufferGuard{};
-    } else {
-        handshake_guard->Produce(static_cast<uint32_t>(total_read));
-        handshake_guard->Advance(static_cast<uint32_t>(consumed));
-        buf::MultiBuffer mb;
-        mb.push_back(std::move(handshake_guard));
-        first_packet = InitialPayload(std::move(mb));
-    }
     auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
         io_context,
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
-        std::move(first_packet),
+        InitialPayload{},
         ctx,
         *stats_,
         timeouts);
@@ -293,7 +275,7 @@ public:
         return validator.GetOnlineDevices(tag);
     }
 
-    acpp::trojan::Validator validator;
+    acpp::UserOnlineTracker validator;
 };
 
 const bool kTrojanInboundRegistered = [] {
@@ -348,11 +330,11 @@ const bool kTrojanInboundRegistered = [] {
             users.reserve(runtime_users.size());
 
             for (const auto& runtime_user : runtime_users) {
-                if (runtime_user.password.empty()) {
-                    continue;
+                if (runtime_user.credential.empty()) {
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedTrojanUser info;
-                const auto hash = acpp::trojan::HashPassword(runtime_user.password);
+                const auto hash = acpp::trojan::HashPassword(runtime_user.credential);
                 info.password_hash.assign(hash.data(), hash.size());
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;

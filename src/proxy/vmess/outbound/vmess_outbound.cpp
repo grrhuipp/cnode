@@ -143,18 +143,15 @@ private:
 // proxy/vmess/outbound.Handler 实现
 // ============================================================================
 
-proxy::vmess::outbound::Handler::Handler(std::string tag,
-                                         const VMessOutboundConfig& config,
-                                         const ::acpp::vmess::MemoryAccount& user,
-                                         ::acpp::app::dns::DNS& dns_service)
-    : tag_(std::move(tag))
-    , config_(config)
-    , user_(user)
-    , dns_service_(dns_service) {
+proxy::vmess::outbound::Handler::Handler(
+    std::string_view tag, std::shared_ptr<const PreparedSettings> prepared,
+    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
+    : tag_(tag), prepared_(std::move(prepared)), dial_timeout_(dial_timeout),
+      dns_service_(dns_service) {
     LOG_DEBUG("VMess outbound '{}' created: {}:{}, network={}, security={}",
-              tag_, config_.address, config_.port,
-              config_.stream_settings.network,
-              config_.stream_settings.security);
+              tag_, prepared_->config.address, prepared_->config.port,
+              prepared_->config.stream_settings.network,
+              prepared_->config.stream_settings.security);
 }
 
 net::awaitable<OutboundProcessResult>
@@ -170,43 +167,43 @@ proxy::vmess::outbound::Handler::Process(
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const auto& target = ctx.outbound.target;
 
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_service_,
-        .address = config_.address,
-        .literal_address = config_.literal_address,
-        .port = config_.port,
-        .stream_settings = &config_.stream_settings,
-        .timeout = config_.timeout,
-        .send_through = &config_.send_through,
+        .address = prepared_->config.address,
+        .literal_address = prepared_->config.literal_address,
+        .port = prepared_->config.port,
+        .stream_settings = &prepared_->config.stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &prepared_->config.send_through,
         .inbound_local_addr = inbound_local_addr,
         .inbound_source_ip = ctx.inbound.source_ip,
         .inbound_source_port = ctx.inbound.source_port,
         .tls_server_name = ResolveOutboundTlsServerName(
-            config_.stream_settings, config_.address),
-        .ws_host = config_.address,
+            prepared_->config.stream_settings, prepared_->config.address),
+        .ws_host = prepared_->config.address,
     });
     if (!transport_target) {
         if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", config_.address);
+            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
         }
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
     LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
-                   config_.address, config_.port,
-                   config_.stream_settings.security,
-                   config_.stream_settings.network);
+                   prepared_->config.address, prepared_->config.port,
+                   prepared_->config.stream_settings.security,
+                   prepared_->config.stream_settings.network);
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
     if (!dial_result.Ok()) {
         LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -223,9 +220,9 @@ proxy::vmess::outbound::Handler::Process(
 
     const bool is_udp = ctx.content.network == Network::UDP;
     ::acpp::vmess::encoding::ClientSession vmess_session(
-        user_,
+        prepared_->user,
         target,
-        config_.security,
+        prepared_->config.security,
         is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(*stream);
@@ -237,7 +234,7 @@ proxy::vmess::outbound::Handler::Process(
         LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
                       ctx.conn_id, ErrorCodeToString(code));
         stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : code);
     }
@@ -396,21 +393,16 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        struct PreparedVmessState {
-            acpp::VMessOutboundConfig config;
-            acpp::vmess::MemoryAccount user;
-        };
+        using PreparedSettings = acpp::proxy::vmess::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            PreparedVmessState,
+            PreparedSettings,
             +[](std::string_view tag,
-                const PreparedVmessState& state,
+                std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = state.config;
-                runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vmess::outbound::Handler>(
-                    std::string(tag), runtime_config, state.user, dns);
-            }>(PreparedVmessState{std::move(vmess_config), std::move(*user)});
+                    tag, std::move(state), dns, timeout);
+            }>(PreparedSettings{std::move(vmess_config), std::move(*user)});
     }), true);
 }  // namespace

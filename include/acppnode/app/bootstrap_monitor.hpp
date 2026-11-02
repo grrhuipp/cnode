@@ -1,5 +1,7 @@
 #pragma once
 
+#include "acppnode/common/asio_types.hpp"
+
 #include <memory>
 
 namespace acpp {
@@ -17,6 +19,8 @@ public:
     RuntimeMonitor& operator=(RuntimeMonitor&&) = delete;
 
     void Start();
+    void RequestStop() noexcept;
+    net::awaitable<void> AsyncJoin();
 
 private:
     struct Impl;

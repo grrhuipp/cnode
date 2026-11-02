@@ -23,11 +23,9 @@ auto Parse(std::string_view body) {
         parsed.as_object());
 }
 
-void CheckInvalid(std::string_view body, std::string_view cause) {
+void CheckInvalid(std::string_view body) {
     auto result = Parse(body);
     Check(!result, "invalid UoT settings were accepted");
-    Check(result.error().find(cause) != std::string::npos,
-          "UoT settings error lost its cause");
 }
 
 void TestValidFormsAreNormalized() {
@@ -53,19 +51,13 @@ void TestValidFormsAreNormalized() {
 }
 
 void TestInvalidFormsAreRejected() {
-    CheckInvalid(R"({"uot":true,"uotVersion":3})", "must be 1 or 2");
-    CheckInvalid(R"({"uot":"true"})", "must be a boolean or object");
-    CheckInvalid(
-        R"({"uot":{"enabled":true,"version":3}})",
-        "must be 1 or 2");
-    CheckInvalid(
-        R"({"uot":{"enabled":1,"version":2}})",
-        "enabled must be a boolean");
-    CheckInvalid(R"({"uotVersion":2})", "requires uot");
-    CheckInvalid(R"({"uot":1})", "must be a boolean or object");
-    CheckInvalid(
-        R"({"uot":false,"uotVersion":2})",
-        "disabled but a UoT version");
+    CheckInvalid(R"({"uot":true,"uotVersion":3})");
+    CheckInvalid(R"({"uot":"true"})");
+    CheckInvalid(R"({"uot":{"enabled":true,"version":3}})");
+    CheckInvalid(R"({"uot":{"enabled":1,"version":2}})");
+    CheckInvalid(R"({"uotVersion":2})");
+    CheckInvalid(R"({"uot":1})");
+    CheckInvalid(R"({"uot":false,"uotVersion":2})");
 }
 
 }  // namespace

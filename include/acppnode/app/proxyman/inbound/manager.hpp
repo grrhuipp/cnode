@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/rate_limiter_fwd.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <memory>
 #include <string>
@@ -24,7 +25,7 @@ struct DatagramHandlerBuildResult;
 // 对齐 xray-core features/inbound.Manager 的职责边界。它只在 Worker 线程访问，
 // 不加锁；跨线程控制面操作只能经所属 Worker 的有界 mailbox 投递。
 // ============================================================================
-class Manager final {
+class Manager final : public memory::ThreadAllocated {
 public:
     explicit Manager(StatsShard& stats);
     ~Manager() noexcept;

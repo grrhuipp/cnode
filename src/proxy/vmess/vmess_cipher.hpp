@@ -13,11 +13,12 @@
 
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
+#include "../aead.hpp"
 
 #include <array>
 #include <memory>
-#include <optional>
 #include <cstdint>
+#include <openssl/ossl_typ.h>
 
 namespace acpp {
 namespace vmess {
@@ -31,12 +32,12 @@ namespace vmess {
 class VMessCipher {
 public:
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
-    ~VMessCipher();
+    ~VMessCipher() = default;
 
     VMessCipher(const VMessCipher&)            = delete;
     VMessCipher& operator=(const VMessCipher&) = delete;
-    VMessCipher(VMessCipher&& other) noexcept;
-    VMessCipher& operator=(VMessCipher&& other) noexcept;
+    VMessCipher(VMessCipher&& other) noexcept = default;
+    VMessCipher& operator=(VMessCipher&& other) noexcept = default;
 
     // AEAD tag 大小（GCM_TAG_SIZE = 16）
     size_t Overhead() const;
@@ -57,14 +58,11 @@ private:
     static void GenerateChaCha20Key(const uint8_t* key16, uint8_t* key32);
 
     Security security_;
-    std::array<uint8_t, 16> key_;
-    std::array<uint8_t, 32> key32_;   // ChaCha20 扩展密钥
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
-    void* enc_ctx_          = nullptr;  // EVP_CIPHER_CTX*，加密上下文
-    void* dec_ctx_          = nullptr;  // EVP_CIPHER_CTX*，解密上下文
-    bool  ctx_initialized_  = false;
+    proxy::AeadEncryptor encryptor_;
+    proxy::AeadDecryptor decryptor_;
 };
 
 // ============================================================================
@@ -89,8 +87,8 @@ public:
 private:
     static constexpr size_t kBufferSize = 512;  // 批量 squeeze 大小
 
-    void* ctx_ = nullptr;  // EVP_MD_CTX*
-    alignas(64) uint8_t            buffer_[kBufferSize];
+    EVP_MD_CTX* ctx_ = nullptr;
+    uint8_t buffer_[kBufferSize];
     size_t                         offset_      = kBufferSize;  // 初始为满，触发首次 Refill
 
     void Refill();

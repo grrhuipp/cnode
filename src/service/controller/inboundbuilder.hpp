@@ -15,6 +15,7 @@ namespace acpp::controller {
 struct InboundBuild {
     std::string         protocol;
     std::string         tag;
+    std::string         accounting_key;
     StreamSettings      stream_settings;
     SniffConfig         sniff;
     proxyman::inbound::BuildRequest handler_request;

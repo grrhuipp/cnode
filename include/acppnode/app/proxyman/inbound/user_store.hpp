@@ -17,13 +17,9 @@
 
 namespace acpp::proxyman::inbound {
 
-// ============================================================================
-// UserStore - process-wide inbound user RCU store
-//
-// Authentication users are immutable snapshots shared by all workers. Cold-path
-// updates publish a new snapshot; hot-path validation only loads shared read-only
-// views and performs protocol-specific matching without locks.
-// ============================================================================
+// One immutable process-wide user table, published only on the cold path.
+// Each Worker installs an independent lease; hot aliases share only that
+// Worker's control block and keep retired credentials alive for active sessions.
 class UserStore final {
 public:
     struct Array16Hash {
@@ -42,18 +38,18 @@ public:
         std::array<uint8_t, 16> cmd_key{};
         std::array<uint8_t, 16> auth_key{};
         std::array<uint8_t, 16> cached_auth_aes_key{};
-        std::shared_ptr<const Profile> profile;
+        Profile profile;
     };
 
     struct TrojanCredential {
         std::string password_hash;
-        std::shared_ptr<const Profile> profile;
+        Profile profile;
     };
 
     struct VlessCredential {
         std::array<uint8_t, 16> uuid_bytes{};
         std::string flow;
-        std::shared_ptr<const Profile> profile;
+        Profile profile;
     };
 
     struct ShadowsocksCredential {
@@ -64,12 +60,12 @@ public:
         PreparedAeadCipher cipher_type = PreparedAeadCipher::AES_256_GCM;
         size_t key_size = 32;
         size_t salt_size = 32;
-        std::shared_ptr<const Profile> profile;
+        Profile profile;
     };
 
     struct AnyTlsCredential {
         std::array<uint8_t, 32> password_hash{};
-        std::shared_ptr<const Profile> profile;
+        Profile profile;
     };
 
     using VmessUserMap =
@@ -134,35 +130,33 @@ public:
         }
     };
 
-    struct Stats {
-        size_t vmess_accounts = 0;
-        size_t vless_users = 0;
-        size_t trojan_users = 0;
-        size_t shadowsocks_users = 0;
-        size_t anytls_users = 0;
+    struct Snapshot;
+    using PublishedSnapshot = std::shared_ptr<const Snapshot>;
+    struct WorkerLease;
+    using WorkerView = std::shared_ptr<const WorkerLease>;
+    struct UserUpdate;
 
-        [[nodiscard]] size_t TotalUsers() const noexcept {
-            return vmess_accounts + vless_users + trojan_users +
-                   shadowsocks_users + anytls_users;
-        }
-    };
+    // Control-plane gate must serialize prepare/install/commit or rollback.
+    // Preparation never mutates global or Worker state; callers allocate every
+    // forward and rollback lease before starting bounded Worker operations.
+    [[nodiscard]] static PublishedSnapshot CaptureSnapshot();
+    [[nodiscard]] static PublishedSnapshot PrepareUsers(
+        std::span<const UserUpdate> updates);
+    [[nodiscard]] static PublishedSnapshot PrepareUsers(
+        std::string_view tag, const UserSet& users);
+    [[nodiscard]] static PublishedSnapshot PrepareClearUsers(
+        UserProtocol protocol, std::string_view tag);
+    static void CommitSnapshot(PublishedSnapshot snapshot) noexcept;
+    // Install/Clear execute only on the destination Worker's thread.
+    [[nodiscard]] static WorkerView PrepareWorkerView(PublishedSnapshot snapshot);
+    static void InstallWorkerView(WorkerView view) noexcept;
+    static void ClearWorkerView() noexcept;
+    [[nodiscard]] static uint64_t WorkerViewRevision() noexcept;
 
     struct UserUpdate {
         std::string_view tag;
         const UserSet& users;
     };
-
-    static void ApplyUsers(std::string_view tag,
-                           const UserSet& users);
-    // Synchronous cold-path batch: all updates publish in one RCU snapshot.
-    // Allocation failure leaves the previously published snapshot untouched.
-    static void ApplyUsers(std::span<const UserUpdate> updates);
-    static void AddUsers(std::string_view tag,
-                         const UserSet& users);
-    static void RemoveUsers(std::string_view tag,
-                            const UserSet& users);
-    static void ClearUsers(UserProtocol protocol,
-                           std::string_view tag);
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);
     [[nodiscard]] static VlessUsersView VlessUsers(std::string_view tag);
@@ -176,9 +170,7 @@ public:
     FindAnyTlsUser(std::string_view tag,
                    const std::array<uint8_t, 32>& password_hash);
 
-    [[nodiscard]] static Stats GetStats();
-    [[nodiscard]] static size_t SizeForProtocolTag(UserProtocol protocol,
-                                                   std::string_view tag);
+    [[nodiscard]] static size_t TotalUsers();
 };
 
 }  // namespace acpp::proxyman::inbound

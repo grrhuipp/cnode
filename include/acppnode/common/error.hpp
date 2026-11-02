@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <string>
 #include <string_view>
 
@@ -7,13 +8,25 @@
 
 namespace acpp {
 
+// Match only actual asynchronous-operation cancellation. A real failure that
+// races shutdown must retain its identity and must not be reported as success.
+[[nodiscard]] inline bool IsOperationCancelled(const std::exception_ptr& failure) noexcept {
+    if (!failure) return false;
+    try {
+        std::rethrow_exception(failure);
+    } catch (const IoSystemError& error) {
+        return error.code() == io_error::operation_aborted;
+    } catch (...) {
+        return false;
+    }
+}
+
 // ============================================================================
 // 错误码定义
 // ============================================================================
 enum class ErrorCode : int {
     // 成功
     OK = 0,
-    SUCCESS = 0,  // 别名
 
     // 通用错误 (1-99)
     TIMEOUT = 1,
@@ -252,15 +265,6 @@ struct ResultStatus {
         error_msg = ErrorMessage(code, msg);
     }
 
-    [[nodiscard]] static ResultStatus Success() {
-        return {};
-    }
-
-    [[nodiscard]] static ResultStatus Fail(ErrorCode code, std::string msg = {}) {
-        ResultStatus result;
-        result.SetError(code, msg);
-        return result;
-    }
 };
 
 // 从 Asio error_code 映射到 ErrorCode

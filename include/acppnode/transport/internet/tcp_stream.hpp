@@ -3,6 +3,7 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/internet/proxy_protocol.hpp"
+#include <asio/cancellation_signal.hpp>
 
 #include <chrono>
 #include <memory>
@@ -54,15 +55,7 @@ public:
     tcp::socket::executor_type GetExecutor() noexcept;
     // 仅等待底层 socket 可读，不接收数据、不申请 payload Buffer。
     // TLS 层用它将 8KB 申请延后到首个可读事件之后。
-    net::awaitable<IoErrorCode> WaitReadable();
-    tcp::socket& TlsLayerSocket() noexcept;
-    [[nodiscard]] bool TlsLayerCanRead() const noexcept;
-    [[nodiscard]] bool TlsLayerCanWrite() const noexcept;
-    [[nodiscard]] size_t ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcept;
-    void BeginTlsLayerRead();
-    void EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept;
-    void BeginTlsLayerWrite();
-    void EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept;
+    net::awaitable<IoErrorCode> WaitReadable(net::cancellation_slot cancellation = {});
     tcp::endpoint LocalEndpoint() const;
     tcp::endpoint RemoteEndpoint() const;
     void SetIdleTimeout(std::chrono::seconds timeout);
@@ -106,6 +99,13 @@ protected:
     const TcpStream* BaseTcpStream() const override { return this; }
 
 private:
+    friend class TlsStream;
+    void PrepareTlsIo();
+    [[nodiscard]] bool CanRead() const noexcept;
+    [[nodiscard]] bool CanWrite() const noexcept;
+    [[nodiscard]] std::size_t ReadAvailable(
+        net::mutable_buffer target, IoErrorCode& error) noexcept;
+
     net::awaitable<std::pair<IoErrorCode, std::size_t>> AsyncReceiveSome(
         net::mutable_buffer buffer,
         bool peek = false);

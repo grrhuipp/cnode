@@ -58,31 +58,6 @@ public:
         const uint8_t* payload = nullptr,
         size_t payload_len = 0);
 
-    // UDP 包格式
-    struct UdpPacket {
-        TargetAddress target;
-        std::span<const uint8_t> payload;
-    };
-
-    // UDP 解析结果类型
-    enum class UdpParseResult {
-        SUCCESS,      // 解析成功
-        INCOMPLETE,   // 数据不完整，需要更多数据
-        INVALID       // 格式错误（atype 非法、CRLF 不匹配等）
-    };
-
-    // UDP 解析输出
-    struct UdpParseOutput {
-        UdpParseResult result = UdpParseResult::INCOMPLETE;
-        std::optional<UdpPacket> packet;
-        size_t consumed = 0;
-    };
-
-    // 解析单个 UDP 包。SUCCESS 时 consumed 表示完整 frame 长度；
-    // INCOMPLETE 时保留输入等待更多字节；INVALID 时调用方可丢弃/同步。
-    static UdpParseOutput ParseUdpPacket(
-        const uint8_t* data,
-        size_t len);
 
     // 编码 UDP 包头部（in-place 版本，避免内存分配）
     // 返回实际写入字节数，0 表示失败（缓冲区太小）

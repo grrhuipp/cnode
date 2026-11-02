@@ -2,6 +2,7 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/buf/length_prefixed_packet_buffer.hpp"
 #include "acppnode/common/target_address.hpp"
 #include "acppnode/transport/link.hpp"
 
@@ -28,18 +29,14 @@ public:
     explicit UdpFramer(bool packet_addr) noexcept
         : packet_addr_(packet_addr) {}
 
-    void Feed(const uint8_t* data, size_t len);
+    void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
+    void Finish() const;
 
 private:
-    void Parse();
-    void CompactPending();
-
     bool packet_addr_ = false;
-    memory::ByteVector pending_;
-    size_t pending_offset_ = 0;
-    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
-    bool shrink_queue_on_drain_ = false;
+    bool failed_ = false;
+    buf::LengthPrefixedPacketBuffer pending_;
 };
 
 net::awaitable<void> WriteUdpDatagram(

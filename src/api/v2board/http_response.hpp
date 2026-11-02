@@ -12,7 +12,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
-#include <expected>
+#include <tl/expected.hpp>
 #include <istream>
 #include <limits>
 #include <optional>
@@ -118,13 +118,13 @@ inline std::optional<size_t> FindCrlf(const net::streambuf& buffer) {
 }
 
 template <typename Stream>
-net::awaitable<std::expected<std::string, std::string>> ReadCrlfLine(
+net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
     Stream& stream,
     net::streambuf& buffer) {
     for (;;) {
         if (const auto line_size = FindCrlf(buffer)) {
             if (*line_size > kMaxHttpLineSize) {
-                co_return std::unexpected("HTTP line too large");
+                co_return tl::unexpected("HTTP line too large");
             }
             std::string line(*line_size, '\0');
             std::istream input(&buffer);
@@ -132,12 +132,12 @@ net::awaitable<std::expected<std::string, std::string>> ReadCrlfLine(
             char terminator[2]{};
             input.read(terminator, 2);
             if (!input || terminator[0] != '\r' || terminator[1] != '\n') {
-                co_return std::unexpected("invalid CRLF line");
+                co_return tl::unexpected("invalid CRLF line");
             }
             co_return line;
         }
         if (buffer.size() > kMaxHttpLineSize) {
-            co_return std::unexpected("HTTP line too large");
+            co_return tl::unexpected("HTTP line too large");
         }
 
         auto [read_ec, bytes] = co_await stream.async_read_some(
@@ -146,13 +146,13 @@ net::awaitable<std::expected<std::string, std::string>> ReadCrlfLine(
             buffer.commit(bytes);
         }
         if (read_ec && bytes == 0) {
-            co_return std::unexpected(read_ec.message());
+            co_return tl::unexpected(read_ec.message());
         }
     }
 }
 
 template <typename Stream>
-net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
+net::awaitable<tl::expected<std::string, std::string>> ReadChunkedBody(
     Stream& stream,
     net::streambuf& buffer) {
     std::string decoded;
@@ -160,13 +160,13 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
     for (;;) {
         auto size_line = co_await ReadCrlfLine(stream, buffer);
         if (!size_line) {
-            co_return std::unexpected(
+            co_return tl::unexpected(
                 "invalid chunked HTTP response: " + size_line.error());
         }
 
         const auto chunk_size = ParseChunkSize(*size_line);
         if (!chunk_size) {
-            co_return std::unexpected("invalid chunked HTTP response: invalid chunk size");
+            co_return tl::unexpected("invalid chunked HTTP response: invalid chunk size");
         }
 
         if (*chunk_size == 0) {
@@ -176,7 +176,7 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
             for (;;) {
                 auto trailer = co_await ReadCrlfLine(stream, buffer);
                 if (!trailer) {
-                    co_return std::unexpected(
+                    co_return tl::unexpected(
                         "invalid chunked HTTP response: " + trailer.error());
                 }
                 if (trailer->empty()) {
@@ -189,7 +189,7 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
             *chunk_size > kMaxHttpBodySize - decoded.size() ||
             *chunk_size > static_cast<size_t>(
                 std::numeric_limits<std::streamsize>::max())) {
-            co_return std::unexpected("invalid chunked HTTP response: body too large");
+            co_return tl::unexpected("invalid chunked HTTP response: body too large");
         }
 
         const size_t required = *chunk_size + 2;
@@ -201,7 +201,7 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
                 net::as_tuple(net::use_awaitable));
             (void)body_bytes;
             if (body_ec) {
-                co_return std::unexpected(
+                co_return tl::unexpected(
                     "invalid chunked HTTP response: " + body_ec.message());
             }
         }
@@ -215,7 +215,7 @@ net::awaitable<std::expected<std::string, std::string>> ReadChunkedBody(
         char terminator[2]{};
         body_stream.read(terminator, 2);
         if (!body_stream || terminator[0] != '\r' || terminator[1] != '\n') {
-            co_return std::unexpected(
+            co_return tl::unexpected(
                 "invalid chunked HTTP response: missing chunk terminator");
         }
     }

@@ -16,6 +16,23 @@ public:
     static constexpr size_t kMaxQueuedBytes = 4 * 1024 * 1024;
     static constexpr size_t kMaxQueuedPackets = 1024;
 
+    static constexpr size_t kMaxUploads = 64;
+
+    [[nodiscard]] bool AcquireUpload() noexcept {
+        if (uploads_ == kMaxUploads) return false;
+        ++uploads_;
+        return true;
+    }
+    void ReleaseUpload() noexcept { --uploads_; }
+    [[nodiscard]] bool Reserve(size_t bytes) noexcept {
+        if (bytes > kMaxQueuedBytes - queued_capacity_ - reserved_) return false;
+        reserved_ += bytes;
+        return true;
+    }
+    void Release(size_t bytes) noexcept { reserved_ -= bytes; }
+    [[nodiscard]] size_t UsedCapacity() const noexcept {
+        return queued_capacity_ + reserved_;
+    }
     [[nodiscard]] bool Push(uint64_t seq, buf::MultiBuffer payload) {
         if (seq < next_seq_) {
             payload.clear();
@@ -27,8 +44,9 @@ public:
         }
 
         const size_t bytes = buf::TotalLen(payload);
+        const size_t capacity = payload.size() * buf::Buffer::kSize;
         if (queued_packets_ >= kMaxQueuedPackets ||
-            bytes > kMaxQueuedBytes - queued_bytes_) {
+            capacity > kMaxQueuedBytes - queued_capacity_ - reserved_) {
             payload.clear();
             return false;
         }
@@ -38,6 +56,7 @@ public:
             ready_.push_back(std::move(packet));
             ++queued_packets_;
             queued_bytes_ += bytes;
+            queued_capacity_ += capacity;
             ++next_seq_;
             PromoteReadyPackets();
             return true;
@@ -46,6 +65,7 @@ public:
         pending_.emplace(seq, std::move(packet));
         ++queued_packets_;
         queued_bytes_ += bytes;
+        queued_capacity_ += capacity;
         return true;
     }
 
@@ -55,9 +75,11 @@ public:
             return 0;
         }
         auto& front = ready_.front();
+        const size_t old_blocks = front.payload.size();
         const size_t consumed = front.payload.ConsumePrefixTo(out);
         front.bytes -= std::min(front.bytes, consumed);
         queued_bytes_ -= std::min(queued_bytes_, consumed);
+        queued_capacity_ -= (old_blocks - front.payload.size()) * buf::Buffer::kSize;
         PruneEmptyFront();
         return consumed;
     }
@@ -69,6 +91,7 @@ public:
         }
         QueuedPacket packet = std::move(ready_.front());
         ready_.pop_front();
+        queued_capacity_ -= packet.payload.size() * buf::Buffer::kSize;
         queued_bytes_ -= std::min(queued_bytes_, packet.bytes);
         queued_packets_ -= std::min<size_t>(queued_packets_, 1);
         return std::move(packet.payload);
@@ -79,6 +102,7 @@ public:
         pending_.clear();
         queued_bytes_ = 0;
         queued_packets_ = 0;
+        queued_capacity_ = 0;
     }
 
     [[nodiscard]] bool HasReady() {
@@ -110,6 +134,7 @@ private:
     void PruneEmptyFront() {
         while (!ready_.empty() && !buf::HasData(ready_.front().payload)) {
             queued_bytes_ -= std::min(queued_bytes_, ready_.front().bytes);
+            queued_capacity_ -= ready_.front().payload.size() * buf::Buffer::kSize;
             queued_packets_ -= std::min<size_t>(queued_packets_, 1);
             ready_.pop_front();
         }
@@ -119,6 +144,9 @@ private:
     memory::ThreadLocalMap<uint64_t, QueuedPacket> pending_;
     size_t queued_bytes_ = 0;
     size_t queued_packets_ = 0;
+    size_t queued_capacity_ = 0;
+    size_t reserved_ = 0;
+    size_t uploads_ = 0;
     uint64_t next_seq_ = 0;
 };
 

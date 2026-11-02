@@ -83,17 +83,22 @@ jobs:
         run: |
           if [ '${{ matrix.libc }}' = musl ]; then
             apk add --no-cache build-base binutils ccache cmake ninja git curl \
-              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-cryptography bash file ca-certificates openssl
+              zip unzip tar zstd pkgconf linux-headers musl-dev perl nasm python3 py3-pip py3-cryptography bash file ca-certificates openssl
           else
             # Keep package manpages: update-alternatives must find its targets.
             rm -f /etc/dpkg/dpkg.cfg.d/excludes
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               build-essential binutils ccache cmake ninja-build git curl \
-              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-cryptography ca-certificates openssl
+              zip unzip tar zstd pkg-config perl nasm file linux-libc-dev python3 python3-venv python3-cryptography ca-certificates openssl
           fi
 
       - uses: actions/checkout@v6.0.3
+
+      - name: Install independent protocol test dependencies
+        run: |
+          python3 -m venv --system-site-packages "$BUILD_DIR/test-python"
+          "$BUILD_DIR/test-python/bin/python" -m pip install --only-binary=:all: 'blake3==1.0.8'
 
       - name: Restore compiler cache
         uses: actions/cache/restore@v5.0.5
@@ -110,6 +115,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCNODE_BUILD_TESTS=ON \
+            -DPython3_EXECUTABLE="$PWD/$BUILD_DIR/test-python/bin/python" \
             -DCNODE_TEST_SANITIZERS=${{ matrix.sanitizers }} \
             -DCNODE_RELEASE_DEBUG_SYMBOLS=OFF \
             -DCNODE_RELEASE_FRAME_POINTERS=OFF \

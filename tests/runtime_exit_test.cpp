@@ -1,11 +1,15 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/ip/udp.hpp>
+#include <asio/write.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
 
 #include "panel_http_fixture.hpp"
 
 #include <chrono>
+#include <array>
+#include <atomic>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -48,8 +52,8 @@ bool WriteConfig(const fs::path& root,
         if (i != 0) inbounds << ',';
         inbounds
             << R"({"tag":"shutdown-test-)" << i
-            << R"(","protocol":"vmess","listen":"127.0.0.1","port":)" << ports[i]
-            << R"(,"settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]},"streamSettings":{"network":"tcp","security":"none"}})";
+            << R"(","protocol":"shadowsocks","listen":"127.0.0.1","port":)" << ports[i]
+            << R"(,"settings":{"method":"aes-128-gcm","password":"shutdown-fixture"},"streamSettings":{"network":"tcp","security":"none"}})";
     }
     inbounds << "]\n";
     if (!inbounds) return false;
@@ -179,6 +183,46 @@ bool NodeListening(unsigned short port) {
     return !result;
 }
 
+bool WaitForListeners(unsigned short first, unsigned short second) {
+    const auto deadline = std::chrono::steady_clock::now() + 12s;
+    do {
+        if (NodeListening(first) && NodeListening(second)) return true;
+        std::this_thread::sleep_for(20ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+bool PortsReleased(unsigned short port) {
+    asio::io_context io;
+    std::error_code error;
+    asio::ip::tcp::acceptor tcp(io);
+    tcp.open(asio::ip::tcp::v4(), error);
+    if (error) return false;
+    tcp.set_option(asio::socket_base::reuse_address(true), error);
+    if (error) return false;
+    tcp.bind({asio::ip::address_v4::loopback(), port}, error);
+    if (error) return false;
+    tcp.listen(asio::socket_base::max_listen_connections, error);
+    if (error) return false;
+    asio::ip::udp::socket udp(io, asio::ip::udp::v4());
+    udp.bind({asio::ip::address_v4::loopback(), port}, error);
+    return !error;
+}
+
+void ObservePanelClose(std::shared_ptr<asio::ip::tcp::socket> socket,
+                       std::shared_ptr<std::array<char, 4096>> buffer,
+                       std::atomic<bool>& closed) {
+    socket->async_read_some(asio::buffer(*buffer),
+        [socket, buffer, &closed](const std::error_code& error, size_t) {
+            if (error) {
+                if (error == asio::error::eof || error == asio::error::connection_reset)
+                    closed.store(true, std::memory_order_release);
+                return;
+            }
+            ObservePanelClose(socket, buffer, closed);
+        });
+}
+
 int WaitForReadyNode(const fs::path& path) {
     const auto deadline = std::chrono::steady_clock::now() + 12s;
     do {
@@ -253,10 +297,7 @@ int main(int argc, char** argv) {
         std::ifstream file(output_path, std::ios::binary);
         const std::string output{std::istreambuf_iterator<char>(file), {}};
         const bool valid = expected_ready ? exit_code == 0 && listeners_ready :
-            exit_code == 1 && output.find("Failed to initialize runtime: startup inbound") != std::string::npos &&
-            output.find(test_tag_collision ? "duplicates tag" : "duplicates listen endpoint") != std::string::npos &&
-            output.find("static_inbound ready") == std::string::npos &&
-            output.find("server started") == std::string::npos;
+            exit_code == 1 && !NodeListening(static_port);
         if (!valid) {
             std::cerr << "unexpected " << startup_case << ": exit=" << exit_code << '\n' << output;
             return 16;
@@ -314,13 +355,11 @@ int main(int argc, char** argv) {
                     const auto port = fixture.NodePort();
                     const auto companion = fixture.CompanionPort();
                     lifecycle_valid =
-                        WaitForOutput(output_path, "Panel replay-panel/1 config: ready", 1, 12s) &&
-                        WaitForOutput(output_path, "Panel replay-panel/2 config: ready", 1, 12s) &&
-                        NodeListening(port) && NodeListening(companion) &&
-                        WaitForOutput(root / "logs", "Panel replay-panel/1 sync: unavailable | pull", 1, 8s) &&
+                        WaitForListeners(port, companion) &&
+                        fixture.WaitForConfigStatus(503) &&
                         NodeListening(port) && NodeListening(companion) &&
                         fixture.WaitForUserRequests(2) && NodeListening(port) && NodeListening(companion) &&
-                        WaitForOutput(root / "logs", "Panel replay-panel/1 sync: unavailable | pull", 2, 8s) &&
+                        fixture.WaitForConfigStatus(404) &&
                         NodeListening(port) && NodeListening(companion) &&
                         fixture.WaitForUserRequests(3) &&
                         NodeListening(port) && NodeListening(companion);
@@ -401,12 +440,7 @@ int main(int argc, char** argv) {
         const int exit_code = RunAndSignal(executable, root, output_path, false);
         std::ifstream output_file(output_path, std::ios::binary);
         const std::string output{std::istreambuf_iterator<char>(output_file), {}};
-        if (exit_code != 1 ||
-            output.find("runtime failed phase=inbound-startup") == std::string::npos ||
-            output.find("tag=shutdown-test-1 port=" + std::to_string(port) + " stage=tcp-listen") == std::string::npos ||
-            output.find("status=forced") == std::string::npos ||
-            output.find("server started") != std::string::npos ||
-            output.find("cnode stopped") != std::string::npos) {
+        if (exit_code != 1 || !PortsReleased(ready_port)) {
             std::cerr << "unexpected startup failure exit or diagnostic: " << exit_code << '\n' << output;
             return 10;
         }
@@ -432,6 +466,8 @@ int main(int argc, char** argv) {
     if (!WriteConfig(root, {port}, panel_port)) return 5;
 
     std::shared_ptr<asio::ip::tcp::socket> hanging_panel_socket;
+    std::atomic<bool> panel_connected{false};
+    std::atomic<bool> panel_closed{false};
     auto panel_work = asio::make_work_guard(panel_io);
     panel_acceptor.async_accept(
         [&](const std::error_code& accept_error,
@@ -439,12 +475,43 @@ int main(int argc, char** argv) {
             if (!accept_error) {
                 hanging_panel_socket =
                     std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+                panel_connected.store(true, std::memory_order_release);
+                ObservePanelClose(hanging_panel_socket,
+                    std::make_shared<std::array<char, 4096>>(), panel_closed);
             }
         });
     std::thread panel_thread([&] { panel_io.run(); });
 
     const fs::path output_path = root / "child-output.log";
-    const int exit_code = RunAndSignal(executable, root, output_path, true);
+    asio::ip::tcp::socket held_connection(io_context);
+    bool pending_ready = false;
+    const int exit_code = RunAndSignal(executable, root, output_path, true, [&] {
+        const auto ready_deadline = std::chrono::steady_clock::now() + 8s;
+        while (std::chrono::steady_clock::now() < ready_deadline) {
+            if (panel_connected.load(std::memory_order_acquire) && NodeListening(port)) break;
+            std::this_thread::sleep_for(20ms);
+        }
+        held_connection.connect({asio::ip::address_v4::loopback(), port}, ec);
+        if (ec) return;
+        // A partial AEAD salt leaves a real TCP read pending through SIGTERM.
+        const std::array<unsigned char, 1> partial_salt{0x7a};
+        asio::write(held_connection, asio::buffer(partial_salt), ec);
+        if (ec) return;
+        asio::ip::udp::socket client(io_context, asio::ip::udp::v4());
+        client.send_to(asio::buffer(partial_salt),
+            {asio::ip::address_v4::loopback(), port}, 0, ec);
+        if (ec) return;
+        asio::ip::udp::socket probe(io_context, asio::ip::udp::v4());
+        probe.bind({asio::ip::address_v4::loopback(), port}, ec);
+        pending_ready = ec == asio::error::address_in_use &&
+            panel_connected.load(std::memory_order_acquire);
+    });
+
+    const auto close_deadline = std::chrono::steady_clock::now() + 2s;
+    while (!panel_closed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < close_deadline)
+        std::this_thread::sleep_for(10ms);
+    const bool panel_completed = panel_closed.load(std::memory_order_acquire);
 
     asio::post(panel_io, [&] {
         if (hanging_panel_socket) {
@@ -454,7 +521,6 @@ int main(int argc, char** argv) {
         panel_work.reset();
     });
     panel_thread.join();
-    const bool panel_connected = static_cast<bool>(hanging_panel_socket);
 
     std::ifstream output_file(output_path, std::ios::binary);
     const std::string output{
@@ -464,16 +530,16 @@ int main(int argc, char** argv) {
         std::cerr << "unexpected child exit code: " << exit_code << "\n" << output;
         return 6;
     }
-    if (!panel_connected) {
+    if (!pending_ready || !panel_completed) {
         std::cerr << "child never reached hanging panel endpoint\n" << output;
         return 8;
     }
-    if (output.find("status=forced") == std::string::npos) {
-        std::cerr << "missing forced shutdown diagnostic\n" << output;
-        return 7;
-    }
-    if (output.find("cnode stopped") != std::string::npos) {
-        std::cerr << "forced shutdown entered the runtime teardown path\n" << output;
+    held_connection.non_blocking(true, ec);
+    std::array<char, 1> final_byte{};
+    held_connection.read_some(asio::buffer(final_byte), ec);
+    if ((ec != asio::error::eof && ec != asio::error::connection_reset) ||
+        !PortsReleased(port)) {
+        std::cerr << "joined runtime retained a connection or listener\\n" << output;
         return 9;
     }
 

@@ -76,8 +76,8 @@ public:
 
     ~TlsStream() override;
 
-    // Cold Worker-local sweep; no per-connection timer or cross-thread state.
-    static void CollectIdleBuffersForCurrentThread() noexcept;
+    // Process startup only, before creating Workers. No lazy shared initialization.
+    static void InitializeIo();
 
     // 禁止拷贝
     TlsStream(const TlsStream&) = delete;

@@ -1,4 +1,5 @@
 #include "common/monitor_loop.hpp"
+#include "common/awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/post.hpp>
@@ -83,12 +84,13 @@ void TestIndependentCompletionAndOwnership() {
     Require(exits.size() == 3 && exits[1].failure && exits[2].name == "waiting" &&
                 !exits[2].failure,
             "each exit must retain its own name and failure status");
+    bool original_type = false;
     try {
         std::rethrow_exception(exits[0].failure);
-    } catch (const std::runtime_error& error) {
-        Require(std::string_view(error.what()) == "monitor loop failed",
-                "monitor completion must preserve the original error");
+    } catch (const std::runtime_error&) {
+        original_type = true;
     }
+    Require(original_type, "monitor completion must preserve the original error type");
 }
 
 void TestFactoryFailure() {
@@ -152,6 +154,147 @@ void TestOwnerWithWeakLoopSlots() {
             "owner and loops must be reclaimed after the last exit without a reference cycle");
 }
 
+net::awaitable<void> CleanupLoop(net::steady_timer& work, net::steady_timer& cleanup,
+                                int& starts, bool& cleaning, bool& cleaned) {
+    ++starts;
+    const auto [error] = co_await work.async_wait(net::as_tuple(net::use_awaitable));
+    Require(error == net::error::operation_aborted, "stop must cancel active work");
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    cleaning = true;
+    (void)co_await cleanup.async_wait(net::as_tuple(net::use_awaitable));
+    cleaned = true;
+}
+
+void TestStopJoinsActualCleanup() {
+    net::io_context io;
+    net::steady_timer work(io, net::steady_timer::time_point::max());
+    net::steady_timer cleanup(io, net::steady_timer::time_point::max());
+    int starts = 0;
+    int reports = 0;
+    bool cleaning = false;
+    bool cleaned = false;
+    bool joined = false;
+    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "cleanup",
+        [&] { return CleanupLoop(work, cleanup, starts, cleaning, cleaned); },
+        [&](std::string_view, std::exception_ptr) { ++reports; });
+    loop->Start();
+    io.poll();
+    Require(starts == 1 && !cleaning, "loop must enter active work");
+    loop->RequestStop();
+    loop->RequestStop();
+    loop->Start();
+    net::cancellation_signal join_cancel;
+    net::co_spawn(io, loop->AsyncJoin(),
+        net::bind_cancellation_slot(join_cancel.slot(), [&](std::exception_ptr error) {
+            Require(!error && cleaned, "join must complete only after cleanup");
+            joined = true;
+        }));
+    io.poll();
+    join_cancel.emit(net::cancellation_type::all);
+    io.poll();
+    Require(cleaning && !cleaned && !joined && starts == 1,
+            "cancellation and repeated stop must not bypass actual cleanup");
+    cleanup.cancel();
+    io.run();
+    Require(joined && reports == 0, "intentional shutdown must not report a monitor failure");
+    io.restart();
+    loop->Start();
+    net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
+        Require(!error, "joining an already completed loop must succeed");
+    });
+    io.run();
+    Require(starts == 1, "stopping is terminal and must reject restart");
+}
+
+void TestStopBeforeExecution() {
+    net::io_context io;
+    int starts = 0;
+    int reports = 0;
+    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "queued",
+        [&] { return FailLoop(starts); },
+        [&](std::string_view, std::exception_ptr) { ++reports; });
+    loop->Start();
+    loop->RequestStop();
+    bool joined = false;
+    net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
+        Require(!error, "queued stop must join successfully");
+        joined = true;
+    });
+    io.run();
+    Require(joined && starts == 0 && reports == 0,
+            "a stopped queued loop must not begin new work");
+}
+
+void TestPartialStartFailure() {
+    struct FailingFactory {
+        FailingFactory() = default;
+        FailingFactory(const FailingFactory&) { throw std::bad_alloc(); }
+        net::awaitable<void> operator()() const { co_return; }
+    };
+    net::io_context io;
+    net::steady_timer work(io, net::steady_timer::time_point::max());
+    int starts = 0;
+    auto first = std::make_shared<MonitorLoop>(io.get_executor(), "first",
+        [&] { return WaitLoop(work, starts); },
+        [](std::string_view, std::exception_ptr) {});
+    first->Start();
+    io.poll();
+    bool start_failed = false;
+    try {
+        const FailingFactory factory;
+        auto second = std::make_shared<MonitorLoop>(
+            io.get_executor(), "second", factory,
+            [](std::string_view, std::exception_ptr) {});
+        second->Start();
+    } catch (const std::bad_alloc&) {
+        start_failed = true;
+    }
+    first->RequestStop();
+    bool joined = false;
+    net::co_spawn(io, first->AsyncJoin(), [&](std::exception_ptr error) {
+        Require(!error, "partial start failure must leave earlier loops joinable");
+        joined = true;
+    });
+    io.run();
+    Require(start_failed && starts == 1 && joined,
+            "partial startup must retain a completion boundary for started loops");
+}
+
+void TestStopJoinsAcceptedBatch() {
+    net::io_context io;
+    net::steady_timer first(io, net::steady_timer::time_point::max());
+    net::steady_timer second(io, net::steady_timer::time_point::max());
+    int first_starts = 0;
+    int second_starts = 0;
+    int reports = 0;
+    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "batch",
+        [&] {
+            std::vector<net::awaitable<void>> tasks;
+            tasks.push_back(WaitLoop(first, first_starts));
+            tasks.push_back(WaitLoop(second, second_starts));
+            return acpp::RunAwaitableBatch(io.get_executor(), std::move(tasks));
+        },
+        [&](std::string_view, std::exception_ptr) { ++reports; });
+    loop->Start();
+    io.poll();
+    Require(first_starts == 1 && second_starts == 1, "batch must start both accepted tasks");
+    loop->RequestStop();
+    bool joined = false;
+    net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
+        Require(!error, "stopped batch owner must join successfully");
+        joined = true;
+    });
+    io.poll();
+    Require(!joined, "stop must not abandon an accepted batch");
+    first.cancel();
+    io.poll();
+    Require(!joined, "one completed child must not release the batch owner");
+    second.cancel();
+    io.run();
+    Require(joined && reports == 0 && first_starts == 1 && second_starts == 1,
+            "join must cover every accepted child without starting another batch");
+}
+
 }  // namespace
 
 int main() {
@@ -159,6 +302,10 @@ int main() {
         TestIndependentCompletionAndOwnership();
         TestFactoryFailure();
         TestOwnerWithWeakLoopSlots();
+        TestStopJoinsActualCleanup();
+        TestStopBeforeExecution();
+        TestPartialStartFailure();
+        TestStopJoinsAcceptedBatch();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

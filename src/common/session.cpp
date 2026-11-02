@@ -7,6 +7,7 @@
 #include <chrono>
 #include <format>
 #include <iterator>
+#include <optional>
 
 namespace acpp {
 
@@ -19,12 +20,12 @@ ID NewID(uint32_t worker_id) noexcept {
 }  // namespace session
 
 std::string FormatAccessLog(const session::Context& ctx) {
-    std::string src_host_storage;
+    std::optional<iputil::AddressText> src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
     if (src_host.empty()) {
         if (!ctx.inbound.source_addr.is_unspecified()) {
-            src_host_storage = iputil::NormalizeAddressString(ctx.inbound.source_addr);
-            src_host = src_host_storage;
+            src_host_storage.emplace(iputil::NormalizeAddress(ctx.inbound.source_addr));
+            src_host = src_host_storage->View();
         } else {
             src_host = "unknown";
         }
@@ -32,12 +33,12 @@ std::string FormatAccessLog(const session::Context& ctx) {
     const char* net_str = NetworkToString(ctx.content.network);
 
     const TargetAddress& t = ctx.outbound.target;
-    std::string target_host_storage;
+    std::optional<iputil::AddressText> target_host_storage;
     std::string_view target_host = t.host;
     if (target_host.empty()) {
         if (t.resolved_addr) {
-            target_host_storage = iputil::NormalizeAddressString(*t.resolved_addr);
-            target_host = target_host_storage;
+            target_host_storage.emplace(iputil::NormalizeAddress(*t.resolved_addr));
+            target_host = target_host_storage->View();
         } else {
             target_host = "unknown";
         }
@@ -82,8 +83,8 @@ std::string FormatAccessLog(const session::Context& ctx) {
     if (ctx.outbound.connected_local_addr &&
         !ctx.outbound.connected_local_addr->is_unspecified()) {
         access.append(" sendThrough:");
-        access.append(iputil::NormalizeAddressString(
-            *ctx.outbound.connected_local_addr));
+        access.append(iputil::AddressText(iputil::NormalizeAddress(
+            *ctx.outbound.connected_local_addr)).View());
     }
     return access;
 }

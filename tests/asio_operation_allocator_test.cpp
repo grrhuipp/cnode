@@ -105,12 +105,16 @@ void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
     std::exception_ptr error;
     const auto before = resource.allocations;
     auto read = [&]() -> net::awaitable<void> {
-        if (multi_buffer) {
-            auto buffers = co_await stream.ReadMultiBuffer();
-            cancelled = !acpp::buf::HasData(buffers);
-        } else {
-            char byte{};
-            cancelled = co_await stream.AsyncRead(net::buffer(&byte, 1)) == 0;
+        try {
+            if (multi_buffer) {
+                (void)co_await stream.ReadMultiBuffer();
+            } else {
+                char byte{};
+                (void)co_await stream.AsyncRead(net::buffer(&byte, 1));
+            }
+        } catch (const acpp::IoSystemError& failure) {
+            if (failure.code() != acpp::io_error::operation_aborted) throw;
+            cancelled = true;
         }
     };
     net::co_spawn(io, read(), net::bind_cancellation_slot(signal.slot(),

@@ -15,6 +15,7 @@ namespace acpp {
 
 net::awaitable<std::vector<api::UserTraffic>>
 Controller::Impl::getTraffic(const std::string& tag) {
+    ThrowIfStopping();
     using TrafficSnapshot = Worker::UserTrafficSnapshot;
     std::vector<TrafficSnapshot> per_worker(workers_.size());
 
@@ -22,14 +23,16 @@ Controller::Impl::getTraffic(const std::string& tag) {
     tasks.reserve(workers_.size());
     for (size_t i = 0; i < workers_.size(); ++i) {
         tasks.push_back(
-            [](Worker* w, const std::string& t,
+            [](Impl* controller, Worker* w, const std::string& t,
                TrafficSnapshot& out) -> net::awaitable<void> {
+                controller->ThrowIfStopping();
                 out = co_await w->PostTask(w->GetTrafficTask(t));
-            }(workers_[i].get(), tag, per_worker[i])
+            }(this, workers_[i].get(), tag, per_worker[i])
         );
     }
     co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
+    ThrowIfStopping();
 
     size_t merged_hint = 0;
     for (const auto& traffic : per_worker) {
@@ -59,20 +62,23 @@ Controller::Impl::getTraffic(const std::string& tag) {
 
 net::awaitable<controller::OnlineSnapshot>
 Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
+    ThrowIfStopping();
     std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
 
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(workers_.size());
     for (size_t i = 0; i < workers_.size(); ++i) {
         tasks.push_back(
-            [](Worker* w, const std::string& t,
+            [](Impl* controller, Worker* w, const std::string& t,
                std::vector<OnlineDevice>& out) -> net::awaitable<void> {
+                controller->ThrowIfStopping();
                 out = co_await w->PostTask(w->GetOnlineDeviceTask(t));
-            }(workers_[i].get(), tag, per_worker[i])
+            }(this, workers_[i].get(), tag, per_worker[i])
         );
     }
     co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
+    ThrowIfStopping();
 
     size_t total_online = 0;
     for (const auto& online : per_worker) {
@@ -92,7 +98,9 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
     const int node_id = panel.config.NodeIDs.Front();
     const auto& panel_name = panel.config.Name;
 
-    auto traffic_data = co_await getTraffic(tag);
+    auto traffic_data = co_await getTraffic(
+        panel.node.committed->inbound->accounting_key);
+    ThrowIfStopping();
     bool traffic_ok = false;
     {
         auto& ns = panel.stats;
@@ -106,23 +114,29 @@ net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
     }
 
     auto online = co_await GetOnlineSnapshot(tag);
+    ThrowIfStopping();
 
     try {
         // An empty push clears the panel's previous online-user count.
         traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
+        ThrowIfStopping();
         if (traffic_ok) {
             LOG_DEBUG("Panel {}/{} report: traffic ok | users {}",
                       panel_name, node_id, traffic_data.size());
         }
     } catch (const std::exception& e) {
+        if (stopping_) throw;
         LOG_WARN("Panel {}/{} report: traffic failed | {}",
                  panel_name, node_id, e.what());
     }
 
+    ThrowIfStopping();
     bool online_ok = false;
     try {
         online_ok = co_await panel.client->ReportNodeOnlineUsers(online.entries);
+        ThrowIfStopping();
     } catch (const std::exception& e) {
+        if (stopping_) throw;
         LOG_WARN("Panel {}/{} report: online failed | {}",
                  panel_name, node_id, e.what());
     }

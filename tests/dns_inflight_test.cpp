@@ -333,6 +333,145 @@ void TestDNSWorkerCapacity(bool stats_request) {
     Require(recovered, "cancellation must release the DNS mailbox slot");
 }
 
+void TestInflightStopBeforeLeaderCompletion() {
+    net::io_context io;
+    auto inflight = std::make_unique<InflightResolves>(io);
+    net::experimental::channel<void(acpp::IoErrorCode)> gate(io);
+    size_t calls = 0, completed = 0;
+    std::array<DnsResult, 3> results;
+    std::array<std::exception_ptr, 3> errors;
+    bool leader_done = false, expired = false;
+    for (size_t i = 0; i < results.size(); ++i) {
+        net::co_spawn(io, inflight->Run("stop-inflight.example", [&] {
+            return GatedQuery(gate, calls);
+        }), [&, i](std::exception_ptr error, DnsResult result) {
+            errors[i] = error;
+            results[i] = std::move(result);
+            if (i == 0) leader_done = true;
+            ++completed;
+        });
+    }
+    net::post(io, [&] {
+        inflight->RequestStop();
+        inflight->RequestStop();
+    });
+    net::steady_timer watchdog(io, 2s);
+    watchdog.async_wait([&](acpp::IoErrorCode error) {
+        if (!error) { expired = true; gate.close(); }
+    });
+    while (completed < 2 && !expired) io.run_one();
+    Require(!expired && !leader_done,
+            "stopping inflight must release subscribers before a delayed leader completes");
+    gate.close();
+    while (completed < results.size() && !expired) io.run_one();
+    watchdog.cancel();
+    io.run();
+    inflight.reset();
+    Require(!expired && completed == results.size() && calls == 1,
+            "the leader callback must finish before its inflight owner is destroyed");
+    for (size_t i = 0; i < results.size(); ++i) {
+        Require(!errors[i] && results[i].error == acpp::ErrorCode::CANCELLED,
+                "late successful leader completion must not replace service cancellation");
+    }
+}
+
+void TestDNSWorkerStoppedWithoutQueries() {
+    net::io_context io;
+    acpp::app::dns::Config config;
+    config.servers = {{net::ip::address_v4::loopback(), 53}};
+    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(io, config, 1);
+    worker->RequestStop();
+    worker->RequestStop();
+    bool done = false;
+    std::exception_ptr failure;
+    auto stop = [&]() -> net::awaitable<void> {
+        const auto result = co_await worker->Resolve("192.0.2.1");
+        Require(result.error == acpp::ErrorCode::CANCELLED,
+                "an unused stopped service must reject queries without starting I/O");
+        co_await worker->AsyncJoin();
+        co_await worker->AsyncJoin();
+        worker.reset();
+    };
+    net::co_spawn(io, stop(), [&](std::exception_ptr error) {
+        failure = error;
+        done = true;
+    });
+    io.run();
+    if (failure) std::rethrow_exception(failure);
+    Require(done, "joining a never-started service must complete");
+}
+
+void TestDNSWorkerCrossExecutorStop() {
+    net::io_context main_context, first_io, second_io;
+    net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
+    acpp::app::dns::Config config;
+    config.servers = {sink.local_endpoint()};
+    config.timeout_sec = 30;
+    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(main_context, config, 8);
+    acpp::app::dns::DNS first(*worker), second(*worker);
+    auto guard = net::make_work_guard(main_context);
+    std::array<DnsResult, 4> results;
+    std::array<std::exception_ptr, 4> errors;
+    size_t completed = 0;
+    bool joined = false, expired = false;
+    std::exception_ptr join_error;
+    net::steady_timer watchdog(main_context, 2s);
+    auto finish = [&] {
+        if (joined && completed == results.size()) {
+            guard.reset();
+            watchdog.cancel();
+        }
+    };
+    auto handler = [&](size_t i) {
+        return [&, i](std::exception_ptr error, DnsResult result) {
+            errors[i] = error;
+            results[i] = std::move(result);
+            net::post(main_context, [&] { ++completed; finish(); });
+        };
+    };
+    net::co_spawn(first_io, first.Resolve("first-stop.example"), handler(0));
+    net::co_spawn(first_io, first.Resolve("first-stop.example"), handler(1));
+    net::co_spawn(second_io, second.Resolve("second-stop.example"), handler(2));
+    net::co_spawn(second_io, second.Resolve("second-stop.example"), handler(3));
+    size_t packets = 0;
+    auto stop = [&]() -> net::awaitable<void> {
+        std::array<uint8_t, 512> packet{};
+        net::ip::udp::endpoint sender;
+        for (; packets < 8; ++packets) {
+            co_await sink.async_receive_from(net::buffer(packet), sender, net::use_awaitable);
+        }
+        worker->RequestStop();
+        worker->RequestStop();
+        co_await worker->AsyncJoin();
+        sink.close();
+    };
+    net::co_spawn(main_context, stop(), [&](std::exception_ptr error) {
+        join_error = error;
+        joined = true;
+        finish();
+    });
+    watchdog.async_wait([&](acpp::IoErrorCode error) {
+        if (error) return;
+        expired = true;
+        worker->RequestStop();
+        sink.close();
+    });
+    std::thread first_thread([&] { first_io.run(); });
+    std::thread second_thread([&] { second_io.run(); });
+    main_context.run();
+    first_thread.join();
+    second_thread.join();
+    // Caller executor callbacks, not just DNS registry removal, have finished.
+    worker.reset();
+    Require(!expired && joined && packets == 8 && completed == results.size(),
+            "service stop must join real UDP leaders and cross-executor subscribers");
+    if (join_error) std::rethrow_exception(join_error);
+    for (size_t i = 0; i < results.size(); ++i) {
+        Require(!errors[i] && results[i].error == acpp::ErrorCode::CANCELLED,
+                "cross-executor shutdown must return owned cancellation results");
+    }
+}
+
 }  // namespace
 
 void* operator new(std::size_t size) {
@@ -361,6 +500,9 @@ int main() {
         TestDNSWorkerCancellation();
         TestDNSWorkerCapacity(false);
         TestDNSWorkerCapacity(true);
+        TestInflightStopBeforeLeaderCompletion();
+        TestDNSWorkerStoppedWithoutQueries();
+        TestDNSWorkerCrossExecutorStop();
     } catch (const std::exception& error) {
         fail_size = 0;
         std::cerr << error.what() << '\n';

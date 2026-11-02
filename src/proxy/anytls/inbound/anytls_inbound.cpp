@@ -6,7 +6,7 @@
 #include "../payload_queue.hpp"
 #include "../credentials.hpp"
 #include "../../uot/uot.hpp"
-#include "../../../transport/internet/async_write_gate.hpp"
+#include "acppnode/transport/internet/async_write_gate.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/allocator.hpp"
@@ -19,7 +19,8 @@
 #include "acppnode/transport/async_stream.hpp"
 #include "acppnode/transport/link_error.hpp"
 #include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "../validator.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <algorithm>
@@ -56,7 +57,7 @@ void CopySessionContext(const session::Context& source, session::Context& target
 
 }  // namespace
 
-Handler::Handler(Validator& validator,
+Handler::Handler(UserOnlineTracker& validator,
                  StatsShard& stats,
                  ConnectionLimiterPtr limiter,
                  std::shared_ptr<const ::acpp::anytls::PaddingScheme> padding_scheme)
@@ -67,53 +68,6 @@ Handler::Handler(Validator& validator,
 
 namespace {
 
-// A SOCKS target belongs to the logical byte stream, not to a PSH frame.
-// Keep only the bounded address prefix on the coroutine frame; pending owns
-// every byte already read after it and is transferred to TCP relay or UoT.
-net::awaitable<std::expected<TargetAddress, ErrorCode>> ReadSocksTarget(
-    transport::MultiBufferReader& reader, buf::MultiBuffer& pending) {
-    auto ensure = [&](size_t required) -> net::awaitable<bool> {
-        while (pending.byte_size() < required) {
-            auto next = co_await reader.ReadMultiBuffer();
-            if (!buf::HasData(next)) co_return false;
-            next.MoveTo(pending, true);
-        }
-        co_return true;
-    };
-    std::array<uint8_t, 1 + 1 + 255 + 2> address{};
-    if (!co_await ensure(1)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    (void)pending.CopyPrefixTo(std::span(address).first(1));
-    const uint8_t type = address[0];
-    size_t size = 0;
-    if (type == 1) size = 1 + 4 + 2;
-    else if (type == 4) size = 1 + 16 + 2;
-    else if (type == 3) {
-        if (!co_await ensure(2)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-        (void)pending.CopyPrefixTo(std::span(address).first(2));
-        if (address[1] == 0) co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        size = 1 + 1 + address[1] + 2;
-    } else co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    if (!co_await ensure(size)) co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    (void)pending.CopyPrefixTo(std::span(address).first(size));
-    const uint16_t port = static_cast<uint16_t>((uint16_t(address[size - 2]) << 8) | address[size - 1]);
-    TargetAddress target;
-    if (type == 1) {
-        net::ip::address_v4::bytes_type bytes{};
-        std::copy_n(address.begin() + 1, bytes.size(), bytes.begin());
-        target = TargetAddress(net::ip::make_address_v4(bytes), port);
-    } else if (type == 4) {
-        net::ip::address_v6::bytes_type bytes{};
-        std::copy_n(address.begin() + 1, bytes.size(), bytes.begin());
-        target = TargetAddress(net::ip::make_address_v6(bytes), port);
-    } else {
-        target = TargetAddress(std::string_view(
-            reinterpret_cast<const char*>(address.data() + 2), address[1]), port);
-    }
-    if (!target.IsValid() && !proxy::uot::VersionFromMagicAddress(target))
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    pending.DropPrefixBytes(size);
-    co_return target;
-}
 
 class AnyTLSDemuxSession;
 
@@ -296,18 +250,18 @@ public:
 
     net::awaitable<RelayResult> Run();
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
         if (auto sub = FindStream(sid)) {
             if (cmd == anytls::kCmdFIN && sub->RemoteClosed())
-                co_return std::expected<void, ErrorCode>{};
+                co_return tl::expected<void, ErrorCode>{};
             if (cmd == anytls::kCmdSYNACK && sub->IsClosed())
-                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         try {
@@ -320,13 +274,13 @@ public:
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             mb.clear();
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
         if (auto sub = FindStream(sid)) sub->CheckWrite();
         else throw transport::WriteClosed();
@@ -343,14 +297,14 @@ public:
         } catch (const IoSystemError& e) {
             mb.clear();
             CancelAll();
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         } catch (...) {
             CancelAll();
             throw;
         }
     }
 
-    net::awaitable<std::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, ErrorCode>>
     WriteBuffersSerialized(uint8_t cmd,
                            uint32_t sid,
                            std::span<const net::const_buffer> buffers) {
@@ -362,13 +316,13 @@ public:
             }
         }
         if (!has_data) {
-            co_return std::expected<void, ErrorCode>{};
+            co_return tl::expected<void, ErrorCode>{};
         }
 
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
-            co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
         }
 
         if (auto sub = FindStream(sid)) sub->CheckWrite();
@@ -479,10 +433,15 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     std::optional<proxy::uot::PacketReader> uot_reader;
     std::optional<proxy::uot::PacketWriter> uot_writer;
     auto prepare = [&]() -> net::awaitable<ErrorCode> {
-        auto parsed = co_await ReadSocksTarget(sub, pending);
+        auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
+                                           0, {255, true});
         if (!parsed) co_return parsed.error();
-        target = std::move(*parsed);
+        pending.DropPrefixBytes(parsed->consumed);
+        target = std::move(parsed->target);
         const auto uot_version = proxy::uot::VersionFromMagicAddress(target);
+        if (!target.IsValid() && !uot_version) {
+            co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
+        }
         ctx.outbound.original_target = uot_version ? TargetAddress{} : target;
         ctx.outbound.target = ctx.outbound.original_target;
         ctx.outbound.route_target = ctx.outbound.original_target;
@@ -535,13 +494,22 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
             sub.Cancel();
             co_return;
         }
-        // The token lives inside this child: its callback cannot outlive the
-        // task group it borrows. Cancellation covers both reads and SYNACK I/O.
-        auto deadline = TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, [&] {
-            timed_out = true;
-            sub.Cancel();
-            tasks.Cancel();
-        });
+        // Embedded in this child; cannot outlive the task group it borrows.
+        // Cancellation covers both reads and SYNACK I/O.
+        struct HandshakeDeadline final : TimeoutEvent {
+            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
+                : timed_out(timed_out), sub(sub), tasks(tasks) {}
+            void OnTimeout() override {
+                timed_out = true;
+                sub.Cancel();
+                tasks.Cancel();
+            }
+            bool& timed_out;
+            AnyTLSSubStream& sub;
+            AwaitableTaskGroup& tasks;
+        } deadline(timed_out, sub, tasks);
+        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
+            throw IoSystemError(io_error::operation_aborted);
         prepare_error = co_await prepare();
         // Ready continuations can run before an already-due timer callback.
         // Do not dispatch a header that completed beyond its absolute budget.
@@ -763,7 +731,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
     co_return result;
 }
 
-net::awaitable<std::expected<void, ErrorCode>> ReadAuth(
+net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     AsyncStream& stream,
     std::array<uint8_t, 32>& hash) {
     std::array<uint8_t, 34> auth{};
@@ -773,22 +741,22 @@ net::awaitable<std::expected<void, ErrorCode>> ReadAuth(
             const auto n = co_await stream.AsyncRead(
                 net::buffer(auth.data() + offset, auth.size() - offset));
             if (n == 0) {
-                co_return std::unexpected(ErrorCode::CONNECTION_CLOSED);
+                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
             }
             offset += n;
         } catch (const IoSystemError& e) {
-            co_return std::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(MapAsioError(e.code()));
         } catch (...) {
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
     }
     std::copy_n(auth.begin(), hash.size(), hash.begin());
     const uint16_t padding = static_cast<uint16_t>(
         (static_cast<uint16_t>(auth[32]) << 8) | auth[33]);
     if (auto ok = co_await anytls::DiscardFramePayload(stream, padding); !ok) {
-        co_return std::unexpected(ok.error());
+        co_return tl::unexpected(ok.error());
     }
-    co_return std::expected<void, ErrorCode>{};
+    co_return tl::expected<void, ErrorCode>{};
 }
 
 }  // namespace
@@ -815,7 +783,7 @@ Handler::Process(
         result.error = ok.error();
         co_return result;
     }
-    auto user = validator_.Validate(ctx.inbound.tag, auth_hash);
+    auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     if (!user) {
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
             limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
@@ -839,8 +807,8 @@ Handler::Process(
     stream->ClearPhaseDeadline();
 
     std::optional<UserOnlineSessionGuard> user_session;
-    if (user->profile) {
-        const auto& profile = *user->profile;
+    {
+        const auto& profile = user->profile;
         ctx.inbound.user_email = profile.email;
         ctx.inbound.user_id = profile.user_id;
         ctx.content.speed_limit = profile.speed_limit;
@@ -898,7 +866,7 @@ public:
         return validator.GetOnlineDevices(tag);
     }
 
-    acpp::anytls::Validator validator;
+    acpp::UserOnlineTracker validator;
 };
 
 class AnyTlsSettings final
@@ -948,7 +916,7 @@ const bool kInboundRegistered = [] {
                     tag, acpp::anytls::kMaxFramePayload);
                 return std::nullopt;
             }
-            auto settings = acpp::memory::AllocateShared<AnyTlsSettings>();
+            auto settings = std::make_shared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =
                     acpp::anytls::ParsePaddingScheme(config.padding_scheme);
@@ -958,7 +926,7 @@ const bool kInboundRegistered = [] {
                     return std::nullopt;
                 }
                 settings->padding_scheme =
-                    acpp::memory::AllocateShared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
+                    std::make_shared<const acpp::anytls::PaddingScheme>(std::move(*parsed));
             }
             return settings;
         };
@@ -990,11 +958,11 @@ const bool kInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedAnyTlsUser> users;
             users.reserve(runtime_users.size());
             for (const auto& runtime_user : runtime_users) {
-                if (runtime_user.password.empty()) {
-                    continue;
+                if (runtime_user.credential.empty()) {
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedAnyTlsUser info;
-                info.password_hash = acpp::anytls::PasswordHash(runtime_user.password);
+                info.password_hash = acpp::anytls::PasswordHash(runtime_user.credential);
                 info.profile.email = runtime_user.email;
                 info.profile.user_id = runtime_user.user_id;
                 info.profile.speed_limit = runtime_user.speed_limit;

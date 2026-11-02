@@ -36,16 +36,16 @@ struct VlessOutboundConfig {
 
     StreamSettings stream_settings;
     OutboundBind send_through;
-    std::chrono::seconds timeout{10};
 };
 
 namespace proxy::vless::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::VlessOutboundConfig& config,
-            ::acpp::app::dns::DNS& dns_service);
+    Handler(std::string_view tag,
+            std::shared_ptr<const ::acpp::VlessOutboundConfig> config,
+            ::acpp::app::dns::DNS& dns_service,
+            std::chrono::seconds dial_timeout);
 
     ~Handler() override;
 
@@ -64,8 +64,9 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    const ::acpp::VlessOutboundConfig config_;
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const ::acpp::VlessOutboundConfig> config_;
+    std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
     std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
         encryption_tickets_;

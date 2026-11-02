@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 namespace acpp {
 
@@ -29,11 +30,16 @@ ProxyProtocolResult MakeInvalid() {
     return result;
 }
 
-std::string ProxySourceForLog(const ProxyProtocolResult& result) {
+void LogProxySource(std::string_view version, const ProxyProtocolResult& result) {
+    if (!Log::ShouldLog(LogLevel::DEBUG)) return;
+    std::optional<iputil::AddressText> numeric;
+    std::string_view source(result.src_ip.data(), result.src_ip.size());
     if (result.src_addr) {
-        return iputil::NormalizeAddressString(*result.src_addr);
+        numeric.emplace(iputil::NormalizeAddress(*result.src_addr));
+        source = numeric->View();
     }
-    return {result.src_ip.data(), result.src_ip.size()};
+    LOG_NET_DEBUG("[ProxyProtocol] {} parsed: src={}:{} consumed={}",
+                  version, source, result.src_port, result.consumed);
 }
 
 bool ParsePort(std::string_view text, uint16_t& port) {
@@ -85,8 +91,7 @@ ProxyProtocolResult ProxyProtocolParser::Parse(const uint8_t* data, size_t len) 
         LOG_NET_DEBUG("[ProxyProtocol] detected v2 binary header ({} bytes)", len);
         auto r = ParseV2(data, len);
         if (r.success()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v2 parsed: src={}:{} consumed={}",
-                      ProxySourceForLog(r), r.src_port, r.consumed);
+            LogProxySource("v2", r);
         } else if (r.incomplete()) {
             LOG_NET_DEBUG("[ProxyProtocol] v2 parse incomplete");
         } else {
@@ -100,8 +105,7 @@ ProxyProtocolResult ProxyProtocolParser::Parse(const uint8_t* data, size_t len) 
         LOG_NET_DEBUG("[ProxyProtocol] detected v1 text header");
         auto r = ParseV1(data, len);
         if (r.success()) {
-            LOG_NET_DEBUG("[ProxyProtocol] v1 parsed: src={}:{} consumed={}",
-                      ProxySourceForLog(r), r.src_port, r.consumed);
+            LogProxySource("v1", r);
         } else if (r.incomplete()) {
             LOG_NET_DEBUG("[ProxyProtocol] v1 parse incomplete");
         } else {

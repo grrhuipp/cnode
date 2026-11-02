@@ -66,7 +66,7 @@ void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress&
     size_t consumed = 0;
     const auto parsed = acpp::trojan::TrojanCodec::ParseRequest(output.data(), length, consumed);
     Check(parsed && consumed == header_size, "request parser did not preserve trailing payload");
-    Check(parsed->command == command && parsed->target.ToString() == target.ToString(), "request metadata changed");
+    Check(parsed->command == command && parsed->target.SameEndpoint(target), "request metadata changed");
     Check(std::string_view(parsed->password_hash.data(), parsed->password_hash.size()) == expected_hash,
           "authentication digest changed");
 

@@ -3,6 +3,8 @@
 #include <openssl/evp.h>
 
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <utility>
 
 namespace acpp {
@@ -15,53 +17,21 @@ namespace vmess {
 // OpenSSL 实现（使用 EVP_CIPHER API）
 // 优化：预分配 EVP_CIPHER_CTX，避免每次加解密都分配/释放
 VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv)
-    : security_(security), count_(0), enc_ctx_(nullptr), dec_ctx_(nullptr), ctx_initialized_(false) {
-    std::memcpy(key_.data(), key, 16);
-    std::memcpy(iv_.data(), iv, 16);
-
-    if (security_ == Security::AES_128_GCM || security_ == Security::CHACHA20_POLY1305) {
-        if (security_ == Security::CHACHA20_POLY1305) {
-            GenerateChaCha20Key(key_.data(), key32_.data());
-        }
-
-        // 预分配加密和解密上下文（直接成员指针，无额外堆分配）
-        enc_ctx_ = EVP_CIPHER_CTX_new();
-        dec_ctx_ = EVP_CIPHER_CTX_new();
-
-        ctx_initialized_ = (enc_ctx_ != nullptr && dec_ctx_ != nullptr);
+    : security_(security) {
+    std::memcpy(iv_.data(), iv, iv_.size());
+    const EVP_CIPHER* algorithm = nullptr;
+    std::span<const uint8_t> actual_key(key, 16);
+    std::array<uint8_t, 32> expanded{};
+    if (security == Security::CHACHA20_POLY1305) {
+        GenerateChaCha20Key(key, expanded.data());
+        actual_key = expanded;
+        algorithm = EVP_chacha20_poly1305();
+    } else if (security == Security::AES_128_GCM) {
+        algorithm = EVP_aes_128_gcm();
     }
-}
-
-VMessCipher::~VMessCipher() {
-    if (enc_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(enc_ctx_));
-    if (dec_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(dec_ctx_));
-}
-
-VMessCipher::VMessCipher(VMessCipher&& other) noexcept
-    : security_(other.security_)
-    , key_(other.key_)
-    , key32_(other.key32_)
-    , iv_(other.iv_)
-    , count_(other.count_)
-    , enc_ctx_(std::exchange(other.enc_ctx_, nullptr))
-    , dec_ctx_(std::exchange(other.dec_ctx_, nullptr))
-    , ctx_initialized_(std::exchange(other.ctx_initialized_, false)) {}
-
-VMessCipher& VMessCipher::operator=(VMessCipher&& other) noexcept {
-    if (this == &other) {
-        return *this;
-    }
-    if (enc_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(enc_ctx_));
-    if (dec_ctx_) EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(dec_ctx_));
-    security_ = other.security_;
-    key_ = other.key_;
-    key32_ = other.key32_;
-    iv_ = other.iv_;
-    count_ = other.count_;
-    enc_ctx_ = std::exchange(other.enc_ctx_, nullptr);
-    dec_ctx_ = std::exchange(other.dec_ctx_, nullptr);
-    ctx_initialized_ = std::exchange(other.ctx_initialized_, false);
-    return *this;
+    if (algorithm && (!encryptor_.Configure(algorithm, actual_key) ||
+                      !decryptor_.Configure(algorithm, actual_key)))
+        throw std::runtime_error("VMess AEAD initialization failed");
 }
 
 ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext) {
@@ -70,60 +40,11 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
         return static_cast<ssize_t>(len);
     }
 
-    if (!ctx_initialized_) return -1;
-
-    uint8_t nonce[12];
-    BuildNonce(count_++, nonce);
-
-    EVP_CIPHER_CTX* ctx = static_cast<EVP_CIPHER_CTX*>(enc_ctx_);
-
-    // 重置上下文以便复用
-    EVP_CIPHER_CTX_reset(ctx);
-
-    const EVP_CIPHER* cipher;
-    const uint8_t* actual_key;
-
-    if (security_ == Security::CHACHA20_POLY1305) {
-        cipher = EVP_chacha20_poly1305();
-        actual_key = key32_.data();
-    } else {
-        cipher = EVP_aes_128_gcm();
-        actual_key = key_.data();
-    }
-
-    int out_len = 0;
-    int final_len = 0;
-
-    if (EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
-        return -1;
-    }
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) {
-        return -1;
-    }
-
-    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, actual_key, nonce) != 1) {
-        return -1;
-    }
-
-    // A null input is a finalization signal for custom EVP ciphers. Empty
-    // VMess chunks must finalize exactly once, through EncryptFinal below.
-    if (len > 0 &&
-        EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, static_cast<int>(len)) != 1) {
-        return -1;
-    }
-
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + out_len, &final_len) != 1) {
-        return -1;
-    }
-
-    out_len += final_len;
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, GCM_TAG_SIZE, ciphertext + out_len) != 1) {
-        return -1;
-    }
-
-    return static_cast<ssize_t>(out_len + GCM_TAG_SIZE);
+    std::array<uint8_t, 12> nonce{};
+    BuildNonce(count_++, nonce.data());
+    const auto result = encryptor_.Process(nonce, {plaintext, len}, {},
+                                           {ciphertext, len + GCM_TAG_SIZE});
+    return result ? static_cast<ssize_t>(*result) : -1;
 }
 
 ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* plaintext) {
@@ -133,57 +54,11 @@ ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* pla
     }
 
     if (len < GCM_TAG_SIZE) return -1;
-    if (!ctx_initialized_) return -1;
-
-    uint8_t nonce[12];
-    BuildNonce(count_++, nonce);
-
-    EVP_CIPHER_CTX* ctx = static_cast<EVP_CIPHER_CTX*>(dec_ctx_);
-
-    // 重置上下文以便复用
-    EVP_CIPHER_CTX_reset(ctx);
-
-    const EVP_CIPHER* cipher;
-    const uint8_t* actual_key;
-
-    if (security_ == Security::CHACHA20_POLY1305) {
-        cipher = EVP_chacha20_poly1305();
-        actual_key = key32_.data();
-    } else {
-        cipher = EVP_aes_128_gcm();
-        actual_key = key_.data();
-    }
-
-    size_t ciphertext_len = len - GCM_TAG_SIZE;
-    int out_len = 0;
-    int final_len = 0;
-
-    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
-        return -1;
-    }
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) {
-        return -1;
-    }
-
-    if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, actual_key, nonce) != 1) {
-        return -1;
-    }
-
-    if (EVP_DecryptUpdate(ctx, plaintext, &out_len, ciphertext, static_cast<int>(ciphertext_len)) != 1) {
-        return -1;
-    }
-
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, GCM_TAG_SIZE,
-                           const_cast<uint8_t*>(ciphertext + ciphertext_len)) != 1) {
-        return -1;
-    }
-
-    if (EVP_DecryptFinal_ex(ctx, plaintext + out_len, &final_len) != 1) {
-        return -1;
-    }
-
-    return static_cast<ssize_t>(out_len + final_len);
+    std::array<uint8_t, 12> nonce{};
+    BuildNonce(count_++, nonce.data());
+    const auto result = decryptor_.Process(nonce, {ciphertext, len}, {},
+                                           {plaintext, len - GCM_TAG_SIZE});
+    return result ? static_cast<ssize_t>(*result) : -1;
 }
 
 size_t VMessCipher::Overhead() const {
@@ -197,18 +72,17 @@ size_t VMessCipher::Overhead() const {
 }
 
 void VMessCipher::GenerateChaCha20Key(const uint8_t* key16, uint8_t* key32) {
-    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
-    unsigned int md_len = 16;
-
-    EVP_DigestInit_ex(md_ctx, EVP_md5(), nullptr);
-    EVP_DigestUpdate(md_ctx, key16, 16);
-    EVP_DigestFinal_ex(md_ctx, key32, &md_len);
-
-    EVP_DigestInit_ex(md_ctx, EVP_md5(), nullptr);
-    EVP_DigestUpdate(md_ctx, key32, 16);
-    EVP_DigestFinal_ex(md_ctx, key32 + 16, &md_len);
-
-    EVP_MD_CTX_free(md_ctx);
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>
+        ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx) throw std::bad_alloc();
+    unsigned int md_len = 0;
+    if (EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1 ||
+        EVP_DigestUpdate(ctx.get(), key16, 16) != 1 ||
+        EVP_DigestFinal_ex(ctx.get(), key32, &md_len) != 1 || md_len != 16 ||
+        EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1 ||
+        EVP_DigestUpdate(ctx.get(), key32, 16) != 1 ||
+        EVP_DigestFinal_ex(ctx.get(), key32 + 16, &md_len) != 1 || md_len != 16)
+        throw std::runtime_error("VMess key derivation failed");
 }
 
 void VMessCipher::BuildNonce(uint16_t count, uint8_t* nonce) {
@@ -218,25 +92,24 @@ void VMessCipher::BuildNonce(uint16_t count, uint8_t* nonce) {
 }
 
 // ============================================================================
-// ShakeMask 实现 - 优化版：固定 4KB 数组
+// ShakeMask keeps a small batch of actual SHAKE128 output.
 // ============================================================================
 
 ShakeMask::ShakeMask(const uint8_t* nonce) {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (ctx) {
-        const EVP_MD* md = EVP_shake128();
-        if (md && EVP_DigestInit_ex(ctx, md, nullptr) == 1 &&
-            EVP_DigestUpdate(ctx, nonce, 16) == 1) {
-            ctx_ = ctx;
-        } else {
-            EVP_MD_CTX_free(ctx);
-        }
+    if (!ctx) throw std::bad_alloc();
+    const EVP_MD* md = EVP_shake128();
+    if (!md || EVP_DigestInit_ex(ctx, md, nullptr) != 1 ||
+        EVP_DigestUpdate(ctx, nonce, 16) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("VMess length-mask initialization failed");
     }
+    ctx_ = ctx;
 }
 
 ShakeMask::~ShakeMask() {
     if (ctx_) {
-        EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(ctx_));
+        EVP_MD_CTX_free(ctx_);
     }
 }
 
@@ -252,7 +125,7 @@ ShakeMask& ShakeMask::operator=(ShakeMask&& other) noexcept {
         return *this;
     }
     if (ctx_) {
-        EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(ctx_));
+        EVP_MD_CTX_free(ctx_);
     }
     ctx_ = std::exchange(other.ctx_, nullptr);
     std::memcpy(buffer_, other.buffer_, kBufferSize);
@@ -262,11 +135,8 @@ ShakeMask& ShakeMask::operator=(ShakeMask&& other) noexcept {
 }
 
 void ShakeMask::Refill() {
-    if (ctx_) {
-        EVP_DigestSqueeze(static_cast<EVP_MD_CTX*>(ctx_), buffer_, kBufferSize);
-    } else {
-        memset(buffer_, 0, kBufferSize);
-    }
+    if (!ctx_ || EVP_DigestSqueeze(ctx_, buffer_, kBufferSize) != 1)
+        throw std::runtime_error("VMess length-mask generation failed");
     offset_ = 0;
 }
 

@@ -19,6 +19,13 @@ namespace {
 using namespace acpp;
 using namespace std::chrono_literals;
 
+template<class F>
+struct TestEvent final : TimeoutEvent {
+    explicit TestEvent(F callback) : callback(std::move(callback)) {}
+    void OnTimeout() override { callback(); }
+    F callback;
+};
+
 buf::MultiBuffer Payload(size_t size, uint8_t byte = 0x42) {
     std::vector<uint8_t> bytes(size, byte);
     buf::MultiBuffer result;
@@ -26,10 +33,9 @@ buf::MultiBuffer Payload(size_t size, uint8_t byte = 0x42) {
     return result;
 }
 
-struct Endpoint {
+struct Endpoint : TimeoutEvent {
     buf::MultiBuffer input;
     net::io_context* io = nullptr;
-    TimeoutToken phase_timer;
     bool phase_expired = false;
     uint8_t phase_flags = 0;
     uint32_t phase_generation = 0;
@@ -126,15 +132,16 @@ struct Endpoint {
         const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
         const auto delay = timeout >= maximum ? std::chrono::milliseconds::max()
             : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-        phase_timer = TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, [this] {
-            phase_expired = true;
-            phase_flags = 1;
-            Cancel();
-        });
+        if (!TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, *this)) return {};
         return {&phase_flags, 1, &phase_generation, phase_generation};
     }
+    void OnTimeout() override {
+        phase_expired = true;
+        phase_flags = 1;
+        Cancel();
+    }
     void ClearPhaseDeadline() noexcept {
-        phase_timer = {};
+        TimeoutEvent::Cancel();
         ++phase_generation;
         phase_flags = 0;
         phase_expired = false;
@@ -156,9 +163,8 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     else client.input = Payload(4000);
     if (mode >= 6) target.input = Payload(4000);
     if (mode == 2) target.read_error = ErrorCode::RELAY_READ_FAILED;
-    TimeoutToken external_cancel;
     if (mode >= 14) client.Cancel(mode == 15 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
-    if (mode >= 6 && mode < 14) external_cancel = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&client, &target, mode] {
+    TestEvent external_cancel([&client, &target, mode] {
         if (mode >= 12) {
             client.Cancel(mode == 13 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
             return;
@@ -166,6 +172,8 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
         target.phase_expired = mode == 8 || mode == 9;
         target.Cancel(mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
     });
+    if (mode >= 6 && mode < 14)
+        (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
     StatsShard stats;
     session::Context context;
     const RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
@@ -201,11 +209,11 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     StatsShard stats;
     session::Context context;
     net::cancellation_signal parent;
-    TimeoutToken external;
-    if (mode >= 2) external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] {
+    TestEvent external([&] {
         if (mode == 3) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
+    if (mode >= 2) (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     const auto budget = mode == 4 ? std::chrono::seconds::max() : 1s;
     const RelayConfig config{.uplink_only = budget, .downlink_only = budget};
     const auto start = std::chrono::steady_clock::now();
@@ -240,9 +248,9 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     if (mode == 1) (void)target.StartPhaseDeadline(1s);
     if (mode == 3) (void)target.StartPhaseDeadline(std::chrono::seconds::max());
     if (mode == 4) target.SetReadTimeout(1s);
-    TimeoutToken external;
+    TestEvent external([&] { target.Cancel(); });
     if (mode == 2 || mode == 3)
-        external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] { target.Cancel(); });
+        (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     StatsShard stats;
     session::Context context;
     const RelayConfig config{.speed_limit = 1000};
@@ -269,10 +277,11 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
     target_peer.connect(listener.local_endpoint());
     TcpStream target(listener.accept());
     net::cancellation_signal parent;
-    auto external = TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, [&] {
+    TestEvent external([&] {
         if (parent_cancel) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
+    (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     session::Context context;
     StatsShard stats;
     const RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,

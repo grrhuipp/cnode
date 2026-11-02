@@ -2,6 +2,7 @@
 
 #include "acppnode/common/asio_types.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/transport/cancellation.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -20,10 +21,12 @@ namespace acpp {
 
 // A finite group on one executor. Spawn is only valid during start or from a
 // running child. The group joins actual completion callbacks, including children
-// added by another child. Cancellation and uncaught failure stop every child.
+// added by another child. Parent cancellation and uncaught failure stop every
+// child; an optional request source cancels only the child bound to that source.
 class AwaitableTaskGroup {
 public:
-    virtual void Spawn(net::awaitable<void> task) = 0;
+    virtual void Spawn(net::awaitable<void> task,
+                       transport::CancellationSource* source = nullptr) = 0;
     virtual void Cancel() = 0;
 
 protected:
@@ -32,10 +35,23 @@ protected:
 
 namespace task_group_detail {
 
-struct Child {
+struct Child final : transport::CancellationSubscription {
     net::cancellation_signal cancellation;
+    bool source_cancelled = false;
     Child* next = nullptr;
     Child** previous = nullptr;
+
+    void Bind(transport::CancellationSource& source) noexcept {
+        Resubscribe(source);
+    }
+
+    std::exception_ptr Complete(std::exception_ptr error) noexcept {
+        Unsubscribe();
+        // A locally cancelled child is isolated; never hide a different error
+        // that raced cancellation.
+        if (source_cancelled && IsOperationCancelled(error)) return {};
+        return error;
+    }
 
     void Unlink() noexcept {
         if (!previous) return;
@@ -46,6 +62,12 @@ struct Child {
     }
 
     ~Child() { Unlink(); }
+
+private:
+    void OnCancellation(transport::Cancellation) noexcept override {
+        source_cancelled = true;
+        cancellation.emit(net::cancellation_type::all);
+    }
 };
 
 template <typename Handler>
@@ -55,10 +77,17 @@ public:
     Group(net::any_io_executor executor, Handler handler)
         : executor_(std::move(executor)), completion_(std::move(handler)) {}
 
-    void Spawn(net::awaitable<void> task) override {
+    void Spawn(net::awaitable<void> task,
+               transport::CancellationSource* source = nullptr) override {
         if (stopping_) throw IoSystemError(net::error::operation_aborted);
         // Acquired and released on the group's executor, never on its caller's.
         auto child = memory::AllocateShared<Child>();
+        if (source) {
+            child->Bind(*source);
+            // Stop is delivered synchronously on subscription. Do not start
+            // work whose source was already stopped before co_spawn had a slot.
+            if (child->source_cancelled) return;
+        }
         child->next = head_;
         child->previous = &head_;
         if (head_) head_->previous = &child->next;
@@ -69,7 +98,7 @@ public:
                 net::bind_cancellation_slot(child->cancellation.slot(),
                     [self = this->shared_from_this(), child](std::exception_ptr error) {
                         child->Unlink();
-                        self->Finish(std::move(error));
+                        self->Finish(child->Complete(std::move(error)));
                     }));
         } catch (...) {
             child->Unlink();
@@ -92,8 +121,12 @@ public:
     }
 
     void Finish(std::exception_ptr error = {}) {
-        if (error && !failure_) {
-            failure_ = std::move(error);
+        if (error) {
+            const bool cancelled = IsOperationCancelled(error);
+            if (!failure_ || (failure_is_cancellation_ && !cancelled)) {
+                failure_ = std::move(error);
+                failure_is_cancellation_ = cancelled;
+            }
             Cancel(net::cancellation_type::all);
         }
         if (--remaining_ == 0) {
@@ -108,6 +141,7 @@ private:
     Child* head_ = nullptr;
     size_t remaining_ = 1; // start callback's launch sentinel
     std::exception_ptr failure_;
+    bool failure_is_cancellation_ = false;
     bool stopping_ = false;
 };
 

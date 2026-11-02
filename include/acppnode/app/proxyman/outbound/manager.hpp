@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/features/outbound/outbound.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <memory>
 #include <string_view>
@@ -17,7 +18,7 @@ namespace acpp::proxyman::outbound {
 // 对齐 xray-core app/proxyman/outbound.Manager。它只在 Worker io_context 上
 // 访问，不加锁；dispatcher 按 outbound tag 获取 handler。
 // ============================================================================
-class Manager final : public features::outbound::Manager {
+class Manager final : public features::outbound::Manager, public memory::ThreadAllocated {
 public:
     using HandlerPtr = features::outbound::Manager::HandlerPtr;
 

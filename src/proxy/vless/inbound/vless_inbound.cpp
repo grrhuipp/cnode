@@ -11,6 +11,8 @@
 #include "../vless_vision.hpp"
 #include "acppnode/app/proxyman/inbound/factory.hpp"
 #include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/app/udp_types.hpp"
@@ -27,7 +29,7 @@
 #include "acppnode/transport/link.hpp"
 
 #include <array>
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -47,15 +49,10 @@ public:
 
     VlessUdpReader(transport::MultiBufferReader& src,
                    TargetAddress target,
-                   std::span<const uint8_t> first_packet,
                    bool packet_addr = false)
         : src_(src)
         , target_(std::move(target))
-        , framer_(packet_addr) {
-        if (!first_packet.empty()) {
-            framer_.Feed(first_packet.data(), first_packet.size());
-        }
-    }
+        , framer_(packet_addr) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         while (true) {
@@ -74,14 +71,10 @@ public:
 
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
+                framer_.Finish();
                 co_return buf::MultiBuffer{};
             }
-            for (buf::Buffer* rb : raw) {
-                if (rb && !rb->IsEmpty()) {
-                    framer_.Feed(rb->Bytes().data(), rb->Len());
-                }
-            }
-            raw.clear();
+            framer_.Feed(std::move(raw));
         }
     }
 
@@ -234,7 +227,7 @@ private:
 };
 
 
-net::awaitable<std::expected<::acpp::vless::RequestHeader, ErrorCode>>
+net::awaitable<tl::expected<::acpp::vless::RequestHeader, ErrorCode>>
 ReadVlessRequestHeader(VlessBufferedReader& active_reader,
                        AsyncStream& stream,
                        session::Context& ctx,
@@ -243,7 +236,7 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
     std::array<uint8_t, 536> handshake{};
     size_t total_read = 0;
 
-    auto read_exact = [&](size_t count) -> net::awaitable<std::expected<void, ErrorCode>> {
+    auto read_exact = [&](size_t count) -> net::awaitable<tl::expected<void, ErrorCode>> {
         bool read_ok = false;
         try {
             read_ok = co_await active_reader.ReadExact(
@@ -253,72 +246,57 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
             if (stream.ConsumePhaseDeadline()) {
                 LOG_CONN_WARN(ctx, "[VLESS][{}] handshake phase deadline from {}",
                               tag, client_ip);
-                co_return std::unexpected(ErrorCode::TIMEOUT);
+                co_return tl::unexpected(ErrorCode::TIMEOUT);
             }
-            co_return std::unexpected(ErrorCode::SOCKET_READ_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
         }
         if (!read_ok && stream.ConsumePhaseDeadline()) {
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return tl::unexpected(ErrorCode::TIMEOUT);
         }
         if (!read_ok && stream.ConsumeIdleTimeout()) {
-            co_return std::unexpected(ErrorCode::TIMEOUT);
+            co_return tl::unexpected(ErrorCode::TIMEOUT);
         }
         if (!read_ok) {
-            co_return std::unexpected(ErrorCode::SOCKET_EOF);
+            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
         }
         total_read += count;
-        co_return std::expected<void, ErrorCode>{};
+        co_return tl::expected<void, ErrorCode>{};
     };
 
     if (auto ok = co_await read_exact(1); !ok) {
-        co_return std::unexpected(ok.error());
+        co_return tl::unexpected(ok.error());
     }
     if (handshake[0] != ::acpp::vless::kVersion) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
     }
 
     if (auto ok = co_await read_exact(17); !ok) {
-        co_return std::unexpected(ok.error());
+        co_return tl::unexpected(ok.error());
     }
     const uint8_t addons_len = handshake[17];
     if (auto ok = co_await read_exact(static_cast<size_t>(addons_len) + 1); !ok) {
-        co_return std::unexpected(ok.error());
+        co_return tl::unexpected(ok.error());
     }
 
     const uint8_t cmd = handshake[18 + addons_len];
     if (cmd == static_cast<uint8_t>(::acpp::vless::Command::TCP) ||
         cmd == static_cast<uint8_t>(::acpp::vless::Command::UDP)) {
-        if (auto ok = co_await read_exact(3); !ok) {
-            co_return std::unexpected(ok.error());
-        }
-        const uint8_t atype = handshake[total_read - 1];
-        if (atype == 0x01) {
-            if (auto ok = co_await read_exact(4); !ok) {
-                co_return std::unexpected(ok.error());
+        const size_t address_offset = total_read;
+        while (true) {
+            auto address = DecodeAddress(
+                std::span(handshake.data() + address_offset, total_read - address_offset),
+                AddressWireFormat::PortFirst, {253, true});
+            if (address.status == AddressDecodeStatus::Complete) break;
+            if (address.status == AddressDecodeStatus::Invalid) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
             }
-        } else if (atype == 0x03) {
-            if (auto ok = co_await read_exact(16); !ok) {
-                co_return std::unexpected(ok.error());
+            if (auto ok = co_await read_exact(address.required - (total_read - address_offset)); !ok) {
+                co_return tl::unexpected(ok.error());
             }
-        } else if (atype == 0x02) {
-            if (auto ok = co_await read_exact(1); !ok) {
-                co_return std::unexpected(ok.error());
-            }
-            const uint8_t domain_len = handshake[total_read - 1];
-            if (domain_len == 0 || domain_len > 253) {
-                LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
-                co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            if (auto ok = co_await read_exact(domain_len); !ok) {
-                co_return std::unexpected(ok.error());
-            }
-        } else {
-            LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
-            co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     } else if (cmd != static_cast<uint8_t>(::acpp::vless::Command::MUX)) {
         LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     size_t consumed = 0;
@@ -328,14 +306,14 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
         consumed);
     if (!request || consumed != total_read) {
         LOG_NET_WARN("[VLESS][{}] parse failed from {}", tag, client_ip);
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     co_return std::move(*request);
 }
 }  // namespace
 
 proxy::vless::inbound::Handler::Handler(
-    ::acpp::vless::Validator& validator,
+    ::acpp::UserOnlineTracker& validator,
     StatsShard& stats,
     ConnectionLimiterPtr limiter,
     std::shared_ptr<const ::acpp::vless::VlessEncryptionConfig> decryption)
@@ -445,7 +423,7 @@ proxy::vless::inbound::Handler::Process(
         co_return fail_abortive(parsed_request.error());
     }
     request.emplace(std::move(*parsed_request));
-    auto user_info = validator_.FindUser(tag, request->uuid);
+    auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request->uuid);
     if (!user_info) {
         LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
         if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
@@ -490,8 +468,8 @@ proxy::vless::inbound::Handler::Process(
     }
 
     uint64_t tracked_uid = 0;
-    if (user_info->profile) {
-        const auto& profile = *user_info->profile;
+    {
+        const auto& profile = user_info->profile;
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
@@ -559,7 +537,7 @@ proxy::vless::inbound::Handler::Process(
 
     if (net == Network::UDP) {
         VlessUdpReader udp_reader(
-            *active_reader, ctx.outbound.target, {}, packet_addr_udp);
+            *active_reader, ctx.outbound.target, packet_addr_udp);
         VlessUdpWriter udp_writer(*active_writer, packet_addr_udp);
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -610,7 +588,7 @@ public:
         return validator.GetOnlineDevices(tag);
     }
 
-    acpp::vless::Validator validator;
+    acpp::UserOnlineTracker validator;
 };
 
 class VlessSettings final
@@ -655,20 +633,19 @@ const bool kVlessInboundRegistered = [] {
         [](std::string_view tag, const acpp::StaticUserConfig& config)
             -> std::optional<std::shared_ptr<
                 const acpp::proxyman::inbound::ProtocolSettings>> {
-            auto settings = acpp::memory::AllocateShared<VlessSettings>();
+            auto settings = std::make_shared<VlessSettings>();
             if (!acpp::vless::IsNoVlessEncryption(config.vless_decryption)) {
                 auto parsed = acpp::vless::ParseVlessServerDecryption(
                     config.vless_decryption);
                 if (!parsed) {
-                    LOG_WARN("VLESS inbound '{}': invalid decryption '{}': {}",
+                    LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
                              tag,
-                             config.vless_decryption,
                              acpp::vless::VlessEncryptionParseErrorMessage(
                                  parsed.error));
                     return std::nullopt;
                 }
                 settings->decryption =
-                    acpp::memory::AllocateShared<acpp::vless::VlessEncryptionConfig>(
+                    std::make_shared<acpp::vless::VlessEncryptionConfig>(
                         std::move(*parsed.config));
             }
             return settings;
@@ -681,9 +658,8 @@ const bool kVlessInboundRegistered = [] {
                 auto parsed = acpp::vless::ParseVlessServerDecryption(
                     config.vless_decryption);
                 if (!parsed) {
-                    LOG_WARN("VLESS inbound '{}': invalid decryption '{}': {}",
+                    LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
                              tag,
-                             config.vless_decryption,
                              acpp::vless::VlessEncryptionParseErrorMessage(
                                  parsed.error));
                     return std::nullopt;
@@ -714,11 +690,10 @@ const bool kVlessInboundRegistered = [] {
             std::vector<acpp::proxyman::inbound::PreparedVlessUser> users;
             users.reserve(runtime_users.size());
             for (const auto& runtime_user : runtime_users) {
-                const std::string& uuid =
-                    runtime_user.uuid.empty() ? runtime_user.password : runtime_user.uuid;
+                const std::string& uuid = runtime_user.credential;
                 auto uuid_bytes = acpp::vless::ParseUuidBytes(uuid);
                 if (!uuid_bytes) {
-                    continue;
+                    return std::nullopt;
                 }
                 acpp::proxyman::inbound::PreparedVlessUser info;
                 info.uuid_bytes = *uuid_bytes;

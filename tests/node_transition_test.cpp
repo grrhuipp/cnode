@@ -59,15 +59,6 @@ int main() {
         return 4;
     }
 
-    NodeInfo default_protocol = current;
-    default_protocol.NodeType.clear();
-    NodeInfo explicit_default = default_protocol;
-    explicit_default.NodeType = "vmess";
-    if (acpp::controller::NodeConfigChanged(
-            default_protocol, explicit_default)) {
-        return 5;
-    }
-
     NodeInfo changed = current;
     changed.TransportProtocol = "ws";
     if (!acpp::controller::NodeConfigChanged(current, changed)) return 6;

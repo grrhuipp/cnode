@@ -44,6 +44,7 @@ struct Inbound {
     }
     std::optional<tcp::endpoint> local_endpoint;
     memory::ThreadLocalString tag;
+    memory::ThreadLocalString accounting_key;
     memory::ThreadLocalString protocol;
     memory::ThreadLocalVector<memory::ThreadLocalString> tags;
     int64_t user_id = 0;

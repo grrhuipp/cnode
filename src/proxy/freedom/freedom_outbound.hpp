@@ -5,16 +5,18 @@
 #include "acppnode/proxy/outbound.hpp"
 #include "acppnode/transport/internet/outbound_bind.hpp"
 #include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/proxy/freedom_domain_strategy.hpp"
+#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <chrono>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace acpp {
 namespace app::dns {
@@ -23,20 +25,6 @@ class DNS;
 }  // namespace acpp
 
 namespace acpp::proxy::freedom::outbound {
-
-enum class DomainStrategy : uint8_t {
-    AsIs,
-    UseIP,
-    UseIPv6v4,
-    UseIPv4,
-    UseIPv4v6,
-    UseIPv6,
-    ForceIP,
-    ForceIPv6v4,
-    ForceIPv6,
-    ForceIPv4v6,
-    ForceIPv4,
-};
 
 // ============================================================================
 // Freedom 出站设置
@@ -48,12 +36,15 @@ struct FreedomSettings {
     bool enable_udp = true;               // 是否启用 UDP
 };
 
+[[nodiscard]] proxyman::outbound::PreparedOutboundCreator
+PrepareOutbound(FreedomSettings settings);
+
 // ============================================================================
 // Handler - 直连出站
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(const std::string& tag,
+    Handler(std::string_view tag,
             const FreedomSettings& settings,
             ::acpp::app::dns::DNS& dns_service,
             std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
@@ -74,7 +65,7 @@ public:
 
 private:
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
-    net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
+    net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
     ResolveTargets(session::Context& ctx);
 
     // 确定本地绑定地址
@@ -82,12 +73,13 @@ private:
         const tcp::endpoint* inbound_local_addr,
         const net::ip::address& remote_addr);
 
-    std::string tag_;
-    FreedomSettings settings_;
+    memory::ThreadLocalString tag_;
+    OutboundBind send_through_;
+    DomainStrategy domain_strategy_;
+    bool enable_udp_;
     ::acpp::app::dns::DNS& dns_service_;
     std::chrono::seconds dial_timeout_;
     std::optional<TargetAddress> redirect_target_;
-    std::string redirect_target_text_;
     StreamSettings stream_settings_;          // 默认 tcp/none
 };
 

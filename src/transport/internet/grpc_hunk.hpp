@@ -5,7 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <span>
 #include <string_view>
 
@@ -21,7 +21,7 @@ public:
     GrpcHunkDecoder(const GrpcHunkDecoder&) = delete;
     GrpcHunkDecoder& operator=(const GrpcHunkDecoder&) = delete;
 
-    [[nodiscard]] std::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
+    [[nodiscard]] tl::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
     [[nodiscard]] std::span<const uint8_t> Payload() const noexcept;
     void Consume(size_t size) noexcept;
     void Clear() noexcept;

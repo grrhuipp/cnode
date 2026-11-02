@@ -680,7 +680,7 @@ bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
 // Router 实现
 // ============================================================================
 
-struct Router::Impl {
+struct Router::Impl : memory::ThreadAllocated {
     Impl(const RoutingConfig& routing, const ::acpp::geo::GeoManager* geo);
 
     memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
@@ -696,17 +696,13 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
     // 顺序检查复合规则（AND 语义）
-    for (uint32_t rule_index = 0;
-         rule_index < impl_->compound_rules.size();
-         ++rule_index) {
-        const auto& rule = impl_->compound_rules[rule_index];
+    for (const auto& rule : impl_->compound_rules) {
         if (rule.Match(ctx, impl_->geo_manager)) {
             LOG_NET_DEBUG("Router: {} matched compound rule -> {}",
                       target, rule.outbound_tag);
             return routing::RouteDecision{
                 .outbound_tag = rule.outbound_tag,
                 .matched = true,
-                .rule_index = rule_index,
             };
         }
     }
@@ -717,7 +713,6 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
     return routing::RouteDecision{
         .outbound_tag = {},
         .matched = false,
-        .rule_index = 0,
     };
 }
 

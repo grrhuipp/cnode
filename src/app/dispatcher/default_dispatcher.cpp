@@ -22,7 +22,7 @@
 
 #include <algorithm>
 #include <asio/experimental/awaitable_operators.hpp>
-#include <asio/steady_timer.hpp>
+#include "acppnode/transport/internet/async_delay.hpp"
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <charconv>
@@ -108,12 +108,12 @@ struct ActiveSessionScope {
     app::SessionTrackingState::ActiveSession node{};
 
     ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState& tracking) noexcept
+                       app::SessionTrackingState& tracking)
         : session_tracking(tracking) {
         if (session_ctx.inbound.user_id > 0) {
             session_tracking.RegisterActiveSession(
                 node,
-                session_ctx.inbound.tag,
+                session_ctx.inbound.accounting_key,
                 session_ctx.inbound.user_id,
                 session_ctx.traffic);
         }
@@ -202,19 +202,21 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     AwaitableTaskGroup& request_group,
     ErrorCode& cancellation_reason) {
 
-    struct CancellationContext {
+    struct RequestCancellation final : transport::CancellationSubscription {
+        RequestCancellation(AwaitableTaskGroup& group, ErrorCode& reason) noexcept
+            : group(group), reason(reason) {}
         AwaitableTaskGroup& group;
         ErrorCode& reason;
-    } cancellation{request_group, cancellation_reason};
-    const auto cancel = [](void* raw, transport::Cancellation event) noexcept {
-        auto& state = *static_cast<CancellationContext*>(raw);
-        state.reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
-        state.group.Cancel();
-    };
+
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
+            group.Cancel();
+        }
+    } cancellation(request_group, cancellation_reason);
     auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
-    std::optional<transport::CancellationSubscription> subscription;
     if (cancellation_reader) {
-        subscription.emplace(cancellation_reader->Cancellation(), cancel, &cancellation);
+        cancellation.Resubscribe(cancellation_reader->Cancellation());
     }
     if (cancellation_reason != ErrorCode::OK) {
         stats.OnError();
@@ -361,10 +363,8 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
                             co_return ReadResult{false, std::current_exception()};
                         }
                     };
-                    net::steady_timer timer(io_context);
-                    timer.expires_after(remaining);
-                    auto next = co_await (read_more() ||
-                                         timer.async_wait(net::use_awaitable));
+                    AsyncDelay delay(io_context);
+                    auto next = co_await (read_more() || delay.WaitFor(remaining));
                     const auto cancellation_state =
                         co_await net::this_coro::cancellation_state;
                     if (cancellation_state.cancelled() != net::cancellation_type::none) {

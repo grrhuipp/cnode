@@ -7,6 +7,7 @@
 #include "acppnode/infra/panel_config.hpp"
 #include "online_snapshot.hpp"
 #include "node_state.hpp"
+#include "node_transaction.hpp"
 
 #include <optional>
 #include <string>
@@ -22,11 +23,13 @@ class MonitorLoop;
 struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     struct PanelRuntime;
     Impl(net::io_context& io_context,
-         const std::vector<std::unique_ptr<Worker>>& workers,
-         const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters);
+         const std::vector<std::unique_ptr<Worker>>& workers);
 
     void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
     void Start();
+    void RequestStop() noexcept;
+    net::awaitable<void> AsyncJoin();
+    void ThrowIfStopping() const;
 
     [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
 
@@ -44,14 +47,14 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     [[nodiscard]] std::string BuildUserTag(std::string_view tag,
                                            const api::UserInfo& user) const;
     [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildUsersForInbound(
-        std::string_view protocol,
-        std::string_view tag,
+        const controller::InboundBuild& inbound,
         const api::NodeInfo& node_config,
         const std::vector<api::UserInfo>& api_users) const;
 
     net::io_context&                       io_context_;
     const std::vector<std::unique_ptr<Worker>>&  workers_;
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters_;
+    bool stopping_ = false;
+    controller::NodeMutationGate node_mutations_;
 
     enum class PanelState {
         Connecting,
@@ -66,12 +69,14 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         uint64_t bytes_down   = 0;
     };
     struct PanelRuntime {
-        PanelRuntime(std::unique_ptr<api::API> api, const PanelConfig& source);
+        PanelRuntime(std::unique_ptr<api::API> api, const PanelConfig& source,
+                     controller::NodeMutationGate& gate, net::any_io_executor executor);
 
         const std::unique_ptr<api::API> client;
         const PanelConfig config;
         PanelState state = PanelState::Connecting;
         controller::NodeState node;
+        controller::NodeMutationGate::Participant mutation;
         NodeStats stats;
         // Active loops retain Impl, which owns these address-stable entities.
         std::weak_ptr<monitor_detail::MonitorLoop> sync_loop;

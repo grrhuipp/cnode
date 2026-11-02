@@ -493,7 +493,9 @@ bool RunClientPadding() {
     settings.min_idle_sessions = 1;
     auto make_handler = [&] {
         return std::make_unique<proxy::anytls::outbound::Handler>(
-            "same-client-tag", io, settings, StreamSettings{}, 1s, dns);
+            "same-client-tag", io,
+            std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
+                proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns);
     };
     auto handler = make_handler();
     dialed.clear();
@@ -592,7 +594,9 @@ bool RunOpenOrder(int mode, bool before) {
     OpenOrderScenario scenario{.mode = mode, .before_write_completion = before};
     open_order_scenario = &scenario;
     dialed.clear();
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
+        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
+            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns);
     auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
         ctx.content.network = Network::TCP;
@@ -713,7 +717,9 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io,
+        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
+            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns);
     queue_scenario = &queue;
     dialed.clear();
     fail_first_session = respond_on_auth = false;
@@ -726,10 +732,12 @@ bool RunQueue(int mode, unsigned seed = 1, bool baseline = false) {
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
     const bool use_control = mode == 0 || mode == 10 || mode == 11;
-    TimeoutToken request_timeout;
-    if (mode == 15) request_timeout = TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, [&client] {
-        client.source.Stop(ErrorCode::RELAY_TIMEOUT);
-    });
+    struct RequestTimeout final : TimeoutEvent {
+        explicit RequestTimeout(Client& client) : client(client) {}
+        void OnTimeout() override { client.source.Stop(ErrorCode::RELAY_TIMEOUT); }
+        Client& client;
+    } request_timeout(client);
+    if (mode == 15) (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
     session::Context ctx;
     ctx.outbound.target = TargetAddress("192.0.2.1", 443);
     ctx.content.network = mode == 10 || mode == 11 ? Network::UDP : Network::TCP;
@@ -813,7 +821,9 @@ bool RunIoFault(int mode, int kind) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io, settings, StreamSettings{}, 1s, dns);
+    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io,
+        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
+            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns);
     dialed.clear();
     fail_first_session = false;
     respond_on_auth = false;
@@ -902,7 +912,9 @@ bool Run(int mode) {
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
-        "test", io, settings, StreamSettings{}, 1s, dns);
+        "test", io,
+        std::make_shared<const proxy::anytls::outbound::PreparedSettings>(
+            proxy::anytls::outbound::PreparedSettings{settings, StreamSettings{}}), 1s, dns);
     dialed.clear();
     fail_first_session = mode == 0 || mode == 3;
     respond_on_auth = mode == 3;

@@ -64,11 +64,10 @@ int main() {
 
     rules.push_back(Rule("direct"));
     rules.push_back(Rule("missing"));
-    const auto ignored = acpp::IgnoreUnknownRoutingRules(outbounds, rules);
-    if (ignored.size() != 2 || ignored[0].index != 0 ||
-        ignored[0].tag != "m2" || ignored[1].index != 2 ||
-        ignored[1].tag != "missing") return 6;
-    if (rules.size() != 1 || rules[0].outbound_tag != "direct") return 7;
+    result = acpp::ValidateOutboundSelectionSemantics(outbounds, rules, {});
+    if (result.error != ConfigSemanticError::UnknownRouteOutboundTag ||
+        result.index != 0 || rules.size() != 3) return 6;
+    rules = {Rule("direct")};
 
     result = acpp::ValidateOutboundSelectionSemantics(outbounds, rules, {});
     if (!result.Ok()) return 8;

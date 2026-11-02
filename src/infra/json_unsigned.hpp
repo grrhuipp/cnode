@@ -3,7 +3,7 @@
 #include "acppnode/infra/json.hpp"
 
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <limits>
 #include <optional>
 #include <string>
@@ -11,7 +11,7 @@
 
 namespace acpp {
 
-[[nodiscard]] std::expected<std::optional<uint64_t>, std::string>
+[[nodiscard]] tl::expected<std::optional<uint64_t>, std::string>
 ParseJsonUint64(
     const json::object& source,
     std::string_view key,

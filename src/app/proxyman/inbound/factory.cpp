@@ -3,7 +3,6 @@
 #include "acppnode/proxy/inbound.hpp"
 
 #include <map>
-#include <ranges>
 #include <stdexcept>
 
 namespace acpp::proxyman::inbound {
@@ -43,15 +42,6 @@ bool HasProxy(std::string_view protocol) {
     return Registrations().contains(protocol);
 }
 
-std::vector<std::string> RegisteredProtocols() {
-    auto& registrations = Registrations();
-    std::vector<std::string> result;
-    result.reserve(registrations.size());
-    for (const auto& name : registrations | std::views::keys) {
-        result.push_back(name);
-    }
-    return result;
-}
 
 std::optional<UserProtocol> RegisteredUserProtocol(
     std::string_view protocol) {

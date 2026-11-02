@@ -14,29 +14,6 @@ DnsCache::DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl)
     if (capacity_ > 0) entries_.reserve(capacity_);
 }
 
-std::optional<DnsCacheEntry> DnsCache::Get(std::string_view domain) {
-    const auto found = entries_.find(domain);
-    if (found == entries_.end()) {
-        ++misses_;
-        return std::nullopt;
-    }
-    const auto node = found->second;
-    const auto now = steady_clock::now();
-    if (now >= node->entry.expire_time) {
-        entries_.erase(found);
-        order_.erase(node);
-        ++expired_;
-        ++misses_;
-        return std::nullopt;
-    }
-
-    DnsCacheEntry result = node->entry;
-    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-        result.expire_time - now);
-    result.ttl = static_cast<uint32_t>(std::max<int64_t>(remaining.count(), 1));
-    ++hits_;
-    return result;
-}
 
 std::optional<DnsResult> DnsCache::GetResult(std::string_view domain) {
     const auto found = entries_.find(domain);

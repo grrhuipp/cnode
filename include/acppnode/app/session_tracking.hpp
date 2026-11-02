@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/app/traffic_types.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -14,7 +15,8 @@ struct Traffic;
 
 namespace app {
 
-class SessionTrackingState {
+class SessionTrackingState : public memory::ThreadAllocated {
+    struct Account;
 public:
     struct ActiveSession {
         ActiveSession* prev = nullptr;
@@ -25,6 +27,7 @@ public:
         uint64_t last_reported_up = 0;
         uint64_t last_reported_down = 0;
         bool linked = false;
+        Account* account = nullptr;
     };
 
     SessionTrackingState();
@@ -38,7 +41,7 @@ public:
     void RegisterActiveSession(ActiveSession& node,
                                std::string_view tag,
                                int64_t user_id,
-                               session::Traffic& traffic) noexcept;
+                               session::Traffic& traffic);
 
     void UnregisterActiveSession(ActiveSession& node) noexcept;
 

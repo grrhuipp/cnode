@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/features/routing/router.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <memory>
 
@@ -14,7 +15,7 @@ struct RoutingConfig;
 
 namespace acpp::app::router {
 
-class Router final : public routing::Router {
+class Router final : public routing::Router, public memory::ThreadAllocated {
 public:
     // Build on the owning Worker before binding to Dispatcher. Failed builds
     // never publish partial matchers, and a published Router cannot be changed.

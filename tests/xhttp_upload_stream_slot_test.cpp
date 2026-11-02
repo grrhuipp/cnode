@@ -28,8 +28,7 @@ int main() {
         return 1;
     }
     auto in_flight = slot.Snapshot();
-    // A by-value parameter may be destroyed at the end of the caller's full
-    // expression. Observe destruction only after Attach's expression ends.
+    // A rejected temporary remains owned by the call expression.
     const bool attached_again = slot.Attach(
         std::make_unique<TestStream>(rejected_destructions));
     if (!in_flight || attached_again || rejected_destructions != 1) {
@@ -49,5 +48,21 @@ int main() {
     if (first_destructions != 1) {
         return 5;
     }
+    size_t allocation_failure_destructions = 0;
+    auto retained = std::make_unique<TestStream>(allocation_failure_destructions);
+    auto* previous_resource = std::pmr::set_default_resource(std::pmr::null_memory_resource());
+    bool allocation_failed = false;
+    try {
+        (void)slot.Attach(std::move(retained));
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    std::pmr::set_default_resource(previous_resource);
+    if (!allocation_failed || !retained || !slot.Empty() ||
+        allocation_failure_destructions != 0) return 6;
+    if (!slot.Attach(std::move(retained)) || retained) return 7;
+    auto recovered = slot.Take();
+    recovered.reset();
+    if (allocation_failure_destructions != 1) return 8;
     return EXIT_SUCCESS;
 }

@@ -33,7 +33,6 @@ int main() {
         RouteDecision{
             .outbound_tag = "blocked",
             .matched = true,
-            .rule_index = 7,
         });
     if (forced_selection.outbound_tag != "direct" ||
         forced_selection.source != SelectionSource::Forced) {
@@ -48,11 +47,9 @@ int main() {
         RouteDecision{
             .outbound_tag = "proxy",
             .matched = true,
-            .rule_index = 11,
         });
     if (rule_selection.outbound_tag != "proxy" ||
-        rule_selection.source != SelectionSource::Rule ||
-        rule_selection.rule_index != 11) {
+        rule_selection.source != SelectionSource::Rule) {
         return 6;
     }
 

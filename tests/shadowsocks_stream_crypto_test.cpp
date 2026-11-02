@@ -1,4 +1,11 @@
 #include "stream_crypto.hpp"
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/post.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_future.hpp>
 
 #include <algorithm>
 #include <array>
@@ -12,12 +19,19 @@
 
 namespace {
 thread_local volatile size_t system_allocations = 0;
+size_t cipher_contexts = 0;
+bool fail_cipher_context = false;
 }
 #if defined(CNODE_WRAP_MALLOC)
 extern "C" void* __real_malloc(size_t);
 extern "C" void* __wrap_malloc(size_t size) {
     system_allocations = system_allocations + 1;
     return __real_malloc(size);
+}
+extern "C" EVP_CIPHER_CTX* __real_EVP_CIPHER_CTX_new();
+extern "C" EVP_CIPHER_CTX* __wrap_EVP_CIPHER_CTX_new() {
+    ++cipher_contexts;
+    return fail_cipher_context ? nullptr : __real_EVP_CIPHER_CTX_new();
 }
 #endif
 
@@ -161,7 +175,7 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
     ss::SsAeadCipher cipher(
         cipher_type,
         key.data(),
-        key.size());
+        key.size(), proxy::AeadDirection::Encrypt);
     std::vector<uint8_t> ciphertext(
         payload_size + ss::SsAeadCipher::kTagSize);
     Check(cipher.Encrypt(
@@ -171,8 +185,8 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
               ciphertext.data()),
           "large Shadowsocks record encryption failed");
 
-    ss::detail::StreamAeadDecryptor decryptor(cipher);
-    Check(decryptor.Init(nonce.data()),
+    ss::SsAeadCipher decryptor(cipher_type, key.data(), key.size(), proxy::AeadDirection::Decrypt);
+    Check(decryptor.BeginDecrypt(nonce.data()),
           "large Shadowsocks record decrypt init failed");
     buf::MultiBuffer decoded;
     Check(ss::detail::DecryptStreamPayload(
@@ -203,7 +217,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
     ss::SsAeadCipher cipher(
         ss::SsCipherType::AES_256_GCM,
         key.data(),
-        key.size());
+        key.size(), proxy::AeadDirection::Encrypt);
     Check(cipher.Encrypt(
               nonce.data(),
               plaintext.data(),
@@ -212,8 +226,9 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
           "invalid-tag fixture encryption failed");
     ciphertext.back() ^= 0x80;
 
-    ss::detail::StreamAeadDecryptor decryptor(cipher);
-    Check(decryptor.Init(nonce.data()),
+    ss::SsAeadCipher decryptor(ss::SsCipherType::AES_256_GCM, key.data(), key.size(),
+                               proxy::AeadDirection::Decrypt);
+    Check(decryptor.BeginDecrypt(nonce.data()),
           "invalid-tag decrypt init failed");
     buf::MultiBuffer decoded;
     Check(!ss::detail::DecryptStreamPayload(
@@ -225,6 +240,247 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
           "invalid Shadowsocks record tag was accepted");
     Check(decoded.empty() && buf::TotalLen(decoded) == 0,
           "unauthenticated plaintext escaped into the output");
+}
+
+class WireReader final : public transport::MultiBufferReader {
+public:
+    explicit WireReader(const std::vector<uint8_t>& wire, size_t fragment = SIZE_MAX)
+        : wire_(wire), fragment_(fragment) {}
+
+    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        if (cut_ < cuts.size() && offset_ == cuts[cut_]) {
+            ++cut_;
+            const auto executor = co_await net::this_coro::executor;
+            net::steady_timer wait(executor);
+            wait.expires_at(net::steady_timer::time_point::max());
+            net::post(executor, [this] { signal->emit(net::cancellation_type::terminal); });
+            IoErrorCode error;
+            co_await wait.async_wait(net::redirect_error(net::use_awaitable, error));
+            Check(error == io_error::operation_aborted, "wire interruption did not cancel an actual wait");
+            if (empty_on_cancel) co_return buf::MultiBuffer{};
+            throw IoSystemError(error);
+        }
+        if (offset_ == wire_.size()) {
+            if (fail_at_eof) throw transport::LinkError(ErrorCode::BLOCKED);
+            co_return buf::MultiBuffer{};
+        }
+        size_t count = std::min(fragment_, wire_.size() - offset_);
+        if (cut_ < cuts.size()) count = std::min(count, cuts[cut_] - offset_);
+        Check(count != 0, "invalid encrypted wire cutpoint");
+        buf::MultiBuffer raw;
+        Check(buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw),
+              "wire input allocation failed");
+        offset_ += count;
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+        if (fail_payload_allocation) {
+            fail_payload_allocation = false;
+            memory::reject_next_pmr_allocation = true;
+        }
+#endif
+        co_return raw;
+    }
+
+    std::vector<size_t> cuts;
+    net::cancellation_signal* signal = nullptr;
+    bool empty_on_cancel = false;
+    bool fail_at_eof = false;
+    bool fail_payload_allocation = false;
+
+private:
+    transport::CancellationSource cancellation_;
+    const std::vector<uint8_t>& wire_;
+    size_t fragment_;
+    size_t offset_ = 0;
+    size_t cut_ = 0;
+};
+
+constexpr std::array<uint8_t, 32> kRecordKey{
+    1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37, 40, 43, 46,
+    49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 79, 82, 85, 88, 91, 94};
+
+size_t RecordKeySize(ss::SsCipherType type) {
+    return ss::BaseCipherType(type) == ss::SsCipherType::AES_128_GCM ? 16 : 32;
+}
+
+void AppendRecord(ss::SsAeadCipher& cipher, uint64_t& counter,
+                  std::span<const uint8_t> plaintext, std::vector<uint8_t>& wire) {
+    const size_t start = wire.size();
+    wire.resize(start + 2 + 32 + plaintext.size());
+    const std::array<uint8_t, 2> length{
+        static_cast<uint8_t>(plaintext.size() >> 8), static_cast<uint8_t>(plaintext.size())};
+    auto nonce = ss::detail::MakeNonce(counter++);
+    Check(cipher.Encrypt(nonce.data(), length.data(), length.size(), wire.data() + start),
+          "real record length encryption failed");
+    nonce = ss::detail::MakeNonce(counter++);
+    Check(cipher.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), wire.data() + start + 18),
+          "real record payload encryption failed");
+}
+
+void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_on_cancel,
+                      size_t fragment = 137) {
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Encrypt);
+    uint64_t nonce = initial_nonce;
+    std::vector<uint8_t> wire;
+    const std::vector<uint8_t> first{0x01, 0x02, 0x03};
+    const size_t max_payload = ss::Is2022Cipher(type) ? ss::kSs2022MaxChunkPayload : ss::kMaxChunkPayload;
+    std::vector<uint8_t> second(max_payload);
+    for (size_t i = 0; i < second.size(); ++i) second[i] = static_cast<uint8_t>(i * 11);
+    AppendRecord(encoder, nonce, first, wire);
+    const size_t boundary = wire.size();
+    AppendRecord(encoder, nonce, {}, wire); // Empty authenticated data is not EOF.
+    const size_t data = wire.size();
+    AppendRecord(encoder, nonce, second, wire);
+    net::io_context io;
+    net::cancellation_signal signal;
+    WireReader source(wire, fragment);
+    source.signal = &signal;
+    source.empty_on_cancel = empty_on_cancel;
+    source.cuts = {boundary, boundary, boundary + 1, boundary + 17, boundary + 18,
+                   data + 1, data + 17, data + 18, data + 19, data + 4100, wire.size() - 1};
+    ss::detail::BodyReader reader(
+        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Decrypt),
+        initial_nonce, source, max_payload);
+    const auto contexts = cipher_contexts;
+    const auto exercise = [&]() -> net::awaitable<void> {
+        Check(Flatten(co_await reader.ReadMultiBuffer()) == first, "first real record changed");
+        size_t cancelled = 0;
+        for (;;) {
+            bool interrupted = false;
+            try {
+                Check(Flatten(co_await reader.ReadMultiBuffer()) == second,
+                      "cancelled record resumed with wrong plaintext or nonce");
+            } catch (const IoSystemError& error) {
+                if (error.code() != io_error::operation_aborted) throw;
+                interrupted = true;
+            }
+            if (!interrupted) break;
+            ++cancelled;
+            co_await net::this_coro::reset_cancellation_state();
+        }
+        Check(cancelled == source.cuts.size(), "reader missed a real record cancellation boundary");
+        Check(!buf::HasData(co_await reader.ReadMultiBuffer()), "clean record boundary was not EOF");
+        Check(!buf::HasData(co_await reader.ReadMultiBuffer()), "repeated record EOF returned data");
+    };
+    auto done = net::co_spawn(io, exercise(),
+        net::bind_cancellation_slot(signal.slot(), net::use_future));
+    io.run();
+    done.get();
+    Check(cipher_contexts == contexts, "record processing created an EVP context");
+}
+
+void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
+                        uint64_t nonce, ErrorCode expected, bool preceding_record,
+                        bool source_fault = false) {
+    net::io_context io;
+    WireReader source(wire);
+    source.fail_at_eof = source_fault;
+    ss::detail::BodyReader reader(
+        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Decrypt),
+        nonce, source);
+    const auto exercise = [&]() -> net::awaitable<void> {
+        if (preceding_record)
+            Check(Flatten(co_await reader.ReadMultiBuffer()) == std::vector<uint8_t>({7, 8, 9}),
+                  "valid record preceding corruption was lost");
+        for (int retry = 0; retry < 2; ++retry) {
+            bool failed = false;
+            try { (void)co_await reader.ReadMultiBuffer(); }
+            catch (const transport::LinkError& error) { failed = error.code() == expected; }
+            Check(failed, "record failure was replaced by EOF, another error, or nonce recovery");
+        }
+    };
+    auto done = net::co_spawn(io, exercise(), net::use_future);
+    io.run();
+    done.get();
+}
+
+void TestReaderFailures(ss::SsCipherType type, uint64_t initial_nonce) {
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Encrypt);
+    uint64_t nonce = initial_nonce;
+    std::vector<uint8_t> wire;
+    const std::array<uint8_t, 3> plain{7, 8, 9};
+    AppendRecord(encoder, nonce, plain, wire);
+    const size_t next = wire.size();
+    AppendRecord(encoder, nonce, plain, wire);
+    for (const size_t tamper : {next, next + 17, wire.size() - 1}) {
+        auto corrupted = wire;
+        corrupted[tamper] ^= 0x80;
+        CheckReaderFailure(corrupted, type, initial_nonce, ErrorCode::PROTOCOL_AUTH_FAILED, true);
+    }
+    for (const size_t size : {next + 1, next + 17, next + 18, next + 19, wire.size() - 1}) {
+        const std::vector<uint8_t> truncated(wire.begin(), wire.begin() + size);
+        CheckReaderFailure(truncated, type, initial_nonce, ErrorCode::PROTOCOL_DECODE_FAILED, true);
+    }
+    std::vector<uint8_t> interrupted(wire.begin(), wire.begin() + next + 1);
+    CheckReaderFailure(interrupted, type, initial_nonce, ErrorCode::BLOCKED, true, true);
+    // Authenticated length outside the classic wire limit must fail before
+    // waiting for (or allocating) the claimed payload.
+    std::array<uint8_t, 18> invalid_length{};
+    const std::array<uint8_t, 2> oversized{0x40, 0x00};
+    const auto first_nonce = ss::detail::MakeNonce(initial_nonce);
+    Check(encoder.Encrypt(first_nonce.data(), oversized.data(), 2, invalid_length.data()),
+          "oversized authenticated length fixture failed");
+    CheckReaderFailure({invalid_length.begin(), invalid_length.end()}, type, initial_nonce,
+                       ErrorCode::PROTOCOL_DECODE_FAILED, false);
+}
+
+void TestContextLifetime() {
+    const std::array<uint8_t, 12> nonce{};
+    const std::array<uint8_t, 3> plain{17, 31, 91};
+    std::array<uint8_t, 19> ciphertext{};
+    ss::SsAeadCipher encoder(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
+                              proxy::AeadDirection::Encrypt);
+    Check(encoder.Encrypt(nonce.data(), plain.data(), plain.size(), ciphertext.data()),
+          "trial fixture encryption failed");
+    std::array<uint8_t, 32> wrong{};
+    ss::SsAeadCipher trials(ss::SsCipherType::AES_256_GCM, wrong.data(), 32,
+                             proxy::AeadDirection::Decrypt);
+    const auto contexts = cipher_contexts;
+    std::array<uint8_t, 3> decoded{};
+    Check(!trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()),
+          "wrong trial key authenticated");
+    for (size_t i = 0; i < 8; ++i) {
+        Check(trials.ResetKey(kRecordKey.data(), 32) &&
+              trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()) &&
+              decoded == plain, "reused authentication context failed with correct key");
+        Check(trials.ResetKey(wrong.data(), 32) &&
+              !trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()),
+              "reused authentication context accepted wrong key");
+    }
+    Check(cipher_contexts == contexts, "user trials created a new EVP context");
+#ifdef CNODE_WRAP_MALLOC
+    fail_cipher_context = true;
+    bool failed = false;
+    try {
+        ss::SsAeadCipher unavailable(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
+                                     proxy::AeadDirection::Decrypt);
+    } catch (const std::bad_alloc&) { failed = true; }
+    fail_cipher_context = false;
+    Check(failed, "EVP allocation failure created usable SS state");
+#endif
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    std::vector<uint8_t> wire;
+    uint64_t counter = 0;
+    AppendRecord(encoder, counter, plain, wire);
+    net::io_context io;
+    WireReader source(wire);
+    source.fail_payload_allocation = true;
+    ss::detail::BodyReader reader(
+        ss::SsAeadCipher(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
+                         proxy::AeadDirection::Decrypt), 0, source);
+    const auto exercise = [&]() -> net::awaitable<void> {
+        for (int retry = 0; retry < 2; ++retry) {
+            bool failed = false;
+            try { (void)co_await reader.ReadMultiBuffer(); }
+            catch (const std::bad_alloc&) { failed = true; }
+            Check(failed, "payload OOM exposed plaintext or masqueraded as EOF");
+        }
+    };
+    auto done = net::co_spawn(io, exercise(), net::use_future);
+    io.run();
+    done.get();
+#endif
 }
 
 }  // namespace
@@ -241,6 +497,20 @@ int main() {
             ss::SsCipherType::AES_256_GCM_2022);
     }
     TestInvalidTagDoesNotPublishPartialPlaintext();
+    TestContextLifetime();
+    for (const auto cipher : {ss::SsCipherType::AES_128_GCM, ss::SsCipherType::AES_256_GCM,
+                               ss::SsCipherType::CHACHA20_POLY1305}) {
+        for (const uint64_t nonce : {uint64_t{0}, uint64_t{2}}) {
+            for (const bool empty_cancel : {false, true}) TestReaderResume(cipher, nonce, empty_cancel);
+            TestReaderFailures(cipher, nonce);
+        }
+    }
+    for (const auto cipher : {ss::SsCipherType::AES_128_GCM_2022, ss::SsCipherType::AES_256_GCM_2022,
+                               ss::SsCipherType::CHACHA20_POLY1305_2022}) {
+        for (const uint64_t nonce : {uint64_t{1}, uint64_t{2}})
+            for (const bool empty_cancel : {false, true}) TestReaderResume(cipher, nonce, empty_cancel);
+    }
+    TestReaderResume(ss::SsCipherType::AES_256_GCM, 2, false, 1);
     std::cout << "shadowsocks_stream_crypto_test: ok\n";
     return 0;
 }

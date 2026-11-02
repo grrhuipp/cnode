@@ -4,7 +4,7 @@
 
 namespace acpp {
 
-std::expected<std::optional<bool>, std::string>
+tl::expected<std::optional<bool>, std::string>
 ParseJsonBool(
     const json::object& source,
     std::string_view key) {
@@ -13,7 +13,7 @@ ParseJsonBool(
         return std::optional<bool>{};
     }
     if (!raw->is_bool()) {
-        return std::unexpected(
+        return tl::unexpected(
             std::format("{} must be a boolean", key));
     }
     return std::optional<bool>{raw->as_bool()};

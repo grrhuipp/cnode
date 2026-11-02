@@ -12,11 +12,11 @@ void SetupPanels(net::io_context& main_ctx,
                  Controller& controller,
                  const Config& config,
                  app::dns::DNS& panel_dns_service) {
-    if (config.GetPanels().empty()) {
+    if (config.panels.empty()) {
         return;
     }
 
-    for (const auto& panel_config : config.GetPanels()) {
+    for (const auto& panel_config : config.panels) {
         for (int node_id : panel_config.NodeIDs.Values()) {
             api::Config api_config;
             api_config.Name = panel_config.Name;

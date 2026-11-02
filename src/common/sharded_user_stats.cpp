@@ -9,13 +9,13 @@ namespace acpp {
 
 struct UserOnlineTracker::Impl : memory::ThreadAllocated {
     using DeviceIpMap =
-        memory::ThreadLocalUnorderedMap<std::string,
+        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
                                         uint32_t,
                                         TransparentStringHash,
                                         TransparentStringEq>;
     using UserDeviceMap = memory::ThreadLocalUnorderedMap<uint64_t, DeviceIpMap>;
     using TagDeviceMap =
-        memory::ThreadLocalUnorderedMap<std::string,
+        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
                                         UserDeviceMap,
                                         TransparentStringHash,
                                         TransparentStringEq>;
@@ -37,12 +37,12 @@ void UserOnlineTracker::OnUserConnected(std::string_view tag,
     }
     auto tag_it = impl_->devices.find(tag);
     if (tag_it == impl_->devices.end()) {
-        tag_it = impl_->devices.try_emplace(std::string(tag)).first;
+        tag_it = impl_->devices.try_emplace(memory::ThreadLocalString(tag)).first;
     }
     auto& user_devices = tag_it->second[user_id];
     auto ip_it = user_devices.find(client_ip);
     if (ip_it == user_devices.end()) {
-        user_devices.try_emplace(std::string(client_ip), 1u);
+        user_devices.try_emplace(memory::ThreadLocalString(client_ip), 1u);
     } else {
         ++ip_it->second;
     }
@@ -130,7 +130,7 @@ UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     for (const auto& [uid, ips] : tag_it->second) {
         for (const auto& [ip, active_count] : ips) {
             if (active_count > 0) {
-                result.emplace_back(static_cast<int64_t>(uid), ip);
+                result.emplace_back(static_cast<int64_t>(uid), std::string(std::string_view(ip)));
             }
         }
     }

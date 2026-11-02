@@ -55,14 +55,13 @@ void TestRulesAndOwnership() {
     ctx.outbound.target = acpp::TargetAddress("WWW.EXAMPLE.COM.", 443);
     ctx.outbound.target.resolved_addr = acpp::net::ip::make_address("192.0.2.1");
     const auto domain_match = query.Route(ctx);
-    Require(domain_match.matched && domain_match.outbound_tag == "domain-proxy" &&
-                domain_match.rule_index == 0,
+    Require(domain_match.matched && domain_match.outbound_tag == "domain-proxy",
             "the first matching rule must win over a later IP match");
 
     ctx.content.network = acpp::Network::UDP;
     auto match = query.Route(ctx);
-    Require(match.matched && match.outbound_tag == "ip-proxy" && match.rule_index == 1,
-            "UDP must skip a TCP-only rule and retain the actual rule index");
+    Require(match.matched && match.outbound_tag == "ip-proxy",
+            "UDP must skip a TCP-only rule");
     ctx.outbound.target = acpp::TargetAddress("2001:db8::7", 53);
     Require(query.Route(ctx).outbound_tag == "ip-proxy", "IPv6 routing must match");
 

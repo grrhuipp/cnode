@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -32,8 +33,6 @@ struct TrojanOutboundConfig {
     StreamSettings stream_settings;
     OutboundBind send_through;
 
-    // 连接配置
-    std::chrono::seconds timeout{10};
 
 };
 
@@ -44,9 +43,10 @@ namespace proxy::trojan::outbound {
 
 class Handler final : public ::acpp::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::TrojanOutboundConfig& config,
-            ::acpp::app::dns::DNS& dns_service);
+    Handler(std::string_view tag,
+            std::shared_ptr<const ::acpp::TrojanOutboundConfig> config,
+            ::acpp::app::dns::DNS& dns_service,
+            std::chrono::seconds dial_timeout);
 
     ~Handler() override;
 
@@ -65,8 +65,9 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    const ::acpp::TrojanOutboundConfig config_;
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const ::acpp::TrojanOutboundConfig> config_;
+    std::chrono::seconds dial_timeout_;
     ::acpp::app::dns::DNS& dns_service_;
 };
 

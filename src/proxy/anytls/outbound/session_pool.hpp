@@ -5,8 +5,8 @@
 #include "acppnode/common/error.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/transport/link_error.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
 
-#include <asio/steady_timer.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <algorithm>
@@ -17,6 +17,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace acpp::proxy::anytls::outbound {
@@ -88,9 +89,9 @@ public:
     };
 
     SessionPool(net::io_context& io_context, Clock::duration check_interval,
-                Clock::duration idle_timeout, size_t minimum_idle, std::string tag)
+                Clock::duration idle_timeout, size_t minimum_idle, std::string_view tag)
         : state_(memory::AllocateShared<State>(io_context, check_interval, idle_timeout,
-                                         minimum_idle, std::move(tag))) {}
+                                         minimum_idle, tag)) {}
     SessionPool(const SessionPool&) = delete;
     SessionPool& operator=(const SessionPool&) = delete;
     ~SessionPool() noexcept { state_->Retire(); }
@@ -119,7 +120,7 @@ public:
                 throw std::invalid_argument("cannot adopt a closed AnyTLS session");
             }
             state_->entries.push_back({session, std::nullopt});
-            if (!state_->armed) state_->Schedule();
+            if (!state_->Valid()) state_->Schedule();
             state_->Start(session);
             return Lease(state_, std::move(session));
         } catch (...) {
@@ -129,16 +130,17 @@ public:
     }
 
 private:
-    struct State : std::enable_shared_from_this<State> {
+    struct State : std::enable_shared_from_this<State>, TimeoutEvent {
         struct Entry {
             std::shared_ptr<Session> session;
             std::optional<Clock::time_point> idle_since;
         };
 
         State(net::io_context& io_context, Clock::duration check, Clock::duration timeout,
-              size_t minimum, std::string name)
-            : timer(io_context), check_interval(check), idle_timeout(timeout),
-              minimum_idle(minimum), tag(std::move(name)) {
+              size_t minimum, std::string_view name)
+            : io_context(io_context), scheduler(TimeoutScheduler::ForIoContext(io_context)),
+              check_interval(check), idle_timeout(timeout),
+              minimum_idle(minimum), tag(name) {
             if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
                 throw std::invalid_argument("AnyTLS session intervals must be positive");
             }
@@ -150,10 +152,7 @@ private:
         }
 
         void CancelTimer() noexcept {
-            ++generation;
-            armed = false;
-            IoErrorCode ignored;
-            timer.cancel(ignored);
+            Cancel();
         }
 
         void Remove(const std::shared_ptr<Session>& session) noexcept {
@@ -166,7 +165,7 @@ private:
         }
 
         void Start(const std::shared_ptr<Session>& session) {
-            net::co_spawn(timer.get_executor(), session->Run(),
+            net::co_spawn(io_context, session->Run(),
                 net::bind_cancellation_slot(session->CancellationSlot(),
                     [owner = this->shared_from_this(), session](std::exception_ptr failure) {
                         ErrorCode error = ErrorCode::CONNECTION_CLOSED;
@@ -231,29 +230,26 @@ private:
         }
 
         void Schedule() {
-            const auto now = Clock::now();
-            const auto latest_start = Clock::time_point::max() - check_interval;
-            timer.expires_at(now > latest_start ? Clock::time_point::max() : now + check_interval);
-            const auto current = ++generation;
-            timer.async_wait([weak = this->weak_from_this(), current](IoErrorCode error) {
-                if (auto state = weak.lock(); state && current == state->generation) {
-                    state->armed = false;
-                    if (state->retired) return;
-                    try {
-                        if (error) throw IoSystemError(error);
-                        state->Prune();
-                        if (state->entries.empty()) return;
-                        state->Schedule();
-                    } catch (...) {
-                        state->failure = std::current_exception();
-                        state->Retire();
-                        try {
-                            LOG_ERROR("AnyTLS outbound '{}': idle session scheduler failed", state->tag);
-                        } catch (...) {}
-                    }
-                }
-            });
-            armed = true;
+            if (!scheduler.ScheduleAfter(
+                    std::chrono::ceil<std::chrono::milliseconds>(check_interval), *this))
+                throw IoSystemError(io_error::operation_aborted);
+        }
+
+        void OnTimeout() noexcept override {
+            // Pruning can drop the last indexed session and notify its users.
+            // Keep this event's owner alive until rescheduling has finished.
+            const auto self = this->shared_from_this();
+            if (retired) return;
+            try {
+                Prune();
+                if (!entries.empty()) Schedule();
+            } catch (...) {
+                failure = std::current_exception();
+                Retire();
+                try {
+                    LOG_ERROR("AnyTLS outbound '{}': idle session scheduler failed", tag);
+                } catch (...) {}
+            }
         }
 
         void Retire() noexcept {
@@ -264,14 +260,13 @@ private:
             for (const auto& entry : closing) Close(entry.session);
         }
 
-        net::steady_timer timer;
+        net::io_context& io_context;
+        TimeoutScheduler& scheduler;
         const Clock::duration check_interval;
         const Clock::duration idle_timeout;
         const size_t minimum_idle;
-        const std::string tag;
+        const memory::ThreadLocalString tag;
         memory::ThreadLocalVector<Entry> entries;
-        uint64_t generation = 0;
-        bool armed = false;
         bool retired = false;
         std::exception_ptr failure;
     };

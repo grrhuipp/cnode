@@ -1,8 +1,13 @@
 #pragma once
 
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
+
+#include <chrono>
 #include <cstdint>
 
 namespace acpp {
+
+class AsyncStream;
 
 // Borrowed observation of one owner's absolute phase deadline. The owner must
 // outlive the handle; replacing or clearing a deadline invalidates older views.
@@ -34,6 +39,30 @@ private:
     uint8_t expired_mask_ = 0;
     const uint32_t* generation_ = nullptr;
     uint32_t captured_generation_ = 0;
+};
+
+// One logical stream's phase deadline, owned inline by that stream. All methods
+// and destruction run on the owning Worker; its scheduler and stream must
+// outlive this member. No timer or background task is owned here.
+class StreamPhaseDeadline final : private TimeoutEvent {
+public:
+    StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner);
+    ~StreamPhaseDeadline() noexcept;
+    StreamPhaseDeadline(const StreamPhaseDeadline&) = delete;
+    StreamPhaseDeadline& operator=(const StreamPhaseDeadline&) = delete;
+
+    [[nodiscard]] PhaseDeadlineHandle Start(std::chrono::seconds timeout);
+    // Clear invalidates borrowed handles; Consume only acknowledges expiry.
+    void Clear() noexcept;
+    [[nodiscard]] bool Consume() noexcept;
+
+private:
+    void OnTimeout() noexcept override;
+
+    TimeoutScheduler& scheduler_;
+    AsyncStream& owner_;
+    uint32_t generation_ = 0;
+    uint8_t expired_ = 0;
 };
 
 }  // namespace acpp

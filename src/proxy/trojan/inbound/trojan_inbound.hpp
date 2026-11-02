@@ -1,7 +1,7 @@
 #pragma once
 
 #include "acppnode/proxy/inbound.hpp"
-#include "../validator.hpp"
+#include "acppnode/common/sharded_user_stats.hpp"
 
 namespace acpp {
 struct StatsShard;
@@ -16,7 +16,7 @@ namespace acpp::proxy::trojan::inbound {
 // ============================================================================
 class Handler final : public ::acpp::Inbound {
 public:
-    Handler(::acpp::trojan::Validator& validator,
+    Handler(::acpp::UserOnlineTracker& validator,
             ::acpp::StatsShard& stats,
             ::acpp::ConnectionLimiterPtr limiter);
 
@@ -31,7 +31,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::acpp::trojan::Validator& validator_;
+    ::acpp::UserOnlineTracker& validator_;
     ::acpp::StatsShard* stats_ = nullptr;
     ::acpp::ConnectionLimiterPtr limiter_;
 };

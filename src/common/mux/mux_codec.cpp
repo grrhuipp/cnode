@@ -1,6 +1,7 @@
 #include "acppnode/common/mux/mux_codec.hpp"
 #include "acppnode/common/byte_reader.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -9,59 +10,6 @@
 
 namespace acpp::mux {
 
-// ============================================================================
-// 地址类型转换
-// ============================================================================
-
-uint8_t ToMuxAddrType(AddressType t) noexcept {
-    switch (t) {
-        case AddressType::IPv4:   return 1;
-        case AddressType::Domain: return 2;
-        case AddressType::IPv6:   return 3;
-        default:                  return 0;
-    }
-}
-
-// ============================================================================
-// 内部：解析 PortThenAddress（Mux 线上格式）
-// 返回解析是否成功；成功时填入 target
-// ============================================================================
-static bool ParsePortThenAddress(ByteReader& r, TargetAddress& target) {
-    uint16_t port     = r.ReadU16BE();
-    uint8_t  addr_raw = r.ReadU8();
-    if (!r.Ok()) return false;
-
-    if (addr_raw == 1) {
-        // IPv4: 4 字节
-        auto span = r.ReadBytes(4);
-        if (!r.Ok()) return false;
-        net::ip::address_v4::bytes_type bytes;
-        std::memcpy(bytes.data(), span.data(), 4);
-        auto addr = net::ip::make_address_v4(bytes);
-        target = TargetAddress(addr, port);
-
-    } else if (addr_raw == 2) {
-        // Domain: 1 字节长度 + N 字节域名
-        uint8_t domain_len = r.ReadU8();
-        if (!r.Ok()) return false;
-        std::string_view domain = r.ReadStringView(domain_len);
-        if (!r.Ok()) return false;
-        target = TargetAddress(domain, port);
-
-    } else if (addr_raw == 3) {
-        // IPv6: 16 字节
-        auto span = r.ReadBytes(16);
-        if (!r.Ok()) return false;
-        net::ip::address_v6::bytes_type bytes;
-        std::memcpy(bytes.data(), span.data(), 16);
-        auto addr = net::ip::make_address_v6(bytes);
-        target = TargetAddress(addr, port);
-    } else {
-        return false;
-    }
-
-    return target.IsValid();
-}
 
 class MultiBufferFrameReader {
 public:
@@ -154,36 +102,31 @@ private:
     bool error_ = false;
 };
 
-static bool ParsePortThenAddress(MultiBufferFrameReader& r, TargetAddress& target) {
-    uint16_t port = r.ReadU16BE();
-    uint8_t addr_raw = r.ReadU8();
-    if (!r.Ok()) return false;
+static bool ParsePortThenAddress(ByteReader& reader, TargetAddress& target) {
+    auto view = reader;
+    auto decoded = DecodeAddress(view.ReadBytes(view.Remaining()),
+                                 AddressWireFormat::PortFirst);
+    if (decoded.status != AddressDecodeStatus::Complete ||
+        !reader.Skip(decoded.consumed)) return false;
+    target = std::move(decoded.target);
+    return target.IsValid();
+}
 
-    if (addr_raw == 1) {
-        net::ip::address_v4::bytes_type bytes{};
-        if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
-        target = TargetAddress(net::ip::make_address_v4(bytes), port);
-        return target.IsValid();
-    }
-    if (addr_raw == 2) {
-        const uint8_t domain_len = r.ReadU8();
-        if (!r.Ok()) return false;
-        std::array<char, 255> domain_buf{};
-        if (domain_len > 0 &&
-            !r.ReadBytes(std::span<uint8_t>(
-                reinterpret_cast<uint8_t*>(domain_buf.data()), domain_len))) {
-            return false;
+static bool ParsePortThenAddress(MultiBufferFrameReader& reader, TargetAddress& target) {
+    std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
+    size_t size = 0;
+    for (;;) {
+        auto decoded = DecodeAddress(std::span<const uint8_t>(bytes.data(), size),
+                                     AddressWireFormat::PortFirst);
+        if (decoded.status == AddressDecodeStatus::Invalid) return false;
+        if (decoded.status == AddressDecodeStatus::Complete) {
+            target = std::move(decoded.target);
+            return target.IsValid();
         }
-        target = TargetAddress(std::string_view(domain_buf.data(), domain_len), port);
-        return target.IsValid();
+        if (!reader.ReadBytes(std::span<uint8_t>(
+                bytes.data() + size, decoded.required - size))) return false;
+        size = decoded.required;
     }
-    if (addr_raw == 3) {
-        net::ip::address_v6::bytes_type bytes{};
-        if (!r.ReadBytes(std::span<uint8_t>(bytes.data(), bytes.size()))) return false;
-        target = TargetAddress(net::ip::make_address_v6(bytes), port);
-        return target.IsValid();
-    }
-    return false;
 }
 
 // ============================================================================
@@ -263,46 +206,6 @@ template <typename Reader>
     return meta.Ok() && meta.Remaining() == 0;
 }
 
-std::optional<FrameHeader> DecodeFrame(const uint8_t* data, size_t len) {
-    if (!data || len < 2) {
-        return std::nullopt;
-    }
-
-    const uint16_t meta_len =
-        (static_cast<uint16_t>(data[0]) << 8) |
-        static_cast<uint16_t>(data[1]);
-    if (meta_len < 4) {
-        return InvalidFrame();
-    }
-    if (len < static_cast<size_t>(2 + meta_len)) {
-        return std::nullopt;
-    }
-
-    ByteReader meta(data + 2, meta_len);
-    FrameHeader out;
-    if (!DecodeFrameMetadata(meta, out)) {
-        return InvalidFrame();
-    }
-
-    size_t frame_size = 2 + meta_len;
-    if ((out.option & kOptionData) != 0) {
-        if (len < frame_size + 2) {
-            return std::nullopt;
-        }
-        const uint16_t data_len =
-            (static_cast<uint16_t>(data[frame_size]) << 8) |
-            static_cast<uint16_t>(data[frame_size + 1]);
-        frame_size += 2 + data_len;
-        if (len < frame_size) {
-            return std::nullopt;
-        }
-        out.has_data = true;
-        out.data_len = data_len;
-        out.data_offset = frame_size - data_len;
-    }
-    out.frame_size = frame_size;
-    return out;
-}
 
 std::optional<FrameHeader> DecodeFramePrefix(
     const uint8_t* data,
@@ -402,44 +305,13 @@ std::optional<FrameHeader> DecodeFrame(
 // ============================================================================
 template <class ByteContainer>
 static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
-    if (!addr.IsValid() ||
-        (addr.IsDomain() && addr.host.size() > std::numeric_limits<uint8_t>::max())) {
-        return false;
-    }
-
-    // Port (2 BE)
-    buf.push_back(static_cast<uint8_t>(addr.port >> 8));
-    buf.push_back(static_cast<uint8_t>(addr.port & 0xFF));
-
-    uint8_t atype = ToMuxAddrType(addr.type);
-    buf.push_back(atype);
-
-    switch (addr.type) {
-    case AddressType::IPv4: {
-        if (addr.resolved_addr && addr.resolved_addr->is_v4()) {
-            auto bytes = addr.resolved_addr->to_v4().to_bytes();
-            buf.insert(buf.end(), bytes.begin(), bytes.end());
-        } else {
-            return false;
-        }
-        break;
-    }
-    case AddressType::Domain: {
-        uint8_t dlen = static_cast<uint8_t>(addr.host.size());
-        buf.push_back(dlen);
-        buf.insert(buf.end(), addr.host.begin(), addr.host.begin() + dlen);
-        break;
-    }
-    case AddressType::IPv6: {
-        if (addr.resolved_addr && addr.resolved_addr->is_v6()) {
-            auto bytes = addr.resolved_addr->to_v6().to_bytes();
-            buf.insert(buf.end(), bytes.begin(), bytes.end());
-        } else {
-            return false;
-        }
-        break;
-    }
-    case AddressType::Invalid:
+    const size_t size = AddressEncodedSize(addr, AddressWireFormat::PortFirst);
+    if (!addr.IsValid() || size == 0) return false;
+    const size_t offset = buf.size();
+    buf.resize(offset + size);
+    if (EncodeAddressTo(addr, buf.data() + offset, size,
+                        AddressWireFormat::PortFirst) == 0) {
+        buf.resize(offset);
         return false;
     }
     return true;

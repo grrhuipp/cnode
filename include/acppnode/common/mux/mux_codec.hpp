@@ -81,13 +81,11 @@ struct FrameHeader {
 // ============================================================================
 // DecodeFrame
 //
-// 从 data[0..len) 中解析一个完整的 Mux 帧头。
-//   - 返回 nullopt：数据不足，等待更多字节
-//   - 返回 FrameHeader，frame_size == 0：帧格式非法
-//   - 成功时：Payload 位于 data + (frame_size - data_len)
+// DecodeFrame 解析 MultiBuffer 中 [offset, offset + len) 的完整帧。
+// DecodeFramePrefix 只借用连续元数据前缀；total_len 包含分散存储的载荷。
+// 返回 nullopt 表示数据不足；frame_size == 0 表示非法帧，不能跳字节重同步。
+// 成功时 data_offset 表示载荷相对帧首的偏移，不消费输入。
 // ============================================================================
-[[nodiscard]] std::optional<FrameHeader> DecodeFrame(
-    const uint8_t* data, size_t len);
 
 [[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
     const uint8_t* data,
@@ -131,13 +129,5 @@ void EncodeEndTo(memory::ByteVector& out,
                                          uint16_t session_id,
                                          const TargetAddress& src,
                                          size_t payload_len);
-
-// ============================================================================
-// 地址类型转换
-//
-// 项目内部 AddressType: IPv4=1, Domain=3, IPv6=4
-// Mux 线上格式:         IPv4=1, Domain=2, IPv6=3
-// ============================================================================
-[[nodiscard]] uint8_t     ToMuxAddrType(AddressType t) noexcept;
 
 }  // namespace acpp::mux

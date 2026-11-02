@@ -8,19 +8,12 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
-#include <system_error>
 #include <utility>
 #include <vector>
 
 namespace acpp {
 
 namespace {
-
-std::optional<json::value> ParseConfigContent(
-    const std::filesystem::path&,
-    std::string_view content) {
-    return json::parse(content, json::KeyComparison::AsciiCaseInsensitive);
-}
 
 // 从磁盘读取并解析单个 JSON 文件
 std::optional<json::value> LoadJsonFile(const std::filesystem::path& path) {
@@ -36,7 +29,7 @@ std::optional<json::value> LoadJsonFile(const std::filesystem::path& path) {
     try {
         std::string content((std::istreambuf_iterator<char>(file)),
                             std::istreambuf_iterator<char>());
-        return ParseConfigContent(path, content);
+        return json::parse(content, json::KeyComparison::AsciiCaseInsensitive);
     } catch (const std::exception& e) {
         LOG_ERROR("config.parse_failed file={} error={}",
                   path.filename().string(), e.what());
@@ -46,14 +39,14 @@ std::optional<json::value> LoadJsonFile(const std::filesystem::path& path) {
 
 template <typename AddFn>
 void LoadConfigItems(const json::value& value, AddFn&& add) {
-    if (value.is_array()) {
-        for (const auto& item : value.as_array()) {
-            add(item.as_object());
+    if (!value.is_array()) {
+        throw std::invalid_argument("config list must be an array of objects");
+    }
+    for (const auto& item : value.as_array()) {
+        if (!item.is_object()) {
+            throw std::invalid_argument("config list entries must be objects");
         }
-    } else if (value.is_object()) {
-        add(value.as_object());
-    } else {
-        throw std::invalid_argument("config list must be an object or array");
+        add(item.as_object());
     }
 }
 
@@ -85,7 +78,7 @@ void LoadOutboundItems(
 
 }  // namespace
 
-std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
+std::optional<Config> LoadConfig(const std::filesystem::path& path) {
     std::filesystem::path config_dir;
     json::value main_config;
 
@@ -119,32 +112,26 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         }
         LOG_CONSOLE("config mode=file dir={}", config_dir.string());
 
-        std::ifstream file(file_path);
-        if (!file.is_open()) {
-            LOG_ERROR("config.open_failed file={}", path.string());
+        auto parsed = LoadJsonFile(file_path);
+        if (!parsed) {
+            LOG_ERROR("config.main_load_failed file={}", file_path.filename().string());
             return std::nullopt;
         }
-
-        try {
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                std::istreambuf_iterator<char>());
-            main_config = *ParseConfigContent(file_path, content);
-            LOG_CONSOLE("config.main loaded file={}", file_path.filename().string());
-        } catch (const std::exception& e) {
-            LOG_ERROR("config.parse_failed file={} error={}",
-                      file_path.filename().string(), e.what());
-            return std::nullopt;
-        }
+        main_config = std::move(*parsed);
+        LOG_CONSOLE("config.main loaded file={}", file_path.filename().string());
     }
 
-    const auto& main_object = main_config.as_object();
-    auto cfg_opt = LoadFromJson(main_object);
+    if (!main_config.is_object()) {
+        LOG_ERROR("config.main_invalid reason=expected_object");
+        return std::nullopt;
+    }
+    auto cfg_opt = ParseConfig(main_config.as_object());
     if (!cfg_opt) {
         return std::nullopt;
     }
 
     Config& cfg = *cfg_opt;
-    cfg.config_dir_ = config_dir;
+    cfg.config_dir = config_dir;
 
     const auto default_inbound_path = config_dir / constants::paths::kInboundFile;
     if (std::filesystem::exists(default_inbound_path)) {
@@ -155,11 +142,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             return std::nullopt;
         }
         try {
-            if (j->is_object() && j->as_object().contains("inbounds")) {
-                throw std::invalid_argument("inbounds sidecar must not use outer wrapper");
-            }
             LoadInboundItems(
-                cfg.static_inbounds_,
+                cfg.static_inbounds,
                 *j,
                 constants::paths::kInboundFile);
         } catch (const std::exception& e) {
@@ -178,11 +162,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             return std::nullopt;
         }
         try {
-            if (j->is_object() && j->as_object().contains("outbounds")) {
-                throw std::invalid_argument("outbounds sidecar must not use outer wrapper");
-            }
             LoadOutboundItems(
-                cfg.outbounds_,
+                cfg.outbounds,
                 *j,
                 constants::paths::kOutboundFile);
         } catch (const std::exception& e) {
@@ -204,10 +185,10 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
             if (!j->is_object() || j->as_object().contains("routing")) {
                 throw std::invalid_argument("routing sidecar must be a direct routing object");
             }
-            cfg.routing_ = RoutingConfig::FromJson(j->as_object());
+            cfg.routing = RoutingConfig::FromJson(j->as_object());
             LOG_CONSOLE("config.sidecar loaded file={} rules={}",
                         constants::paths::kRouteFile,
-                        cfg.routing_.rules.size());
+                        cfg.routing.rules.size());
         } catch (const std::exception& e) {
             LOG_ERROR("config.sidecar_parse_failed file={} error={}",
                       constants::paths::kRouteFile, e.what());
@@ -217,7 +198,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
 
     bool has_direct = false;
     bool has_blackhole = false;
-    for (const auto& ob : cfg.outbounds_) {
+    for (const auto& ob : cfg.outbounds) {
         if (ob.tag == constants::protocol::kDirect) has_direct = true;
         if (ob.tag == constants::protocol::kBlackhole) has_blackhole = true;
     }
@@ -226,7 +207,7 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         infra::OutboundSourceConfig direct;
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
-        cfg.outbounds_.insert(cfg.outbounds_.begin(), std::move(direct));
+        cfg.outbounds.insert(cfg.outbounds.begin(), std::move(direct));
         LOG_CONSOLE("config.outbound builtin tag={} sendThrough={}",
                     constants::protocol::kDirect, constants::binding::kAuto);
     }
@@ -235,14 +216,8 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         infra::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
-        cfg.outbounds_.push_back(std::move(blackhole));
+        cfg.outbounds.push_back(std::move(blackhole));
         LOG_CONSOLE("config.outbound builtin tag={}", constants::protocol::kBlackhole);
-    }
-
-    for (const auto& ignored : IgnoreUnknownRoutingRules(
-             cfg.outbounds_, cfg.routing_.rules)) {
-        LOG_WARN("config.routing ignored rule={} unknown_outbound={}",
-                 ignored.index, ignored.tag);
     }
 
     auto geoip_path = config_dir / constants::paths::kGeoIpFile;
@@ -254,26 +229,14 @@ std::optional<Config> Config::LoadFromFile(const std::filesystem::path& path) {
         LOG_CONSOLE("config.geo found file={}", constants::paths::kGeoSiteFile);
     }
 
-    LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} default_outbound={} panels={}",
-                cfg.workers_,
-                cfg.static_inbounds_.size(),
-                cfg.outbounds_.size(),
-                cfg.routing_.rules.size(),
-                cfg.outbounds_.empty() ? std::string(constants::protocol::kDirect)
-                                       : cfg.outbounds_.front().tag,
-                cfg.panels_.size());
+    LOG_CONSOLE("config summary workers={} inbounds={} outbounds={} rules={} panels={}",
+                cfg.workers,
+                cfg.static_inbounds.size(),
+                cfg.outbounds.size(),
+                cfg.routing.rules.size(),
+                cfg.panels.size());
 
     return cfg;
-}
-
-std::optional<Config> Config::LoadFromDirectory(const std::filesystem::path& dir) {
-    std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec)) {
-        LOG_ERROR("config.invalid_path dir={} reason=not_directory", dir.string());
-        return std::nullopt;
-    }
-
-    return LoadFromFile(dir);
 }
 
 }  // namespace acpp

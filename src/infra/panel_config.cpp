@@ -1,6 +1,5 @@
 #include "acppnode/infra/panel_config.hpp"
 
-#include "acppnode/core/naming.hpp"
 #include "json_bool.hpp"
 #include "json_string.hpp"
 #include "acppnode/infra/log.hpp"
@@ -106,7 +105,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
 
     const auto raw_node_type =
         jstr(j, "nodeType", std::string(constants::panel::kDefaultNodeType));
-    cfg.NodeType = naming::NormalizePanelNodeProtocol(raw_node_type);
+    cfg.NodeType = raw_node_type;
 
     if (const auto* node_ids = j.if_contains("nodeIDs")) {
         cfg.NodeIDs = PanelNodeIds::Parse(*node_ids);
@@ -139,7 +138,17 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         cfg.SendIP = std::move(*parsed);
     }
     cfg.EnableDNS = jbool(j, "enableDNS", cfg.EnableDNS);
-    cfg.DNSType = jstr(j, "dnsType", cfg.DNSType);
+    if (const auto* value = j.if_contains("dnsType")) {
+        if (!value->is_string()) {
+            throw std::invalid_argument("Panel dnsType must be a domain strategy string");
+        }
+        const auto strategy =
+            proxy::freedom::outbound::ParseDomainStrategy(value->as_string());
+        if (!strategy) {
+            throw std::invalid_argument("Panel dnsType is not a supported domain strategy");
+        }
+        cfg.DNSType = *strategy;
+    }
     cfg.ProxyProtocol = ParseProxyProtocolMode(j, "proxyProtocol", cfg.ProxyProtocol);
     cfg.TLSEnable = jbool(j, "tlsEnable", cfg.TLSEnable);
     cfg.TLSCert   = jstr(j, "tlsCert", cfg.TLSCert);

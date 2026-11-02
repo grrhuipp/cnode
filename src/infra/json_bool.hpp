@@ -2,14 +2,14 @@
 
 #include "acppnode/infra/json.hpp"
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace acpp {
 
-[[nodiscard]] std::expected<std::optional<bool>, std::string>
+[[nodiscard]] tl::expected<std::optional<bool>, std::string>
 ParseJsonBool(
     const json::object& source,
     std::string_view key);

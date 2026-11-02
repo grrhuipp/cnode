@@ -26,7 +26,7 @@ struct FaultState {
     bool consumed = false;
     std::size_t rejected_before = 0;
     bool preparation_finished = false;
-    std::size_t maintenance_attempts = 0;
+    std::size_t successful_spawns = 0;
 };
 inline thread_local FaultState fault;
 
@@ -78,19 +78,11 @@ inline void FinishPreparation() noexcept {
     std::fflush(stderr);
 }
 
-inline void ReportMaintenanceRearm() noexcept {
-    if (!fault.stage || std::strcmp(fault.stage, "udp-maintenance") != 0) return;
-    std::fprintf(stderr, "udp-maintenance-rearm begun=1\n");
-    std::fflush(stderr);
-}
-
-inline void OnMaintenanceSchedule() noexcept {
-    OnStage("udp-maintenance", static_cast<int>(fault.maintenance_attempts++));
-}
 
 inline void ReportSuccessfulSpawn(std::size_t index) noexcept {
     if (!fault.stage || (std::strcmp(fault.stage, "spawn") != 0 &&
                          std::strcmp(fault.stage, "ready") != 0)) return;
+    ++fault.successful_spawns;
     std::fprintf(stderr, "udp-listener-runtime spawn-started index=%zu\n", index);
     std::fflush(stderr);
 }

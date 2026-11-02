@@ -443,9 +443,13 @@ net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadli
     session::Context context;
     context.content.network = Network::UDP;
     StatsShard stats;
-    TimeoutToken cancellation;
+    struct Cancellation final : TimeoutEvent {
+        explicit Cancellation(UdpRequest& target) : target(target) {}
+        void OnTimeout() override { target.Cancel(); }
+        UdpRequest& target;
+    } cancellation(target);
     if (deadline) target.StartPhaseDeadline(1s);
-    else cancellation = TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, [&] { target.Cancel(); });
+    else (void)TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, cancellation);
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats,
         RelayConfig{.speed_limit = 100});

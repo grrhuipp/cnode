@@ -1,6 +1,7 @@
 #include "client.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/error.hpp"
+#include "acppnode/common/address_codec.hpp"
 #include "acppnode/common/unsafe.hpp"       // ISSUE-02-02: unsafe cast 收敛
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -561,11 +562,11 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
         }
         if (payload.size() >
             ::acpp::vmess::MAX_CHUNK_SIZE - state.cipher->Overhead()) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
         if (!co_await EncodeRequestBodyChunk(
                 state, stream, payload.data(), payload.size())) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         co_return VMessHandshakeResult{};
     }
@@ -574,7 +575,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
     const size_t max_padding_len =
         (state.global_padding && state.mask) ? kStreamMaxPaddingLen : 0;
     if (buf::Buffer::kSize <= 2 + overhead + max_padding_len) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const size_t max_chunk_size = std::min(
         size_t(::acpp::vmess::MAX_CHUNK_SIZE - overhead),
@@ -590,7 +591,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestBody(
                 stream,
                 payload.data() + offset,
                 chunk_size)) {
-            co_return std::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
         }
         offset += chunk_size;
     }
@@ -617,7 +618,7 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         if (code == ErrorCode::OK) {
             code = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        return std::unexpected(code);
+        return tl::unexpected(code);
     };
 
     if (state.sent) {
@@ -656,29 +657,11 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
     if (!append_header_u8(0)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);  // Reserved
     if (!append_header_u8(static_cast<uint8_t>(state.command))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
 
-    const uint8_t port_be[2] = {
-        static_cast<uint8_t>(state.target.port >> 8),
-        static_cast<uint8_t>(state.target.port & 0xFF)
-    };
-    if (!append_header(port_be, sizeof(port_be))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-
-    // Address
-    if (state.target.IsDomain()) {
-        if (state.target.host.size() > 255) co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        if (!append_header_u8(2)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        if (!append_header_u8(static_cast<uint8_t>(state.target.host.size()))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        if (!append_header(state.target.host.data(), state.target.host.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    } else if (state.target.resolved_addr && state.target.resolved_addr->is_v4()) {
-        if (!append_header_u8(1)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        auto bytes = state.target.resolved_addr->to_v4().to_bytes();
-        if (!append_header(bytes.data(), bytes.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    } else if (state.target.resolved_addr && state.target.resolved_addr->is_v6()) {
-        if (!append_header_u8(3)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-        auto bytes = state.target.resolved_addr->to_v6().to_bytes();
-        if (!append_header(bytes.data(), bytes.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    } else {
-        co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    }
+    const size_t address_size = EncodeAddressTo(
+        state.target, header.data() + header_len, header.size() - header_len,
+        AddressWireFormat::PortFirst);
+    if (address_size == 0) co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    header_len += address_size;
 
     // Padding (可选)
     if (padding_len > 0) {

@@ -7,6 +7,41 @@
 
 namespace acpp {
 
+StreamPhaseDeadline::StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner)
+    : scheduler_(TimeoutScheduler::ForIoContext(io_context)), owner_(owner) {}
+
+StreamPhaseDeadline::~StreamPhaseDeadline() noexcept {
+    Clear();
+}
+
+PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
+    Clear();
+    if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) return {};
+    constexpr auto maximum =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
+    const auto delay = timeout >= maximum
+        ? std::chrono::milliseconds::max()
+        : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+    if (!scheduler_.ScheduleAfter(delay, *this)) return {};
+    return {&expired_, 1, &generation_, generation_};
+}
+
+void StreamPhaseDeadline::Clear() noexcept {
+    scheduler_.Cancel(*this);
+    ++generation_;
+    expired_ = 0;
+}
+
+bool StreamPhaseDeadline::Consume() noexcept {
+    return std::exchange(expired_, uint8_t{0}) != 0;
+}
+
+void StreamPhaseDeadline::OnTimeout() noexcept {
+    expired_ = 1;
+    // Do not touch this owner after cancellation: its callback may close it.
+    owner_.Cancel();
+}
+
 void* AsyncStream::operator new(std::size_t size) {
     if (void* ptr = memory::AllocatePmr(size, alignof(AsyncStream))) {
         memory::OnAsyncStreamNew();
@@ -126,6 +161,7 @@ void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
 }
 
 transport::CancellationSource& AsyncStream::Cancellation() noexcept {
+    if (LogicalPhaseDeadline()) return cancellation_;
     if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)
         return tcp->Cancellation();
     return cancellation_;
@@ -147,6 +183,9 @@ bool AsyncStream::ConsumeWriteTimeout() noexcept {
 }
 
 PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout) {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        return deadline->Start(timeout);
+    }
     if (auto* tcp = BaseTcpStream()) {
         return tcp->StartPhaseDeadline(timeout);
     }
@@ -154,12 +193,19 @@ PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout
 }
 
 void AsyncStream::ClearPhaseDeadline() {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        deadline->Clear();
+        return;
+    }
     if (auto* tcp = BaseTcpStream()) {
         tcp->ClearPhaseDeadline();
     }
 }
 
 bool AsyncStream::ConsumePhaseDeadline() noexcept {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        return deadline->Consume();
+    }
     auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumePhaseDeadline();
 }

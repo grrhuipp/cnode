@@ -14,39 +14,13 @@
 #include "acppnode/common/initial_payload.hpp"
 #include "acppnode/common/session.hpp"
 
-#include <algorithm>
-#include <expected>
+#include <cstring>
+#include <tl/expected.hpp>
 #include <span>
 #include <utility>
 
 namespace acpp {
 
-namespace {
-
-
-[[nodiscard]] std::string FormatHexPrefix(const uint8_t* data, size_t len, size_t max_bytes = 24) {
-    if (!data || len == 0) {
-        return "-";
-    }
-
-    const size_t limit = std::min(len, max_bytes);
-    std::string out;
-    out.reserve(limit * 3 + 8);
-    static constexpr char kHex[] = "0123456789abcdef";
-
-    for (size_t i = 0; i < limit; ++i) {
-        if (i > 0) out.push_back(' ');
-        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
-        out.push_back(kHex[data[i] & 0x0F]);
-    }
-
-    if (len > limit) {
-        out.append(" ...");
-    }
-    return out;
-}
-
-}  // namespace
 
 // ============================================================================
 // proxy/vmess/inbound.Handler 实现（代理层，无传输层知识）
@@ -96,64 +70,52 @@ proxy::vmess::inbound::Handler::Process(
         co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
     }
     uint8_t* handshake_buf = handshake_guard->Tail().data();
-    const size_t handshake_capacity = handshake_guard->Available();
+    size_t handshake_capacity = handshake_guard->Available();
+    memory::ByteVector large_header;
     size_t total_read = 0;
-    try {
-        total_read = co_await stream->AsyncRead(net::buffer(handshake_buf, handshake_capacity));
-    } catch (const IoSystemError&) {
-        if (stream->ConsumePhaseDeadline()) {
-            LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
-                              ctx.inbound.tag, ctx.inbound.source_ip);
-            co_return fail(ErrorCode::TIMEOUT);
-        }
-        LOG_CONN_WARN(ctx, "[VMess][{}] handshake read failed from {}",
-                          ctx.inbound.tag, ctx.inbound.source_ip);
-        co_return fail(ErrorCode::SOCKET_READ_FAILED);
-    }
-    if (total_read == 0 && stream->ConsumePhaseDeadline()) {
-        LOG_CONN_WARN(ctx, "[VMess][{}] handshake phase deadline from {}",
-                          ctx.inbound.tag, ctx.inbound.source_ip);
-        co_return fail(ErrorCode::TIMEOUT);
-    }
-    if (total_read == 0 && stream->ConsumeIdleTimeout()) {
-        LOG_CONN_WARN(ctx, "[VMess][{}] handshake idle timeout from {}",
-                          ctx.inbound.tag, ctx.inbound.source_ip);
-        co_return fail(ErrorCode::TIMEOUT);
-    }
-    if (total_read == 0) co_return fail(ErrorCode::SOCKET_EOF);
-
-    LOG_CONN_TRACE(ctx,
-                   "[VMess][{}] handshake bytes={} prefix={}",
-                   tag,
-                   total_read,
-                   FormatHexPrefix(handshake_buf, total_read));
-
-    // VMess AEAD 解析（tag 限定范围，减少搜索量）
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
-    auto [request, consumed] = vmess_session.DecodeRequestHeader(
-        handshake_buf, total_read, ctx.conn_id);
-
-    if (!request) {
-        LOG_CONN_TRACE(ctx,
-                       "[VMess][{}] auth failed after {} handshake bytes prefix={}",
-                       tag,
-                       total_read,
-                       FormatHexPrefix(handshake_buf, total_read));
-        LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
-        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
+    std::optional<::acpp::vmess::VMessRequest> request;
+    size_t consumed = 0;
+    while (!request) {
+        const size_t required = vmess_session.RequiredHeaderBytes();
+        if (required > handshake_capacity) {
+            large_header.resize(required);
+            std::memcpy(large_header.data(), handshake_buf, total_read);
+            handshake_guard = {};
+            handshake_buf = large_header.data();
+            handshake_capacity = large_header.size();
         }
-        co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+        while (total_read < required) {
+            size_t n = 0;
+            try {
+                n = co_await stream->AsyncRead(net::buffer(
+                    handshake_buf + total_read, required - total_read));
+            } catch (const IoSystemError&) {
+                co_return fail(stream->ConsumePhaseDeadline()
+                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            }
+            if (n == 0) {
+                if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
+                    co_return fail(ErrorCode::TIMEOUT);
+                }
+                // EOF in a structured header is truncation, never an auth miss.
+                co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            total_read += n;
+        }
+        auto decoded = vmess_session.DecodeRequestHeader(
+            handshake_buf, total_read, ctx.conn_id);
+        request = std::move(decoded.first);
+        consumed = decoded.second;
+        if (!request && vmess_session.RequiredHeaderBytes() == 0) {
+            LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
+            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
+                limiter_->OnAuthFailTracked(tag, client_ip);
+            }
+            co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+        }
     }
 
-    // 握手后的剩余数据存入 pending_data，VMess inbound Link 构造时消费
-    if (consumed < total_read) {
-        handshake_guard->Produce(static_cast<uint32_t>(total_read));
-        request->SetPendingBuffer(
-            std::move(handshake_guard),
-            consumed,
-            total_read - consumed);
-    }
 
     LOG_CONN_TRACE(ctx,
                    "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
@@ -167,7 +129,7 @@ proxy::vmess::inbound::Handler::Process(
 
     // 填充用户信息
     if (request->user) {
-        const auto& profile = *request->user->profile;
+        const auto& profile = request->user->profile;
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
@@ -319,7 +281,7 @@ const bool kVmessInboundRegistered = [] {
 
             for (const auto& runtime_user : runtime_users) {
                 if (auto user = acpp::vmess::MemoryAccount::FromUUID(
-                        runtime_user.uuid,
+                        runtime_user.credential,
                         runtime_user.user_id,
                         runtime_user.email,
                         runtime_user.speed_limit,
@@ -332,6 +294,8 @@ const bool kVmessInboundRegistered = [] {
                         .cached_auth_aes_key = user->cached_auth_aes_key,
                         .profile = user->profile,
                     });
+                } else {
+                    return std::nullopt;
                 }
             }
 

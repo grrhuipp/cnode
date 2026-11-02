@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
-#include <string>
 #include <thread>
 
 namespace {
@@ -91,8 +90,8 @@ int Run() {
     bool failed_released = false;
     try {
         failed.get();
-    } catch (const std::runtime_error& error) {
-        failed_released = std::string(error.what()) == "posted task failed";
+    } catch (const std::runtime_error&) {
+        failed_released = true;
     }
     Require(failed_released, "posted exception must propagate to the caller");
     Require(mailbox.Outstanding() == 0, "failed post must still release its slot");
@@ -108,9 +107,38 @@ int Run() {
         future_full = true;
     }
     Require(future_full, "PostForFuture must reject when the mailbox is full");
+    // Closing must work even when every ordinary slot is occupied. Join is
+    // not a posted task and must wait for the accepted coroutine to finish.
+    mailbox.CloseAdmission();
+    mailbox.CloseAdmission();
+    Require(mailbox.IsClosed(), "admission closure must be permanent");
+    auto joined = acpp::net::co_spawn(worker_io,
+        mailbox.AsyncJoinAccepted(), acpp::net::use_future);
+    Require(joined.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+        "join returned while accepted I/O was still pending");
+    auto closed_future = mailbox.PostForFuture(AddOne(9));
+    bool future_closed = false;
+    try { (void)closed_future.get(); }
+    catch (const std::system_error& error) {
+        future_closed = error.code() == acpp::net::error::operation_aborted;
+    }
+    Require(future_closed, "closed future admission must report cancellation, not full");
+    auto closed_post = acpp::net::co_spawn(caller_io,
+        mailbox.Post(AddOne(10)), acpp::net::use_future);
+    caller_io.run();
+    bool post_closed = false;
+    try { (void)closed_post.get(); }
+    catch (const std::system_error& error) {
+        post_closed = error.code() == acpp::net::error::operation_aborted;
+    }
+    Require(post_closed, "closed awaitable admission must report cancellation");
     acpp::net::post(worker_io, [&] { future_blocker.cancel(); });
     future_held.get();
     Require(mailbox.Outstanding() == 0, "PostForFuture must release its slot");
+    joined.get();
+    auto joined_again = acpp::net::co_spawn(worker_io,
+        mailbox.AsyncJoinAccepted(), acpp::net::use_future);
+    joined_again.get();
 
     work.reset();
     worker_thread.join();

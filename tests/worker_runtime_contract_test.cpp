@@ -1,24 +1,4 @@
-#include "acppnode/app/worker.hpp"
 #include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/proxyman/outbound/prepared_config.hpp"
-#include "acppnode/features/routing/dispatch_policy.hpp"
-
-#include <concepts>
-#include <string>
-#include <utility>
-
-static_assert(std::same_as<
-    decltype(std::declval<acpp::Worker&>().StartRuntimeTask()),
-    acpp::net::awaitable<void>>);
-static_assert(std::same_as<
-    decltype(std::declval<acpp::Worker&>().AddOutboundTask(
-        std::declval<acpp::proxyman::outbound::PreparedOutboundConfig>())),
-    acpp::net::awaitable<void>>);
-static_assert(std::same_as<
-    decltype(std::declval<acpp::Worker&>().UnregisterListenerTask(
-        std::declval<std::string>())),
-    acpp::net::awaitable<void>>);
-static_assert(!std::default_initializable<acpp::routing::OutboundSelectionPolicy>);
 
 int main() {
     acpp::app::RequestLoadState load(3, 7);
@@ -31,16 +11,15 @@ int main() {
             acpp::app::RequestLoadState::DispatchScope second(load);
             acpp::app::RequestLoadState::DispatchScope third(load);
             if (load.ActiveConnections() != 3 || load.PressureIdleTimeout() != 7) return 3;
-            load.Configure(2, 5);
-            if (load.PressureIdleTimeout() != 5) return 4;
         }
         if (load.ActiveConnections() != 1 || load.PressureIdleTimeout() != 0) return 5;
     }
     if (load.ActiveConnections() != 0) return 6;
-    load.Configure(1, 9);
+    acpp::app::RequestLoadState one_connection(1, 9);
     {
-        acpp::app::RequestLoadState::PhysicalConnectionScope physical(load);
-        if (load.ActiveConnections() != 1 || load.PressureIdleTimeout() != 9) return 7;
+        acpp::app::RequestLoadState::PhysicalConnectionScope physical(one_connection);
+        if (one_connection.ActiveConnections() != 1 ||
+            one_connection.PressureIdleTimeout() != 9) return 7;
     }
     return 0;
 }

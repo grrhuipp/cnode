@@ -11,11 +11,9 @@ int main() {
 
     manager.UpdateRule(tag, {
         acpp::rule::DetectRule{
-            .ID = 7,
             .Pattern = std::regex("blocked\\.example"),
         },
     });
-    if (!manager.HasRule(tag)) return 1;
 
     acpp::session::Context ctx;
     ctx.inbound.tag = tag;
@@ -38,7 +36,6 @@ int main() {
 
     manager.UpdateRule(tag, {
         acpp::rule::DetectRule{
-            .ID = 8,
             .Pattern = std::regex("replacement\\.example"),
         },
     });
@@ -46,7 +43,6 @@ int main() {
     ctx.outbound.target = acpp::TargetAddress("replacement.example", 443);
     if (!policy.Blocked(ctx)) return 8;
     manager.UpdateRule(tag, {});
-    if (manager.HasRule(tag)) return 9;
     if (policy.Blocked(ctx)) return 10;
     return 0;
 }

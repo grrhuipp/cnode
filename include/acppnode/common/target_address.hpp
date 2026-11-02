@@ -91,19 +91,13 @@ struct TargetAddress {
         return type == AddressType::IPv6;
     }
 
-    // 转换为字符串
-    std::string ToString() const {
-        if (host.empty() && resolved_addr) {
-            return iputil::FormatEndpointForLog(resolved_addr->to_string(), port);
-        }
-        return iputil::FormatEndpointForLog(std::string_view(host.data(), host.size()), port);
-    }
 
-    // 写入调用方提供的 out（复用其容量），语义与 ToString() 完全一致。
-    // 用于按连接复用 scratch 的热路径，省去每次的 destination 串分配。
-    void ToStringInto(std::string& out) const {
+    // Writes into the caller's owning string, using its allocator and capacity.
+    // Numeric addresses are formatted through stack storage.
+    template<class Allocator>
+    void ToStringInto(std::basic_string<char, std::char_traits<char>, Allocator>& out) const {
         if (host.empty() && resolved_addr) {
-            iputil::FormatEndpointForLogInto(out, resolved_addr->to_string(), port);
+            iputil::FormatEndpointForLogInto(out, iputil::AddressText(*resolved_addr).View(), port);
             return;
         }
         iputil::FormatEndpointForLogInto(out, std::string_view(host.data(), host.size()), port);
@@ -212,12 +206,12 @@ struct std::formatter<acpp::TargetAddress> {
 
     template <class FormatContext>
     auto format(const acpp::TargetAddress& target, FormatContext& ctx) const {
-        std::string ip_storage;
+        std::optional<acpp::iputil::AddressText> ip_storage;
         std::string_view host(target.host.data(), target.host.size());
         const bool use_resolved = host.empty() && target.resolved_addr.has_value();
         if (use_resolved) {
-            ip_storage = target.resolved_addr->to_string();
-            host = ip_storage;
+            ip_storage.emplace(*target.resolved_addr);
+            host = ip_storage->View();
         }
         if (host.empty()) {
             host = "unknown";

@@ -34,11 +34,11 @@ public:
                            std::span<uint8_t> output) noexcept;
 
 private:
-    explicit VlessEncryptionCtr(void* ctx) noexcept : ctx_(ctx) {}
+    explicit VlessEncryptionCtr(EVP_CIPHER_CTX* ctx) noexcept : ctx_(ctx) {}
 
     void Close() noexcept;
 
-    void* ctx_ = nullptr;
+    EVP_CIPHER_CTX* ctx_ = nullptr;
 };
 
 [[nodiscard]] std::optional<std::array<uint8_t, kVlessEncryptionCtrKeySize>>

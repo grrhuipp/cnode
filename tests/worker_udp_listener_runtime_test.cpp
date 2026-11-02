@@ -51,6 +51,10 @@ struct FixtureState {
     std::vector<Observation> observations;
     unsigned responses_created = 0;
     unsigned responses_destroyed = 0;
+    unsigned handlers_created = 0;
+    unsigned handlers_destroyed = 0;
+    std::thread::id owner = std::this_thread::get_id();
+    bool wrong_destructor_thread = false;
 };
 
 class TrackedResponse final : public acpp::InboundDatagramResponse {
@@ -78,7 +82,11 @@ struct Runtime final : acpp::proxyman::inbound::ProtocolRuntime {
 class Datagram final : public acpp::Inbound {
 public:
     Datagram(FixtureState& state, unsigned token, bool association)
-        : state_(state), token_(token), create_association_(association) {}
+        : state_(state), token_(token), create_association_(association) { ++state_.handlers_created; }
+    ~Datagram() override {
+        state_.wrong_destructor_thread |= std::this_thread::get_id() != state_.owner;
+        ++state_.handlers_destroyed;
+    }
 
     acpp::net::awaitable<acpp::RelayResult> Process(
         std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
@@ -87,17 +95,16 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    std::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
+    tl::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest& request) override {
         if (!request.payload.empty())
             state_.observations.push_back({token_, request.payload.front()});
         if (!create_association_ || request.payload.empty())
-            return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+            return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
         acpp::InboundDatagramResult decoded;
         const std::array<uint8_t, 1> owner{1};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
-        decoded.session_key = std::to_string(request.payload.front());
-        decoded.response = acpp::memory::AllocateShared<TrackedResponse>(state_);
+        decoded.session_id = request.payload.front();
         decoded.target = acpp::TargetAddress(acpp::net::ip::address_v4::loopback(), 9);
         acpp::buf::BufferGuard payload(acpp::buf::Buffer::New());
         if (!payload) throw std::bad_alloc();
@@ -105,6 +112,10 @@ public:
         payload->Produce(1);
         decoded.payload.push_back(std::move(payload));
         return decoded;
+    }
+    tl::expected<std::shared_ptr<acpp::InboundDatagramResponse>, acpp::ErrorCode>
+    CreateDatagramResponse(const acpp::InboundDatagramResult&) override {
+        return acpp::memory::AllocateShared<TrackedResponse>(state_);
     }
 
 private:
@@ -254,8 +265,9 @@ acpp::net::awaitable<void> WaitForListenerCounts(
 acpp::net::awaitable<void> DrainWorker(
     acpp::net::io_context& io, std::unique_ptr<acpp::Worker>& worker) {
     if (!worker) co_return;
-    co_await worker->UnregisterListenerTask(std::string(kTag));
-    co_await WaitForListenerCounts(io, *worker, 0, 0);
+    if (!io.get_executor().running_in_this_thread()) Fail("cleanup left the Worker executor");
+    worker->RequestStop();
+    co_await worker->AsyncJoin();
     worker.reset();
 }
 
@@ -277,13 +289,12 @@ acpp::net::awaitable<void> RunAssociationWorker(
     try {
         co_await worker.StartRuntimeTask();
         const auto request = BuildRequest(worker.Id() + 1, true);
-        if (!co_await worker.RegisterInboundTask({}, request, BuildReceiver()))
+        if (!co_await worker.RegisterInboundTask(request, BuildReceiver()))
             Fail("two-worker inbound registration failed");
         const auto listen = acpp::InboundListen::Parse("0.0.0.0");
         if (!listen) Fail("could not prepare shared IPv4 listener");
-        const auto binding = acpp::MakePortBinding(
-            port, std::string(kProtocol), std::string(kTag), *listen);
-        if (!co_await worker.AddUdpListenerTask(binding, {}, request))
+        const auto binding = acpp::PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen};
+        if (!co_await worker.AddUdpListenerTask(binding, request))
             Fail("two-worker UDP listener registration failed");
         listener_registered = true;
         auto initial = co_await Snapshot(worker);
@@ -343,6 +354,8 @@ acpp::net::awaitable<void> RunAssociationWorker(
             co_await Pause(io, 10ms);
         } catch (...) {}
     }
+    worker.RequestStop();
+    co_await worker.AsyncJoin();
     done.set_value(std::move(result));
 }
 
@@ -439,7 +452,7 @@ acpp::net::awaitable<bool> CancelledSameSocketUpdate(
         acpp::net::redirect_error(acpp::net::use_awaitable, ec)));
     if (ec != acpp::net::error::operation_aborted)
         Fail("same-socket cancellation gate was not explicitly released");
-    co_return co_await worker.AddUdpListenerTask(std::move(binding), {}, std::move(request));
+    co_return co_await worker.AddUdpListenerTask(std::move(binding), std::move(request));
 }
 
 acpp::net::awaitable<void> VerifyCancelledSameSocket(
@@ -473,7 +486,7 @@ acpp::net::awaitable<void> VerifyCancelledSameSocket(
 }
 
 enum class Mode { Success, PrepareStandard, PreparePmr, Spawn, Ready, SameSocketCancel,
-                  Associations, TwoWorkersAssociations, Maintenance };
+                  Associations, TwoWorkersAssociations };
 struct Options {
     Mode mode = Mode::Success;
     std::size_t budget_or_index = 0;
@@ -482,22 +495,21 @@ struct Options {
 acpp::net::awaitable<void> RunCases(
     acpp::net::io_context& io, acpp::Worker& worker,
     std::unique_ptr<acpp::Worker>& worker_owner,
-    FixtureState& state, uint16_t port, Options options, int& result) {
+    FixtureState& state, uint16_t port, Options options, int& result,
+    std::exception_ptr& runtime_failure) {
     try {
         co_await worker.StartRuntimeTask();
         const auto auto_listen = acpp::InboundListen::Parse("auto");
         const auto ipv4_wildcard = acpp::InboundListen::Parse("0.0.0.0");
         if (!auto_listen || !ipv4_wildcard) Fail("could not prepare listener endpoints");
 
-        auto old_request = BuildRequest(1,
-            options.mode == Mode::Associations || options.mode == Mode::Maintenance);
-        if (!co_await worker.RegisterInboundTask({}, old_request, BuildReceiver()))
+        auto old_request = BuildRequest(1, options.mode == Mode::Associations);
+        if (!co_await worker.RegisterInboundTask(old_request, BuildReceiver()))
             Fail("Worker::RegisterInboundTask failed");
         const auto old_listen = (options.mode == Mode::Spawn || options.mode == Mode::Ready)
             ? *ipv4_wildcard : *auto_listen;
-        const auto old_binding = acpp::MakePortBinding(
-            port, std::string(kProtocol), std::string(kTag), old_listen);
-        if (!co_await worker.AddUdpListenerTask(old_binding, {}, old_request))
+        const auto old_binding = acpp::PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = old_listen};
+        if (!co_await worker.AddUdpListenerTask(old_binding, old_request))
             Fail("initial Worker::AddUdpListenerTask failed");
 
         acpp::udp::socket sender(io, acpp::udp::v4());
@@ -505,16 +517,6 @@ acpp::net::awaitable<void> RunCases(
         if (!initial.resources || initial.resources->udp_listeners == 0 ||
             initial.resources->udp_receive_loops != initial.resources->udp_listeners)
             Fail("initial real listener and receive-loop metrics are inconsistent");
-        if (options.mode == Mode::Maintenance) {
-            worker_udp_listener_runtime_test::Configure(
-                "udp-maintenance", static_cast<int>(options.budget_or_index),
-                worker_udp_listener_runtime_test::FaultKind::Pmr);
-            // A burst exceeding one global batch keeps rows for a genuine
-            // callback rearm, not a fake throw or a packet-triggered cleanup.
-            for (uint8_t nonce = 1; nonce <= 130; ++nonce) Send(sender, port, nonce);
-            co_await Pause(io, 1s);
-            Fail("configured maintenance allocation fault did not terminate scheduling");
-        }
         if (options.mode == Mode::Associations) {
             for (uint8_t nonce = 1; nonce <= 30; ++nonce)
                 co_await SendAndVerify(io, sender, port, state, 1, nonce);
@@ -537,7 +539,7 @@ acpp::net::awaitable<void> RunCases(
 
         if (options.mode == Mode::SameSocketCancel) {
             co_await VerifyCancelledSameSocket(io, worker,
-                acpp::MakePortBinding(port, std::string(kProtocol), std::string(kTag), old_listen),
+                acpp::PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = old_listen},
                 BuildRequest(2));
             co_await SendAndVerify(io, sender, port, state, 1, 0x32);
             co_await DrainWorker(io, worker_owner);
@@ -556,8 +558,7 @@ acpp::net::awaitable<void> RunCases(
         auto replacement_request = BuildRequest(2);
         const auto new_listen = (options.mode == Mode::Spawn || options.mode == Mode::Ready)
             ? *auto_listen : *ipv4_wildcard;
-        const auto replacement = acpp::MakePortBinding(
-            port, std::string(kProtocol), std::string(kTag), new_listen);
+        const auto replacement = acpp::PortBinding{.port = port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = new_listen};
 
         if (options.mode == Mode::PrepareStandard) {
             worker_udp_listener_runtime_test::Configure(
@@ -581,7 +582,7 @@ acpp::net::awaitable<void> RunCases(
             bool threw_bad_alloc = false;
             try {
                 (void)co_await worker.AddUdpListenerTask(
-                    replacement, {}, replacement_request);
+                    replacement, replacement_request);
             } catch (const std::bad_alloc&) {
                 threw_bad_alloc = true;
             }
@@ -618,27 +619,33 @@ acpp::net::awaitable<void> RunCases(
             co_return;
         }
 
-        // Spawn failures are intentionally fatal in Worker::StartUdpListening;
-        // the CTest subprocess asserts the production phase and exit status.
-        if (!co_await worker.AddUdpListenerTask(replacement, {}, replacement_request))
+        // A real post-commit allocation failure requests global shutdown.
+        if (!co_await worker.AddUdpListenerTask(replacement, replacement_request))
             Fail("replacement Worker::AddUdpListenerTask failed");
         if (options.mode == Mode::Success) {
             co_await WaitForListenerCounts(io, worker, 1, 1);
             co_await SendAndVerify(io, sender, port, state, 2, 0x42);
-            co_await worker.UnregisterListenerTask(std::string(kTag));
-            co_await WaitForListenerCounts(io, worker, 0, 0);
-            worker_owner.reset();
+            co_await DrainWorker(io, worker_owner);
             result = 0;
             co_return;
         }
 
-        Fail("configured spawn fault did not terminate during the real co_spawn call");
-    } catch (const std::exception& error) {
-        std::cerr << "worker UDP runtime fixture: " << error.what() << '\n';
-        result = 2;
+        Fail("configured spawn allocation fault was not consumed");
     } catch (...) {
-        std::cerr << "worker UDP runtime fixture: unknown exception\n";
-        result = 2;
+        const bool expected_fault =
+            (options.mode == Mode::Spawn || options.mode == Mode::Ready) &&
+            worker_udp_listener_runtime_test::fault.consumed && runtime_failure &&
+            worker_udp_listener_runtime_test::fault.successful_spawns ==
+                (options.mode == Mode::Ready ? 1 : options.budget_or_index);
+        result = expected_fault ? 0 : 2;
+        if (!expected_fault) {
+            try { std::rethrow_exception(std::current_exception()); }
+            catch (const std::exception& error) {
+                std::cerr << "worker UDP runtime fixture: " << error.what() << '\n';
+            } catch (...) {
+                std::cerr << "worker UDP runtime fixture: unknown exception\n";
+            }
+        }
     }
     if (worker_owner) {
         try {
@@ -671,11 +678,6 @@ bool ParseOptions(int argc, char** argv, Options& options) {
     if (argc == 2 && std::string_view(argv[1]) == "--prepare-fault-pmr") {
         options.mode = Mode::PreparePmr;
         return true;
-    }
-    if (argc == 3 && std::string_view(argv[1]) == "--maintenance-fault") {
-        options.mode = Mode::Maintenance;
-        options.budget_or_index = static_cast<std::size_t>(std::strtoul(argv[2], nullptr, 10));
-        return options.budget_or_index <= 1;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--ready-fault") {
         options.mode = Mode::Ready;
@@ -726,7 +728,6 @@ int main(int argc, char** argv) {
     acpp::app::dns::DNSWorker dns(io, dns_config, 8);
     acpp::StatsShard stats;
     acpp::WorkerRuntimeConfig runtime_config;
-    runtime_config.mailbox_capacity = 8;
     FixtureState state;
     g_state = &state;
     const uint16_t port = ReservePort(io);
@@ -740,9 +741,13 @@ int main(int argc, char** argv) {
         }
     }
     auto worker = std::make_unique<acpp::Worker>(0, io, runtime_config, stats, dns);
+    std::exception_ptr runtime_failure;
+    worker->SetFailureHandler([&runtime_failure](std::exception_ptr error) {
+        runtime_failure = error;
+    });
     int result = 2;
     acpp::net::co_spawn(
-        io, RunCases(io, *worker, worker, state, port, options, result),
+        io, RunCases(io, *worker, worker, state, port, options, result, runtime_failure),
         [&result](std::exception_ptr error) {
             if (!error) return;
             try {
@@ -762,5 +767,15 @@ int main(int argc, char** argv) {
         worker.reset();
         return 2;
     }
+    if (result == 0) {
+        if (state.handlers_created == 0 || state.handlers_created != state.handlers_destroyed ||
+            state.responses_created != state.responses_destroyed || state.wrong_destructor_thread)
+            return 2;
+        try {
+            acpp::udp::socket rebound(io, acpp::udp::v4());
+            rebound.bind({acpp::net::ip::address_v4::loopback(), port});
+        } catch (...) { return 2; }
+    }
+    acpp::Log::Shutdown();
     return result;
 }

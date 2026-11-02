@@ -12,10 +12,10 @@ int HexValue(char value) noexcept {
 
 }  // namespace
 
-std::expected<RealityShortId, RealityShortIdError>
+tl::expected<RealityShortId, RealityShortIdError>
 ParseRealityShortId(std::string_view value) noexcept {
     if (value.size() % 2 != 0 || value.size() > kRealityShortIdSize * 2) {
-        return std::unexpected(RealityShortIdError::InvalidFormat);
+        return tl::unexpected(RealityShortIdError::InvalidFormat);
     }
 
     RealityShortId parsed{};
@@ -23,7 +23,7 @@ ParseRealityShortId(std::string_view value) noexcept {
         const int high = HexValue(value[i]);
         const int low = HexValue(value[i + 1]);
         if (high < 0 || low < 0) {
-            return std::unexpected(RealityShortIdError::InvalidFormat);
+            return tl::unexpected(RealityShortIdError::InvalidFormat);
         }
         parsed[i / 2] = static_cast<uint8_t>((high << 4) | low);
     }

@@ -96,7 +96,7 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         using ActiveList = memory::ThreadLocalList<const Credential*>;
 
         struct Entry {
-            memory::ThreadLocalString tag;
+            const proxyman::inbound::UserStore::VmessUserMap* table = nullptr;
             int64_t timestamp;
             ActiveList::iterator order_it;
         };
@@ -104,10 +104,10 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
         memory::ThreadLocalUnorderedMap<const Credential*, Entry> entries;
         ActiveList active_order;
 
-        void Touch(const Credential* user, std::string_view tag, int64_t now) {
+        void Touch(const Credential* user,
+                   const proxyman::inbound::UserStore::VmessUserMap* table, int64_t now) {
             auto it = entries.find(user);
             if (it != entries.end()) {
-                it->second.tag.assign(tag.data(), tag.size());
                 it->second.timestamp = now;
                 if (it->second.order_it != active_order.begin()) {
                     active_order.splice(active_order.begin(), active_order, it->second.order_it);
@@ -117,7 +117,7 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
 
             active_order.push_front(user);
             Entry entry;
-            entry.tag.assign(tag.data(), tag.size());
+            entry.table = table;
             entry.timestamp = now;
             entry.order_it = active_order.begin();
             entries.emplace(user, std::move(entry));
@@ -153,9 +153,9 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
     };
 
     mutable HotUserCache hot_cache;
-    // Cache entries borrow credentials only while the currently loaded table
-    // owns them. An idle validator must not retain a replaced authentication table.
-    mutable std::weak_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
+    // Borrowed entries are invalidated on cold Worker publication, not when
+    // requests alternate between tags sharing this validator.
+    mutable uint64_t view_revision = 0;
     mutable int64_t last_hot_cache_cleanup = 0;
     mutable SessionHistory session_history;
 };
@@ -203,10 +203,10 @@ TimedUserValidator::FindByAuthIDForTag(
     };
 
     auto view = proxyman::inbound::UserStore::VmessUsers(tag);
-    const auto hot_users = impl_->hot_users.lock();
-    if (!hot_users || view.users.get() != hot_users.get()) {
+    const uint64_t revision = proxyman::inbound::UserStore::WorkerViewRevision();
+    if (impl_->view_revision != revision) {
         impl_->hot_cache.Clear();
-        impl_->hot_users = view.users;
+        impl_->view_revision = revision;
     }
 
     if (now - impl_->last_hot_cache_cleanup > 60) {
@@ -220,7 +220,7 @@ TimedUserValidator::FindByAuthIDForTag(
         for (const auto* user : impl_->hot_cache.active_order) {
             auto it = impl_->hot_cache.entries.find(user);
             if (it != impl_->hot_cache.entries.end() &&
-                std::string_view(it->second.tag.data(), it->second.tag.size()) == tag &&
+                it->second.table == view.users.get() &&
                 it->second.timestamp + Impl::HotUserCache::kWindowSeconds >= now) {
                 candidates[candidate_count++] = user;
                 if (candidate_count == candidates.size()) {
@@ -244,7 +244,7 @@ TimedUserValidator::FindByAuthIDForTag(
 
     for (const auto& [uuid, user] : *view.users) {
         if (tryUser(user)) {
-            impl_->hot_cache.Touch(&user, tag, now);
+            impl_->hot_cache.Touch(&user, view.users.get(), now);
             return view.Share(user);
         }
     }

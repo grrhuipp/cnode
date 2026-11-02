@@ -28,7 +28,7 @@ class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
 // 生命周期规范：
 // ┌─────────────────────────────────────────────────────────────────────────┐
 // │ 1. 所有操作（ShutdownRead/ShutdownWrite/Cancel/Close）必须幂等         │
-// │ 2. Close() 后所有 Async 操作应立即返回错误                               │
+// │ 2. Close() 后读取返回 EOF，写入失败                                     │
 // │ 3. Cancel() 仅取消挂起操作，不改变连接状态                               │
 // │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
 // └─────────────────────────────────────────────────────────────────────────┘
@@ -45,6 +45,12 @@ public:
 
     virtual ~AsyncStream() noexcept = default;
 
+    // Byte-stream EOF half-closes the peer writer; full-close transports
+    // explicitly override this contract.
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::ShutdownPeerWrite;
+    }
+
     // ========================================================================
     // 数据传输
     // ========================================================================
@@ -54,7 +60,7 @@ public:
      *
      * @param buf 目标缓冲区
      * @return 读取字节数；0 表示 EOF（对端关闭写端）
-     * @throws IoSystemError 网络错误
+     * @throws IoSystemError 网络错误或取消；取消不能伪装成 EOF
      */
     virtual net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) = 0;
 
@@ -84,7 +90,7 @@ public:
      * 批量读取数据到 buf::MultiBuffer
      *
      * @return buf::MultiBuffer（无有效数据 = EOF）；返回值按 RAII 自动归还 Buffer
-     * @throws IoSystemError 网络错误
+     * @throws IoSystemError 网络错误或取消；内存不足抛出 std::bad_alloc
      */
     virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override = 0;
 
@@ -208,6 +214,8 @@ public:
     [[nodiscard]] bool ConsumeReadTimeout() noexcept;
     [[nodiscard]] bool ConsumeWriteTimeout() noexcept;
 
+    // Logical streams select their inline deadline owner below; ordinary byte
+    // streams continue to use the physical connection's aggregate deadlines.
     [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline();
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept;
@@ -216,6 +224,10 @@ public:
     [[nodiscard]] std::optional<tcp::endpoint> RemoteEndpoint() const;
 
 protected:
+    // Override for a logical stream, including split transports. Its Cancel()
+    // must cancel only that logical stream, never the shared physical stream.
+    virtual StreamPhaseDeadline* LogicalPhaseDeadline() noexcept { return nullptr; }
+
     void NotifyCancellation() noexcept { Cancellation().CancelPending(); }
     void NotifyClosed() noexcept { Cancellation().Stop(); }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。

@@ -116,6 +116,7 @@ install_dependency() {
 # ============================================================================
 
 install_cnode() {
+    BINARY_UPDATED=0
     install_dependency curl curl
     install_dependency jq jq
 
@@ -226,38 +227,36 @@ install_cnode() {
     fi
 
     if [ "$NEED_BINARY_UPDATE" -eq 1 ]; then
-        # 运行中的二进制无法覆盖（Text file busy），先停服务并杀残留进程
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            echo "停止 cnode 服务..."
-            systemctl stop "$SERVICE_NAME"
-        fi
-        pkill -f "$BIN_PATH" 2>/dev/null || true
-        sleep 1
 
         UPDATE_TARGET="$REMOTE_VERSION"
         if [ -z "$UPDATE_TARGET" ]; then
             UPDATE_TARGET="release:$RELEASE_TAG"
         fi
         echo "更新 cnode: ${LOCAL_ID:-none} (${LOCAL_ASSET:-unknown}) -> $UPDATE_TARGET ($ASSET_NAME)"
-        if ! curl -fsSL --connect-timeout 10 --retry 3 "$LATEST_URL" -o "$BIN_PATH"; then
-            echo "cnode 下载失败。"
+        BINARY_TMP=$(mktemp "$INSTALL_DIR/.cnode.XXXXXX") || exit 1
+        if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+            "$LATEST_URL" -o "$BINARY_TMP" || [ ! -s "$BINARY_TMP" ] ||
+            ! chmod 0755 "$BINARY_TMP"; then
+            rm -f "$BINARY_TMP"
+            echo "cnode 下载失败，保留原二进制和运行中的服务。"
             exit 1
         fi
-        chmod +x "$BIN_PATH"
 
-        # 验证下载的版本
-        NEW_ID=$(timeout 3 "$BIN_PATH" -v 2>/dev/null | tr -d '[:space:]')
-        if [ -n "$REMOTE_VERSION" ]; then
-            if [ "$NEW_ID" != "$REMOTE_VERSION" ]; then
-                echo "版本校验失败: 期望 $REMOTE_VERSION，实际 $NEW_ID"
-                exit 1
-            fi
-            echo "cnode 已更新到 $REMOTE_VERSION"
-        elif [ -n "$NEW_ID" ]; then
-            echo "cnode 已更新: $NEW_ID"
-        else
-            echo "cnode 已更新: $BIN_PATH"
+        # Validate the candidate before replacing the executable. Atomic rename
+        # leaves a running process on its old inode until main restarts it.
+        NEW_ID=$(timeout 3 "$BINARY_TMP" -v 2>/dev/null | tr -d '[:space:]')
+        if [ -z "$NEW_ID" ] || { [ -n "$REMOTE_VERSION" ] && [ "$NEW_ID" != "$REMOTE_VERSION" ]; }; then
+            rm -f "$BINARY_TMP"
+            echo "版本校验失败，保留原二进制: 期望 ${REMOTE_VERSION:-有效版本标识}，实际 $NEW_ID"
+            exit 1
         fi
+        if ! mv -f "$BINARY_TMP" "$BIN_PATH"; then
+            rm -f "$BINARY_TMP"
+            echo "cnode 替换失败，保留原二进制。"
+            exit 1
+        fi
+        BINARY_UPDATED=1
+        echo "cnode 已更新: $NEW_ID"
         echo "$ASSET_NAME" > "$INSTALLED_ASSET_PATH"
     else
         echo "cnode 已是最新版本: $REMOTE_VERSION ($ASSET_NAME)"
@@ -265,11 +264,14 @@ install_cnode() {
 
     if [ "$NEED_DEBUG_DOWNLOAD" -eq 1 ]; then
         echo "下载符号文件: $DEBUG_PATH"
-        if ! curl -fsSL --connect-timeout 10 --retry 3 "$DEBUG_URL" -o "$DEBUG_PATH"; then
-            echo ".debug 文件下载失败。"
+        DEBUG_TMP=$(mktemp "$INSTALL_DIR/.cnode-debug.XXXXXX") || exit 1
+        if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+            "$DEBUG_URL" -o "$DEBUG_TMP" || [ ! -s "$DEBUG_TMP" ] ||
+            ! chmod 0644 "$DEBUG_TMP" || ! mv -f "$DEBUG_TMP" "$DEBUG_PATH"; then
+            rm -f "$DEBUG_TMP"
+            echo ".debug 文件下载失败，保留原符号文件。"
             exit 1
         fi
-        chmod 0644 "$DEBUG_PATH"
         echo ".debug 文件已下载: $DEBUG_PATH"
     fi
 }
@@ -411,34 +413,21 @@ ensure_config_json_valid() {
         return 0
     fi
 
-    # 校验现有 config.json 是否合法
-    if ! jq empty "$CONFIG_JSON" 2>/dev/null; then
-        echo "警告: config.json 格式损坏，尝试自动修复..."
-        # 用 python/sed 尝试修复常见问题（缺逗号等），若失败则重建
-        if command -v python3 >/dev/null 2>&1; then
-            python3 -c "
-import json, re, sys
-with open('$CONFIG_JSON') as f:
-    text = f.read()
-# 修复对象/数组元素之间缺少逗号: }{ -> },{  或 ]{ -> ],{
-text = re.sub(r'(\})\s*(\{)', r'\1,\2', text)
-text = re.sub(r'(\])\s*(\{)', r'\1,\2', text)
-try:
-    obj = json.loads(text)
-    with open('$CONFIG_JSON', 'w') as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    print('自动修复成功')
-except Exception as e:
-    print(f'自动修复失败: {e}', file=sys.stderr)
-    sys.exit(1)
-" || {
-                echo "错误: config.json 无法自动修复，请手动检查"
-                exit 1
-            }
-        else
-            echo "错误: config.json 格式损坏且无 python3 可用，请手动修复"
-            exit 1
-        fi
+    # Never guess repairs for broken input, or publish a case-folded collision.
+    if ! jq -e '
+        def validkeys:
+            if type == "object" then
+                ((keys_unsorted | map(ascii_downcase)) as $keys |
+                    ($keys | length) == ($keys | unique | length)) and
+                all(.[]; validkeys)
+            elif type == "array" then all(.[]; validkeys)
+            else true end;
+        type == "object" and validkeys and
+        all(to_entries[] | select(.key | ascii_downcase == "panels");
+            .value | type == "array" and all(.[]; type == "object"))
+    ' "$CONFIG_JSON" >/dev/null 2>&1; then
+        echo "错误: config.json 无效或存在大小写冲突的字段，保留原文件，请手动修复"
+        exit 1
     fi
 }
 
@@ -460,36 +449,43 @@ add_panel_json() {
         --argjson node_ids "$NODE_ID_JSON" \
         --arg node_type "$node_type" \
         '{
-            Name: $name,
-            Type: "V2board",
-            APIHost: $api_host,
-            Key: $api_key,
-            NodeIDs: $node_ids,
-            NodeType: $node_type,
-            ListenIP: "auto",
-            SendIP: "auto",
-            EnableDNS: true,
-            TLSEnable: false,
-            TLSCert: "",
-            TLSKey: ""
+            name: $name,
+            type: "V2board",
+            apihost: $api_host,
+            key: $api_key,
+            nodeids: $node_ids,
+            nodetype: $node_type,
+            listenip: "auto",
+            sendip: "auto",
+            enabledns: true,
+            tlsenable: false,
+            tlscert: "",
+            tlskey: ""
         }')
 
     if [ "$tls_enable" = "true" ]; then
         PANEL_JSON=$(echo "$PANEL_JSON" | jq \
             --arg cert "$tls_cert" \
             --arg key  "$tls_key" \
-            '.TLSEnable = true
-             | if $cert != "" then .TLSCert = $cert else . end
-             | if $key  != "" then .TLSKey  = $key  else . end')
+            '.tlsenable = true
+             | if $cert != "" then .tlscert = $cert else . end
+             | if $key  != "" then .tlskey = $key else . end')
     fi
 
     ensure_config_json_valid
 
-    # 先删除同名 panel（去重），再追加
-    jq --arg name "$name" --argjson panel "$PANEL_JSON" \
-        '.panels = [.panels[] | select(.Name != $name)] + [$panel]' \
-        "$CONFIG_JSON" > "$CONFIG_JSON.tmp" \
-        && mv "$CONFIG_JSON.tmp" "$CONFIG_JSON"
+    # Match keys case-insensitively, but preserve names, values and unrelated
+    # configuration spelling. Panel identity itself remains case-sensitive.
+    PANEL_TMP=$(mktemp "$CONFIG_JSON.XXXXXX") || exit 1
+    if ! jq --arg name "$name" --argjson panel "$PANEL_JSON" '
+        (keys_unsorted | map(select(ascii_downcase == "panels")) | .[0] // "panels") as $key |
+        .[$key] = [(.[$key] // [])[] |
+            select((with_entries(.key |= ascii_downcase) | .name) != $name)] + [$panel]
+    ' "$CONFIG_JSON" > "$PANEL_TMP" || ! mv "$PANEL_TMP" "$CONFIG_JSON"; then
+        rm -f "$PANEL_TMP"
+        echo "错误: panel 配置写入失败，保留原文件"
+        exit 1
+    fi
 
     echo "已添加 panel: $name (nodeType=$node_type, NodeIDs=$node_id)"
 }
@@ -509,7 +505,7 @@ main() {
         update_geodata || exit 1
         install_cnode
         if [ "$WAS_ACTIVE" -eq 1 ]; then
-            if [ "$GEODATA_UPDATED" -eq 1 ]; then
+            if [ "$GEODATA_UPDATED" -eq 1 ] || [ "${BINARY_UPDATED:-0}" -eq 1 ]; then
                 systemctl restart "$SERVICE_NAME" || exit 1
             else
                 systemctl start "$SERVICE_NAME" || exit 1

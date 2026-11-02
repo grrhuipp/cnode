@@ -3,9 +3,10 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "validator.hpp"
+#include "acppnode/app/proxyman/inbound/user_store.hpp"
 #include "acppnode/common/target_address.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <memory>
@@ -32,8 +33,8 @@ private:
     bool initialized_ = false;
 };
 
-// Worker-local cache. It deliberately rejects new sessions when full instead of
-// evicting a still-protected session and reopening a replay window.
+// Worker-local cache, scoped by authenticated credential and protocol session ID.
+// Rejects new sessions when full instead of reopening a protected replay window.
 class Ss2022UdpReplayCache {
 public:
     static constexpr size_t kMaxSessions = 16384;
@@ -46,6 +47,7 @@ public:
     Ss2022UdpReplayCache& operator=(Ss2022UdpReplayCache&&) = default;
 
     [[nodiscard]] bool Accept(
+        std::span<const uint8_t> authenticated_key,
         std::span<const uint8_t, 8> session_id,
         uint64_t packet_id,
         std::chrono::steady_clock::time_point now =
@@ -54,6 +56,27 @@ public:
     [[nodiscard]] size_t Size() const noexcept { return sessions_.size(); }
 
 private:
+    struct SessionKey {
+        KeyBytes credential;
+        uint64_t session_id = 0;
+
+        [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
+            return session_id == other.session_id && credential.size == other.credential.size &&
+                std::equal(credential.bytes.begin(), credential.bytes.begin() + credential.size,
+                           other.credential.bytes.begin());
+        }
+    };
+    struct SessionKeyHash {
+        [[nodiscard]] size_t operator()(const SessionKey& key) const noexcept {
+            size_t hash = 2166136261u;
+            for (uint8_t byte : key.credential.span()) hash = (hash ^ byte) * 16777619u;
+            hash = (hash ^ key.credential.size) * 16777619u;
+            for (unsigned shift = 0; shift < 64; shift += 8)
+                hash = (hash ^ static_cast<uint8_t>(key.session_id >> shift)) * 16777619u;
+            return hash;
+        }
+    };
+
     struct Session {
         Ss2022UdpReplayWindow window;
         std::chrono::steady_clock::time_point last_seen;
@@ -61,7 +84,7 @@ private:
 
     void PruneExpired(std::chrono::steady_clock::time_point now);
 
-    memory::ThreadLocalUnorderedMap<uint64_t, Session> sessions_;
+    memory::ThreadLocalUnorderedMap<SessionKey, Session, SessionKeyHash> sessions_;
 };
 
 // ============================================================================
@@ -92,15 +115,8 @@ struct Ss2022UdpSessionState {
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
-    memory::ThreadLocalString session_key;
+    std::optional<uint64_t> session_id;
     size_t               user_index = 0;   // 匹配用户在 users 列表中的下标
-    // reply_* 由 UDP 接收侧直接拿来编码回包，不再经过额外回调包装
-    int64_t              user_id = 0;
-    memory::ThreadLocalString user_email;
-    uint64_t             speed_limit = 0;
-    KeyBytes             reply_key;
-    SsCipherInfo         cipher_info{};
-    std::shared_ptr<Ss2022UdpSessionState> ss2022_session;
 };
 
 // ============================================================================

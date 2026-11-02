@@ -49,6 +49,10 @@ void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+struct OwnerFailure final : std::runtime_error {
+    OwnerFailure() : std::runtime_error("owner failure") {}
+};
+
 struct Counts {
     int active = 0;
     int finished = 0;
@@ -117,7 +121,7 @@ void TestDynamicCancellation() {
 
 net::awaitable<void> Fail() {
     co_await net::post(net::use_awaitable);
-    throw std::runtime_error("child failure");
+    throw OwnerFailure{};
 }
 
 net::awaitable<void> Stop(acpp::AwaitableTaskGroup& group,
@@ -158,7 +162,7 @@ void TestFailure(bool start_failure) {
     auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
         [&](acpp::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
-            if (start_failure) throw std::runtime_error("start failure");
+            if (start_failure) throw OwnerFailure{};
             group.Spawn(Fail());
         }), net::use_future);
     io.run_for(std::chrono::seconds(1));
@@ -166,10 +170,112 @@ void TestFailure(bool start_failure) {
           "failure must cancel and join pending children without an external wake");
     bool failed = false;
     try { result.get(); }
-    catch (const std::runtime_error& error) {
-        failed = std::string(error.what()) == (start_failure ? "start failure" : "child failure");
-    }
+    catch (const OwnerFailure&) { failed = true; }
     Check(failed && counts.active == 0, "first failure must survive child cancellation");
+}
+
+net::awaitable<void> AbortedChild() {
+    co_await net::post(net::use_awaitable);
+    throw acpp::IoSystemError(net::error::operation_aborted);
+}
+
+net::awaitable<void> FailingCleanup(bool& finished) {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    co_await net::post(net::use_awaitable);
+    co_await net::post(net::use_awaitable);
+    finished = true;
+    throw acpp::IoSystemError(net::error::address_in_use);
+}
+
+void TestFailureOutranksCancellation() {
+    net::io_context io;
+    bool cleanup_finished = false;
+    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
+        [&](acpp::AwaitableTaskGroup& group) {
+            group.Spawn(AbortedChild());
+            group.Spawn(FailingCleanup(cleanup_finished));
+        }), net::use_future);
+    io.run();
+    bool preserved = false;
+    try { result.get(); }
+    catch (const acpp::IoSystemError& error) {
+        preserved = error.code() == net::error::address_in_use;
+    }
+    Check(cleanup_finished && preserved, "cancellation masked a joined child's real failure");
+}
+
+net::awaitable<void> CancelledRequest(
+    net::steady_timer& operation, net::steady_timer& cleanup, Counts& counts,
+    std::unique_ptr<acpp::transport::CancellationSource> source, bool fail_cleanup) {
+    Lifetime lifetime(counts);
+    auto [error] = co_await operation.async_wait(net::as_tuple(net::use_awaitable));
+    Check(error == net::error::operation_aborted, "request operation was not cancelled");
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    (void)co_await cleanup.async_wait(net::as_tuple(net::use_awaitable));
+    // Destroy the source before the co_spawn completion callback. Its intrusive
+    // subscription must detach even though the group still owns the child.
+    source.reset();
+    if (fail_cleanup) throw OwnerFailure{};
+    throw acpp::IoSystemError(net::error::operation_aborted);
+}
+
+void TestRequestCancellation(bool fail_cleanup) {
+    net::io_context io;
+    net::steady_timer operation(io), cleanup(io), sibling(io);
+    operation.expires_at(net::steady_timer::time_point::max());
+    cleanup.expires_at(net::steady_timer::time_point::max());
+    sibling.expires_at(net::steady_timer::time_point::max());
+    Counts request_counts, sibling_counts;
+    auto source = std::make_unique<acpp::transport::CancellationSource>();
+    auto* request_source = source.get();
+    auto request = CancelledRequest(operation, cleanup, request_counts,
+                                    std::move(source), fail_cleanup);
+    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
+        [&](acpp::AwaitableTaskGroup& group) {
+            group.Spawn(std::move(request), request_source);
+            group.Spawn(Wait(sibling, sibling_counts));
+        }), net::use_future);
+    io.poll();
+    Check(request_counts.active == 1 && sibling_counts.active == 1,
+          "request and sibling must both start");
+    request_source->CancelPending();
+    io.poll();
+    Check(request_counts.active == 1 && sibling_counts.active == 1 &&
+          result.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
+          "request cancellation must join cleanup without cancelling its sibling");
+    cleanup.cancel();
+    io.poll();
+    Check(request_counts.finished == 1, "request cleanup did not complete");
+    if (!fail_cleanup) {
+        Check(sibling_counts.active == 1 &&
+              result.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
+              "locally aborted request stopped its sibling or completed parent early");
+        sibling.cancel();
+    }
+    io.restart();
+    io.run();
+    bool failed = false;
+    try { result.get(); }
+    catch (const OwnerFailure&) { failed = true; }
+    Check(failed == fail_cleanup && sibling_counts.finished == 1,
+          "local cancellation hid a real cleanup failure or failed to join sibling");
+}
+
+void TestStoppedRequest() {
+    net::io_context io;
+    net::steady_timer gate(io);
+    gate.expires_at(net::steady_timer::time_point::max());
+    acpp::transport::CancellationSource source;
+    source.Stop();
+    Counts counts;
+    auto result = net::co_spawn(io, acpp::RunAwaitableTaskGroup(io.get_executor(),
+        [&](acpp::AwaitableTaskGroup& group) {
+            group.Spawn(Wait(gate, counts), &source);
+        }), net::use_future);
+    io.run();
+    result.get();
+    Check(counts.active == 0 && counts.finished == 0,
+          "already stopped request started before its cancellation slot was bound");
 }
 
 net::awaitable<void> WithFailure(net::io_context& io, net::steady_timer& timer,
@@ -291,6 +397,10 @@ int main() {
         TestExplicitCancel();
         TestFailure(false);
         TestFailure(true);
+        TestFailureOutranksCancellation();
+        TestRequestCancellation(false);
+        TestRequestCancellation(true);
+        TestStoppedRequest();
         TestAllocationFailures();
         TestMoveOnlyStart();
         TestExecutor();

@@ -7,9 +7,9 @@
 
 namespace acpp::proxyman::outbound {
 
-struct Manager::Impl {
+struct Manager::Impl : memory::ThreadAllocated {
     using HandlerMap = memory::ThreadLocalUnorderedMap<
-        std::string,
+        memory::ThreadLocalString,
         std::shared_ptr<Outbound>,
         TransparentStringHash,
         TransparentStringEq>;
@@ -34,8 +34,10 @@ Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
         return nullptr;
     }
 
-    std::string tag(handler->Tag());
-    auto shared_handler = std::shared_ptr<Outbound>(std::move(handler));
+    memory::ThreadLocalString tag(handler->Tag());
+    auto shared_handler = std::shared_ptr<Outbound>(
+        handler.release(), std::default_delete<Outbound>{},
+        memory::ThreadLocalAllocator<Outbound>{});
     auto [it, inserted] = impl_->handlers.try_emplace(
         std::move(tag), std::move(shared_handler));
     if (!inserted) {

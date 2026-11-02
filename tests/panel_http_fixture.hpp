@@ -123,6 +123,16 @@ public:
         return posted_.wait_for(lock, std::chrono::seconds(8),
             [this, count] { return user_requests_ >= count; });
     }
+    bool WaitForConfigStatus(int status) {
+        std::unique_lock lock(mutex_);
+        return posted_.wait_for(lock, std::chrono::seconds(8), [this, status] {
+            for (const int response : config_statuses_) {
+                if (response == status) return true;
+            }
+            return false;
+        });
+    }
+
 
     unsigned short NodePort() const noexcept { return node_port_; }
     unsigned short CompanionPort() const noexcept { return companion_port_; }
@@ -192,6 +202,7 @@ private:
         input.read(body.data(), static_cast<std::streamsize>(body_size));
         std::string payload = "{}";
         std::string status = "200 OK";
+        int status_code = 200;
         const bool primary = path.find("node_id=1&") != std::string::npos;
         if (path.find("/config?") != std::string::npos) {
             if (mode_ == Mode::Collision && !primary) {
@@ -207,9 +218,11 @@ private:
                     ? R"(,"network":"tcp","tls":0,"base_config":{"pull_interval":2,"push_interval":1}})"
                     : R"(,"network":"tcp","tls":0,"base_config":{"pull_interval":60,"push_interval":2}})");
             if (mode_ == Mode::Lifecycle && primary && config_requests_ == 2) {
+                status_code = 503;
                 status = "503 Service Unavailable";
                 payload = R"({"message":"fixture pull failure"})";
             } else if (mode_ == Mode::Lifecycle && primary && config_requests_ == 4) {
+                status_code = 404;
                 status = "404 Not Found";
                 payload = "{}";
             }
@@ -249,6 +262,14 @@ private:
         const std::string response = "HTTP/1.1 " + status + "\r\nContent-Length: " +
             std::to_string(payload.size()) + "\r\nConnection: close\r\n\r\n" + payload;
         co_await asio::async_write(socket, asio::buffer(response), asio::use_awaitable);
+        if (mode_ == Mode::Lifecycle && primary &&
+            path.find("/config?") != std::string::npos) {
+            {
+                std::lock_guard lock(mutex_);
+                config_statuses_.push_back(status_code);
+            }
+            posted_.notify_one();
+        }
     }
 
     asio::io_context io_;
@@ -267,5 +288,6 @@ private:
     std::atomic<bool> companion_released_{false};
     size_t config_requests_ = 0;
     size_t user_requests_ = 0;
+    std::vector<int> config_statuses_;
     std::thread thread_;
 };

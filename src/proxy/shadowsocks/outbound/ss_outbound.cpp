@@ -164,23 +164,23 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     std::chrono::seconds relay_idle_timeout,
     std::chrono::seconds relay_write_timeout) {
     if (!inbound.Valid()) {
-        co_return std::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const bool use_uot =
-        ctx.content.network == Network::UDP && config_.uot_version.has_value();
+        ctx.content.network == Network::UDP && prepared_->config.uot_version.has_value();
 
     if (ctx.content.network == Network::UDP && !use_uot) {
-        auto server = MakeServerTarget(config_);
+        auto server = MakeServerTarget(prepared_->config);
         if (!server.IsValid()) {
-            co_return std::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
 
-        auto bind_addr = SelectUdpBindAddress(config_);
-        if (config_.send_through.GetMode() == OutboundBind::Mode::Ordered) {
-            const auto remote = config_.literal_address.value_or(
+        auto bind_addr = SelectUdpBindAddress(prepared_->config);
+        if (prepared_->config.send_through.GetMode() == OutboundBind::Mode::Ordered) {
+            const auto remote = prepared_->config.literal_address.value_or(
                 net::ip::address_v4::any());
-            const auto selected = config_.send_through.Select(
+            const auto selected = prepared_->config.send_through.Select(
                 remote, ctx.inbound.source_ip, ctx.inbound.source_port);
             bind_addr = selected.address.value_or(remote.is_v6()
                 ? net::ip::address(net::ip::address_v6::any())
@@ -191,9 +191,9 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             dns_service_,
             bind_addr,
             std::move(server),
-            credentials_.Cipher(),
-            credentials_.MasterKey(),
-            credentials_.PskChain());
+            prepared_->credentials.Cipher(),
+            prepared_->credentials.MasterKey(),
+            prepared_->credentials.PskChain());
         target_endpoint.SetIdleTimeout(relay_idle_timeout);
         target_endpoint.SetWriteTimeout(relay_write_timeout);
         if (inbound.control) {
@@ -208,7 +208,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     const TargetAddress protocol_target = use_uot
         ? TargetAddress(
-            *config_.uot_version == SsUotVersion::V1
+            *prepared_->config.uot_version == SsUotVersion::V1
                 ? proxy::uot::kV1MagicAddress
                 : proxy::uot::kMagicAddress,
             0)
@@ -216,20 +216,20 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_service_,
-        .address = config_.address,
-        .literal_address = config_.literal_address,
-        .port = config_.port,
-        .stream_settings = &config_.stream_settings,
-        .timeout = config_.timeout,
-        .send_through = &config_.send_through,
+        .address = prepared_->config.address,
+        .literal_address = prepared_->config.literal_address,
+        .port = prepared_->config.port,
+        .stream_settings = &prepared_->config.stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &prepared_->config.send_through,
         .inbound_local_addr = inbound_local_addr,
         .inbound_source_ip = ctx.inbound.source_ip,
         .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(config_.stream_settings, config_.address),
-        .ws_host = config_.address,
+        .tls_server_name = ResolveOutboundTlsServerName(prepared_->config.stream_settings, prepared_->config.address),
+        .ws_host = prepared_->config.address,
     });
     if (!transport_target) {
-        co_return std::unexpected(transport_target.error());
+        co_return tl::unexpected(transport_target.error());
     }
 
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
@@ -237,7 +237,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
                           ctx.inbound.source_ip, ctx.outbound.target,
                           ctx.outbound.tag, dial_result.error_msg);
-        co_return std::unexpected(dial_result.error);
+        co_return tl::unexpected(dial_result.error);
     }
 
     auto stream = std::move(dial_result.stream);
@@ -253,10 +253,10 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     auto request_writer_result = co_await ss::WriteTCPRequest(
-        protocol_target, credentials_.Cipher(), credentials_.MasterKey(), credentials_.PskChain(), *stream);
+        protocol_target, prepared_->credentials.Cipher(), prepared_->credentials.MasterKey(), prepared_->credentials.PskChain(), *stream);
     if (!request_writer_result) {
         stream->Cancel();
-        co_return std::unexpected(outbound_protocol_deadline.Expired()
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
             ? ErrorCode::TIMEOUT
             : request_writer_result.error());
     }
@@ -270,17 +270,17 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
 
     ShadowsocksOutboundEndpoint target_endpoint(
         std::move(request_writer),
-        credentials_.Cipher(),
-        credentials_.MasterKey(),
+        prepared_->credentials.Cipher(),
+        prepared_->credentials.MasterKey(),
         request_session.request_salt,
         *stream);
 
     if (use_uot &&
-        *config_.uot_version != SsUotVersion::V1) {
+        *prepared_->config.uot_version != SsUotVersion::V1) {
         auto request = proxy::uot::EncodeRequest(false, ctx.outbound.target);
         if (!request) {
             target_endpoint.Cancel();
-            co_return std::unexpected(request.error());
+            co_return tl::unexpected(request.error());
         }
         const std::array<net::const_buffer, 1> request_buffers{
             net::buffer(request->bytes.data(), request->size)};
@@ -306,14 +306,11 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     co_return co_await relay_endpoint(target_endpoint);
 }
 
-proxy::shadowsocks::outbound::Handler::Handler(std::string tag,
-                                               const SsOutboundConfig& config,
-                                               const Credentials& credentials,
-                                               ::acpp::app::dns::DNS& dns_service)
-    : tag_(std::move(tag))
-    , config_(config)
-    , credentials_(credentials)
-    , dns_service_(dns_service) {}
+proxy::shadowsocks::outbound::Handler::Handler(
+    std::string_view tag, std::shared_ptr<const PreparedSettings> prepared,
+    ::acpp::app::dns::DNS& dns_service, std::chrono::seconds dial_timeout)
+    : tag_(tag), prepared_(std::move(prepared)), dial_timeout_(dial_timeout),
+      dns_service_(dns_service) {}
 
 }  // namespace acpp
 
@@ -406,21 +403,16 @@ const bool kSsOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
             LOG_ERROR("shadowsocks outbound '{}': address must be an IP literal or DNS hostname", cfg.tag);
             return std::nullopt;
         }
-        struct PreparedSsState {
-            acpp::SsOutboundConfig config;
-            acpp::proxy::shadowsocks::outbound::Credentials credentials;
-        };
+        using PreparedSettings = acpp::proxy::shadowsocks::outbound::PreparedSettings;
         return acpp::proxyman::outbound::MakePreparedOutboundCreator<
-            PreparedSsState,
+            PreparedSettings,
             +[](std::string_view tag,
-                const PreparedSsState& state,
+                std::shared_ptr<const PreparedSettings> state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns_service,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = state.config;
-                runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::shadowsocks::outbound::Handler>(
-                    std::string(tag), runtime_config, state.credentials, dns_service);
-            }>(PreparedSsState{std::move(ss_config), std::move(*credentials)});
+                    tag, std::move(state), dns_service, timeout);
+            }>(PreparedSettings{std::move(ss_config), std::move(*credentials)});
     }), true);
 }  // namespace

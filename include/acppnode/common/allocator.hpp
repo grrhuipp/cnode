@@ -102,7 +102,15 @@ inline void OsUnmap(void* address, std::size_t bytes) noexcept {
 class ReturningThreadPool final : public std::pmr::memory_resource {
 public:
     using Clock = std::chrono::steady_clock;
-    using IdleWakeup = void (*)(void*) noexcept;
+    // Borrowed by the pool; the owner unbinds before it is destroyed.
+    class IdleWakeup {
+    protected:
+        IdleWakeup() = default;
+        ~IdleWakeup() = default;
+        virtual void OnPoolIdle() noexcept = 0;
+    private:
+        friend class ReturningThreadPool;
+    };
     struct Footprint {
         std::size_t mapped_bytes = 0;
         std::size_t direct_bytes = 0;
@@ -142,18 +150,14 @@ public:
         return idle_head_ ? idle_head_->idle_at + kThreadPoolPurgeDelay
                           : Clock::time_point::max();
     }
-    [[nodiscard]] bool BindIdleWakeup(void* owner, IdleWakeup wakeup) noexcept {
-        if (wakeup_ && wakeup_owner_ != owner) return false;
-        wakeup_owner_ = owner;
-        wakeup_ = wakeup;
-        if (idle_head_ && wakeup_) wakeup_(wakeup_owner_);
+    [[nodiscard]] bool BindIdleWakeup(IdleWakeup& owner) noexcept {
+        if (wakeup_ && wakeup_ != &owner) return false;
+        wakeup_ = &owner;
+        if (idle_head_) wakeup_->OnPoolIdle();
         return true;
     }
-    void UnbindIdleWakeup(void* owner) noexcept {
-        if (wakeup_owner_ == owner) {
-            wakeup_ = nullptr;
-            wakeup_owner_ = nullptr;
-        }
+    void UnbindIdleWakeup(IdleWakeup& owner) noexcept {
+        if (wakeup_ == &owner) wakeup_ = nullptr;
     }
 
     // Same geometry used for mappings and layout regression tests. Depth is
@@ -229,7 +233,7 @@ public:
                 Purge();
                 // The callback may purge this mapping on scheduling failure.
                 // Never access chunk after notifying; no per-free callback chain.
-                if (first_idle && wakeup_) wakeup_(wakeup_owner_);
+                if (first_idle && wakeup_) wakeup_->OnPoolIdle();
             }
             return;
         }
@@ -427,8 +431,7 @@ private:
     Chunk* idle_head_ = nullptr;
     Chunk* idle_tail_ = nullptr;
     Footprint footprint_{};
-    IdleWakeup wakeup_ = nullptr;
-    void* wakeup_owner_ = nullptr;
+    IdleWakeup* wakeup_ = nullptr;
 };
 
 [[nodiscard]] inline ReturningThreadPool& ThreadPool() noexcept {
@@ -486,14 +489,9 @@ protected:
         return this == &other;
     }
 };
-extern "C" void cnode_set_tls_buffer_allocator(
-    void* (*alloc_fn)(std::size_t), void (*free_fn)(void*));
-inline void* AllocateTlsReadWriteBuffer(std::size_t size) { return AllocatePmr(size); }
-inline void FreeTlsReadWriteBuffer(void* p) { DeallocatePmr(p); }
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
     ConfigureProcessGlibc();
-    cnode_set_tls_buffer_allocator(&AllocateTlsReadWriteBuffer, &FreeTlsReadWriteBuffer);
     static ThreadPoolFacade default_resource;
     std::pmr::set_default_resource(&default_resource);
 }

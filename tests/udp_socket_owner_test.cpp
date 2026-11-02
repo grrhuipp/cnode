@@ -51,11 +51,11 @@ public:
         co_return acpp::RelayResult{};
     }
 
-    std::expected<
+    tl::expected<
         acpp::InboundDatagramResult,
         acpp::ErrorCode> Process(
         const acpp::InboundDatagramRequest&) override {
-        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+        return tl::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 
 private:
@@ -108,13 +108,35 @@ class CountingUdpResponseContext final
     : public acpp::InboundDatagramResponse {
 public:
     acpp::buf::MultiBuffer Encode(acpp::UDPPacketView packet) override {
+        if (fail) throw 9;
         ++calls;
         last_size = packet.data.size();
-        return {};
+        acpp::buf::MultiBuffer encoded;
+        if (!acpp::buf::AppendSpanToMultiBuffer(packet.data, encoded)) throw std::bad_alloc();
+        return encoded;
     }
 
     size_t calls = 0;
     size_t last_size = 0;
+    bool fail = false;
+};
+
+struct RecordingReplySink final : acpp::worker_detail::UdpReplySink {
+    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*, acpp::udp::endpoint peer,
+                         acpp::buf::MultiBuffer payload, uint32_t) override {
+        ++calls;
+        endpoint = peer;
+        bytes.clear();
+        for (const auto* buffer : payload) {
+            const auto part = buffer->Bytes();
+            bytes.insert(bytes.end(), part.begin(), part.end());
+        }
+        return !reject;
+    }
+    size_t calls = 0;
+    acpp::udp::endpoint endpoint;
+    std::vector<uint8_t> bytes;
+    bool reject = false;
 };
 
 static_assert(noexcept(
@@ -135,10 +157,146 @@ static_assert(noexcept(
     std::exit(1);
 }
 
+void VerifyWorkerBudget() {
+    using Ingress = acpp::worker_detail::UdpIngress;
+    using Result = Ingress::ReplyEnqueueResult;
+    acpp::net::io_context io;
+    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
+    acpp::worker_detail::UdpAssociationReclaimer reclaimer(
+        scheduler, [](std::exception_ptr) { std::terminate(); });
+    acpp::worker_detail::UdpResourceBudget budget({
+        .associations = 2, .datagrams = 3,
+        .payload_capacity = 3 * acpp::buf::Buffer::kSize});
+    Ingress first("first", std::make_unique<DummyDatagramHandler>(), reclaimer, budget, io);
+    Ingress second("second", std::make_unique<DummyDatagramHandler>(), reclaimer, budget, io);
+    acpp::InboundDatagramOwner owner;
+    const std::array<uint8_t, 1> owner_bytes{0x53};
+    if (!owner.Assign(owner_bytes)) Fail("failed to prepare budget test owner");
+    const auto key = [&](uint64_t id) {
+        return acpp::worker_detail::ClientSessionKey{owner, id};
+    };
+    const acpp::udp::endpoint endpoint(acpp::net::ip::address_v4::loopback(), 12001);
+    const acpp::worker_detail::ClientSessionKey endpoint_key{owner, std::nullopt, endpoint};
+    const acpp::worker_detail::ClientSessionKey mapped_key{owner, std::nullopt,
+        {acpp::net::ip::make_address("::ffff:127.0.0.1"), endpoint.port()}};
+    const acpp::worker_detail::ClientSessionKey moved_key{owner, std::nullopt,
+        {endpoint.address(), static_cast<uint16_t>(endpoint.port() + 1)}};
+    const acpp::worker_detail::ClientSessionKeyHash hash;
+    if (!(endpoint_key == mapped_key) || hash(endpoint_key) != hash(mapped_key) ||
+        endpoint_key == moved_key || endpoint_key == key(0) ||
+        !(key(0) == acpp::worker_detail::ClientSessionKey{owner, 0, endpoint}))
+        Fail("typed UDP identity lost normalization, endpoint port or zero-session distinction");
+    const acpp::TargetAddress target(endpoint.address(), 53);
+    const auto create = [&](Ingress& ingress, uint64_t id) {
+        return ingress.CreateClientSession("socket", key(id), io,
+            {}, endpoint, owner,
+            std::chrono::steady_clock::now(), std::chrono::seconds::zero());
+    };
+    const auto payload = [](size_t blocks = 1) {
+        acpp::buf::MultiBuffer result;
+        for (size_t i = 0; i < blocks; ++i) {
+            acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
+            if (!buffer) Fail("failed to prepare budget test payload");
+            buffer->Tail()[0] = 0x55;
+            buffer->Produce(1);
+            result.push_back(std::move(buffer));
+        }
+        return result;
+    };
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    acpp::memory::reject_next_pmr_allocation = true;
+    bool association_oom = false;
+    try {
+        (void)create(first, 1);
+    } catch (const std::bad_alloc&) {
+        association_oom = !acpp::memory::reject_next_pmr_allocation;
+    }
+    acpp::memory::reject_next_pmr_allocation = false;
+    if (!association_oom || budget.GetUsage().associations != 0 ||
+        first.GetResourceStats().associations != 0)
+        Fail("session construction failure leaked its association lease");
+#endif
+    auto one = create(first, 1);
+    auto two = create(second, 2);
+    if (!one || !two || create(first, 3) || budget.GetUsage().associations != 2)
+        Fail("association admission was not shared across ingresses");
+    first.CleanupClientSessions("socket");
+    if (!one->Closed() || create(second, 3) || budget.GetUsage().associations != 2)
+        Fail("map removal bypassed the live association budget");
+    one.reset();
+    auto three = create(first, 3);
+    if (!three || budget.GetUsage().associations != 2 ||
+        !two->Push(target, payload()))
+        Fail("association release failed to restore admission or existing request");
+
+    if (first.EnqueueReply("reply", endpoint, payload()) != Result::StartSend)
+        Fail("failed to reserve a shared reply payload");
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    acpp::memory::reject_next_pmr_allocation = true;
+#endif
+    auto active = first.BeginReplySend("reply");
+#ifdef CNODE_TEST_ALLOCATOR_FAULT
+    const bool allocated = !acpp::memory::reject_next_pmr_allocation;
+    acpp::memory::reject_next_pmr_allocation = false;
+    if (allocated) Fail("ordinary UDP send handoff allocated a packet node");
+#endif
+    if (!active || budget.GetUsage().datagrams != 2 ||
+        budget.GetUsage().payload_capacity != 2 * acpp::buf::Buffer::kSize ||
+        second.EnqueueReply("reply", endpoint, payload(2)) != Result::Rejected)
+        Fail("payload capacity did not include in-flight reply buffers");
+    if (three->Push(target, payload(2)) || three->Closed() ||
+        budget.GetUsage().datagrams != 2)
+        Fail("shared payload rejection closed an existing association or leaked a reservation");
+    if (second.EnqueueReply("reply", endpoint, payload()) != Result::StartSend ||
+        three->Push(target, payload()) || three->Closed())
+        Fail("global datagram saturation was not isolated to the incoming packet");
+    first.ClearReplyQueue("reply");
+    if (budget.GetUsage().datagrams != 3)
+        Fail("clearing the reply map prematurely released an in-flight send");
+    active.reset();
+    if (budget.GetUsage().datagrams != 2 || !three->Push(target, payload()))
+        Fail("in-flight completion failed to restore shared payload capacity");
+
+    bool read = false;
+    acpp::net::co_spawn(io, two->ReadMultiBuffer(),
+        [&](std::exception_ptr error, acpp::buf::MultiBuffer buffers) {
+            read = !error && acpp::buf::TotalLen(buffers) == 1;
+            if (budget.GetUsage().datagrams != 2)
+                Fail("relay-owned payload still consumed queue budget");
+        });
+    io.poll();
+    io.restart();
+    if (!read || two->Closed() || !two->Push(target, payload()))
+        Fail("a saturated Worker stopped serving an existing association");
+    second.ClearReplyQueue("reply");
+    first.RequestStop();
+    second.RequestStop();
+    three.reset();
+    two.reset();
+    if (budget.GetUsage().associations != 0 || budget.GetUsage().datagrams != 0 ||
+        budget.GetUsage().payload_capacity != 0)
+        Fail("stop and destruction retained shared UDP resources");
+
+    // The independent count limit is observable even with ample byte capacity.
+    acpp::worker_detail::UdpResourceBudget count_budget({
+        .associations = 1, .datagrams = 1, .payload_capacity = 1024 * 1024});
+    Ingress counted("counted", std::make_unique<DummyDatagramHandler>(), reclaimer,
+                    count_budget, io);
+    if (counted.EnqueueReply("count", endpoint, payload()) != Result::StartSend ||
+        counted.EnqueueReply("count", endpoint, payload()) != Result::Rejected ||
+        count_budget.GetUsage().datagrams != 1)
+        Fail("shared datagram count limit was not enforced independently");
+    counted.RequestStop();
+    if (count_budget.GetUsage().datagrams != 0 ||
+        count_budget.GetUsage().payload_capacity != 0)
+        Fail("reply queue destruction leaked its payload reservation");
+}
+
 }  // namespace
 
 int main() {
     ThreadResourceScope thread_resource;
+    VerifyWorkerBudget();
     if (std::pmr::get_default_resource() != &thread_resource.resource) {
         Fail("UDP PMR test resource was not installed");
     }
@@ -148,49 +306,26 @@ int main() {
     callback_source.resolved_addr = acpp::net::ip::address_v4::loopback();
     callback_source.port = 5353;
     std::array<uint8_t, 1> callback_payload{0x5a};
-    acpp::UDPPacketView callback_packet{callback_source, callback_payload};
-    const acpp::udp::endpoint callback_peer(acpp::net::ip::address_v4::loopback(), 5353);
-
-    acpp::RoutedPacketCallback empty_callback;
-    if (empty_callback(callback_packet, callback_peer)) {
-        Fail("empty UDP callback reported successful delivery");
-    }
-
-    acpp::RoutedPacketCallback throwing_callback{
-        [](acpp::UDPPacketView, const acpp::udp::endpoint&) { throw 7; }};
-    if (throwing_callback(callback_packet, callback_peer)) {
-        Fail("throwing UDP callback reported successful delivery");
-    }
-
-    bool callback_invoked = false;
-    acpp::RoutedPacketCallback valid_callback{
-        [&](acpp::UDPPacketView packet, const acpp::udp::endpoint& peer) {
-            callback_invoked = packet.data.size() == 1 && packet.data[0] == 0x5a && peer == callback_peer;
-        }};
-    if (!valid_callback(callback_packet, callback_peer) || !callback_invoked) {
-        Fail("valid UDP callback was not delivered");
-    }
-
-    acpp::RoutedPacketCallback rejecting_callback{
-        [](acpp::UDPPacketView, const acpp::udp::endpoint&) { return false; }};
-    if (rejecting_callback(callback_packet, callback_peer)) {
-        Fail("UDP callback rejection was converted to delivery success");
-    }
 
     acpp::net::io_context io_context;
+    acpp::worker_detail::UdpResourceBudget udp_budget;
     acpp::IoErrorCode ec;
     const acpp::udp::endpoint reply_endpoint_a(
         acpp::net::ip::address_v4::loopback(), 10001);
     const acpp::udp::endpoint reply_endpoint_b(
         acpp::net::ip::address_v4::loopback(), 10002);
-    const acpp::InboundDatagramOwner default_owner;
+    acpp::InboundDatagramOwner default_owner;
+    const std::array<uint8_t, 1> default_owner_bytes{1};
+    if (!default_owner.Assign(default_owner_bytes)) Fail("failed to prepare owner");
+    RecordingReplySink failed_sink, raw_sink, large_sink, snapshot_sink;
+    const auto failing_response = std::make_shared<CountingUdpResponseContext>();
+    failing_response->fail = true;
 
     acpp::worker_detail::UdpIngress::ClientSession failing_reply_session(
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) { throw 9; }},
+        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink},
         reply_endpoint_a,
-        default_owner);
+        default_owner, udp_budget, udp_budget.AcquireAssociation());
     acpp::buf::BufferGuard reply_buffer{acpp::buf::Buffer::New()};
     if (!reply_buffer) Fail("failed to allocate UDP callback test buffer");
     reply_buffer->Tail()[0] = 0x33;
@@ -210,15 +345,12 @@ int main() {
     }
     io_context.restart();
 
-    size_t raw_reply_callbacks = 0;
     acpp::worker_detail::UdpIngress::ClientSession raw_reply_session(
         io_context,
-        acpp::RoutedPacketCallback{
-            [&](acpp::UDPPacketView, const acpp::udp::endpoint&) {
-                ++raw_reply_callbacks;
-            }},
+        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
+         .sink = &raw_sink},
         reply_endpoint_a,
-        default_owner);
+        default_owner, udp_budget, udp_budget.AcquireAssociation());
     std::array<acpp::net::const_buffer, 1> raw_reply_buffers{
         acpp::net::buffer(callback_payload)};
     bool raw_reply_rejected = false;
@@ -229,7 +361,7 @@ int main() {
             raw_reply_rejected = error != nullptr;
         });
     io_context.run();
-    if (!raw_reply_rejected || raw_reply_callbacks != 0) {
+    if (!raw_reply_rejected || raw_sink.calls != 0) {
         Fail("UDP raw scatter write was silently reported as delivered");
     }
     io_context.restart();
@@ -247,23 +379,12 @@ int main() {
         }
     }
 
-    size_t large_callback_count = 0;
-    bool large_callback_matches = false;
-    acpp::udp::endpoint observed_reply_endpoint;
     acpp::worker_detail::UdpIngress::ClientSession large_reply_session(
         io_context,
-        acpp::RoutedPacketCallback{[&](
-            acpp::UDPPacketView packet,
-            const acpp::udp::endpoint& reply_endpoint) {
-            ++large_callback_count;
-            observed_reply_endpoint = reply_endpoint;
-            large_callback_matches =
-                packet.data.size() == callback_large_payload.size() &&
-                std::equal(packet.data.begin(), packet.data.end(),
-                           callback_large_payload.begin());
-        }},
+        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
+         .sink = &large_sink},
         reply_endpoint_a,
-        default_owner);
+        default_owner, udp_budget, udp_budget.AcquireAssociation());
     bool large_reply_failed = false;
     acpp::net::co_spawn(
         io_context,
@@ -272,11 +393,8 @@ int main() {
             large_reply_failed = error != nullptr;
         });
     io_context.run();
-    if (large_reply_failed || large_callback_count != 1 ||
-        !large_callback_matches || observed_reply_endpoint != reply_endpoint_a) {
-        std::cerr << "large_reply_failed=" << large_reply_failed
-                  << " callback_count=" << large_callback_count
-                  << " callback_matches=" << large_callback_matches << '\n';
+    if (large_reply_failed || large_sink.calls != 1 ||
+        large_sink.bytes != callback_large_payload || large_sink.endpoint != reply_endpoint_a) {
         Fail("multi-buffer UDP reply was split into multiple datagrams");
     }
     io_context.restart();
@@ -299,18 +417,17 @@ int main() {
             large_reply_failed = error != nullptr;
         });
     io_context.run();
-    if (large_reply_failed || large_callback_count != 2 ||
-        !large_callback_matches || observed_reply_endpoint != reply_endpoint_b) {
+    if (large_reply_failed || large_sink.calls != 2 ||
+        large_sink.bytes != callback_large_payload || large_sink.endpoint != reply_endpoint_b) {
         Fail("UDP client session kept replying to its stale endpoint");
     }
     io_context.restart();
 
     acpp::worker_detail::UdpIngress::ClientSession bounded_input_session(
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        {},
         reply_endpoint_a,
-        default_owner);
+        default_owner, udp_budget, udp_budget.AcquireAssociation());
     auto make_tiny_payload = [&]() {
         acpp::buf::BufferGuard buffer{acpp::buf::Buffer::New()};
         if (!buffer) Fail("failed to allocate bounded UDP queue payload");
@@ -402,10 +519,11 @@ int main() {
     if (ec) Fail("owned UDP socket did not release its bound port");
 
     auto& udp_scheduler = acpp::TimeoutScheduler::ForIoContext(io_context);
-    acpp::worker_detail::UdpAssociationReclaimer udp_reclaimer(udp_scheduler);
+    acpp::worker_detail::UdpAssociationReclaimer udp_reclaimer(
+        udp_scheduler, [](std::exception_ptr) { std::terminate(); });
     acpp::worker_detail::UdpIngress worker(
         "test-inbound", std::make_unique<DummyDatagramHandler>(), udp_reclaimer,
-        io_context);
+        udp_budget, io_context);
 
     for (size_t i = 0; i < 512; ++i) {
         (void)worker.EnqueueReply(
@@ -424,7 +542,7 @@ int main() {
         Fail("UDP reply stats omitted the active sender");
     }
     ++drained_replies;
-    if (!worker.CompleteReplySend("bounded-replies", *first_bounded_reply)) {
+    if (!worker.CompleteReplySend("bounded-replies", first_bounded_reply->id)) {
         Fail("UDP reply completion did not leave pending datagrams");
     }
     reply_stats = worker.GetResourceStats();
@@ -434,7 +552,7 @@ int main() {
     }
     while (auto reply = worker.BeginReplySend("bounded-replies")) {
         ++drained_replies;
-        if (!worker.CompleteReplySend("bounded-replies", *reply)) {
+        if (!worker.CompleteReplySend("bounded-replies", reply->id)) {
             break;
         }
     }
@@ -458,6 +576,7 @@ int main() {
     };
     auto exercise_reply_oom = [&](const std::string& socket_key,
                                   bool use_buffer_guard) {
+        const auto budget_before = udp_budget.GetUsage();
         auto enqueue_one = [&]() {
             if (use_buffer_guard) {
                 auto payload = make_tiny_guard();
@@ -517,22 +636,26 @@ int main() {
             before_recovery.active_reply_senders != 1) {
             Fail("UDP reply OOM changed pending or active queue accounting");
         }
+        if (udp_budget.GetUsage().datagrams != budget_before.datagrams + pending_before_failure + 1 ||
+            udp_budget.GetUsage().payload_capacity != budget_before.payload_capacity +
+                (pending_before_failure + 1) * acpp::buf::Buffer::kSize)
+            Fail("reply deque allocation failure leaked a shared payload reservation");
         const auto active_buffers =
-            acpp::worker_detail::UdpIngress::ReplySendBuffers(*active);
+            active->SendBuffers();
         if (active_buffers.empty() ||
             static_cast<const uint8_t*>(active_buffers.front().data())[0] != 0x7a ||
-            acpp::worker_detail::UdpIngress::ReplyEndpoint(*active) != reply_endpoint_a) {
+            active->endpoint != reply_endpoint_a) {
             Fail("UDP reply OOM changed the active datagram");
         }
         if (enqueue_one() !=
             acpp::worker_detail::UdpIngress::ReplyEnqueueResult::Queued) {
             Fail("UDP reply queue did not recover after injected OOM");
         }
-        bool more = worker.CompleteReplySend(socket_key, *active);
+        bool more = worker.CompleteReplySend(socket_key, active->id);
         while (more) {
             auto reply = worker.BeginReplySend(socket_key);
             if (!reply) Fail("UDP reply queue lost a pending packet after OOM");
-            more = worker.CompleteReplySend(socket_key, *reply);
+            more = worker.CompleteReplySend(socket_key, reply->id);
         }
         active.reset();
         const auto drained_stats = worker.GetResourceStats();
@@ -541,6 +664,9 @@ int main() {
             Fail("UDP reply OOM recovery did not drain to zero");
         }
         worker.ClearReplyQueue(socket_key);
+        if (udp_budget.GetUsage().datagrams != budget_before.datagrams ||
+            udp_budget.GetUsage().payload_capacity != budget_before.payload_capacity)
+            Fail("reply OOM recovery did not return its shared budget");
     };
     exercise_reply_oom("oom-reply-multibuffer", false);
     exercise_reply_oom("oom-reply-buffer-guard", true);
@@ -566,7 +692,7 @@ int main() {
     if (!active_reply) {
         Fail("failed to acquire the replacement UDP reply generation");
     }
-    if (worker.CompleteReplySend("reply-generation", *stale_reply)) {
+    if (worker.CompleteReplySend("reply-generation", stale_reply->id)) {
         Fail("stale UDP reply completion matched a replacement queue");
     }
     if (worker.EnqueueReply(
@@ -574,14 +700,14 @@ int main() {
         acpp::worker_detail::UdpIngress::ReplyEnqueueResult::Queued) {
         Fail("stale UDP reply completion released a replacement queue");
     }
-    if (!worker.CompleteReplySend("reply-generation", *active_reply)) {
+    if (!worker.CompleteReplySend("reply-generation", active_reply->id)) {
         Fail("active UDP reply completion did not release its queue");
     }
     auto queued_reply = worker.BeginReplySend("reply-generation");
     if (!queued_reply) {
         Fail("replacement UDP reply queue lost its pending datagram");
     }
-    if (worker.CompleteReplySend("reply-generation", *queued_reply)) {
+    if (worker.CompleteReplySend("reply-generation", queued_reply->id)) {
         Fail("drained UDP reply queue still reported pending datagrams");
     }
     worker.ClearReplyQueue("reply-generation");
@@ -595,20 +721,16 @@ int main() {
     if (!owner_a.Assign(owner_a_bytes) || !owner_b.Assign(owner_b_bytes)) {
         Fail("failed to initialize UDP session owners");
     }
-    const std::string owner_a_session_key =
-        owner_a.ScopeSessionKey("shared-session-id");
-    const std::string owner_b_session_key =
-        owner_b.ScopeSessionKey("shared-session-id");
-    if (owner_a_session_key.empty() || owner_b_session_key.empty() ||
-        owner_a_session_key == owner_b_session_key) {
+    const acpp::worker_detail::ClientSessionKey owner_a_session_key{owner_a, 0x1234};
+    const acpp::worker_detail::ClientSessionKey owner_b_session_key{owner_b, 0x1234};
+    if (owner_a_session_key == owner_b_session_key) {
         Fail("UDP protocol session key was not scoped by authenticated owner");
     }
     const auto owner_session = worker.CreateClientSession(
         "owner-socket",
         owner_a_session_key,
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        {},
         reply_endpoint_a,
         owner_a,
         std::chrono::steady_clock::now(),
@@ -648,8 +770,7 @@ int main() {
         "owner-socket",
         owner_b_session_key,
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        {},
         reply_endpoint_a,
         owner_b,
         std::chrono::steady_clock::now(),
@@ -686,19 +807,19 @@ int main() {
 
 #ifdef CNODE_TEST_ALLOCATOR_FAULT
     const auto input_baseline = worker.GetResourceStats();
+    const auto input_budget_baseline = udp_budget.GetUsage();
     const std::string oom_input_socket = "oom-input-socket";
     auto oom_input_session = worker.CreateClientSession(
         oom_input_socket,
-        "oom-input-client",
+        acpp::worker_detail::ClientSessionKey{default_owner, 9},
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        {},
         reply_endpoint_a,
         default_owner,
         std::chrono::steady_clock::now(),
         std::chrono::seconds(60));
     if (!worker.PushClientPayload(
-            oom_input_socket, "oom-input-client", callback_source,
+            oom_input_socket, acpp::worker_detail::ClientSessionKey{default_owner, 9}, callback_source,
             reply_endpoint_a, default_owner, make_owner_payload(),
             std::chrono::steady_clock::now())) {
         Fail("failed to prime UDP input OOM queue");
@@ -710,7 +831,7 @@ int main() {
         acpp::memory::reject_next_pmr_allocation = true;
         try {
             if (!worker.PushClientPayload(
-                    oom_input_socket, "oom-input-client", callback_source,
+                    oom_input_socket, acpp::worker_detail::ClientSessionKey{default_owner, 9}, callback_source,
                     reply_endpoint_a, default_owner, std::move(payload),
                     std::chrono::steady_clock::now())) {
                 Fail("UDP input queue rejected before injected allocation failure");
@@ -733,8 +854,12 @@ int main() {
         input_stats.input_bytes != input_baseline.input_bytes + input_oom_items) {
         Fail("UDP input OOM changed queued occupancy accounting");
     }
+    if (udp_budget.GetUsage().datagrams != input_budget_baseline.datagrams + input_oom_items ||
+        udp_budget.GetUsage().payload_capacity != input_budget_baseline.payload_capacity +
+            input_oom_items * acpp::buf::Buffer::kSize)
+        Fail("input deque allocation failure leaked a shared payload reservation");
     if (!worker.PushClientPayload(
-            oom_input_socket, "oom-input-client", callback_source,
+            oom_input_socket, acpp::worker_detail::ClientSessionKey{default_owner, 9}, callback_source,
             reply_endpoint_a, default_owner, make_owner_payload(),
             std::chrono::steady_clock::now())) {
         Fail("UDP input queue did not recover after injected OOM");
@@ -761,14 +886,17 @@ int main() {
         input_stats.input_bytes != input_baseline.input_bytes) {
         Fail("UDP input queue occupancy did not return to baseline");
     }
+    if (udp_budget.GetUsage().datagrams != input_budget_baseline.datagrams ||
+        udp_budget.GetUsage().payload_capacity != input_budget_baseline.payload_capacity ||
+        udp_budget.GetUsage().associations != input_budget_baseline.associations)
+        Fail("input OOM cleanup did not return its shared resource budget");
 #endif
 
     acpp::worker_detail::UdpIngress::ClientSession overflow_session(
         io_context,
-        acpp::RoutedPacketCallback{
-            [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+        {},
         reply_endpoint_a,
-        owner_a);
+        owner_a, udp_budget, udp_budget.AcquireAssociation());
     acpp::buf::MultiBuffer oversized_input;
     size_t oversized_bytes = 0;
     while (oversized_bytes <= 512 * 1024) {
@@ -821,15 +949,9 @@ int main() {
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     acpp::worker_detail::UdpIngress::ClientSession snapshot_reply_session(
         io_context,
-        acpp::RoutedPacketCallback{
-            [response_context](
-                acpp::UDPPacketView packet,
-                const acpp::udp::endpoint&) {
-                auto encoded = response_context->Encode(packet);
-                encoded.clear();
-            }},
+        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink},
         reply_endpoint_a,
-        default_owner);
+        default_owner, udp_budget, udp_budget.AcquireAssociation());
     auto adopted_worker_state = std::make_shared<int>(-1);
     if (!worker.ReplaceHandler(
             std::make_unique<DummyDatagramHandler>(adopted_worker_state))) {
@@ -892,14 +1014,12 @@ int main() {
             thread_resource.resource.large_allocations;
         const size_t large_deallocations_before =
             thread_resource.resource.large_deallocations;
-        const std::string long_client_key =
-            std::string(192, 'c') + std::to_string(cycle);
+        const acpp::worker_detail::ClientSessionKey long_client_key{default_owner, cycle};
         auto cycle_session = worker.CreateClientSession(
             long_socket_key,
             long_client_key,
             io_context,
-            acpp::RoutedPacketCallback{
-                [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+            {},
             reply_endpoint_a,
             default_owner,
             std::chrono::steady_clock::now(),
@@ -931,7 +1051,7 @@ int main() {
         if (!long_reply || worker.GetResourceStats().active_reply_senders != 1) {
             Fail("long UDP reply queue was absent from resource stats");
         }
-        (void)worker.CompleteReplySend(long_socket_key, *long_reply);
+        (void)worker.CompleteReplySend(long_socket_key, long_reply->id);
         long_reply.reset();
         worker.ClearReplyQueue(long_socket_key);
         cycle_session->Close();
@@ -982,46 +1102,48 @@ int main() {
 
     const auto session_now = std::chrono::steady_clock::now();
     constexpr std::string_view idle_cleanup_socket = "idle-cleanup-socket";
-    auto make_session = [&](std::string key, auto last_active,
+    const auto typed_key = [&](uint64_t id) {
+        return acpp::worker_detail::ClientSessionKey{default_owner, id};
+    };
+    auto make_session = [&](uint64_t id, auto last_active,
                             std::chrono::seconds idle_timeout) {
         return worker.CreateClientSession(
             std::string(idle_cleanup_socket),
-            key,
+            typed_key(id),
             io_context,
-            acpp::RoutedPacketCallback{
-                [](acpp::UDPPacketView, const acpp::udp::endpoint&) {}},
+            {},
             reply_endpoint_a,
             default_owner,
             last_active,
             idle_timeout);
     };
     auto closed_disabled = make_session(
-        "closed-disabled", session_now, std::chrono::seconds::zero());
+        1, session_now, std::chrono::seconds::zero());
     auto open_disabled = make_session(
-        "open-disabled", session_now, std::chrono::seconds::zero());
+        2, session_now, std::chrono::seconds::zero());
     closed_disabled->Close();
     io_context.run_for(std::chrono::milliseconds(150));
     io_context.restart();
-    if (worker.FindClientSession(std::string(idle_cleanup_socket), "closed-disabled") ||
-        worker.FindClientSession(std::string(idle_cleanup_socket), "open-disabled") != open_disabled ||
+    if (worker.FindClientSession(idle_cleanup_socket, typed_key(1)) ||
+        worker.FindClientSession(idle_cleanup_socket, typed_key(2)) != open_disabled ||
         open_disabled->Closed()) {
         Fail("disabled idle cleanup retained a closed session or removed an open session");
     }
 
     auto closed_within_budget = make_session(
-        "closed-within-budget", session_now, std::chrono::seconds(1));
+        3, session_now, std::chrono::seconds(1));
     auto expired_open = make_session(
-        "expired-open", session_now - std::chrono::seconds(2), std::chrono::seconds(1));
+        4, session_now - std::chrono::seconds(2), std::chrono::seconds(1));
     auto fresh_open = make_session(
-        "fresh-open", session_now, std::chrono::seconds(1));
+        5, session_now, std::chrono::seconds(1));
     closed_within_budget->Close();
     io_context.run_for(std::chrono::milliseconds(150));
     io_context.restart();
     if (worker.FindClientSession(
-            std::string(idle_cleanup_socket), "closed-within-budget") ||
-        worker.FindClientSession(std::string(idle_cleanup_socket), "expired-open") ||
+            idle_cleanup_socket, typed_key(3)) ||
+        worker.FindClientSession(idle_cleanup_socket, typed_key(4)) ||
         !expired_open->Closed() ||
-        worker.FindClientSession(std::string(idle_cleanup_socket), "fresh-open") != fresh_open ||
+        worker.FindClientSession(idle_cleanup_socket, typed_key(5)) != fresh_open ||
         fresh_open->Closed()) {
         Fail("positive idle cleanup did not independently remove closed and expired sessions");
     }
@@ -1029,17 +1151,15 @@ int main() {
     constexpr size_t closed_session_count = 32;
     std::array<acpp::worker_detail::UdpIngress::ClientSessionPtr,
                closed_session_count> closed_sessions;
-    std::array<std::string, closed_session_count> closed_keys;
     for (size_t i = 0; i < closed_session_count; ++i) {
-        closed_keys[i] = "closed-distinct-" + std::to_string(i);
         closed_sessions[i] = make_session(
-            closed_keys[i], session_now, std::chrono::seconds::zero());
+            100 + i, session_now, std::chrono::seconds::zero());
         closed_sessions[i]->Close();
     }
     io_context.run_for(std::chrono::milliseconds(150));
     io_context.restart();
     for (size_t i = 0; i < closed_session_count; ++i) {
-        if (worker.FindClientSession(std::string(idle_cleanup_socket), closed_keys[i])) {
+        if (worker.FindClientSession(idle_cleanup_socket, typed_key(100 + i))) {
             Fail("distinct closed UDP session key remained retained with idle timeout disabled");
         }
     }

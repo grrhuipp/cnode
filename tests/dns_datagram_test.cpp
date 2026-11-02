@@ -217,9 +217,14 @@ class CacheFault : public std::pmr::memory_resource {
 public:
     explicit CacheFault(std::pmr::memory_resource* resource) : upstream(resource) {}
     size_t faults = 0;
+    bool fail_next = false;
 private:
     void* do_allocate(size_t bytes, size_t alignment) override {
-        if (!faults && bytes == 4 * sizeof(net::ip::address)) { ++faults; throw std::bad_alloc(); }
+        if (fail_next || (!faults && bytes == 4 * sizeof(net::ip::address))) {
+            fail_next = false;
+            ++faults;
+            throw std::bad_alloc();
+        }
         return upstream->allocate(bytes, alignment);
     }
     void do_deallocate(void* p, size_t bytes, size_t alignment) override { upstream->deallocate(p, bytes, alignment); }
@@ -254,10 +259,180 @@ void TestCacheFailure() {
     } catch (...) { std::pmr::set_default_resource(original); throw; }
     std::pmr::set_default_resource(original);
 }
+
+void TestServiceStopJoin() {
+    net::io_context io;
+    Peer peer(io), fallback(io);
+    peer.hold = true;
+    auto config = Config(peer);
+    config.servers.push_back(fallback.socket.local_endpoint());
+    config.timeout_sec = 30;
+    auto worker = std::make_unique<acpp::app::dns::DNSWorker>(io, config, 8);
+    std::array<DnsResult, 5> answers;
+    std::array<std::exception_ptr, 5> errors;
+    size_t completed = 0;
+    for (size_t i = 0; i < answers.size(); ++i) {
+        net::co_spawn(io, worker->Resolve(i < 3 ? "shared.example" :
+                                         i == 3 ? "second.example" : "third.example"),
+            [&, i](std::exception_ptr error, DnsResult result) {
+                errors[i] = error;
+                answers[i] = std::move(result);
+                ++completed;
+            });
+    }
+    net::steady_timer watchdog(io, 2s);
+    bool expired = false;
+    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+        if (!ec) { expired = true; io.stop(); }
+    });
+    while (peer.packets != 12 && !expired) io.run_one();
+    Require(!expired, "all DNS leaders must reach their upstream before service stop");
+    worker->RequestStop();
+    worker->RequestStop();
+    // Real late datagrams must neither revive a stopped receive nor trigger
+    // fallback to another configured upstream.
+    for (const auto& [name, group] : peer.queries) {
+        for (const auto& query : group) {
+            auto reply = query.bytes;
+            reply[2] = 0x81;
+            reply[3] = 0x83;
+            acpp::IoErrorCode ignored;
+            peer.socket.send_to(net::buffer(reply), query.sender, 0, ignored);
+        }
+    }
+    bool joined = false;
+    std::exception_ptr join_error;
+    auto stop = [&]() -> net::awaitable<void> {
+        const auto rejected = co_await worker->Resolve("192.0.2.9");
+        Require(rejected.error == acpp::ErrorCode::CANCELLED,
+                "stopped DNS must reject even a literal without doing new work");
+        co_await worker->AsyncJoin();
+        co_await worker->AsyncJoin();
+        worker.reset();
+    };
+    net::co_spawn(io, stop(), [&](std::exception_ptr error) {
+        join_error = error;
+        joined = true;
+        watchdog.cancel();
+        peer.Stop();
+        fallback.Stop();
+    });
+    io.run();
+    Require(!expired && joined && completed == answers.size(),
+            "stop must join every accepted leader and subscriber promptly");
+    if (join_error) std::rethrow_exception(join_error);
+    for (size_t i = 0; i < answers.size(); ++i) {
+        Require(!errors[i] && answers[i].error == acpp::ErrorCode::CANCELLED,
+                "service cancellation must survive leader and subscriber completion");
+    }
+    Require(peer.packets == 12 && fallback.packets == 0,
+            "late responses and cancellation must not restart queries or upstream fallback");
+}
+
+void TestDatagramStopJoin(bool active) {
+    net::io_context io;
+    Peer peer(io);
+    peer.hold = true;
+    peer.batch_size = 1;
+    auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(
+        io, peer.socket.local_endpoint());
+    std::weak_ptr weak = transport;
+    std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
+    bool query_done = !active;
+    std::exception_ptr query_error;
+    acpp::IoErrorCode reply_error;
+    if (active) {
+        net::co_spawn(io, transport->Exchange(query, 30s),
+            [&](std::exception_ptr error, acpp::app::dns::DatagramExchange::Reply reply) {
+                query_error = error;
+                reply_error = reply.error;
+                query_done = true;
+            });
+    }
+    net::steady_timer watchdog(io, 2s);
+    bool expired = false;
+    watchdog.async_wait([&](acpp::IoErrorCode ec) {
+        if (!ec) { expired = true; io.stop(); }
+    });
+    while (active && peer.packets != 1 && !expired) io.run_one();
+    Require(!expired, "the datagram exchange must start real receive I/O");
+    transport->RequestStop();
+    transport->RequestStop();
+    bool joined = false;
+    std::exception_ptr join_error;
+    auto stop = [&]() -> net::awaitable<void> {
+        co_await transport->AsyncJoin();
+        const auto rejected = co_await transport->Exchange(query, 30s);
+        Require(rejected.error == acpp::io_error::operation_aborted,
+                "a stopped exchange must not reopen its socket");
+        transport.reset();
+        Require(weak.expired(),
+                "join must release the actual receive callback's captured owner");
+    };
+    net::co_spawn(io, stop(), [&](std::exception_ptr error) {
+        joined = true;
+        join_error = error;
+        watchdog.cancel();
+        peer.Stop();
+    });
+    io.run();
+    Require(!expired && joined && query_done && !query_error,
+            "exchange and receive completions must both finish before destruction");
+    if (join_error) std::rethrow_exception(join_error);
+    Require(!active || reply_error == acpp::io_error::operation_aborted,
+            "the stopped pending query must retain cancellation");
+    Require(peer.packets == (active ? 1 : 0),
+            "zero-query stop and late rejected queries must not send datagrams");
+}
+
+void TestDatagramAllocationFailureJoin() {
+    CacheFault resource(std::pmr::get_default_resource());
+    const auto original = std::pmr::set_default_resource(&resource);
+    try {
+        net::io_context io;
+        Peer peer(io);
+        auto transport = std::make_shared<acpp::app::dns::DatagramExchange>(
+            io, peer.socket.local_endpoint());
+        std::weak_ptr weak = transport;
+        std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
+        resource.fail_next = true;
+        bool failed = false, joined = false;
+        std::exception_ptr failure;
+        auto run = [&]() -> net::awaitable<void> {
+            try {
+                (void)co_await transport->Exchange(query, 30s);
+            } catch (const std::bad_alloc&) {
+                failed = true;
+            }
+            transport->RequestStop();
+            co_await transport->AsyncJoin();
+            transport.reset();
+            Require(weak.expired(), "failed exchange startup must retain no receive owner");
+        };
+        net::co_spawn(io, run(), [&](std::exception_ptr error) {
+            failure = error;
+            joined = true;
+            peer.Stop();
+        });
+        io.run_for(2s);
+        if (failure) std::rethrow_exception(failure);
+        Require(joined && failed && resource.faults == 1 && peer.packets == 0,
+                "query registration allocation failure must unwind before stop and join");
+    } catch (...) {
+        std::pmr::set_default_resource(original);
+        throw;
+    }
+    std::pmr::set_default_resource(original);
+}
 }
 int main() {
     acpp::memory::ConfigureProcessAllocator();
-    try { TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false); TestFallback(); TestCacheFailure(); TestIdRotation(); }
+    try {
+        TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
+        TestFallback(); TestCacheFailure(); TestIdRotation();
+        TestServiceStopJoin(); TestDatagramStopJoin(false); TestDatagramStopJoin(true);
+        TestDatagramAllocationFailureJoin();
+    }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
     std::cout << "DNS parallel sampling / socket reuse / validation / isolation / fallback / cache: PASS\n";
 }

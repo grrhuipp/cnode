@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <utility>
 
 namespace acpp::worker_detail {
 namespace {
@@ -12,14 +13,15 @@ constexpr auto kInterval = std::chrono::milliseconds(100);
 constexpr size_t kMaxChecks = 64;
 }
 
-UdpAssociationReclaimer::UdpAssociationReclaimer(TimeoutScheduler& scheduler) noexcept
-    : scheduler_(scheduler) {}
+UdpAssociationReclaimer::UdpAssociationReclaimer(
+    TimeoutScheduler& scheduler, std::function<void(std::exception_ptr)> on_failure) noexcept
+    : scheduler_(scheduler), on_failure_(std::move(on_failure)) {}
 
 UdpAssociationReclaimer::~UdpAssociationReclaimer() noexcept { Stop(); }
 
 void UdpAssociationReclaimer::Register(
     UdpAssociationHook& hook, UdpIngress& owner, std::string_view socket_key,
-    std::string_view client_key, std::chrono::seconds idle_timeout) noexcept {
+    const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept {
     if (stopped_) {
         FailRuntime("udp-maintenance", "association registered after reclaimer stop");
     }
@@ -28,7 +30,7 @@ void UdpAssociationReclaimer::Register(
     }
     hook.owner = &owner;
     hook.socket_key = socket_key;
-    hook.client_key = client_key;
+    hook.client_key = &client_key;
     hook.idle_timeout = idle_timeout;
     hook.previous = nullptr;
     hook.next = head_;
@@ -49,48 +51,32 @@ void UdpAssociationReclaimer::Unregister(UdpAssociationHook& hook) noexcept {
     hook = {};
     if (!head_) {
         cursor_ = nullptr;
-        scheduler_.Cancel(token_);
+        scheduler_.Cancel(*this);
     }
 }
 
 void UdpAssociationReclaimer::Stop() noexcept {
     if (stopped_) return;
     stopped_ = true;
-    scheduler_.Cancel(token_);
+    scheduler_.Cancel(*this);
 }
 
-void UdpAssociationReclaimer::Tick(void* owner) noexcept {
-    auto& self = *static_cast<UdpAssociationReclaimer*>(owner);
-    self.token_.Reset();
-    if (self.stopped_ || !self.head_) return;
-    self.RunBatch();
-    if (self.head_) {
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-        worker_udp_listener_runtime_test::ReportMaintenanceRearm();
-#endif
-        self.Schedule();
+void UdpAssociationReclaimer::OnTimeout() noexcept {
+    if (stopped_ || !head_) return;
+    RunBatch();
+    if (head_) {
+        Schedule();
     }
 }
 
 void UdpAssociationReclaimer::Schedule() noexcept {
-    if (stopped_ || !head_ || token_.Valid()) return;
+    if (stopped_ || failed_ || !head_ || Valid()) return;
     try {
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-        worker_udp_listener_runtime_test::OnMaintenanceSchedule();
-#endif
-        token_ = scheduler_.ScheduleAfter(kInterval, [this] { Tick(this); });
-        if (!token_.Valid()) FailRuntime("udp-maintenance", "association schedule returned empty token");
-    } catch (const std::exception& error) {
-        (void)error;
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-        worker_udp_listener_runtime_test::ReportPmrConsumption();
-#endif
-        FailRuntime("udp-maintenance", "failed to schedule association reclaimer");
+        if (!scheduler_.ScheduleAfter(kInterval, *this))
+            FailRuntime("udp-maintenance", "association schedule refused after release");
     } catch (...) {
-#ifdef CNODE_TEST_UDP_LISTENER_RUNTIME_FAULT
-        worker_udp_listener_runtime_test::ReportPmrConsumption();
-#endif
-        FailRuntime("udp-maintenance", "failed to schedule association reclaimer");
+        failed_ = true;
+        on_failure_(std::current_exception());
     }
 }
 

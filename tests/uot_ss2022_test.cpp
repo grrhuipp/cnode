@@ -1,6 +1,7 @@
 #include "uot.hpp"
 
 #include "shadowsocks_protocol.hpp"
+#include "acppnode/common/address_codec.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/steady_timer.hpp>
@@ -410,11 +411,150 @@ void TestNonConnectRequestAndPackets() {
     });
 }
 
+// Exercise the public wire codec independently of each protocol's handshake.
+void TestSharedAddressCodec() {
+    const std::array targets{
+        TargetAddress("192.0.2.1", 0x1234),
+        TargetAddress("2001:db8::1", 0x1234),
+        TargetAddress("example.com", 0x1234)};
+    const std::array formats{AddressWireFormat::Socks5,
+        AddressWireFormat::PortFirst, AddressWireFormat::Uot};
+    for (const auto format : formats) {
+        for (const auto& target : targets) {
+            std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+            const size_t size = EncodeAddressTo(
+                target, encoded.data(), encoded.size(), format);
+            Check(size == AddressEncodedSize(target, format) && size != 0,
+                  "shared address size mismatch");
+            const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
+            const uint8_t expected_type = target.IsDomain()
+                ? (format == AddressWireFormat::Socks5 ? 3 : 2)
+                : target.IsIPv4() ? (format == AddressWireFormat::Uot ? 0 : 1)
+                : format == AddressWireFormat::Socks5 ? 4
+                : format == AddressWireFormat::PortFirst ? 3 : 1;
+            Check(encoded[type_pos] == expected_type,
+                  "shared address changed wire type semantics");
+            const size_t port_pos = format == AddressWireFormat::PortFirst ? 0 : size - 2;
+            Check(encoded[port_pos] == 0x12 && encoded[port_pos + 1] == 0x34,
+                  "shared address changed port byte order");
+            const auto* body = encoded.data() + type_pos + 1;
+            if (target.IsIPv4()) {
+                const std::array<uint8_t, 4> expected{192, 0, 2, 1};
+                Check(std::equal(expected.begin(), expected.end(), body),
+                      "shared address changed IPv4 wire bytes");
+            } else if (target.IsIPv6()) {
+                const std::array<uint8_t, 16> expected{
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+                Check(std::equal(expected.begin(), expected.end(), body),
+                      "shared address changed IPv6 wire bytes");
+            } else {
+                Check(body[0] == 11 && std::memcmp(body + 1, "example.com", 11) == 0,
+                      "shared address changed domain wire bytes");
+            }
+            Check(EncodeAddressTo(target, encoded.data(), size - 1, format) == 0,
+                  "shared address overwrote insufficient output");
+            for (size_t split = 0; split <= size; ++split) {
+                const auto parsed = DecodeAddress(
+                    std::span<const uint8_t>(encoded.data(), split), format);
+                Check(parsed.status == (split == size ? AddressDecodeStatus::Complete
+                                                      : AddressDecodeStatus::Incomplete),
+                      "shared address confused split input with invalid input");
+                Check(split == size
+                    ? parsed.consumed == size && parsed.target.SameEndpoint(target)
+                    : parsed.consumed == 0 && parsed.required > split,
+                    "shared address lost consumed/required boundary");
+                std::vector<uint8_t> input{0xaa};
+                input.insert(input.end(), encoded.begin(), encoded.begin() + size);
+                input.push_back(0xbb);
+                FragmentReader source(input, {1, split ? split : 1, 1});
+                buf::MultiBuffer pending;
+                Run([&]() -> net::awaitable<void> {
+                    auto decoded = co_await ReadAddress(source, pending, format, 1);
+                    Check(decoded && decoded->consumed == size &&
+                          decoded->target.SameEndpoint(target),
+                          "incremental shared address failed a split");
+                    Check(pending.byte_size() >= size + 1,
+                          "incremental address consumed caller-owned prefix");
+                    pending.DropPrefixBytes(size + 1);
+                    if (!buf::HasData(pending)) {
+                        auto remaining = co_await source.ReadMultiBuffer();
+                        remaining.MoveTo(pending, true);
+                    }
+                    Check(Flatten(pending) == std::vector<uint8_t>{0xbb},
+                          "incremental address lost the following frame byte");
+                });
+                if (split == size) continue;
+                FragmentReader truncated(
+                    std::vector<uint8_t>(encoded.begin(), encoded.begin() + split), {1, 2});
+                buf::MultiBuffer incomplete;
+                Run([&]() -> net::awaitable<void> {
+                    auto decoded = co_await ReadAddress(truncated, incomplete, format);
+                    Check(!decoded && decoded.error() == ErrorCode::PROTOCOL_DECODE_FAILED,
+                          "incremental address accepted truncated EOF");
+                });
+            }
+            encoded[type_pos] = 0xff;
+            Check(DecodeAddress(std::span<const uint8_t>(encoded.data(), size), format).status ==
+                      AddressDecodeStatus::Invalid,
+                  "shared address accepted an unknown type");
+        }
+        std::array<uint8_t, kMaxEncodedAddressSize> domain{};
+        const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
+        domain[type_pos] = format == AddressWireFormat::Socks5 ? 3 : 2;
+        domain[type_pos + 1] = 0;
+        Check(DecodeAddress(domain, format, {253, true}).status ==
+                  AddressDecodeStatus::Invalid,
+              "shared address accepted a forbidden empty domain");
+        domain[type_pos + 1] = 254;
+        Check(DecodeAddress(domain, format, {253, true}).status ==
+                  AddressDecodeStatus::Invalid,
+              "shared address accepted an excessive domain length");
+        domain[type_pos + 1] = 255;
+        Check(DecodeAddress(std::span<const uint8_t>(domain.data(), domain.size() - 1),
+                            format).status == AddressDecodeStatus::Incomplete &&
+              DecodeAddress(domain, format).consumed == domain.size(),
+              "shared address failed its maximum wire-domain boundary");
+    }
+}
+
+void TestPacketEofBoundaries() {
+    const TargetAddress target("192.0.2.1", 53);
+    for (bool connect : {false, true}) {
+        CaptureWriter capture;
+        proxy::uot::PacketWriter writer(capture, connect, target);
+        Run([&]() -> net::awaitable<void> {
+            co_await writer.WriteMultiBuffer(MakePacket("end", target));
+        });
+        for (size_t length = 0; length <= capture.bytes.size(); ++length) {
+            FragmentReader source(std::vector<uint8_t>(
+                capture.bytes.begin(), capture.bytes.begin() + length), {1, 1, 2});
+            proxy::uot::PacketReader reader(source, connect, target);
+            bool failed = false;
+            try {
+                Run([&]() -> net::awaitable<void> {
+                    auto packet = co_await reader.ReadMultiBuffer();
+                    Check(length == 0 ? !buf::HasData(packet)
+                        : Flatten(packet) == std::vector<uint8_t>({'e','n','d'}),
+                        "UoT boundary EOF lost a complete packet");
+                    auto eof = co_await reader.ReadMultiBuffer();
+                    Check(!buf::HasData(eof), "UoT boundary EOF returned data");
+                });
+            } catch (const IoSystemError&) {
+                failed = true;
+            }
+            Check(failed == (length != 0 && length != capture.bytes.size()),
+                  "UoT confused truncated framing with normal EOF");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
     TestV2BoardSs2022Keys();
     TestMagicAndRequestCodec();
+    TestSharedAddressCodec();
+    TestPacketEofBoundaries();
     TestConnectPacketRoundTrip();
     TestLargeConnectPacketRoundTrip();
     TestNonConnectRequestAndPackets();

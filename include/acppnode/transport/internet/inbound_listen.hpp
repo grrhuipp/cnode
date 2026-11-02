@@ -24,6 +24,7 @@ public:
     // The listener reserves its requested address space, including auto-mode
     // candidates unavailable on this host. IPv6 sockets are always v6-only.
     [[nodiscard]] bool Overlaps(const InboundListen& other) const noexcept;
+    [[nodiscard]] bool operator==(const InboundListen& other) const noexcept;
 
 private:
     std::array<net::ip::address, 2> candidates_{};

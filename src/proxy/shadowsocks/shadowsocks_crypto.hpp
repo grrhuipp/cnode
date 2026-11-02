@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shadowsocks_protocol.hpp"
+#include "../aead.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/aes.h>
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <span>
+#include <variant>
 
 namespace acpp::ss {
 
@@ -21,13 +23,16 @@ namespace acpp::ss {
 // 每次 Encrypt/Decrypt 后由调用方自增 nonce 计数器。
 class SsAeadCipher {
 public:
-    SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size);
-    ~SsAeadCipher();
+    // Authentication trials bind the first candidate key through ResetKey.
+    SsAeadCipher(SsCipherType type, proxy::AeadDirection direction);
+    SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size,
+                 proxy::AeadDirection direction);
+    ~SsAeadCipher() = default;
 
     SsAeadCipher(const SsAeadCipher&) = delete;
     SsAeadCipher& operator=(const SsAeadCipher&) = delete;
-    SsAeadCipher(SsAeadCipher&& other) noexcept;
-    SsAeadCipher& operator=(SsAeadCipher&& other) noexcept;
+    SsAeadCipher(SsAeadCipher&& other) noexcept = default;
+    SsAeadCipher& operator=(SsAeadCipher&& other) noexcept = default;
 
     [[nodiscard]] bool Encrypt(const uint8_t* nonce,
                                const uint8_t* plaintext,
@@ -39,18 +44,17 @@ public:
                                size_t ciphertext_len,
                                uint8_t* output) noexcept;
 
-    [[nodiscard]] SsCipherType Type() const noexcept { return type_; }
-    [[nodiscard]] std::span<const uint8_t> Key() const noexcept {
-        return {key_.data(), key_size_};
-    }
+    [[nodiscard]] bool ResetKey(const uint8_t* key, size_t key_size);
+    [[nodiscard]] bool BeginDecrypt(const uint8_t* nonce) noexcept;
+    [[nodiscard]] bool DecryptUpdate(std::span<const uint8_t> input,
+                                     std::span<uint8_t> output) noexcept;
+    [[nodiscard]] bool FinishDecrypt(const uint8_t* tag) noexcept;
 
     static constexpr size_t kTagSize = 16;
 
 private:
     SsCipherType type_;
-    std::array<uint8_t, 32> key_{};
-    size_t key_size_ = 0;
-    EVP_CIPHER_CTX* ctx_ = nullptr;
+    std::variant<proxy::AeadEncryptor, proxy::AeadDecryptor> context_;
 };
 
 static constexpr size_t kMaxChunkPayload = 0x3FFF;

@@ -37,20 +37,18 @@ function(expect_rejected case_name main_content sidecar_name sidecar_content)
         ERROR_VARIABLE stderr
         TIMEOUT 5)
 
+    if(ARGC GREATER 4)
+        set(rejection_context "${case_name} (${ARGV4})")
+    else()
+        set(rejection_context "${case_name}")
+    endif()
     if("${result}" STREQUAL "0")
         message(SEND_ERROR
-            "${case_name}: invalid config was accepted\nstdout=${stdout}\nstderr=${stderr}")
+            "${rejection_context}: invalid config was accepted\nstdout=${stdout}\nstderr=${stderr}")
     endif()
     if(NOT "${result}" MATCHES "^[0-9]+$")
         message(SEND_ERROR
-            "${case_name}: cnode did not reject promptly: ${result}\nstdout=${stdout}\nstderr=${stderr}")
-    endif()
-    if(ARGC GREATER 4)
-        set(output "${stdout}\n${stderr}")
-        if(NOT "${output}" MATCHES "${ARGV4}")
-            message(SEND_ERROR
-                "${case_name}: rejection lost expected cause '${ARGV4}'\nstdout=${stdout}\nstderr=${stderr}")
-        endif()
+            "${rejection_context}: cnode did not reject promptly: ${result}\nstdout=${stdout}\nstderr=${stderr}")
     endif()
 endfunction()
 
@@ -107,6 +105,10 @@ function(expect_outbound_credentials case_name protocol credentials accepted)
 endfunction()
 
 expect_rejected(malformed_main "{" "" "")
+foreach(non_object_main IN ITEMS "[]" "null" "true" "\"text\"")
+    string(MD5 case_id "${non_object_main}")
+    expect_rejected("non_object_main_${case_id}" "${non_object_main}" "" "")
+endforeach()
 expect_rejected(malformed_inbounds "{}" "inbounds.json" "{")
 expect_rejected(malformed_outbounds "{}" "outbounds.json" "{")
 expect_rejected(malformed_routing "{}" "routing.json" "{")
@@ -135,6 +137,12 @@ expect_rejected(case_collision_nested_outbound_settings "{}" "outbounds.json"
 expect_rejected(wrong_shape_inbounds "{}" "inbounds.json" [=[{"inbounds":{}}]=])
 expect_rejected(wrong_shape_outbounds "{}" "outbounds.json" [=[{"outbounds":{}}]=])
 expect_rejected(wrong_shape_routing "{}" "routing.json" [=[{"routing":[]}]=])
+expect_rejected(single_inbound_object [=[{"workers":1}]=] "inbounds.json"
+    [=[{"tag":"single","protocol":"vless","listen":"127.0.0.1","port":12100,"settings":{"clients":[{"id":"11111111-1111-4111-8111-111111111111"}]}}]=])
+expect_rejected(single_outbound_object [=[{"workers":1}]=] "outbounds.json"
+    [=[{"tag":"single","protocol":"freedom"}]=])
+expect_rejected(non_object_inbound_entry "{}" "inbounds.json" "[null]")
+expect_rejected(non_object_outbound_entry "{}" "outbounds.json" "[42]")
 expect_rejected(scalar_inbounds "{}" "inbounds.json" "42")
 expect_rejected(scalar_outbounds "{}" "outbounds.json" "42")
 expect_rejected(scalar_routing "{}" "routing.json" "42")
@@ -157,6 +165,20 @@ foreach(request_timeout IN LISTS request_timeout_cases)
         "{\"panels\":[{\"name\":\"bad-timeout\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"requestTimeout\":${request_timeout}}]}"
         "" "" "requestTimeout must be an integer between 1 and 3600 seconds")
 endforeach()
+foreach(dns_type IN ITEMS "\"misspelled\"" "\"\"" "42" "null" "true")
+    string(MD5 case_id "${dns_type}")
+    expect_rejected("invalid_panel_dns_type_${case_id}"
+        "{\"panels\":[{\"name\":\"bad-dns\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"dnsType\":${dns_type}}]}"
+        "" "")
+endforeach()
+foreach(node_type IN ITEMS "" "v2ray" "ss" "shadowsocks-plugin" "VMESS")
+    string(MD5 case_id "${node_type}")
+    expect_rejected("removed_panel_node_type_${case_id}"
+        "{\"panels\":[{\"name\":\"bad-type\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"nodeType\":\"${node_type}\"}]}"
+        "" "")
+endforeach()
+expect_rejected(unknown_route_outbound "{}" "routing.json"
+    [=[{"rules":[{"network":"tcp","outboundTag":"misspelled-blackhole"}]}]=])
 expect_rejected(orphan_panel_tls_certificate
     "{\"panels\":[{\"name\":\"orphan-tls\",\"type\":\"V2board\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"nodeType\":\"vmess\",\"tlsEnable\":true,\"tlsCert\":\"${EXISTING_TEST_FILE}\"}]}"
     "" "")

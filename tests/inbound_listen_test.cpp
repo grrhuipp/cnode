@@ -3,6 +3,7 @@
 #include "worker/tcp_listener.hpp"
 
 #include <array>
+#include <chrono>
 #include <string_view>
 
 int main() {
@@ -63,16 +64,11 @@ int main() {
         if (acpp::InboundListen::Parse(value)) return 20;
     }
 
-    auto socket_binding = acpp::MakePortBinding(
-        443, "vmess", "stable-inbound", *ipv4);
-    auto protocol_update = acpp::MakePortBinding(
-        443, "trojan", "stable-inbound", *ipv4);
-    auto port_update = acpp::MakePortBinding(
-        8443, "vmess", "stable-inbound", *ipv4);
-    auto address_update = acpp::MakePortBinding(
-        443, "vmess", "stable-inbound", *ipv6);
-    auto tag_update = acpp::MakePortBinding(
-        443, "vmess", "other-inbound", *ipv4);
+    auto socket_binding = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv4};
+    auto protocol_update = acpp::PortBinding{.port = 443, .protocol = "trojan", .tag = "stable-inbound", .listen = *ipv4};
+    auto port_update = acpp::PortBinding{.port = 8443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv4};
+    auto address_update = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "stable-inbound", .listen = *ipv6};
+    auto tag_update = acpp::PortBinding{.port = 443, .protocol = "vmess", .tag = "other-inbound", .listen = *ipv4};
     if (!socket_binding.UsesSameSocket(protocol_update) ||
         socket_binding.UsesSameSocket(port_update) ||
         socket_binding.UsesSameSocket(address_update) ||
@@ -81,10 +77,9 @@ int main() {
     }
 
     acpp::net::io_context io_context;
-    acpp::worker_detail::TcpListenerOwner worker("test-inbound");
+    acpp::worker_detail::TcpListenerOwner worker;
     auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
-    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor ||
-        !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
+    if (!acceptor || !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
 
     acpp::IoErrorCode ec;
     acceptor->open(acpp::tcp::v4(), ec);
@@ -96,7 +91,7 @@ int main() {
     if (ec) return 10;
 
     if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 11;
-    if (worker.FindAcceptor("stable-listener") != acceptor ||
+    if (!worker.OwnsAcceptor("stable-listener", acceptor.get()) ||
         !acceptor->is_open()) return 12;
 
     bool accept_cancelled = false;
@@ -107,11 +102,30 @@ int main() {
         });
 
     worker.CloseAcceptor("stable-listener");
-    if (worker.FindAcceptor("stable-listener") != nullptr) return 13;
     if (!acceptor || acceptor->is_open() ||
         worker.OwnsAcceptor("stable-listener", acceptor.get())) return 14;
     io_context.run();
     if (!accept_cancelled) return 15;
+    acpp::worker_detail::TcpListenerOwner::AcceptorPtr retained;
+    bool retired_accept_cancelled = false;
+    {
+        acpp::worker_detail::TcpListenerOwner retiring;
+        retained = retiring.CreateAcceptor("retained-until-completion", io_context);
+        retained->open(acpp::tcp::v4(), ec);
+        if (ec) return 16;
+        retained->bind(
+            acpp::tcp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
+        if (ec) return 17;
+        retained->listen(acpp::net::socket_base::max_listen_connections, ec);
+        if (ec) return 18;
+        retained->async_accept(
+            [&](acpp::IoErrorCode error, acpp::tcp::socket) {
+                retired_accept_cancelled = error == acpp::io_error::operation_aborted;
+            });
+    }
+    io_context.restart();
+    io_context.run_for(std::chrono::milliseconds(500));
+    if (!retired_accept_cancelled || retained->is_open()) return 19;
 
     return 0;
 }

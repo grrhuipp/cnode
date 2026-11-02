@@ -1,4 +1,5 @@
 #include "inboundbuilder.hpp"
+#include <format>
 #include "tls_policy.hpp"
 
 #include "acppnode/app/proxyman/inbound/factory.hpp"
@@ -13,9 +14,11 @@ namespace acpp::controller {
 InboundBuild InboundBuilder(const PanelConfig& panel_config,
                             const api::NodeInfo& node_config) {
     InboundBuild build;
-    build.protocol = naming::ResolveProtocolOrDefault(node_config.NodeType);
+    build.protocol = node_config.NodeType;
     build.tag = naming::BuildPanelNodeTag(
         panel_config.Name, panel_config.NodeIDs.Front(), build.protocol, node_config.Port);
+    build.accounting_key = std::format("panel/{}/{}/",
+        panel_config.Name, panel_config.NodeIDs.Front());
 
     build.stream_settings.network = node_config.TransportProtocol.empty()
         ? std::string(constants::protocol::kTcp)
@@ -38,6 +41,10 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     }
 
     build.stream_settings = NormalizeStreamSettings(build.stream_settings);
+    if (build.stream_settings.network_mode == NetworkMode::Unsupported ||
+        build.stream_settings.security_mode == SecurityMode::Unsupported) {
+        throw std::invalid_argument("panel inbound has unsupported stream settings");
+    }
 
     if (build.stream_settings.IsWs()) {
         build.stream_settings.ws.path = node_config.Path.empty()
@@ -75,9 +82,7 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     build.sniff.dest_override = node_config.DestOverride;
 
     StaticUserConfig protocol_source;
-    protocol_source.method = node_config.CypherMethod.empty()
-        ? std::string(constants::protocol::kAes256Gcm)
-        : node_config.CypherMethod;
+    protocol_source.method = node_config.CypherMethod;
     protocol_source.identity_password = node_config.ShadowsocksServerKey;
     auto handler_request = proxyman::inbound::PrepareBuildRequest(
         build.protocol,
@@ -90,11 +95,7 @@ InboundBuild InboundBuilder(const PanelConfig& panel_config,
     }
     build.handler_request = std::move(*handler_request);
 
-    build.binding = MakePortBinding(
-        node_config.Port,
-        build.protocol,
-        build.tag,
-        panel_config.ListenIP);
+    build.binding = PortBinding{.port = node_config.Port, .protocol = build.protocol, .tag = build.tag, .listen = panel_config.ListenIP};
 
     return build;
 }

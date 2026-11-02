@@ -1,21 +1,10 @@
 #include "acppnode/app/rate_limiter.hpp"
 #include "acppnode/common/session.hpp"
-#include "acppnode/proxy/inbound.hpp"
-
-#include <concepts>
+#include <iostream>
 #include <memory>
 #include <string_view>
-
-namespace {
-
-template <typename T>
-concept MutableBanTracking = requires(T& handler) {
-    handler.SetBanTrackingEnabled(true);
-};
-
-static_assert(!MutableBanTracking<acpp::Inbound>);
-
-}  // namespace
+#include <string>
+#include <vector>
 
 int main() {
     acpp::RateLimitConfig config;
@@ -78,5 +67,49 @@ int main() {
         != acpp::ConnectionLimiter::RejectReason::MAX_CONNECTIONS_PER_IP) {
         return 12;
     }
+    // Exhaust tracking with distinct, live source addresses. Lack of tracking
+    // storage must reject admission, not silently remove the per-IP policy.
+    auto capacity = std::make_unique<acpp::ConnectionLimiter>(
+        acpp::RateLimitConfig{.max_conn_per_ip = 1, .auth_fail_limit = 0});
+    std::vector<std::string> admitted;
+    std::string rejected;
+    for (unsigned value = 0; value < 65536; ++value) {
+        auto address = "198.18." + std::to_string(value >> 8) + "." +
+                       std::to_string(value & 255);
+        const auto reason = capacity->TryAcceptIP(tag, address);
+        if (reason != acpp::ConnectionLimiter::RejectReason::NONE) {
+            if (reason != acpp::ConnectionLimiter::RejectReason::TRACKING_CAPACITY) return 21;
+            rejected = std::move(address);
+            break;
+        }
+        admitted.push_back(std::move(address));
+    }
+    if (rejected.empty()) {
+        std::cerr << "exhausted IP tracking admitted untracked connections\n";
+        return 13;
+    }
+    for (const auto& address : admitted) capacity->ReleaseHash(acpp::Hash(address));
+    if (capacity->TryAcceptIP(tag, rejected) !=
+        acpp::ConnectionLimiter::RejectReason::NONE) return 14;
+    if (capacity->TryAcceptIP(tag, rejected) !=
+        acpp::ConnectionLimiter::RejectReason::MAX_CONNECTIONS_PER_IP) return 15;
+    capacity->ReleaseHash(acpp::Hash(rejected));
+
+    auto independent = std::make_unique<acpp::ConnectionLimiter>(
+        acpp::RateLimitConfig{.max_connections = 1, .max_conn_per_ip = 1});
+    if (independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiter::RejectReason::NONE) return 16;
+    if (independent->TryAcceptIP(tag, ip) !=
+        acpp::ConnectionLimiter::RejectReason::NONE) return 17;
+    independent->ReleaseHash(acpp::Hash(ip));
+    if (independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiter::RejectReason::MAX_CONNECTIONS) return 18;
+    if (independent->TryAcceptIP(tag, ip) !=
+        acpp::ConnectionLimiter::RejectReason::NONE) return 19;
+    independent->ReleaseHash(acpp::Hash(ip));
+    independent->ReleaseGlobal();
+    if (independent->TryAcceptGlobal() !=
+        acpp::ConnectionLimiter::RejectReason::NONE) return 20;
+    independent->ReleaseGlobal();
     return 0;
 }

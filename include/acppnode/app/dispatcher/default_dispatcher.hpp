@@ -1,6 +1,7 @@
 #pragma once
 
 #include "acppnode/features/routing/dispatcher.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -44,7 +45,7 @@ struct OutboundSelection;
 // Worker 冷路径一次性构造；热路径只消费窄 DispatchPolicy，编排强制出口、
 // Router 规则决策、显式 fallback 和通用请求策略。
 // ============================================================================
-class DefaultDispatcher final : public routing::Dispatcher {
+class DefaultDispatcher final : public routing::Dispatcher, public memory::ThreadAllocated {
 public:
     DefaultDispatcher(
         const routing::Router& router,

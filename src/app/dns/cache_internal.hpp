@@ -10,12 +10,6 @@
 
 namespace acpp::app::dns {
 
-struct DnsCacheEntry {
-    memory::ThreadLocalVector<net::ip::address> addresses;
-    time_point expire_time;
-    uint32_t ttl;
-    bool negative = false;
-};
 
 // One bounded cache owned by the main/control DNS executor.
 class DnsCache {
@@ -24,12 +18,17 @@ public:
     DnsCache(const DnsCache&) = delete;
     DnsCache& operator=(const DnsCache&) = delete;
 
-    std::optional<DnsCacheEntry> Get(std::string_view domain);
     std::optional<DnsResult> GetResult(std::string_view domain);
     void Store(std::string_view domain, const DnsResult& result);
     DnsCacheStats GetStats() const;
 
 private:
+    struct DnsCacheEntry {
+        memory::ThreadLocalVector<net::ip::address> addresses;
+        time_point expire_time;
+        uint32_t ttl;
+        bool negative = false;
+    };
     struct CacheNode {
         memory::ThreadLocalString domain;
         DnsCacheEntry entry;
