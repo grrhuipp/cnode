@@ -8,6 +8,8 @@ loopback port. No external server or credentials are involved.
 import argparse
 import asyncio
 import base64
+from contextlib import ExitStack, contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -410,6 +412,28 @@ async def exercise_quic(client, mode, result):
     return expected
 
 
+@contextmanager
+def reserve_inbound_port(native):
+    # Native Shadowsocks starts TCP and UDP on the same port. A UDP-only
+    # reservation can select a port already used by another test's TCP socket.
+    for _ in range(64):
+        with ExitStack() as sockets:
+            tcp = sockets.enter_context(socket.socket())
+            tcp.bind(('127.0.0.1', 0))
+            address = tcp.getsockname()
+            if native:
+                udp = sockets.enter_context(socket.socket(type=socket.SOCK_DGRAM))
+                try:
+                    udp.bind(address)
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    continue
+            yield address[1]
+            return
+    raise RuntimeError('no free TCP/UDP inbound port after 64 candidates')
+
+
 async def run_case(binary, output, protocol, mode):
     output.mkdir(parents=True, exist_ok=True)
     quic_case = mode in QUIC_MODES
@@ -432,54 +456,52 @@ async def run_case(binary, output, protocol, mode):
         fallback_peer = EchoPeer(protocol, mode)
         fallback_transport, _ = await loop.create_datagram_endpoint(
             lambda: fallback_peer, local_addr=('127.0.0.1', 0))
-    with socket.socket(type=socket.SOCK_DGRAM if mode.startswith('native_') else socket.SOCK_STREAM) as reserved:
-        reserved.bind(('127.0.0.1', 0))
-        inbound_port = reserved.getsockname()[1]
-    outbound = {'tag': 'udp-out', 'protocol': protocol, 'settings': {}}
-    if protocol == 'shadowsocks':
-        outbound['settings'] = {'servers': [{
-            'address': 'udp-sink.test' if mode == 'dns_timeout' else '127.0.0.1',
-            'port': peer_port, 'method': 'aes-128-gcm', 'password': 'secret'}]}
-    configs = {
-        'config.json': {'workers': 1, 'timeouts': {'write': 1, 'connIdle': 30, 'downlinkOnly': 1},
-                        'dns': {'servers': [dns_server], 'timeout': 10},
-                        'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
-        'inbounds.json': [{'tag': 'udp-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
-                           'port': inbound_port,
-                           'settings': {'clients': [{'id': str(USER)},
-                                                     {'id': str(SECOND_USER)}] if isolated else
-                                                    [{'id': str(USER)}]}}],
-        'outbounds.json': [outbound],
-        'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'udp-out'}]},
-    }
-    sniffing = quic_case or mode in ('sniff_echo', 'native_sniff_echo', 'sniff_burst', 'native_sniff_burst')
-    configs['inbounds.json'][0]['sniffing'] = {'enabled': sniffing}
-    if quic_case:
-        configs['inbounds.json'][0]['sniffing']['routeOnly'] = True
-        configs['inbounds.json'][0]['sniffing']['destOverride'] = ['quic']
-        configs['outbounds.json'].append({
-            'tag': 'fallback-out', 'protocol': 'shadowsocks',
-            'settings': {'servers': [{
-                'address': '127.0.0.1',
-                'port': fallback_transport.get_extra_info('sockname')[1],
-                'method': 'aes-128-gcm', 'password': 'secret'}]}})
-        configs['routing.json'] = {'domainStrategy': 'AsIs', 'rules': [
-            {'type': 'field', 'domain': ['full:' + QUIC_SNI], 'outboundTag': 'udp-out'},
-            {'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'fallback-out'}]}
-    if mode.startswith('native_'):
-        configs['inbounds.json'][0]['protocol'] = 'shadowsocks'
-        configs['inbounds.json'][0]['settings'] = {
-            'method': 'aes-128-gcm', 'clients': [{'password': 'secret'}]}
-        if isolated:
-            configs['inbounds.json'][0]['settings']['clients'].append(
-                {'password': 'second-secret'})
-        if mode == 'native_ss2022_isolation':
+    with reserve_inbound_port(mode.startswith('native_')) as inbound_port:
+        outbound = {'tag': 'udp-out', 'protocol': protocol, 'settings': {}}
+        if protocol == 'shadowsocks':
+            outbound['settings'] = {'servers': [{
+                'address': 'udp-sink.test' if mode == 'dns_timeout' else '127.0.0.1',
+                'port': peer_port, 'method': 'aes-128-gcm', 'password': 'secret'}]}
+        configs = {
+            'config.json': {'workers': 1, 'timeouts': {'write': 1, 'connIdle': 30, 'downlinkOnly': 1},
+                            'dns': {'servers': [dns_server], 'timeout': 10},
+                            'log': {'enable': False, 'logDir': (output / 'logs').as_posix()}},
+            'inbounds.json': [{'tag': 'udp-probe', 'protocol': 'vless', 'listen': '127.0.0.1',
+                               'port': inbound_port,
+                               'settings': {'clients': [{'id': str(USER)},
+                                                         {'id': str(SECOND_USER)}] if isolated else
+                                                        [{'id': str(USER)}]}}],
+            'outbounds.json': [outbound],
+            'routing.json': {'rules': [{'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'udp-out'}]},
+        }
+        sniffing = quic_case or mode in ('sniff_echo', 'native_sniff_echo', 'sniff_burst', 'native_sniff_burst')
+        configs['inbounds.json'][0]['sniffing'] = {'enabled': sniffing}
+        if quic_case:
+            configs['inbounds.json'][0]['sniffing']['routeOnly'] = True
+            configs['inbounds.json'][0]['sniffing']['destOverride'] = ['quic']
+            configs['outbounds.json'].append({
+                'tag': 'fallback-out', 'protocol': 'shadowsocks',
+                'settings': {'servers': [{
+                    'address': '127.0.0.1',
+                    'port': fallback_transport.get_extra_info('sockname')[1],
+                    'method': 'aes-128-gcm', 'password': 'secret'}]}})
+            configs['routing.json'] = {'domainStrategy': 'AsIs', 'rules': [
+                {'type': 'field', 'domain': ['full:' + QUIC_SNI], 'outboundTag': 'udp-out'},
+                {'type': 'field', 'inboundTag': ['udp-probe'], 'outboundTag': 'fallback-out'}]}
+        if mode.startswith('native_'):
+            configs['inbounds.json'][0]['protocol'] = 'shadowsocks'
             configs['inbounds.json'][0]['settings'] = {
-                'method': '2022-blake3-aes-128-gcm',
-                'clients': [{'password': base64.b64encode(bytes(range(start, start + 16))).decode()}
-                            for start in (0, 16)]}
-    for name, config in configs.items():
-        (output / name).write_text(json.dumps(config), encoding='utf-8')
+                'method': 'aes-128-gcm', 'clients': [{'password': 'secret'}]}
+            if isolated:
+                configs['inbounds.json'][0]['settings']['clients'].append(
+                    {'password': 'second-secret'})
+            if mode == 'native_ss2022_isolation':
+                configs['inbounds.json'][0]['settings'] = {
+                    'method': '2022-blake3-aes-128-gcm',
+                    'clients': [{'password': base64.b64encode(bytes(range(start, start + 16))).decode()}
+                                for start in (0, 16)]}
+        for name, config in configs.items():
+            (output / name).write_text(json.dumps(config), encoding='utf-8')
     clients = []
     result = {'protocol': protocol, 'mode': mode}
     with (output / 'child.log').open('w', encoding='utf-8') as logfile:

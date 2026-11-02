@@ -35,6 +35,8 @@ ctest --test-dir build -C Release --no-tests=error --output-on-failure --paralle
 
 发布回归应使用 `Release`：默认启用 LTO，`RelWithDebInfo` 不覆盖这条优化路径，不能替代发布配置的验证。Linux 的密码学故障注入测试单独保留链接器可拦截的调用边界，主程序与依赖仍使用 Release LTO。
 
+集成测试按实际监听范围预留动态端口：同时监听 TCP/UDP 的场景会占有两个协议的同号端口，写完配置后才释放并启动进程，避免把仅 UDP 空闲的端口用于 TCP 监听。
+
 ## 架构总览
 
 所有 TCP / UDP 请求最终只能经过一条数据链路：
