@@ -1,0 +1,48 @@
+{
+  "domainStrategy": "AsIs",
+  "rules": [
+    {
+      "domain": [
+        "geosite:category-ads-all"
+      ],
+      "outboundTag": "blackhole"
+    },
+    {
+      "domain": [
+        "geosite:cn",
+        "domain:baidu.com",
+        "domain:qq.com"
+      ],
+      "outboundTag": "direct"
+    },
+    {
+      "ip": [
+        "geoip:private",
+        "geoip:cn"
+      ],
+      "outboundTag": "direct"
+    },
+    {
+      "domain": [
+        "geosite:google",
+        "geosite:youtube",
+        "geosite:twitter",
+        "geosite:telegram"
+      ],
+      "outboundTag": "proxy-vmess"
+    },
+    {
+      "port": "0-1023",
+      "network": "udp",
+      "outboundTag": "blackhole"
+    },
+    {
+      "source": ["10.0.0.0/8", "172.16.0.0/12"],
+      "outboundTag": "direct"
+    },
+    {
+      "protocol": ["bittorrent"],
+      "outboundTag": "blackhole"
+    }
+  ]
+}

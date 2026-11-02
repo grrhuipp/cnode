@@ -1,0 +1,27 @@
+#pragma once
+
+#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "acppnode/features/routing/dispatch_policy.hpp"
+#include "acppnode/proxy/sniff_config.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/inbound_listen.hpp"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace acpp {
+
+struct StaticInboundRuntimeEntry {
+    std::string protocol;
+    std::string tag;
+    std::vector<std::string> all_tags;
+    uint16_t port = 0;
+    InboundListen listen;
+    StreamSettings stream_settings;
+    SniffConfig sniffing;
+    routing::OutboundSelectionPolicy outbound_policy;
+    proxyman::inbound::BuildRequest build_request;
+};
+
+}  // namespace acpp

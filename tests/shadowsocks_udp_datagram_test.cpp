@@ -1,0 +1,299 @@
+#include "ss_udp.hpp"
+#include "shadowsocks_crypto.hpp"
+#include "acppnode/common/buf/contiguous_buffer_view.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using namespace acpp;
+
+[[noreturn]] void Fail(std::string_view message) {
+    std::cerr << message << '\n';
+    std::exit(1);
+}
+
+void Check(bool condition, std::string_view message) {
+    if (!condition) {
+        Fail(message);
+    }
+}
+
+std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
+    std::vector<uint8_t> out;
+    out.reserve(buf::TotalLen(payload));
+    for (const buf::Buffer* buffer : payload) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        const auto bytes = buffer->Bytes();
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+    return out;
+}
+
+buf::MultiBuffer MakePayload(const std::vector<uint8_t>& source,
+                             const TargetAddress& target) {
+    buf::MultiBuffer payload;
+    Check(buf::AppendSpanToMultiBuffer(source, payload),
+          "failed to allocate Shadowsocks UDP test payload");
+    for (buf::Buffer* buffer : payload) {
+        if (buffer && !buffer->IsEmpty()) {
+            buffer->SetUDP(target);
+        }
+    }
+    return payload;
+}
+
+void CheckClassic(const TargetAddress& target,
+                  const std::vector<uint8_t>& source,
+                  std::span<const uint8_t> payload,
+                  const ss::SsCipherInfo& cipher) {
+    const ss::KeyBytes key = ss::DeriveKey("udp-datagram-test", cipher.key_size);
+    const size_t encoded_size = ss::EncodeUdpPacketTo(
+        target, payload.data(), payload.size(), key.span(),
+        cipher.type, cipher.key_size, cipher.salt_size, nullptr, 0);
+    Check(encoded_size > source.size(),
+          "classic Shadowsocks UDP size calculation failed");
+    std::vector<uint8_t> encoded(encoded_size);
+    Check(ss::EncodeUdpPacketTo(
+              target, payload.data(), payload.size(), key.span(),
+              cipher.type, cipher.key_size, cipher.salt_size,
+              encoded.data(), encoded.size()) == encoded.size(),
+          "classic Shadowsocks UDP encoding failed");
+
+    auto decoded = ss::DecodeUdpPacketWithKey(
+        encoded.data(), encoded.size(), key.span(),
+        cipher.type, cipher.key_size, cipher.salt_size);
+    Check(decoded && decoded->target.SameEndpoint(target) &&
+          Flatten(decoded->payload) == source,
+          "classic Shadowsocks split one MultiBuffer datagram");
+
+    // Cross-check the one-shot AEAD API against the existing streaming EVP
+    // implementation, rather than only round-tripping through the new path.
+    std::array<uint8_t, 32> subkey{};
+    std::array<uint8_t, 12> nonce{};
+    Check(ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
+                          subkey.data()), "reference subkey derivation failed");
+    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size);
+    const auto body = std::span<const uint8_t>(encoded).subspan(cipher.salt_size);
+    std::vector<uint8_t> plaintext(body.size() - ss::SsAeadCipher::kTagSize);
+    Check(reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()),
+          "EVP could not decrypt one-shot AEAD ciphertext");
+    Check(std::equal(source.begin(), source.end(), plaintext.end() - source.size()),
+          "reference AEAD plaintext mismatch");
+    std::vector<uint8_t> reference_ciphertext(body.size());
+    Check(reference.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
+          std::equal(body.begin(), body.end(), reference_ciphertext.begin()),
+          "AEAD ciphertext/tag differ from streaming EVP");
+    encoded.back() ^= 1;
+    Check(!ss::DecodeUdpPacketWithKey(encoded.data(), encoded.size(), key.span(),
+                                    cipher.type, cipher.key_size, cipher.salt_size),
+          "datagram AEAD accepted a modified tag");
+}
+
+void Check2022(const TargetAddress& target,
+               const std::vector<uint8_t>& source,
+               std::span<const uint8_t> payload,
+               ss::SsCipherType cipher_type,
+               size_t key_size,
+               proxyman::inbound::PreparedAeadCipher prepared_cipher,
+               bool identity = false) {
+    const ss::SsCipherInfo cipher{cipher_type, key_size, key_size};
+    ss::KeyBytes key;
+    std::array<uint8_t, 32> key_bytes{};
+    for (size_t i = 0; i < key_size; ++i) {
+        key_bytes[i] = static_cast<uint8_t>(i + 1);
+    }
+    Check(key.assign(std::span<const uint8_t>(key_bytes).first(key_size)),
+          "failed to initialize Shadowsocks 2022 key");
+
+    std::array<ss::KeyBytes, 2> chain{};
+    std::span<const ss::KeyBytes> psk_chain;
+    if (identity) {
+        auto identity_bytes = key_bytes;
+        for (auto& byte : identity_bytes) byte ^= 0xa5;
+        Check(chain[0].assign(std::span<const uint8_t>(identity_bytes).first(key_size)),
+              "failed to initialize identity key");
+        chain[1] = key;
+        psk_chain = chain;
+    }
+    ss::Ss2022UdpSessionState encoder;
+    Check(ss::Init2022UdpSessionState(encoder, cipher, key),
+          "failed to initialize Shadowsocks 2022 UDP state");
+    const size_t encoded_size = ss::Encode2022UdpRequestPacketTo(
+        target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
+    Check(encoded_size > source.size(),
+          "Shadowsocks 2022 UDP size calculation failed");
+    Check(encoder.next_packet_id == 0,
+          "Shadowsocks 2022 size calculation advanced packet state");
+    std::vector<uint8_t> encoded(encoded_size);
+    Check(ss::Encode2022UdpRequestPacketTo(
+              target, payload.data(), payload.size(), encoder, psk_chain,
+              encoded.data(), encoded.size()) == encoded.size(),
+          "Shadowsocks 2022 UDP encoding failed");
+    Check(encoder.next_packet_id == 1,
+          "Shadowsocks 2022 request did not advance packet state once");
+
+    auto user_list = std::make_shared<
+        proxyman::inbound::UserStore::ShadowsocksUserList>();
+    proxyman::inbound::UserStore::ShadowsocksCredential user;
+    Check(user.derived_key.assign(key.span()),
+          "failed to initialize Shadowsocks 2022 decode user");
+    if (identity) {
+        Check(user.identity_key.assign(chain[0].span()) &&
+              ss::Hash2022Psk(key.span(), user.psk_hash),
+              "failed to prepare identity credential");
+    }
+    user.cipher_type = prepared_cipher;
+    user.key_size = cipher.key_size;
+    user.salt_size = cipher.salt_size;
+    if (identity) {
+        auto decoy = user;
+        decoy.derived_key.bytes[0] ^= 0x5a;
+        Check(ss::Hash2022Psk(decoy.derived_key.span(), decoy.psk_hash),
+              "failed to prepare decoy credential");
+        auto other_identity = decoy;
+        other_identity.identity_key.bytes[0] ^= 0x33;
+        user_list->push_back(std::move(other_identity));
+        user_list->push_back(std::move(decoy));
+    }
+    user_list->push_back(std::move(user));
+    const proxyman::inbound::UserStore::ShadowsocksUsersView users{user_list};
+    if (identity) {
+        auto bad_users = std::make_shared<proxyman::inbound::UserStore::ShadowsocksUserList>(*user_list);
+        bad_users->back().psk_hash[0] ^= 1;
+        ss::Ss2022UdpReplayCache bad_cache;
+        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), {bad_users},
+                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache),
+              "identity authentication ignored prepared PSK hash");
+    }
+    std::vector<uint8_t> corrupted = encoded;
+    corrupted.back() ^= 0x01;
+    ss::Ss2022UdpReplayCache validation_cache;
+    Check(!ss::DecodeUdpPacket(
+              corrupted.data(), corrupted.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size,
+              validation_cache),
+          "invalid Shadowsocks 2022 request unexpectedly decoded");
+    Check(ss::DecodeUdpPacket(
+              encoded.data(), encoded.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size,
+              validation_cache).has_value(),
+          "invalid Shadowsocks 2022 request poisoned the replay window");
+
+    ss::Ss2022UdpReplayCache replay_cache;
+    auto decoded = ss::DecodeUdpPacket(
+        encoded.data(), encoded.size(), users,
+        cipher.type, cipher.key_size, cipher.salt_size, replay_cache);
+    Check(decoded && decoded->target.SameEndpoint(target) &&
+          Flatten(decoded->payload) == source,
+          "Shadowsocks 2022 split one MultiBuffer datagram");
+    Check(!ss::DecodeUdpPacket(
+              encoded.data(), encoded.size(), users,
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache),
+          "Shadowsocks 2022 accepted a replayed request packet");
+
+    auto make_response_state = [&]() {
+        ss::Ss2022UdpSessionState state;
+        state.cipher_info = encoder.cipher_info;
+        state.key = encoder.key;
+        state.client_session_id = encoder.client_session_id;
+        state.server_session_id = encoder.server_session_id;
+        return state;
+    };
+    ss::Ss2022UdpSessionState response_encoder = make_response_state();
+    ss::Ss2022UdpSessionState response_decoder = make_response_state();
+    const size_t response_size = ss::Encode2022UdpResponsePacketTo(
+        target, payload.data(), payload.size(), response_encoder, nullptr, 0);
+    std::vector<uint8_t> response(response_size);
+    Check(ss::Encode2022UdpResponsePacketTo(
+              target, payload.data(), payload.size(), response_encoder,
+              response.data(), response.size()) == response.size(),
+          "Shadowsocks 2022 UDP response encoding failed");
+    auto response_decoded = ss::Decode2022UdpResponsePacket(
+        response.data(), response.size(), response_decoder);
+    Check(response_decoded &&
+          response_decoded->target.SameEndpoint(target) &&
+          Flatten(response_decoded->payload) == source,
+          "Shadowsocks 2022 UDP response decoding failed");
+    Check(!ss::Decode2022UdpResponsePacket(
+              response.data(), response.size(), response_decoder),
+          "Shadowsocks 2022 accepted a replayed response packet");
+}
+
+void Check2022ReplayWindow() {
+    ss::Ss2022UdpReplayWindow window;
+    Check(window.Accept(100) && window.Accept(98) && window.Accept(99),
+          "Shadowsocks 2022 replay window rejected valid reordering");
+    Check(!window.Accept(100) && !window.Accept(98),
+          "Shadowsocks 2022 replay window accepted duplicate packet IDs");
+    Check(window.Accept(100 + ss::Ss2022UdpReplayWindow::kWindowBits),
+          "Shadowsocks 2022 replay window rejected a new high packet ID");
+    Check(!window.Accept(100),
+          "Shadowsocks 2022 replay window accepted an out-of-window packet ID");
+
+    ss::Ss2022UdpReplayWindow cross_word_window;
+    Check(cross_word_window.Accept(0) && cross_word_window.Accept(65) &&
+          !cross_word_window.Accept(0) && cross_word_window.Accept(64) &&
+          !cross_word_window.Accept(64),
+          "Shadowsocks 2022 replay window lost bits across word boundaries");
+
+    ss::Ss2022UdpReplayCache cache;
+    const std::array<uint8_t, 8> session_id{1, 2, 3, 4, 5, 6, 7, 8};
+    const auto started = std::chrono::steady_clock::time_point{};
+    Check(cache.Accept(session_id, 7, started) &&
+          !cache.Accept(session_id, 7, started + std::chrono::seconds(64)) &&
+          cache.Accept(session_id, 7, started + std::chrono::seconds(66)),
+          "Shadowsocks 2022 replay cache retention is incorrect");
+
+    ss::Ss2022UdpReplayCache previous_cache;
+    Check(previous_cache.Accept(session_id, 9, started),
+          "failed to seed Shadowsocks 2022 replay cache");
+    ss::Ss2022UdpReplayCache adopted_cache = std::move(previous_cache);
+    Check(!adopted_cache.Accept(
+              session_id, 9, started + std::chrono::seconds(1)),
+          "Shadowsocks 2022 replay cache lost state during handler adoption");
+}
+
+}  // namespace
+
+int main() {
+    const TargetAddress target("1.1.1.1", 53);
+    const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
+    const buf::MultiBuffer fragmented = MakePayload(source, target);
+    const buf::ContiguousBufferView payload(fragmented);
+    Check(payload.Bytes().size() == source.size() &&
+          std::equal(payload.Bytes().begin(), payload.Bytes().end(), source.begin()),
+          "Shadowsocks UDP payload coalescing mismatch");
+
+    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
+        const auto cipher = ss::ParseCipherMethod(method);
+        Check(cipher.has_value(), "test cipher unavailable");
+        CheckClassic(target, source, payload.Bytes(), *cipher);
+    }
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::AES_256_GCM_2022, 32,
+        proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022);
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::AES_128_GCM_2022, 16,
+        proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022);
+    Check2022(
+        target, source, payload.Bytes(),
+        ss::SsCipherType::CHACHA20_POLY1305_2022, 32,
+        proxyman::inbound::PreparedAeadCipher::CHACHA20_POLY1305_2022);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16,
+              proxyman::inbound::PreparedAeadCipher::AES_128_GCM_2022, true);
+    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32,
+              proxyman::inbound::PreparedAeadCipher::AES_256_GCM_2022, true);
+    Check2022ReplayWindow();
+    return 0;
+}

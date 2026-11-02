@@ -1,0 +1,134 @@
+#pragma once
+
+#include "acppnode/common/asio_types.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buf/multi_buffer.hpp"
+#include "acppnode/common/error.hpp"
+#include "acppnode/common/target_address.hpp"
+
+#include <array>
+#include <cstdint>
+#include <expected>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace acpp {
+class AsyncStream;
+}
+
+namespace acpp::anytls {
+
+inline constexpr uint8_t kCmdWaste = 0;
+inline constexpr uint8_t kCmdSYN = 1;
+inline constexpr uint8_t kCmdPSH = 2;
+inline constexpr uint8_t kCmdFIN = 3;
+inline constexpr uint8_t kCmdSettings = 4;
+inline constexpr uint8_t kCmdAlert = 5;
+inline constexpr uint8_t kCmdUpdatePaddingScheme = 6;
+inline constexpr uint8_t kCmdSYNACK = 7;
+inline constexpr uint8_t kCmdHeartRequest = 8;
+inline constexpr uint8_t kCmdHeartResponse = 9;
+inline constexpr uint8_t kCmdServerSettings = 10;
+
+inline constexpr size_t kFrameHeaderSize = 7;
+inline constexpr size_t kMaxFramePayload = 0xffff;
+
+inline constexpr uint32_t kProtocolVersion = 2;
+
+enum class SessionVersion : uint8_t { V1 = 1, V2 = 2 };
+
+struct PeerSettings {
+    SessionVersion version = SessionVersion::V1;
+    std::string padding_md5; // Handshake-only metadata, never retained by a session.
+};
+
+[[nodiscard]] std::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text);
+
+struct FrameHeader {
+    uint8_t cmd = 0;
+    uint32_t sid = 0;
+    uint16_t length = 0;
+};
+
+// Write-phase encoding storage. Payloads remain borrowed from the caller's
+// MultiBuffer; this object must not move or outlive that write operation.
+class FrameBatch {
+public:
+    FrameBatch() = default;
+    FrameBatch(const FrameBatch&) = delete;
+    FrameBatch& operator=(const FrameBatch&) = delete;
+    [[nodiscard]] std::expected<void, ErrorCode> Encode(
+        uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload);
+    [[nodiscard]] std::expected<void, ErrorCode> Encode(
+        uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> buffers);
+    [[nodiscard]] std::span<const net::const_buffer> Buffers() const noexcept {
+        return spilled_ ? std::span<const net::const_buffer>(spill_buffers_)
+                        : std::span<const net::const_buffer>(buffers_.data(), count_);
+    }
+private:
+    static constexpr size_t kInlineFrames = buf::MultiBuffer::kInlineCapacity;
+    std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
+    std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
+    memory::ThreadLocalVector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;
+    memory::ThreadLocalVector<net::const_buffer> spill_buffers_;
+    size_t count_ = 0;
+    bool spilled_ = false;
+};
+
+class PaddingScheme;
+
+[[nodiscard]] std::string ClientSettings(const PaddingScheme& scheme);
+[[nodiscard]] std::expected<std::string, ErrorCode> EncodeSocksAddress(const TargetAddress& target);
+[[nodiscard]] std::expected<void, ErrorCode> AppendFrameBytesTo(
+    memory::ByteVector& out,
+    uint8_t cmd,
+    uint32_t sid,
+    std::span<const uint8_t> payload);
+
+// Protocol validation and actual I/O errors are values. Non-I/O exceptions
+// retain their types for the owning request/session boundary to classify.
+net::awaitable<std::expected<void, ErrorCode>>
+WriteAll(AsyncStream& stream, std::span<const uint8_t> data);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WritePacketWithPadding(AsyncStream& stream,
+                       const PaddingScheme& scheme,
+                       uint32_t packet_index,
+                       memory::ByteVector packet);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteMultiBufferAsFrameBatch(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
+                                    const PaddingScheme& scheme,
+                                    uint32_t packet_index,
+                                    uint8_t cmd,
+                                    uint32_t sid,
+                                    buf::MultiBuffer mb);
+
+net::awaitable<std::expected<void, ErrorCode>>
+WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+                                const PaddingScheme& scheme,
+                                uint32_t packet_index,
+                                uint8_t cmd,
+                                uint32_t sid,
+                                std::span<const net::const_buffer> buffers);
+
+net::awaitable<std::expected<FrameHeader, ErrorCode>>
+ReadFrameHeader(AsyncStream& stream);
+
+net::awaitable<std::expected<std::string, ErrorCode>>
+ReadFrameText(AsyncStream& stream, uint16_t length);
+
+net::awaitable<std::expected<void, ErrorCode>>
+DiscardFramePayload(AsyncStream& stream, uint16_t length);
+
+net::awaitable<std::expected<buf::MultiBuffer, ErrorCode>>
+ReadFramePayload(AsyncStream& stream, uint16_t length);
+
+}  // namespace acpp::anytls

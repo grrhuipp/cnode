@@ -1,0 +1,882 @@
+#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
+#include "acppnode/common/memory_stats.hpp"
+#include "acppnode/infra/log.hpp"
+#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "connection_timeouts.hpp"
+
+#include <asio/read.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/use_awaitable.hpp>
+#include <asio/write.hpp>
+#include <asio/connect.hpp>
+#include <asio/buffer.hpp>
+#include <asio/bind_allocator.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+
+namespace acpp {
+
+namespace {
+constexpr size_t kProxyHeaderMaxBytes = 2048;
+constexpr size_t kProxyProbeBytes = 256;
+template<class Timeouts, bool IsRead>
+struct OperationTimeoutScope {
+    explicit OperationTimeoutScope(Timeouts& timeouts) : timeouts(timeouts) {
+        if constexpr (IsRead) timeouts.BeginRead();
+        else timeouts.BeginWrite();
+    }
+    OperationTimeoutScope(const OperationTimeoutScope&) = delete;
+    OperationTimeoutScope& operator=(const OperationTimeoutScope&) = delete;
+    ~OperationTimeoutScope() noexcept {
+        if constexpr (IsRead) timeouts.EndRead();
+        else timeouts.EndWrite();
+    }
+    Timeouts& timeouts;
+};
+
+struct PendingOperationState {
+    bool timed_out = false;
+    bool active = true;
+
+    bool TakeActive() noexcept {
+        if (!active) {
+            return false;
+        }
+        active = false;
+        return true;
+    }
+};
+
+net::io_context& SocketIoContext(tcp::socket& socket) {
+    return static_cast<net::io_context&>(socket.get_executor().context());
+}
+
+ProxyProtocolReadResult ProxyReadResult(
+    ProxyProtocolReadStatus status,
+    ProxyProtocolResult result = {}) {
+    ProxyProtocolReadResult out;
+    out.status = status;
+    out.result = std::move(result);
+    return out;
+}
+
+void SetupConnectedSocket(tcp::socket& sock);
+}
+
+enum class StreamLabelKind : uint8_t {
+    Unknown,
+    Inbound,
+    Outbound,
+};
+
+enum Flag : uint8_t {
+    kAbortiveClose          = 1u << 0,
+    kReadShutdown           = 1u << 1,
+    kWriteShutdown          = 1u << 2,
+    kCountedActive          = 1u << 3,
+    kDeferWriteCancellation = 1u << 4,
+};
+
+struct TcpStream::Impl : memory::ThreadAllocated {
+    explicit Impl(tcp::socket socket, TcpStream& owner)
+        : socket(std::move(socket))
+        , owner(owner)
+        , timeouts(SocketIoContext(this->socket), *this) {}
+
+    void OnTimeout(ErrorCode reason) noexcept {
+        if (reason != ErrorCode::CANCELLED) owner.Cancellation().Stop(reason);
+        owner.Cancel();
+        owner.Close();
+    }
+
+    [[nodiscard]] bool HasFlag(Flag flag) const noexcept {
+        return (flags & static_cast<uint8_t>(flag)) != 0;
+    }
+
+    void SetFlag(Flag flag, bool enabled = true) noexcept {
+        if (enabled) {
+            flags |= static_cast<uint8_t>(flag);
+        } else {
+            flags &= static_cast<uint8_t>(~static_cast<uint8_t>(flag));
+        }
+    }
+
+    tcp::socket socket;
+    TcpStream& owner;
+    transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
+    buf::MultiBuffer pending_data;
+    StreamLabelKind stream_label = StreamLabelKind::Unknown;
+    uint8_t flags = 0;
+};
+
+// ============================================================================
+// TcpStream 实现
+// ============================================================================
+
+void* TcpStream::operator new(std::size_t size) {
+    if (void* p = memory::AllocatePmr(size, alignof(TcpStream))) {
+        memory::OnAsyncStreamNew();
+        return p;
+    }
+    throw std::bad_alloc();
+}
+
+void TcpStream::operator delete(void* p) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocatePmr(p, sizeof(TcpStream), alignof(TcpStream));
+}
+
+void TcpStream::operator delete(void* p, std::size_t size) noexcept {
+    memory::OnAsyncStreamFree();
+    memory::DeallocatePmr(p, size, alignof(TcpStream));
+}
+
+TcpStream::TcpStream(tcp::socket socket)
+    : impl_(std::make_unique<Impl>(std::move(socket), *this)) {
+    if (impl_->socket.is_open()) {
+        impl_->SetFlag(kCountedActive);
+        memory::OnTcpStreamNew();
+        SetupConnectedSocket(impl_->socket);
+    }
+}
+
+TcpStream::~TcpStream() {
+    // Close() 内部已包含所有 Cancel 调用，不重复
+    Close();
+    ReleasePendingData();
+}
+
+net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        co_return 0;
+    }
+
+    // 先返回 pending 数据；Buffer 游标推进后，消费完立即归还。
+    if (!impl_->pending_data.empty()) {
+        const size_t copy = ConsumePendingData(buf);
+        TouchActivity();
+        co_return copy;
+    }
+
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    auto [ec, n] = co_await impl_->socket.async_read_some(buf,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+
+    if (ec) {
+        if (ec == io_error::eof) {
+            co_return 0;  // 正常关闭
+        }
+        if (ec == io_error::connection_reset ||
+            ec == io_error::broken_pipe) {
+            LOG_NET_DEBUG("AsyncRead: {} (fd={})", ec.message(), NativeHandle());
+            co_return 0;
+        }
+        if (ec == io_error::operation_aborted) {
+            co_return 0;  // 被取消（可能是 idle timeout）
+        }
+        throw IoSystemError(ec);
+    }
+
+    TouchActivity();
+    co_return n;
+}
+
+// ============================================================================
+// TcpStream::ReadMultiBuffer
+//
+// 优化路径：async_read_some 直接填充 pool Buffer，省去 relay buffer 中转。
+// pending_data 优先返回（保持与 AsyncRead 相同语义）。
+//
+// 每个 relay 方向只允许一个挂起的 8KB payload Buffer，双向 payload
+// 容量总计 16KB。吞吐依靠连续 async_read_some 驱动，不再预分配 readv 批量。
+// ============================================================================
+net::awaitable<buf::MultiBuffer> TcpStream::ReadMultiBuffer() {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) co_return buf::MultiBuffer{};
+
+    // 先消费 pending_data；MultiBuffer move 即转移剩余 Buffer 所有权。
+    if (!impl_->pending_data.empty()) {
+        buf::MultiBuffer pending = std::move(impl_->pending_data);
+        TouchActivity();
+        co_return pending;
+    }
+
+    const IoErrorCode wait_ec = co_await WaitReadable();
+    if (wait_ec) {
+        if (wait_ec == io_error::eof ||
+            wait_ec == io_error::operation_aborted) {
+            co_return buf::MultiBuffer{};
+        }
+        if (wait_ec == io_error::connection_reset ||
+            wait_ec == io_error::broken_pipe) {
+            LOG_NET_DEBUG("ReadMultiBuffer wait: {} (fd={})",
+                          wait_ec.message(), NativeHandle());
+            co_return buf::MultiBuffer{};
+        }
+        throw IoSystemError(wait_ec);
+    }
+
+    buf::BufferGuard buffer{buf::Buffer::New()};
+    if (!buffer) {
+        co_return buf::MultiBuffer{};
+    }
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    auto [ec, n] = co_await impl_->socket.async_read_some(
+        net::mutable_buffer(buffer->Tail().data(), buffer->Available()),
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+
+    if (ec || n == 0) {
+        if (!ec || ec == io_error::eof ||
+            ec == io_error::operation_aborted)
+            co_return buf::MultiBuffer{};
+        if (ec == io_error::connection_reset ||
+            ec == io_error::broken_pipe) {
+            LOG_NET_DEBUG("ReadMultiBuffer: {} (fd={})", ec.message(), NativeHandle());
+            co_return buf::MultiBuffer{};
+        }
+        throw IoSystemError(ec);
+    }
+
+    buffer->Produce(static_cast<uint32_t>(n));
+    TouchActivity();
+    co_return buf::MultiBuffer{std::move(buffer)};
+}
+
+// ============================================================================
+// TcpStream::WriteMultiBuffer
+//
+// 优化路径：将多个 Buffer 合并为 net::const_buffer_sequence，
+// 通过 net::async_write 发出单次 scatter-write（WSASend / writev），
+// 减少系统调用次数。
+// ============================================================================
+net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
+
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown) || !buf::HasData(mb)) co_return;
+
+    ConstBufferSpanBuilder<8> out;
+    out.AppendMultiBuffer(mb);
+    if (out.empty()) co_return;
+
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
+    auto [ec, n] = co_await net::async_write(
+        impl_->socket, out.Span(),
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+
+    if (ec) {
+        throw IoSystemError(ec);
+    }
+    if (!ec) TouchActivity();
+}
+
+net::awaitable<void> TcpStream::WriteBuffers(
+    std::span<const net::const_buffer> buffers) {
+
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown) || buffers.empty()) {
+        co_return;
+    }
+
+    ConstBufferSpanBuilder<16> out;
+    out.AppendBuffers(buffers);
+    if (out.empty()) {
+        co_return;
+    }
+
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
+    auto [ec, n] = co_await net::async_write(
+        impl_->socket, out.Span(),
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+    (void)n;
+
+    if (ec) {
+        throw IoSystemError(ec);
+    }
+    TouchActivity();
+}
+
+net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
+        co_return 0;
+    }
+
+    OperationTimeoutScope<decltype(impl_->timeouts), false> timeout_scope{impl_->timeouts};
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    const auto slot = IsWriteCancellationDeferred()
+        ? net::cancellation_slot{} : cancellation.slot();
+    auto [ec, n] = co_await net::async_write(impl_->socket, buf,
+        net::bind_cancellation_slot(slot, net::bind_allocator(
+            memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable))));
+
+    if (ec) {
+        throw IoSystemError(ec);
+    }
+
+    TouchActivity();
+    co_return n;
+}
+
+void TcpStream::ShutdownRead() {
+    ReleasePendingData();
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        return;
+    }
+
+    IoErrorCode ec;
+    impl_->socket.shutdown(tcp::socket::shutdown_receive, ec);
+    impl_->SetFlag(kReadShutdown);
+    // 忽略错误，可能对端已关闭
+}
+
+void TcpStream::ShutdownWrite() {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
+        return;
+    }
+
+    IoErrorCode ec;
+    impl_->socket.shutdown(tcp::socket::shutdown_send, ec);
+    impl_->SetFlag(kWriteShutdown);
+    // 忽略错误
+}
+
+void TcpStream::Close() {
+    ReleasePendingData();
+    impl_->timeouts.Stop();
+    NotifyClosed();
+    if (impl_->socket.is_open()) {
+        IoErrorCode ec;
+        // 仅错误路径使用 abortive close；正常关闭保持 FIN 语义，
+        // 避免高并发下统一 RST 导致对端看到 connection reset。
+        if (impl_->HasFlag(kAbortiveClose)) {
+            struct linger lg = {1, 0};
+            ::setsockopt(impl_->socket.native_handle(), SOL_SOCKET, SO_LINGER,
+                         reinterpret_cast<const char*>(&lg), sizeof(lg));
+        }
+        impl_->socket.shutdown(tcp::socket::shutdown_both, ec);
+        impl_->socket.close(ec);
+    }
+    ReleaseActiveCounter();
+    impl_->SetFlag(kReadShutdown);
+    impl_->SetFlag(kWriteShutdown);
+}
+
+void TcpStream::Cancel() noexcept {
+    NotifyCancellation();
+    if (impl_->socket.is_open()) {
+        IoErrorCode ec;
+        impl_->socket.cancel(ec);
+    }
+}
+
+int TcpStream::NativeHandle() const {
+    if (!impl_->socket.is_open()) {
+        return -1;
+    }
+    return static_cast<int>(const_cast<tcp::socket&>(impl_->socket).native_handle());
+}
+
+bool TcpStream::IsOpen() const {
+    return impl_->socket.is_open();
+}
+
+net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
+    net::mutable_buffer buffer,
+    bool peek) {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        co_return std::make_pair(io_error::not_connected, std::size_t{0});
+    }
+
+    const auto flags = peek
+        ? net::socket_base::message_peek
+        : net::socket_base::message_flags{0};
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    auto [ec, n] = co_await impl_->socket.async_receive(
+        buffer, flags,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+    if (!ec && n > 0 && !peek) {
+        TouchActivity();
+    }
+    co_return std::make_pair(ec, n);
+}
+
+net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
+    std::chrono::seconds timeout) {
+    SetIdleTimeout(timeout);
+    auto deadline = StartPhaseDeadline(timeout);
+
+    auto timed_out = [&]() noexcept {
+        return deadline.Expired() ||
+               ConsumePhaseDeadline() ||
+               ConsumeIdleTimeout();
+    };
+
+    std::array<uint8_t, kProxyProbeBytes> probe;
+    auto [peek_ec, probe_len] = co_await AsyncReceiveSome(
+        net::buffer(probe), true);
+
+    if (peek_ec || probe_len == 0) {
+        auto out = timed_out()
+            ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut)
+            : ProxyReadResult(ProxyProtocolReadStatus::Ok);
+        ClearPhaseDeadline();
+        co_return out;
+    }
+
+    auto result = ProxyProtocolParser::Parse(probe.data(), probe_len);
+
+    if (!result.incomplete()) {
+        if (result.status == ProxyProtocolParseStatus::Invalid) {
+            ClearPhaseDeadline();
+            co_return ProxyReadResult(ProxyProtocolReadStatus::Invalid, std::move(result));
+        }
+
+        size_t remaining = result.consumed;
+        while (remaining > 0) {
+            std::array<uint8_t, kProxyProbeBytes> discard;
+            const size_t want = std::min(remaining, discard.size());
+            auto [read_ec, n] = co_await AsyncReceiveSome(
+                net::buffer(discard.data(), want));
+            if (read_ec || n == 0) {
+                auto out = timed_out()
+                    ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut, std::move(result))
+                    : ProxyReadResult(ProxyProtocolReadStatus::Truncated, std::move(result));
+                ClearPhaseDeadline();
+                co_return out;
+            }
+            remaining -= n;
+        }
+
+        ClearPhaseDeadline();
+        co_return ProxyReadResult(ProxyProtocolReadStatus::Ok, std::move(result));
+    }
+
+    memory::ByteVector buf;
+    buf.reserve(kProxyProbeBytes * 2);
+
+    while (buf.size() < kProxyHeaderMaxBytes) {
+        std::array<uint8_t, kProxyProbeBytes> chunk;
+        auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(chunk));
+        if (read_ec || n == 0) {
+            if (timed_out()) {
+                ClearPhaseDeadline();
+                co_return ProxyReadResult(ProxyProtocolReadStatus::TimedOut, std::move(result));
+            }
+            result = ProxyProtocolParser::Parse(buf.data(), buf.size());
+            if (result.incomplete()) {
+                ClearPhaseDeadline();
+                co_return ProxyReadResult(ProxyProtocolReadStatus::Truncated, std::move(result));
+            }
+        } else {
+            buf.insert(buf.end(), chunk.begin(),
+                       chunk.begin() + static_cast<ptrdiff_t>(n));
+            result = ProxyProtocolParser::Parse(buf.data(), buf.size());
+            if (result.incomplete()) {
+                continue;
+            }
+        }
+
+        if (result.status == ProxyProtocolParseStatus::Invalid) {
+            ClearPhaseDeadline();
+            co_return ProxyReadResult(ProxyProtocolReadStatus::Invalid, std::move(result));
+        }
+        if (buf.size() >= kProxyHeaderMaxBytes) {
+            ClearPhaseDeadline();
+            co_return ProxyReadResult(ProxyProtocolReadStatus::TooLarge, std::move(result));
+        }
+        if (result.consumed < buf.size()) {
+            SetPendingData(std::span<const uint8_t>(buf).subspan(result.consumed));
+        }
+
+        ClearPhaseDeadline();
+        co_return ProxyReadResult(ProxyProtocolReadStatus::Ok, std::move(result));
+    }
+
+    ClearPhaseDeadline();
+    co_return ProxyReadResult(ProxyProtocolReadStatus::TooLarge, std::move(result));
+}
+
+void TcpStream::SetPendingData(std::span<const uint8_t> data) {
+    ReleasePendingData();
+    size_t offset = 0;
+    while (offset < data.size()) {
+        buf::BufferGuard buffer{buf::Buffer::New()};
+        if (!buffer) {
+            throw std::bad_alloc();
+        }
+        const size_t n = std::min(data.size() - offset,
+                                  static_cast<size_t>(buffer->Available()));
+        std::memcpy(buffer->Tail().data(), data.data() + offset, n);
+        buffer->Produce(static_cast<uint32_t>(n));
+        impl_->pending_data.push_back(std::move(buffer));
+        offset += n;
+    }
+}
+
+void TcpStream::PrependReadData(std::span<const uint8_t> data) {
+    if (data.empty()) return;
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        throw IoSystemError(io_error::operation_aborted, "TCP read closed");
+    }
+    buf::MultiBuffer prefix;
+    if (!buf::AppendSpanToMultiBuffer(data, prefix)) {
+        throw std::bad_alloc();
+    }
+    // MoveTo reserves before transferring; allocation failure preserves old data.
+    impl_->pending_data.MoveTo(prefix);
+    impl_->pending_data = std::move(prefix);
+}
+
+void TcpStream::SetStreamLabel(std::string_view label) noexcept {
+    if (label == "in") {
+        impl_->stream_label = StreamLabelKind::Inbound;
+    } else if (label == "out") {
+        impl_->stream_label = StreamLabelKind::Outbound;
+    } else {
+        impl_->stream_label = StreamLabelKind::Unknown;
+    }
+}
+
+std::string_view TcpStream::StreamLabel() const noexcept {
+    switch (impl_->stream_label) {
+        case StreamLabelKind::Inbound:
+            return "in";
+        case StreamLabelKind::Outbound:
+            return "out";
+        case StreamLabelKind::Unknown:
+        default:
+            return {};
+    }
+}
+
+void TcpStream::SetAbortiveClose(bool enable) noexcept {
+    impl_->SetFlag(kAbortiveClose, enable);
+}
+
+void TcpStream::SetWriteCancellationDeferred() noexcept {
+    impl_->SetFlag(kDeferWriteCancellation);
+}
+
+bool TcpStream::IsWriteCancellationDeferred() const noexcept {
+    return impl_->HasFlag(kDeferWriteCancellation);
+}
+
+tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
+    return impl_->socket.get_executor();
+}
+
+net::awaitable<IoErrorCode> TcpStream::WaitReadable() {
+    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
+        co_return io_error::eof;
+    }
+    if (buf::HasData(impl_->pending_data)) {
+        co_return IoErrorCode{};
+    }
+
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts};
+    auto [ec] = co_await impl_->socket.async_wait(
+        tcp::socket::wait_read,
+        net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::as_tuple(net::use_awaitable)));
+    co_return ec;
+}
+
+tcp::socket& TcpStream::TlsLayerSocket() noexcept {
+    return impl_->socket;
+}
+
+bool TcpStream::TlsLayerCanRead() const noexcept {
+    return impl_->socket.is_open() && !impl_->HasFlag(kReadShutdown);
+}
+
+bool TcpStream::TlsLayerCanWrite() const noexcept {
+    return impl_->socket.is_open() && !impl_->HasFlag(kWriteShutdown);
+}
+
+size_t TcpStream::ConsumeTlsLayerPendingData(net::mutable_buffer target) noexcept {
+    return ConsumePendingData(target);
+}
+
+void TcpStream::BeginTlsLayerRead() {
+    impl_->timeouts.BeginRead();
+}
+
+void TcpStream::EndTlsLayerRead(const IoErrorCode& ec, std::size_t n) noexcept {
+    impl_->timeouts.EndRead();
+    if (!ec && n > 0) {
+        TouchActivity();
+    }
+}
+
+void TcpStream::BeginTlsLayerWrite() {
+    impl_->timeouts.BeginWrite();
+}
+
+void TcpStream::EndTlsLayerWrite(const IoErrorCode& ec, std::size_t n) noexcept {
+    impl_->timeouts.EndWrite();
+    if (!ec && n > 0) {
+        TouchActivity();
+    }
+}
+
+tcp::endpoint TcpStream::LocalEndpoint() const {
+    if (!impl_->socket.is_open()) {
+        return tcp::endpoint();
+    }
+    IoErrorCode ec;
+    auto ep = impl_->socket.local_endpoint(ec);
+    return ec ? tcp::endpoint() : ep;
+}
+
+tcp::endpoint TcpStream::RemoteEndpoint() const {
+    if (!impl_->socket.is_open()) {
+        return tcp::endpoint();
+    }
+    IoErrorCode ec;
+    auto ep = impl_->socket.remote_endpoint(ec);
+    return ec ? tcp::endpoint() : ep;
+}
+
+// ============================================================================
+// 静态连接方法
+// ============================================================================
+
+net::awaitable<DialResult> TcpStream::Connect(
+    net::io_context& io_context,
+    const tcp::endpoint& endpoint,
+    std::chrono::seconds timeout) {
+
+    if (timeout.count() <= 0) {
+        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+    }
+
+    tcp::socket socket(io_context);
+    PendingOperationState op_state;
+
+    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
+    TimeoutToken token = scheduler.ScheduleAfter(
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+        [&socket, &op_state]() {
+            if (op_state.TakeActive()) {
+                op_state.timed_out = true;
+                IoErrorCode close_ec;
+                socket.close(close_ec);
+            }
+        });
+
+    IoErrorCode connect_ec;
+
+    try {
+        co_await socket.async_connect(endpoint,
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
+    } catch (const IoSystemError& e) {
+        connect_ec = e.code();
+    }
+
+    if (op_state.TakeActive()) {
+        scheduler.Cancel(token);
+    } else {
+        token.Reset();
+    }
+
+    if (op_state.timed_out) {
+        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+    }
+
+    if (connect_ec) {
+        auto err = MapAsioError(connect_ec);
+        co_return DialResult::Fail(err, connect_ec.message(), connect_ec.value());
+    }
+    co_return DialResult::Success(
+        std::make_unique<TcpStream>(std::move(socket)));
+}
+
+net::awaitable<DialResult> TcpStream::ConnectWithBind(
+    net::io_context& io_context,
+    const net::ip::address& local_addr,
+    const tcp::endpoint& remote_endpoint,
+    std::chrono::seconds timeout) {
+
+    if (timeout.count() <= 0) {
+        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+    }
+
+    tcp::socket socket(io_context);
+    PendingOperationState op_state;
+
+    // 打开 socket
+    IoErrorCode ec;
+    socket.open(remote_endpoint.protocol(), ec);
+    if (ec) {
+        co_return DialResult::Fail(
+            ErrorCode::SOCKET_CREATE_FAILED, ec.message(), ec.value());
+    }
+
+    // 绑定本地地址
+    tcp::endpoint local_endpoint(local_addr, 0);  // 端口为 0，由系统分配
+    socket.bind(local_endpoint, ec);
+    if (ec) {
+        co_return DialResult::Fail(
+            ErrorCode::SOCKET_BIND_FAILED, ec.message(), ec.value());
+    }
+
+    auto& scheduler = TimeoutScheduler::ForIoContext(io_context);
+    TimeoutToken token = scheduler.ScheduleAfter(
+        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+        [&socket, &op_state]() {
+            if (op_state.TakeActive()) {
+                op_state.timed_out = true;
+                IoErrorCode close_ec;
+                socket.close(close_ec);
+            }
+        });
+
+    IoErrorCode connect_ec;
+
+    try {
+        co_await socket.async_connect(remote_endpoint,
+            net::bind_allocator(memory::ThreadLocalAllocator<std::byte>{}, net::use_awaitable));
+    } catch (const IoSystemError& e) {
+        connect_ec = e.code();
+    }
+
+    if (op_state.TakeActive()) {
+        scheduler.Cancel(token);
+    } else {
+        token.Reset();
+    }
+
+    if (op_state.timed_out) {
+        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+    }
+
+    if (connect_ec) {
+        auto err = MapAsioError(connect_ec);
+        co_return DialResult::Fail(err, connect_ec.message(), connect_ec.value());
+    }
+    co_return DialResult::Success(
+        std::make_unique<TcpStream>(std::move(socket)));
+}
+
+// ============================================================================
+// Idle Timeout
+// ============================================================================
+
+void TcpStream::SetIdleTimeout(std::chrono::seconds timeout) {
+    impl_->timeouts.SetIdleTimeout(timeout);
+}
+
+bool TcpStream::ConsumeIdleTimeout() noexcept {
+    return impl_->timeouts.ConsumeIdleTimeout();
+}
+
+void TcpStream::SetReadTimeout(std::chrono::seconds timeout) {
+    impl_->timeouts.SetReadTimeout(timeout);
+}
+
+void TcpStream::SetWriteTimeout(std::chrono::seconds timeout) {
+    impl_->timeouts.SetWriteTimeout(timeout);
+}
+
+bool TcpStream::ConsumeReadTimeout() noexcept {
+    return impl_->timeouts.ConsumeReadTimeout();
+}
+
+bool TcpStream::ConsumeWriteTimeout() noexcept {
+    return impl_->timeouts.ConsumeWriteTimeout();
+}
+
+PhaseDeadlineHandle TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) {
+    if (!impl_->socket.is_open()) return {};
+    return impl_->timeouts.StartPhaseDeadline(timeout);
+}
+
+void TcpStream::ClearPhaseDeadline() {
+    impl_->timeouts.ClearPhaseDeadline();
+}
+
+bool TcpStream::ConsumePhaseDeadline() noexcept {
+    return impl_->timeouts.ConsumePhaseDeadline();
+}
+
+size_t TcpStream::ConsumePendingData(net::mutable_buffer target) noexcept {
+    auto& pending = impl_->pending_data;
+    const auto consumed = pending.ConsumePrefixTo(
+        std::span<uint8_t>(
+            static_cast<uint8_t*>(target.data()),
+            target.size()));
+    return consumed;
+}
+
+void TcpStream::ReleasePendingData() noexcept {
+    impl_->pending_data.clear();
+}
+
+// Successful I/O refreshes the authoritative connection idle deadline.
+void TcpStream::TouchActivity() noexcept {
+    impl_->timeouts.TouchActivity();
+}
+
+void TcpStream::ReleaseActiveCounter() noexcept {
+    if (!impl_->HasFlag(kCountedActive)) return;
+    memory::OnTcpStreamFree();
+    impl_->SetFlag(kCountedActive, false);
+}
+
+// ============================================================================
+// Socket 设置函数
+// ============================================================================
+
+namespace {
+void SetupConnectedSocket(tcp::socket& sock) {
+    if (!sock.is_open()) {
+        return;
+    }
+
+    IoErrorCode ec;
+    auto fd = sock.native_handle();
+
+    // 启用 TCP KeepAlive
+    sock.set_option(net::socket_base::keep_alive(true), ec);
+
+    // 60 seconds idle, then six probes 10 seconds apart where supported.
+#if defined(__APPLE__) && defined(TCP_KEEPALIVE)
+    int keepidle = 60;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
+#elif defined(TCP_KEEPIDLE)
+    int keepidle = 60;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+#endif
+
+    // TCP_KEEPINTVL: 探测间隔 (10秒)
+#if defined(TCP_KEEPINTVL)
+    int keepintvl = 10;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+#endif
+
+    // TCP_KEEPCNT: 探测次数 (6次)
+#if defined(TCP_KEEPCNT)
+    int keepcnt = 6;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
+
+    // TCP_QUICKACK - 立即发送 ACK，降低延迟 (Linux 特有)
+#if defined(TCP_QUICKACK)
+    int quickack = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+#endif
+}
+}  // namespace
+
+}  // namespace acpp

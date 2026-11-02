@@ -1,0 +1,1013 @@
+if(NOT DEFINED SOURCE_DIR)
+    message(FATAL_ERROR "SOURCE_DIR is required")
+endif()
+
+foreach(interface_header IN ITEMS inbound.hpp outbound.hpp)
+    if(NOT EXISTS "${SOURCE_DIR}/include/acppnode/proxy/${interface_header}")
+        message(FATAL_ERROR
+            "missing public proxy interface: ${interface_header}")
+    endif()
+endforeach()
+
+set(PUBLIC_PROXY_ROOT "${SOURCE_DIR}/include/acppnode/proxy")
+file(GLOB_RECURSE PUBLIC_PROXY_HEADERS
+    LIST_DIRECTORIES false
+    "${PUBLIC_PROXY_ROOT}/*.hpp")
+foreach(header IN LISTS PUBLIC_PROXY_HEADERS)
+    get_filename_component(header_dir "${header}" DIRECTORY)
+    if(NOT header_dir STREQUAL PUBLIC_PROXY_ROOT)
+        message(FATAL_ERROR
+            "protocol-specific headers must remain private to src/proxy: ${header}")
+    endif()
+endforeach()
+
+set(INBOUND_MANAGER
+    "${SOURCE_DIR}/src/app/proxyman/inbound/manager.cpp")
+file(READ "${INBOUND_MANAGER}" INBOUND_MANAGER_SOURCE)
+if(INBOUND_MANAGER_SOURCE MATCHES "#include[ \t]+\"acppnode/proxy/")
+    message(FATAL_ERROR
+        "inbound Manager must not include concrete protocol implementation headers")
+endif()
+if(INBOUND_MANAGER_SOURCE MATCHES "constants::protocol::")
+    message(FATAL_ERROR
+        "inbound Manager must not branch on concrete protocol tags")
+endif()
+
+set(ANYTLS_INBOUND
+    "${SOURCE_DIR}/src/proxy/anytls/inbound/anytls_inbound.cpp")
+file(READ "${SOURCE_DIR}/src/proxy/anytls/anytls_codec.cpp" ANYTLS_CODEC_SOURCE)
+file(READ "${SOURCE_DIR}/src/proxy/anytls/anytls_codec.hpp" ANYTLS_CODEC_HEADER)
+if(ANYTLS_CODEC_SOURCE MATCHES "WriteFrameBody" OR ANYTLS_CODEC_HEADER MATCHES "WriteFrameBody")
+    message(FATAL_ERROR
+        "AnyTLS callers must pass byte views to WriteFrame without a Buffer-specific wrapper")
+endif()
+if(ANYTLS_CODEC_SOURCE MATCHES "catch[ \t]*[(][.][.][.][)]|MapWriteException")
+    message(FATAL_ERROR
+        "AnyTLS codec must preserve non-I/O exceptions for the owning request or physical task")
+endif()
+file(READ "${ANYTLS_INBOUND}" ANYTLS_INBOUND_SOURCE)
+if(ANYTLS_INBOUND_SOURCE MATCHES
+       "active_dispatches_|dispatch_completion_|WaitForDispatches|CompleteDispatch|FinishRun|enable_shared_from_this|shared_ptr<AnyTLSDemuxSession>")
+    message(FATAL_ERROR
+        "AnyTLS demux must not restore detached lifetime counters or cyclic session ownership")
+endif()
+if(ANYTLS_INBOUND_SOURCE MATCHES "stream_states_|GetOrCreateStream|StreamEntry|PendingTarget|PendingUotRequest|MultiBufferByteReader|ParseSocksAddress|SpawnDispatch|StartDispatch")
+    message(FATAL_ERROR
+        "AnyTLS stream identity and receive state must not use separate mutable indexes or reopen existing streams")
+endif()
+if(ANYTLS_INBOUND_SOURCE MATCHES "QueuedInput|queued_bytes_|ShrinkQueueIfDrained|shrink_queue_on_drain_|kSubStreamQueueShrinkItems")
+    message(FATAL_ERROR
+        "AnyTLS logical input must not restore per-frame queues, duplicate byte counts or shrink bookkeeping")
+endif()
+file(READ "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp" MUX_INBOUND_SOURCE)
+foreach(container_source IN ITEMS ANYTLS_INBOUND_SOURCE MUX_INBOUND_SOURCE)
+    if(${container_source} MATCHES "net::detached|net::co_spawn" OR
+       NOT ${container_source} MATCHES "co_await RunAwaitableTaskGroup" OR
+       NOT ${container_source} MATCHES "tasks[.]Spawn[(]" OR
+       NOT ${container_source} MATCHES "tasks[.]Cancel[(][)]")
+        message(FATAL_ERROR
+            "Mux/AnyTLS must cancel and join all dynamic children through the owned task group")
+    endif()
+endforeach()
+if(NOT ANYTLS_INBOUND_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate_" OR
+   ANYTLS_INBOUND_SOURCE MATCHES "write_busy_|write_signal_")
+    message(FATAL_ERROR
+        "AnyTLS inbound writes must use the shared cancellation-broadcast gate")
+endif()
+
+set(ANYTLS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/anytls/outbound/anytls_outbound.cpp")
+file(READ "${ANYTLS_OUTBOUND}" ANYTLS_OUTBOUND_SOURCE)
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES "co_await logical->PushPayload[(]" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES "payload_space_signal_[.]async_receive" OR
+   ANYTLS_OUTBOUND_SOURCE MATCHES "Close[(]ErrorCode::RESOURCE_EXHAUSTED[)]")
+    message(FATAL_ERROR
+        "AnyTLS outbound queue capacity must backpressure its owned physical reader, not reject a byte stream")
+endif()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES
+       "struct QueuedPayload|ThreadLocalDeque|queued_bytes_|ShrinkQueueIfDrained|shrink_queue_on_drain_|kLogicalQueueShrinkItems|uint32_t Sid[(][)]|uint32_t sid_ =")
+    message(FATAL_ERROR
+        "AnyTLS outbound must not restore per-frame queues, duplicate byte counts or unused stream identity")
+endif()
+foreach(queue_source IN ITEMS ANYTLS_INBOUND_SOURCE ANYTLS_OUTBOUND_SOURCE)
+    if(NOT ${queue_source} MATCHES "AppendQueuedPayload[(]")
+        message(FATAL_ERROR "AnyTLS physical readers must share their private payload aggregation")
+    endif()
+endforeach()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES "net::co_spawn|net::detached|read_loop_started")
+    message(FATAL_ERROR
+        "AnyTLS physical task lifetime must belong to the session pool, not individual requests")
+endif()
+file(READ "${SOURCE_DIR}/src/proxy/anytls/outbound/session_pool.hpp" ANYTLS_POOL_SOURCE)
+if(ANYTLS_POOL_SOURCE MATCHES "net::detached")
+    message(FATAL_ERROR "AnyTLS physical task completion and exceptions must be observed")
+endif()
+foreach(container_source IN ITEMS ANYTLS_INBOUND_SOURCE ANYTLS_OUTBOUND_SOURCE)
+    if(${container_source} MATCHES "peer_version|handshake_done_|ParseSettingsPaddingMd5|optional<[^>]*PeerSettings>" OR
+       NOT ${container_source} MATCHES "ParsePeerSettings" OR
+       NOT ${container_source} MATCHES "optional<[^>]*SessionVersion>" OR
+       NOT ${container_source} MATCHES "SessionVersion::V2")
+        message(FATAL_ERROR "AnyTLS sessions must use parsed peer settings and negotiated feature gates")
+    endif()
+endforeach()
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES "LogicalStreamLease")
+    message(FATAL_ERROR
+        "AnyTLS outbound logical streams must use exception-safe RAII ownership")
+endif()
+if(ANYTLS_OUTBOUND_SOURCE MATCHES "cleanup_logical_stream")
+    message(FATAL_ERROR
+        "AnyTLS outbound must not restore manual logical stream cleanup")
+endif()
+if(NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate" OR
+   NOT ANYTLS_OUTBOUND_SOURCE MATCHES
+       "CloseAll[(]ok[.]error[(][)][)]" OR
+   ANYTLS_OUTBOUND_SOURCE MATCHES
+       "write_busy|write_signal|atomic_bool|closed[.](load|store)")
+    message(FATAL_ERROR
+        "AnyTLS outbound writes must broadcast terminal failures through the shared gate")
+endif()
+
+set(TRANSPORT_STACK
+    "${SOURCE_DIR}/src/transport/internet/transport_stack.cpp")
+file(READ "${TRANSPORT_STACK}" TRANSPORT_STACK_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/transport_dialer.cpp"
+    TRANSPORT_DIALER_SOURCE)
+if(TRANSPORT_DIALER_SOURCE MATCHES "next_seq_[+][+]" OR
+   NOT TRANSPORT_DIALER_SOURCE MATCHES
+       "if [(][!]build_result[)] \\{[^}]*ThrowXHttpPacketError[^}]*\\}[\r\n\t ]*[+][+]next_seq_;")
+    message(FATAL_ERROR
+        "XHTTP packet-up sequence must commit only after the server accepts the request")
+endif()
+file(READ
+    "${SOURCE_DIR}/include/acppnode/transport/internet/ws_stream.hpp"
+    WS_STREAM_SOURCE)
+if(TRANSPORT_STACK_SOURCE MATCHES
+       "void Cancel\\(\\) noexcept override \\{[\r\n\t ]*closed_ = true;" OR
+   WS_STREAM_SOURCE MATCHES
+       "void Cancel\\(\\) noexcept override \\{[\r\n\t ]*closed_ = true;")
+    message(FATAL_ERROR
+        "transport wrapper Cancel must not suppress the following Close operation")
+endif()
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/xhttp_packet_queue.hpp"
+    XHTTP_PACKET_QUEUE_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/xhttp_upload_stream_slot.hpp"
+    XHTTP_UPLOAD_SLOT_SOURCE)
+file(READ
+    "${SOURCE_DIR}/src/transport/internet/http_path_match.hpp"
+    HTTP_PATH_MATCH_SOURCE)
+if(NOT HTTP_PATH_MATCH_SOURCE MATCHES
+       "actual[[]expected[.]size[(][)][]] == '/'" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "detail::PathPrefixMatchesSegment[(]expected, actual[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "detail::PathPrefixMatchesSegment[(][\r\n\t ]*EffectivePath[(]configured[)]")
+    message(FATAL_ERROR
+        "HTTP and XHTTP path prefixes must share segment-boundary matching")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "const bool valid_content_length" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "EqualsAsciiCI[(]TrimAscii[(]transfer_encoding[)], \"chunked\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(][!]valid_content_length && [!]valid_chunked[)]")
+    message(FATAL_ERROR
+        "H1 XHTTP packet-up must require one unambiguous valid body framing")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"incomplete HTTP/1 chunk-size line\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"invalid HTTP/1 chunk-size line\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"incomplete HTTP/1 chunk trailers\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"truncated HTTP/1 chunk payload\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "FailChunkedRead[(]\"invalid HTTP/1 chunk terminator\"[)]")
+    message(FATAL_ERROR
+        "malformed HTTP/1 chunks must fail the request instead of becoming normal EOF")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "CountHeadersCI[(]request, \"Transfer-Encoding\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "CountHeadersCI[(]request, \"Content-Length\"[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "transfer_encoding_count == 0 && content_length_count == 1" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "content_length_count == 0 && transfer_encoding_count == 1")
+    message(FATAL_ERROR
+        "H1 XHTTP packet framing must reject duplicate CL and TE headers")
+endif()
+if(NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
+       "kMaxQueuedBytes = 4 [*] 1024 [*] 1024" OR
+   NOT XHTTP_PACKET_QUEUE_SOURCE MATCHES
+       "kMaxQueuedPackets = 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketQueue packet_queue_" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "ThreadLocalMap<uint64_t, buf::MultiBuffer> pending_")
+    message(FATAL_ERROR
+        "XHTTP packet-up reordering must use the bounded Worker-local queue")
+endif()
+if(NOT XHTTP_UPLOAD_SLOT_SOURCE MATCHES
+       "std::shared_ptr<Stream> Snapshot[(][)]" OR
+   NOT XHTTP_UPLOAD_SLOT_SOURCE MATCHES
+       "if [(][!]stream [|][|] current_[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "stream_input_[.]Snapshot[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "std::unique_ptr<AsyncStream> stream_input_")
+    message(FATAL_ERROR
+        "XHTTP stream-up reads must retain one non-replaceable owner across await")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketSessionKeyRef lookup_key\{&io_context, session_id\}" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "XHttpPacketSessionKey stored_key" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "[.]owner = &io_context")
+    message(FATAL_ERROR
+        "XHTTP packet session registry keys must include the owning io_context")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kXHttpMaxPacketSessions = 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]session->AcceptingInput[(][)][)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]sessions[.]size[(][)] >= kXHttpMaxPacketSessions[)]")
+    message(FATAL_ERROR
+        "XHTTP packet session registry must reject retired sessions and enforce a hard cap")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "void CancelPendingOperations[(][)] noexcept" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "ThrowIfReadCancelled[(][)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "session_->CancelPendingOperations[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "void Cancel[(][)] noexcept override \\{[\r\n\t ]*if [(]session_[)] \\{[\r\n\t ]*session_->Close[(][)]")
+    message(FATAL_ERROR
+        "XHTTP packet stream cancellation must abort pending reads without closing the session")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "ReadClientResponseHeaders[(]H2Frame frame[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "field[.]name == \":status\"" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 peer closed before response headers" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 DATA arrived before response headers" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 stream reset by peer" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "HTTP/2 connection closed by peer")
+    message(FATAL_ERROR
+        "HTTP/2 client streams must validate a successful response before accepting data or EOF")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]frame[.]length > kHttp2MaxFramePayload[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "first_fragment->size[(][)] > kHttp2MaxHeaderBlockSize" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHttp2MaxHeaderBlockSize - header_block[.]size[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "frame[.]length > 16 [*] 1024 [*] 1024")
+    message(FATAL_ERROR
+        "HTTP/2 frame and accumulated header blocks must remain protocol bounded")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHttp2MaxConcurrentStreams = 256" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "[(]stream_id & 1u[)] == 0" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "stream_id <= last_remote_stream_id_" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "streams_[.]size[(][)] >= kHttp2MaxConcurrentStreams" OR
+   TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]it != streams_[.]end[(][)][)] \\{[\r\n\t ]*return it->second;")
+    message(FATAL_ERROR
+        "HTTP/2 server streams must be unique, ordered, client-owned, and capacity bounded")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxDynamicTableSize = 4096" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(]size > kHpackMaxDynamicTableSize[)]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "if [(][!]size [|][|] [!]ResizeDynamic[(][*]size[)][)]")
+    message(FATAL_ERROR
+        "HPACK peer table size updates must not exceed the local decoder limit")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxHeaderFields = 256" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "kHpackMaxHeaderListSize = 64 [*] 1024" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "fields[.]size[(][)] >= kHpackMaxHeaderFields" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "field_size > kHpackMaxHeaderListSize - header_list_size")
+    message(FATAL_ERROR
+        "HPACK decoded header lists must bound both field count and expanded size")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES "StreamRemovalGuard")
+    message(FATAL_ERROR
+        "detached HTTP/2 server stream close must own exception-safe removal")
+endif()
+if(NOT TRANSPORT_STACK_SOURCE MATCHES
+       "transport::internet::AsyncWriteGate write_gate_" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "write_gate_[.]Cancel[(][)]" OR
+   TRANSPORT_STACK_SOURCE MATCHES "write_busy_" OR
+   TRANSPORT_STACK_SOURCE MATCHES "write_signal_")
+    message(FATAL_ERROR
+        "gRPC server writes must use the shared cancellation-broadcast gate")
+endif()
+string(FIND "${TRANSPORT_STACK_SOURCE}"
+    "~StreamRemovalGuard() noexcept" STREAM_REMOVAL_GUARD_DESTRUCTOR)
+if(STREAM_REMOVAL_GUARD_DESTRUCTOR EQUAL -1)
+    message(FATAL_ERROR
+        "HTTP/2 server stream removal must run while unwinding failed writes")
+endif()
+
+set(MUX_RELAY "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp")
+file(READ "${MUX_RELAY}" MUX_RELAY_SOURCE)
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "ThreadLocalUnorderedMap<uint16_t, MuxSubInfo> sub_sessions")
+    message(FATAL_ERROR
+        "Mux TCP and UDP substreams must share one session-id namespace")
+endif()
+if(MUX_RELAY_SOURCE MATCHES "udp_subs|tcp_subs")
+    message(FATAL_ERROR
+        "Mux must not restore per-network session-id namespaces")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES "bool dispatch_done = false")
+    message(FATAL_ERROR
+        "Mux substream completion must notify cleanup independently from wire END")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "if [(]reply[.]dispatch_done[)][\r\n \t{]*sub_sessions[.]erase")
+    message(FATAL_ERROR
+        "Mux dispatch completion must remove the unified session entry")
+endif()
+if(MUX_RELAY_SOURCE MATCHES "packet_len > buf::Buffer::kSize")
+    message(FATAL_ERROR
+        "XUDP wire packet length must not be limited by one internal Buffer")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+        "const auto datagram = buf::InspectUdpDatagram[(]mb[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+        "mb[.]MoveTo[(]reply[.]payload, true[)]")
+    message(FATAL_ERROR
+        "Mux UDP replies must preserve one datagram across Buffer chunks")
+endif()
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+if(VLESS_OUTBOUND_SOURCE MATCHES "SameTargetAddress")
+    message(FATAL_ERROR
+        "VLESS must use the shared TargetAddress endpoint identity")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES "EncodeNewHeaderTo")
+    message(FATAL_ERROR
+        "VLESS Mux must encode one complete MultiBuffer datagram length")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES
+        "target, payload_size[)]")
+    message(FATAL_ERROR
+        "VLESS Mux header must use the complete datagram payload size")
+endif()
+set(UOT_SOURCE "${SOURCE_DIR}/src/proxy/uot/uot.cpp")
+file(READ "${UOT_SOURCE}" UOT_SOURCE_TEXT)
+if(UOT_SOURCE_TEXT MATCHES "payload_size > buf::Buffer::kSize")
+    message(FATAL_ERROR
+        "UoT datagram length must not be limited by one Buffer")
+endif()
+if(NOT UOT_SOURCE_TEXT MATCHES
+        "buf::InspectUdpDatagram[(]mb[)]" OR
+   NOT UOT_SOURCE_TEXT MATCHES
+        "WritePacket[(][*]target, payload[.]Span[(][)][)]")
+    message(FATAL_ERROR
+        "UoT must encode one complete MultiBuffer datagram per frame")
+endif()
+set(TROJAN_UDP_FRAMING
+    "${SOURCE_DIR}/src/proxy/trojan/udp_framing.cpp")
+set(TROJAN_INBOUND
+    "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp")
+set(TROJAN_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/trojan/outbound/trojan_outbound.cpp")
+file(READ "${TROJAN_UDP_FRAMING}" TROJAN_UDP_FRAMING_SOURCE)
+file(READ "${TROJAN_INBOUND}" TROJAN_INBOUND_SOURCE)
+file(READ "${TROJAN_OUTBOUND}" TROJAN_OUTBOUND_SOURCE)
+foreach(TROJAN_ENDPOINT_SOURCE IN ITEMS
+        TROJAN_INBOUND_SOURCE TROJAN_OUTBOUND_SOURCE)
+    if(${TROJAN_ENDPOINT_SOURCE} MATCHES "class TrojanUdpFramer")
+        message(FATAL_ERROR
+            "Trojan endpoints must not duplicate UDP stream framing")
+    endif()
+    if(NOT ${TROJAN_ENDPOINT_SOURCE} MATCHES
+            "trojan::WriteUdpDatagram")
+        message(FATAL_ERROR
+            "Trojan endpoints must use the shared datagram writer")
+    endif()
+    if(NOT ${TROJAN_ENDPOINT_SOURCE} MATCHES
+            "co_return std::move[(]packet[.]payload[)]")
+        message(FATAL_ERROR
+            "Trojan UDP readers must return exactly one logical datagram")
+    endif()
+endforeach()
+if(NOT TROJAN_UDP_FRAMING_SOURCE MATCHES
+        "buf::InspectUdpDatagram[(]payload[)]" OR
+   NOT TROJAN_UDP_FRAMING_SOURCE MATCHES
+        "buf::AppendSpanToMultiBuffer")
+    message(FATAL_ERROR
+        "Trojan UDP framing must preserve complete MultiBuffer datagrams")
+endif()
+set(VLESS_UDP_FRAMING
+    "${SOURCE_DIR}/src/proxy/vless/udp_framing.cpp")
+set(VLESS_INBOUND
+    "${SOURCE_DIR}/src/proxy/vless/inbound/vless_inbound.cpp")
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_UDP_FRAMING}" VLESS_UDP_FRAMING_SOURCE)
+file(READ "${VLESS_INBOUND}" VLESS_INBOUND_SOURCE)
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+foreach(VLESS_ENDPOINT_SOURCE IN ITEMS
+        VLESS_INBOUND_SOURCE VLESS_OUTBOUND_SOURCE)
+    if(${VLESS_ENDPOINT_SOURCE} MATCHES "class VlessUdpFramer")
+        message(FATAL_ERROR
+            "VLESS endpoints must not duplicate UDP stream framing")
+    endif()
+    if(NOT ${VLESS_ENDPOINT_SOURCE} MATCHES
+            "vless::WriteUdpDatagram")
+        message(FATAL_ERROR
+            "VLESS endpoints must use the shared datagram writer")
+    endif()
+    if(NOT ${VLESS_ENDPOINT_SOURCE} MATCHES
+            "co_return std::move[(]packet[.]payload[)]")
+        message(FATAL_ERROR
+            "VLESS UDP readers must return exactly one logical datagram")
+    endif()
+endforeach()
+if(NOT VLESS_UDP_FRAMING_SOURCE MATCHES
+        "buf::InspectUdpDatagram[(]payload[)]" OR
+   NOT VLESS_UDP_FRAMING_SOURCE MATCHES
+        "buf::AppendSpanToMultiBuffer")
+    message(FATAL_ERROR
+        "VLESS UDP framing must preserve complete MultiBuffer datagrams")
+endif()
+set(VMESS_SERVER_ENCODING
+    "${SOURCE_DIR}/src/proxy/vmess/encoding/server.cpp")
+set(VMESS_CLIENT_ENCODING
+    "${SOURCE_DIR}/src/proxy/vmess/encoding/client.cpp")
+set(VMESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vmess/outbound/vmess_outbound.cpp")
+file(READ "${VMESS_SERVER_ENCODING}" VMESS_SERVER_ENCODING_SOURCE)
+file(READ "${SOURCE_DIR}/src/proxy/vmess/encoding/server.hpp" VMESS_SERVER_ENCODING_HEADER)
+if(VMESS_SERVER_ENCODING_HEADER MATCHES "EncodeResponseHeader[(]|EncodeResponseBody[(]" OR
+   VMESS_SERVER_ENCODING_SOURCE MATCHES "ServerSession::EncodeResponseHeader|ServerSession::EncodeResponseBody[(]|ResponseBodyWriter[(]const VMessRequest& request, AsyncStream& stream[)]")
+    message(FATAL_ERROR
+        "VMess server responses must use the single header-carrying writer factory, not standalone header/body wrappers")
+endif()
+file(READ "${VMESS_CLIENT_ENCODING}" VMESS_CLIENT_ENCODING_SOURCE)
+file(READ "${VMESS_OUTBOUND}" VMESS_OUTBOUND_SOURCE)
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode[)][ \t\r\n]*[{][ \t\r\n]*co_return co_await DecodeRequestBody")
+    message(FATAL_ERROR
+        "VMess UDP body reader must return exactly one authenticated chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode = request[.]command == Command::UDP")
+    message(FATAL_ERROR
+        "VMess request body state must derive packet mode from the command")
+endif()
+string(REGEX MATCHALL
+    "state[.]packet_mode = request[.]command == Command::UDP"
+    VMESS_PACKET_MODE_INITIALIZERS "${VMESS_SERVER_ENCODING_SOURCE}")
+list(LENGTH VMESS_PACKET_MODE_INITIALIZERS
+    VMESS_PACKET_MODE_INITIALIZER_COUNT)
+if(NOT VMESS_PACKET_MODE_INITIALIZER_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "VMess request reader and response writer must both derive packet mode")
+endif()
+if(NOT VMESS_OUTBOUND_SOURCE MATCHES
+        "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
+    message(FATAL_ERROR
+        "VMess outbound must validate each complete UDP datagram atomically")
+endif()
+if(NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "request_body_state_[.]packet_mode = command_ == Command::UDP" OR
+   NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "ContiguousBufferView packet[(]mb[)]" OR
+   NOT VMESS_CLIENT_ENCODING_SOURCE MATCHES
+        "EncodeRequestBodyChunk")
+    message(FATAL_ERROR
+        "VMess client UDP writer must encode one complete datagram per chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "state[.]packet_mode = request[.]command == Command::UDP" OR
+   NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "ContiguousBufferView packet[(]mb[)]" OR
+   NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "EncodeResponseBodyChunk[(]state, packet[.]Bytes[(][)], out_mb[)]")
+    message(FATAL_ERROR
+        "VMess server UDP writer must encode one complete datagram per chunk")
+endif()
+if(NOT VMESS_SERVER_ENCODING_SOURCE MATCHES
+        "ValidateFixedUdpDatagram[(]mb, udp_target_[)]")
+    message(FATAL_ERROR
+        "VMess server response writer must validate each UDP datagram atomically")
+endif()
+set(SHADOWSOCKS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/ss_outbound.cpp")
+file(READ "${SHADOWSOCKS_OUTBOUND}" SHADOWSOCKS_OUTBOUND_SOURCE)
+set(SHADOWSOCKS_UDP_HEADER
+    "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.hpp")
+set(SHADOWSOCKS_UDP_SOURCE
+    "${SOURCE_DIR}/src/proxy/shadowsocks/ss_udp.cpp")
+set(SHADOWSOCKS_INBOUND_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/shadowsocks/inbound/ss_inbound.cpp")
+file(READ "${SHADOWSOCKS_UDP_HEADER}" SHADOWSOCKS_UDP_HEADER_SOURCE)
+file(READ "${SHADOWSOCKS_UDP_SOURCE}" SHADOWSOCKS_UDP_SOURCE)
+file(READ "${SHADOWSOCKS_INBOUND_SOURCE_PATH}" SHADOWSOCKS_INBOUND_SOURCE)
+if(NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
+        "class Ss2022UdpReplayWindow" OR
+   NOT SHADOWSOCKS_UDP_HEADER_SOURCE MATCHES
+        "Ss2022UdpReplayCache&" OR
+   NOT SHADOWSOCKS_UDP_SOURCE MATCHES
+        "replay_cache[.]Accept[(]client_session_id, packet_id[)]" OR
+   NOT SHADOWSOCKS_UDP_SOURCE MATCHES
+        "receive_replay_cache[.]Accept[(]server_session_id, packet_id[)]")
+    message(FATAL_ERROR
+        "Shadowsocks 2022 UDP request and response paths must reject replayed packet IDs")
+endif()
+if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "session_owner[.]Assign[(]user[.]derived_key[.]span[(][)][)]")
+    message(FATAL_ERROR
+        "Shadowsocks UDP sessions must bind protocol session IDs to authenticated credentials")
+endif()
+if(NOT SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "udp_replay_cache_ = std::move[(]previous_handler->udp_replay_cache_[)]")
+    message(FATAL_ERROR
+        "Shadowsocks handler replacement must preserve Worker-local UDP replay state")
+endif()
+if(SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "Handler::EncodeUdpResponse" OR
+   SHADOWSOCKS_INBOUND_SOURCE MATCHES
+        "dynamic_cast<ShadowsocksUdpResponseContext")
+    message(FATAL_ERROR
+        "Shadowsocks UDP response encoding must belong to its captured session context")
+endif()
+foreach(REMOVED_UDP_MANAGER_FILE IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/udp_channel.hpp"
+        "${SOURCE_DIR}/include/acppnode/app/udp_session.hpp"
+        "${SOURCE_DIR}/src/app/udp_channel.cpp"
+        "${SOURCE_DIR}/src/app/udp_session.cpp"
+        "${SOURCE_DIR}/src/app/udp_callback_router.cpp"
+        "${SOURCE_DIR}/src/app/udp_callback_router.hpp"
+        "${SOURCE_DIR}/tests/udp_callback_router_test.cpp"
+        "${SOURCE_DIR}/tests/udp_channel_test.cpp")
+    if(EXISTS "${REMOVED_UDP_MANAGER_FILE}")
+        message(FATAL_ERROR
+            "removed shared UDP manager architecture must not return: ${REMOVED_UDP_MANAGER_FILE}")
+    endif()
+endforeach()
+set(UDP_TYPES_HEADER "${SOURCE_DIR}/include/acppnode/app/udp_types.hpp")
+file(READ "${UDP_TYPES_HEADER}" UDP_TYPES_HEADER_SOURCE)
+if(NOT UDP_TYPES_HEADER_SOURCE MATCHES
+        "return invoke_bool_[(]storage_, std::forward<Args>[(]args[)][.][.][.][)]")
+    message(FATAL_ERROR
+        "UDP callback rejection must propagate through inline type erasure")
+endif()
+
+set(DATAGRAM_SOCKET_HEADER
+    "${SOURCE_DIR}/include/acppnode/transport/internet/datagram_socket.hpp")
+set(DATAGRAM_SOCKET_SOURCE
+    "${SOURCE_DIR}/src/transport/internet/datagram_socket.cpp")
+set(CONNECTION_TIMEOUTS_HEADER
+    "${SOURCE_DIR}/src/transport/internet/connection_timeouts.hpp")
+file(READ "${DATAGRAM_SOCKET_HEADER}" DATAGRAM_SOCKET_HEADER_SOURCE)
+file(READ "${DATAGRAM_SOCKET_SOURCE}" DATAGRAM_SOCKET_SOURCE_TEXT)
+file(READ "${CONNECTION_TIMEOUTS_HEADER}" CONNECTION_TIMEOUTS_SOURCE)
+foreach(LOWER_SOURCE IN ITEMS
+        DATAGRAM_SOCKET_HEADER_SOURCE DATAGRAM_SOCKET_SOURCE_TEXT CONNECTION_TIMEOUTS_SOURCE)
+    if(${LOWER_SOURCE} MATCHES
+           "acppnode/app/|app::dns|PanelConfig|panel/|proxy/|json::|nlohmann::|UDPSession|UDPSessionManager|shared_ptr|steady_timer|ReplyQueue|reply_queue|read_loop|ReadLoop|RunReceive|StartReceive")
+        message(FATAL_ERROR
+            "datagram transport and timeout lower layer must not own app, protocol, session, timer, read-loop or reply-queue architecture")
+    endif()
+endforeach()
+string(REGEX MATCHALL "TimeoutToken [A-Za-z_][A-Za-z0-9_]*"
+    CONNECTION_TIMEOUT_TOKENS "${CONNECTION_TIMEOUTS_SOURCE}")
+list(LENGTH CONNECTION_TIMEOUT_TOKENS CONNECTION_TIMEOUT_TOKEN_COUNT)
+if(NOT CONNECTION_TIMEOUT_TOKEN_COUNT EQUAL 1 OR
+   CONNECTION_TIMEOUTS_SOURCE MATCHES "steady_timer")
+    message(FATAL_ERROR
+        "connection timeouts must use one scheduler token, not a per-connection timer")
+endif()
+
+set(FREEDOM_UDP_REQUEST_HEADER
+    "${SOURCE_DIR}/src/proxy/freedom/outbound/udp_request.hpp")
+set(SHADOWSOCKS_UDP_REQUEST_HEADER
+    "${SOURCE_DIR}/src/proxy/shadowsocks/outbound/udp_request.hpp")
+set(UDP_TARGET_HELPER "${SOURCE_DIR}/src/proxy/udp_target.hpp")
+file(READ "${FREEDOM_UDP_REQUEST_HEADER}" FREEDOM_UDP_REQUEST_SOURCE)
+file(READ "${SHADOWSOCKS_UDP_REQUEST_HEADER}" SHADOWSOCKS_UDP_REQUEST_SOURCE)
+file(READ "${UDP_TARGET_HELPER}" UDP_TARGET_HELPER_SOURCE)
+foreach(UDP_REQUEST_SOURCE IN ITEMS
+        FREEDOM_UDP_REQUEST_SOURCE SHADOWSOCKS_UDP_REQUEST_SOURCE)
+    if(NOT ${UDP_REQUEST_SOURCE} MATCHES
+           "transport::internet::DatagramSocket socket_" OR
+       ${UDP_REQUEST_SOURCE} MATCHES
+           ":[^{]*public[^{]*(MultiBufferReader|MultiBufferWriter)|virtual[ \t]+(net::awaitable|void|bool)")
+        message(FATAL_ERROR
+            "Freedom and Shadowsocks UDP requests must directly own DatagramSocket, without another polymorphic MultiBuffer endpoint")
+    endif()
+    if(NOT ${UDP_REQUEST_SOURCE} MATCHES
+           "buf::InspectUdpDatagram[(]payload[)]")
+        message(FATAL_ERROR
+            "logical UDP writes must continue validating exactly one datagram")
+    endif()
+endforeach()
+if(NOT UDP_TARGET_HELPER_SOURCE MATCHES "ResolveUdpEndpoint" OR
+   NOT UDP_TARGET_HELPER_SOURCE MATCHES "dns[.]Resolve[(]target[.]host[)]" OR
+   NOT UDP_TARGET_HELPER_SOURCE MATCHES "socket[.]IsIPv6[(][)]")
+    message(FATAL_ERROR
+        "outbound-only UDP target resolution must remain in the narrow proxy helper")
+endif()
+if(NOT FREEDOM_UDP_REQUEST_SOURCE MATCHES
+       "ResolveUdpEndpoint[(]dns_, [*]datagram[.]target" OR
+   NOT SHADOWSOCKS_UDP_REQUEST_SOURCE MATCHES
+       "ResolveUdpEndpoint[(]dns_, server_" OR
+   NOT SHADOWSOCKS_UDP_REQUEST_SOURCE MATCHES
+       "EncodePacketTo[(][*]datagram[.]target")
+    message(FATAL_ERROR
+        "UDP target lookup belongs to outbound request preparation; Shadowsocks inner targets remain encoded in each packet")
+endif()
+string(REGEX MATCHALL "StartRead[(][)]"
+    SHADOWSOCKS_READ_SCOPES "${SHADOWSOCKS_UDP_REQUEST_SOURCE}")
+list(LENGTH SHADOWSOCKS_READ_SCOPES SHADOWSOCKS_READ_SCOPE_COUNT)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto read = socket_.StartRead();" SS_READ_START_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "while (true)" SS_READ_LOOP_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto packet = co_await read.Receive();" SS_RECEIVE_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "if (!server_endpoint_ || packet.source != *server_endpoint_) continue;" SS_SOURCE_FILTER_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "auto decoded =" SS_DECODE_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "if (!decoded || !buf::HasData(decoded->payload)) continue;" SS_INVALID_PACKET_OFFSET)
+string(FIND "${SHADOWSOCKS_UDP_REQUEST_SOURCE}"
+    "socket_.TouchActivity();" SS_TOUCH_ACTIVITY_OFFSET)
+if(NOT SHADOWSOCKS_READ_SCOPE_COUNT EQUAL 1 OR
+   SS_READ_START_OFFSET LESS 0 OR
+   SS_READ_LOOP_OFFSET LESS SS_READ_START_OFFSET OR
+   SS_RECEIVE_OFFSET LESS SS_READ_LOOP_OFFSET OR
+   SS_SOURCE_FILTER_OFFSET LESS SS_RECEIVE_OFFSET OR
+   SS_DECODE_OFFSET LESS SS_SOURCE_FILTER_OFFSET OR
+   SS_INVALID_PACKET_OFFSET LESS SS_DECODE_OFFSET OR
+   SS_TOUCH_ACTIVITY_OFFSET LESS SS_INVALID_PACKET_OFFSET)
+    message(FATAL_ERROR
+        "Shadowsocks must use one logical read scope and touch activity only after authenticated response decoding")
+endif()
+
+set(UDP_WORKER_SOURCE_PATH
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.cpp")
+set(UDP_WORKER_HEADER_PATH
+    "${SOURCE_DIR}/src/app/worker/udp_ingress.hpp")
+set(INBOUND_HANDLER_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/proxy/inbound.hpp")
+set(INBOUND_DATAGRAM_HEADER_PATH
+    "${SOURCE_DIR}/include/acppnode/proxy/inbound_datagram.hpp")
+file(READ "${UDP_WORKER_SOURCE_PATH}" UDP_WORKER_SOURCE)
+file(READ "${UDP_WORKER_HEADER_PATH}" UDP_WORKER_HEADER_SOURCE)
+file(READ "${INBOUND_HANDLER_HEADER_PATH}" INBOUND_HANDLER_HEADER_SOURCE)
+file(READ "${INBOUND_DATAGRAM_HEADER_PATH}" INBOUND_DATAGRAM_HEADER_SOURCE)
+set(LINK_HEADER_PATH "${SOURCE_DIR}/include/acppnode/transport/link.hpp")
+file(READ "${LINK_HEADER_PATH}" LINK_HEADER_SOURCE)
+set(MUX_RELAY_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.cpp")
+file(READ "${MUX_RELAY_SOURCE_PATH}" MUX_RELAY_SOURCE)
+set(TROJAN_INBOUND_SOURCE_PATH
+    "${SOURCE_DIR}/src/proxy/trojan/inbound/trojan_inbound.cpp")
+file(READ "${TROJAN_INBOUND_SOURCE_PATH}" TROJAN_INBOUND_SOURCE)
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "datagram[.]buffer_count == 1" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+    "coalesced[.]reserve[(]datagram[.]payload_size[)]")
+    message(FATAL_ERROR
+        "UDP ClientSession must preserve one datagram across Buffer chunks")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "kMaxQueuedUdpDatagrams = 256" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "kMaxQueuedUdpBytes = 512 [*] 1024" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "WouldOverflowUdpQueue[(]" OR
+   NOT UDP_WORKER_HEADER_SOURCE MATCHES
+        "bool[\r\n ]+Push[(]")
+    message(FATAL_ERROR
+        "UDP input and reply queues must expose bounded backpressure")
+endif()
+if(NOT LINK_HEADER_SOURCE MATCHES
+        "co_await WriteMultiBuffer[(]std::move[(]payload[)][)]" OR
+   UDP_WORKER_SOURCE MATCHES
+        "ClientSession::WriteBuffers" OR
+   MUX_RELAY_SOURCE MATCHES
+        "WriteBuffers[(]std::span<const net::const_buffer>[)][\r\n ]*override[\r\n ]*[{][\r\n ]*co_return" OR
+   TROJAN_INBOUND_SOURCE MATCHES
+        "WriteBuffers[(]std::span<const net::const_buffer>[)][\r\n ]*override[\r\n ]*[{][\r\n ]*co_return")
+    message(FATAL_ERROR
+        "packet writers must not silently discard raw scatter writes")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "session[.]link->UpdateReplyEndpoint[(]std::move[(]reply_endpoint[)][)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "packet_session->Owns[(]decoded->session_owner[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "packet_session->UpdateReplyEndpoint[(]datagram[.]client_endpoint[)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "packet_session->Push[(]decoded->target, std::move[(]decoded->payload[)][)]" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "const udp::endpoint& reply_endpoint")
+    message(FATAL_ERROR
+        "UDP ClientSession must route replies to the latest authenticated client endpoint")
+endif()
+if(NOT UDP_WORKER_SOURCE MATCHES
+        "[!]session_it->second[.]link->Owns[(]session_owner[)]")
+    message(FATAL_ERROR
+        "UDP session key collisions must not cross authenticated owners")
+endif()
+if(NOT INBOUND_DATAGRAM_HEADER_SOURCE MATCHES "ScopeSessionKey" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "decoded->session_owner[.]ScopeSessionKey[(]protocol_session_key[)]")
+    message(FATAL_ERROR
+        "UDP protocol session IDs must be scoped by authenticated owner identity")
+endif()
+if(INBOUND_DATAGRAM_HEADER_SOURCE MATCHES "EncodeUdpResponse" OR
+   UDP_WORKER_SOURCE MATCHES "impl_->proxy->EncodeUdpResponse" OR
+   NOT UDP_WORKER_SOURCE MATCHES "response_context->Encode[(]pkt[)]")
+    message(FATAL_ERROR
+        "live UDP sessions must encode replies through their captured response context")
+endif()
+if(NOT INBOUND_HANDLER_HEADER_SOURCE MATCHES "AdoptWorkerStateFrom" OR
+   NOT UDP_WORKER_SOURCE MATCHES
+        "proxy->AdoptWorkerStateFrom[(][*]impl_->proxy[)]" OR
+   UDP_WORKER_SOURCE MATCHES
+        "ReplaceHandler[(][^)]*[)][^{]*[{][^}]*CleanupAllClientSessions")
+    message(FATAL_ERROR
+        "UDP handler replacement must preserve live sessions and protocol Worker state")
+endif()
+set(WORKER_SOURCE_PATH "${SOURCE_DIR}/src/app/worker.cpp")
+file(READ "${WORKER_SOURCE_PATH}" WORKER_SOURCE)
+if(WORKER_SOURCE MATCHES
+        "async_receive_from[\r\n ()a-zA-Z0-9_,.>*&]*kRecvBufSize")
+    message(FATAL_ERROR
+        "native UDP inbound receive must not be limited to one Buffer")
+endif()
+file(READ "${SOURCE_DIR}/src/app/worker/udp_receive_loop.hpp" UDP_RECEIVE_SOURCE)
+if(NOT WORKER_SOURCE MATCHES "return worker_detail::RunUdpReceiveLoop" OR
+   NOT UDP_RECEIVE_SOURCE MATCHES "detail::UdpReceiveBuffer receive_buffer")
+    message(FATAL_ERROR
+        "native UDP inbound must share the full-datagram receive path")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES "class SubLoopLease final")
+    message(FATAL_ERROR
+        "Mux detached sub-dispatch lifetime must be owned by its coroutine frame")
+endif()
+string(REGEX MATCHALL "SubLoopLease[{]reply_queue[}]"
+    MUX_SUB_LOOP_LEASES "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_SUB_LOOP_LEASES MUX_SUB_LOOP_LEASE_COUNT)
+if(NOT MUX_SUB_LOOP_LEASE_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "every TCP and UDP Mux sub-dispatch must receive an owned loop lease")
+endif()
+string(REGEX MATCHALL "void MarkDispatchDone[(][)] noexcept"
+    MUX_NOEXCEPT_DISPATCH_COMPLETIONS "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_NOEXCEPT_DISPATCH_COMPLETIONS
+    MUX_NOEXCEPT_DISPATCH_COMPLETION_COUNT)
+if(NOT MUX_NOEXCEPT_DISPATCH_COMPLETION_COUNT EQUAL 2)
+    message(FATAL_ERROR
+        "TCP and UDP Mux dispatch completion must not strand loop ownership")
+endif()
+string(REGEX MATCHALL "QueueBytesWouldExceed"
+    MUX_BOUNDED_QUEUE_CHECKS "${MUX_RELAY_SOURCE}")
+list(LENGTH MUX_BOUNDED_QUEUE_CHECKS MUX_BOUNDED_QUEUE_CHECK_COUNT)
+if(MUX_BOUNDED_QUEUE_CHECK_COUNT LESS 7)
+    message(FATAL_ERROR
+        "every Mux input and reply queue must use overflow-safe byte limits")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES "catch [(]const std::bad_alloc&[)]")
+    message(FATAL_ERROR
+        "Mux inbound must enter owned async cleanup after allocation failure")
+endif()
+
+set(MUX_INBOUND_HEADER
+    "${SOURCE_DIR}/src/proxy/mux/inbound/mux_inbound.hpp")
+file(READ "${MUX_INBOUND_HEADER}" MUX_INBOUND_HEADER_SOURCE)
+if(MUX_INBOUND_HEADER_SOURCE MATCHES "AsyncStream[*]")
+    message(FATAL_ERROR
+        "Mux inbound control stream must be a required non-null reference")
+endif()
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "client_control[.]ClearPhaseDeadline[(][)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "client_control[.]SetIdleTimeout[(]relay_idle_timeout[)]" OR
+   NOT MUX_RELAY_SOURCE MATCHES
+       "std::chrono::seconds[(]pressure_idle_timeout[)]")
+    message(FATAL_ERROR
+        "Mux inbound must replace the handshake deadline with the pressure-aware relay timeout")
+endif()
+foreach(LEGACY_MUX_SURFACE IN ITEMS
+        "${SOURCE_DIR}/include/acppnode/app/mux_session_handler.hpp"
+        "${SOURCE_DIR}/include/acppnode/common/mux/mux_relay.hpp"
+        "${SOURCE_DIR}/src/app/mux_session_handler.cpp"
+        "${SOURCE_DIR}/src/common/mux/mux_relay.cpp")
+    if(EXISTS "${LEGACY_MUX_SURFACE}")
+        message(FATAL_ERROR
+            "Mux must not restore the public app wrapper or common relay path: ${LEGACY_MUX_SURFACE}")
+    endif()
+endforeach()
+
+set(DEFAULT_DISPATCHER
+    "${SOURCE_DIR}/src/app/dispatcher/default_dispatcher.cpp")
+file(READ "${DEFAULT_DISPATCHER}" DEFAULT_DISPATCHER_SOURCE)
+if(DEFAULT_DISPATCHER_SOURCE MATCHES
+       "MuxSessionHandler|Network::MUX|ProcessInbound|DoMuxRelay")
+    message(FATAL_ERROR
+        "Dispatcher must not own or enter the Mux inbound container path")
+endif()
+string(REGEX MATCHALL "ActiveSessionScope relay_scope"
+    DISPATCHER_ACTIVE_SESSION_SCOPES "${DEFAULT_DISPATCHER_SOURCE}")
+list(LENGTH DISPATCHER_ACTIVE_SESSION_SCOPES
+    DISPATCHER_ACTIVE_SESSION_SCOPE_COUNT)
+if(NOT DISPATCHER_ACTIVE_SESSION_SCOPE_COUNT EQUAL 1)
+    message(FATAL_ERROR
+        "only logical routed requests may enter traffic tracking; Mux control frames must not be counted beside child sessions")
+endif()
+string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
+    "auto outbound_process = co_await outbound_handler->Process("
+    DISPATCHER_OUTBOUND_PROCESS_OFFSET)
+string(FIND "${DEFAULT_DISPATCHER_SOURCE}"
+    "ActiveSessionScope relay_scope"
+    DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET)
+if(DISPATCHER_OUTBOUND_PROCESS_OFFSET LESS 0 OR
+   DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS 0 OR
+   NOT DISPATCHER_ACTIVE_SESSION_SCOPE_OFFSET LESS
+       DISPATCHER_OUTBOUND_PROCESS_OFFSET)
+    message(FATAL_ERROR
+        "traffic tracking must wrap the logical outbound Process call")
+endif()
+
+foreach(MUX_OUTER_INBOUND IN ITEMS
+        "${SOURCE_DIR}/src/proxy/vmess/inbound/vmess_inbound.cpp"
+        "${SOURCE_DIR}/src/proxy/vless/inbound/vless_inbound.cpp")
+    file(READ "${MUX_OUTER_INBOUND}" MUX_OUTER_INBOUND_SOURCE)
+    if(NOT MUX_OUTER_INBOUND_SOURCE MATCHES "mux::ProcessInbound[(]")
+        message(FATAL_ERROR
+            "VMess and VLESS Mux commands must enter the private Mux inbound path: ${MUX_OUTER_INBOUND}")
+    endif()
+endforeach()
+if(NOT MUX_RELAY_SOURCE MATCHES
+       "co_await dispatcher[.]Dispatch[(]")
+    message(FATAL_ERROR
+        "every decoded Mux child must re-enter the dispatcher request chain")
+endif()
+
+set(VLESS_OUTBOUND
+    "${SOURCE_DIR}/src/proxy/vless/outbound/vless_outbound.cpp")
+file(READ "${VLESS_OUTBOUND}" VLESS_OUTBOUND_SOURCE)
+if(VLESS_OUTBOUND_SOURCE MATCHES
+        "[+]\+pending_offset_[;]")
+    message(FATAL_ERROR
+        "VLESS outbound must not scan through invalid Mux frame bytes")
+endif()
+if(NOT VLESS_OUTBOUND_SOURCE MATCHES
+        "frame[.]header[.]session_id != session_id_")
+    message(FATAL_ERROR
+        "VLESS Mux UDP responses must remain bound to their logical session")
+endif()
+if(VLESS_OUTBOUND_SOURCE MATCHES
+        "VLESS mux request encode failed[^\n]*\n[^\n]*continue")
+    message(FATAL_ERROR
+        "VLESS Mux request encoding failures must propagate to relay")
+endif()
+
+set(MUX_CODEC "${SOURCE_DIR}/src/common/mux/mux_codec.cpp")
+file(READ "${MUX_CODEC}" MUX_CODEC_SOURCE)
+string(REGEX MATCHALL "DecodeFrameMetadata"
+    MUX_METADATA_PARSER_REFERENCES "${MUX_CODEC_SOURCE}")
+list(LENGTH MUX_METADATA_PARSER_REFERENCES
+    MUX_METADATA_PARSER_REFERENCE_COUNT)
+if(NOT MUX_METADATA_PARSER_REFERENCE_COUNT EQUAL 4)
+    message(FATAL_ERROR
+        "all three Mux byte layouts must share one metadata parser")
+endif()
+if(MUX_CODEC_SOURCE MATCHES "Remaining[(][)] >= 8")
+    message(FATAL_ERROR
+        "Mux GlobalID must be exactly eight metadata bytes")
+endif()
+
+set(INBOUND_FACTORY_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/factory.hpp")
+set(INBOUND_PREPARED_CONFIG_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/prepared_config.hpp")
+file(READ "${INBOUND_FACTORY_HEADER}" INBOUND_FACTORY_HEADER_SOURCE)
+file(READ "${INBOUND_PREPARED_CONFIG_HEADER}"
+    INBOUND_PREPARED_CONFIG_HEADER_SOURCE)
+if(EXISTS
+   "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/udp_handler.hpp" OR
+   INBOUND_FACTORY_HEADER_SOURCE MATCHES
+       "UdpHandler|ProtocolDeps|ValidatorAs|void[*][ \t]+Validator" OR
+   NOT INBOUND_FACTORY_HEADER_SOURCE MATCHES
+       "create_datagram_handler" OR
+   NOT INBOUND_HANDLER_HEADER_SOURCE MATCHES
+       "Process[(]const InboundDatagramRequest&")
+    message(FATAL_ERROR
+        "native UDP must use the common Inbound handler/runtime boundary")
+endif()
+if(INBOUND_PREPARED_CONFIG_HEADER_SOURCE MATCHES
+       "cipher_method|ss_identity_password|anytls_padding_scheme|vless_decryption" OR
+   NOT INBOUND_PREPARED_CONFIG_HEADER_SOURCE MATCHES
+       "shared_ptr<const ProtocolSettings> settings")
+    message(FATAL_ERROR
+        "generic prepared inbound config must not expose protocol-specific fields")
+endif()
+
+set(PREPARED_INBOUND_HANDLER
+    "${SOURCE_DIR}/src/app/proxyman/inbound/handler.cpp")
+set(PREPARED_INBOUND_HANDLER_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/proxyman/inbound/handler.hpp")
+file(READ "${PREPARED_INBOUND_HANDLER}" PREPARED_INBOUND_HANDLER_SOURCE)
+file(READ "${PREPARED_INBOUND_HANDLER_HEADER}"
+    PREPARED_INBOUND_HANDLER_HEADER_SOURCE)
+if(WORKER_SOURCE MATCHES
+       "ReadProxyProtocolHeader|ProxyProtocolReadStatus|ApplyProxyProtocolResult" OR
+   NOT PREPARED_INBOUND_HANDLER_SOURCE MATCHES
+       "ReadInboundProxyProtocol[(]" OR
+   NOT TRANSPORT_STACK_SOURCE MATCHES
+       "tcp->ReadProxyProtocolHeader[(]timeout[)]")
+    message(FATAL_ERROR
+        "Worker must not parse PROXY protocol; accepted-prefix handling belongs to transport")
+endif()
+string(REGEX MATCHALL "ReceiverSettings[(][)]"
+    RECEIVER_SETTINGS_ACCESSORS "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}")
+list(LENGTH RECEIVER_SETTINGS_ACCESSORS RECEIVER_SETTINGS_ACCESSOR_COUNT)
+string(FIND "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}"
+    "private:"
+    PREPARED_HANDLER_PRIVATE_OFFSET)
+string(FIND "${PREPARED_INBOUND_HANDLER_HEADER_SOURCE}"
+    "ProcessPreparedTransportStream"
+    PREPARED_STREAM_PROCESS_OFFSET)
+if(NOT RECEIVER_SETTINGS_ACCESSOR_COUNT EQUAL 1 OR
+   PREPARED_HANDLER_PRIVATE_OFFSET LESS 0 OR
+   PREPARED_STREAM_PROCESS_OFFSET LESS 0 OR
+   NOT PREPARED_HANDLER_PRIVATE_OFFSET LESS
+       PREPARED_STREAM_PROCESS_OFFSET)
+    message(FATAL_ERROR
+        "prepared inbound handlers must expose only immutable settings and the physical ingress")
+endif()
+
+foreach(PROTOCOL_VALIDATOR IN ITEMS
+        "${SOURCE_DIR}/src/proxy/vmess/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/vless/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/trojan/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/shadowsocks/validator.hpp"
+        "${SOURCE_DIR}/src/proxy/anytls/validator.hpp")
+    file(READ "${PROTOCOL_VALIDATOR}" PROTOCOL_VALIDATOR_SOURCE)
+    if(PROTOCOL_VALIDATOR_SOURCE MATCHES
+           "ApplyUsers[(]|AddUsers[(]|RemoveUsers[(]|ClearUsers[(]")
+        message(FATAL_ERROR
+            "protocol validators must remain read-only UserStore consumers: ${PROTOCOL_VALIDATOR}")
+    endif()
+endforeach()
+
+foreach(LEGACY_PROTOCOL_USER_MODEL IN ITEMS
+        "${SOURCE_DIR}/src/proxy/shadowsocks/user_info.hpp"
+        "${SOURCE_DIR}/src/proxy/trojan/user_info.hpp"
+        "${SOURCE_DIR}/src/proxy/anytls/user_info.hpp")
+    if(EXISTS "${LEGACY_PROTOCOL_USER_MODEL}")
+        message(FATAL_ERROR
+            "protocol-local public user models must not bypass RuntimeUser -> UserSet -> UserStore: ${LEGACY_PROTOCOL_USER_MODEL}")
+    endif()
+endforeach()
+
+set(WORKER_RUNTIME_CONFIG_HEADER
+    "${SOURCE_DIR}/include/acppnode/app/worker_runtime_config.hpp")
+set(DEFAULT_ROUTER_SOURCE
+    "${SOURCE_DIR}/src/app/router/router.cpp")
+file(READ "${WORKER_RUNTIME_CONFIG_HEADER}" WORKER_RUNTIME_CONFIG_SOURCE)
+file(READ "${DEFAULT_ROUTER_SOURCE}" DEFAULT_ROUTER_SOURCE_TEXT)
+if(WORKER_SOURCE MATCHES
+       "RoutePolicyKind|constants::protocol|proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)" OR
+   WORKER_RUNTIME_CONFIG_SOURCE MATCHES
+       "constants::outbound::kDirect|proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)" OR
+   DEFAULT_ROUTER_SOURCE_TEXT MATCHES
+       "proxy/(vmess|vless|trojan|shadowsocks|anytls|freedom|blackhole)")
+    message(FATAL_ERROR
+        "Worker/runtime/router must not understand concrete proxy protocols or fixed outbound policy")
+endif()

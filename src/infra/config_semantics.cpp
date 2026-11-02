@@ -1,0 +1,186 @@
+#include "config_semantics.hpp"
+
+#include "acppnode/core/naming.hpp"
+
+#include <format>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace acpp {
+
+ConfigSemanticValidation ValidateOutboundSelectionSemantics(
+    std::span<const infra::OutboundSourceConfig> outbounds,
+    std::span<const RouteRuleConfig> rules,
+    std::span<const StaticInboundConfig> inbounds) {
+    if (outbounds.empty()) {
+        return {.error = ConfigSemanticError::NoOutbounds, .index = 0, .tag = {}};
+    }
+
+    std::unordered_set<std::string_view> tags;
+    tags.reserve(outbounds.size());
+    for (size_t i = 0; i < outbounds.size(); ++i) {
+        const std::string_view tag = outbounds[i].tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyOutboundTag,
+                .index = i,
+                .tag = {},
+            };
+        }
+        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+            return {.error = ConfigSemanticError::ReservedOutboundTag, .index = i, .tag = tag};
+        }
+        if (!tags.insert(tag).second) {
+            return {
+                .error = ConfigSemanticError::DuplicateOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const std::string_view tag = rules[i].outbound_tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyRouteOutboundTag,
+                .index = i,
+                .tag = {},
+            };
+        }
+        if (!tags.contains(tag)) {
+            return {
+                .error = ConfigSemanticError::UnknownRouteOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < inbounds.size(); ++i) {
+        if (!inbounds[i].outbound_tag) continue;
+        const std::string_view tag = *inbounds[i].outbound_tag;
+        if (tag.empty()) {
+            return {
+                .error = ConfigSemanticError::EmptyStaticInboundOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+        if (!tags.contains(tag)) {
+            return {
+                .error = ConfigSemanticError::UnknownStaticInboundOutboundTag,
+                .index = i,
+                .tag = tag,
+            };
+        }
+    }
+
+    return {};
+}
+
+std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
+    std::span<const infra::OutboundSourceConfig> outbounds,
+    std::vector<RouteRuleConfig>& rules) {
+    std::unordered_set<std::string_view> tags;
+    tags.reserve(outbounds.size());
+    for (const auto& outbound : outbounds) {
+        tags.insert(outbound.tag);
+    }
+
+    std::vector<IgnoredRouteRule> ignored;
+    ignored.reserve(rules.size());
+    size_t index = 0;
+    std::erase_if(rules, [&](const RouteRuleConfig& rule) {
+        const bool unknown = !rule.outbound_tag.empty() &&
+                             !tags.contains(rule.outbound_tag);
+        if (unknown) {
+            ignored.push_back(IgnoredRouteRule{
+                .index = index,
+                .tag = rule.outbound_tag,
+            });
+        }
+        ++index;
+        return unknown;
+    });
+    return ignored;
+}
+
+std::string StaticInboundSemanticValidation::Message() const {
+    switch (error) {
+        case StaticInboundSemanticError::None: return {};
+        case StaticInboundSemanticError::InvalidPort:
+            return std::format("at index {} has an invalid port", index);
+        case StaticInboundSemanticError::EmptyTag:
+            return std::format("at index {} has an empty tag", index);
+        case StaticInboundSemanticError::ReservedTag:
+            return std::format("at index {} uses reserved panel tag '{}'", index, detail);
+        case StaticInboundSemanticError::DuplicateTag:
+            return std::format("at index {} duplicates tag '{}' from index {}", index, detail, conflicting_index);
+        case StaticInboundSemanticError::DuplicateEndpoint:
+            return std::format("at index {} duplicates listen endpoint '{}' from index {}", index, detail, conflicting_index);
+    }
+    throw std::logic_error("unknown static inbound validation result");
+}
+
+StaticInboundSemanticValidation ValidateStaticInboundSemantics(
+    std::span<const StaticInboundConfig> inbounds) {
+    std::unordered_map<std::string, size_t> tags;
+    tags.reserve(inbounds.size());
+
+    for (size_t i = 0; i < inbounds.size(); ++i) {
+        const auto& inbound = inbounds[i];
+        if (inbound.port == 0) {
+            return {
+                .error = StaticInboundSemanticError::InvalidPort,
+                .index = i,
+                .conflicting_index = 0,
+                .detail = {},
+            };
+        }
+
+        std::string tag = inbound.tags.empty()
+            ? naming::BuildProtocolPortTag(inbound.protocol, inbound.port)
+            : inbound.tags.front();
+        if (tag.empty()) {
+            return {
+                .error = StaticInboundSemanticError::EmptyTag,
+                .index = i,
+                .conflicting_index = 0,
+                .detail = {},
+            };
+        }
+        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+            return {.error = StaticInboundSemanticError::ReservedTag,
+                    .index = i, .conflicting_index = 0, .detail = std::move(tag)};
+        }
+        if (const auto [it, inserted] = tags.emplace(tag, i); !inserted) {
+            return {
+                .error = StaticInboundSemanticError::DuplicateTag,
+                .index = i,
+                .conflicting_index = it->second,
+                .detail = std::move(tag),
+            };
+        }
+
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (inbounds[previous].port == inbound.port &&
+                inbounds[previous].listen.Overlaps(inbound.listen)) {
+                return {
+                    .error = StaticInboundSemanticError::DuplicateEndpoint,
+                    .index = i,
+                    .conflicting_index = previous,
+                    .detail = std::to_string(inbound.port),
+                };
+            }
+        }
+    }
+
+    return {};
+}
+
+}  // namespace acpp

@@ -1,0 +1,70 @@
+#pragma once
+
+#include "acppnode/transport/async_stream.hpp"
+#include "acppnode/transport/internet/proxy_protocol.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
+#include <expected>
+#include <memory>
+#include <span>
+#include <string_view>
+
+namespace acpp {
+namespace app::dns {
+class DNS;
+}  // namespace app::dns
+
+
+using TransportBuildResult = std::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
+
+class InboundTransportStreamHandler {
+public:
+    virtual ~InboundTransportStreamHandler() noexcept = default;
+    virtual void OnInboundTransportStream(std::unique_ptr<AsyncStream> stream) = 0;
+};
+
+struct InboundTransportMetadata {
+    memory::ThreadLocalString real_ip;
+    memory::ThreadLocalString real_ip_header;
+};
+
+// Consume an optional PROXY protocol prefix from a raw accepted transport.
+// Parsing, timeout handling and preservation of non-PROXY bytes stay entirely
+// inside the transport layer.
+net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
+    AsyncStream& raw,
+    std::chrono::seconds timeout);
+
+// 根据 StreamSettings 将原始 TCP 流包装成最终传输流。
+net::awaitable<TransportBuildResult> BuildInboundTransport(
+    net::io_context& io_context,
+    std::unique_ptr<AsyncStream> raw,
+    const StreamSettings& s,
+    uint64_t trace_conn_id = 0,
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler = nullptr,
+    InboundTransportMetadata* metadata = nullptr,
+    app::dns::DNS* dns_service = nullptr);
+
+net::awaitable<TransportBuildResult> BuildOutboundTransport(
+    std::unique_ptr<AsyncStream> raw,
+    const StreamSettings& s,
+    std::string_view tls_server_name = {},
+    std::string_view ws_host = {},
+    uint64_t trace_conn_id = 0);
+
+enum class XHttpClientRequestKind {
+    Downlink,
+    StreamUp,
+    PacketUp,
+};
+
+net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
+    std::unique_ptr<AsyncStream> raw,
+    const StreamSettings& s,
+    std::string_view tls_server_name,
+    std::string_view host,
+    std::string_view path,
+    XHttpClientRequestKind kind,
+    std::span<const net::const_buffer> packet_payload = {},
+    uint64_t trace_conn_id = 0);
+
+}  // namespace acpp

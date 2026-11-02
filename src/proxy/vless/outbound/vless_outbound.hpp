@@ -1,0 +1,76 @@
+#pragma once
+
+#include "acppnode/proxy/outbound.hpp"
+#include "acppnode/transport/internet/stream_settings.hpp"
+#include "acppnode/transport/internet/outbound_bind.hpp"
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace acpp {
+
+namespace app::dns {
+class DNS;
+}  // namespace app::dns
+
+namespace vless {
+struct VlessEncryptionConfig;
+struct VlessEncryptionClientTicketCache;
+}  // namespace vless
+
+struct VlessOutboundConfig {
+    std::string address;
+    std::optional<net::ip::address> literal_address;
+    uint16_t port = 443;
+    std::array<uint8_t, 16> uuid_bytes{};
+    std::shared_ptr<const vless::VlessEncryptionConfig> encryption;
+    std::string flow;
+    bool packet_xudp = true;
+    bool packet_addr = false;
+
+    StreamSettings stream_settings;
+    OutboundBind send_through;
+    std::chrono::seconds timeout{10};
+};
+
+namespace proxy::vless::outbound {
+
+class Handler final : public ::acpp::Outbound {
+public:
+    Handler(std::string tag,
+            const ::acpp::VlessOutboundConfig& config,
+            ::acpp::app::dns::DNS& dns_service);
+
+    ~Handler() override;
+
+    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
+        ::acpp::net::io_context& io_context,
+        const ::acpp::tcp::endpoint* inbound_local_addr,
+        ::acpp::session::Context& ctx,
+        const ::acpp::TimeoutsConfig& timeouts,
+        ::acpp::transport::Link inbound,
+        ::acpp::StatsShard& stats,
+        const ::acpp::RelayConfig& relay_config,
+        ::acpp::buf::MultiBufferBatch first_payload,
+        std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout) override;
+
+    std::string_view Tag() const noexcept override { return tag_; }
+
+private:
+    std::string tag_;
+    const ::acpp::VlessOutboundConfig config_;
+    ::acpp::app::dns::DNS& dns_service_;
+    std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
+        encryption_tickets_;
+};
+
+}  // namespace proxy::vless::outbound
+
+}  // namespace acpp

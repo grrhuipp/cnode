@@ -1,0 +1,120 @@
+[
+  {
+    "tag": "static-vmess",
+    "protocol": "vmess",
+    "listen": "0.0.0.0",
+    "port": 10086,
+    "settings": {
+      "clients": [
+        {
+          "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "email": "vmess-static@example.com"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "none"
+    },
+    "sniffing": {
+      "enabled": true,
+      "destOverride": ["http", "tls"]
+    }
+  },
+  {
+    "tag": "static-vless-reality",
+    "protocol": "vless",
+    "listen": "0.0.0.0",
+    "port": 10444,
+    "settings": {
+      "decryption": "none",
+      "clients": [
+        {
+          "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+          "flow": "xtls-rprx-vision",
+          "email": "vless-static@example.com"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "serverNames": ["www.example.com"],
+        "privateKey": "your-reality-private-key",
+        "shortIds": ["0123456789abcdef"]
+      }
+    },
+    "sniffing": {
+      "enabled": true,
+      "destOverride": ["http", "tls"]
+    }
+  },
+  {
+    "tag": "static-trojan",
+    "protocol": "trojan",
+    "listen": "0.0.0.0",
+    "port": 10443,
+    "settings": {
+      "clients": [
+        {
+          "password": "your-trojan-password",
+          "email": "trojan-static@example.com"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "example.com",
+        "certFile": "/etc/cnode/certs/fullchain.pem",
+        "keyFile": "/etc/cnode/certs/privkey.pem"
+      }
+    },
+    "outboundTag": "ipv6-first"
+  },
+  {
+    "tag": "static-ss",
+    "protocol": "shadowsocks",
+    "listen": "0.0.0.0",
+    "port": 1080,
+    "settings": {
+      "method": "aes-256-gcm",
+      "password": "your-shadowsocks-password",
+      "email": "ss-static@example.com"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "none"
+    }
+  },
+  {
+    "tag": "static-anytls",
+    "protocol": "anytls",
+    "listen": "0.0.0.0",
+    "port": 9443,
+    "settings": {
+      "clients": [
+        {
+          "password": "your-anytls-password",
+          "email": "anytls-static@example.com"
+        }
+      ],
+      "paddingScheme": [
+        "stop=8",
+        "0=30-30",
+        "1=100-400"
+      ]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "example.com",
+        "certFile": "/etc/cnode/certs/fullchain.pem",
+        "keyFile": "/etc/cnode/certs/privkey.pem"
+      }
+    }
+  }
+]
