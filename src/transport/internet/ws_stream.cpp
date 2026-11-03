@@ -631,8 +631,8 @@ const TcpStream* BaseWsStream::BaseTcpStream() const {
 }
 
 net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
-    const std::string& host,
-    const std::string& path,
+    std::string_view host,
+    std::string_view path,
     const transport::internet::HttpHeaders* headers) {
     // RFC 6455 §4.1: 密钥必须是随机生成的 16 字节 base64 编码
     uint8_t raw_key[16];

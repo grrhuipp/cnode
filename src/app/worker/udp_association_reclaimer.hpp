@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <functional>
 #include <string_view>
 
 namespace acpp::worker_detail {
@@ -28,8 +27,20 @@ struct UdpAssociationHook final {
 // Worker-local bounded scan over association rows embedded in UdpIngress maps.
 class UdpAssociationReclaimer final : public memory::ThreadAllocated, private TimeoutEvent {
 public:
+    using FailureCallback = void (*)(void*, std::exception_ptr);
+    using StatelessFailureCallback = void (*)(std::exception_ptr);
+
     UdpAssociationReclaimer(TimeoutScheduler& scheduler,
-        std::function<void(std::exception_ptr)> on_failure) noexcept;
+                            void* failure_context,
+                            FailureCallback on_failure) noexcept;
+    UdpAssociationReclaimer(TimeoutScheduler& scheduler,
+                            StatelessFailureCallback on_failure) noexcept
+        : UdpAssociationReclaimer(
+              scheduler,
+              reinterpret_cast<void*>(on_failure),
+              +[](void* fn, std::exception_ptr error) {
+                  reinterpret_cast<StatelessFailureCallback>(fn)(std::move(error));
+              }) {}
     ~UdpAssociationReclaimer() noexcept;
     UdpAssociationReclaimer(const UdpAssociationReclaimer&) = delete;
     UdpAssociationReclaimer& operator=(const UdpAssociationReclaimer&) = delete;
@@ -54,7 +65,8 @@ private:
     void RunBatch() noexcept;
 
     TimeoutScheduler& scheduler_;
-    std::function<void(std::exception_ptr)> on_failure_;
+    void* failure_context_ = nullptr;
+    FailureCallback on_failure_ = nullptr;
     UdpAssociationHook* head_ = nullptr;
     UdpAssociationHook* cursor_ = nullptr;
     bool stopped_ = false;

@@ -520,7 +520,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
                 last_error = e.what();
                 LOG_DEBUG("V2Board[{}]: HTTPS endpoint {} failed: {}",
                           config_.Name,
-                          iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
+                          iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
             }
@@ -555,7 +555,7 @@ APIClient::Impl::HttpExchange(HttpMethod method, const std::string& path,
                 last_error = e.what();
                 LOG_DEBUG("V2Board[{}]: HTTP endpoint {} failed: {}",
                           config_.Name,
-                          iputil::FormatEndpointForLog(endpoint.address().to_string(), endpoint.port()),
+                          iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
                           last_error);
                 continue;
             }

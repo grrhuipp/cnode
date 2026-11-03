@@ -59,7 +59,8 @@ public:
 
 private:
     void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_next_pmr_allocation && size == fail_allocation_bytes) {
+        if (fail_next_allocation || (fail_next_pmr_allocation && size == fail_allocation_bytes)) {
+            fail_next_allocation = false;
             fail_next_pmr_allocation = false;
             fail_allocation_bytes = 0;
             ++allocation_failures;

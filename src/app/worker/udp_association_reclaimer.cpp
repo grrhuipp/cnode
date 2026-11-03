@@ -14,8 +14,12 @@ constexpr size_t kMaxChecks = 64;
 }
 
 UdpAssociationReclaimer::UdpAssociationReclaimer(
-    TimeoutScheduler& scheduler, std::function<void(std::exception_ptr)> on_failure) noexcept
-    : scheduler_(scheduler), on_failure_(std::move(on_failure)) {}
+    TimeoutScheduler& scheduler,
+    void* failure_context,
+    FailureCallback on_failure) noexcept
+    : scheduler_(scheduler)
+    , failure_context_(failure_context)
+    , on_failure_(on_failure) {}
 
 UdpAssociationReclaimer::~UdpAssociationReclaimer() noexcept { Stop(); }
 
@@ -76,7 +80,7 @@ void UdpAssociationReclaimer::Schedule() noexcept {
             FailRuntime("udp-maintenance", "association schedule refused after release");
     } catch (...) {
         failed_ = true;
-        on_failure_(std::current_exception());
+        on_failure_(failure_context_, std::current_exception());
     }
 }
 

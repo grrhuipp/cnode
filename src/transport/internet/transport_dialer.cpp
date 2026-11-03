@@ -82,34 +82,35 @@ enum class XHttpOutboundMode {
     return std::nullopt;
 }
 
-[[nodiscard]] std::string AppendU64Hex(std::string out, uint64_t value) {
+void AppendU64Hex(memory::ThreadLocalString& out, uint64_t value) {
     std::array<char, 16> buf{};
     auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value, 16);
     if (ec == std::errc{}) {
         out.append(buf.data(), static_cast<size_t>(ptr - buf.data()));
     }
-    return out;
 }
 
-[[nodiscard]] std::string MakeXHttpSessionId(uint64_t conn_id) {
+[[nodiscard]] memory::ThreadLocalString MakeXHttpSessionId(uint64_t conn_id) {
     thread_local uint64_t sequence = 0;
     const auto now = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
 
-    std::string id;
+    memory::ThreadLocalString id;
     id.reserve(48);
-    id = AppendU64Hex(std::move(id), now);
+    AppendU64Hex(id, now);
     id.push_back('-');
-    id = AppendU64Hex(std::move(id), conn_id);
+    AppendU64Hex(id, conn_id);
     id.push_back('-');
-    id = AppendU64Hex(std::move(id), ++sequence);
+    AppendU64Hex(id, ++sequence);
     return id;
 }
 
-[[nodiscard]] std::string BuildXHttpSplitPath(const XHttpConfig& cfg,
-                                              std::string_view session_id,
-                                              std::optional<uint64_t> seq) {
-    std::string path = cfg.NormalizedPath();
+[[nodiscard]] memory::ThreadLocalString BuildXHttpSplitPath(
+    const XHttpConfig& cfg,
+    std::string_view session_id,
+    std::optional<uint64_t> seq) {
+    const std::string normalized = cfg.NormalizedPath();
+    memory::ThreadLocalString path(normalized.data(), normalized.size());
     path.append(session_id);
     if (seq) {
         path.push_back('/');
@@ -139,7 +140,7 @@ public:
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
                            const OutboundDialCandidate& candidate,
-                           std::string upload_path,
+                           memory::ThreadLocalString upload_path,
                            uint64_t conn_id)
         : io_context_(&io_context)
         , downlink_(std::move(downlink))
@@ -365,7 +366,7 @@ private:
     OutboundTransportTarget target_;
     StreamSettings stream_settings_;
     OutboundDialCandidate candidate_;
-    std::string upload_path_;
+    memory::ThreadLocalString upload_path_;
     buf::MultiBuffer pending_initial_;
     uint64_t conn_id_ = 0;
     bool closed_ = false;
@@ -377,7 +378,7 @@ public:
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
                               const OutboundDialCandidate& candidate,
-                              std::string session_id,
+                              memory::ThreadLocalString session_id,
                               uint64_t conn_id)
         : io_context_(io_context)
         , downlink_(std::move(downlink))
@@ -520,7 +521,7 @@ private:
         if (!target_.stream_settings) {
             ThrowXHttpPacketError("xhttp packet-up missing stream settings");
         }
-        std::string path = BuildXHttpSplitPath(
+        memory::ThreadLocalString path = BuildXHttpSplitPath(
             target_.stream_settings->xhttp,
             session_id_,
             next_seq_);
@@ -552,7 +553,7 @@ private:
     OutboundTransportTarget target_;
     StreamSettings stream_settings_;
     OutboundDialCandidate candidate_;
-    std::string session_id_;
+    memory::ThreadLocalString session_id_;
     uint64_t conn_id_ = 0;
     uint64_t next_seq_ = 0;
     bool write_closed_ = false;
@@ -691,7 +692,7 @@ net::awaitable<DialResult> DialAndBuildCandidatesSequential(
 
         LOG_CONN_DEBUG(ctx,
                        "DIAL_CANDIDATE_FAILED endpoint={}:{} error={}",
-                       candidate.endpoint.address().to_string(),
+                       iputil::AddressText(candidate.endpoint.address()).View(),
                        candidate.endpoint.port(),
                        attempt.error_msg);
         last_result = std::move(attempt);
@@ -723,12 +724,12 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             "invalid xhttp downlink target");
     }
 
-    const std::string session_id = MakeXHttpSessionId(ctx.conn_id);
-    const std::string downlink_path = BuildXHttpSplitPath(
+    const memory::ThreadLocalString session_id = MakeXHttpSessionId(ctx.conn_id);
+    const memory::ThreadLocalString downlink_path = BuildXHttpSplitPath(
         downlink_target.stream_settings->xhttp,
         session_id,
         std::nullopt);
-    const std::string upload_path = BuildXHttpSplitPath(
+    const memory::ThreadLocalString upload_path = BuildXHttpSplitPath(
         target.stream_settings->xhttp,
         session_id,
         std::nullopt);
@@ -755,7 +756,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 
         LOG_CONN_DEBUG(ctx,
                        "XHTTP_DOWNLINK_CANDIDATE_FAILED endpoint={}:{} error={}",
-                       candidate.endpoint.address().to_string(),
+                       iputil::AddressText(candidate.endpoint.address()).View(),
                        candidate.endpoint.port(),
                        attempt.error_msg);
         last_result = std::move(attempt);

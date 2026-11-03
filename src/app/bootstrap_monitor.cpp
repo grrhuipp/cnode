@@ -25,9 +25,6 @@
 #include <fstream>
 #include <vector>
 
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 
 namespace acpp {
 
@@ -224,9 +221,6 @@ net::awaitable<void> RuntimeSamplingLoop(
 net::awaitable<void> RuntimeStatsOutputLoop(
     const MonitorContext& ctx) {
     net::steady_timer timer(ctx.main_ctx);
-#ifdef __GLIBC__
-    auto last_glibc_sample = std::chrono::steady_clock::time_point{};
-#endif
     while (true) {
         auto worker_snapshots = co_await CollectWorkerRuntimeStats(ctx, true);
         auto snapshot = ctx.stats.WithCurrentRate(AggregateWorkerStats(worker_snapshots));
@@ -297,33 +291,6 @@ net::awaitable<void> RuntimeStatsOutputLoop(
                 worker.memory.pool_mapped_bytes, worker.memory.pool_direct_bytes,
                 worker.memory.pool_idle_bytes, worker.memory.pool_chunks);
         }
-
-#ifdef __GLIBC__
-        const auto heap_now = std::chrono::steady_clock::now();
-        if (last_glibc_sample.time_since_epoch().count() == 0 ||
-            heap_now - last_glibc_sample >= std::chrono::minutes(5)) {
-            const auto heap = ::mallinfo2();
-            LOG_INFO("runtime.glibc arena={}MB used={}MB free={}MB mmap={}MB mmap_chunks={} top_free={}MB",
-                     heap.arena / (1024 * 1024),
-                     heap.uordblks / (1024 * 1024),
-                     heap.fordblks / (1024 * 1024),
-                     heap.hblkhd / (1024 * 1024),
-                     heap.hblks,
-                     heap.keepcost / (1024 * 1024));
-            last_glibc_sample = heap_now;
-        }
-#endif
-
-#ifdef CNODE_MEMORY_STATS
-        const auto runtime_mem = memory::SnapshotRuntimeMemoryStats();
-        LOG_DEBUG("runtime.memory async_stream={}/{} tcp_stream={}/{} tls_stream={}/{}",
-                  runtime_mem.async_streams_live,
-                  runtime_mem.async_streams_peak,
-                  runtime_mem.tcp_streams_live,
-                  runtime_mem.tcp_streams_peak,
-                  runtime_mem.tls_streams_live,
-                  runtime_mem.tls_streams_peak);
-#endif
 
         auto node_stats = ctx.controller.GetNodeStats();
         if (!node_stats.empty()) {

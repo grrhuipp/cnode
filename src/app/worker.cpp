@@ -460,7 +460,10 @@ void Worker::RuntimeState::Start(Worker& worker) {
     memory_reclaimer.Start(scheduler);
     udp_association_reclaimer =
         std::make_unique<worker_detail::UdpAssociationReclaimer>(
-            scheduler, [&worker](std::exception_ptr error) { worker.ReportFailure(error); });
+            scheduler, &worker,
+            +[](void* ctx, std::exception_ptr error) {
+                static_cast<Worker*>(ctx)->ReportFailure(std::move(error));
+            });
     session_tracking = std::make_unique<app::SessionTrackingState>();
     inbound_manager = std::make_unique<proxyman::inbound::Manager>(stats);
     outbound_manager = std::make_unique<proxyman::outbound::Manager>();

@@ -101,7 +101,6 @@ enum Flag : uint8_t {
     kAbortiveClose          = 1u << 0,
     kReadShutdown           = 1u << 1,
     kWriteShutdown          = 1u << 2,
-    kCountedActive          = 1u << 3,
     kDeferWriteCancellation = 1u << 4,
 };
 
@@ -141,29 +140,9 @@ struct TcpStream::Impl : memory::ThreadAllocated {
 // TcpStream 实现
 // ============================================================================
 
-void* TcpStream::operator new(std::size_t size) {
-    if (void* p = memory::AllocatePmr(size, alignof(TcpStream))) {
-        memory::OnAsyncStreamNew();
-        return p;
-    }
-    throw std::bad_alloc();
-}
-
-void TcpStream::operator delete(void* p) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(p, sizeof(TcpStream), alignof(TcpStream));
-}
-
-void TcpStream::operator delete(void* p, std::size_t size) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(p, size, alignof(TcpStream));
-}
-
 TcpStream::TcpStream(tcp::socket socket)
     : impl_(std::make_unique<Impl>(std::move(socket), *this)) {
     if (impl_->socket.is_open()) {
-        impl_->SetFlag(kCountedActive);
-        memory::OnTcpStreamNew();
         SetupConnectedSocket(impl_->socket);
     }
 }
@@ -389,7 +368,6 @@ void TcpStream::Close() {
         impl_->socket.shutdown(tcp::socket::shutdown_both, ec);
         impl_->socket.close(ec);
     }
-    ReleaseActiveCounter();
     impl_->SetFlag(kReadShutdown);
     impl_->SetFlag(kWriteShutdown);
 }
@@ -820,11 +798,6 @@ void TcpStream::TouchActivity() noexcept {
     impl_->timeouts.TouchActivity();
 }
 
-void TcpStream::ReleaseActiveCounter() noexcept {
-    if (!impl_->HasFlag(kCountedActive)) return;
-    memory::OnTcpStreamFree();
-    impl_->SetFlag(kCountedActive, false);
-}
 
 // ============================================================================
 // Socket 设置函数

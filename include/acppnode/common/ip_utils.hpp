@@ -108,15 +108,45 @@ inline std::string FormatHostForEndpoint(std::string_view host) {
     return std::string(host);
 }
 
+template<class Allocator>
+inline void FormatHttpHostHeaderInto(
+    std::basic_string<char, std::char_traits<char>, Allocator>& out,
+    std::string_view host,
+    uint16_t port,
+    bool use_ssl) {
+    const bool bracket_ipv6 = NeedsIpv6Brackets(host);
+    const uint16_t default_port = use_ssl ? 443 : 80;
+    const bool include_port = port != 0 && port != default_port;
+    char port_buf[5];
+    char* port_end = port_buf;
+    if (include_port) {
+        auto [ptr, ec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
+        (void)ec;
+        port_end = ptr;
+    }
+
+    out.clear();
+    out.reserve(host.size() + (bracket_ipv6 ? 2 : 0) +
+                (include_port ? 1 + static_cast<size_t>(port_end - port_buf) : 0));
+    if (bracket_ipv6) {
+        out.push_back('[');
+    }
+    out.append(host);
+    if (bracket_ipv6) {
+        out.push_back(']');
+    }
+    if (include_port) {
+        out.push_back(':');
+        out.append(port_buf, port_end);
+    }
+}
+
 inline std::string FormatHttpHostHeader(
     std::string_view host,
     uint16_t port,
     bool use_ssl) {
-    std::string header = FormatHostForEndpoint(host);
-    const uint16_t default_port = use_ssl ? 443 : 80;
-    if (port != 0 && port != default_port) {
-        header += ":" + std::to_string(port);
-    }
+    std::string header;
+    FormatHttpHostHeaderInto(header, host, port, use_ssl);
     return header;
 }
 

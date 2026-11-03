@@ -6055,18 +6055,17 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             co_return tl::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
 
-        std::string sni = tls_server_name.empty()
-            ? s.tls.server_name
-            : std::string(tls_server_name);
-        std::vector<std::string> alpn = s.tls.alpn;
+        const std::string_view sni = tls_server_name.empty()
+            ? std::string_view(s.tls.server_name)
+            : tls_server_name;
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
             LOG_ERROR("[Transport] BuildOutbound: TLS-like security requested but base stream is not TcpStream");
             co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
         auto tls = s.IsReality()
-            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, alpn)
-            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, alpn);
+            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, s.tls.alpn)
+            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, s.tls.alpn);
         if (!tls) {
             LOG_NET_DEBUG("[Transport] BuildOutbound: {} client handshake failed (sni={})",
                              s.IsReality() ? "REALITY" : "TLS",
@@ -6089,17 +6088,17 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_grpc_out = 1;
             conn_id = s_conn_counter_grpc_out++;
         }
-        std::string authority;
+        std::string_view authority;
         if (!s.grpc.authority.empty()) {
             authority = s.grpc.authority;
         } else if (s.IsReality()) {
-            authority.clear();
+            authority = {};
         } else if (!ws_host.empty()) {
-            authority = std::string(ws_host);
+            authority = ws_host;
         } else {
-            authority = std::string(tls_server_name.empty()
-                ? s.tls.server_name
-                : tls_server_name);
+            authority = tls_server_name.empty()
+                ? std::string_view(s.tls.server_name)
+                : tls_server_name;
         }
         auto grpc_result = co_await DoGrpcClientHandshake(
             std::move(stream), s.grpc, authority, s.IsTlsLike(), conn_id);
@@ -6118,12 +6117,12 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_http_out = 1;
             conn_id = s_conn_counter_http_out++;
         }
-        std::string host = ws_host.empty()
-            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
-            : std::string(ws_host);
+        std::string_view host = ws_host.empty()
+            ? (tls_server_name.empty() ? std::string_view(s.tls.server_name) : tls_server_name)
+            : ws_host;
         if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(s.http));
             !configured_host.empty()) {
-            host = std::string(configured_host);
+            host = configured_host;
         }
         if (host.empty()) {
             host = "www.example.com";
@@ -6172,13 +6171,13 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_xhttp_out = 1;
             conn_id = s_conn_counter_xhttp_out++;
         }
-        std::string host = ws_host.empty()
-            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
-            : std::string(ws_host);
+        std::string_view host = ws_host.empty()
+            ? (tls_server_name.empty() ? std::string_view(s.tls.server_name) : tls_server_name)
+            : ws_host;
         const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, true);
         if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(http));
             !configured_host.empty()) {
-            host = std::string(configured_host);
+            host = configured_host;
         }
         if (host.empty()) {
             host = "www.example.com";
@@ -6204,9 +6203,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_out = 1;
             conn_id = s_conn_counter_out++;
         }
-        std::string host = ws_host.empty()
-            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
-            : std::string(ws_host);
+        const std::string_view host = ws_host.empty()
+            ? (tls_server_name.empty() ? std::string_view(s.tls.server_name) : tls_server_name)
+            : ws_host;
         auto ws = std::make_unique<WsClientStream>(std::move(stream), conn_id);
         auto ws_result = co_await ws->Handshake(
             host,
@@ -6227,9 +6226,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             thread_local uint64_t s_conn_counter_http_out = 1;
             conn_id = s_conn_counter_http_out++;
         }
-        std::string host = ws_host.empty()
-            ? std::string(tls_server_name.empty() ? s.tls.server_name : tls_server_name)
-            : std::string(ws_host);
+        const std::string_view host = ws_host.empty()
+            ? (tls_server_name.empty() ? std::string_view(s.tls.server_name) : tls_server_name)
+            : ws_host;
         auto http_upgrade_result = co_await DoHttpUpgradeClientHandshake(
             std::move(stream), s.http_upgrade, host, conn_id);
         if (!http_upgrade_result) {
@@ -6264,17 +6263,16 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
         if (!ctx) {
             co_return tl::unexpected(ErrorCode::TLS_CERT_INVALID);
         }
-        std::string sni = tls_server_name.empty()
-            ? s.tls.server_name
-            : std::string(tls_server_name);
-        std::vector<std::string> alpn = s.tls.alpn;
+        const std::string_view sni = tls_server_name.empty()
+            ? std::string_view(s.tls.server_name)
+            : tls_server_name;
         auto tcp = TakeOwnedTcpStream(stream);
         if (!tcp) {
             co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
         auto tls = s.IsReality()
-            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, alpn)
-            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, alpn);
+            ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni, s.tls.alpn)
+            : co_await WrapTlsClient(std::move(tcp), *ctx, sni, s.tls.alpn);
         if (!tls) {
             co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
         }
@@ -6288,19 +6286,19 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
         s.IsTlsLike(),
         kind);
 
-    std::string authority(host);
+    std::string_view authority = host;
     if (authority.empty()) {
         if (s.IsReality() && !s.reality.server_name.empty()) {
             authority = s.reality.server_name;
         } else {
             authority = tls_server_name.empty()
-                ? s.tls.server_name
-                : std::string(tls_server_name);
+                ? std::string_view(s.tls.server_name)
+                : tls_server_name;
         }
     }
     if (const std::string_view configured_host = TrimAscii(ExpectedHttpHost(http));
         !configured_host.empty()) {
-        authority = std::string(configured_host);
+        authority = configured_host;
     }
     if (authority.empty()) {
         authority = "www.example.com";

@@ -170,11 +170,11 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             target.emplace(io_context, dns_service_, bind_address);
         } catch (const transport::LinkError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
-                           ctx.outbound.target, bind_address.to_string(), e.what());
+                           ctx.outbound.target, iputil::AddressText(bind_address).View(), e.what());
             co_return tl::unexpected(e.code());
         } catch (const IoSystemError& e) {
             LOG_CONN_DEBUG(ctx, "failed to dial UDP {} via {} > {}",
-                           ctx.outbound.target, bind_address.to_string(), e.what());
+                           ctx.outbound.target, iputil::AddressText(bind_address).View(), e.what());
             co_return tl::unexpected(MapAsioError(e.code()));
         }
         target->SetIdleTimeout(relay_idle_timeout);
@@ -258,12 +258,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         const auto& candidate = *transport_target.single_candidate;
         if (candidate.bind_local) {
             LOG_CONN_DEBUG(ctx, "Freedom target {}:{} bind {}",
-                           candidate.endpoint.address().to_string(),
+                           iputil::AddressText(candidate.endpoint.address()).View(),
                            candidate.endpoint.port(),
-                           candidate.bind_local->to_string());
+                           iputil::AddressText(*candidate.bind_local).View());
         } else {
             LOG_CONN_DEBUG(ctx, "Freedom target {}:{} (system bind)",
-                           candidate.endpoint.address().to_string(),
+                           iputil::AddressText(candidate.endpoint.address()).View(),
                            candidate.endpoint.port());
         }
     } else {

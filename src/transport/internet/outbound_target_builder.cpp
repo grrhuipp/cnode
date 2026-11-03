@@ -94,7 +94,16 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
     return {};
 }
 
-[[nodiscard]] std::string BuildWsHostHeader(
+[[nodiscard]] memory::ThreadLocalString FormatOutboundHostHeader(
+    std::string_view fallback_host,
+    uint16_t port,
+    bool use_ssl) {
+    memory::ThreadLocalString out;
+    iputil::FormatHttpHostHeaderInto(out, fallback_host, port, use_ssl);
+    return out;
+}
+
+[[nodiscard]] memory::ThreadLocalString BuildWsHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -103,12 +112,12 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
     }
     if (const std::string_view explicit_host = FindHttpHeaderCI(settings.ws.headers, "Host");
         !explicit_host.empty()) {
-        return std::string(explicit_host);
+        return memory::ThreadLocalString(explicit_host);
     }
-    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
 }
 
-[[nodiscard]] std::string BuildHttpUpgradeHostHeader(
+[[nodiscard]] memory::ThreadLocalString BuildHttpUpgradeHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -116,17 +125,17 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
         return {};
     }
     if (!settings.http_upgrade.host.empty()) {
-        return settings.http_upgrade.host;
+        return memory::ThreadLocalString(settings.http_upgrade.host);
     }
     if (const std::string_view explicit_host =
             FindHttpHeaderCI(settings.http_upgrade.headers, "Host");
         !explicit_host.empty()) {
-        return std::string(explicit_host);
+        return memory::ThreadLocalString(explicit_host);
     }
-    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
 }
 
-[[nodiscard]] std::string BuildGrpcAuthority(
+[[nodiscard]] memory::ThreadLocalString BuildGrpcAuthority(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -134,15 +143,15 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
         return {};
     }
     if (!settings.grpc.authority.empty()) {
-        return settings.grpc.authority;
+        return memory::ThreadLocalString(settings.grpc.authority);
     }
     if (settings.IsReality()) {
         return {};
     }
-    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
 }
 
-[[nodiscard]] std::string BuildXHttpHostHeader(
+[[nodiscard]] memory::ThreadLocalString BuildXHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -150,17 +159,17 @@ bool WantsIPv6(const OutboundBind& bind, const tcp::endpoint* inbound_local_addr
         return {};
     }
     if (!settings.xhttp.host.empty()) {
-        return settings.xhttp.host;
+        return memory::ThreadLocalString(settings.xhttp.host);
     }
     if (const std::string_view explicit_host =
             FindHttpHeaderCI(settings.xhttp.headers, "Host");
         !explicit_host.empty()) {
-        return std::string(explicit_host);
+        return memory::ThreadLocalString(explicit_host);
     }
-    return iputil::FormatHttpHostHeader(fallback_host, port, settings.IsTls());
+    return FormatOutboundHostHeader(fallback_host, port, settings.IsTls());
 }
 
-[[nodiscard]] std::string BuildHttpHostHeader(
+[[nodiscard]] memory::ThreadLocalString BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {

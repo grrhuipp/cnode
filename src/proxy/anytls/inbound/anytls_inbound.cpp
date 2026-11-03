@@ -600,9 +600,9 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
                 co_return co_await RejectSession("invalid client settings", parsed.error());
             session_version_ = parsed->version; // Publish once before accepting any SYN.
             if (session_version_ == anytls::SessionVersion::V2) {
-                const std::string settings = "v=" + std::to_string(anytls::kProtocolVersion);
+                constexpr std::string_view kServerSettings = "v=2";
                 if (auto ok = co_await WriteFrameSerialized(anytls::kCmdServerSettings, 0,
-                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(settings.data()), settings.size())); !ok) {
+                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kServerSettings.data()), kServerSettings.size())); !ok) {
                     result.error = ok.error();
                     break;
                 }

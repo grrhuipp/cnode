@@ -20,10 +20,6 @@ public:
     // 从已接受的 socket 构造
     explicit TcpStream(tcp::socket socket);
 
-    static void* operator new(std::size_t size);
-    static void operator delete(void* p) noexcept;
-    static void operator delete(void* p, std::size_t size) noexcept;
-
     // 禁止拷贝
     TcpStream(const TcpStream&) = delete;
     TcpStream& operator=(const TcpStream&) = delete;
@@ -112,7 +108,6 @@ private:
     void SetPendingData(std::span<const uint8_t> data);
 
     void TouchActivity() noexcept;
-    void ReleaseActiveCounter() noexcept;
     [[nodiscard]] size_t ConsumePendingData(net::mutable_buffer target) noexcept;
     void ReleasePendingData() noexcept;
 

@@ -276,14 +276,16 @@ size_t ProxyProtocolParser::Encode(
 
     if (version == 1) {
         if (src_addr.is_v4() && dst_addr.is_v4()) {
-            const std::string src_str = src_addr.to_string();
-            const std::string dst_str = dst_addr.to_string();
+            const iputil::AddressText src_text(src_addr);
+            const iputil::AddressText dst_text(dst_addr);
+            const auto src_view = src_text.View();
+            const auto dst_view = dst_text.View();
             const int written = std::snprintf(
                 reinterpret_cast<char*>(out.data()),
                 out.size(),
-                "PROXY TCP4 %s %s %u %u\r\n",
-                src_str.c_str(),
-                dst_str.c_str(),
+                "PROXY TCP4 %.*s %.*s %u %u\r\n",
+                static_cast<int>(src_view.size()), src_view.data(),
+                static_cast<int>(dst_view.size()), dst_view.data(),
                 static_cast<unsigned int>(src_port),
                 static_cast<unsigned int>(dst_port));
             return (written > 0 && static_cast<size_t>(written) < out.size())
@@ -296,14 +298,16 @@ size_t ProxyProtocolParser::Encode(
         const auto dst_v6 = dst_addr.is_v6()
             ? dst_addr.to_v6()
             : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
-        const std::string src_str = src_v6.to_string();
-        const std::string dst_str = dst_v6.to_string();
+        const iputil::AddressText src_text(src_v6);
+        const iputil::AddressText dst_text(dst_v6);
+        const auto src_view = src_text.View();
+        const auto dst_view = dst_text.View();
         const int written = std::snprintf(
             reinterpret_cast<char*>(out.data()),
             out.size(),
-            "PROXY TCP6 %s %s %u %u\r\n",
-            src_str.c_str(),
-            dst_str.c_str(),
+            "PROXY TCP6 %.*s %.*s %u %u\r\n",
+            static_cast<int>(src_view.size()), src_view.data(),
+            static_cast<int>(dst_view.size()), dst_view.data(),
             static_cast<unsigned int>(src_port),
             static_cast<unsigned int>(dst_port));
         return (written > 0 && static_cast<size_t>(written) < out.size())

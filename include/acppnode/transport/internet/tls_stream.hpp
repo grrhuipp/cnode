@@ -91,7 +91,7 @@ public:
     [[nodiscard]] bool SetServerIdentity(std::string_view identity);
 
     // 设置 ALPN（客户端调用）
-    [[nodiscard]] bool SetAlpn(const std::vector<std::string>& protocols);
+    [[nodiscard]] bool SetAlpn(std::span<const std::string> protocols);
 
     // 设置 REALITY 客户端认证（客户端调用）
     bool SetRealityClient(const RealityConfig& reality);
@@ -155,8 +155,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
 net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
-    const std::string& server_name = "",
-    const std::vector<std::string>& alpn = {});
+    std::string_view server_name = {},
+    std::span<const std::string> alpn = {});
 
 // 包装现有 TCP 流为 REALITY 客户端
 [[nodiscard]]
@@ -164,7 +164,7 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
     const RealityConfig& reality,
-    const std::string& server_name = "",
-    const std::vector<std::string>& alpn = {});
+    std::string_view server_name = {},
+    std::span<const std::string> alpn = {});
 
 }  // namespace acpp

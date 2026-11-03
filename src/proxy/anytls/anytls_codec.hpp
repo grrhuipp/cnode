@@ -40,7 +40,7 @@ enum class SessionVersion : uint8_t { V1 = 1, V2 = 2 };
 
 struct PeerSettings {
     SessionVersion version = SessionVersion::V1;
-    std::string padding_md5; // Handshake-only metadata, never retained by a session.
+    std::string_view padding_md5; // Handshake-only metadata view, never retained by a session.
 };
 
 [[nodiscard]] tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text);
@@ -78,7 +78,7 @@ private:
 
 class PaddingScheme;
 
-[[nodiscard]] std::string ClientSettings(const PaddingScheme& scheme);
+[[nodiscard]] memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme);
 [[nodiscard]] tl::expected<void, ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
     uint8_t cmd,
@@ -121,7 +121,7 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
 net::awaitable<tl::expected<FrameHeader, ErrorCode>>
 ReadFrameHeader(AsyncStream& stream);
 
-net::awaitable<tl::expected<std::string, ErrorCode>>
+net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length);
 
 net::awaitable<tl::expected<void, ErrorCode>>

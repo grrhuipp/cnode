@@ -33,16 +33,10 @@ class BaseWsStream;  // 允许 WS 包装链透传底层 TCP 能力
 // │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
 // └─────────────────────────────────────────────────────────────────────────┘
 // ============================================================================
-class AsyncStream : public transport::MultiBufferReader, public transport::MultiBufferWriter {
+class AsyncStream : public memory::ThreadAllocated,
+                    public transport::MultiBufferReader,
+                    public transport::MultiBufferWriter {
 public:
-    // 流对象在所属 Worker 线程创建和销毁，分配走该线程的 PMR 池。
-    [[nodiscard]] static void* operator new(std::size_t size);
-    [[nodiscard]] static void* operator new(std::size_t size, std::align_val_t alignment);
-    static void operator delete(void* ptr) noexcept;
-    static void operator delete(void* ptr, std::size_t size) noexcept;
-    static void operator delete(void* ptr, std::align_val_t alignment) noexcept;
-    static void operator delete(void* ptr, std::size_t size, std::align_val_t alignment) noexcept;
-
     virtual ~AsyncStream() noexcept = default;
 
     // Byte-stream EOF half-closes the peer writer; full-close transports

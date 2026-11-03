@@ -196,8 +196,8 @@ public:
         : BaseWsStream(std::move(inner), conn_id, true) {}
 
     net::awaitable<WsHandshakeResult> Handshake(
-        const std::string& host,
-        const std::string& path,
+        std::string_view host,
+        std::string_view path,
         const transport::internet::HttpHeaders* headers = nullptr);
 };
 

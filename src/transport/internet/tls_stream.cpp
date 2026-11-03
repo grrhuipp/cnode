@@ -314,12 +314,10 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         if (server) SSL_set_accept_state(ssl.get());
         else SSL_set_connect_state(ssl.get());
         Resubscribe(tcp->Cancellation());
-        memory::OnTlsStreamNew();
     }
 
     ~Impl() {
         Unsubscribe();
-        memory::OnTlsStreamFree();
     }
 
     acpp::tcp::socket::executor_type Executor() {
@@ -645,11 +643,11 @@ bool TlsStream::SetServerIdentity(std::string_view identity) {
     return !is_server_ && ConfigureTlsServerIdentity(ssl, identity);
 }
 
-bool TlsStream::SetAlpn(const std::vector<std::string>& protocols) {
+bool TlsStream::SetAlpn(std::span<const std::string> protocols) {
     SSL* ssl = NativeSsl();
     if (!ssl) return false;
 
-    std::vector<unsigned char> alpn;
+    memory::ByteVector alpn;
     if (!EncodeTlsAlpnProtocols(protocols, alpn)) return false;
     return SSL_set_alpn_protos(ssl, alpn.data(), alpn.size()) == 0;
 }
@@ -913,8 +911,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapTlsServer(
 net::awaitable<std::unique_ptr<TlsStream>> WrapTlsClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
-    const std::string& server_name,
-    const std::vector<std::string>& alpn) {
+    std::string_view server_name,
+    std::span<const std::string> alpn) {
 
     auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
 
@@ -936,8 +934,8 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     std::unique_ptr<TcpStream> inner,
     SslContext& ctx,
     const RealityConfig& reality,
-    const std::string& server_name,
-    const std::vector<std::string>& alpn) {
+    std::string_view server_name,
+    std::span<const std::string> alpn) {
 
     auto stream = std::make_unique<TlsStream>(std::move(inner), ctx.Native(), false);
 

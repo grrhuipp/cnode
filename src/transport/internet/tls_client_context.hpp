@@ -3,6 +3,7 @@
 #include <openssl/ssl.h>
 
 #include "acppnode/transport/internet/tls_config.hpp"
+#include "acppnode/common/allocator.hpp"
 
 #include <span>
 #include <string>
@@ -22,5 +23,8 @@ namespace acpp {
 [[nodiscard]] bool EncodeTlsAlpnProtocols(
     std::span<const std::string> protocols,
     std::vector<unsigned char>& wire);
+[[nodiscard]] bool EncodeTlsAlpnProtocols(
+    std::span<const std::string> protocols,
+    memory::ByteVector& wire);
 
 }  // namespace acpp

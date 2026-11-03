@@ -10,6 +10,8 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <array>
+#include <cstring>
 #include <string>
 
 namespace acpp {
@@ -39,9 +41,12 @@ bool ConfigureTlsProtocolVersions(
         SSL_CTX_set_max_proto_version(context, maximum) == 1;
 }
 
-bool EncodeTlsAlpnProtocols(
+namespace {
+
+template <typename ByteContainer>
+bool EncodeTlsAlpnProtocolsImpl(
     std::span<const std::string> protocols,
-    std::vector<unsigned char>& wire) {
+    ByteContainer& wire) {
     wire.clear();
     if (!IsValidTlsAlpn(protocols)) return false;
 
@@ -55,6 +60,20 @@ bool EncodeTlsAlpnProtocols(
         wire.insert(wire.end(), protocol.begin(), protocol.end());
     }
     return true;
+}
+
+}  // namespace
+
+bool EncodeTlsAlpnProtocols(
+    std::span<const std::string> protocols,
+    std::vector<unsigned char>& wire) {
+    return EncodeTlsAlpnProtocolsImpl(protocols, wire);
+}
+
+bool EncodeTlsAlpnProtocols(
+    std::span<const std::string> protocols,
+    memory::ByteVector& wire) {
+    return EncodeTlsAlpnProtocolsImpl(protocols, wire);
 }
 
 bool ConfigureTlsServerIdentity(
@@ -74,13 +93,15 @@ bool ConfigureTlsServerIdentity(
         return X509_VERIFY_PARAM_set1_ip(parameters, bytes.data(), bytes.size()) == 1;
     }
     if (!domain::IsValidDnsHostname(identity, domain::TrailingDotPolicy::Allow)) return false;
-    const std::string identity_text(identity);
+    std::array<char, 256> identity_text{};
+    if (identity.size() >= identity_text.size()) return false;
+    std::memcpy(identity_text.data(), identity.data(), identity.size());
 
-    if (SSL_set_tlsext_host_name(ssl, identity_text.c_str()) != 1) {
+    if (SSL_set_tlsext_host_name(ssl, identity_text.data()) != 1) {
         return false;
     }
     SSL_set_hostflags(ssl, X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
-    return SSL_set1_host(ssl, identity_text.c_str()) == 1;
+    return SSL_set1_host(ssl, identity_text.data()) == 1;
 }
 
 std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {

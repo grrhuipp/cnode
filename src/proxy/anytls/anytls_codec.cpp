@@ -213,15 +213,20 @@ tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
         } else if (key == "padding-md5") {
             if (std::exchange(has_padding_md5, true))
                 return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-            result.padding_md5.assign(value);
+            result.padding_md5 = value;
         }
         // Unknown well-formed keys belong to extensions, never feature gates.
     }
     return result;
 }
 
-std::string ClientSettings(const PaddingScheme& scheme) {
-    return std::format("v={}\nclient=cnode\npadding-md5={}", kProtocolVersion, scheme.Digest());
+memory::ThreadLocalString ClientSettings(const PaddingScheme& scheme) {
+    memory::ThreadLocalString settings;
+    const auto& digest = scheme.Digest();
+    settings.reserve(28 + digest.size());
+    settings.append("v=2\nclient=cnode\npadding-md5=");
+    settings.append(digest);
+    return settings;
 }
 
 
@@ -452,9 +457,9 @@ ReadFrameHeader(AsyncStream& stream) {
     co_return out;
 }
 
-net::awaitable<tl::expected<std::string, ErrorCode>>
+net::awaitable<tl::expected<memory::ThreadLocalString, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length) {
-    std::string text(length, '\0');
+    memory::ThreadLocalString text(length, '\0');
     auto bytes = std::span<uint8_t>(
         reinterpret_cast<uint8_t*>(text.data()),
         text.size());

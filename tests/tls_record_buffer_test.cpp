@@ -167,7 +167,8 @@ struct Fixture {
         stream = std::make_unique<acpp::TlsStream>(
             std::make_unique<acpp::TcpStream>(std::move(socket)),
             product_server ? server->Native() : client->Native(), product_server);
-        if (!product_server) Require(stream->SetAlpn({"h2"}), "ALPN preparation failed");
+        const std::array<std::string, 1> alpn{"h2"};
+        if (!product_server) Require(stream->SetAlpn(alpn), "ALPN preparation failed");
         if (resource) retained_before_handshake = resource->large_live;
         try {
             auto first = net::co_spawn(io, stream->Handshake(), net::use_future);

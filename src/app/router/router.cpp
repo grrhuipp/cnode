@@ -55,7 +55,7 @@ bool MatchIPv6Prefix(const net::ip::address_v6::bytes_type& ip,
     return (ip[full_bytes] & mask) == (network[full_bytes] & mask);
 }
 
-using StringVector = memory::ThreadLocalVector<std::string>;
+using StringVector = memory::ThreadLocalVector<memory::ThreadLocalString>;
 
 void SortUniqueStrings(StringVector& values) {
     std::sort(values.begin(), values.end());
@@ -67,7 +67,7 @@ void SortUniqueStrings(StringVector& values) {
     std::string_view value) {
     const auto it = std::lower_bound(
         values.begin(), values.end(), value,
-        [](const std::string& lhs, std::string_view rhs) {
+        [](const memory::ThreadLocalString& lhs, std::string_view rhs) {
             return std::string_view(lhs) < rhs;
         });
     return it != values.end() && std::string_view(*it) == value;
@@ -125,7 +125,7 @@ public:
     }
 
 private:
-    memory::ThreadLocalUnorderedSet<std::string, TransparentStringHash, TransparentStringEq> domains_;
+    memory::ThreadLocalUnorderedSet<memory::ThreadLocalString, TransparentStringHash, TransparentStringEq> domains_;
     DomainTrie suffix_trie_;
     StringVector keywords_;
     memory::ThreadLocalVector<std::regex> regexes_;
@@ -277,7 +277,7 @@ struct CompoundRoutingRule {
     std::optional<DomainMatcher> domain_matcher;
     std::optional<GeoSiteCondition> geosite_condition;
     std::optional<GeoIPCondition> geoip_condition;
-    std::string outbound_tag;
+    memory::ThreadLocalString outbound_tag;
     bool has_network_condition = false;
     bool has_protocol_condition = false;
     bool has_inbound_tag_condition = false;
@@ -468,7 +468,7 @@ DomainMatcher::~DomainMatcher() noexcept = default;
 void DomainMatcher::AddDomain(const std::string& domain) {
     std::string lower = domain;
     ::acpp::domain::NormalizeDnsHostnameInPlace(lower);
-    domains_.insert(std::move(lower));
+    domains_.emplace(lower);
 }
 
 void DomainMatcher::AddSuffix(const std::string& suffix) {
@@ -478,7 +478,7 @@ void DomainMatcher::AddSuffix(const std::string& suffix) {
 void DomainMatcher::AddKeyword(const std::string& keyword) {
     std::string lower = keyword;
     ToLowerInPlace(lower);
-    keywords_.push_back(std::move(lower));
+    keywords_.emplace_back(lower);
 }
 
 void DomainMatcher::AddRegex(const std::string& pattern) {

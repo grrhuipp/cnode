@@ -29,9 +29,6 @@
 #include <sys/prctl.h>
 #include <unistd.h>
 #endif
-#if defined(__GLIBC__)
-#include <malloc.h>
-#endif
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
 #include <mimalloc.h>
 #endif
@@ -39,9 +36,6 @@
 namespace acpp::memory {
 
 inline constexpr bool kAllocatorCollects = true;
-inline constexpr int kGlibcArenaMax = 2;
-inline constexpr int kGlibcTrimThreshold = 64 * 1024;
-inline constexpr int kGlibcMmapThreshold = 64 * 1024;
 inline constexpr std::size_t kThreadPoolTargetBytes = 64 * 1024;
 inline constexpr std::size_t kThreadPoolMaxClass = 16 * 1024;
 inline constexpr std::size_t kLargeBlockGranularity = 4 * 1024;
@@ -64,13 +58,6 @@ inline const std::size_t kAllocationPageBytes = []() noexcept -> std::size_t {
 inline void DisableTransparentHugePages() noexcept {
 #if defined(__linux__) && defined(PR_SET_THP_DISABLE)
     (void)::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
-}
-inline void ConfigureProcessGlibc() noexcept {
-#if defined(__GLIBC__)
-    (void)::mallopt(M_ARENA_MAX, kGlibcArenaMax);
-    (void)::mallopt(M_TRIM_THRESHOLD, kGlibcTrimThreshold);
-    (void)::mallopt(M_MMAP_THRESHOLD, kGlibcMmapThreshold);
 #endif
 }
 
@@ -935,7 +922,6 @@ protected:
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
-    ConfigureProcessGlibc();
     static ThreadPoolFacade default_resource;
     std::pmr::set_default_resource(&default_resource);
 }
@@ -945,8 +931,6 @@ inline void CollectSteady() noexcept {
     detail::task_frame_cache_release();
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_collect(false);
-#elif defined(__GLIBC__)
-    (void)::malloc_trim(0);
 #endif
 }
 
@@ -954,8 +938,6 @@ inline void CollectBurst() noexcept {
     ThreadPool().PurgeIdle();
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
     mi_collect(true);
-#elif defined(__GLIBC__)
-    (void)::malloc_trim(0);
 #endif
 }
 
