@@ -2016,6 +2016,11 @@ public:
         return fields;
     }
 
+    void Clear() noexcept {
+        dynamic_table_.clear();
+        dynamic_size_ = 0;
+    }
+
 private:
     struct StaticField {
         std::string_view name;
@@ -2429,9 +2434,7 @@ public:
             std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
             h2_data_offset_ += n;
             if (h2_data_offset_ >= h2_data_end_) {
-                h2_data_.clear();
-                h2_data_offset_ = 0;
-                h2_data_end_ = 0;
+                ReleaseH2Data();
             }
             co_return n;
         }
@@ -2558,9 +2561,7 @@ public:
     void ShutdownRead() override {
         read_closed_ = true;
         hunk_.Clear();
-        h2_data_.clear();
-        h2_data_offset_ = 0;
-        h2_data_end_ = 0;
+        ReleaseH2Data();
         inner_->ShutdownRead();
     }
 
@@ -2603,9 +2604,7 @@ public:
         }
         closed_ = true;
         hunk_.Clear();
-        h2_data_.clear();
-        h2_data_offset_ = 0;
-        h2_data_end_ = 0;
+        ReleaseH2Data();
         inner_->Close();
     }
 
@@ -2637,10 +2636,15 @@ protected:
     }
 
 private:
+    void ReleaseH2Data() noexcept {
+        memory::ByteVector{h2_data_.get_allocator()}.swap(h2_data_);
+        h2_data_offset_ = 0;
+        h2_data_end_ = 0;
+    }
+
     net::awaitable<bool> WaitForRawData() {
         while (h2_data_offset_ >= h2_data_end_) {
-            h2_data_.clear();
-            h2_data_offset_ = h2_data_end_ = 0;
+            ReleaseH2Data();
             if (!co_await ReadNextDataFrame()) co_return false;
         }
         co_return true;
@@ -2717,6 +2721,7 @@ private:
             ThrowHttp2StreamError("HTTP/2 server rejected request");
         }
         response_headers_received_ = true;
+        response_decoder_.Clear();
         co_return end_stream;
     }
 

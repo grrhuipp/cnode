@@ -481,37 +481,43 @@ proxy::vless::outbound::Handler::Process(
     }
 
     const auto& target = ctx.outbound.target;
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service_,
-        .address = config_->address,
-        .literal_address = config_->literal_address,
-        .port = config_->port,
-        .stream_settings = &config_->stream_settings,
-        .timeout = dial_timeout_,
-        .send_through = &config_->send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            config_->stream_settings, config_->address),
-        .ws_host = config_->address,
-    });
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_->address);
+    auto dial_stream = [&]() -> net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>> {
+        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+            .dns_service = &dns_service_,
+            .address = config_->address,
+            .literal_address = config_->literal_address,
+            .port = config_->port,
+            .stream_settings = &config_->stream_settings,
+            .timeout = dial_timeout_,
+            .send_through = &config_->send_through,
+            .inbound_local_addr = inbound_local_addr,
+            .inbound_source_ip = ctx.inbound.source_ip,
+            .inbound_source_port = ctx.inbound.source_port,
+            .tls_server_name = ResolveOutboundTlsServerName(
+                config_->stream_settings, config_->address),
+            .ws_host = config_->address,
+        });
+        if (!transport_target) {
+            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+                LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_->address);
+            }
+            co_return tl::unexpected(transport_target.error());
         }
-        co_return tl::unexpected(transport_target.error());
+        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+        if (!dial_result.Ok()) {
+            LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
+                              ctx.inbound.source_ip, ctx.outbound.target,
+                              ctx.outbound.tag, dial_result.error_msg);
+            co_return tl::unexpected(dial_result.error);
+        }
+        co_return std::move(dial_result.stream);
+    };
+    auto dialed = co_await dial_stream();
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
     }
+    auto stream = std::move(*dialed);
 
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
-    }
-
-    auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {
@@ -534,23 +540,31 @@ proxy::vless::outbound::Handler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
-    TargetAddress request_target = use_packet_addr
-        ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
-        : target;
-    std::array<uint8_t, 512> header{};
-    const size_t header_len = ::acpp::vless::Codec::EncodeRequestHeaderTo(
-        config_->uuid_bytes,
-        use_xudp
-            ? ::acpp::vless::Command::MUX
-            : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
-        request_target,
-        header.data(),
-        header.size(),
-        use_vision ? std::string_view(config_->flow) : std::string_view{});
-    if (header_len == 0) {
-        co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-
+    auto send_request_header = [&](transport::MultiBufferWriter& writer) -> net::awaitable<ErrorCode> {
+        TargetAddress request_target = use_packet_addr
+            ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
+            : target;
+        std::array<uint8_t, 512> header{};
+        const size_t header_len = ::acpp::vless::Codec::EncodeRequestHeaderTo(
+            config_->uuid_bytes,
+            use_xudp
+                ? ::acpp::vless::Command::MUX
+                : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
+            request_target,
+            header.data(),
+            header.size(),
+            use_vision ? std::string_view(config_->flow) : std::string_view{});
+        if (header_len == 0) {
+            co_return ErrorCode::PROTOCOL_ENCODE_FAILED;
+        }
+        try {
+            co_await WriteVlessBytes(writer, std::span<const uint8_t>(header.data(), header_len));
+            co_return ErrorCode::OK;
+        } catch (...) {
+            co_return outbound_protocol_deadline.Expired()
+                ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_WRITE_FAILED;
+        }
+    };
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter* protocol_writer = stream.get();
     VlessBufferedReader* active_reader = &protocol_reader;
@@ -602,12 +616,9 @@ proxy::vless::outbound::Handler::Process(
         }
     }
 
-    try {
-        co_await WriteVlessBytes(*active_writer,
-            std::span<const uint8_t>(header.data(), header_len));
-    } catch (...) {
-        co_return fail_abortive(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_WRITE_FAILED);
+    if (const ErrorCode header_err = co_await send_request_header(*active_writer);
+        header_err != ErrorCode::OK) {
+        co_return fail_abortive(header_err);
     }
 
     stream->SetIdleTimeout(relay_idle_timeout);

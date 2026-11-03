@@ -55,8 +55,8 @@ public:
     net::awaitable<buf::MultiBuffer> DecodeResponseBody(AsyncStream& stream);
 
 private:
-    MemoryAccount user_;
-    TargetAddress target_;
+    const MemoryAccount* user_ = nullptr;
+    const TargetAddress* target_ = nullptr;
     Security security_ = Security::AES_128_GCM;
     Command command_ = Command::TCP;
     std::array<uint8_t, 16> request_body_key_{};

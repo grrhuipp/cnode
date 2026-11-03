@@ -670,12 +670,14 @@ void InitRequestBodyState(DecodeRequestBodyState& state, VMessRequest& request) 
 
     state.request = &request;
     state.packet_mode = request.command == Command::UDP;
-    state.cipher.emplace(security, request_key.data(), request_iv.data());
+    state.cipher.emplace(
+        security, request_key.data(), request_iv.data(), proxy::AeadDirection::Decrypt);
     if ((option & Option::AUTHENTICATED_LENGTH) != 0 &&
         (security == Security::AES_128_GCM || security == Security::CHACHA20_POLY1305)) {
         const std::array<std::string_view, 1> path{"auth_len"};
         auto length_key = KDF16(request_key.data(), request_key.size(), path);
-        state.length_cipher.emplace(security, length_key.data(), request_iv.data());
+        state.length_cipher.emplace(
+            security, length_key.data(), request_iv.data(), proxy::AeadDirection::Decrypt);
     }
     state.global_padding = (option & Option::GLOBAL_PADDING) != 0 &&
         !(security == Security::NONE && request.command != Command::UDP);
@@ -719,7 +721,8 @@ void InitResponseBodyState(EncodeResponseBodyState& state, const VMessRequest& r
 
     state.security = security;
     state.option = option;
-    state.cipher.emplace(security, response_key.data(), response_iv.data());
+    state.cipher.emplace(
+        security, response_key.data(), response_iv.data(), proxy::AeadDirection::Encrypt);
     if ((option & Option::AUTHENTICATED_LENGTH) != 0 &&
         (security == Security::AES_128_GCM || security == Security::CHACHA20_POLY1305)) {
         std::array<uint8_t, 16> request_key{};
@@ -728,7 +731,8 @@ void InitResponseBodyState(EncodeResponseBodyState& state, const VMessRequest& r
         std::memcpy(request_iv.data(), request.body_iv.data(), 16);
         const std::array<std::string_view, 1> path{"auth_len"};
         auto length_key = KDF16(request_key.data(), request_key.size(), path);
-        state.length_cipher.emplace(security, length_key.data(), request_iv.data());
+        state.length_cipher.emplace(
+            security, length_key.data(), request_iv.data(), proxy::AeadDirection::Encrypt);
     }
     state.global_padding = (option & Option::GLOBAL_PADDING) != 0 &&
         !(security == Security::NONE && request.command != Command::UDP);

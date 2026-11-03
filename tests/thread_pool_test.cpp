@@ -52,12 +52,12 @@ bool RunBoundaries() {
 
 bool RunGeometry() {
     // Finer classes and a single header, with no protocol-specific exceptions.
-    if (Pool::Describe(224, 8).slot_bytes != 256 ||
+    if (Pool::Describe(240, 8).slot_bytes != 256 ||
         Pool::Describe(632, 8).slot_bytes != 704 ||
         Pool::Describe(8296, 8).slot_bytes != 8448 ||
         Pool::Describe(17408, 8).slot_bytes != 20480) return false;
     size_t last_stride = 0;
-    for (size_t bytes = 1; bytes <= kThreadPoolMaxClass - 32; ++bytes) {
+    for (size_t bytes = 1; bytes <= kThreadPoolMaxClass - 16; ++bytes) {
         const auto layout = Pool::Describe(bytes, 8, 4);
         if (layout.slot_bytes == last_stride) continue;
         last_stride = layout.slot_bytes;
@@ -118,13 +118,13 @@ bool RunFragmented() {
     if (!first || !held) return false;
     std::memset(held, 0x6b, 600);
     pool.Deallocate(first);
-    void* reused = pool.Allocate(608, 16);
+    void* reused = pool.Allocate(624, 16);
     if (reused != first) return false;
-    std::memset(reused, 0xa5, 608);
+    std::memset(reused, 0xa5, 624);
     pool.Deallocate(reused);
-    void* larger = pool.Allocate(609, 8);
+    void* larger = pool.Allocate(625, 8);
     if (!larger || larger == first) return false;
-    std::memset(larger, 0xa7, 609);
+    std::memset(larger, 0xa7, 625);
     if (!Intact(held, 600, 0x6b)) return false;
     pool.Deallocate(larger);
     pool.Deallocate(held);
@@ -429,6 +429,27 @@ bool RunRequestArenaAndContext() {
             std::pmr::vector<int> arena_vec(ctx.allocator<int>());
             arena_vec.resize(64, 99);
             if (arena_vec.back() != 99) {
+                std::pmr::set_default_resource(prev);
+                return false;
+            }
+        }
+        {
+            worker_memory deque_pool(upstream);
+            ThreadLocalDeque<int> idle_deque(deque_pool.resource());
+            if (deque_pool.GetFootprint().mapped_bytes != 0 || idle_deque.capacity() != 0) {
+                std::pmr::set_default_resource(prev);
+                return false;
+            }
+            for (int i = 0; i < 16; ++i) idle_deque.push_back(i);
+            for (int i = 0; i < 16; ++i) {
+                if (idle_deque.front() != i) {
+                    std::pmr::set_default_resource(prev);
+                    return false;
+                }
+                idle_deque.pop_front();
+            }
+            if (!idle_deque.empty() || idle_deque.capacity() != 0 ||
+                deque_pool.GetFootprint().idle_bytes != deque_pool.GetFootprint().mapped_bytes) {
                 std::pmr::set_default_resource(prev);
                 return false;
             }

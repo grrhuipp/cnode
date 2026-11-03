@@ -150,8 +150,11 @@ WorkerPool CreateWorkerPool(const WorkerRuntimeConfig& runtime_config,
     pool.io_contexts.reserve(workers);
     pool.work_guards.reserve(workers);
 
+    constexpr int kSingleThreadIoConcurrencyHint =
+        static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
     for (uint32_t i = 0; i < workers; ++i) {
-        pool.io_contexts.push_back(std::make_unique<net::io_context>());
+        pool.io_contexts.push_back(
+            std::make_unique<net::io_context>(kSingleThreadIoConcurrencyHint));
         pool.work_guards.push_back(net::make_work_guard(*pool.io_contexts[i]));
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
@@ -171,7 +174,9 @@ BootstrapEnvironment CreateBootstrapEnvironment(
         test_mode || (config.panels.empty() && config.static_inbounds.empty());
     auto outbounds = PrepareStartupOutbounds(config.outbounds);
     const auto inbounds = PrepareStartupInbounds(config.static_inbounds, enable_test_mode);
-    env.main_ctx = std::make_unique<net::io_context>();
+    constexpr int kMainIoConcurrencyHint =
+        static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
+    env.main_ctx = std::make_unique<net::io_context>(kMainIoConcurrencyHint);
     env.dns_worker = std::make_unique<app::dns::DNSWorker>(
         *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
     env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);

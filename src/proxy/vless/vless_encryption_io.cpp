@@ -75,7 +75,6 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
             ThrowVlessEncryptionIoError("VLESS Encryption lazy context too large");
         }
         if (read_bytes_.size() < pending_read_context_size_) {
-            read_bytes_.reserve(kVlessEncryptionMaxRecordCiphertextSize);
             read_bytes_.resize(pending_read_context_size_);
         }
         auto& context = read_bytes_;
@@ -108,6 +107,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         aead_ready_ = true;
         pending_read_context_size_ = 0;
         header_xor_from_context_ = false;
+        memory::ByteVector{read_bytes_.get_allocator()}.swap(read_bytes_);
     }
 
     auto& header = read_header_;
@@ -128,7 +128,6 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     }
 
     if (read_bytes_.size() < encrypted_size_) {
-        read_bytes_.reserve(kVlessEncryptionMaxRecordCiphertextSize);
         read_bytes_.resize(encrypted_size_);
     }
     if (!co_await src_.ReadExact(read_bytes_.data(), encrypted_size_,
@@ -144,10 +143,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
     buf::MultiBuffer out;
     buf::BufferGuard plain_buffer;
-    std::array<
-        uint8_t,
-        kVlessEncryptionMaxRecordCiphertextSize - kVlessEncryptionTagSize>
-        plain_scratch;
+    memory::ByteVector plain_scratch;
     std::span<uint8_t> plain;
     if (plain_capacity <= buf::Buffer::kSize) {
         plain_buffer = buf::BufferGuard{buf::Buffer::New()};
@@ -157,6 +153,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         }
         plain = plain_buffer->Tail().first(plain_capacity);
     } else {
+        plain_scratch.resize(plain_capacity);
         plain = std::span<uint8_t>(plain_scratch.data(), plain_capacity);
     }
 
@@ -170,11 +167,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     }
 
     if (rekey) {
-        std::array<
-            uint8_t,
-            kVlessEncryptionRecordHeaderSize +
-                kVlessEncryptionMaxRecordCiphertextSize>
-            rekey_context;
+        memory::ByteVector rekey_context(header.size() + encrypted_span.size());
         std::copy(header.begin(), header.end(), rekey_context.begin());
         std::copy(
             encrypted_span.begin(),
@@ -182,7 +175,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
             rekey_context.begin() + static_cast<std::ptrdiff_t>(header.size()));
         if (!Rekey(std::span<const uint8_t>(
                 rekey_context.data(),
-                header.size() + encrypted_span.size()))) {
+                rekey_context.size()))) {
             ThrowVlessEncryptionIoError("VLESS Encryption read rekey failed");
         }
     }
@@ -201,6 +194,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     header_read_ = 0;
     bytes_read_ = 0;
     encrypted_size_ = 0;
+    memory::ByteVector{read_bytes_.get_allocator()}.swap(read_bytes_);
     co_return out;
 }
 
@@ -277,11 +271,21 @@ net::awaitable<void> VlessEncryptionWriter::WritePlaintext(
         const size_t n = std::min<size_t>(
             data.size(),
             kVlessEncryptionMaxPlaintextSize);
-        std::array<
-            uint8_t,
-            kVlessEncryptionRecordHeaderSize +
-                kVlessEncryptionMaxPlaintextSize +
-                kVlessEncryptionTagSize> frame{};
+        const size_t frame_capacity =
+            kVlessEncryptionRecordHeaderSize + n + kVlessEncryptionTagSize;
+        buf::BufferGuard frame_buffer;
+        memory::ByteVector large_frame;
+        std::span<uint8_t> frame;
+        if (frame_capacity <= buf::Buffer::kSize) {
+            frame_buffer = buf::BufferGuard{buf::Buffer::New()};
+            if (!frame_buffer) {
+                ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
+            }
+            frame = frame_buffer->Tail().first(frame_capacity);
+        } else {
+            large_frame.resize(frame_capacity);
+            frame = std::span<uint8_t>(large_frame.data(), frame_capacity);
+        }
 
         const bool rekey = IsVlessEncryptionMaxNonce(aead_.Nonce());
         const auto written = SealVlessEncryptionRecord(

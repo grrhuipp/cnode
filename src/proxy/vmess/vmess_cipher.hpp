@@ -32,6 +32,8 @@ namespace vmess {
 class VMessCipher {
 public:
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
+    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
+                proxy::AeadDirection direction);
     ~VMessCipher() = default;
 
     VMessCipher(const VMessCipher&)            = delete;

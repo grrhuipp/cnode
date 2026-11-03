@@ -1,20 +1,21 @@
 #include "vless_encryption_record.hpp"
 
 #include <blake3.h>
-#include <openssl/evp.h>
+#include <openssl/aead.h>
+#include <openssl/err.h>
 
 #include <algorithm>
 
 namespace acpp::vless {
 namespace {
 
-[[nodiscard]] const EVP_CIPHER* ResolveCipher(
+[[nodiscard]] const EVP_AEAD* ResolveAead(
     VlessEncryptionAeadCipher cipher) noexcept {
     switch (cipher) {
     case VlessEncryptionAeadCipher::Aes256Gcm:
-        return EVP_aes_256_gcm();
+        return EVP_aead_aes_256_gcm();
     case VlessEncryptionAeadCipher::Chacha20Poly1305:
-        return EVP_chacha20_poly1305();
+        return EVP_aead_chacha20_poly1305();
     }
     return nullptr;
 }
@@ -105,20 +106,25 @@ std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     std::span<const uint8_t> context,
     std::span<const uint8_t> key,
     VlessEncryptionAeadCipher cipher) noexcept {
-    if (!ResolveCipher(cipher)) {
+    const EVP_AEAD* algorithm = ResolveAead(cipher);
+    if (!algorithm) {
         return std::nullopt;
     }
 
     VlessEncryptionAead aead;
     const auto derived = DeriveAeadKey(context, key);
     aead.cipher_ = cipher;
-    try {
-        if (!aead.encryptor_.Configure(ResolveCipher(cipher), derived) ||
-            !aead.decryptor_.Configure(ResolveCipher(cipher), derived))
-            return std::nullopt;
-    } catch (const std::bad_alloc&) {
+    if (EVP_AEAD_CTX_init(
+            &aead.aead_ctx_,
+            algorithm,
+            derived.data(),
+            derived.size(),
+            kVlessEncryptionTagSize,
+            nullptr) != 1) {
+        ERR_clear_error();
         return std::nullopt;
     }
+    aead.initialized_ = true;
     return aead;
 }
 
@@ -135,7 +141,26 @@ std::optional<size_t> VlessEncryptionAead::SealWithNonce(
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    return encryptor_.Process(nonce, plaintext, additional_data, output);
+    if (!initialized_ || output.size() < kVlessEncryptionTagSize ||
+        output.size() - kVlessEncryptionTagSize < plaintext.size()) {
+        return std::nullopt;
+    }
+    size_t out_len = 0;
+    if (EVP_AEAD_CTX_seal(
+            &aead_ctx_,
+            output.data(),
+            &out_len,
+            output.size(),
+            nonce.data(),
+            nonce.size(),
+            plaintext.data(),
+            plaintext.size(),
+            additional_data.data(),
+            additional_data.size()) != 1) {
+        ERR_clear_error();
+        return std::nullopt;
+    }
+    return out_len;
 }
 
 std::optional<size_t> VlessEncryptionAead::Open(
@@ -151,7 +176,26 @@ std::optional<size_t> VlessEncryptionAead::OpenWithNonce(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> additional_data,
     std::span<uint8_t> output) noexcept {
-    return decryptor_.Process(nonce, ciphertext, additional_data, output);
+    if (!initialized_ || ciphertext.size() < kVlessEncryptionTagSize ||
+        output.size() < ciphertext.size() - kVlessEncryptionTagSize) {
+        return std::nullopt;
+    }
+    size_t out_len = 0;
+    if (EVP_AEAD_CTX_open(
+            &aead_ctx_,
+            output.data(),
+            &out_len,
+            output.size(),
+            nonce.data(),
+            nonce.size(),
+            ciphertext.data(),
+            ciphertext.size(),
+            additional_data.data(),
+            additional_data.size()) != 1) {
+        ERR_clear_error();
+        return std::nullopt;
+    }
+    return out_len;
 }
 
 

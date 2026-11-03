@@ -116,6 +116,8 @@ proxy::vmess::inbound::Handler::Process(
         }
     }
 
+    handshake_guard = {};
+    memory::ByteVector{}.swap(large_header);
 
     LOG_CONN_TRACE(ctx,
                    "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
@@ -168,6 +170,7 @@ proxy::vmess::inbound::Handler::Process(
     }
 
     vmess_session.SetRequest(std::move(*request));
+    request.reset();
 
     ctx.outbound.original_target = target;
     ctx.outbound.target = std::move(target);

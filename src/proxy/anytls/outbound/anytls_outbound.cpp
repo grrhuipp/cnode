@@ -690,6 +690,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
 
         auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+        *transport_target = {};
         if (!dial_result.Ok()) {
             LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
                               ctx.inbound.source_ip, ctx.outbound.target,
@@ -723,6 +724,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
             new_stream->Cancel();
             co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
+        memory::ByteVector{}.swap(auth_packet);
         session = memory::AllocateShared<ClientSession>(io_context, std::move(new_stream),
             padding_, std::move(opening_scheme));
         transport_lease = pool_->Adopt(session);

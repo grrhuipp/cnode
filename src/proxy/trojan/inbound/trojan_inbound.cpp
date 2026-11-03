@@ -131,62 +131,61 @@ proxy::trojan::inbound::Handler::Process(
     }
     std::optional<UserOnlineSessionGuard> user_session;
 
-    buf::BufferGuard handshake_guard{buf::Buffer::New()};
-    if (!handshake_guard) {
-        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
-    }
-    uint8_t* handshake_buf = handshake_guard->Tail().data();
-    size_t total_read = 0;
-    auto read_until = [&](size_t required) -> net::awaitable<ErrorCode> {
-        if (required > handshake_guard->Available()) {
-            co_return ErrorCode::PROTOCOL_DECODE_FAILED;
-        }
-        while (total_read < required) {
-            size_t n = 0;
-            try {
-                n = co_await stream->AsyncRead(net::buffer(
-                    handshake_buf + total_read, required - total_read));
-            } catch (const IoSystemError&) {
-                co_return stream->ConsumePhaseDeadline()
-                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED;
-            }
-            if (n == 0) {
-                if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
-                    co_return ErrorCode::TIMEOUT;
-                }
+    size_t consumed = 0;
+    auto read_request = [&]() -> net::awaitable<tl::expected<::acpp::trojan::TrojanRequest, ErrorCode>> {
+        std::array<uint8_t, 320> handshake_buf{};
+        size_t total_read = 0;
+        auto read_until = [&](size_t required) -> net::awaitable<ErrorCode> {
+            if (required > handshake_buf.size()) {
                 co_return ErrorCode::PROTOCOL_DECODE_FAILED;
             }
-            total_read += n;
+            while (total_read < required) {
+                size_t n = 0;
+                try {
+                    n = co_await stream->AsyncRead(net::buffer(
+                        handshake_buf.data() + total_read, required - total_read));
+                } catch (const IoSystemError&) {
+                    co_return stream->ConsumePhaseDeadline()
+                        ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED;
+                }
+                if (n == 0) {
+                    if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
+                        co_return ErrorCode::TIMEOUT;
+                    }
+                    co_return ErrorCode::PROTOCOL_DECODE_FAILED;
+                }
+                total_read += n;
+            }
+            co_return ErrorCode::OK;
+        };
+        if (auto error = co_await read_until(59); error != ErrorCode::OK) {
+            co_return tl::unexpected(error);
         }
-        co_return ErrorCode::OK;
+        while (true) {
+            auto address = DecodeAddress(
+                std::span(handshake_buf.data() + 59, total_read - 59),
+                AddressWireFormat::Socks5, {253, true});
+            if (address.status == AddressDecodeStatus::Invalid) {
+                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            }
+            const size_t required = 59 + (address.status == AddressDecodeStatus::Complete
+                ? address.consumed + 2 : address.required);
+            if (auto error = co_await read_until(required); error != ErrorCode::OK) {
+                co_return tl::unexpected(error);
+            }
+            if (address.status == AddressDecodeStatus::Complete) break;
+        }
+        auto parsed = ::acpp::trojan::TrojanCodec::ParseRequest(
+            handshake_buf.data(), total_read, consumed);
+        if (!parsed) {
+            LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        co_return std::move(*parsed);
     };
-    // The credential prefix, address and terminal CRLF are independently
-    // framed. Incomplete TCP segments never reach authentication.
-    if (auto error = co_await read_until(59); error != ErrorCode::OK) {
-        co_return fail_abortive(error);
-    }
-    while (true) {
-        auto address = DecodeAddress(
-            std::span(handshake_buf + 59, total_read - 59),
-            AddressWireFormat::Socks5, {253, true});
-        if (address.status == AddressDecodeStatus::Invalid) {
-            co_return fail_abortive(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        const size_t required = 59 + (address.status == AddressDecodeStatus::Complete
-            ? address.consumed + 2 : address.required);
-        if (auto error = co_await read_until(required); error != ErrorCode::OK) {
-            co_return fail_abortive(error);
-        }
-        if (address.status == AddressDecodeStatus::Complete) break;
-    }
-
-    size_t consumed = 0;
-    auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
-        handshake_buf, total_read, consumed);
-
+    auto request = co_await read_request();
     if (!request) {
-        LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
-        co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return fail_abortive(request.error());
     }
 
     const std::string_view password_hash = request->PasswordHashView();
@@ -234,7 +233,6 @@ proxy::trojan::inbound::Handler::Process(
     ctx.outbound.target = std::move(request->target);
     ctx.content.network = net;
 
-    handshake_guard = {};
 
     if (net == Network::UDP) {
         TrojanUdpReader udp_reader(*stream);

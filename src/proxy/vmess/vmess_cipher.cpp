@@ -34,6 +34,30 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
         throw std::runtime_error("VMess AEAD initialization failed");
 }
 
+VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
+                         proxy::AeadDirection direction)
+    : security_(security) {
+    std::memcpy(iv_.data(), iv, iv_.size());
+    const EVP_CIPHER* algorithm = nullptr;
+    std::span<const uint8_t> actual_key(key, 16);
+    std::array<uint8_t, 32> expanded{};
+    if (security == Security::CHACHA20_POLY1305) {
+        GenerateChaCha20Key(key, expanded.data());
+        actual_key = expanded;
+        algorithm = EVP_chacha20_poly1305();
+    } else if (security == Security::AES_128_GCM) {
+        algorithm = EVP_aes_128_gcm();
+    }
+    if (algorithm) {
+        const bool ok = direction == proxy::AeadDirection::Encrypt
+            ? encryptor_.Configure(algorithm, actual_key)
+            : decryptor_.Configure(algorithm, actual_key);
+        if (!ok) {
+            throw std::runtime_error("VMess AEAD initialization failed");
+        }
+    }
+}
+
 ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext) {
     if (security_ == Security::NONE || security_ == Security::ZERO) {
         if (len > 0 && plaintext) memcpy(ciphertext, plaintext, len);

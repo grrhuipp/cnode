@@ -107,8 +107,8 @@ namespace vmess::encoding {
 namespace {
 
 struct EncodeRequestHeaderState final {
-    MemoryAccount user;
-    TargetAddress target;
+    const MemoryAccount* user = nullptr;
+    const TargetAddress* target = nullptr;
     Security security = Security::AES_128_GCM;
     Command command = Command::TCP;
     bool sent = false;
@@ -648,9 +648,11 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    const size_t address_size = EncodeAddressTo(
-        state.target, header.data() + header_len, header.size() - header_len,
-        AddressWireFormat::PortFirst);
+    const size_t address_size = state.target
+        ? EncodeAddressTo(
+            *state.target, header.data() + header_len, header.size() - header_len,
+            AddressWireFormat::PortFirst)
+        : 0;
     if (address_size == 0) return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     header_len += address_size;
 
@@ -675,8 +677,9 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
+    if (!state.user) return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
     std::array<uint8_t, 16> auth_id;
-    GenerateAuthID(state.user.auth_key.data(), ts, auth_id.data());
+    GenerateAuthID(state.user->auth_key.data(), ts, auth_id.data());
 
     uint8_t connection_nonce[8];
     if (RAND_bytes(connection_nonce, 8) != 1) {
@@ -688,12 +691,12 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
 
     const std::array<std::string_view, 3> len_key_path{
         KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, auth_id_sv, nonce_sv};
-    auto len_key = KDF16(state.user.cmd_key.data(), 16, len_key_path);
+    auto len_key = KDF16(state.user->cmd_key.data(), 16, len_key_path);
 
     uint8_t len_iv[12];
     const std::array<std::string_view, 3> len_iv_path{
         KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV, auth_id_sv, nonce_sv};
-    KDF(state.user.cmd_key.data(), 16, len_iv_path, len_iv, 12);
+    KDF(state.user->cmd_key.data(), 16, len_iv_path, len_iv, 12);
 
     uint8_t len_plain[2] = {
         static_cast<uint8_t>((header_len >> 8) & 0xFF),
@@ -709,12 +712,12 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
 
     const std::array<std::string_view, 3> header_key_path{
         KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY, auth_id_sv, nonce_sv};
-    auto header_key = KDF16(state.user.cmd_key.data(), 16, header_key_path);
+    auto header_key = KDF16(state.user->cmd_key.data(), 16, header_key_path);
 
     uint8_t header_iv[12];
     const std::array<std::string_view, 3> header_iv_path{
         KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_IV, auth_id_sv, nonce_sv};
-    KDF(state.user.cmd_key.data(), 16, header_iv_path, header_iv, 12);
+    KDF(state.user->cmd_key.data(), 16, header_iv_path, header_iv, 12);
 
     std::array<uint8_t, kVMessHandshakeHeaderEncMax> header_enc{};
     const size_t header_enc_len = header_len + 16;
@@ -817,18 +820,17 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
     KDF(state.response_key.data(), 16, resp_header_key_path, header_key, 16);
     KDF(state.response_iv.data(), 16, resp_header_iv_path, header_iv, 12);
 
-    std::array<uint8_t, kVMessResponseHeaderMax> header_dec{};
     size_t header_dec_len = 0;
     if (!AES128GCMDecryptTo(header_key, header_iv, sizeof(header_iv),
                             header_enc.data(), static_cast<size_t>(header_len) + 16,
                             nullptr, 0,
-                            header_dec.data(), header_dec.size(), header_dec_len) ||
+                            header_enc.data(), kVMessResponseHeaderMax, header_dec_len) ||
         header_dec_len != header_len) {
         co_return false;
     }
 
     // 验证 response_header 字节
-    if (header_dec[0] != state.response_header) {
+    if (header_enc[0] != state.response_header) {
         co_return false;
     }
 
@@ -841,8 +843,8 @@ ClientSession::ClientSession(const MemoryAccount& user,
                              Security security,
                              Command command,
                              uint8_t options)
-    : user_(user)
-    , target_(target)
+    : user_(&user)
+    , target_(&target)
     , security_(security)
     , command_(command) {
     std::array<uint8_t, 33> random_bytes{};
@@ -863,13 +865,14 @@ ClientSession::ClientSession(const MemoryAccount& user,
         options_ = Option::CHUNK_STREAM | Option::CHUNK_MASKING | Option::GLOBAL_PADDING;
     }
 
-    request_body_state_.cipher.emplace(security_, request_key_.data(), request_iv_.data());
+    request_body_state_.cipher.emplace(
+        security_, request_key_.data(), request_iv_.data(), proxy::AeadDirection::Encrypt);
     if ((options_ & Option::AUTHENTICATED_LENGTH) != 0 &&
         (security_ == Security::AES_128_GCM || security_ == Security::CHACHA20_POLY1305)) {
         const std::array<std::string_view, 1> path{"auth_len"};
         auto length_key = KDF16(request_body_key_.data(), request_body_key_.size(), path);
         request_body_state_.length_cipher.emplace(
-            security_, length_key.data(), request_body_iv_.data());
+            security_, length_key.data(), request_body_iv_.data(), proxy::AeadDirection::Encrypt);
     }
     request_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0 &&
         !(security_ == Security::NONE && command_ != Command::UDP);
@@ -878,13 +881,14 @@ ClientSession::ClientSession(const MemoryAccount& user,
         request_body_state_.mask.emplace(request_body_iv_.data());
     }
 
-    response_body_state_.cipher.emplace(security_, response_key_.data(), response_iv_.data());
+    response_body_state_.cipher.emplace(
+        security_, response_key_.data(), response_iv_.data(), proxy::AeadDirection::Decrypt);
     if ((options_ & Option::AUTHENTICATED_LENGTH) != 0 &&
         (security_ == Security::AES_128_GCM || security_ == Security::CHACHA20_POLY1305)) {
         const std::array<std::string_view, 1> path{"auth_len"};
         auto length_key = KDF16(request_body_key_.data(), request_body_key_.size(), path);
         response_body_state_.length_cipher.emplace(
-            security_, length_key.data(), request_body_iv_.data());
+            security_, length_key.data(), response_iv_.data(), proxy::AeadDirection::Decrypt);
     }
     response_body_state_.global_padding = (options_ & Option::GLOBAL_PADDING) != 0 &&
         !(security_ == Security::NONE && command_ != Command::UDP);
@@ -910,6 +914,10 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     state.options = options_;
     auto result = co_await ::acpp::vmess::encoding::EncodeRequestHeader(state, stream);
     sent_ = state.sent;
+    if (sent_) {
+        user_ = nullptr;
+        target_ = nullptr;
+    }
     co_return result;
 }
 

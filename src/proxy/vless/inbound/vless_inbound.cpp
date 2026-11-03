@@ -500,10 +500,11 @@ proxy::vless::inbound::Handler::Process(
     const bool packet_addr_udp =
         request->command == ::acpp::vless::Command::UDP &&
         ::acpp::vless::IsPacketAddrMagic(request->target);
+    const std::array<uint8_t, 16> request_uuid = request->uuid;
     ctx.outbound.original_target = request->target;
     ctx.outbound.target = std::move(request->target);
     ctx.content.network = net;
-
+    request.reset();
     uint8_t response_header[2]{};
     const size_t response_len =
         ::acpp::vless::Codec::EncodeResponseHeaderTo(response_header, sizeof(response_header));
@@ -553,9 +554,9 @@ proxy::vless::inbound::Handler::Process(
     if (use_vision) {
         ::acpp::vless::VisionReader vision_reader(
             *active_reader,
-            request->uuid,
+            request_uuid,
             {});
-        ::acpp::vless::VisionWriter vision_writer(*active_writer, request->uuid);
+        ::acpp::vless::VisionWriter vision_writer(*active_writer, request_uuid);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver.dispatch_policy,

@@ -103,8 +103,10 @@ VisionReader::VisionReader(transport::MultiBufferReader& src,
                            std::span<const uint8_t> initial)
     : src_(src)
     , user_uuid_(user_uuid) {
-    EnsureAppendCapacity(pending_, initial.size(), buf::Buffer::kSize);
-    pending_.insert(pending_.end(), initial.begin(), initial.end());
+    if (!initial.empty()) {
+        EnsureAppendCapacity(pending_, initial.size(), buf::Buffer::kSize);
+        pending_.insert(pending_.end(), initial.begin(), initial.end());
+    }
 }
 
 void VisionReader::Feed(buf::MultiBuffer mb) {
@@ -191,8 +193,7 @@ bool VisionReader::TryDecode(buf::MultiBuffer& out) {
 
         pending_offset_ += frame_len;
         if (pending_offset_ >= pending_.size()) {
-            pending_.clear();
-            pending_offset_ = 0;
+            release_pending();
         }
 
         if (command == kCommandPaddingEnd ||
@@ -309,12 +310,17 @@ bool VisionWriter::AppendVisionFrameBuffers(
         ? kVisionUuidHeaderLen
         : kVisionBaseHeaderLen;
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header || header->Available() < header_len) {
-        return false;
+    buf::Buffer* header_buf = header_owner.back();
+    if (!header_buf || header_buf->Available() < header_len) {
+        buf::BufferGuard header{buf::Buffer::New()};
+        if (!header || header->Available() < header_len) {
+            return false;
+        }
+        header_buf = header.get();
+        header_owner.push_back(std::move(header));
     }
 
-    uint8_t* tail = header->Tail().data();
+    uint8_t* tail = header_buf->Tail().data();
     size_t pos = 0;
     if (send_uuid_) {
         std::memcpy(tail, user_uuid_.data(), user_uuid_.size());
@@ -326,10 +332,9 @@ bool VisionWriter::AppendVisionFrameBuffers(
     pos += 2;
     WriteU16(tail + pos, padding_len);
     pos += 2;
-    header->Produce(static_cast<uint32_t>(pos));
-    out.emplace_back(header->Bytes().data(), header->Bytes().size());
-    header_owner.push_back(std::move(header));
-
+    header_buf->Produce(static_cast<uint32_t>(pos));
+    header_owner.RecordTailProduced(pos);
+    out.emplace_back(tail, pos);
     if (!content.empty()) {
         out.emplace_back(content.data(), content.size());
     }

@@ -70,6 +70,11 @@ inline void DisableTransparentHugePages() noexcept {
 }
 
 namespace detail {
+[[nodiscard]] inline std::uintptr_t CurrentThreadToken() noexcept {
+    thread_local std::uint8_t anchor = 0;
+    return reinterpret_cast<std::uintptr_t>(&anchor);
+}
+
 
 [[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
     if (!ValidAlignment(alignment)) {
@@ -90,9 +95,13 @@ inline void DeallocateProcessRaw(
     void* block, std::size_t bytes_value, std::size_t alignment) noexcept {
     if (!block) return;
 #if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
-    (void)bytes_value;
-    (void)alignment;
-    mi_free(block);
+    if (bytes_value != 0 && ValidAlignment(alignment)) {
+        mi_free_size_aligned(block, bytes_value, alignment);
+    } else if (bytes_value != 0) {
+        mi_free_size(block, bytes_value);
+    } else {
+        mi_free(block);
+    }
 #else
     const std::size_t actual_bytes = bytes_value == 0 ? 1 : bytes_value;
     std::pmr::new_delete_resource()->deallocate(
@@ -359,7 +368,7 @@ public:
         : upstream_((validate_memory_pool_config(config), &upstream))
         , request_initial_buffer_bytes_(config.request_initial_buffer_bytes_)
         , retained_block_bytes_(config.retained_block_bytes_)
-        , owner_thread_(std::this_thread::get_id()) {}
+        , owner_thread_(detail::CurrentThreadToken()) {}
 
     worker_memory(const worker_memory&) = delete;
     worker_memory& operator=(const worker_memory&) = delete;
@@ -390,8 +399,8 @@ public:
     // Releases cached blocks and drains the calling thread's coroutine frame
     // cache on the bound owner thread.
     void trim() {
-        const auto caller = std::this_thread::get_id();
-        if (trimmed_owner_ != std::thread::id{} && caller != trimmed_owner_) {
+        const auto caller = detail::CurrentThreadToken();
+        if (trimmed_owner_ != 0 && caller != trimmed_owner_) {
             throw std::logic_error("worker memory trim must run on its owner worker");
         }
         trimmed_owner_ = caller;
@@ -499,13 +508,14 @@ public:
                     std::size_t alignment = 0) noexcept {
         if (!pointer) return;
         auto* header = reinterpret_cast<SlotHeader*>(pointer) - 1;
-        if (header->owner != std::this_thread::get_id()) {
+        auto* chunk = header->chunk;
+        if (!chunk) return;
+        if (chunk->owner != detail::CurrentThreadToken()) {
             OnCrossThreadFree();
             return;
         }
-        auto* chunk = header->chunk;
-        if (!chunk || chunk->pool != this || chunk->live == 0 ||
-            bytes > header->capacity ||
+        if (chunk->pool != this || chunk->live == 0 ||
+            bytes > chunk->slot_capacity ||
             (alignment && (!ValidAlignment(alignment) ||
              reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0))) return;
         --chunk->live;
@@ -564,12 +574,11 @@ private:
     struct Chunk;
     struct alignas(kSlotAlignment) SlotHeader {
         Chunk* chunk = nullptr;
-        std::thread::id owner{};
-        std::size_t capacity = 0;
         SlotHeader* next_free = nullptr;
     };
     struct Chunk {
         worker_memory* pool = nullptr;
+        std::uintptr_t owner = 0;
         Chunk* all_next = nullptr;
         Chunk* all_prev = nullptr;
         Chunk* rec_next = nullptr;
@@ -581,6 +590,7 @@ private:
         std::size_t map_bytes = 0;
         std::size_t map_alignment = kSlotAlignment;
         std::size_t stride = 0;
+        std::size_t slot_capacity = 0;
         std::size_t class_index = 0;
         std::size_t live = 0;
         Clock::time_point idle_at{};
@@ -618,10 +628,16 @@ private:
     [[nodiscard]] static Layout PooledLayout(std::size_t stride, std::size_t depth) noexcept {
         const auto page = kAllocationPageBytes;
         const auto target = std::max(page, kThreadPoolTargetBytes);
-        const auto pages = std::min(
-            std::size_t{1} << std::min(depth, std::size_t{4}), target / page);
-        Layout best{stride, RoundUp(ChunkLead() + stride, page), 1, false};
-        for (std::size_t n = 1; n <= pages; ++n) {
+        const auto min_pages = RoundUp(ChunkLead() + stride, page) / page;
+        const auto max_pages = std::max(
+            min_pages,
+            std::min(min_pages << std::min(depth, std::size_t{4}), target / page));
+        Layout best{
+            stride,
+            min_pages * page,
+            (min_pages * page - ChunkLead()) / stride,
+            false};
+        for (std::size_t n = min_pages; n <= max_pages; ++n) {
             const auto map_bytes = n * page;
             if (map_bytes < ChunkLead() + stride) continue;
             const auto slots = (map_bytes - ChunkLead()) / stride;
@@ -634,8 +650,7 @@ private:
         return static_cast<std::size_t>(chunk.end - chunk.bump) >= chunk.stride;
     }
     [[nodiscard]] void* Carve(Chunk& chunk) noexcept {
-        auto* header = ::new (chunk.bump) SlotHeader{
-            &chunk, owner_thread_, chunk.stride - sizeof(SlotHeader)};
+        auto* header = ::new (chunk.bump) SlotHeader{&chunk, nullptr};
         chunk.bump += chunk.stride;
         if (chunk.idle) MarkUsed(chunk);
         ++chunk.live;
@@ -662,7 +677,8 @@ private:
             reinterpret_cast<std::uintptr_t>(chunk) + sizeof(Chunk) + sizeof(SlotHeader),
             eff_align);
         auto* header = ::new (reinterpret_cast<SlotHeader*>(address) - 1) SlotHeader{
-            chunk, owner_thread_, class_bytes};
+            chunk, nullptr};
+        chunk->slot_capacity = class_bytes;
         chunk->large_user_ptr = header + 1;
         chunk->live = 1;
         return chunk->large_user_ptr;
@@ -678,7 +694,8 @@ private:
             reinterpret_cast<std::uintptr_t>(chunk) + sizeof(Chunk) + sizeof(SlotHeader),
             eff_align);
         auto* header = ::new (reinterpret_cast<SlotHeader*>(address) - 1) SlotHeader{
-            chunk, owner_thread_, bytes};
+            chunk, nullptr};
+        chunk->slot_capacity = bytes;
         chunk->live = 1;
         return header + 1;
     }
@@ -692,12 +709,16 @@ private:
             return nullptr;
         }
         if (!mapped) return nullptr;
-        owner_thread_ = std::this_thread::get_id();
+        owner_thread_ = detail::CurrentThreadToken();
         auto* chunk = ::new (mapped) Chunk;
         chunk->pool = this;
+        chunk->owner = owner_thread_;
         chunk->map_bytes = layout.map_bytes;
         chunk->map_alignment = map_alignment;
         chunk->stride = layout.slot_bytes;
+        chunk->slot_capacity = layout.slot_bytes >= sizeof(SlotHeader)
+            ? layout.slot_bytes - sizeof(SlotHeader)
+            : 0;
         chunk->class_index = class_index;
         chunk->direct = layout.direct && !large_cached;
         chunk->large_cached = large_cached;
@@ -800,8 +821,8 @@ private:
     std::size_t request_initial_buffer_bytes_;
     std::size_t retained_block_bytes_;
     std::size_t cached_large_bytes_ = 0;
-    std::thread::id owner_thread_{};
-    std::thread::id trimmed_owner_{};
+    std::uintptr_t owner_thread_ = 0;
+    std::uintptr_t trimmed_owner_ = 0;
     std::array<Class, kClassCount> classes_{};
     std::array<Chunk*, kLargeBinCount> large_bins_{};
     Chunk* all_ = nullptr;
@@ -922,6 +943,10 @@ protected:
 
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
+#if defined(CNODE_USE_MIMALLOC) && !defined(__SANITIZE_ADDRESS__)
+    mi_option_set(mi_option_allow_thp, 0);
+    mi_option_set(mi_option_purge_delay, 10);
+#endif
     static ThreadPoolFacade default_resource;
     std::pmr::set_default_resource(&default_resource);
 }
@@ -948,7 +973,237 @@ template <class T, class... Args>
     return std::allocate_shared<T>(ThreadLocalAllocator<T>{}, std::forward<Args>(args)...);
 }
 template <class T> using ThreadLocalVector = std::pmr::vector<T>;
-template <class T> using ThreadLocalDeque = std::pmr::deque<T>;
+
+// Zero-allocation-when-empty PMR ring deque. Allocates a contiguous power-of-2
+// array from its memory_resource on demand and returns it immediately when the
+// queue drains to empty, so idle sessions/substreams retain 0 bytes.
+template <class T>
+class RingDeque {
+public:
+    using value_type = T;
+    using allocator_type = std::pmr::polymorphic_allocator<T>;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using reference = T&;
+    using const_reference = const T&;
+
+    RingDeque() noexcept : resource_(std::pmr::get_default_resource()) {}
+    explicit RingDeque(std::pmr::memory_resource* resource) noexcept
+        : resource_(resource ? resource : std::pmr::get_default_resource()) {}
+    explicit RingDeque(const allocator_type& alloc) noexcept
+        : resource_(alloc.resource()) {}
+
+    RingDeque(const RingDeque& other)
+        : resource_(std::pmr::get_default_resource()) {
+        if (!other.empty()) {
+            Reserve(other.size_);
+            for (std::size_t i = 0; i < other.size_; ++i) {
+                std::construct_at(data_ + size_, other[i]);
+                ++size_;
+            }
+        }
+    }
+
+    RingDeque(RingDeque&& other) noexcept
+        : resource_(other.resource_)
+        , data_(std::exchange(other.data_, nullptr))
+        , head_(std::exchange(other.head_, 0))
+        , size_(std::exchange(other.size_, 0))
+        , capacity_(std::exchange(other.capacity_, 0)) {}
+
+    RingDeque& operator=(const RingDeque& other) {
+        if (this != &other) {
+            clear();
+            if (!other.empty()) {
+                Reserve(other.size_);
+                for (std::size_t i = 0; i < other.size_; ++i) {
+                    std::construct_at(data_ + size_, other[i]);
+                    ++size_;
+                }
+            }
+        }
+        return *this;
+    }
+
+    RingDeque& operator=(RingDeque&& other) noexcept {
+        if (this != &other) {
+            clear();
+            if (resource_ == other.resource_) {
+                data_ = std::exchange(other.data_, nullptr);
+                head_ = std::exchange(other.head_, 0);
+                size_ = std::exchange(other.size_, 0);
+                capacity_ = std::exchange(other.capacity_, 0);
+            } else {
+                if (!other.empty()) {
+                    Reserve(other.size_);
+                    for (std::size_t i = 0; i < other.size_; ++i) {
+                        std::construct_at(data_ + size_, std::move(other[i]));
+                        ++size_;
+                    }
+                }
+                other.clear();
+            }
+        }
+        return *this;
+    }
+
+    ~RingDeque() noexcept {
+        clear();
+    }
+
+    [[nodiscard]] allocator_type get_allocator() const noexcept {
+        return allocator_type(resource_);
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
+    [[nodiscard]] T& front() noexcept { return data_[head_]; }
+    [[nodiscard]] const T& front() const noexcept { return data_[head_]; }
+
+    [[nodiscard]] T& back() noexcept {
+        return data_[(head_ + size_ - 1) & (capacity_ - 1)];
+    }
+    [[nodiscard]] const T& back() const noexcept {
+        return data_[(head_ + size_ - 1) & (capacity_ - 1)];
+    }
+
+    [[nodiscard]] T& operator[](std::size_t index) noexcept {
+        return data_[(head_ + index) & (capacity_ - 1)];
+    }
+    [[nodiscard]] const T& operator[](std::size_t index) const noexcept {
+        return data_[(head_ + index) & (capacity_ - 1)];
+    }
+
+    template <typename... Args>
+    T& emplace_back(Args&&... args) {
+        if (size_ == capacity_) {
+            Grow();
+        }
+        const std::size_t idx = (head_ + size_) & (capacity_ - 1);
+        T* ptr = std::construct_at(data_ + idx, std::forward<Args>(args)...);
+        ++size_;
+        return *ptr;
+    }
+
+    void push_back(const T& value) { (void)emplace_back(value); }
+    void push_back(T&& value) { (void)emplace_back(std::move(value)); }
+
+    template <typename... Args>
+    T& emplace_front(Args&&... args) {
+        if (size_ == capacity_) {
+            Grow();
+        }
+        const std::size_t next_head = (head_ + capacity_ - 1) & (capacity_ - 1);
+        T* ptr = std::construct_at(data_ + next_head, std::forward<Args>(args)...);
+        head_ = next_head;
+        ++size_;
+        return *ptr;
+    }
+
+    void push_front(const T& value) { (void)emplace_front(value); }
+    void push_front(T&& value) { (void)emplace_front(std::move(value)); }
+
+    void pop_front() noexcept {
+        std::destroy_at(data_ + head_);
+        head_ = (head_ + 1) & (capacity_ - 1);
+        if (--size_ == 0) {
+            ReleaseStorage();
+        }
+    }
+
+    void pop_back() noexcept {
+        const std::size_t idx = (head_ + size_ - 1) & (capacity_ - 1);
+        std::destroy_at(data_ + idx);
+        if (--size_ == 0) {
+            ReleaseStorage();
+        }
+    }
+
+    void clear() noexcept {
+        for (std::size_t i = 0; i < size_; ++i) {
+            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
+        }
+        size_ = 0;
+        ReleaseStorage();
+    }
+
+    void shrink_to_fit() noexcept {
+        if (size_ == 0) {
+            ReleaseStorage();
+        }
+    }
+
+    void swap(RingDeque& other) noexcept {
+        if (this == &other) return;
+        if (resource_ == other.resource_) {
+            std::swap(data_, other.data_);
+            std::swap(head_, other.head_);
+            std::swap(size_, other.size_);
+            std::swap(capacity_, other.capacity_);
+            return;
+        }
+        RingDeque temp(std::move(*this));
+        *this = std::move(other);
+        other = std::move(temp);
+    }
+
+private:
+    void ReleaseStorage() noexcept {
+        if (data_) {
+            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
+            data_ = nullptr;
+            capacity_ = 0;
+        }
+        head_ = 0;
+    }
+
+    void Reserve(std::size_t min_cap) {
+        std::size_t next_cap = capacity_ ? capacity_ : 4;
+        while (next_cap < min_cap) {
+            next_cap *= 2;
+        }
+        if (next_cap <= capacity_) return;
+        T* next_data = static_cast<T*>(
+            resource_->allocate(next_cap * sizeof(T), alignof(T)));
+        std::size_t constructed = 0;
+        try {
+            for (; constructed < size_; ++constructed) {
+                std::construct_at(
+                    next_data + constructed,
+                    std::move_if_noexcept(data_[(head_ + constructed) & (capacity_ - 1)]));
+            }
+        } catch (...) {
+            for (std::size_t i = 0; i < constructed; ++i) {
+                std::destroy_at(next_data + i);
+            }
+            resource_->deallocate(next_data, next_cap * sizeof(T), alignof(T));
+            throw;
+        }
+        for (std::size_t i = 0; i < size_; ++i) {
+            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
+        }
+        if (data_) {
+            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
+        }
+        data_ = next_data;
+        head_ = 0;
+        capacity_ = next_cap;
+    }
+
+    void Grow() {
+        Reserve(capacity_ ? capacity_ * 2 : 4);
+    }
+
+    std::pmr::memory_resource* resource_;
+    T* data_ = nullptr;
+    std::size_t head_ = 0;
+    std::size_t size_ = 0;
+    std::size_t capacity_ = 0;
+};
+
+template <class T> using ThreadLocalDeque = RingDeque<T>;
 template <class T> using ThreadLocalList = std::pmr::list<T>;
 template <class Key, class Value, class Compare = std::less<Key>>
 using ThreadLocalMap = std::pmr::map<Key, Value, Compare>;

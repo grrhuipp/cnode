@@ -171,42 +171,48 @@ proxy::vmess::outbound::Handler::Process(
     }
     const auto& target = ctx.outbound.target;
 
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service_,
-        .address = prepared_->config.address,
-        .literal_address = prepared_->config.literal_address,
-        .port = prepared_->config.port,
-        .stream_settings = &prepared_->config.stream_settings,
-        .timeout = dial_timeout_,
-        .send_through = &prepared_->config.send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            prepared_->config.stream_settings, prepared_->config.address),
-        .ws_host = prepared_->config.address,
-    });
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
+    auto dial_stream = [&]() -> net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>> {
+        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+            .dns_service = &dns_service_,
+            .address = prepared_->config.address,
+            .literal_address = prepared_->config.literal_address,
+            .port = prepared_->config.port,
+            .stream_settings = &prepared_->config.stream_settings,
+            .timeout = dial_timeout_,
+            .send_through = &prepared_->config.send_through,
+            .inbound_local_addr = inbound_local_addr,
+            .inbound_source_ip = ctx.inbound.source_ip,
+            .inbound_source_port = ctx.inbound.source_port,
+            .tls_server_name = ResolveOutboundTlsServerName(
+                prepared_->config.stream_settings, prepared_->config.address),
+            .ws_host = prepared_->config.address,
+        });
+        if (!transport_target) {
+            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+                LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
+            }
+            co_return tl::unexpected(transport_target.error());
         }
-        co_return tl::unexpected(transport_target.error());
+
+        LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
+                       prepared_->config.address, prepared_->config.port,
+                       prepared_->config.stream_settings.security,
+                       prepared_->config.stream_settings.network);
+
+        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+        if (!dial_result.Ok()) {
+            LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
+                              ctx.inbound.source_ip, ctx.outbound.target,
+                              ctx.outbound.tag, dial_result.error_msg);
+            co_return tl::unexpected(dial_result.error);
+        }
+        co_return std::move(dial_result.stream);
+    };
+    auto dialed = co_await dial_stream();
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
     }
-
-    LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
-                   prepared_->config.address, prepared_->config.port,
-                   prepared_->config.stream_settings.security,
-                   prepared_->config.stream_settings.network);
-
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
-    }
-
-    auto stream = std::move(dial_result.stream);
+    auto stream = std::move(*dialed);
     stream->SetStreamLabel("out");
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {

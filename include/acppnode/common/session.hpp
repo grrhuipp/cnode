@@ -97,7 +97,7 @@ struct Traffic {
 // records directly instead of going through the old app-layer context shell.
 struct Context {
 private:
-    static constexpr std::size_t kInitialArenaBytes = 512;
+    static constexpr std::size_t kInitialArenaBytes = 224;
     memory::request_memory memory_{kInitialArenaBytes, std::pmr::get_default_resource()};
 
 public:

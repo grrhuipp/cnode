@@ -511,7 +511,9 @@ public:
     void clear() noexcept {
         ReleaseOwnedBuffers();
         if (using_spill_) {
-            spill_.clear();
+            memory::ThreadLocalVector<Buffer*> empty{spill_.get_allocator()};
+            spill_.swap(empty);
+            using_spill_ = false;
             spill_start_ = 0;
         } else {
             for (size_t i = 0; i < size_; ++i) {
@@ -646,7 +648,9 @@ private:
             return;
         }
         if (spill_start_ == spill_.size()) {
-            spill_.clear();
+            memory::ThreadLocalVector<Buffer*> empty{spill_.get_allocator()};
+            spill_.swap(empty);
+            using_spill_ = false;
             spill_start_ = 0;
             return;
         }
