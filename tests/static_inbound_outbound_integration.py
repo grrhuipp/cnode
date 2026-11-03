@@ -22,22 +22,28 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def configs(forced_port, routed_port, inbound_overrides=None):
-    forced = {
-        "tag": "forced", "protocol": "vless", "listen": "127.0.0.1",
-        "port": forced_port, "outboundTag": "Chosen",
+def configs(default_port, forced_port, routed_port, inbound_overrides=None):
+    default_inbound = {
+        "tag": "default-direct", "protocol": "vless", "listen": "127.0.0.1",
+        "port": default_port,
         "settings": {"clients": [{"id": str(USER)}]},
     }
+    forced = dict(
+        default_inbound,
+        tag="forced",
+        port=forced_port,
+        routingEnabled=True,
+        outboundTag="Chosen",
+    )
     if inbound_overrides:
         forced.update(inbound_overrides)
-    routed = dict(forced, tag="routed", port=routed_port)
-    routed.pop("outboundTag", None)
+    routed = dict(default_inbound, tag="routed", port=routed_port, routingEnabled=True)
     return {
         "config.json": {"workers": 1, "log": {"enable": False}},
-        "inbounds.json": [forced, routed],
+        "inbounds.json": [default_inbound, forced, routed],
         "outbounds.json": [{"tag": "Chosen", "protocol": "freedom"},
                            {"tag": "chosen", "protocol": "blackhole"}],
-        "routing.json": {"rules": [{"type": "field", "inboundTag": ["forced", "routed"], "outboundTag": "blackhole"}]},
+        "routing.json": {"rules": [{"type": "field", "inboundTag": ["default-direct", "forced", "routed"], "outboundTag": "blackhole"}]},
     }
 
 
@@ -65,7 +71,7 @@ def write_configs(root, values, mixed_case=False):
 
 
 def reject_config(binary, root, overrides, reason):
-    write_configs(root, configs(free_port(), free_port(), overrides))
+    write_configs(root, configs(free_port(), free_port(), free_port(), overrides))
     result = subprocess.run(
         [str(binary), "--config-dir", str(root)], capture_output=True,
         text=True, timeout=5,
@@ -91,11 +97,11 @@ async def probe(port, destination_port):
 
 
 async def run_live(binary, root, mixed_case=False):
-    forced_port, routed_port = free_port(), free_port()
-    while routed_port == forced_port:
-        routed_port = free_port()
-    write_configs(root / "live", configs(forced_port, routed_port), mixed_case)
-
+    ports = set()
+    while len(ports) < 3:
+        ports.add(free_port())
+    default_port, forced_port, routed_port = tuple(ports)
+    write_configs(root / "live", configs(default_port, forced_port, routed_port), mixed_case)
     received = []
 
     async def echo(reader, writer):
@@ -126,14 +132,15 @@ async def run_live(binary, root, mixed_case=False):
                     root / "live" / "child.log"
                 ).read_text(encoding="utf-8", errors="replace")
                 await asyncio.sleep(0.05)
+            assert await probe(default_port, destination_port) == b"\0\0" + PAYLOAD
             assert await probe(forced_port, destination_port) == b"\0\0" + PAYLOAD
-            assert received == [PAYLOAD]
+            assert received == [PAYLOAD, PAYLOAD]
             try:
                 assert await probe(routed_port, destination_port) != b"\0\0" + PAYLOAD
             except (TimeoutError, asyncio.IncompleteReadError):
                 pass  # A silent blackhole may leave the inbound request open.
             await asyncio.sleep(0.1)
-            assert received == [PAYLOAD], "unforced inbound bypassed the blackhole rule"
+            assert received == [PAYLOAD, PAYLOAD], "routed inbound bypassed the blackhole rule"
             if mixed_case:
                 # Inspect actual directory spelling even on case-insensitive filesystems.
                 assert "CaseSensitiveLogs" in {entry.name for entry in (root / "live").iterdir()}
@@ -162,12 +169,13 @@ async def main(binary, root):
         ({"outboundTag": "missing"}, "references unknown outboundTag"),
         ({"outboundTag": ""}, "outboundTag must not be empty"),
         ({"outboundTag": 3}, "outboundTag"),
-        ({"routingEnabled": False}, "routingEnabled is removed"),
+        ({"routingEnabled": "true"}, "routingEnabled"),
+        ({"routing_enabled": True}, "must use routingEnabled"),
         ({"outbound_tag": "chosen"}, "must use outboundTag"),
         ({"outbound": "chosen"}, "must use outboundTag"),
     )):
         reject_config(binary, root / f"rejected-{index}", overrides, message)
-    print("static inbound forced outbound bypasses routing; unconfigured inbound follows rules")
+    print("static inbound defaults to direct; routingEnabled enables routing; outboundTag forces outbound")
 
 
 if __name__ == "__main__":

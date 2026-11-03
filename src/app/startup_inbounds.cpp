@@ -47,8 +47,11 @@ PreparedStartupInbound PrepareInbound(
         .sniffing = source.sniffing,
         .outbound_policy = source.outbound_tag
             ? routing::OutboundSelectionPolicy{routing::ForceOutbound(*source.outbound_tag)}
-            : routing::OutboundSelectionPolicy{routing::RouteWithFallback(
-                std::string(constants::protocol::kDirect))},
+            : (source.routing_enabled
+                ? routing::OutboundSelectionPolicy{routing::RouteWithFallback(
+                    std::string(constants::protocol::kDirect))}
+                : routing::OutboundSelectionPolicy{routing::ForceOutbound(
+                    std::string(constants::protocol::kDirect))}),
         .build_request = {},
     };
 

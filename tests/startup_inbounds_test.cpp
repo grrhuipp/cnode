@@ -84,14 +84,23 @@ int main() {
         user_builds != 2 || UserStore::VmessUsers("static-owner").users != old) return 3;
     if (!PrepareStartupInbounds({}, false).empty() || PrepareStartupInbounds({}, true).size() != 1) return 4;
 
+    auto routed = Source("routed", 12002);
+    routed.routing_enabled = true;
     auto forced = Source("forced", 12001);
     forced.outbound_tag = "custom-out";
-    const auto policies = PrepareStartupInbounds({Source("routed", 12002), forced}, false);
-    if (policies.size() != 2 ||
-        !std::holds_alternative<routing::RouteWithFallback>(policies[0].runtime.outbound_policy) ||
-        std::get<routing::RouteWithFallback>(policies[0].runtime.outbound_policy).outbound_tag != "direct" ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[1].runtime.outbound_policy) ||
-        std::get<routing::ForceOutbound>(policies[1].runtime.outbound_policy).outbound_tag != "custom-out") return 5;
-
+    auto forced_override = Source("forced-override", 12003);
+    forced_override.routing_enabled = true;
+    forced_override.outbound_tag = "custom-out";
+    const auto policies = PrepareStartupInbounds(
+        {Source("default-direct", 12000), routed, forced, forced_override}, false);
+    if (policies.size() != 4 ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[0].runtime.outbound_policy) ||
+        std::get<routing::ForceOutbound>(policies[0].runtime.outbound_policy).outbound_tag != "direct" ||
+        !std::holds_alternative<routing::RouteWithFallback>(policies[1].runtime.outbound_policy) ||
+        std::get<routing::RouteWithFallback>(policies[1].runtime.outbound_policy).outbound_tag != "direct" ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[2].runtime.outbound_policy) ||
+        std::get<routing::ForceOutbound>(policies[2].runtime.outbound_policy).outbound_tag != "custom-out" ||
+        !std::holds_alternative<routing::ForceOutbound>(policies[3].runtime.outbound_policy) ||
+        std::get<routing::ForceOutbound>(policies[3].runtime.outbound_policy).outbound_tag != "custom-out") return 5;
     std::cout << "startup sources share validation and preparation without user publication\n";
 }

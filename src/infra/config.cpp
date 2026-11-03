@@ -1433,10 +1433,11 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         }
     }
 
-    if (j.contains("routingEnabled") || j.contains("routing_enabled")) {
+    if (j.contains("routing_enabled")) {
         throw std::invalid_argument(
-            "static inbound routingEnabled is removed; use outboundTag to force an outbound");
+            "static inbound routing selection must use routingEnabled");
     }
+    cfg.routing_enabled = jbool(j, "routingEnabled", false);
     if (j.contains("outbound_tag") || j.contains("outbound")) {
         throw std::invalid_argument(
             "static inbound outbound selection must use outboundTag");
