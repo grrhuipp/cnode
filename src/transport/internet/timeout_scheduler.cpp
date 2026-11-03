@@ -70,8 +70,7 @@ struct TimeoutScheduler::Impl : memory::ThreadAllocated {
     }
     void RequestWakeup() noexcept {
         if (!wait_pending || wakeup_requested) return;
-        IoErrorCode ignored;
-        timer.cancel(ignored);
+        timer.cancel();
         wakeup_requested = true;
     }
     void ArmTimer() {

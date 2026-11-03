@@ -316,7 +316,7 @@ Handler::ResolveTargets(session::Context& ctx) {
 
     // 如果目标已经有解析结果，直接复用 dispatcher/router 阶段的 DNS 结果。
     if (target.resolved_addr) {
-        memory::ThreadLocalVector<net::ip::address> addresses;
+        memory::ThreadLocalVector<net::ip::address> addresses(ctx.allocator<net::ip::address>());
         addresses.reserve(1);
         addresses.push_back(*target.resolved_addr);
         co_return addresses;
@@ -332,7 +332,7 @@ Handler::ResolveTargets(session::Context& ctx) {
         co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
     }
 
-    memory::ThreadLocalVector<net::ip::address> addresses;
+    memory::ThreadLocalVector<net::ip::address> addresses(ctx.allocator<net::ip::address>());
     addresses.reserve(dns_result.addresses.size());
 
     auto append_family = [&](const bool want_v6) {

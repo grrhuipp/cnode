@@ -13,9 +13,6 @@ std::unique_ptr<net::signal_set> InstallShutdownHandler(
     auto signals = std::make_unique<net::signal_set>(io_context);
     signals->add(SIGINT);
     signals->add(SIGTERM);
-#ifdef _WIN32
-    signals->add(SIGBREAK);
-#endif
 
     signals->async_wait([request_stop = std::move(request_stop)](const IoErrorCode& ec, int signo) {
         if (ec) return;

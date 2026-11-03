@@ -421,79 +421,69 @@ void BaseWsStream::CheckWritable() const {
         throw IoSystemError(io_error::broken_pipe, "WebSocket write after Close");
 }
 
-net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite() {
-    const auto state = co_await net::this_coro::cancellation_state;
-    if (closed_ || state.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(io_error::operation_aborted);
+net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
+    net::cancellation_slot caller_slot) {
+    if (auto lease = write_gate_.TryAcquire()) co_return lease;
     const auto executor = co_await net::this_coro::executor;
-    if (!write_gate_) write_gate_.emplace(executor);
-    auto lease = write_gate_->TryAcquire();
-    if (lease) co_return lease;
     // Cancel() is reusable, so only this acquisition is cancelled. Closing the
     // shared gate is reserved for terminal shutdown, not a sniff deadline.
-    WriteGateWait wait(Cancellation(), state.slot());
+    WriteGateWait wait(Cancellation(), caller_slot);
     if (wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
-    lease = co_await net::co_spawn(
-        executor, write_gate_->Acquire(),
+    auto lease = co_await net::co_spawn(
+        executor, write_gate_.Acquire(),
         net::bind_cancellation_slot(wait.Slot(), net::use_awaitable));
     if (!lease || wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
     co_return lease;
 }
 
 net::awaitable<void> BaseWsStream::WriteDataFrame(
-    std::span<const net::const_buffer> buffers, size_t size, buf::MultiBuffer* owned) {
-    auto lease = co_await AcquireWrite();
+    std::span<const net::const_buffer> buffers, size_t size) {
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    WriteGate::Lease lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
     CheckWritable();
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
         throw IoSystemError(io_error::fault, "WebSocket mask generation failed");
     const auto header = ws::EncodeFrameHeader(size, ws::Opcode::BINARY, is_client_, mask);
     try {
-        if (!is_client_ || owned) {
-            if (is_client_) {
-                size_t offset = 0;
-                for (auto* buffer : *owned) {
-                    if (!buffer) continue;
-                    const auto bytes = buffer->Bytes();
-                    ws::MaskData(bytes.data(), bytes.size(), mask, offset);
-                    offset += bytes.size();
-                }
-            }
+        if (!is_client_) {
             ConstBufferSpanBuilder<16> output;
             output.Append(net::buffer(header.bytes.data(), header.size));
             output.AppendBuffers(buffers);
             co_await inner_->WriteBuffers(output.Span());
-        } else if (size <= kSmallFrameThreshold) {
-            std::array<uint8_t, kSmallFrameThreshold + 14> frame;
-            std::memcpy(frame.data(), header.bytes.data(), header.size);
-            size_t offset = header.size;
-            for (const auto& buffer : buffers) {
-                if (buffer.size() == 0) continue;
-                std::memcpy(frame.data() + offset, buffer.data(), buffer.size());
-                offset += buffer.size();
-            }
-            ws::MaskData(frame.data() + header.size, size, mask);
-            const net::const_buffer output(frame.data(), header.size + size);
-            co_await inner_->WriteBuffers({&output, 1});
         } else {
             buf::BufferGuard scratch{buf::Buffer::New()};
             if (!scratch) throw std::bad_alloc();
-            const net::const_buffer head(header.bytes.data(), header.size);
-            co_await inner_->WriteBuffers({&head, 1});
+            std::memcpy(scratch->Tail().data(), header.bytes.data(), header.size);
+            scratch->Produce(static_cast<uint32_t>(header.size));
             size_t offset = 0;
             for (const auto& buffer : buffers) {
                 const auto* data = static_cast<const uint8_t*>(buffer.data());
                 size_t remaining = buffer.size();
                 while (remaining != 0) {
+                    if (scratch->Available() == 0) {
+                        const auto bytes = scratch->Bytes();
+                        const net::const_buffer output(bytes.data(), bytes.size());
+                        co_await inner_->WriteBuffers({&output, 1});
+                        scratch->Reset();
+                    }
                     const size_t chunk = std::min(remaining, static_cast<size_t>(scratch->Available()));
-                    std::memcpy(scratch->Tail().data(), data, chunk);
-                    ws::MaskData(scratch->Tail().data(), chunk, mask, offset);
-                    const net::const_buffer output(scratch->Tail().data(), chunk);
-                    co_await inner_->WriteBuffers({&output, 1});
+                    uint8_t* dst = scratch->Tail().data();
+                    std::memcpy(dst, data, chunk);
+                    ws::MaskData(dst, chunk, mask, offset);
+                    scratch->Produce(static_cast<uint32_t>(chunk));
                     data += chunk;
                     remaining -= chunk;
                     offset += chunk;
                 }
+            }
+            if (!scratch->IsEmpty()) {
+                const auto bytes = scratch->Bytes();
+                const net::const_buffer output(bytes.data(), bytes.size());
+                co_await inner_->WriteBuffers({&output, 1});
             }
         }
     } catch (...) {
@@ -509,32 +499,63 @@ net::awaitable<void> BaseWsStream::WriteBuffers(
     CheckWritable();
     size_t size = 0;
     for (const auto& buffer : buffers) AddPayloadSize(size, buffer.size());
-    if (size != 0) co_await WriteDataFrame(buffers, size, nullptr);
+    if (size != 0) co_await WriteDataFrame(buffers, size);
 }
 
 net::awaitable<size_t> BaseWsStream::AsyncWrite(net::const_buffer buffer) {
-    co_await WriteBuffers({&buffer, 1});
+    CheckWritable();
+    if (buffer.size() > kMaxFrameSize)
+        throw IoSystemError(io_error::message_size, "WebSocket frame exceeds payload budget");
+    if (buffer.size() != 0) co_await WriteDataFrame({&buffer, 1}, buffer.size());
     co_return buffer.size();
 }
 
 net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
     CheckWritable();
-    ConstBufferSpanBuilder<16> payload;
     size_t size = 0;
     for (const auto* buffer : buffers) {
         if (!buffer || buffer->IsEmpty()) continue;
-        const auto bytes = buffer->Bytes();
-        AddPayloadSize(size, bytes.size());
-        payload.Append(net::buffer(bytes.data(), bytes.size()));
+        AddPayloadSize(size, buffer->Len());
     }
-    if (size != 0) co_await WriteDataFrame(payload.Span(), size, &buffers);
+    if (size == 0) co_return;
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    WriteGate::Lease lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
+    CheckWritable();
+    uint8_t mask[4]{};
+    if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
+        throw IoSystemError(io_error::fault, "WebSocket mask generation failed");
+    const auto header = ws::EncodeFrameHeader(size, ws::Opcode::BINARY, is_client_, mask);
+    try {
+        ConstBufferSpanBuilder<16> output;
+        output.Append(net::buffer(header.bytes.data(), header.size));
+        size_t offset = 0;
+        for (auto* buffer : buffers) {
+            if (!buffer || buffer->IsEmpty()) continue;
+            auto bytes = buffer->Bytes();
+            if (is_client_) {
+                ws::MaskData(bytes.data(), bytes.size(), mask, offset);
+                offset += bytes.size();
+            }
+            output.Append(net::buffer(bytes.data(), bytes.size()));
+        }
+        co_await inner_->WriteBuffers(output.Span());
+    } catch (...) {
+        CloseAbortive();
+        throw;
+    }
 }
-
 net::awaitable<void> BaseWsStream::WriteControlFrame(
     ws::Opcode opcode, std::span<const uint8_t> payload) {
     const bool closing = opcode == ws::Opcode::CLOSE;
     if (closing) close_requested_ = true;
-    auto lease = co_await AcquireWrite();
+    const auto state = co_await net::this_coro::cancellation_state;
+    if (closed_ || state.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(io_error::operation_aborted);
+    WriteGate::Lease lease = write_gate_.TryAcquire();
+    if (!lease) lease = co_await AcquireWrite(state.slot());
     if (write_closed_ || (!closing && close_requested_)) co_return;
     uint8_t mask[4]{};
     if (is_client_ && RAND_bytes(mask, sizeof(mask)) != 1)
@@ -579,7 +600,7 @@ void BaseWsStream::ShutdownRead() {
 
 void BaseWsStream::Close() {
     NotifyClosed();
-    if (write_gate_) write_gate_->Cancel();
+    write_gate_.Cancel();
     if (closed_) return;
     closed_ = true;
     close_requested_ = true;
@@ -589,7 +610,7 @@ void BaseWsStream::Close() {
 
 void BaseWsStream::CloseAbortive() {
     NotifyClosed();
-    if (write_gate_) write_gate_->Cancel();
+    write_gate_.Cancel();
     if (closed_) return;
     closed_ = true;
     close_requested_ = true;
@@ -639,7 +660,9 @@ net::awaitable<WsHandshakeResult> WsClientStream::Handshake(
         }
     }
 
-    std::string request;
+    std::array<std::byte, 512> arena_buf{};
+    memory::request_memory arena(memory::ThreadPool(), arena_buf);
+    memory::ThreadLocalString request(arena.resource());
     request.reserve(reserve_size);
     request.append("GET ");
     request.append(req_path);

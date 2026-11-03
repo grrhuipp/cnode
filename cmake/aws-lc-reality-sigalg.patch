@@ -50,10 +50,11 @@ diff --git a/ssl/extensions.cc b/ssl/extensions.cc
 index b4c799eb5..558a51f10 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -347,6 +347,10 @@ bool tls12_add_verify_sigalgs(const SSL_HANDSHAKE *hs, CBB *out) {
+@@ -391,7 +391,11 @@ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
+     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
+     return false;
+   }
  
- bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
-                              uint16_t sigalg) {
 +  if (hs->config && hs->config->reality_client_hello_cb != nullptr &&
 +      sigalg == SSL_SIGN_ED25519) {
 +    return true;

@@ -40,9 +40,7 @@
 #include "acppnode/app/proxyman/inbound/handler.hpp"
 #include "acppnode/proxy/inbound.hpp"
 
-#ifndef _WIN32
 #include <sys/socket.h>
-#endif
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -619,7 +617,6 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
             break;
         }
 
-#ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立 accept，内核负责负载均衡。
         int optval = 1;
         if (::setsockopt(candidate_acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT,
@@ -627,7 +624,6 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
             break;
         }
-#endif
 
         candidate_acceptor->bind(ep, ec);
         if (ec) {
@@ -674,13 +670,8 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         Spawn(worker, AcceptLoop(worker, listener_key, memory::ThreadLocalString(binding.tag),
                                  std::move(prepared.acceptor), slot_it->second), true);
 
-#ifdef _WIN32
-        LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
-                  worker.id_, listener_key, binding.tag, binding.protocol);
-#else
         LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, listener_key, binding.tag, binding.protocol);
-#endif
     }
     return true;
 }
@@ -1360,7 +1351,6 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             break;
         }
 
-#ifndef _WIN32
         // SO_REUSEPORT：每 Worker 独立绑定，内核负载均衡。
         int optval = 1;
         if (::setsockopt(candidate_sock->native_handle(), SOL_SOCKET, SO_REUSEPORT,
@@ -1368,7 +1358,6 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             if (fail_candidate("SO_REUSEPORT", strerror(errno))) continue;
             break;
         }
-#endif
 
         // The OOM path must consume a datagram without allocating another
         // async operation. Asio's synchronous receive requires user-level
@@ -1511,13 +1500,8 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             worker_udp_listener_runtime_test::OnStage("ready", index);
 #endif
 
-#ifdef _WIN32
-            LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEADDR",
-                  worker.id_, socket_key, binding.tag, binding.protocol);
-#else
             LOG_DEBUG("worker.udp_listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
-                  worker.id_, socket_key, binding.tag, binding.protocol);
-#endif
+                      worker.id_, socket_key, binding.tag, binding.protocol);
         }
     } catch (...) {
         // A committed listener cannot be restored after a partial spawn.

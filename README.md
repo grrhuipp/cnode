@@ -1,12 +1,12 @@
 # cnode
 
-cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C++20、Asio 协程和 Worker-local 资源模型实现，在保留 xray-core 配置语义的同时，把面板同步、配置归一化、协议处理和流量转发拆成清晰的运行边界。
+cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目使用 C++20 协程与 Worker-local 资源模型实现，将面板同步、配置归一化、协议处理和流量转发拆成清晰的运行边界。
 
 ## 文档分工
 
 - `README.md` 面向使用者，说明项目定位、运行架构、配置入口、部署和关键语义。
 - `AGENTS.md` 面向代码修改和自动化协作者，记录必须遵守的职责边界、禁止项、审查清单和硬性删除规则。
-- [`docs/local_logging.md`](docs/local_logging.md) 规定对齐 xray-core 的 error/access 文本格式、通道和级别口径。
+- [`docs/local_logging.md`](docs/local_logging.md) 规定本地 error/access 文本格式、通道和级别口径。
 
 如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
 
@@ -16,14 +16,14 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持 TCP、TLS、WebSocket、PROXY protocol、原生 datagram、UDP-over-TCP 和 Mux/子流。
 - 支持单进程接入多个 V2Board 面板和多个节点。
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
-- 默认按多数据 Worker 运行；各数据 Worker 同构，分别拥有监听和转发资源。Linux 使用 `SO_REUSEPORT`；Windows 使用 `SO_REUSEADDR` 作为允许的降级，不保证相同的连接分布。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
+- 默认按多数据 Worker 运行；各数据 Worker 同构，通过 `SO_REUSEPORT` 分别拥有监听和转发资源。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`，不改写既有配置。二进制先下载到同目录临时文件并校验版本，再原子替换；下载、空文件或版本校验失败时保留原二进制，不停止现有服务。二进制或 geo 数据变化后重启原本运行中的服务；geo 下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 
 ## 构建与测试
 
 需要 CMake 3.20 或更新版本，以及支持 C++20 协程、`std::span` 和 `std::format` 的编译器与标准库。主程序和测试统一使用严格 C++20 模式，不依赖 C++23 标准库接口；依赖由 CMake 按固定版本获取。
 
-本地与 CI 使用同一测试入口，需要 Python 3、`cryptography` 和 `blake3`（可用 `python -m pip install cryptography blake3` 安装）以及 PATH 中可执行的 `openssl` 命令。REALITY 集成测试用该命令生成临时证书；Alpine 使用 `apk add openssl`，Debian/Ubuntu 使用 `apt-get install openssl`，仅安装 TLS 库不能替代命令行工具：
+本地与 CI 使用同一测试入口，需要 Python 3 相关测试依赖以及 PATH 中可执行的 `openssl` 命令。REALITY 集成测试用该命令生成临时证书；Alpine 使用 `apk add openssl`，Debian/Ubuntu 使用 `apt-get install openssl`，仅安装系统库不能替代命令行工具：
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCNODE_BUILD_TESTS=ON
@@ -69,7 +69,7 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个数据 Worker 独立绑定同一组端口（Linux `SO_REUSEPORT`，Windows 降级为 `SO_REUSEADDR`），连接不跨线程迁移。面板与数据 Worker 经有界入口访问主控线程上的 DNSWorker；其他跨线程控制面经有界 mailbox 投递，不共享 live handler、会话或 allocator。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口，连接不跨线程迁移。面板与数据 Worker 经有界入口访问主控线程上的 DNSWorker；其他跨线程控制面经有界 mailbox 投递，不共享 live handler、会话或 allocator。
 
 数据 Worker 在开始监听前准备路由、出站与请求策略等能力，再一次性构造完整的分发器；不存在分阶段绑定或运行期重新绑定。
 
@@ -77,7 +77,7 @@ main
 
 出站配置与认证凭据在冷路径准备为不可变快照，handler 持有该快照，不在各 Worker 内重复解析或深拷贝。拨号超时、密码学会话、连接和会话池仍由所属 Worker 独立持有；替换配置不会改写仍在使用旧快照的请求。
 
-这条边界沿用 xray-core 的关键做法：proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
+proxyman / ingress 在冷路径准备 receiver 语义，公开 Dispatcher 只接收请求所需的窄契约；强制出口和未命中回退属于 Dispatcher 编排，Router 只回答“哪条路由规则命中”。每个 receiver 必须在构建时明确选择 `ForceOutbound` 或 `RouteWithFallback`，不存在 Worker 全局默认出口，也不存在可进入热路径的空策略。cnode 使用强类型、只读 `DispatchPolicy`，不把完整 `ReceiverSettings` 或可变配置 context 传入 Dispatcher。面板 `DetectRule` 由 Worker-local 实现通过通用 `RequestPolicy` 接口提供 allow / block 结果，不进入 Router，也不让 Dispatcher 依赖面板规则管理器。
 
 HTTP 与 HTTPUpgrade 只在建链阶段处理 HTTP 握手，完成后继续使用原来的 TCP / TLS 流，不保留长期透传包装。握手提前读到的应用数据由实际读端按原顺序承接；TLS 明文残留不会进入底层 TCP 密文缓冲。残留读完或读端关闭后释放，取消、半关闭与 TLS 关闭仍沿原传输链路生效。
 
@@ -131,7 +131,7 @@ DNS 缓存链路：
 
 ## 配置设计
 
-默认主配置文件为 `config.json`。cnode 与 XrayR YAML 配置布局有意不同：cnode 使用 JSON 作为部署配置格式，进程级字段保留在 `config.json`，代理条目使用 xray-core object shapes 放在同目录侧车文件中。
+默认主配置文件为 `config.json`。cnode 使用 JSON 作为部署配置格式，进程级字段保留在 `config.json`，代理与分流条目放在同目录侧车文件中。
 
 目录模式固定读取：
 
@@ -242,10 +242,10 @@ bash scripts/cnode.sh -variant glibc -debug_file true
 - 原生 UDP 回包按 socket 保持一个在途发送任务；payload 按值存于该任务帧内，普通数据报出队不额外申请堆节点，也不逐包复制监听字符串键。旧 socket 的发送完成不能清除替换 socket 的活动队列；删除队列后，在途 payload 仍计入共享预算，直至 I/O 完成并释放。
 - `limits.maxConnections` 和 `limits.maxConnectionsPerIP` 按 Worker 数向上取整拆分，各 Worker 内跨入站共享额度，`0` 表示不限。IP 跟踪容量耗尽时拒绝新准入，不绕过限制；仍有下行工作的半关闭请求继续占用额度，完整结束后归还。
 - TCP 和原生 UDP 的 idle/read/write/phase 超时共用聚合状态，由所属 Worker 的调度器承载；逻辑读写结束或连接关闭时撤销对应预算，阶段句柄随清除而失效。
-- `info` 级别的周期资源日志包括 `runtime.process`（Linux 当前 FD 数及软上限，Windows 进程 handle 数）与 `runtime.worker`（各 Worker 的 UDP association、待处理输入/回包、调度事件及池内存）。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=活跃事件数/索引容量` 区分当前超时占用与历史峰值容量保留；取消会立即移除索引，不保留过期节点。容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD/handle 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
+- `info` 级别的周期资源日志包括 `runtime.process`（Linux 当前 FD 数及软上限）与 `runtime.worker`（各 Worker 的 UDP association、待处理输入/回包、调度事件及池内存）。`udp_listeners` 是当前注册的入站 socket 数，`udp_receive_loops` 包含尚未完成退役的接收任务，`udp_native_dispatches` 是尚未实际完成的原生 UDP 分发任务数，包含退休中的任务；association 记录归零不代表此计数也已归零，不统计 TCP 或 Mux 子流。`udp_resource_drops` 累计记录接收资源不足、处理分配失败或截断导致的丢包。队列指标是当前占用，不是累计吞吐；回包统计包含正在发送的包，`udp_reply_senders` 是活跃发送 socket 数。`timeout_heap=活跃事件数/索引容量` 区分当前超时占用与历史峰值容量保留；取消会立即移除索引，不保留过期节点。容量未回落不等于泄漏，PMR 映射量也不等于 RSS。FD 采样不可用时显示 `unknown`，不会伪报为零。这些日志用于故障前后的趋势对照，不能单凭重启恢复判定资源耗尽。
 - 本地日志：`error` 保存受 `loglevel` 控制的诊断与错误，`access` 保存无级别的访问事实。默认启用 `rotateDaily` 和 `gzip`：`access` / `error` 配置作为基础文件名，运行时写入 `access_YYYY-MM-DD.log` / `error_YYYY-MM-DD.log`，历史日志轮转后压缩为 `.gz`，`maxDays` 控制保留天数。不提供集中上传。
 - WS 入站默认使用 `X-Forwarded-For` 的首个 IP 作为客户端地址；缺失或无效时保留 TCP 对端。`streamSettings.wsSettings.realIpHeader` 可指定其他头，设为 `""` 可关闭该行为。此头可被伪造：仅应通过可信代理访问源站，且代理必须覆盖客户端传入的同名头；当前程序不自行校验代理来源。通过 HTTP 头无法恢复客户端源端口，日志记为 `:0`。
-- 面板 `dnsType` 会映射到 freedom outbound 的 `settings.domainStrategy`，取值对齐 xray-core freedom outbound。
+- 面板 `dnsType` 会映射到 freedom outbound 的 `settings.domainStrategy`。
 - 静态 outbound 的顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组；数组按顺序选首个同地址族条目：单个 IP 直接用，CIDR 从网段中生成一个地址；不检查接口地址或本地路由。CIDR 地址由 `sendThroughStrategy` 选择：默认 `hash`（入站源 IP＋源端口），也可设 `random`。每个目标地址族仅选定一个源 IP：绑定或连接失败不更换同族源 IP，也不回退系统默认源 IP；只有完全没有同族条目才由系统选择。`settings.domainStrategy: "UseIPv6v4"` 下 IPv6 目标失败仍可尝试 IPv4 目标，IPv4 单独选源 IP；若目标已由路由预先解析为单个 IP，则不会重新查询另一地址族。UDP 域名逐包解析，建立 socket 前无法获知每包最终地址族；数组绑定依据请求初始目标地址族。原有字符串 `sendThrough` 行为不变。
 - 未显式配置 `inboundTag` 的路由规则匹配所有入站；只有显式写出 `inboundTag` 时才限制入站来源。
 - 静态 inbound 未指定 `outboundTag` 时参与 routing，未命中回落内置 `direct`；指定 `"outboundTag": "出口标签"` 时强制使用该出口，不经过分流（即使规则可命中）。标签必须指向已配置或内置的静态 outbound；不存在或为空会拒绝启动。旧字段 `routingEnabled` 已移除，原先设置 `false` 的入站如需保持直连，请改为 `"outboundTag": "direct"`。
@@ -357,4 +357,4 @@ scripts/              部署与更新脚本
 
 ## 构建兼容性
 
-- x86-64 构建默认启用 BLAKE3 的运行时 SIMD 分派，保留 portable 回退，不要求部署机器与构建机器具有相同指令集。排查时可用 `-DCNODE_BLAKE3_SIMD=OFF` 构建纯 portable 版本。
+- x86-64 构建默认启用摘要算法的运行时 SIMD 分派，保留 portable 回退，不要求部署机器与构建机器具有相同指令集。排查时可用 `-DCNODE_BLAKE3_SIMD=OFF` 构建纯 portable 版本。

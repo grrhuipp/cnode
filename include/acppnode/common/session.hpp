@@ -29,6 +29,18 @@ namespace session {
 // xray-core common/session.Inbound 对应的连接入站元数据。
 // 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
 struct Inbound {
+    Inbound() = default;
+    explicit Inbound(std::pmr::memory_resource* resource)
+        : source_ip(resource)
+        , peer_ip(resource)
+        , client_ip_source("socket", resource)
+        , tag(resource)
+        , accounting_key(resource)
+        , protocol(resource)
+        , tags(resource)
+        , user_email(resource)
+        , security(resource) {}
+
     net::ip::address source_addr;
     memory::ThreadLocalString source_ip;
     uint16_t source_port = 0;
@@ -65,6 +77,10 @@ struct Outbound {
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
+    Content() = default;
+    explicit Content(std::pmr::memory_resource* resource)
+        : protocol(resource) {}
+
     Network network = Network::TCP;
     memory::ThreadLocalString protocol;
     uint64_t speed_limit = 0;
@@ -80,12 +96,17 @@ struct Traffic {
 // Worker-local; protocol, routing, outbound and relay code read/write the
 // records directly instead of going through the old app-layer context shell.
 struct Context {
+private:
+    static constexpr std::size_t kInitialArenaBytes = 512;
+    memory::request_memory memory_{kInitialArenaBytes, std::pmr::get_default_resource()};
+
+public:
     // 连接标识
     ID conn_id = 0;
 
-    Inbound inbound;
+    Inbound inbound{memory_.resource()};
     Outbound outbound;
-    Content content;
+    Content content{memory_.resource()};
     Traffic traffic;
 
     // 接入时间戳（微秒，使用 steady_clock），用于访问日志。
@@ -101,6 +122,21 @@ struct Context {
     Context& operator=(const Context&) = delete;
     Context(Context&&) = delete;
     Context& operator=(Context&&) = delete;
+
+    // Request/session lifetime monotonic arena.
+    [[nodiscard]] std::pmr::memory_resource* arena() const noexcept {
+        return memory_.resource();
+    }
+
+    // Worker-local reclaimable pool resource.
+    [[nodiscard]] std::pmr::memory_resource* pool() const noexcept {
+        return memory_.upstream_resource();
+    }
+
+    template <typename T = std::byte>
+    [[nodiscard]] std::pmr::polymorphic_allocator<T> allocator() const noexcept {
+        return std::pmr::polymorphic_allocator<T>(arena());
+    }
 };
 
 [[nodiscard]] ID NewID(uint32_t worker_id) noexcept;

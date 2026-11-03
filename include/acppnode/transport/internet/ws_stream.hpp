@@ -99,7 +99,6 @@ inline void MaskData(uint8_t* data, size_t len, const uint8_t* mask_key,
 // physical write, including control frames and the closing handshake.
 class BaseWsStream : public AsyncStream {
 public:
-    static constexpr size_t kSmallFrameThreshold = 4 * 1024;
     static constexpr size_t kMaxFrameSize = 4 * 1024 * 1024;
 
     BaseWsStream(std::unique_ptr<AsyncStream> inner, uint64_t conn_id, bool is_client);
@@ -154,9 +153,9 @@ private:
     void FinishDataFrame();
     void ValidateClose();
 
-    net::awaitable<WriteGate::Lease> AcquireWrite();
+    net::awaitable<WriteGate::Lease> AcquireWrite(net::cancellation_slot caller_slot);
     net::awaitable<void> WriteDataFrame(
-        std::span<const net::const_buffer> buffers, size_t size, buf::MultiBuffer* owned);
+        std::span<const net::const_buffer> buffers, size_t size);
     net::awaitable<void> WriteControlFrame(ws::Opcode opcode, std::span<const uint8_t> payload);
 
     buf::MultiBuffer pending_data_;
@@ -182,7 +181,7 @@ private:
     bool close_requested_ = false;
     bool write_closed_ = false;
     bool closed_ = false;
-    std::optional<WriteGate> write_gate_;
+    WriteGate write_gate_;
 };
 
 class WsServerStream final : public BaseWsStream {

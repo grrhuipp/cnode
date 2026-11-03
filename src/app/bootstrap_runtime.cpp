@@ -42,8 +42,8 @@ public:
         monitor.RequestStop();
         for (size_t i = 0; i < started_threads; ++i) ctx.workers[i]->RequestStop();
         ctx.dns_worker.RequestStop();
+        stop_event.cancel();
         IoErrorCode ignored;
-        stop_event.cancel(ignored);
         if (signals) signals->cancel(ignored);
     }
 
@@ -85,11 +85,7 @@ public:
                         LOG_CONSOLE("static_inbound ready tag={} port={} protocol={} network={}",
                             inbound.tag, inbound.port, inbound.protocol, inbound.stream_settings.network);
                     }
-#ifdef _WIN32
-                    LOG_CONSOLE("server started workers={} accept=SO_REUSEADDR", ctx.workers.size());
-#else
                     LOG_CONSOLE("server started workers={} accept=SO_REUSEPORT", ctx.workers.size());
-#endif
                 }
             } catch (const IoSystemError& error) {
                 if (!stopping || error.code() != net::error::operation_aborted)

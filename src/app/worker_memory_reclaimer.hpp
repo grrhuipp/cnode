@@ -10,7 +10,7 @@ namespace acpp {
 // Owned by Worker::RuntimeState. Start/Stop and all notifications run on its
 // executor. The allocator reports only empty-FIFO transitions, not every free.
 class WorkerMemoryReclaimer final : private TimeoutMaintenance,
-                                    private memory::ReturningThreadPool::IdleWakeup {
+                                    private memory::worker_memory::IdleWakeup {
 public:
     WorkerMemoryReclaimer() = default;
     WorkerMemoryReclaimer(const WorkerMemoryReclaimer&) = delete;
@@ -44,7 +44,7 @@ private:
     }
     void Schedule() noexcept {
         const auto deadline = pool_->NextPurgeDeadline();
-        if (deadline == memory::ReturningThreadPool::Clock::time_point::max()) {
+        if (deadline == memory::worker_memory::Clock::time_point::max()) {
             scheduler_->CancelMaintenance(*this);
             return;
         }
@@ -58,7 +58,7 @@ private:
         pool_->PurgeIdle();
     }
 
-    memory::ReturningThreadPool* pool_ = nullptr;
+    memory::worker_memory* pool_ = nullptr;
     TimeoutScheduler* scheduler_ = nullptr;
 };
 

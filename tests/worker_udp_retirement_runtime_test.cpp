@@ -420,8 +420,7 @@ acpp::net::awaitable<void> WaitTestPredicate(
         if (*expired) Fail(failure);
         co_await Pause(io, 2ms);
     }
-    acpp::IoErrorCode ignored;
-    deadline.cancel(ignored);
+    deadline.cancel();
 }
 
 acpp::proxyman::inbound::BuildRequest BuildFixtureRequest(std::string tag) {
@@ -601,8 +600,7 @@ acpp::net::awaitable<RetirementSnapshot> UnregisterAndSnapshot(
         if (*expired) Fail("Worker-owned UDP jobs/resources did not drain before test deadline");
         co_await Pause(*g_state->owner_io, 2ms);
     }
-    acpp::IoErrorCode ignored;
-    deadline.cancel(ignored);
+    deadline.cancel();
     result.responses_created = g_state->created;
     result.responses_destroyed = g_state->destroyed;
     result.wrong_destructor_thread = g_state->wrong_destructor_thread;
@@ -622,8 +620,7 @@ acpp::net::awaitable<void> AbortWorkerTask(acpp::Worker& worker) {
     std::exception_ptr failure;
     if (state.delayed_mode) {
         if (state.cleanup_gate) {
-            acpp::IoErrorCode ignored;
-            state.cleanup_gate->cancel(ignored);
+            state.cleanup_gate->cancel();
         }
         if (state.unregister_started) {
             state.unregister_cancel.emit(acpp::net::cancellation_type::terminal);

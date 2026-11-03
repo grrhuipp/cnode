@@ -10,19 +10,6 @@
 // ============================================================================
 
 // ============================================================================
-// Windows 预处理（必须在 Asio/系统 socket 头之前）
-// ============================================================================
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  define NOMINMAX
-// 统一设置 Windows 10 API 级别，供 Asio 和系统 socket API 使用。
-#  undef  _WIN32_WINNT
-#  define _WIN32_WINNT 0x0A00
-#  undef  WINVER
-#  define WINVER 0x0A00
-#endif
-
-// ============================================================================
 // Asio（最重，PCH 收益最大）
 // ============================================================================
 #include <asio.hpp>
@@ -42,14 +29,7 @@
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
 #include <asio/signal_set.hpp>
-#ifdef _MSC_VER
-#  pragma warning(push)
-#  pragma warning(disable : 4996)
-#endif
 #include <asio/ssl.hpp>
-#ifdef _MSC_VER
-#  pragma warning(pop)
-#endif
 #include <asio/steady_timer.hpp>
 #include <asio/system_error.hpp>
 #include <asio/write.hpp>
@@ -58,19 +38,6 @@
 // third-party C++ headers that use BLOCK_SIZE as an identifier.
 #ifdef BLOCK_SIZE
 #  undef BLOCK_SIZE
-#endif
-
-// Windows 宏污染清理
-#ifdef _WIN32
-#  ifdef ERROR
-#    undef ERROR
-#  endif
-#  ifdef DOMAIN
-#    undef DOMAIN
-#  endif
-#  ifdef WriteConsole
-#    undef WriteConsole
-#  endif
 #endif
 
 // ============================================================================

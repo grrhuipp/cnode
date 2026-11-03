@@ -109,8 +109,7 @@ public:
 
 private:
     static void Wake(Participant& participant) noexcept {
-        IoErrorCode ignored;
-        participant.ready_.cancel(ignored);
+        participant.ready_.cancel();
     }
 
     void Unqueue(Participant& participant) noexcept {

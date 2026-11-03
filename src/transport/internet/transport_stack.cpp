@@ -4291,9 +4291,10 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
         actual);
 }
 
-[[nodiscard]] std::string BuildXHttpResponseHeaders(const HttpConfig& cfg,
-                                                    bool chunked_body) {
-    std::string response;
+[[nodiscard]] memory::ThreadLocalString BuildXHttpResponseHeaders(
+    const HttpConfig& cfg,
+    bool chunked_body) {
+    memory::ThreadLocalString response;
     response.reserve(192 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("X-Accel-Buffering: no\r\n");
@@ -4497,7 +4498,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
            EqualsAsciiCI(key, "Transfer-Encoding");
 }
 
-[[nodiscard]] std::string BuildXHttp1ClientRequest(
+[[nodiscard]] memory::ThreadLocalString BuildXHttp1ClientRequest(
     const HttpConfig& cfg,
     std::string_view host,
     std::string_view content_length = {},
@@ -4507,7 +4508,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
                           content_length.size() + cfg.headers.size() * 32;
 
-    std::string request;
+    memory::ThreadLocalString request;
     request.reserve(reserve_size);
     request.append(method);
     request.push_back(' ');
@@ -4564,7 +4565,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     }
 
     const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    const std::string request = BuildXHttp1ClientRequest(
+    const memory::ThreadLocalString request = BuildXHttp1ClientRequest(
         cfg,
         host,
         content_length,
@@ -4854,7 +4855,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (!session) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
-        const std::string response = BuildXHttpResponseHeaders(cfg, true);
+        const memory::ThreadLocalString response = BuildXHttpResponseHeaders(cfg, true);
         if (!co_await WriteFullToStream(
                 *stream,
                 unsafe::ptr_cast<const uint8_t>(response.data()),
@@ -4926,7 +4927,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
 
-        const std::string response = BuildXHttpResponseHeaders(cfg, false);
+        const memory::ThreadLocalString response = BuildXHttpResponseHeaders(cfg, false);
         if (!co_await WriteFullToStream(
                 *body,
                 unsafe::ptr_cast<const uint8_t>(response.data()),
@@ -5075,7 +5076,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     RecordExtractedRealIp(request, cfg.real_ip_header, transport_metadata);
 
-    std::string response;
+    memory::ThreadLocalString response;
     response.reserve(96 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("Cache-Control: no-store\r\n");
@@ -5239,7 +5240,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         }
     }
 
-    std::string request;
+    memory::ThreadLocalString request;
     request.reserve(reserve_size);
     request.append(method);
     request.push_back(' ');
@@ -5459,7 +5460,7 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
         }
     }
 
-    std::string request;
+    memory::ThreadLocalString request;
     request.reserve(reserve_size);
     request.append("GET ");
     request.append(req_path);
@@ -5641,13 +5642,14 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     std::string accept = ws::ComputeWsAccept(ws_key);
 
     // 发送 101
-    std::string resp = std::format(
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: {}\r\n"
-        "\r\n",
-        accept);
+    memory::ThreadLocalString resp;
+    resp.reserve(128);
+    resp.append("HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: ");
+    resp.append(accept);
+    resp.append("\r\n\r\n");
     size_t sent = 0;
     while (sent < resp.size()) {
         size_t n = co_await stream->AsyncWrite(

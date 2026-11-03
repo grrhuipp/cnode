@@ -29,11 +29,6 @@
 #include <malloc.h>
 #endif
 
-#ifdef _WIN32
-#include <windows.h>
-#include <psapi.h>
-#endif
-
 namespace acpp {
 
 namespace {
@@ -52,15 +47,6 @@ struct MonitorContext {
 };
 
 size_t ReadResidentMemoryBytes() {
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    if (GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-            sizeof(counters))) {
-        return static_cast<size_t>(counters.WorkingSetSize);
-    }
-#else
     std::ifstream status("/proc/self/status");
     std::string line;
     while (std::getline(status, line)) {
@@ -68,7 +54,6 @@ size_t ReadResidentMemoryBytes() {
             return std::stoull(line.substr(6)) * 1024;
         }
     }
-#endif
     return 0;
 }
 

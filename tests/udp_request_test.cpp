@@ -81,7 +81,7 @@ public:
         stopped_ = true;
         IoErrorCode ignored;
         socket_.close(ignored);
-        query_ready_.cancel(ignored);
+        query_ready_.cancel();
     }
 
 private:
@@ -91,8 +91,7 @@ private:
                 if (error || stopped_) return;
                 Query query{{buffer_.begin(), buffer_.begin() + size}, sender_};
                 queries_.push_back(query);
-                IoErrorCode ignored;
-                query_ready_.cancel(ignored);
+                query_ready_.cancel();
                 if (auto_reply_) Reply(query);
                 Receive();
             });

@@ -612,25 +612,15 @@ net::awaitable<void> EncodeRequestBody(
     co_await EncodeRequestBodyBuffers(state, stream, buffers);
 }
 
-net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderState& state,
-                                                         AsyncStream& stream) {
-    auto fail = [](ErrorCode code) -> VMessHandshakeResult {
-        if (code == ErrorCode::OK) {
-            code = ErrorCode::PROTOCOL_AUTH_FAILED;
-        }
-        return tl::unexpected(code);
-    };
+namespace {
 
-    if (state.sent) {
-        co_return VMessHandshakeResult{};
-    }
-
-    // 获取当前时间戳
+tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
+    const EncodeRequestHeaderState& state,
+    std::array<uint8_t, kVMessHandshakePacketMax>& packet) {
     auto now = std::chrono::system_clock::now();
     int64_t ts = std::chrono::duration_cast<std::chrono::seconds>(
         now.time_since_epoch()).count();
 
-    // 构建请求头（固定缓冲，避免握手阶段临时堆分配）
     std::array<uint8_t, kVMessHandshakeHeaderMax> header{};
     size_t header_len = 0;
     auto append_header = [&](const void* data, size_t len) -> bool {
@@ -643,36 +633,37 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         return append_header(&v, 1);
     };
 
-    if (!append_header_u8(VERSION)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_header(state.body_iv.data(), state.body_iv.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_header(state.body_key.data(), state.body_key.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_header_u8(state.response_header)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_header_u8(state.options)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-
-    // Padding Length + Security (1 byte)
-    uint8_t padding_len = 0;
-    if (!append_header_u8(static_cast<uint8_t>((padding_len << 4) | static_cast<uint8_t>(state.security)))) {
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    if (!append_header_u8(VERSION) ||
+        !append_header(state.body_iv.data(), state.body_iv.size()) ||
+        !append_header(state.body_key.data(), state.body_key.size()) ||
+        !append_header_u8(state.response_header) ||
+        !append_header_u8(state.options)) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    if (!append_header_u8(0)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);  // Reserved
-    if (!append_header_u8(static_cast<uint8_t>(state.command))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+
+    uint8_t padding_len = 0;
+    if (!append_header_u8(static_cast<uint8_t>((padding_len << 4) | static_cast<uint8_t>(state.security))) ||
+        !append_header_u8(0) ||
+        !append_header_u8(static_cast<uint8_t>(state.command))) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
 
     const size_t address_size = EncodeAddressTo(
         state.target, header.data() + header_len, header.size() - header_len,
         AddressWireFormat::PortFirst);
-    if (address_size == 0) co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (address_size == 0) return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     header_len += address_size;
 
-    // Padding (可选)
     if (padding_len > 0) {
-        if (header_len + padding_len > header.size()) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        if (header_len + padding_len > header.size()) {
+            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
         if (RAND_bytes(header.data() + header_len, static_cast<int>(padding_len)) != 1) {
-            co_return fail(ErrorCode::INTERNAL);
+            return tl::unexpected(ErrorCode::INTERNAL);
         }
         header_len += padding_len;
     }
 
-    // F (checksum) - FNV1a of header
     uint32_t checksum = FNV1a32(header.data(), header_len);
     const uint8_t checksum_be[4] = {
         static_cast<uint8_t>(checksum >> 24),
@@ -680,81 +671,60 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         static_cast<uint8_t>(checksum >> 8),
         static_cast<uint8_t>(checksum)
     };
-    if (!append_header(checksum_be, sizeof(checksum_be))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    if (!append_header(checksum_be, sizeof(checksum_be))) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
 
-    // 生成 AuthID
     std::array<uint8_t, 16> auth_id;
     GenerateAuthID(state.user.auth_key.data(), ts, auth_id.data());
 
-    // 生成 connection nonce (8 bytes)
     uint8_t connection_nonce[8];
     if (RAND_bytes(connection_nonce, 8) != 1) {
-        co_return fail(ErrorCode::INTERNAL);
+        return tl::unexpected(ErrorCode::INTERNAL);
     }
 
-    // 派生密钥需要 auth_id 和 nonce。KDF path 支持二进制 string_view，
-    // 避免为每次 VMess 握手构造 16B/8B 临时 std::string。
     const std::string_view auth_id_sv(unsafe::ptr_cast<const char>(auth_id.data()), 16);
     const std::string_view nonce_sv(unsafe::ptr_cast<const char>(connection_nonce), 8);
 
-    // 加密长度
     const std::array<std::string_view, 3> len_key_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY,
-        auth_id_sv,
-        nonce_sv
-    };
+        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY, auth_id_sv, nonce_sv};
     auto len_key = KDF16(state.user.cmd_key.data(), 16, len_key_path);
 
     uint8_t len_iv[12];
     const std::array<std::string_view, 3> len_iv_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV,
-        auth_id_sv,
-        nonce_sv
-    };
+        KDFSalt::VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV, auth_id_sv, nonce_sv};
     KDF(state.user.cmd_key.data(), 16, len_iv_path, len_iv, 12);
 
     uint8_t len_plain[2] = {
         static_cast<uint8_t>((header_len >> 8) & 0xFF),
         static_cast<uint8_t>(header_len & 0xFF)
     };
-
-    // 加密长度（使用 AAD = auth_id）
     uint8_t len_enc[18];
     if (!AES128GCMEncrypt(len_key.data(), len_iv,
                           auth_id.data(), auth_id.size(),
                           len_plain, sizeof(len_plain),
                           len_enc, len_enc + 2)) {
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    // 加密请求头
     const std::array<std::string_view, 3> header_key_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY,
-        auth_id_sv,
-        nonce_sv
-    };
+        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_KEY, auth_id_sv, nonce_sv};
     auto header_key = KDF16(state.user.cmd_key.data(), 16, header_key_path);
 
     uint8_t header_iv[12];
     const std::array<std::string_view, 3> header_iv_path{
-        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_IV,
-        auth_id_sv,
-        nonce_sv
-    };
+        KDFSalt::VMESS_HEADER_PAYLOAD_AEAD_IV, auth_id_sv, nonce_sv};
     KDF(state.user.cmd_key.data(), 16, header_iv_path, header_iv, 12);
 
-    // 加密头部（使用 AAD = auth_id）
     std::array<uint8_t, kVMessHandshakeHeaderEncMax> header_enc{};
     const size_t header_enc_len = header_len + 16;
     if (!AES128GCMEncrypt(header_key.data(), header_iv,
                           auth_id.data(), auth_id.size(),
                           header.data(), header_len,
                           header_enc.data(), header_enc.data() + header_len)) {
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
-    // 发送: AuthID (16) + EncLen (18) + ConnectionNonce (8) + EncHeader
-    std::array<uint8_t, kVMessHandshakePacketMax> packet{};
     size_t packet_len = 0;
     auto append_packet = [&](const void* data, size_t len) -> bool {
         if (packet_len + len > packet.size()) return false;
@@ -762,15 +732,30 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
         packet_len += len;
         return true;
     };
-    if (!append_packet(auth_id.data(), auth_id.size())) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_packet(len_enc, sizeof(len_enc))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_packet(connection_nonce, sizeof(connection_nonce))) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    if (!append_packet(header_enc.data(), header_enc_len)) co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-
-    if (!co_await WriteFull(stream, packet.data(), packet_len)) {
-        co_return fail(ErrorCode::SOCKET_WRITE_FAILED);
+    if (!append_packet(auth_id.data(), auth_id.size()) ||
+        !append_packet(len_enc, sizeof(len_enc)) ||
+        !append_packet(connection_nonce, sizeof(connection_nonce)) ||
+        !append_packet(header_enc.data(), header_enc_len)) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
+    return packet_len;
+}
 
+}  // namespace
+
+net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderState& state,
+                                                         AsyncStream& stream) {
+    if (state.sent) {
+        co_return VMessHandshakeResult{};
+    }
+    std::array<uint8_t, kVMessHandshakePacketMax> packet{};
+    auto built = BuildRequestHeaderPacket(state, packet);
+    if (!built) {
+        co_return tl::unexpected(built.error());
+    }
+    if (!co_await WriteFull(stream, packet.data(), *built)) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
     state.sent = true;
     co_return VMessHandshakeResult{};
 }

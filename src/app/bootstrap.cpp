@@ -59,11 +59,7 @@ std::optional<Config> LoadConfigFromCli(
 }
 
 constexpr std::string_view IoBackendName() noexcept {
-#if defined(__APPLE__)
-    return "kqueue";
-#elif defined(_WIN32)
-    return "IOCP";
-#elif defined(CNODE_IO_URING_ENABLED)
+#if defined(CNODE_IO_URING_ENABLED)
     return "io_uring";
 #else
     return "epoll";
@@ -115,13 +111,8 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-#ifdef _WIN32
-    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEADDR allocator=thread-local",
-                config.workers, IoBackendName());
-#else
     LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
                 config.workers, IoBackendName());
-#endif
 
     if (!ValidateConfig(config)) {
         std::cerr << "Invalid configuration\n";

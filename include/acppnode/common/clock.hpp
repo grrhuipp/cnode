@@ -28,11 +28,7 @@ inline int64_t NowMillis() {
 // 使用系统本地时区转换时间，避免依赖 chrono tzdb 在静态环境中漂移。
 inline std::tm LocalTime(std::time_t timestamp) noexcept {
     std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &timestamp);
-#else
     localtime_r(&timestamp, &tm);
-#endif
     return tm;
 }
 

@@ -20,10 +20,8 @@
 #include <chrono>
 #include <functional>
 
-#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/tcp.h>
-#endif
 
 namespace acpp {
 

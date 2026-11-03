@@ -114,8 +114,7 @@ struct Endpoint : TimeoutEvent {
         cancelled = true;
         cancellation.Stop(reason);
         if (pending_read) {
-            IoErrorCode ec;
-            pending_read->cancel(ec);
+            pending_read->cancel();
         }
     }
     transport::CancellationSource& Cancellation() noexcept { return cancellation; }

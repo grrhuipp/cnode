@@ -14,12 +14,8 @@
 
 #include <system_error>
 
-#ifdef _WIN32
-#include <ws2tcpip.h>
-#else
 #include <arpa/inet.h>
 #include <net/if.h>
-#endif
 namespace acpp::iputil {
 
 inline net::ip::address NormalizeAddress(
@@ -64,24 +60,18 @@ public:
             ? ::inet_ntop(AF_INET6, &native_v6, text_.data(), text_.size())
             : ::inet_ntop(AF_INET, &native_v4, text_.data(), text_.size());
         if (!result) {
-#ifdef _WIN32
-            throw std::system_error(WSAGetLastError(), std::system_category(), "inet_ntop");
-#else
             throw std::system_error(errno, std::system_category(), "inet_ntop");
-#endif
         }
         size_ = std::char_traits<char>::length(text_.data());
         if (!ipv6) return;
         const auto v6 = address.to_v6();
         if (v6.scope_id() == 0) return;
         text_[size_++] = '%';
-#ifndef _WIN32
         if ((v6.is_link_local() || v6.is_multicast_link_local()) &&
             ::if_indextoname(static_cast<unsigned>(v6.scope_id()), text_.data() + size_)) {
             size_ += std::char_traits<char>::length(text_.data() + size_);
             return;
         }
-#endif
         const auto [end, error] = std::to_chars(
             text_.data() + size_, text_.data() + text_.size(), v6.scope_id());
         if (error != std::errc{}) throw std::system_error(std::make_error_code(error));
@@ -91,11 +81,7 @@ public:
     [[nodiscard]] std::string_view View() const noexcept { return {text_.data(), size_}; }
 
 private:
-#ifdef _WIN32
-    static constexpr size_t kScopeBytes = 20;
-#else
     static constexpr size_t kScopeBytes = std::max<size_t>(IF_NAMESIZE, 20);
-#endif
     std::array<char, INET6_ADDRSTRLEN + 1 + kScopeBytes> text_;
     size_t size_ = 0;
 };

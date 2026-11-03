@@ -170,14 +170,16 @@ void TestInboundMetadataOwnershipAndRouting() {
                             counted_worker_pool.OutstandingAllocations() > baseline_allocations &&
                             counted_worker_pool.OutstandingBytes() > baseline_bytes,
                         "long inbound metadata and its copy must allocate through Worker PMR");
-                Require(ctx.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
-                            ctx.inbound.protocol.get_allocator().resource() == &counted_worker_pool &&
-                            ctx.inbound.security.get_allocator().resource() == &counted_worker_pool &&
-                            ctx.inbound.tags.get_allocator().resource() == &counted_worker_pool &&
-                            ctx.inbound.tags[0].get_allocator().resource() == &counted_worker_pool &&
-                            copy.inbound.tag.get_allocator().resource() == &counted_worker_pool &&
-                            copy.inbound.tags[0].get_allocator().resource() == &counted_worker_pool,
-                        "inbound metadata and Context copies must use the Worker PMR resource");
+                Require(ctx.pool() == &counted_worker_pool &&
+                            copy.pool() == &counted_worker_pool &&
+                            ctx.inbound.tag.get_allocator().resource() == ctx.arena() &&
+                            ctx.inbound.protocol.get_allocator().resource() == ctx.arena() &&
+                            ctx.inbound.security.get_allocator().resource() == ctx.arena() &&
+                            ctx.inbound.tags.get_allocator().resource() == ctx.arena() &&
+                            ctx.inbound.tags[0].get_allocator().resource() == ctx.arena() &&
+                            copy.inbound.tag.get_allocator().resource() == copy.arena() &&
+                            copy.inbound.tags[0].get_allocator().resource() == copy.arena(),
+                        "inbound metadata and Context copies must use the Context arena backed by the Worker PMR pool");
                 ctx.inbound.tag[0] = 'c';
                 ctx.inbound.tags[1][0] = 'y';
                 Require(copy.inbound.tag[0] == 'm' && copy.inbound.tags[1][0] == 'x',

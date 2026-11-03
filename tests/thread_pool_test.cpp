@@ -1,6 +1,6 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/buf/multi_buffer.hpp"
-
+#include "acppnode/common/session.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -13,7 +13,7 @@
 
 namespace {
 using namespace acpp::memory;
-using Pool = ReturningThreadPool;
+using Pool = worker_memory;
 using namespace std::chrono_literals;
 
 bool Intact(void* p, size_t bytes, uint8_t pattern) {
@@ -55,7 +55,7 @@ bool RunGeometry() {
     if (Pool::Describe(224, 8).slot_bytes != 256 ||
         Pool::Describe(632, 8).slot_bytes != 704 ||
         Pool::Describe(8296, 8).slot_bytes != 8448 ||
-        Pool::Describe(17408, 8).slot_bytes != 17664) return false;
+        Pool::Describe(17408, 8).slot_bytes != 20480) return false;
     size_t last_stride = 0;
     for (size_t bytes = 1; bytes <= kThreadPoolMaxClass - 32; ++bytes) {
         const auto layout = Pool::Describe(bytes, 8, 4);
@@ -167,7 +167,7 @@ bool RunMixed() {
 
 bool RunPinnedChunks() {
     Pool pool;
-    constexpr size_t bytes = 17408;
+    constexpr size_t bytes = 8192;
     std::vector<void*> blocks;
     for (size_t depth = 0; depth < 5; ++depth) {
         const auto layout = Pool::Describe(bytes, 16, depth);
@@ -338,6 +338,120 @@ bool RunSharedAllocation() {
     return passed;
 }
 
+class CountingResource final : public std::pmr::memory_resource {
+public:
+    std::size_t allocations = 0;
+    std::size_t returns = 0;
+    std::size_t live = 0;
+    std::size_t live_bytes = 0;
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        void* block = process_resource()->allocate(bytes, alignment);
+        ++allocations;
+        ++live;
+        live_bytes += bytes;
+        return block;
+    }
+    void do_deallocate(void* block, std::size_t bytes, std::size_t alignment) override {
+        process_resource()->deallocate(block, bytes, alignment);
+        ++returns;
+        --live;
+        live_bytes -= bytes;
+    }
+    [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+};
+
+bool RunLargeBlockCache() {
+    CountingResource upstream;
+    {
+        worker_memory pool(upstream, {.retained_block_bytes_ = 2 * 36864});
+        auto* resource = pool.resource();
+        // 40000 and 38000 both round to the same 40 KiB class in the block cache.
+        void* first = resource->allocate(40000, 16);
+        std::memset(first, 0x33, 40000);
+        resource->deallocate(first, 40000, 16);
+        const auto allocs_after_free = upstream.allocations;
+        void* second = resource->allocate(38000, 16);
+        if (second != first || upstream.allocations != allocs_after_free) return false;
+        resource->deallocate(second, 38000, 16);
+        pool.trim();
+        if (upstream.live != 0 || upstream.live_bytes != 0) return false;
+
+        // Retention budget keeps 2 blocks of 32 KiB class and returns the 3rd immediately.
+        std::array<void*, 3> blocks{};
+        for (auto& b : blocks) b = resource->allocate(30000, 16);
+        for (auto* b : blocks) resource->deallocate(b, 30000, 16);
+        if (upstream.live != 2) return false;
+        bool cross_thread_trim_rejected = false;
+        std::thread other([&] {
+            try {
+                pool.trim();
+            } catch (const std::logic_error&) {
+                cross_thread_trim_rejected = true;
+            }
+        });
+        other.join();
+        if (!cross_thread_trim_rejected || upstream.live != 2) return false;
+        pool.trim();
+        if (upstream.live != 0) return false;
+    }
+    return upstream.live == 0 && upstream.allocations == upstream.returns;
+}
+
+bool RunRequestArenaAndContext() {
+    CountingResource upstream;
+    {
+        worker_memory worker(upstream, {.request_initial_buffer_bytes_ = 512});
+        std::array<std::byte, 256> initial{};
+        request_memory parent(worker, initial);
+        const auto before = upstream.allocations;
+        void* in_place = parent.resource()->allocate(128, 16);
+        std::memset(in_place, 0x5a, 128);
+        if (upstream.allocations != before || parent.upstream_resource() != worker.resource()) {
+            return false;
+        }
+        request_memory child = parent.fork();
+        void* child_mem = child.resource()->allocate(256, 16);
+        std::memset(child_mem, 0x7b, 256);
+
+        auto* prev = std::pmr::set_default_resource(worker.resource());
+        {
+            acpp::session::Context ctx;
+            if (ctx.pool() != worker.resource() || ctx.arena() == ctx.pool()) {
+                std::pmr::set_default_resource(prev);
+                return false;
+            }
+            ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
+            ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
+            std::pmr::vector<int> arena_vec(ctx.allocator<int>());
+            arena_vec.resize(64, 99);
+            if (arena_vec.back() != 99) {
+                std::pmr::set_default_resource(prev);
+                return false;
+            }
+        }
+        std::pmr::set_default_resource(prev);
+    }
+    return upstream.live == 0 && upstream.allocations == upstream.returns;
+}
+
+bool RunTaskFrameCache() {
+    detail::task_frame_cache_release();
+    if (detail::task_frame_cached_bytes() != 0) return false;
+    void* frame = detail::task_frame_allocate(300);
+    if (!frame) return false;
+    std::memset(frame, 0x42, 300);
+    detail::task_frame_deallocate_sized(frame, 300);
+    if (detail::task_frame_cached_bytes() != 384) return false;
+    void* reused = detail::task_frame_allocate(260);
+    if (reused != frame || detail::task_frame_cached_bytes() != 0) return false;
+    detail::task_frame_deallocate_sized(reused, 260);
+    detail::task_frame_cache_release();
+    return detail::task_frame_cached_bytes() == 0;
+}
 bool RunAll() {
     struct Case { const char* name; bool (*run)(); };
     for (const auto& test : std::array{
@@ -345,8 +459,14 @@ bool RunAll() {
         Case{"fragmented/mixed alignment", RunFragmented}, Case{"mixed lifetime", RunMixed},
         Case{"pinned chunks", RunPinnedChunks}, Case{"idle FIFO", RunIdleQueue},
         Case{"ownership/PMR/OOM", RunOwnershipAndPmr}, Case{"Buffer", RunBuffer},
-        Case{"shared allocation/alignment/exception", RunSharedAllocation}}) {
-        if (!test.run()) { std::fprintf(stderr, "pool case failed: %s\n", test.name); return false; }
+        Case{"shared allocation/alignment/exception", RunSharedAllocation},
+        Case{"large block cache", RunLargeBlockCache},
+        Case{"request arena and session context", RunRequestArenaAndContext},
+        Case{"task frame cache", RunTaskFrameCache}}) {
+        if (!test.run()) {
+            std::fprintf(stderr, "pool case failed: %s\n", test.name);
+            return false;
+        }
     }
     return true;
 }

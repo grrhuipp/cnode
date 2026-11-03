@@ -20,10 +20,10 @@ option(CNODE_TEST_SANITIZERS "Include ASan/UBSan regression targets in CTest" OF
 # completion batches. This does not replace global allocation or add a pool;
 # buffers and application-owned objects still use the owning Worker's PMR.
 set(CNODE_ASIO_RECYCLING_CACHE_SIZE 64 CACHE STRING "Asio small-block recycling cache size")
-set(CNODE_LIBURING_TAG "liburing-2.14" CACHE STRING "axboe/liburing tag used for the io_uring backend")
+set(CNODE_LIBURING_TAG "liburing-2.15" CACHE STRING "axboe/liburing tag used for the io_uring backend")
 
-if(CNODE_IO_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "CNODE_IO_URING is only supported on Linux")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "cnode only supports Linux")
 endif()
 
 set(CNODE_COMPILER_MACHINE "")
@@ -110,7 +110,7 @@ FetchContent_MakeAvailable(tl_expected)
 FetchContent_Declare(
     asio
     GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-    GIT_TAG asio-1-32-0
+    GIT_TAG asio-1-38-2
 )
 FetchContent_MakeAvailable(asio)
 
@@ -121,6 +121,7 @@ target_include_directories(asio_standalone INTERFACE
 )
 target_compile_definitions(asio_standalone INTERFACE
     ASIO_STANDALONE
+    ASIO_NO_DEPRECATED
     ASIO_RECYCLING_ALLOCATOR_CACHE_SIZE=${CNODE_ASIO_RECYCLING_CACHE_SIZE}
 )
 
@@ -177,7 +178,7 @@ endif()
 FetchContent_Declare(
     aws_lc
     GIT_REPOSITORY https://github.com/aws/aws-lc.git
-    GIT_TAG v1.73.0
+    GIT_TAG v5.12.0
     PATCH_COMMAND
         ${CMAKE_COMMAND}
             -DAWS_LC_SOURCE_DIR=<SOURCE_DIR>
@@ -191,7 +192,7 @@ message(STATUS "Using AWS-LC via FetchContent")
 FetchContent_Declare(
     zlib
     GIT_REPOSITORY https://github.com/madler/zlib.git
-    GIT_TAG v1.3.1
+    GIT_TAG v1.3.2
     SOURCE_SUBDIR cnode-no-upstream-cmake
 )
 FetchContent_MakeAvailable(zlib)
@@ -207,7 +208,7 @@ message(STATUS "Using moodycamel ConcurrentQueue via FetchContent")
 FetchContent_Declare(
     blake3
     GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
-    GIT_TAG 1.8.5
+    GIT_TAG 1.8.7
     SOURCE_SUBDIR cnode-no-upstream-cmake
 )
 FetchContent_MakeAvailable(blake3)
@@ -243,9 +244,33 @@ if(UNIX)
 endif()
 
 find_package(Threads REQUIRED)
-set(CNODE_ALLOCATOR_SUMMARY "system (global), Worker-local PMR pool")
-message(STATUS "Allocator: ${CNODE_ALLOCATOR_SUMMARY}")
 
+set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MI_USE_CXX ON CACHE STRING "" FORCE)
+set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+if(CNODE_TARGET_IS_MUSL)
+    set(MI_LIBC_MUSL ON CACHE BOOL "" FORCE)
+else()
+    set(MI_LIBC_MUSL OFF CACHE BOOL "" FORCE)
+endif()
+FetchContent_Declare(
+    mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v3.6.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(mimalloc)
+set_target_properties(mimalloc-static PROPERTIES
+    INTERPROCEDURAL_OPTIMIZATION OFF
+    INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF
+)
+target_compile_options(mimalloc-static PRIVATE -ffunction-sections -fdata-sections -Wno-attributes)
+
+set(CNODE_ALLOCATOR_SUMMARY "mimalloc (static override), Worker multi-tier PMR pool + request arena")
+message(STATUS "Allocator: ${CNODE_ALLOCATOR_SUMMARY}")
 # ============================================================================
 # 源文件收集
 # ============================================================================
@@ -3105,9 +3130,16 @@ foreach(target IN LISTS cnode_targets)
     get_target_property(target_type ${target} TYPE)
     if(target_type STREQUAL "EXECUTABLE" AND target MATCHES "^cnode($|_)")
         target_link_libraries(${target} PRIVATE tl::expected)
+        if(NOT target MATCHES "_sanitized$")
+            target_compile_definitions(${target} PRIVATE CNODE_USE_MIMALLOC)
+            target_include_directories(${target} SYSTEM PRIVATE ${mimalloc_SOURCE_DIR}/include)
+            target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
+            if(target MATCHES "^cnode_")
+                target_link_options(${target} PRIVATE -Wl,--allow-multiple-definition)
+            endif()
+        endif()
     endif()
 endforeach()
-
 # ============================================================================
 # 打印配置摘要
 # ============================================================================

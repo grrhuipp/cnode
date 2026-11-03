@@ -4,8 +4,11 @@
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <cstddef>
+#include <optional>
 #include <utility>
 
 namespace acpp::transport::internet {
@@ -55,12 +58,11 @@ public:
         AsyncWriteGate* gate_ = nullptr;
     };
 
-    explicit AsyncWriteGate(net::io_context& io_context)
-        : signal_(io_context, 1) {}
+    AsyncWriteGate() noexcept = default;
 
-    explicit AsyncWriteGate(net::any_io_executor executor)
-        : signal_(std::move(executor), 1) {}
+    explicit AsyncWriteGate(net::io_context&) noexcept {}
 
+    explicit AsyncWriteGate(const net::any_io_executor&) noexcept {}
     AsyncWriteGate(const AsyncWriteGate&) = delete;
     AsyncWriteGate& operator=(const AsyncWriteGate&) = delete;
 
@@ -74,7 +76,15 @@ public:
 
     [[nodiscard]] net::awaitable<Lease> Acquire() {
         while (busy_ && !cancelled_) {
-            auto [ec] = co_await signal_.async_receive(
+            if (!signal_) {
+                signal_.emplace(co_await net::this_coro::executor, 1);
+            }
+            ++waiters_;
+            struct WaiterScope {
+                std::size_t& waiters;
+                ~WaiterScope() noexcept { --waiters; }
+            } scope{waiters_};
+            auto [ec] = co_await signal_->async_receive(
                 net::as_tuple(net::use_awaitable));
             if (ec) {
                 co_return Lease{};
@@ -86,20 +96,21 @@ public:
     void Cancel() noexcept {
         if (cancelled_) return;
         cancelled_ = true;
-        // Closing is the terminal broadcast: every outstanding receive is
-        // completed, and future acquirers observe cancelled_ before waiting.
-        signal_.close();
+        if (signal_) {
+            signal_->close();
+        }
     }
 
 private:
     void Release() noexcept {
         busy_ = false;
-        if (!cancelled_) {
-            (void)signal_.try_send(IoErrorCode{});
+        if (!cancelled_ && waiters_ != 0 && signal_) {
+            (void)signal_->try_send(IoErrorCode{});
         }
     }
 
-    net::experimental::channel<void(IoErrorCode)> signal_;
+    std::optional<net::experimental::channel<void(IoErrorCode)>> signal_;
+    std::size_t waiters_ = 0;
     bool busy_ = false;
     bool cancelled_ = false;
 };
