@@ -418,6 +418,8 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
             result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
             co_return;
         }
+        sniff_payload.clear();
+        memory::ByteVector{}.swap(sniff_scratch);
     }
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (sniff_cancellation.cancelled() != net::cancellation_type::none ||
@@ -476,6 +478,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     if (outbound_first_payload.empty() && !first_packet.empty()) {
         outbound_first_payload.Push(first_packet.MoveToMultiBuffer());
     }
+    first_packet = {};
     const size_t relay_payload_size = outbound_first_payload.byte_size();
 
     LOG_CONN_DEBUG(ctx, "[Session] Relay start: {} -> {} via {} payload={}B",

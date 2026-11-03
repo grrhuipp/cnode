@@ -189,9 +189,9 @@ struct Handler::ClientSession {
         transport::CancellationSource cancellation_;
         net::io_context& io_context_;
         TimeoutScheduler& timeout_scheduler_;
-        net::experimental::channel<void(IoErrorCode)> syn_signal_;
-        net::experimental::channel<void(IoErrorCode)> payload_signal_;
-        net::experimental::channel<void(IoErrorCode)> payload_space_signal_;
+        SignalChannel syn_signal_;
+        SignalChannel payload_signal_;
+        SignalChannel payload_space_signal_;
         buf::MultiBuffer queued_payload_;
         ErrorCode error_ = ErrorCode::OK;
         bool closed_ = false;
@@ -748,49 +748,53 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     auto logical = session->RegisterLogicalStream(sid);
     LogicalStreamLease logical_lease(transport_lease, session, logical, sid);
     const bool is_udp = ctx.content.network == Network::UDP;
-    const TargetAddress original_target = ctx.outbound.target;
-    const TargetAddress stream_target = is_udp
-        ? TargetAddress(proxy::uot::kMagicAddress, 0)
-        : ctx.outbound.target;
-    std::array<uint8_t, kMaxEncodedAddressSize> target{};
-    const size_t target_size = (stream_target.IsValid() ||
-        proxy::uot::VersionFromMagicAddress(stream_target))
-        ? EncodeAddressTo(stream_target, target.data(), target.size(),
-                          AddressWireFormat::Socks5) : 0;
-    if (target_size == 0) {
-        stream.Cancel();
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
-    }
-
-    memory::ByteVector open_packet;
-    open_packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
-    auto syn_frame = AppendFrameBytesTo(open_packet, kCmdSYN, sid, {});
-    auto target_frame = AppendFrameBytesTo(
-        open_packet,
-        kCmdPSH,
-        sid,
-        std::span<const uint8_t>(target.data(), target_size));
-    if (!syn_frame || !target_frame) {
-        stream.Cancel();
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    if (is_udp) {
-        auto request = proxy::uot::EncodeRequest(true, original_target);
-        if (!request) {
-            stream.Cancel();
-            co_return tl::unexpected(request.error());
+    const TargetAddress& original_target = ctx.outbound.target;
+    auto build_open_packet = [&]() -> tl::expected<memory::ByteVector, ErrorCode> {
+        const TargetAddress stream_target = is_udp
+            ? TargetAddress(proxy::uot::kMagicAddress, 0)
+            : original_target;
+        std::array<uint8_t, kMaxEncodedAddressSize> target{};
+        const size_t target_size = (stream_target.IsValid() ||
+            proxy::uot::VersionFromMagicAddress(stream_target))
+            ? EncodeAddressTo(stream_target, target.data(), target.size(),
+                              AddressWireFormat::Socks5) : 0;
+        if (target_size == 0) {
+            return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
         }
-        auto request_frame = AppendFrameBytesTo(
-            open_packet,
+
+        memory::ByteVector packet;
+        packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
+        auto syn_frame = AppendFrameBytesTo(packet, kCmdSYN, sid, {});
+        auto target_frame = AppendFrameBytesTo(
+            packet,
             kCmdPSH,
             sid,
-            request->span());
-        if (!request_frame) {
-            stream.Cancel();
-            co_return tl::unexpected(request_frame.error());
+            std::span<const uint8_t>(target.data(), target_size));
+        if (!syn_frame || !target_frame) {
+            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
+        if (is_udp) {
+            auto request = proxy::uot::EncodeRequest(true, original_target);
+            if (!request) {
+                return tl::unexpected(request.error());
+            }
+            auto request_frame = AppendFrameBytesTo(
+                packet,
+                kCmdPSH,
+                sid,
+                request->span());
+            if (!request_frame) {
+                return tl::unexpected(request_frame.error());
+            }
+        }
+        return packet;
+    };
+    auto open_packet = build_open_packet();
+    if (!open_packet) {
+        stream.Cancel();
+        co_return tl::unexpected(open_packet.error());
     }
-    if (auto ok = co_await session->WriteOpenPacket(std::move(open_packet)); !ok) {
+    if (auto ok = co_await session->WriteOpenPacket(std::move(*open_packet)); !ok) {
         stream.Cancel();
         logical->Close(ok.error());
         co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
@@ -815,7 +819,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         std::shared_ptr<ClientSession::LogicalStream> logical;
         uint32_t sid = 0;
         bool is_udp = false;
-        TargetAddress original_target;
+        const TargetAddress& original_target;
         bool cancelled = false;
         size_t pending_writes = 0;
 
@@ -831,12 +835,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
                         std::shared_ptr<ClientSession::LogicalStream> l,
                         uint32_t stream_id,
                         bool udp,
-                        TargetAddress target)
+                        const TargetAddress& target)
             : session(std::move(s))
             , logical(std::move(l))
             , sid(stream_id)
             , is_udp(udp)
-            , original_target(std::move(target)) {}
+            , original_target(target) {}
 
         net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
             auto payload = co_await logical->ReadPayload();

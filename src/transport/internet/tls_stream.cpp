@@ -262,7 +262,7 @@ struct TlsStream::Impl : memory::ThreadAllocated, private transport::Cancellatio
         Impl& owner;
         OutputTurn* previous;
         OutputTurn* next = nullptr;
-        std::optional<net::experimental::channel<void(IoErrorCode)>> wake;
+        std::optional<SignalChannel> wake;
     };
 
     struct InputWait {
@@ -707,8 +707,8 @@ net::awaitable<bool> TlsStream::Handshake() {
             };
             try {
                 co_await impl_->Write(request_buffers);
-                std::array<uint8_t, 1024> drain;
-                (void)co_await impl_->Read(net::buffer(drain), nullptr);
+                buf::BufferGuard drain;
+                (void)co_await impl_->Read({}, &drain);
             } catch (const IoSystemError&) {
                 // The camouflage exchange is best-effort; authentication still
                 // fails regardless of the origin's response or close behavior.

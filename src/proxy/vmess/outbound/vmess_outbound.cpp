@@ -33,11 +33,11 @@ public:
     VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
                           AsyncStream& stream,
                           bool is_udp,
-                          TargetAddress udp_target)
+                          const TargetAddress& udp_target)
         : session_(session)
         , stream_(stream)
         , is_udp_(is_udp)
-        , udp_target_(std::move(udp_target)) {}
+        , udp_target_(udp_target) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!response_header_read_) {
@@ -135,7 +135,7 @@ private:
     AsyncStream& stream_;
     bool response_header_read_ = false;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
 };
 
 }  // namespace
@@ -171,48 +171,43 @@ proxy::vmess::outbound::Handler::Process(
     }
     const auto& target = ctx.outbound.target;
 
-    auto dial_stream = [&]() -> net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>> {
-        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = prepared_->config.address,
-            .literal_address = prepared_->config.literal_address,
-            .port = prepared_->config.port,
-            .stream_settings = &prepared_->config.stream_settings,
-            .timeout = dial_timeout_,
-            .send_through = &prepared_->config.send_through,
-            .inbound_local_addr = inbound_local_addr,
-            .inbound_source_ip = ctx.inbound.source_ip,
-            .inbound_source_port = ctx.inbound.source_port,
-            .tls_server_name = ResolveOutboundTlsServerName(
-                prepared_->config.stream_settings, prepared_->config.address),
-            .ws_host = prepared_->config.address,
-        });
-        if (!transport_target) {
-            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-                LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
-            }
-            co_return tl::unexpected(transport_target.error());
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service_,
+        .address = prepared_->config.address,
+        .literal_address = prepared_->config.literal_address,
+        .port = prepared_->config.port,
+        .stream_settings = &prepared_->config.stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &prepared_->config.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            prepared_->config.stream_settings, prepared_->config.address),
+        .ws_host = prepared_->config.address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
         }
-
-        LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
-                       prepared_->config.address, prepared_->config.port,
-                       prepared_->config.stream_settings.security,
-                       prepared_->config.stream_settings.network);
-
-        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-        if (!dial_result.Ok()) {
-            LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
-                              ctx.inbound.source_ip, ctx.outbound.target,
-                              ctx.outbound.tag, dial_result.error_msg);
-            co_return tl::unexpected(dial_result.error);
-        }
-        co_return std::move(dial_result.stream);
-    };
-    auto dialed = co_await dial_stream();
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+        co_return tl::unexpected(transport_target.error());
     }
-    auto stream = std::move(*dialed);
+
+    LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
+                   prepared_->config.address, prepared_->config.port,
+                   prepared_->config.stream_settings.security,
+                   prepared_->config.stream_settings.network);
+
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    *transport_target = {};
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+
+    auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {

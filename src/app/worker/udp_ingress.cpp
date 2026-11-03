@@ -168,7 +168,7 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
     UdpResourceBudget::AssociationLease association;
     UdpResourceBudget& budget;
     net::io_context& io_context;
-    net::experimental::channel<void(IoErrorCode)> reader_signal;
+    SignalChannel reader_signal;
     ReplyRoute reply;
     udp::endpoint reply_endpoint;
     struct QueuedInput {
@@ -392,7 +392,7 @@ struct UdpIngress::Impl : memory::ThreadAllocated {
     UdpSocketMap udp_sockets;
     ReplyQueueMap reply_queues;
     ClientSessionOuterMap client_sessions;
-    net::experimental::channel<void(IoErrorCode)> completion_signal;
+    SignalChannel completion_signal;
     ClientSession* jobs = nullptr;
     size_t outstanding_jobs = 0;
     size_t join_observers = 0;

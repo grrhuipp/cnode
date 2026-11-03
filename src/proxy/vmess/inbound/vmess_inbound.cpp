@@ -65,31 +65,21 @@ proxy::vmess::inbound::Handler::Process(
     }
     std::optional<UserOnlineSessionGuard> user_session;
 
-    buf::BufferGuard handshake_guard{buf::Buffer::New()};
-    if (!handshake_guard) {
-        co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
-    }
-    uint8_t* handshake_buf = handshake_guard->Tail().data();
-    size_t handshake_capacity = handshake_guard->Available();
-    memory::ByteVector large_header;
+    memory::ByteVector header_buf;
     size_t total_read = 0;
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
     std::optional<::acpp::vmess::VMessRequest> request;
     size_t consumed = 0;
     while (!request) {
         const size_t required = vmess_session.RequiredHeaderBytes();
-        if (required > handshake_capacity) {
-            large_header.resize(required);
-            std::memcpy(large_header.data(), handshake_buf, total_read);
-            handshake_guard = {};
-            handshake_buf = large_header.data();
-            handshake_capacity = large_header.size();
+        if (required > header_buf.size()) {
+            header_buf.resize(required);
         }
         while (total_read < required) {
             size_t n = 0;
             try {
                 n = co_await stream->AsyncRead(net::buffer(
-                    handshake_buf + total_read, required - total_read));
+                    header_buf.data() + total_read, required - total_read));
             } catch (const IoSystemError&) {
                 co_return fail(stream->ConsumePhaseDeadline()
                     ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
@@ -104,7 +94,7 @@ proxy::vmess::inbound::Handler::Process(
             total_read += n;
         }
         auto decoded = vmess_session.DecodeRequestHeader(
-            handshake_buf, total_read, ctx.conn_id);
+            header_buf.data(), total_read, ctx.conn_id);
         request = std::move(decoded.first);
         consumed = decoded.second;
         if (!request && vmess_session.RequiredHeaderBytes() == 0) {
@@ -116,8 +106,7 @@ proxy::vmess::inbound::Handler::Process(
         }
     }
 
-    handshake_guard = {};
-    memory::ByteVector{}.swap(large_header);
+    memory::ByteVector{}.swap(header_buf);
 
     LOG_CONN_TRACE(ctx,
                    "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",

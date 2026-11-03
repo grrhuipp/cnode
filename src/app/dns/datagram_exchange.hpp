@@ -131,7 +131,7 @@ private:
         DatagramExchange& owner;
         uint16_t id;
         std::span<const uint8_t> query;
-        net::experimental::channel<void(IoErrorCode)> completion;
+        SignalChannel completion;
         void OnTimeout() override { owner.Complete(id, io_error::timed_out); }
         Reply reply;
     };
@@ -231,7 +231,7 @@ private:
     udp::socket socket_;
     udp::endpoint endpoint_;
     TimeoutScheduler& scheduler_;
-    net::experimental::channel<void(IoErrorCode)> joined_;
+    SignalChannel joined_;
     memory::ThreadLocalUnorderedMap<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;

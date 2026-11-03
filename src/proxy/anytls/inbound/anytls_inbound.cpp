@@ -209,8 +209,8 @@ private:
     }
 
     net::io_context& io_context_;
-    net::experimental::channel<void(IoErrorCode)> input_signal_;
-    net::experimental::channel<void(IoErrorCode)> input_space_signal_;
+    SignalChannel input_signal_;
+    SignalChannel input_space_signal_;
     AnyTLSDemuxSession& session_; // Run joins all users before destroying the session.
     uint32_t sid_ = 0;
     buf::MultiBuffer queued_input_;

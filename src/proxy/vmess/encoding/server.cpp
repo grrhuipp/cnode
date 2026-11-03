@@ -963,7 +963,7 @@ private:
     DecodeRequestBodyState request_body_state_;
     AsyncStream* stream_ = nullptr;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
 };
 
 class ResponseBodyWriter final
@@ -1024,7 +1024,7 @@ private:
     EncodeResponseBodyState response_body_state_;
     AsyncStream* stream_ = nullptr;
     bool packet_mode_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
 };
 
 }  // namespace

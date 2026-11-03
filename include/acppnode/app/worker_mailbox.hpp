@@ -87,7 +87,7 @@ public:
     }
 
 private:
-    using CompletionChannel = net::experimental::channel<void(IoErrorCode)>;
+    using CompletionChannel = SignalChannel;
     static constexpr size_t kClosed = size_t{1} << (std::numeric_limits<size_t>::digits - 1);
     class Slot {
     public:

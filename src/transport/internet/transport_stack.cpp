@@ -1023,11 +1023,11 @@ private:
     }
 
     net::io_context& io_context_;
-    net::experimental::channel<void(IoErrorCode)> input_signal_;
+    SignalChannel input_signal_;
     detail::XHttpPacketQueue packet_queue_;
     detail::XHttpUploadStreamSlot stream_input_;
     transport::CancellationSource cancellation_;
-    net::experimental::channel<void(IoErrorCode)> upload_signal_{io_context_, 1};
+    SignalChannel upload_signal_{io_context_, 1};
     size_t upload_reads_ = 0;
     bool input_closed_ = false;
     bool closed_ = false;
@@ -2420,38 +2420,15 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        auto* out = static_cast<uint8_t*>(buffer.data());
-        const size_t capacity = buffer.size();
-        if (capacity == 0) {
+        if (buffer.size() == 0 || !co_await EnsureReadablePayload()) {
             co_return 0;
         }
-
-        if (payload_codec_ == H2PayloadCodec::RawData) {
-            if (!co_await EnsureReadablePayload()) {
-                co_return 0;
-            }
-            const size_t n = std::min(capacity, h2_data_end_ - h2_data_offset_);
-            std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
-            h2_data_offset_ += n;
-            if (h2_data_offset_ >= h2_data_end_) {
-                ReleaseH2Data();
-            }
-            co_return n;
-        }
-
-        if (!co_await EnsureReadablePayload()) {
-            co_return 0;
-        }
-
-        const auto payload = hunk_.Payload();
-        const size_t n = std::min(capacity, payload.size());
-        std::memcpy(out, payload.data(), n);
-        hunk_.Consume(n);
-        co_return n;
+        co_return ConsumeReadablePayload(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        auto lease = co_await AcquireWrite();
+        auto lease = write_gate_.TryAcquire();
+        if (!lease) lease = co_await AcquireWrite();
         if (write_closed_) {
             ThrowHttp2StreamError("gRPC write on closed stream");
         }
@@ -2480,19 +2457,18 @@ public:
         if (!buffer) {
             throw std::bad_alloc();
         }
-        size_t n = co_await AsyncRead(
+        const size_t n = ConsumeReadablePayload(
             net::buffer(buffer->Tail().data(), buffer->Available()));
         if (n == 0) {
             co_return buf::MultiBuffer{};
         }
         buffer->Produce(static_cast<uint32_t>(n));
-        buf::MultiBuffer mb;
-        mb.push_back(std::move(buffer));
-        co_return mb;
+        co_return buf::MultiBuffer{std::move(buffer)};
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        auto lease = co_await AcquireWrite();
+        auto lease = write_gate_.TryAcquire();
+        if (!lease) lease = co_await AcquireWrite();
         if (write_closed_) ThrowHttp2StreamError("HTTP/2 write on closed stream");
         if (payload_codec_ == H2PayloadCodec::RawData) {
             ConstBufferSpanBuilder<16> payloads;
@@ -2534,7 +2510,8 @@ public:
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        auto lease = co_await AcquireWrite();
+        auto lease = write_gate_.TryAcquire();
+        if (!lease) lease = co_await AcquireWrite();
         if (write_closed_) ThrowHttp2StreamError("HTTP/2 write on closed stream");
         if (payload_codec_ == H2PayloadCodec::RawData) {
             if (!co_await WriteH2DataPayloadBuffers(
@@ -2574,7 +2551,8 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        auto lease = co_await AcquireWrite();
+        auto lease = write_gate_.TryAcquire();
+        if (!lease) lease = co_await AcquireWrite();
         if (write_closed_) {
             co_return;
         }
@@ -2640,6 +2618,25 @@ private:
         memory::ByteVector{h2_data_.get_allocator()}.swap(h2_data_);
         h2_data_offset_ = 0;
         h2_data_end_ = 0;
+    }
+
+    [[nodiscard]] size_t ConsumeReadablePayload(net::mutable_buffer buffer) noexcept {
+        auto* out = static_cast<uint8_t*>(buffer.data());
+        const size_t capacity = buffer.size();
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            const size_t n = std::min(capacity, h2_data_end_ - h2_data_offset_);
+            std::memcpy(out, h2_data_.data() + h2_data_offset_, n);
+            h2_data_offset_ += n;
+            if (h2_data_offset_ >= h2_data_end_) {
+                ReleaseH2Data();
+            }
+            return n;
+        }
+        const auto payload = hunk_.Payload();
+        const size_t n = std::min(capacity, payload.size());
+        std::memcpy(out, payload.data(), n);
+        hunk_.Consume(n);
+        return n;
     }
 
     net::awaitable<bool> WaitForRawData() {
@@ -2736,12 +2733,14 @@ private:
             switch (frame->type) {
             case H2FrameType::SETTINGS:
                 if ((frame->flags & 0x1) == 0) {
-                    auto lease = co_await AcquireWrite();
+                    auto lease = write_gate_.TryAcquire();
+                    if (!lease) lease = co_await AcquireWrite();
                     co_await AcknowledgeH2Settings(*inner_);
                 }
                 break;
             case H2FrameType::PING: {
-                auto lease = co_await AcquireWrite();
+                auto lease = write_gate_.TryAcquire();
+                if (!lease) lease = co_await AcquireWrite();
                 co_await ReplyH2Ping(*inner_, *frame);
                 break;
             }
@@ -2777,7 +2776,8 @@ private:
                         data.data() - frame->payload.data());
                     h2_data_end_ = h2_data_offset_ + data_len;
                     h2_data_ = std::move(frame->payload);
-                    auto lease = co_await AcquireWrite();
+                    auto lease = write_gate_.TryAcquire();
+                    if (!lease) lease = co_await AcquireWrite();
                     co_await SendWindowUpdate(
                         *inner_,
                         0,
@@ -2875,14 +2875,14 @@ private:
 
     net::awaitable<bool> EnsureReadablePayload();
     net::awaitable<bool> WaitForRawData();
-    net::awaitable<size_t> AsyncReadRaw(net::mutable_buffer buffer);
+    [[nodiscard]] size_t ConsumeReadablePayload(net::mutable_buffer buffer) noexcept;
     void MarkQueueForShrinkIfLarge() noexcept;
     void ShrinkQueueIfDrained() noexcept;
     void ClearH2Queue() noexcept;
 
     net::io_context& io_context_;
-    net::experimental::channel<void(IoErrorCode)> input_signal_;
-    net::experimental::channel<void(IoErrorCode)> owner_signal_{io_context_, 1};
+    SignalChannel input_signal_;
+    SignalChannel owner_signal_{io_context_, 1};
     bool owner_released_ = false;
     IoErrorCode terminal_error_ = io_error::operation_aborted;
     std::weak_ptr<Http2ServerSession> session_;
@@ -3184,7 +3184,8 @@ public:
         uint8_t flags,
         uint32_t stream_id,
         std::span<const uint8_t> payload = {}) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_ ||
             (stream_id != 0 && type != H2FrameType::RST_STREAM && !streams_.contains(stream_id))) {
             co_return false;
@@ -3201,7 +3202,8 @@ public:
     net::awaitable<bool> WriteGrpcMessageSerialized(
         uint32_t stream_id,
         std::span<const uint8_t> data) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
@@ -3213,7 +3215,8 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> data,
         bool end_stream = false) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
@@ -3229,7 +3232,8 @@ public:
         uint32_t stream_id,
         std::span<const net::const_buffer> buffers,
         bool end_stream = false) {
-        auto write_lease = co_await write_gate_.Acquire();
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_ || !streams_.contains(stream_id)) {
             co_return false;
         }
@@ -3874,22 +3878,10 @@ void Http2ServerSubStreamState::ShutdownWrite() noexcept {
 
 net::awaitable<size_t> Http2ServerSubStreamState::AsyncRead(
     net::mutable_buffer buffer) {
-    auto* out = static_cast<uint8_t*>(buffer.data());
-    const size_t capacity = buffer.size();
-    if (capacity == 0) {
+    if (buffer.size() == 0 || !co_await EnsureReadablePayload()) {
         co_return 0;
     }
-
-    if (payload_codec_ == H2PayloadCodec::RawData) {
-        co_return co_await AsyncReadRaw(buffer);
-    }
-
-    if (!co_await EnsureReadablePayload()) co_return 0;
-    const auto payload = hunk_.Payload();
-    const size_t n = std::min(capacity, payload.size());
-    std::memcpy(out, payload.data(), n);
-    hunk_.Consume(n);
-    co_return n;
+    co_return ConsumeReadablePayload(buffer);
 }
 
 net::awaitable<size_t> Http2ServerSubStreamState::AsyncWrite(
@@ -3927,15 +3919,13 @@ net::awaitable<buf::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer() {
     if (!buffer) {
         throw std::bad_alloc();
     }
-    size_t n = co_await AsyncRead(
+    const size_t n = ConsumeReadablePayload(
         net::buffer(buffer->Tail().data(), buffer->Available()));
     if (n == 0) {
         co_return buf::MultiBuffer{};
     }
     buffer->Produce(static_cast<uint32_t>(n));
-    buf::MultiBuffer mb;
-    mb.push_back(std::move(buffer));
-    co_return mb;
+    co_return buf::MultiBuffer{std::move(buffer)};
 }
 
 net::awaitable<void> Http2ServerSubStreamState::WriteMultiBuffer(
@@ -4123,29 +4113,32 @@ net::awaitable<bool> Http2ServerSubStreamState::EnsureReadablePayload() {
     co_return true;
 }
 
-net::awaitable<size_t> Http2ServerSubStreamState::AsyncReadRaw(
-    net::mutable_buffer buffer) {
+size_t Http2ServerSubStreamState::ConsumeReadablePayload(
+    net::mutable_buffer buffer) noexcept {
     auto* out = static_cast<uint8_t*>(buffer.data());
     const size_t capacity = buffer.size();
-    if (capacity == 0 || !co_await WaitForRawData()) {
-        co_return 0;
-    }
-
-    const auto& front = h2_data_queue_.front();
-    const size_t n = std::min(capacity, front.end - h2_data_offset_);
-    std::memcpy(out, front.data.data() + h2_data_offset_, n);
-    h2_data_offset_ += n;
-    if (h2_data_offset_ == front.end) {
-        queued_bytes_ -= front.Size();
-        if (upload_budget_) {
-            upload_budget_->Release(front.data.capacity());
-            upload_reserved_ -= front.data.capacity();
+    if (payload_codec_ == H2PayloadCodec::RawData) {
+        const auto& front = h2_data_queue_.front();
+        const size_t n = std::min(capacity, front.end - h2_data_offset_);
+        std::memcpy(out, front.data.data() + h2_data_offset_, n);
+        h2_data_offset_ += n;
+        if (h2_data_offset_ == front.end) {
+            queued_bytes_ -= front.Size();
+            if (upload_budget_) {
+                upload_budget_->Release(front.data.capacity());
+                upload_reserved_ -= front.data.capacity();
+            }
+            h2_data_queue_.pop_front();
+            h2_data_offset_ = 0;
+            ShrinkQueueIfDrained();
         }
-        h2_data_queue_.pop_front();
-        h2_data_offset_ = 0;
-        ShrinkQueueIfDrained();
+        return n;
     }
-    co_return n;
+    const auto payload = hunk_.Payload();
+    const size_t n = std::min(capacity, payload.size());
+    std::memcpy(out, payload.data(), n);
+    hunk_.Consume(n);
+    return n;
 }
 
 int Http2ServerSubStream::NativeHandle() const {

@@ -168,42 +168,36 @@ proxy::trojan::outbound::Handler::Process(
 
     const auto& target = ctx.outbound.target;
 
-    auto dial_stream = [&]() -> net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>> {
-        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = config_->address,
-            .literal_address = config_->literal_address,
-            .port = config_->port,
-            .stream_settings = &config_->stream_settings,
-            .timeout = dial_timeout_,
-            .send_through = &config_->send_through,
-            .inbound_local_addr = inbound_local_addr,
-            .inbound_source_ip = ctx.inbound.source_ip,
-            .inbound_source_port = ctx.inbound.source_port,
-            .tls_server_name = ResolveOutboundTlsServerName(
-                config_->stream_settings, config_->address),
-            .ws_host = config_->address,
-        });
-        if (!transport_target) {
-            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-                LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_->address);
-            }
-            co_return tl::unexpected(transport_target.error());
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service_,
+        .address = config_->address,
+        .literal_address = config_->literal_address,
+        .port = config_->port,
+        .stream_settings = &config_->stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &config_->send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            config_->stream_settings, config_->address),
+        .ws_host = config_->address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_->address);
         }
-        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-        if (!dial_result.Ok()) {
-            LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
-                              ctx.inbound.source_ip, ctx.outbound.target,
-                              ctx.outbound.tag, dial_result.error_msg);
-            co_return tl::unexpected(dial_result.error);
-        }
-        co_return std::move(dial_result.stream);
-    };
-    auto dialed = co_await dial_stream();
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+        co_return tl::unexpected(transport_target.error());
     }
-    auto stream = std::move(*dialed);
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    *transport_target = {};
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+    auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {
@@ -223,34 +217,25 @@ proxy::trojan::outbound::Handler::Process(
 
     const bool is_udp = ctx.content.network == Network::UDP;
 
-    auto send_handshake = [&]() -> net::awaitable<ErrorCode> {
-        std::array<uint8_t, 512> header{};
-        const size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
-            config_->password_hash,
-            is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
-                   : ::acpp::trojan::TrojanCommand::CONNECT,
-            target,
-            header.data(), header.size());
-        if (header_len == 0) {
-            LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
-            co_return ErrorCode::PROTOCOL_ENCODE_FAILED;
-        }
-        const bool handshake_ok = co_await WriteFull(*stream, header.data(), header_len);
-        if (!handshake_ok) {
-            LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake write failed");
-            co_return outbound_protocol_deadline.Expired()
-                ? ErrorCode::TIMEOUT
-                : ErrorCode::SOCKET_WRITE_FAILED;
-        }
-        LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
-        co_return ErrorCode::OK;
-    };
+    buf::BufferGuard header_buf{buf::Buffer::New()};
+    if (!header_buf) {
+        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    const size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
+        config_->password_hash,
+        is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
+               : ::acpp::trojan::TrojanCommand::CONNECT,
+        target,
+        header_buf->Tail().data(), header_buf->Available());
+    if (header_len == 0) {
+        LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
+        co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    header_buf->Produce(static_cast<uint32_t>(header_len));
 
     try {
-        if (const ErrorCode handshake_err = co_await send_handshake();
-            handshake_err != ErrorCode::OK) {
-            co_return fail_abortive(handshake_err);
-        }
+        co_await stream->WriteMultiBuffer(buf::MultiBuffer{std::move(header_buf)});
+        LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
         stream->SetIdleTimeout(relay_idle_timeout);
         stream->SetReadTimeout(std::chrono::seconds(0));
         stream->SetWriteTimeout(relay_write_timeout);

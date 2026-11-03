@@ -62,7 +62,8 @@ public:
     explicit FailingPmrResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
 private:
     void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_next_pmr_allocation && size == 128) {
+        if (std::exchange(fail_next_allocation, false) ||
+            (fail_next_pmr_allocation && size == 128)) {
             fail_next_pmr_allocation = false;
             ++allocation_failures;
             failed_allocation_size = size;

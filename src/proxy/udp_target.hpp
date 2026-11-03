@@ -38,7 +38,7 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
 
     struct CancellationWait final : transport::CancellationSubscription {
         explicit CancellationWait(net::io_context& io) : wake(io, 1) {}
-        net::experimental::channel<void(IoErrorCode)> wake;
+        SignalChannel wake;
         ErrorCode reason = ErrorCode::OK;
 
     private:

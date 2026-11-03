@@ -109,7 +109,7 @@ private:
         }
     }
 
-    std::optional<net::experimental::channel<void(IoErrorCode)>> signal_;
+    std::optional<SignalChannel> signal_;
     std::size_t waiters_ = 0;
     bool busy_ = false;
     bool cancelled_ = false;

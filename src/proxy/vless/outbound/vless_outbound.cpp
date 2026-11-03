@@ -51,11 +51,26 @@ class VlessOutboundEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
+    struct VisionIoState : memory::ThreadAllocated {
+        ::acpp::vless::VisionReader reader;
+        ::acpp::vless::VisionWriter writer;
+
+        VisionIoState(VlessBufferedReader& src,
+                      transport::MultiBufferWriter& dst,
+                      std::array<uint8_t, 16> user_uuid)
+            : reader(src, user_uuid)
+            , writer(dst, user_uuid) {}
+    };
+    struct UdpIoState : memory::ThreadAllocated {
+        explicit UdpIoState(bool packet_addr) : framer(packet_addr) {}
+        ::acpp::vless::UdpFramer framer;
+    };
+
     VlessOutboundEndpoint(AsyncStream& control,
                           VlessBufferedReader& reader,
                           transport::MultiBufferWriter& writer,
                           bool is_udp,
-                          TargetAddress udp_target,
+                          const TargetAddress& udp_target,
                           bool packet_addr = false,
                           bool vision = false,
                           std::array<uint8_t, 16> user_uuid = {})
@@ -63,12 +78,13 @@ public:
         , reader_(reader)
         , writer_(writer)
         , is_udp_(is_udp)
-        , udp_target_(std::move(udp_target))
-        , packet_addr_(packet_addr)
-        , framer_(packet_addr) {
+        , udp_target_(udp_target)
+        , packet_addr_(packet_addr) {
         if (vision) {
-            vision_reader_.emplace(reader_, user_uuid);
-            vision_writer_.emplace(writer_, user_uuid);
+            vision_io_ = std::make_unique<VisionIoState>(reader_, writer_, user_uuid);
+        }
+        if (is_udp_) {
+            udp_io_ = std::make_unique<UdpIoState>(packet_addr);
         }
     }
 
@@ -83,15 +99,15 @@ public:
         }
 
         if (!is_udp_) {
-            if (vision_reader_) {
-                co_return co_await vision_reader_->ReadMultiBuffer();
+            if (vision_io_) {
+                co_return co_await vision_io_->reader.ReadMultiBuffer();
             }
             co_return co_await reader_.ReadMultiBuffer();
         }
 
         while (true) {
             ::acpp::vless::FramedUdpPacket packet;
-            if (framer_.Next(packet)) {
+            if (udp_io_->framer.Next(packet)) {
                 const TargetAddress& target = packet.target
                     ? *packet.target
                     : udp_target_;
@@ -105,17 +121,17 @@ public:
 
             buf::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
             if (!buf::HasData(raw)) {
-                framer_.Finish();
+                udp_io_->framer.Finish();
                 co_return buf::MultiBuffer{};
             }
-            framer_.Feed(std::move(raw));
+            udp_io_->framer.Feed(std::move(raw));
         }
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (!is_udp_) {
-            if (vision_writer_) {
-                co_await vision_writer_->WriteMultiBuffer(std::move(mb));
+            if (vision_io_) {
+                co_await vision_io_->writer.WriteMultiBuffer(std::move(mb));
                 co_return;
             }
             co_await writer_.WriteMultiBuffer(std::move(mb));
@@ -129,8 +145,8 @@ public:
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         if (!is_udp_) {
-            if (vision_writer_) {
-                co_await vision_writer_->WriteBuffers(buffers);
+            if (vision_io_) {
+                co_await vision_io_->writer.WriteBuffers(buffers);
                 co_return;
             }
             co_await writer_.WriteBuffers(buffers);
@@ -218,11 +234,10 @@ private:
     transport::MultiBufferWriter& writer_;
     bool response_header_read_ = false;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
     bool packet_addr_ = false;
-    std::optional<::acpp::vless::VisionReader> vision_reader_;
-    std::optional<::acpp::vless::VisionWriter> vision_writer_;
-    ::acpp::vless::UdpFramer framer_;
+    std::unique_ptr<VisionIoState> vision_io_;
+    std::unique_ptr<UdpIoState> udp_io_;
 };
 
 
@@ -233,11 +248,11 @@ public:
     VlessMuxUdpEndpoint(AsyncStream& control,
                         VlessBufferedReader& reader,
                         transport::MultiBufferWriter& writer,
-                        TargetAddress udp_target)
+                        const TargetAddress& udp_target)
         : control_(control)
         , reader_(reader)
         , writer_(writer)
-        , udp_target_(std::move(udp_target)) {}
+        , udp_target_(udp_target) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (!response_header_read_) {
@@ -439,7 +454,7 @@ private:
     AsyncStream& control_;
     VlessBufferedReader& reader_;
     transport::MultiBufferWriter& writer_;
-    TargetAddress udp_target_;
+    const TargetAddress& udp_target_;
     bool response_header_read_ = false;
     bool session_started_ = false;
     bool end_sent_ = false;
@@ -481,43 +496,36 @@ proxy::vless::outbound::Handler::Process(
     }
 
     const auto& target = ctx.outbound.target;
-    auto dial_stream = [&]() -> net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>> {
-        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = config_->address,
-            .literal_address = config_->literal_address,
-            .port = config_->port,
-            .stream_settings = &config_->stream_settings,
-            .timeout = dial_timeout_,
-            .send_through = &config_->send_through,
-            .inbound_local_addr = inbound_local_addr,
-            .inbound_source_ip = ctx.inbound.source_ip,
-            .inbound_source_port = ctx.inbound.source_port,
-            .tls_server_name = ResolveOutboundTlsServerName(
-                config_->stream_settings, config_->address),
-            .ws_host = config_->address,
-        });
-        if (!transport_target) {
-            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-                LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_->address);
-            }
-            co_return tl::unexpected(transport_target.error());
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service_,
+        .address = config_->address,
+        .literal_address = config_->literal_address,
+        .port = config_->port,
+        .stream_settings = &config_->stream_settings,
+        .timeout = dial_timeout_,
+        .send_through = &config_->send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            config_->stream_settings, config_->address),
+        .ws_host = config_->address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_WARN(ctx, "[VLESS] DNS resolve failed for {}", config_->address);
         }
-        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-        if (!dial_result.Ok()) {
-            LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
-                              ctx.inbound.source_ip, ctx.outbound.target,
-                              ctx.outbound.tag, dial_result.error_msg);
-            co_return tl::unexpected(dial_result.error);
-        }
-        co_return std::move(dial_result.stream);
-    };
-    auto dialed = co_await dial_stream();
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+        co_return tl::unexpected(transport_target.error());
     }
-    auto stream = std::move(*dialed);
-
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    *transport_target = {};
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[VLESS] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+    auto stream = std::move(dial_result.stream);
     stream->SetStreamLabel("out");
     if (auto local_ep = stream->LocalEndpoint();
         local_ep && !local_ep->address().is_unspecified()) {
@@ -540,38 +548,16 @@ proxy::vless::outbound::Handler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
-    auto send_request_header = [&](transport::MultiBufferWriter& writer) -> net::awaitable<ErrorCode> {
-        TargetAddress request_target = use_packet_addr
-            ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
-            : target;
-        std::array<uint8_t, 512> header{};
-        const size_t header_len = ::acpp::vless::Codec::EncodeRequestHeaderTo(
-            config_->uuid_bytes,
-            use_xudp
-                ? ::acpp::vless::Command::MUX
-                : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
-            request_target,
-            header.data(),
-            header.size(),
-            use_vision ? std::string_view(config_->flow) : std::string_view{});
-        if (header_len == 0) {
-            co_return ErrorCode::PROTOCOL_ENCODE_FAILED;
-        }
-        try {
-            co_await WriteVlessBytes(writer, std::span<const uint8_t>(header.data(), header_len));
-            co_return ErrorCode::OK;
-        } catch (...) {
-            co_return outbound_protocol_deadline.Expired()
-                ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_WRITE_FAILED;
-        }
-    };
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter* protocol_writer = stream.get();
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = protocol_writer;
-    std::optional<::acpp::vless::VlessEncryptionReader> encrypted_reader;
-    std::optional<::acpp::vless::VlessEncryptionWriter> encrypted_writer;
-    std::optional<VlessBufferedReader> encrypted_plain_reader;
+    struct EncryptedIoState : memory::ThreadAllocated {
+        std::optional<::acpp::vless::VlessEncryptionReader> reader;
+        std::optional<::acpp::vless::VlessEncryptionWriter> writer;
+        std::optional<VlessBufferedReader> plain_reader;
+    };
+    std::unique_ptr<EncryptedIoState> encrypted_io;
 
     if (config_->encryption) {
         try {
@@ -584,14 +570,15 @@ proxy::vless::outbound::Handler::Process(
             if (!runtime) {
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
+            encrypted_io = std::make_unique<EncryptedIoState>();
             if (runtime->read_aead_ready) {
-                encrypted_reader.emplace(
+                encrypted_io->reader.emplace(
                     protocol_reader,
                     std::move(runtime->read_aead),
                     runtime->united_key,
                     std::move(runtime->read_xor));
             } else {
-                encrypted_reader.emplace(
+                encrypted_io->reader.emplace(
                     ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
                         protocol_reader,
                         runtime->lazy_read_context_size,
@@ -599,14 +586,14 @@ proxy::vless::outbound::Handler::Process(
                         runtime->cipher,
                         runtime->lazy_read_xor_from_context));
             }
-            encrypted_writer.emplace(
+            encrypted_io->writer.emplace(
                 *protocol_writer,
                 std::move(runtime->write_aead),
                 std::move(runtime->united_key),
                 std::move(runtime->write_xor));
-            encrypted_plain_reader.emplace(*encrypted_reader);
-            active_reader = std::addressof(*encrypted_plain_reader);
-            active_writer = std::addressof(*encrypted_writer);
+            encrypted_io->plain_reader.emplace(*encrypted_io->reader);
+            active_reader = std::addressof(*encrypted_io->plain_reader);
+            active_writer = std::addressof(*encrypted_io->writer);
         } catch (const IoSystemError&) {
             co_return fail_abortive(outbound_protocol_deadline.Expired()
                 ? ErrorCode::TIMEOUT
@@ -616,11 +603,35 @@ proxy::vless::outbound::Handler::Process(
         }
     }
 
-    if (const ErrorCode header_err = co_await send_request_header(*active_writer);
-        header_err != ErrorCode::OK) {
-        co_return fail_abortive(header_err);
+    buf::BufferGuard header_buf{buf::Buffer::New()};
+    if (!header_buf) {
+        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
     }
-
+    {
+        const TargetAddress packet_magic_target = use_packet_addr
+            ? TargetAddress(::acpp::vless::kPacketAddrMagicAddress, 0)
+            : TargetAddress{};
+        const TargetAddress& request_target = use_packet_addr ? packet_magic_target : target;
+        const size_t header_len = ::acpp::vless::Codec::EncodeRequestHeaderTo(
+            config_->uuid_bytes,
+            use_xudp
+                ? ::acpp::vless::Command::MUX
+                : (is_udp ? ::acpp::vless::Command::UDP : ::acpp::vless::Command::TCP),
+            request_target,
+            header_buf->Tail().data(),
+            header_buf->Available(),
+            use_vision ? std::string_view(config_->flow) : std::string_view{});
+        if (header_len == 0) {
+            co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        }
+        header_buf->Produce(static_cast<uint32_t>(header_len));
+    }
+    try {
+        co_await active_writer->WriteMultiBuffer(buf::MultiBuffer{std::move(header_buf)});
+    } catch (...) {
+        co_return fail_abortive(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_WRITE_FAILED);
+    }
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);

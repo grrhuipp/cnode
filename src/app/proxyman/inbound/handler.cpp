@@ -448,6 +448,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             ctx, transport_metadata->real_ip, transport_metadata->real_ip_header);
     }
 
+    local_metadata = {};
     reject = limiter_.TryAcceptIP(
         ctx.inbound.tag, ctx.inbound.source_ip,
         ctx.inbound.HasProxyProtocolClientIP());

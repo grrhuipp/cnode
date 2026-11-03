@@ -67,7 +67,7 @@ private:
     // directly; channel.cancel/post would allocate another completion node.
     void OnTimeout() override { (void)wake_.try_send_via_dispatch(IoErrorCode{}); }
     TimeoutScheduler& scheduler_;
-    net::experimental::channel<void(IoErrorCode)> wake_;
+    SignalChannel wake_;
     bool waiting_ = false;
 };
 

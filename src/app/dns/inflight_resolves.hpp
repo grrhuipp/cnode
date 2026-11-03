@@ -23,7 +23,7 @@ class InflightResolves {
             : domain(name), completion(io_context) {}
 
         memory::ThreadLocalString domain;
-        net::experimental::channel<void(IoErrorCode)> completion;
+        SignalChannel completion;
         std::optional<DnsResult> result;
     };
     using PendingPtr = std::shared_ptr<Pending>;

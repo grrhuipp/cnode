@@ -49,7 +49,6 @@ constexpr size_t kMuxReplyOverhead       = 128;
     return queued > limit || incoming > limit - queued;
 }
 
-using SignalChannel = net::experimental::channel<void(IoErrorCode)>;
 
 // 回包元素（出站 → 客户端）
 struct MuxReply {
@@ -591,7 +590,7 @@ private:
 
     net::io_context& io_context_;
     AsyncDelay output_sleep_;
-    net::experimental::channel<void(IoErrorCode)> input_signal_;
+    SignalChannel input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     struct QueuedInput {
@@ -850,7 +849,7 @@ private:
     }
 
     net::io_context& io_context_;
-    net::experimental::channel<void(IoErrorCode)> input_signal_;
+    SignalChannel input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
     uint64_t parent_conn_id_ = 0;

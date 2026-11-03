@@ -368,9 +368,12 @@ proxy::vless::inbound::Handler::Process(
     transport::MultiBufferWriter* protocol_writer = stream.get();
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = protocol_writer;
-    std::optional<::acpp::vless::VlessEncryptionReader> encrypted_reader;
-    std::optional<::acpp::vless::VlessEncryptionWriter> encrypted_writer;
-    std::optional<VlessBufferedReader> encrypted_plain_reader;
+    struct EncryptedIoState : memory::ThreadAllocated {
+        std::optional<::acpp::vless::VlessEncryptionReader> reader;
+        std::optional<::acpp::vless::VlessEncryptionWriter> writer;
+        std::optional<VlessBufferedReader> plain_reader;
+    };
+    std::unique_ptr<EncryptedIoState> encrypted_io;
 
     if (decryption_) {
         try {
@@ -385,14 +388,15 @@ proxy::vless::inbound::Handler::Process(
                               tag, client_ip);
                 co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
+            encrypted_io = std::make_unique<EncryptedIoState>();
             if (runtime->read_aead_ready) {
-                encrypted_reader.emplace(
+                encrypted_io->reader.emplace(
                     protocol_reader,
                     std::move(runtime->read_aead),
                     runtime->united_key,
                     std::move(runtime->read_xor));
             } else {
-                encrypted_reader.emplace(
+                encrypted_io->reader.emplace(
                     ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
                         protocol_reader,
                         runtime->lazy_read_context_size,
@@ -400,14 +404,14 @@ proxy::vless::inbound::Handler::Process(
                         runtime->cipher,
                         runtime->lazy_read_xor_from_context));
             }
-            encrypted_writer.emplace(
+            encrypted_io->writer.emplace(
                 *protocol_writer,
                 std::move(runtime->write_aead),
                 std::move(runtime->united_key),
                 std::move(runtime->write_xor));
-            encrypted_plain_reader.emplace(*encrypted_reader);
-            active_reader = std::addressof(*encrypted_plain_reader);
-            active_writer = std::addressof(*encrypted_writer);
+            encrypted_io->plain_reader.emplace(*encrypted_io->reader);
+            active_reader = std::addressof(*encrypted_io->plain_reader);
+            active_writer = std::addressof(*encrypted_io->writer);
         } catch (const IoSystemError&) {
             co_return fail_abortive(stream->ConsumePhaseDeadline()
                 ? ErrorCode::TIMEOUT

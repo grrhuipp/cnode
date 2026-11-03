@@ -220,7 +220,7 @@ struct RelayCloseState {
     bool known = false;
     bool client = false;
     bool complete = false;
-    net::experimental::channel<void(IoErrorCode)> wake;
+    SignalChannel wake;
 };
 
 template <typename Reader>
@@ -706,14 +706,9 @@ net::awaitable<RelayResult> DoRelayLink(
         relay_detail::CloseAbortiveIfSupported(client_control);
         relay_detail::CloseAbortiveIfSupported(target);
     } else {
-        auto shutdown_client = [&]() -> net::awaitable<void> {
-            co_await relay_detail::ShutdownWriteForClose(client_writer, client_control);
-        };
-        auto shutdown_target = [&]() -> net::awaitable<void> {
-            co_await relay_detail::ShutdownWriteForClose(target);
-        };
         try {
-            co_await (shutdown_client() && shutdown_target());
+            co_await (relay_detail::ShutdownWriteForClose(client_writer, client_control) &&
+                      relay_detail::ShutdownWriteForClose(target));
         } catch (...) {
             result.error = relay_detail::CaptureShutdownFailure();
             if (client_state.cancellation_error != ErrorCode::OK &&
@@ -1065,14 +1060,9 @@ net::awaitable<RelayResult> DoRelayLink(
         target.Cancel();
         relay_detail::CloseAbortiveIfSupported(target);
     } else {
-        auto shutdown_client = [&]() -> net::awaitable<void> {
-            co_await relay_detail::ShutdownWriteForClose(client_writer);
-        };
-        auto shutdown_target = [&]() -> net::awaitable<void> {
-            co_await relay_detail::ShutdownWriteForClose(target);
-        };
         try {
-            co_await (shutdown_client() && shutdown_target());
+            co_await (relay_detail::ShutdownWriteForClose(client_writer) &&
+                      relay_detail::ShutdownWriteForClose(target));
         } catch (...) {
             result.error = relay_detail::CaptureShutdownFailure();
             if (stop.reason != ErrorCode::OK && stop.reason != ErrorCode::CANCELLED)

@@ -131,63 +131,55 @@ proxy::trojan::inbound::Handler::Process(
     }
     std::optional<UserOnlineSessionGuard> user_session;
 
-    size_t consumed = 0;
-    auto read_request = [&]() -> net::awaitable<tl::expected<::acpp::trojan::TrojanRequest, ErrorCode>> {
-        std::array<uint8_t, 320> handshake_buf{};
-        size_t total_read = 0;
-        auto read_until = [&](size_t required) -> net::awaitable<ErrorCode> {
-            if (required > handshake_buf.size()) {
-                co_return ErrorCode::PROTOCOL_DECODE_FAILED;
-            }
-            while (total_read < required) {
-                size_t n = 0;
-                try {
-                    n = co_await stream->AsyncRead(net::buffer(
-                        handshake_buf.data() + total_read, required - total_read));
-                } catch (const IoSystemError&) {
-                    co_return stream->ConsumePhaseDeadline()
-                        ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED;
-                }
-                if (n == 0) {
-                    if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
-                        co_return ErrorCode::TIMEOUT;
-                    }
-                    co_return ErrorCode::PROTOCOL_DECODE_FAILED;
-                }
-                total_read += n;
-            }
-            co_return ErrorCode::OK;
-        };
-        if (auto error = co_await read_until(59); error != ErrorCode::OK) {
-            co_return tl::unexpected(error);
+    memory::ByteVector handshake_buf;
+    size_t total_read = 0;
+    size_t required = 59;
+    while (true) {
+        if (required > 320) {
+            co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        while (true) {
-            auto address = DecodeAddress(
-                std::span(handshake_buf.data() + 59, total_read - 59),
-                AddressWireFormat::Socks5, {253, true});
-            if (address.status == AddressDecodeStatus::Invalid) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-            }
-            const size_t required = 59 + (address.status == AddressDecodeStatus::Complete
-                ? address.consumed + 2 : address.required);
-            if (auto error = co_await read_until(required); error != ErrorCode::OK) {
-                co_return tl::unexpected(error);
-            }
-            if (address.status == AddressDecodeStatus::Complete) break;
+        if (required > handshake_buf.size()) {
+            handshake_buf.resize(required);
         }
-        auto parsed = ::acpp::trojan::TrojanCodec::ParseRequest(
-            handshake_buf.data(), total_read, consumed);
-        if (!parsed) {
-            LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        while (total_read < required) {
+            size_t n = 0;
+            try {
+                n = co_await stream->AsyncRead(net::buffer(
+                    handshake_buf.data() + total_read, required - total_read));
+            } catch (const IoSystemError&) {
+                co_return fail_abortive(stream->ConsumePhaseDeadline()
+                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            }
+            if (n == 0) {
+                co_return fail_abortive(
+                    (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout())
+                        ? ErrorCode::TIMEOUT
+                        : ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            total_read += n;
         }
-        co_return std::move(*parsed);
-    };
-    auto request = co_await read_request();
-    if (!request) {
-        co_return fail_abortive(request.error());
+        auto address = DecodeAddress(
+            std::span(handshake_buf.data() + 59, total_read - 59),
+            AddressWireFormat::Socks5, {253, true});
+        if (address.status == AddressDecodeStatus::Invalid) {
+            co_return fail_abortive(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        const size_t next_required = 59 + (address.status == AddressDecodeStatus::Complete
+            ? address.consumed + 2 : address.required);
+        if (address.status == AddressDecodeStatus::Complete && total_read >= next_required) {
+            break;
+        }
+        required = next_required;
     }
 
+    size_t consumed = 0;
+    auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
+        handshake_buf.data(), total_read, consumed);
+    memory::ByteVector{}.swap(handshake_buf);
+    if (!request) {
+        LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
+        co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
     const std::string_view password_hash = request->PasswordHashView();
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(tag, password_hash);
     if (!user_info) {
