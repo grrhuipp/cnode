@@ -31,23 +31,15 @@ tl::expected<SsUotVersion, std::string> ParseVersionValue(
 
 tl::expected<std::optional<SsUotVersion>, std::string> ReadTopLevelVersion(
     const json::object& source) {
-    std::optional<SsUotVersion> result;
-    std::string_view first_key;
-    for (const std::string_view key : {"uotVersion"}) {
-        const auto* value = source.if_contains(key);
-        if (!value) continue;
-        auto parsed = ParseVersionValue(*value, key);
-        if (!parsed) return tl::unexpected(std::move(parsed.error()));
-        if (result && *result != *parsed) {
-            return tl::unexpected(std::format(
-                "{} and {} must match", first_key, key));
-        }
-        if (!result) {
-            result = *parsed;
-            first_key = key;
-        }
+    const auto* value = source.if_contains("uotVersion");
+    if (!value) {
+        return std::optional<SsUotVersion>{};
     }
-    return result;
+    auto parsed = ParseVersionValue(*value, "uotVersion");
+    if (!parsed) {
+        return tl::unexpected(std::move(parsed.error()));
+    }
+    return std::optional<SsUotVersion>{*parsed};
 }
 
 tl::expected<std::optional<SsUotVersion>, std::string> ParseActivation(

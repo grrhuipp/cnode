@@ -84,16 +84,40 @@ ComputeVlessX25519SharedKey(std::span<const uint8_t> private_key,
     return shared;
 }
 
-std::optional<std::array<uint8_t, kVlessMlKem768PublicKeySize>>
-DeriveVlessMlKem768PublicKeyFromSeed(
+std::shared_ptr<EVP_PKEY>
+CreateVlessMlKem768PrivateKeyFromSeed(
     std::span<const uint8_t> seed) noexcept {
     UniquePkey key = MlKem768PrivateKeyFromSeed(seed);
+    if (!key) {
+        return nullptr;
+    }
+    return std::shared_ptr<EVP_PKEY>(key.release(), EvpPkeyDeleter{});
+}
+
+std::shared_ptr<EVP_PKEY>
+CreateVlessMlKem768PublicKey(
+    std::span<const uint8_t> public_key) noexcept {
+    if (public_key.size() != kVlessMlKem768PublicKeySize) {
+        return nullptr;
+    }
+    UniquePkey key(EVP_PKEY_kem_new_raw_public_key(
+        NID_MLKEM768,
+        public_key.data(),
+        public_key.size()));
+    if (!key) {
+        return nullptr;
+    }
+    return std::shared_ptr<EVP_PKEY>(key.release(), EvpPkeyDeleter{});
+}
+
+std::optional<std::array<uint8_t, kVlessMlKem768PublicKeySize>>
+DeriveVlessMlKem768PublicKey(const EVP_PKEY* key) noexcept {
     if (!key) {
         return std::nullopt;
     }
 
     size_t public_len = 0;
-    if (EVP_PKEY_get_raw_public_key(key.get(), nullptr, &public_len) != 1 ||
+    if (EVP_PKEY_get_raw_public_key(key, nullptr, &public_len) != 1 ||
         public_len != kVlessMlKem768PublicKeySize) {
         return std::nullopt;
     }
@@ -101,13 +125,20 @@ DeriveVlessMlKem768PublicKeyFromSeed(
     std::array<uint8_t, kVlessMlKem768PublicKeySize> public_key{};
     public_len = public_key.size();
     if (EVP_PKEY_get_raw_public_key(
-            key.get(),
+            key,
             public_key.data(),
             &public_len) != 1 ||
         public_len != public_key.size()) {
         return std::nullopt;
     }
     return public_key;
+}
+
+std::optional<std::array<uint8_t, kVlessMlKem768PublicKeySize>>
+DeriveVlessMlKem768PublicKeyFromSeed(
+    std::span<const uint8_t> seed) noexcept {
+    UniquePkey key = MlKem768PrivateKeyFromSeed(seed);
+    return DeriveVlessMlKem768PublicKey(key.get());
 }
 
 bool ValidateVlessMlKem768PublicKey(
@@ -124,20 +155,12 @@ bool ValidateVlessMlKem768PublicKey(
 }
 
 std::optional<VlessMlKem768Encapsulation>
-EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept {
-    if (public_key.size() != kVlessMlKem768PublicKeySize) {
+EncapsulateVlessMlKem768(EVP_PKEY* public_key) noexcept {
+    if (!public_key) {
         return std::nullopt;
     }
 
-    UniquePkey key(EVP_PKEY_kem_new_raw_public_key(
-        NID_MLKEM768,
-        public_key.data(),
-        public_key.size()));
-    if (!key) {
-        return std::nullopt;
-    }
-
-    UniquePkeyCtx ctx(EVP_PKEY_CTX_new(key.get(), nullptr));
+    UniquePkeyCtx ctx(EVP_PKEY_CTX_new(public_key, nullptr));
     if (!ctx) {
         return std::nullopt;
     }
@@ -171,19 +194,27 @@ EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept {
     return result;
 }
 
+std::optional<VlessMlKem768Encapsulation>
+EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept {
+    if (public_key.size() != kVlessMlKem768PublicKeySize) {
+        return std::nullopt;
+    }
+
+    UniquePkey key(EVP_PKEY_kem_new_raw_public_key(
+        NID_MLKEM768,
+        public_key.data(),
+        public_key.size()));
+    return EncapsulateVlessMlKem768(key.get());
+}
+
 std::optional<std::array<uint8_t, kVlessMlKem768SharedSecretSize>>
-DecapsulateVlessMlKem768FromSeed(std::span<const uint8_t> seed,
-                                 std::span<const uint8_t> ciphertext) noexcept {
-    if (ciphertext.size() != kVlessMlKem768CiphertextSize) {
+DecapsulateVlessMlKem768(EVP_PKEY* private_key,
+                         std::span<const uint8_t> ciphertext) noexcept {
+    if (!private_key || ciphertext.size() != kVlessMlKem768CiphertextSize) {
         return std::nullopt;
     }
 
-    UniquePkey key = MlKem768PrivateKeyFromSeed(seed);
-    if (!key) {
-        return std::nullopt;
-    }
-
-    UniquePkeyCtx ctx(EVP_PKEY_CTX_new(key.get(), nullptr));
+    UniquePkeyCtx ctx(EVP_PKEY_CTX_new(private_key, nullptr));
     if (!ctx) {
         return std::nullopt;
     }
@@ -200,6 +231,17 @@ DecapsulateVlessMlKem768FromSeed(std::span<const uint8_t> seed,
         return std::nullopt;
     }
     return shared;
+}
+
+std::optional<std::array<uint8_t, kVlessMlKem768SharedSecretSize>>
+DecapsulateVlessMlKem768FromSeed(std::span<const uint8_t> seed,
+                                 std::span<const uint8_t> ciphertext) noexcept {
+    if (ciphertext.size() != kVlessMlKem768CiphertextSize) {
+        return std::nullopt;
+    }
+
+    UniquePkey key = MlKem768PrivateKeyFromSeed(seed);
+    return DecapsulateVlessMlKem768(key.get(), ciphertext);
 }
 
 }  // namespace acpp::vless

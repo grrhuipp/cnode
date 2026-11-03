@@ -2,6 +2,7 @@
 
 #include "acppnode/features/outbound/outbound.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/string_hash.hpp"
 
 #include <memory>
 #include <string_view>
@@ -37,8 +38,13 @@ public:
     void Clear() noexcept;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    using HandlerMap = memory::ThreadLocalUnorderedMap<
+        memory::ThreadLocalString,
+        std::shared_ptr<Outbound>,
+        TransparentStringHash,
+        TransparentStringEq>;
+
+    HandlerMap handlers_;
 };
 
 }  // namespace acpp::proxyman::outbound

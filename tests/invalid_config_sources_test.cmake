@@ -177,6 +177,10 @@ foreach(node_type IN ITEMS "" "v2ray" "ss" "shadowsocks-plugin" "VMESS")
         "{\"panels\":[{\"name\":\"bad-type\",\"apiHost\":\"http://127.0.0.1\",\"key\":\"secret\",\"nodeIDs\":[1],\"nodeType\":\"${node_type}\"}]}"
         "" "")
 endforeach()
+expect_started(case_insensitive_uppercase_config_keys
+    [=[{"WORKERS":1,"LOG":{"ENABLE":false,"LOGLEVEL":"info"}}]=]
+    "outbounds.json"
+    [=[[{"TAG":"direct","PROTOCOL":"freedom","SENDTHROUGH":"auto"}]]=])
 expect_rejected(unknown_route_outbound "{}" "routing.json"
     [=[{"rules":[{"network":"tcp","outboundTag":"misspelled-blackhole"}]}]=])
 expect_rejected(orphan_panel_tls_certificate

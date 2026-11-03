@@ -26,7 +26,6 @@ std::optional<DnsResult> DnsCache::GetResult(std::string_view domain) {
     if (now >= node->entry.expire_time) {
         entries_.erase(found);
         order_.erase(node);
-        ++expired_;
         ++misses_;
         return std::nullopt;
     }
@@ -105,7 +104,6 @@ DnsCacheStats DnsCache::GetStats() const {
         .misses = misses_,
         .entries = entries_.size(),
         .capacity = capacity_,
-        .expired = expired_,
     };
 }
 

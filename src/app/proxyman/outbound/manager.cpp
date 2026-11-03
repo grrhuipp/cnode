@@ -7,26 +7,15 @@
 
 namespace acpp::proxyman::outbound {
 
-struct Manager::Impl : memory::ThreadAllocated {
-    using HandlerMap = memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString,
-        std::shared_ptr<Outbound>,
-        TransparentStringHash,
-        TransparentStringEq>;
-
-    HandlerMap handlers;
-};
-
-Manager::Manager()
-    : impl_(std::make_unique<Impl>()) {}
+Manager::Manager() = default;
 
 Manager::~Manager() noexcept {
     Clear();
 }
 
 Manager::HandlerPtr Manager::GetHandler(std::string_view tag) noexcept {
-    auto it = impl_->handlers.find(tag);
-    return it == impl_->handlers.end() ? nullptr : it->second;
+    auto it = handlers_.find(tag);
+    return it == handlers_.end() ? nullptr : it->second;
 }
 
 Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
@@ -38,7 +27,7 @@ Manager::HandlerPtr Manager::AddHandler(std::unique_ptr<Outbound> handler) {
     auto shared_handler = std::shared_ptr<Outbound>(
         handler.release(), std::default_delete<Outbound>{},
         memory::ThreadLocalAllocator<Outbound>{});
-    auto [it, inserted] = impl_->handlers.try_emplace(
+    auto [it, inserted] = handlers_.try_emplace(
         std::move(tag), std::move(shared_handler));
     if (!inserted) {
         return nullptr;
@@ -52,28 +41,29 @@ Manager::HandlerPtr Manager::ReplaceHandler(std::unique_ptr<Outbound> handler) {
         return nullptr;
     }
 
-    std::string tag(handler->Tag());
-    auto it = impl_->handlers.find(tag);
-    if (it == impl_->handlers.end()) {
+    auto it = handlers_.find(handler->Tag());
+    if (it == handlers_.end()) {
         return AddHandler(std::move(handler));
     }
 
-    it->second = std::shared_ptr<Outbound>(std::move(handler));
+    it->second = std::shared_ptr<Outbound>(
+        handler.release(), std::default_delete<Outbound>{},
+        memory::ThreadLocalAllocator<Outbound>{});
     return it->second;
 }
 
 void Manager::RemoveHandler(std::string_view tag) {
-    auto it = impl_->handlers.find(tag);
-    if (it == impl_->handlers.end()) {
+    auto it = handlers_.find(tag);
+    if (it == handlers_.end()) {
         return;
     }
 
-    impl_->handlers.erase(it);
+    handlers_.erase(it);
 }
 
 void Manager::Clear() noexcept {
-    impl_->handlers.clear();
-    MaybeShrinkHashContainer(impl_->handlers, 8);
+    handlers_.clear();
+    MaybeShrinkHashContainer(handlers_, 8);
 }
 
 }  // namespace acpp::proxyman::outbound

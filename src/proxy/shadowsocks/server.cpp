@@ -16,8 +16,7 @@ namespace acpp::ss {
 
 namespace {
 
-constexpr size_t kStreamChunkPayloadSize =
-    buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
+using detail::kStreamChunkPayloadSize;
 constexpr size_t kSs2022SmallVariableBufferSize = 512;
 
 [[noreturn]] void ThrowSsWriteError(const char* what) {
@@ -115,7 +114,12 @@ public:
         for (auto* buf : mb) {
             auto bytes = buf->Bytes();
             if (bytes.empty()) continue;
-            state.EncryptToMultiBuffer(bytes, out_mb);
+            detail::EncryptToMultiBuffer(
+                *state.write_cipher_,
+                state.write_nonce_,
+                bytes,
+                out_mb,
+                &state.skip_first_bytes_);
         }
         mb.clear();
 
@@ -162,7 +166,12 @@ public:
             if (!data || size == 0) {
                 continue;
             }
-            state.EncryptToMultiBuffer(std::span<const uint8_t>{data, size}, out_mb);
+            detail::EncryptToMultiBuffer(
+                *state.write_cipher_,
+                state.write_nonce_,
+                std::span<const uint8_t>{data, size},
+                out_mb,
+                &state.skip_first_bytes_);
         }
 
         co_await state.FlushPendingAndWrite(stream, std::move(out_mb));
@@ -264,59 +273,6 @@ private:
                 data + static_cast<std::ptrdiff_t>(n));
         }
         return first;
-    }
-
-    void EncryptToMultiBuffer(std::span<const uint8_t> bytes,
-                              buf::MultiBuffer& out_mb) {
-        const uint8_t* data = bytes.data();
-        size_t remaining = bytes.size();
-        if (skip_first_bytes_ > 0) {
-            const size_t skip = std::min(skip_first_bytes_, remaining);
-            data += skip;
-            remaining -= skip;
-            skip_first_bytes_ -= skip;
-            if (remaining == 0) {
-                return;
-            }
-        }
-
-        while (remaining > 0) {
-            const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                throw std::bad_alloc();
-            }
-
-            uint8_t* dst = out->Tail().data();
-
-            const uint8_t len_plain[2] = {
-                static_cast<uint8_t>(chunk_size >> 8),
-                static_cast<uint8_t>(chunk_size & 0xFF)
-            };
-            auto nonce_l = MakeNonce(write_nonce_);
-            if (!write_cipher_->Encrypt(nonce_l.data(), len_plain, 2, dst)) {
-                ThrowSsWriteError("Shadowsocks server stream encrypt length failed");
-            }
-            ++write_nonce_;
-
-            auto nonce_p = MakeNonce(write_nonce_);
-            if (!write_cipher_->Encrypt(
-                    nonce_p.data(), data, chunk_size,
-                    dst + kLenHeaderSize)) {
-                ThrowSsWriteError("Shadowsocks server stream encrypt payload failed");
-            }
-            ++write_nonce_;
-
-            const size_t output_size =
-                kLenHeaderSize +
-                chunk_size +
-                SsAeadCipher::kTagSize;
-            out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(std::move(out));
-
-            data += chunk_size;
-            remaining -= chunk_size;
-        }
     }
 
     net::awaitable<void> FlushPendingAndWrite(

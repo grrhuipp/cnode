@@ -100,7 +100,6 @@ private:
 
 struct RouteRuleConfig {
     // 匹配条件（可多选）
-    std::vector<std::string> domain;         // 域名匹配
     std::vector<std::string> domain_suffix;  // 域名后缀
     std::vector<std::string> domain_keyword; // 域名关键词
     std::vector<std::string> domain_full;    // 完整域名

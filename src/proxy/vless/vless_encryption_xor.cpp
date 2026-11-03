@@ -5,12 +5,20 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <utility>
-
 namespace acpp::vless {
 namespace {
 
 constexpr char kVlessCtrContext[] = "VLESS";
+
+struct EvpCipherCtxDeleter {
+    void operator()(EVP_CIPHER_CTX* ctx) const noexcept {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+};
+
+using UniqueCipherCtx = std::unique_ptr<EVP_CIPHER_CTX, EvpCipherCtxDeleter>;
 
 [[nodiscard]] bool FitsEvpInt(size_t value) noexcept {
     return value <= static_cast<size_t>(std::numeric_limits<int>::max());
@@ -109,8 +117,43 @@ bool XorVlessEncryptionInPlace(
     std::span<const uint8_t> key,
     std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv,
     std::span<uint8_t> data) noexcept {
-    auto ctr = VlessEncryptionCtr::Create(key, iv);
-    return ctr && ctr->XorInPlace(data);
+    if (!FitsEvpInt(data.size())) {
+        return false;
+    }
+    auto derived = DeriveVlessEncryptionCtrKey(key);
+    if (!derived) {
+        return false;
+    }
+    if (data.empty()) {
+        return true;
+    }
+
+    thread_local UniqueCipherCtx tls_ctx;
+    if (!tls_ctx) {
+        tls_ctx.reset(EVP_CIPHER_CTX_new());
+        if (!tls_ctx) {
+            return false;
+        }
+    }
+
+    if (EVP_CipherInit_ex(
+            tls_ctx.get(),
+            EVP_aes_256_ctr(),
+            nullptr,
+            derived->data(),
+            iv.data(),
+            1) != 1) {
+        return false;
+    }
+
+    int out_len = 0;
+    return EVP_CipherUpdate(
+               tls_ctx.get(),
+               data.data(),
+               &out_len,
+               data.data(),
+               static_cast<int>(data.size())) == 1 &&
+           out_len == static_cast<int>(data.size());
 }
 
 std::optional<VlessEncryptionHeaderXor> VlessEncryptionHeaderXor::Create(

@@ -42,7 +42,7 @@ void TestValidUsersAreNormalized() {
     Check((*result)[0].Email == "user@example.com", "email mismatch");
     Check((*result)[1].SpeedLimit == 0, "null speed limit was not unlimited");
     Check((*result)[1].DeviceLimit == 0, "null device limit was not unlimited");
-    Check((*result)[1].Email == "8", "missing email did not use user id");
+    Check((*result)[1].Email.empty(), "missing email should remain empty");
     Check((*result)[2].SpeedLimit ==
               std::numeric_limits<uint64_t>::max() - 131071,
           "maximum speed limit was not preserved");

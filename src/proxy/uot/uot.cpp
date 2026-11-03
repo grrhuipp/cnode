@@ -106,7 +106,50 @@ net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     request.destination = std::move(address->target);
     request.consumed = 1 + address->consumed;
     pending.DropPrefixBytes(request.consumed);
+    pending.ReleaseIfIdle();
     co_return request;
+}
+
+net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
+    Version version,
+    transport::MultiBufferReader& reader,
+    buf::MultiBuffer pending,
+    ErrorCode v1_eof_error) {
+    PreparedRequest out;
+    if (version == Version::V2) {
+        auto request = co_await ReadRequest(reader, pending);
+        if (!request || !request->destination.IsValid()) {
+            co_return tl::unexpected(request
+                ? ErrorCode::PROTOCOL_INVALID_ADDRESS
+                : request.error());
+        }
+        out.is_connect = request->is_connect;
+        out.destination = std::move(request->destination);
+        out.pending = std::move(pending);
+        co_return out;
+    }
+
+    PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
+    try {
+        auto first_packet = co_await packet_reader.ReadMultiBuffer();
+        if (!buf::HasData(first_packet)) {
+            co_return tl::unexpected(v1_eof_error);
+        }
+        for (const buf::Buffer* buffer : first_packet) {
+            if (buffer && buffer->HasUDP()) {
+                out.destination = buffer->UDP();
+                break;
+            }
+        }
+        if (!out.destination.IsValid()) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        out.pending = packet_reader.TakePending();
+        out.initial_decoded = std::move(first_packet);
+        co_return out;
+    } catch (const IoSystemError& e) {
+        co_return tl::unexpected(MapAsioError(e.code()));
+    }
 }
 
 PacketReader::PacketReader(transport::MultiBufferReader& reader,
@@ -118,10 +161,23 @@ PacketReader::PacketReader(transport::MultiBufferReader& reader,
     , destination_(std::move(destination))
     , pending_(std::move(pending)) {}
 
+PacketReader::PacketReader(transport::MultiBufferReader& reader,
+                           PreparedRequest prepared)
+    : reader_(reader)
+    , is_connect_(prepared.is_connect)
+    , destination_(std::move(prepared.destination))
+    , pending_(std::move(prepared.pending))
+    , initial_decoded_(std::move(prepared.initial_decoded)) {}
+
 void PacketReader::SetInitialDecoded(buf::MultiBuffer packet) noexcept {
     initial_decoded_ = std::move(packet);
 }
 
+buf::MultiBuffer PacketReader::TakePending() noexcept {
+    buf::MultiBuffer out = std::move(pending_);
+    pending_.ReleaseIfIdle();
+    return out;
+}
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
     if (buf::HasData(initial_decoded_)) {
         co_return std::move(initial_decoded_);
@@ -167,12 +223,14 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
 
         pending_.DropPrefixBytes(header_size);
         if (payload_size == 0) {
+            pending_.ReleaseIfIdle();
             continue;
         }
         buf::MultiBuffer packet;
         if (!pending_.MovePrefixTo(packet, payload_size)) {
             ThrowDecodeFailure();
         }
+        pending_.ReleaseIfIdle();
         for (buf::Buffer* buffer : packet) {
             if (buffer) {
                 buffer->SetUDP(packet_target);

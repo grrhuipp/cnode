@@ -27,16 +27,9 @@ std::string_view RealIpHeader(const StreamSettings& settings) noexcept {
     return {};
 }
 
-void PrepareInboundLogMetadata(
-    session::Context& ctx,
-    const ReceiverSettings& listener) {
-    ctx.inbound.security = listener.stream_settings.security;
-}
-
 void ApplyHttpRealIp(
     session::Context& ctx,
-    std::string_view real_ip,
-    std::string_view header) {
+    std::string_view real_ip) {
     if (real_ip.empty()) return;
     const auto literal = iputil::ParseLiteral(real_ip);
     if (!literal) return;
@@ -47,39 +40,32 @@ void ApplyHttpRealIp(
     // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
     ctx.inbound.source_port = 0;
     ctx.inbound.client_ip_source = "http_header";
-    if (!header.empty()) {
-        ctx.inbound.client_ip_source.push_back(':');
-        ctx.inbound.client_ip_source.append(header);
-    }
-    ctx.inbound.client_ip_trusted = true;
 }
 
 void ApplyProxyProtocolResult(
     session::Context& ctx,
     const ProxyProtocolResult& result) {
-    if (!result.success()) {
+    if (!result.success() || (!result.src_addr && result.src_ip.empty())) {
         return;
     }
 
+    const auto proxy_ip = std::move(ctx.inbound.source_ip);
     if (result.src_addr) {
         const auto source = iputil::NormalizeAddress(*result.src_addr);
         ctx.inbound.source_addr = source;
         ctx.inbound.source_ip = iputil::AddressText(source).View();
-    } else if (!result.src_ip.empty()) {
+    } else {
         ctx.inbound.source_addr = net::ip::address{};
         ctx.inbound.source_ip = result.src_ip;
-    } else {
-        return;
     }
 
     ctx.inbound.source_port = result.src_port;
     ctx.inbound.client_ip_source = "proxy_protocol";
-    ctx.inbound.client_ip_trusted = true;
     LOG_CONN_DEBUG(
         ctx,
         "[{}] PROXY protocol: proxy={} real_ip={}:{}",
         ctx.inbound.tag,
-        ctx.inbound.peer_ip,
+        proxy_ip,
         ctx.inbound.source_ip,
         ctx.inbound.source_port);
 }
@@ -141,16 +127,6 @@ private:
     StatsShard* stats_;
 };
 
-void CopyTransportBaseContext(const session::Context& source,
-                              session::Context& target) {
-    target.conn_id = session::NewID(source.worker_id);
-    target.worker_id = source.worker_id;
-    target.accept_time_us = NowMicros();
-    target.inbound = source.inbound;
-    target.inbound.user_id = 0;
-    target.inbound.user_email.clear();
-}
-
 }  // namespace
 
 class Handler::LogicalTransportStreamSink final
@@ -171,9 +147,11 @@ public:
         , request_load_(request_load)
         , timeouts_(timeouts)
         , metadata_(std::move(metadata)) {
-        CopyTransportBaseContext(base_ctx, base_ctx_);
+        base_ctx_.InitSubstreamFrom(base_ctx);
         base_ctx_.conn_id = base_ctx.conn_id;
         base_ctx_.accept_time_us = base_ctx.accept_time_us;
+        base_ctx_.inbound.user_id = 0;
+        base_ctx_.inbound.user_email.clear();
     }
 
     [[nodiscard]] InboundTransportMetadata& Metadata() noexcept {
@@ -195,8 +173,8 @@ public:
             co_return;
         }
         session::Context ctx;
-        CopyTransportBaseContext(base_ctx_, ctx);
-        ApplyHttpRealIp(ctx, metadata.real_ip, metadata.real_ip_header);
+        ctx.InitSubstreamFrom(base_ctx_);
+        ApplyHttpRealIp(ctx, metadata.real_ip);
         co_await handler_->ProcessPreparedTransportStream(
             io_context_, dispatcher_, stats_, request_load_, timeouts_,
             std::move(stream), ctx, active_children_);
@@ -232,9 +210,7 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    ctx.inbound.protocol = listener.protocol;
     ctx.inbound.accounting_key.assign(listener.accounting_key);
-    PrepareInboundLogMetadata(ctx, listener);
 
     if (!stream) {
         stats.OnError();
@@ -271,7 +247,6 @@ net::awaitable<void> Handler::ProcessPreparedTransportStream(
     }
     connection_limit.MarkIPAccepted(ctx.inbound.source_ip);
 
-    stream->SetStreamLabel("in");
     (void)stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     LOG_CONN_DEBUG(ctx, "[Session] Logical transport stream ready ({}/{})",
@@ -318,9 +293,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     const inbound::ReceiverSettings& listener = receiver_;
     ConnectionStatsScope connection_stats(stats);
 
-    ctx.inbound.protocol = listener.protocol;
     ctx.inbound.accounting_key.assign(listener.accounting_key);
-    PrepareInboundLogMetadata(ctx, listener);
 
     if (!raw_conn) {
         stats.OnError();
@@ -391,7 +364,6 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
     ConnectionLimitScope connection_limit(limiter_);
 
-    raw_conn->SetStreamLabel("in");
     raw_conn->SetIdleTimeout(timeouts.HandshakeTimeout());
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
@@ -444,8 +416,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     if (!transport_metadata->real_ip.empty()) {
         LOG_CONN_DEBUG(ctx, "[Session] HTTP transport real IP from header: {} -> {}",
                        ctx.inbound.source_ip, transport_metadata->real_ip);
-        ApplyHttpRealIp(
-            ctx, transport_metadata->real_ip, transport_metadata->real_ip_header);
+        ApplyHttpRealIp(ctx, transport_metadata->real_ip);
     }
 
     local_metadata = {};

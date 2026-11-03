@@ -45,16 +45,6 @@ constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
 // queue limit this bounds queued application data to less than 8 MiB/session.
 constexpr size_t kMaxConcurrentSubstreams = 128;
 
-
-void CopySessionContext(const session::Context& source, session::Context& target) {
-    target.conn_id = session::NewID(source.worker_id);
-    target.inbound = source.inbound;
-    target.outbound = source.outbound;
-    target.content = source.content;
-    target.traffic = {};
-    target.worker_id = source.worker_id;
-}
-
 }  // namespace
 
 Handler::Handler(UserOnlineTracker& validator,
@@ -226,7 +216,7 @@ public:
                        routing::Dispatcher& dispatcher,
                        const routing::DispatchPolicy& policy,
                        net::io_context& io_context,
-                       const session::Context& base_ctx,
+                       const session::Context& session_ctx,
                        StatsShard& stats,
                        const TimeoutsConfig& timeouts,
                        const PaddingScheme* padding_scheme)
@@ -234,12 +224,11 @@ public:
         , dispatcher_(dispatcher)
         , policy_(policy)
         , io_context_(io_context)
+        , session_ctx_(session_ctx)
         , stats_(stats)
         , timeouts_(timeouts)
         , padding_scheme_(padding_scheme)
-        , write_gate_(io_context) {
-        CopySessionContext(base_ctx, base_ctx_);
-    }
+        , write_gate_(io_context) {}
 
     ~AnyTLSDemuxSession() noexcept {
         CancelAll();
@@ -380,6 +369,11 @@ private:
         co_return result;
     }
 
+    net::awaitable<ErrorCode> ProcessUdpSubstream(
+        AnyTLSSubStream& sub,
+        proxy::uot::Version uot_version,
+        buf::MultiBuffer pending,
+        std::chrono::steady_clock::time_point opened_at);
     net::awaitable<ErrorCode> ProcessStream(
         AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at);
     net::awaitable<void> RunStream(
@@ -390,7 +384,7 @@ private:
     routing::Dispatcher& dispatcher_;
     const routing::DispatchPolicy& policy_;
     net::io_context& io_context_;
-    session::Context base_ctx_;
+    const session::Context& session_ctx_;
     StatsShard& stats_;
     TimeoutsConfig timeouts_;
     const PaddingScheme* padding_scheme_ = nullptr;
@@ -424,25 +418,91 @@ net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
         throw transport::LinkError(result.error());
 }
 
+net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
+    AnyTLSSubStream& sub,
+    proxy::uot::Version uot_version,
+    buf::MultiBuffer pending,
+    std::chrono::steady_clock::time_point opened_at) {
+    std::optional<proxy::uot::PreparedRequest> prepared;
+    ErrorCode prepare_error = ErrorCode::INTERNAL;
+    bool timed_out = false;
+    auto handshake = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+        const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - opened_at);
+        const auto remaining = std::max(std::chrono::milliseconds::zero(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(timeouts_.HandshakeTimeout()) - elapsed);
+        if (remaining == std::chrono::milliseconds::zero()) {
+            timed_out = true;
+            sub.Cancel();
+            co_return;
+        }
+        struct HandshakeDeadline final : TimeoutEvent {
+            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub, AwaitableTaskGroup& tasks)
+                : timed_out(timed_out), sub(sub), tasks(tasks) {}
+            void OnTimeout() override {
+                timed_out = true;
+                sub.Cancel();
+                tasks.Cancel();
+            }
+            bool& timed_out;
+            AnyTLSSubStream& sub;
+            AwaitableTaskGroup& tasks;
+        } deadline(timed_out, sub, tasks);
+        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
+            throw IoSystemError(io_error::operation_aborted);
+        auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
+            uot_version, sub, std::move(pending), ErrorCode::CONNECTION_CLOSED);
+        if (!uot_header) {
+            prepare_error = uot_header.error();
+        } else {
+            prepared.emplace(std::move(*uot_header));
+            prepare_error = ErrorCode::OK;
+        }
+        if (std::chrono::steady_clock::now() >= opened_at + timeouts_.HandshakeTimeout()) {
+            timed_out = true;
+            sub.Cancel();
+        }
+    };
+    try {
+        co_await RunAwaitableTaskGroup(io_context_.get_executor(),
+            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(handshake(tasks)); });
+    } catch (const IoSystemError&) {
+        if (!timed_out) throw;
+    }
+    if (timed_out) co_return ErrorCode::TIMEOUT;
+    if (prepare_error != ErrorCode::OK || !prepared) co_return prepare_error;
+    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+
+    session::Context& ctx = sub.ctx;
+    const bool is_connect = prepared->is_connect;
+    ctx.outbound.original_target = prepared->destination;
+    ctx.outbound.target = ctx.outbound.original_target;
+    ctx.outbound.route_target = ctx.outbound.original_target;
+    ctx.content.network = Network::UDP;
+    proxy::uot::PacketReader uot_reader(sub, std::move(*prepared));
+    prepared.reset();
+    proxy::uot::PacketWriter uot_writer(sub, is_connect, ctx.outbound.target);
+    (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+        transport::Link{&uot_reader, &uot_writer},
+        InitialPayload{}, ctx, stats_, timeouts_);
+    co_return ErrorCode::OK;
+}
+
 net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
     buf::MultiBuffer pending;
-    TargetAddress target;
+    std::optional<proxy::uot::Version> uot_version;
     session::Context& ctx = sub.ctx;
-    bool is_connect = false;
-    std::optional<proxy::uot::PacketReader> uot_reader;
-    std::optional<proxy::uot::PacketWriter> uot_writer;
     auto prepare = [&]() -> net::awaitable<ErrorCode> {
         auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
                                            0, {255, true});
         if (!parsed) co_return parsed.error();
         pending.DropPrefixBytes(parsed->consumed);
-        target = std::move(parsed->target);
-        const auto uot_version = proxy::uot::VersionFromMagicAddress(target);
-        if (!target.IsValid() && !uot_version) {
+        uot_version = proxy::uot::VersionFromMagicAddress(parsed->target);
+        if (!parsed->target.IsValid() && !uot_version) {
             co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
         }
-        ctx.outbound.original_target = uot_version ? TargetAddress{} : target;
+        ctx.outbound.original_target = uot_version ? TargetAddress{} : std::move(parsed->target);
         ctx.outbound.target = ctx.outbound.original_target;
         ctx.outbound.route_target = ctx.outbound.original_target;
         ctx.content.network = uot_version ? Network::UDP : Network::TCP;
@@ -450,35 +510,6 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
             if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(), {}); !ok)
                 co_return ok.error();
         }
-
-        if (uot_version) {
-            target = {};
-            if (*uot_version == proxy::uot::Version::V2) {
-                auto request = co_await proxy::uot::ReadRequest(sub, pending);
-                if (!request) co_return request.error();
-                if (!request->destination.IsValid()) co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
-                is_connect = request->is_connect;
-                target = std::move(request->destination);
-            }
-            uot_reader.emplace(sub, is_connect, target, std::move(pending));
-            if (*uot_version == proxy::uot::Version::V1) {
-                auto first_packet = co_await uot_reader->ReadMultiBuffer();
-                if (!buf::HasData(first_packet)) co_return ErrorCode::CONNECTION_CLOSED;
-                for (const buf::Buffer* buffer : first_packet) {
-                    if (buffer && buffer->HasUDP()) {
-                        target = buffer->UDP();
-                        break;
-                    }
-                }
-                if (!target.IsValid()) co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
-                uot_reader->SetInitialDecoded(std::move(first_packet));
-            }
-            uot_writer.emplace(sub, is_connect, target);
-        }
-        ctx.outbound.original_target = target;
-        ctx.outbound.target = target;
-        ctx.outbound.route_target = target;
-        ctx.content.network = uot_version ? Network::UDP : Network::TCP;
         co_return ErrorCode::OK;
     };
 
@@ -528,15 +559,13 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     if (prepare_error != ErrorCode::OK) co_return prepare_error;
     if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
     // Header preparation is joined and its timer removed before Dispatcher.
-    if (uot_reader) {
-        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-            transport::Link{std::addressof(*uot_reader), std::addressof(*uot_writer)},
-            InitialPayload{}, ctx, stats_, timeouts_);
-    } else {
-        (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-            transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
-            ctx, stats_, timeouts_);
+    if (uot_version) {
+        co_return co_await ProcessUdpSubstream(
+            sub, *uot_version, std::move(pending), opened_at);
     }
+    (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
+        transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
+        ctx, stats_, timeouts_);
     co_return ErrorCode::OK;
 }
 
@@ -665,7 +694,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
             }
             const auto opened_at = std::chrono::steady_clock::now();
             auto sub = memory::AllocateShared<AnyTLSSubStream>(io_context_, *this, sid);
-            CopySessionContext(base_ctx_, sub->ctx);
+            sub->ctx.InitSubstreamFrom(session_ctx_);
             sub->ctx.content.network = Network::TCP;
             streams_.emplace(sid, sub);
             last_stream_id_ = sid; // Commit after the complete stream was inserted.
@@ -759,6 +788,68 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
     co_return tl::expected<void, ErrorCode>{};
 }
 
+net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
+AuthenticateSession(
+    AsyncStream& stream,
+    UserOnlineTracker& validator,
+    ConnectionLimiter* limiter,
+    StatsShard& stats,
+    session::Context& ctx,
+    const TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
+    std::array<uint8_t, 32> auth_hash{};
+    if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
+        stats.OnError();
+        co_return tl::unexpected(ok.error());
+    }
+    auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
+    if (!user) {
+        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+            limiter->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
+        }
+        stats.OnError();
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+
+    auto control_idle_timeout = timeouts.IdleTimeout();
+    if (pressure_idle_timeout > 0) {
+        control_idle_timeout = std::min(
+            control_idle_timeout,
+            std::chrono::seconds(pressure_idle_timeout));
+    }
+    stream.SetIdleTimeout(control_idle_timeout);
+    stream.SetReadTimeout(std::chrono::seconds(0));
+    stream.SetWriteTimeout(
+        std::min(timeouts.WriteTimeout(), control_idle_timeout));
+    stream.ClearPhaseDeadline();
+
+    const auto& profile = user->profile;
+    ctx.inbound.user_email = profile.email;
+    ctx.inbound.user_id = profile.user_id;
+    ctx.content.speed_limit = profile.speed_limit;
+
+    auto user_session = validator.TryConnectSession(
+        ctx.inbound.tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+    if (!user_session) {
+        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            FormatTimestamp(ctx.accept_time_us),
+            ctx.inbound.source_ip,
+            ctx.inbound.source_port,
+            ctx.inbound.tag,
+            ctx.inbound.user_email,
+            profile.device_limit,
+            validator.OnlineDeviceCount(ctx.inbound.tag, static_cast<uint64_t>(profile.user_id)));
+        stats.OnError();
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+    }
+
+    // Metadata is owned by ctx; authentication must not pin an old user table
+    // for the lifetime of this control transport and all its logical streams.
+    user.reset();
+    ctx.content.network = Network::MUX;
+    co_return std::move(*user_session);
+}
+
 }  // namespace
 
 net::awaitable<RelayResult>
@@ -776,73 +867,17 @@ Handler::Process(
         co_return result;
     }
 
-    std::array<uint8_t, 32> auth_hash{};
-    if (auto ok = co_await ReadAuth(*stream, auth_hash); !ok) {
-        stats_->OnError();
-        RelayResult result;
-        result.error = ok.error();
-        co_return result;
-    }
-    auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
-    if (!user) {
-        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(ctx.inbound.tag, ctx.inbound.source_ip);
-        }
-        stats_->OnError();
-        RelayResult result;
-        result.error = ErrorCode::PROTOCOL_AUTH_FAILED;
-        co_return result;
-    }
-
-    auto control_idle_timeout = timeouts.IdleTimeout();
-    if (pressure_idle_timeout > 0) {
-        control_idle_timeout = std::min(
-            control_idle_timeout,
-            std::chrono::seconds(pressure_idle_timeout));
-    }
-    stream->SetIdleTimeout(control_idle_timeout);
-    stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(
-        std::min(timeouts.WriteTimeout(), control_idle_timeout));
-    stream->ClearPhaseDeadline();
-
-    std::optional<UserOnlineSessionGuard> user_session;
+    UserOnlineSessionGuard user_session;
     {
-        const auto& profile = user->profile;
-        ctx.inbound.user_email = profile.email;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.content.speed_limit = profile.speed_limit;
-
-        const uint64_t uid = static_cast<uint64_t>(profile.user_id);
-        if (uid != 0) {
-            if (!validator_.CanAcceptDevice(
-                    ctx.inbound.tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-                LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
-                    FormatTimestamp(ctx.accept_time_us),
-                    ctx.inbound.source_ip,
-                    ctx.inbound.source_port,
-                    ctx.inbound.tag,
-                    ctx.inbound.user_email,
-                    profile.device_limit,
-                    validator_.OnlineDeviceCount(ctx.inbound.tag, uid));
-                stats_->OnError();
-                RelayResult result;
-                result.error = ErrorCode::PERMISSION_DENIED;
-                co_return result;
-            }
-            validator_.OnUserConnected(ctx.inbound.tag, uid, ctx.inbound.source_ip);
-            user_session.emplace(validator_, ctx.inbound.tag, uid, ctx.inbound.source_ip);
+        auto auth = co_await AuthenticateSession(
+            *stream, validator_, limiter_, *stats_, ctx, timeouts, pressure_idle_timeout);
+        if (!auth) {
+            RelayResult result;
+            result.error = auth.error();
+            co_return result;
         }
+        user_session = std::move(*auth);
     }
-
-    // Metadata is owned by ctx; authentication must not pin an old user table
-    // for the lifetime of this control transport and all its logical streams.
-    user.reset();
-
-    // The authenticated socket is an AnyTLS control transport. The shared
-    // access-session boundary suppresses MUX containers while each logical
-    // child below replaces this with TCP/UDP and reports independently.
-    ctx.content.network = Network::MUX;
 
     AnyTLSDemuxSession demux(
         std::move(stream),

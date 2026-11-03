@@ -310,6 +310,173 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
     }
     co_return std::move(*request);
 }
+
+struct EncryptedIoState : memory::ThreadAllocated {
+    std::optional<::acpp::vless::VlessEncryptionReader> reader;
+    std::optional<::acpp::vless::VlessEncryptionWriter> writer;
+    std::optional<VlessBufferedReader> plain_reader;
+};
+
+struct VlessHandshakeOutcome {
+    UserOnlineSessionGuard user_session;
+    Network net = Network::TCP;
+    bool packet_addr_udp = false;
+    bool use_vision = false;
+    std::array<uint8_t, 16> request_uuid{};
+};
+
+net::awaitable<tl::expected<VlessHandshakeOutcome, ErrorCode>>
+CompleteVlessInboundHandshake(
+    AsyncStream& stream,
+    const ::acpp::vless::VlessEncryptionConfig* decryption,
+    ::acpp::vless::VlessEncryptionServerTicketStore* decryption_tickets,
+    VlessBufferedReader& protocol_reader,
+    transport::MultiBufferWriter& protocol_writer,
+    std::unique_ptr<EncryptedIoState>& encrypted_io,
+    VlessBufferedReader*& active_reader,
+    transport::MultiBufferWriter*& active_writer,
+    ::acpp::UserOnlineTracker& validator,
+    ConnectionLimiter* limiter,
+    const proxyman::inbound::ReceiverSettings& receiver,
+    session::Context& ctx,
+    std::string_view tag,
+    std::string_view client_ip) {
+    if (decryption) {
+        try {
+            auto runtime =
+                co_await ::acpp::vless::RunVlessEncryptionServerHandshake(
+                    protocol_reader,
+                    protocol_writer,
+                    *decryption,
+                    decryption_tickets);
+            if (!runtime) {
+                LOG_NET_WARN("[VLESS][{}] encryption handshake failed from {}",
+                              tag, client_ip);
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            encrypted_io = std::make_unique<EncryptedIoState>();
+            if (runtime->read_aead_ready) {
+                encrypted_io->reader.emplace(
+                    protocol_reader,
+                    std::move(runtime->read_aead),
+                    runtime->united_key,
+                    std::move(runtime->read_xor));
+            } else {
+                encrypted_io->reader.emplace(
+                    ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
+                        protocol_reader,
+                        runtime->lazy_read_context_size,
+                        runtime->united_key,
+                        runtime->cipher,
+                        runtime->lazy_read_xor_from_context));
+            }
+            encrypted_io->writer.emplace(
+                protocol_writer,
+                std::move(runtime->write_aead),
+                std::move(runtime->united_key),
+                std::move(runtime->write_xor));
+            encrypted_io->plain_reader.emplace(*encrypted_io->reader);
+            active_reader = std::addressof(*encrypted_io->plain_reader);
+            active_writer = std::addressof(*encrypted_io->writer);
+        } catch (const IoSystemError&) {
+            co_return tl::unexpected(stream.ConsumePhaseDeadline()
+                ? ErrorCode::TIMEOUT
+                : ErrorCode::SOCKET_READ_FAILED);
+        } catch (...) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+    }
+
+    auto parsed_request = co_await ReadVlessRequestHeader(
+        *active_reader, stream, ctx, tag, client_ip);
+    if (!parsed_request) {
+        co_return tl::unexpected(parsed_request.error());
+    }
+    auto& request = *parsed_request;
+    auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
+    if (!user_info) {
+        LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
+        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+            limiter->OnAuthFailTracked(tag, client_ip);
+        }
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+    if (request.addons_len != 0 && request.flow.empty()) {
+        LOG_NET_WARN("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    const bool use_vision = ::acpp::vless::IsVisionFlow(request.flow);
+    if (!request.flow.empty()) {
+        if (std::string_view(request.flow) != user_info->flow) {
+            LOG_NET_WARN("[VLESS][{}] request flow '{}' not allowed for user",
+                          tag, request.flow);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+        if (!use_vision) {
+            LOG_NET_WARN("[VLESS][{}] unknown request flow '{}'", tag, request.flow);
+            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        }
+    }
+    if (!user_info->flow.empty() && !::acpp::vless::IsVisionFlow(user_info->flow)) {
+        LOG_NET_WARN("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (request.flow.empty() && ::acpp::vless::IsVisionFlow(user_info->flow)) {
+        LOG_NET_WARN("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (use_vision && request.command != ::acpp::vless::Command::TCP) {
+        LOG_NET_WARN("[VLESS][{}] flow '{}' only supports TCP", tag, request.flow);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    if (use_vision &&
+        (!receiver.stream_settings.IsTlsLike() ||
+         receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
+        LOG_NET_WARN("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
+                      tag, request.flow);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+
+    const auto& profile = user_info->profile;
+    ctx.inbound.user_id = profile.user_id;
+    ctx.inbound.user_email = profile.email;
+    ctx.content.speed_limit = profile.speed_limit;
+    auto user_session = validator.TryConnectSession(
+        tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+    if (!user_session) {
+        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            FormatTimestamp(ctx.accept_time_us),
+            ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
+            profile.device_limit,
+            validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+    }
+
+    // Flow validation and metadata copy are complete; no credential is needed
+    // by the request body or Vision's per-session UUID state.
+    user_info.reset();
+
+    Network net = Network::TCP;
+    if (request.command == ::acpp::vless::Command::UDP) {
+        net = Network::UDP;
+    } else if (request.command == ::acpp::vless::Command::MUX) {
+        net = Network::MUX;
+    }
+    const bool packet_addr_udp =
+        request.command == ::acpp::vless::Command::UDP &&
+        ::acpp::vless::IsPacketAddrMagic(request.target);
+    ctx.outbound.original_target = request.target;
+    ctx.outbound.target = std::move(request.target);
+    ctx.content.network = net;
+
+    co_return VlessHandshakeOutcome{
+        .user_session = std::move(*user_session),
+        .net = net,
+        .packet_addr_udp = packet_addr_udp,
+        .use_vision = use_vision,
+        .request_uuid = request.uuid,
+    };
+}
 }  // namespace
 
 proxy::vless::inbound::Handler::Handler(
@@ -362,153 +529,42 @@ proxy::vless::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 
-    std::optional<UserOnlineSessionGuard> user_session;
-    std::optional<::acpp::vless::RequestHeader> request;
     VlessBufferedReader protocol_reader(*stream);
     transport::MultiBufferWriter* protocol_writer = stream.get();
     VlessBufferedReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = protocol_writer;
-    struct EncryptedIoState : memory::ThreadAllocated {
-        std::optional<::acpp::vless::VlessEncryptionReader> reader;
-        std::optional<::acpp::vless::VlessEncryptionWriter> writer;
-        std::optional<VlessBufferedReader> plain_reader;
-    };
     std::unique_ptr<EncryptedIoState> encrypted_io;
 
-    if (decryption_) {
-        try {
-            auto runtime =
-                co_await ::acpp::vless::RunVlessEncryptionServerHandshake(
-                    protocol_reader,
-                    *protocol_writer,
-                    *decryption_,
-                    decryption_tickets_.get());
-            if (!runtime) {
-                LOG_NET_WARN("[VLESS][{}] encryption handshake failed from {}",
-                              tag, client_ip);
-                co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            encrypted_io = std::make_unique<EncryptedIoState>();
-            if (runtime->read_aead_ready) {
-                encrypted_io->reader.emplace(
-                    protocol_reader,
-                    std::move(runtime->read_aead),
-                    runtime->united_key,
-                    std::move(runtime->read_xor));
-            } else {
-                encrypted_io->reader.emplace(
-                    ::acpp::vless::VlessEncryptionReader::CreateLazyReadContext(
-                        protocol_reader,
-                        runtime->lazy_read_context_size,
-                        runtime->united_key,
-                        runtime->cipher,
-                        runtime->lazy_read_xor_from_context));
-            }
-            encrypted_io->writer.emplace(
-                *protocol_writer,
-                std::move(runtime->write_aead),
-                std::move(runtime->united_key),
-                std::move(runtime->write_xor));
-            encrypted_io->plain_reader.emplace(*encrypted_io->reader);
-            active_reader = std::addressof(*encrypted_io->plain_reader);
-            active_writer = std::addressof(*encrypted_io->writer);
-        } catch (const IoSystemError&) {
-            co_return fail_abortive(stream->ConsumePhaseDeadline()
-                ? ErrorCode::TIMEOUT
-                : ErrorCode::SOCKET_READ_FAILED);
-        } catch (...) {
-            co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-    }
-
-    auto parsed_request = co_await ReadVlessRequestHeader(
-        *active_reader, *stream, ctx, tag, client_ip);
-    if (!parsed_request) {
-        co_return fail_abortive(parsed_request.error());
-    }
-    request.emplace(std::move(*parsed_request));
-    auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request->uuid);
-    if (!user_info) {
-        LOG_NET_WARN("[VLESS][{}] auth failed from {}", tag, client_ip);
-        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
-        }
-        co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
-    if (request->addons_len != 0 && request->flow.empty()) {
-        LOG_NET_WARN("[VLESS][{}] unsupported request addons from {}", tag, client_ip);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-    const bool use_vision = ::acpp::vless::IsVisionFlow(request->flow);
-    if (!request->flow.empty()) {
-        if (std::string_view(request->flow) != user_info->flow) {
-            LOG_NET_WARN("[VLESS][{}] request flow '{}' not allowed for user",
-                          tag, request->flow);
-            co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-        }
-        if (!use_vision) {
-            LOG_NET_WARN("[VLESS][{}] unknown request flow '{}'", tag, request->flow);
-            co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-        }
-    }
-    if (!user_info->flow.empty() && !::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_NET_WARN("[VLESS][{}] unsupported flow '{}'", tag, user_info->flow);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-    if (request->flow.empty() && ::acpp::vless::IsVisionFlow(user_info->flow)) {
-        LOG_NET_WARN("[VLESS][{}] missing required flow '{}'", tag, user_info->flow);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-    if (use_vision && request->command != ::acpp::vless::Command::TCP) {
-        LOG_NET_WARN("[VLESS][{}] flow '{}' only supports TCP", tag, request->flow);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-    if (use_vision &&
-        (!receiver.stream_settings.IsTlsLike() ||
-         receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        LOG_NET_WARN("[VLESS][{}] flow '{}' requires raw TCP TLS-like transport",
-                      tag, request->flow);
-        co_return fail_abortive(ErrorCode::PROTOCOL_UNSUPPORTED);
-    }
-
-    uint64_t tracked_uid = 0;
-    {
-        const auto& profile = user_info->profile;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.inbound.user_email = profile.email;
-        ctx.content.speed_limit = profile.speed_limit;
-        tracked_uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, tracked_uid));
-            co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
-        }
-    }
-
-    // Flow validation and metadata copy are complete; no credential is needed
-    // by the request body or Vision's per-session UUID state.
-    user_info.reset();
-    validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
-    user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
-
+    UserOnlineSessionGuard user_session;
     Network net = Network::TCP;
-    if (request->command == ::acpp::vless::Command::UDP) {
-        net = Network::UDP;
-    } else if (request->command == ::acpp::vless::Command::MUX) {
-        net = Network::MUX;
+    bool packet_addr_udp = false;
+    bool use_vision = false;
+    std::array<uint8_t, 16> request_uuid{};
+    {
+        auto handshake = co_await CompleteVlessInboundHandshake(
+            *stream,
+            decryption_.get(),
+            decryption_tickets_.get(),
+            protocol_reader,
+            *protocol_writer,
+            encrypted_io,
+            active_reader,
+            active_writer,
+            validator_,
+            limiter_,
+            receiver,
+            ctx,
+            tag,
+            client_ip);
+        if (!handshake) {
+            co_return fail_abortive(handshake.error());
+        }
+        user_session = std::move(handshake->user_session);
+        net = handshake->net;
+        packet_addr_udp = handshake->packet_addr_udp;
+        use_vision = handshake->use_vision;
+        request_uuid = handshake->request_uuid;
     }
-    const bool packet_addr_udp =
-        request->command == ::acpp::vless::Command::UDP &&
-        ::acpp::vless::IsPacketAddrMagic(request->target);
-    const std::array<uint8_t, 16> request_uuid = request->uuid;
-    ctx.outbound.original_target = request->target;
-    ctx.outbound.target = std::move(request->target);
-    ctx.content.network = net;
-    request.reset();
     uint8_t response_header[2]{};
     const size_t response_len =
         ::acpp::vless::Codec::EncodeResponseHeaderTo(response_header, sizeof(response_header));

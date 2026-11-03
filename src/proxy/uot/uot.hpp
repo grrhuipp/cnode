@@ -54,6 +54,20 @@ struct EncodedRequest {
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending);
 
+
+struct PreparedRequest {
+    bool is_connect = false;
+    TargetAddress destination;
+    buf::MultiBuffer pending;
+    buf::MultiBuffer initial_decoded;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<PreparedRequest, ErrorCode>>
+ReadUotRequestHeader(
+    Version version,
+    transport::MultiBufferReader& reader,
+    buf::MultiBuffer pending = {},
+    ErrorCode v1_eof_error = ErrorCode::PROTOCOL_DECODE_FAILED);
 class PacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
@@ -67,10 +81,13 @@ public:
                  TargetAddress destination,
                  buf::MultiBuffer pending = {});
 
+    PacketReader(transport::MultiBufferReader& reader,
+                 PreparedRequest prepared);
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
     void SetInitialDecoded(buf::MultiBuffer packet) noexcept;
-
+    [[nodiscard]] buf::MultiBuffer TakePending() noexcept;
 private:
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;

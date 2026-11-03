@@ -44,8 +44,6 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
 
-    [[nodiscard]] std::string BuildUserTag(std::string_view tag,
-                                           const api::UserInfo& user) const;
     [[nodiscard]] std::optional<proxyman::inbound::UserSet> BuildUsersForInbound(
         const controller::InboundBuild& inbound,
         const api::NodeInfo& node_config,

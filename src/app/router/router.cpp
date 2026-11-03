@@ -38,21 +38,9 @@ auto LowerBoundTrieChild(auto& children, char ch) {
         });
 }
 
-bool MatchIPv6Prefix(const net::ip::address_v6::bytes_type& ip,
-                     const net::ip::address_v6::bytes_type& network,
-                     uint8_t prefix) {
-    const size_t full_bytes = prefix / 8;
-    const uint8_t remaining_bits = prefix % 8;
-
-    if (full_bytes > 0 && std::memcmp(ip.data(), network.data(), full_bytes) != 0) {
-        return false;
-    }
-    if (remaining_bits == 0) {
-        return true;
-    }
-
-    const uint8_t mask = static_cast<uint8_t>(0xFFu << (8 - remaining_bits));
-    return (ip[full_bytes] & mask) == (network[full_bytes] & mask);
+template <typename Vector>
+void ClearAndRelease(Vector& vec) noexcept {
+    Vector(vec.get_allocator()).swap(vec);
 }
 
 using StringVector = memory::ThreadLocalVector<memory::ThreadLocalString>;
@@ -143,7 +131,10 @@ public:
     [[nodiscard]] bool MatchIPv4(uint32_t ip) const;
     [[nodiscard]] bool MatchIPv6(const net::ip::address_v6::bytes_type& ip) const;
 
-    [[nodiscard]] bool Empty() const { return rules_.empty() && rules_v6_.empty(); }
+    [[nodiscard]] bool Empty() const {
+        return rules_.empty() && rules_v6_.empty()
+            && trie_nodes_.empty() && trie_nodes_v6_.empty();
+    }
 
 private:
     struct CIDRRule {
@@ -603,6 +594,8 @@ void IPMatcher::BuildIndex() {
         }
     }
 
+    ClearAndRelease(rules_);
+    ClearAndRelease(rules_v6_);
     index_built_ = true;
 }
 
@@ -620,27 +613,21 @@ bool IPMatcher::Match(const net::ip::address& ip) const {
 }
 
 bool IPMatcher::MatchIPv4(uint32_t ip) const {
-    if (index_built_ && !trie_nodes_.empty()) {
-        int node = 0;
-        if (trie_nodes_[0].rule_index >= 0) {
-            return true;
-        }
-        for (uint8_t i = 0; i < 32; ++i) {
-            int bit = (ip >> (31 - i)) & 1;
-            int next = trie_nodes_[node].children[bit];
-            if (next < 0) {
-                return false;
-            }
-            node = next;
-            if (trie_nodes_[node].rule_index >= 0) {
-                return true;
-            }
-        }
+    if (!index_built_ || trie_nodes_.empty()) {
         return false;
     }
-
-    for (const auto& rule : rules_) {
-        if ((ip & rule.mask) == rule.network) {
+    int node = 0;
+    if (trie_nodes_[0].rule_index >= 0) {
+        return true;
+    }
+    for (uint8_t i = 0; i < 32; ++i) {
+        int bit = (ip >> (31 - i)) & 1;
+        int next = trie_nodes_[node].children[bit];
+        if (next < 0) {
+            return false;
+        }
+        node = next;
+        if (trie_nodes_[node].rule_index >= 0) {
             return true;
         }
     }
@@ -648,28 +635,22 @@ bool IPMatcher::MatchIPv4(uint32_t ip) const {
 }
 
 bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
-    if (index_built_ && !trie_nodes_v6_.empty()) {
-        int node = 0;
-        if (trie_nodes_v6_[0].rule_index >= 0) {
-            return true;
-        }
-        for (uint8_t bit_idx = 0; bit_idx < 128; ++bit_idx) {
-            const uint8_t byte = ip[bit_idx / 8];
-            const int bit = (byte >> (7 - (bit_idx % 8))) & 1;
-            const int next = trie_nodes_v6_[node].children[bit];
-            if (next < 0) {
-                return false;
-            }
-            node = next;
-            if (trie_nodes_v6_[node].rule_index >= 0) {
-                return true;
-            }
-        }
+    if (!index_built_ || trie_nodes_v6_.empty()) {
         return false;
     }
-
-    for (const auto& rule : rules_v6_) {
-        if (MatchIPv6Prefix(ip, rule.network, rule.prefix)) {
+    int node = 0;
+    if (trie_nodes_v6_[0].rule_index >= 0) {
+        return true;
+    }
+    for (uint8_t bit_idx = 0; bit_idx < 128; ++bit_idx) {
+        const uint8_t byte = ip[bit_idx / 8];
+        const int bit = (byte >> (7 - (bit_idx % 8))) & 1;
+        const int next = trie_nodes_v6_[node].children[bit];
+        if (next < 0) {
+            return false;
+        }
+        node = next;
+        if (trie_nodes_v6_[node].rule_index >= 0) {
             return true;
         }
     }
@@ -773,9 +754,6 @@ Router::Impl::Impl(
         }
 
         DomainMatcher domain_matcher;
-        for (const auto& value : rc.domain) {
-            domain_matcher.AddSuffix(value);
-        }
         for (const auto& value : rc.domain_suffix) {
             domain_matcher.AddSuffix(value);
         }

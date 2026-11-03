@@ -17,6 +17,19 @@ ID NewID(uint32_t worker_id) noexcept {
     return GenerateWorkerConnId(worker_id);
 }
 
+
+void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port) {
+    worker_id = parent.worker_id;
+    conn_id = NewID(worker_id);
+    accept_time_us = NowMicros();
+    inbound = parent.inbound;
+    if (sub_source_port != 0) {
+        inbound.source_port = sub_source_port;
+    }
+    outbound.tag = parent.outbound.tag;
+    content.speed_limit = parent.content.speed_limit;
+    traffic = {};
+}
 }  // namespace session
 
 std::string FormatAccessLog(const session::Context& ctx) {

@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-
+#include <span>
 namespace acpp::buf {
 class MultiBuffer;
 }
@@ -50,7 +50,7 @@ enum class NetworkType : uint8_t {
 
 constexpr uint8_t kOptionData  = 0x01;
 constexpr uint8_t kOptionError = 0x02;
-
+inline constexpr size_t kMaxFrameHeaderBytes = 269;
 // ============================================================================
 // FrameHeader - 解析结果
 // ============================================================================
@@ -101,33 +101,39 @@ struct FrameHeader {
 // 序列化：服务器 → 客户端
 // ============================================================================
 
+[[nodiscard]] size_t EncodeKeepAliveTo(std::span<uint8_t> out) noexcept;
 void EncodeKeepAliveTo(memory::ByteVector& out);
-[[nodiscard]] bool EncodeNewTo(memory::ByteVector& out,
-                               uint16_t session_id,
-                               NetworkType network,
-                               const TargetAddress& target,
-                               const uint8_t* data,
-                               size_t len);
+
+[[nodiscard]] size_t EncodeNewHeaderTo(std::span<uint8_t> out,
+                                       uint16_t session_id,
+                                       NetworkType network,
+                                       const TargetAddress& target,
+                                       size_t payload_len) noexcept;
 [[nodiscard]] bool EncodeNewHeaderTo(memory::ByteVector& out,
                                      uint16_t session_id,
                                      NetworkType network,
                                      const TargetAddress& target,
                                      size_t payload_len);
+
+[[nodiscard]] size_t EncodeEndTo(std::span<uint8_t> out,
+                                 uint16_t session_id,
+                                 bool error = false) noexcept;
 void EncodeEndTo(memory::ByteVector& out,
                  uint16_t session_id, bool error = false);
-[[nodiscard]] bool EncodeKeepDataTo(memory::ByteVector& out,
-                                    uint16_t session_id,
-                                    const uint8_t* data, size_t len);
+
+[[nodiscard]] size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
+                                            uint16_t session_id,
+                                            size_t payload_len) noexcept;
 [[nodiscard]] bool EncodeKeepDataHeaderTo(memory::ByteVector& out,
                                           uint16_t session_id,
                                           size_t payload_len);
-[[nodiscard]] bool EncodeKeepUDPTo(memory::ByteVector& out,
-                     uint16_t session_id,
-                     const TargetAddress& src,
-                     const uint8_t* data, size_t len);
+
+[[nodiscard]] size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
+                                           uint16_t session_id,
+                                           const TargetAddress& src,
+                                           size_t payload_len) noexcept;
 [[nodiscard]] bool EncodeKeepUDPHeaderTo(memory::ByteVector& out,
                                          uint16_t session_id,
                                          const TargetAddress& src,
                                          size_t payload_len);
-
 }  // namespace acpp::mux

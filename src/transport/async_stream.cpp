@@ -88,11 +88,6 @@ void AsyncStream::SetWriteTimeout(std::chrono::seconds timeout) {
     }
 }
 
-void AsyncStream::SetStreamLabel(std::string_view label) noexcept {
-    if (auto* tcp = BaseTcpStream()) {
-        tcp->SetStreamLabel(label);
-    }
-}
 
 void AsyncStream::SetAbortiveClose(bool enable) noexcept {
     if (auto* tcp = BaseTcpStream()) {

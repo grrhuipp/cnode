@@ -140,8 +140,6 @@ public:
         if (!forced || forced->outbound_tag != "loopback")
             Fail("native job did not retain its narrow dispatch policy snapshot");
         if (context.inbound.tag != "receiver-tag" ||
-            context.inbound.protocol != "native-test" ||
-            context.inbound.security != "tls" ||
             context.inbound.tags.size() != 1 ||
             context.inbound.tags.front() != "route-tag")
             Fail("native request retained borrowed receiver metadata");

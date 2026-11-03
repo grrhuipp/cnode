@@ -29,8 +29,8 @@ struct TargetAddress {
     TargetAddress() = default;
 
     TargetAddress(std::string_view h, uint16_t p)
-        : host(h), port(p) {
-        DetermineType();
+        : port(p) {
+        InitFromHost(h);
     }
 
     TargetAddress(const net::ip::address& addr, uint16_t p)
@@ -123,28 +123,29 @@ private:
         return true;
     }
 
-    void DetermineType() {
+    void InitFromHost(std::string_view h) {
         type = AddressType::Invalid;
         resolved_addr.reset();
-        if (auto literal = iputil::ParseLiteral(host)) {
+        host.clear();
+        if (h.empty()) {
+            return;
+        }
+        if (auto literal = iputil::ParseLiteral(h)) {
             const auto addr = iputil::NormalizeAddress(*literal);
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
                 resolved_addr = addr;
-                host.clear();
             } else if (addr.is_v6()) {
                 type = AddressType::IPv6;
                 resolved_addr = addr;
-                host.clear();
             }
-        } else {
-            if (domain::IsValidDnsHostname(
-                    host, domain::TrailingDotPolicy::Allow)) {
-                domain::NormalizeDnsHostnameInPlace(host);
-                type = AddressType::Domain;
-            } else {
-                host.clear();
-            }
+            return;
+        }
+        if (domain::IsValidDnsHostname(
+                h, domain::TrailingDotPolicy::Allow)) {
+            host.assign(h);
+            domain::NormalizeDnsHostnameInPlace(host);
+            type = AddressType::Domain;
         }
     }
 };

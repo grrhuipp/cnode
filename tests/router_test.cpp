@@ -142,6 +142,9 @@ void TestInboundMetadataOwnershipAndRouting() {
             {
                 Context ctx;
                 Context copy;
+                Require(counted_worker_pool.OutstandingAllocations() == baseline_allocations &&
+                            counted_worker_pool.OutstandingBytes() == baseline_bytes,
+                        "default-constructed Context must not pre-allocate an arena block");
                 {
                     acpp::proxyman::inbound::ReceiverSettings receiver{
                         .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
@@ -154,16 +157,16 @@ void TestInboundMetadataOwnershipAndRouting() {
                     receiver.protocol = std::string(104, 'p');
                     receiver.stream_settings.security = std::string(108, 's');
                     ctx.inbound.tag = receiver.inbound_tag;
-                    ctx.inbound.protocol = receiver.protocol;
-                    ctx.inbound.security = receiver.stream_settings.security;
+                    ctx.inbound.accounting_key = receiver.protocol;
+                    ctx.inbound.user_email = receiver.stream_settings.security;
                     for (const auto& tag : receiver.inbound_tags) {
                         ctx.inbound.tags.emplace_back(tag);
                     }
                     copy.inbound = ctx.inbound;
                 }
 
-                Require(ctx.inbound.tag.size() == 96 && ctx.inbound.protocol.size() == 104 &&
-                            ctx.inbound.security.size() == 108 && ctx.inbound.tags.size() == 2 &&
+                Require(ctx.inbound.tag.size() == 96 && ctx.inbound.accounting_key.size() == 104 &&
+                            ctx.inbound.user_email.size() == 108 && ctx.inbound.tags.size() == 2 &&
                             ctx.inbound.tags[1].size() == 112,
                         "inbound metadata must outlive its cold receiver source");
                 Require(counted_worker_pool.TotalAllocations() > 0 &&
@@ -172,15 +175,21 @@ void TestInboundMetadataOwnershipAndRouting() {
                         "long inbound metadata and its copy must allocate through Worker PMR");
                 Require(ctx.pool() == &counted_worker_pool &&
                             copy.pool() == &counted_worker_pool &&
-                            ctx.inbound.tag.get_allocator().resource() == ctx.arena() &&
-                            ctx.inbound.protocol.get_allocator().resource() == ctx.arena() &&
-                            ctx.inbound.security.get_allocator().resource() == ctx.arena() &&
-                            ctx.inbound.tags.get_allocator().resource() == ctx.arena() &&
-                            ctx.inbound.tags[0].get_allocator().resource() == ctx.arena() &&
-                            copy.inbound.tag.get_allocator().resource() == copy.arena() &&
-                            copy.inbound.tags[0].get_allocator().resource() == copy.arena(),
-                        "inbound metadata and Context copies must use the Context arena backed by the Worker PMR pool");
+                            ctx.inbound.tag.get_allocator().resource() == ctx.pool() &&
+                            ctx.inbound.accounting_key.get_allocator().resource() == ctx.pool() &&
+                            ctx.inbound.user_email.get_allocator().resource() == ctx.pool() &&
+                            ctx.inbound.tags.get_allocator().resource() == ctx.pool() &&
+                            ctx.inbound.tags[0].get_allocator().resource() == ctx.pool() &&
+                            copy.inbound.tag.get_allocator().resource() == copy.pool() &&
+                            copy.inbound.tags[0].get_allocator().resource() == copy.pool(),
+                        "inbound metadata and Context copies must use the Context pool resource");
                 ctx.inbound.tag[0] = 'c';
+                const size_t allocs_before_ipv6 = counted_worker_pool.TotalAllocations();
+                ctx.outbound.target = acpp::TargetAddress("2001:db8:85a3::8a2e:370:7334", 443);
+                Require(ctx.outbound.target.IsIPv6() &&
+                            ctx.outbound.target.host.empty() &&
+                            counted_worker_pool.TotalAllocations() == allocs_before_ipv6,
+                        "IPv6 literal TargetAddress must not allocate on the heap");
                 ctx.inbound.tags[1][0] = 'y';
                 Require(copy.inbound.tag[0] == 'm' && copy.inbound.tags[1][0] == 'x',
                         "copied inbound metadata must be independent owned values");

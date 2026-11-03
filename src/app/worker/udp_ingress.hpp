@@ -186,6 +186,7 @@ public:
     [[nodiscard]] bool OwnsSocket(
         std::string_view socket_key,
         const udp::socket* socket) const noexcept;
+    [[nodiscard]] size_t SocketCount() const noexcept;
     void CloseSocket(std::string_view socket_key) noexcept;
     void CloseAllSockets() noexcept;
 

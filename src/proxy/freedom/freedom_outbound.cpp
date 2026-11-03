@@ -126,7 +126,6 @@ Handler::Handler(
     : tag_(tag)
     , send_through_(settings.send_through)
     , domain_strategy_(settings.domain_strategy)
-    , enable_udp_(settings.enable_udp)
     , dns_service_(dns_service)
     , dial_timeout_(dial_timeout) {
     if (!settings.redirect.empty()) {
@@ -156,9 +155,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == Network::UDP) {
-        if (!enable_udp_) {
-            co_return tl::unexpected(ErrorCode::NOT_SUPPORTED);
-        }
         auto bind_address = SelectUdpBindAddress(send_through_, ctx);
         if (send_through_.GetMode() == OutboundBind::Mode::Ordered) {
             const auto selected = send_through_.Select(
@@ -196,6 +192,31 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         ctx.outbound.target = *redirect_target_;
     }
 
+    auto dialed = co_await DialOutboundStream(io_context, inbound_local_addr, ctx);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto stream = std::move(*dialed);
+    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetReadTimeout(std::chrono::seconds(0));
+    stream->SetWriteTimeout(relay_write_timeout);
+    AsyncStream* inbound_control = inbound.control;
+
+    if (inbound_control) {
+        co_return co_await DoRelayLink(
+            io_context, *inbound.reader, *inbound.writer, *inbound_control,
+            *stream, ctx, stats, relay_config, std::move(first_payload));
+    }
+    co_return co_await DoRelayLink(
+        io_context, *inbound.reader, *inbound.writer,
+        *stream, ctx, stats, relay_config, std::move(first_payload));
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+Handler::DialOutboundStream(
+    net::io_context& io_context,
+    const tcp::endpoint* inbound_local_addr,
+    session::Context& ctx) {
     const auto& target = ctx.outbound.target;
     if (!target.IsValid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
@@ -275,8 +296,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     ctx.outbound.connected_local_addr.reset();
     auto dial_result = co_await DialOutboundTransport(io_context, ctx, transport_target);
     if (!dial_result.Ok()) {
-        // Dispatcher logs the stable terminal ErrorCode at warning level.
-        // Preserve the transport-specific cause for debug diagnostics only.
         LOG_CONN_DEBUG(ctx, "failed to dial {} -> {} via {} > {}",
                        ctx.inbound.source_ip, ctx.outbound.target,
                        ctx.outbound.tag, dial_result.error_msg);
@@ -284,8 +303,6 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     }
 
     auto stream = std::move(dial_result.stream);
-    transport_target = {};
-    stream->SetStreamLabel("out");
     LOG_CONN_DEBUG(ctx, "[Outbound] TCP dial ok -> {} via {}",
                    ctx.outbound.target, ctx.outbound.tag);
     if (auto local_ep = stream->LocalEndpoint()) {
@@ -295,20 +312,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
     }
     LOG_ACCESS(FormatAccessLog(ctx));
-
-    stream->SetIdleTimeout(relay_idle_timeout);
-    stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_write_timeout);
-    AsyncStream* inbound_control = inbound.control;
-
-    if (inbound_control) {
-        co_return co_await DoRelayLink(
-            io_context, *inbound.reader, *inbound.writer, *inbound_control,
-            *stream, ctx, stats, relay_config, std::move(first_payload));
-    }
-    co_return co_await DoRelayLink(
-        io_context, *inbound.reader, *inbound.writer,
-        *stream, ctx, stats, relay_config, std::move(first_payload));
+    co_return std::move(stream);
 }
 
 net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>

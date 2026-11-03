@@ -46,6 +46,140 @@ private:
     std::optional<ss::Ss2022UdpSessionState> ss2022_session_;
 };
 
+struct PreparedSsTcpSession {
+    std::unique_ptr<transport::MultiBufferReader> request_reader;
+    std::unique_ptr<transport::MultiBufferWriter> response_writer;
+    InitialPayload initial_payload;
+    UserOnlineSessionGuard user_session;
+    std::optional<proxy::uot::Version> uot_version;
+};
+
+net::awaitable<tl::expected<PreparedSsTcpSession, ErrorCode>>
+PrepareSsTcpSession(
+    AsyncStream& stream,
+    const ss::SsCipherInfo& cipher_info,
+    size_t& last_matched_index,
+    UserOnlineTracker& validator,
+    ConnectionLimiter* limiter,
+    StatsShard& stats,
+    session::Context& ctx,
+    std::string_view tag,
+    std::string_view client_ip) {
+    auto session_result = co_await ss::ReadTCPSession(
+        stream,
+        cipher_info,
+        tag,
+        last_matched_index);
+    if (!session_result) {
+        const ErrorCode error = session_result.error();
+        if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
+            LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
+            if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+                limiter->OnAuthFailTracked(tag, client_ip);
+            }
+            stats.OnError();
+        } else {
+            LOG_CONN_WARN(ctx, "[SS][{}] ReadTCPSession failed from {}: {}",
+                          tag, client_ip, ErrorCodeToString(error));
+        }
+        co_return tl::unexpected(error);
+    }
+
+    auto request_reader = std::move(session_result->body_reader);
+    const auto* matched = session_result->user.get();
+    if (!matched) {
+        LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
+        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+            limiter->OnAuthFailTracked(tag, client_ip);
+        }
+        stats.OnError();
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+
+    const auto& profile = matched->profile;
+    ctx.inbound.user_id = profile.user_id;
+    ctx.inbound.user_email = profile.email;
+    ctx.content.speed_limit = profile.speed_limit;
+
+    auto user_session = validator.TryConnectSession(
+        tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+    if (!user_session) {
+        LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+            FormatTimestamp(ctx.accept_time_us),
+            ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
+            profile.device_limit,
+            validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+    }
+
+    LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
+                   tag, client_ip, session_result->target, ctx.inbound.user_email);
+    const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
+    ctx.outbound.original_target = session_result->target;
+    ctx.outbound.target = std::move(session_result->target);
+    ctx.content.network = Network::TCP;
+
+    auto response_writer_result = ss::WriteTCPResponse(
+        *matched, cipher_info, session_result->request_salt, stream);
+    if (!request_reader) {
+        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    if (!response_writer_result) {
+        co_return tl::unexpected(response_writer_result.error());
+    }
+    // Both directions now own their cipher/key state, including the lazy
+    // response header. Authentication ownership must end before UoT/relay waits.
+    session_result->user.reset();
+
+    co_return PreparedSsTcpSession{
+        .request_reader = std::move(request_reader),
+        .response_writer = std::move(response_writer_result.value()),
+        .initial_payload = std::move(session_result->initial_payload),
+        .user_session = std::move(*user_session),
+        .uot_version = uot_version,
+    };
+}
+
+net::awaitable<RelayResult> DispatchSsUotSession(
+    proxy::uot::Version uot_version,
+    std::unique_ptr<AsyncStream> stream,
+    transport::MultiBufferReader& request_reader,
+    transport::MultiBufferWriter& response_writer,
+    buf::MultiBuffer pending,
+    routing::Dispatcher& dispatcher,
+    const routing::DispatchPolicy& dispatch_policy,
+    net::io_context& io_context,
+    session::Context& ctx,
+    StatsShard& stats,
+    const TimeoutsConfig& timeouts) {
+    auto prepared = co_await proxy::uot::ReadUotRequestHeader(
+        uot_version, request_reader, std::move(pending));
+    if (!prepared) {
+        stats.OnError();
+        RelayResult result;
+        result.error = prepared.error();
+        co_return result;
+    }
+    const bool is_connect = prepared->is_connect;
+    const TargetAddress udp_target = prepared->destination;
+    proxy::uot::PacketReader uot_reader(request_reader, std::move(*prepared));
+    proxy::uot::PacketWriter uot_writer(response_writer, is_connect, udp_target);
+    ctx.outbound.original_target = udp_target;
+    ctx.outbound.target = udp_target;
+    ctx.outbound.route_target = udp_target;
+    ctx.content.network = Network::UDP;
+
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        dispatch_policy,
+        std::move(stream),
+        transport::Link{&uot_reader, &uot_writer},
+        InitialPayload{},
+        ctx,
+        stats,
+        timeouts);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -112,133 +246,42 @@ proxy::shadowsocks::inbound::Handler::Process(
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
     }
-    std::optional<UserOnlineSessionGuard> user_session;
-
-    auto session_result = co_await ss::ReadTCPSession(
-        *stream,
-        cipher_info_,
-        tag,
-        last_matched_index_);
-    if (!session_result) {
-        const ErrorCode error = session_result.error();
-        if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
-            LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
-            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-                limiter_->OnAuthFailTracked(tag, client_ip);
-            }
-            stats_->OnError();
-        } else {
-            LOG_CONN_WARN(ctx, "[SS][{}] ReadTCPSession failed from {}: {}",
-                              tag, client_ip, ErrorCodeToString(error));
-        }
-        co_return fail(error);
-    }
-
-    auto request_reader = std::move(session_result->body_reader);
+    std::unique_ptr<transport::MultiBufferReader> request_reader;
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
+    InitialPayload initial_payload;
+    UserOnlineSessionGuard user_session;
+    std::optional<proxy::uot::Version> uot_version;
     {
-        const auto* matched = session_result->user.get();
-        if (!matched) {
-            LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
-            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-                limiter_->OnAuthFailTracked(tag, client_ip);
-            }
-            stats_->OnError();
-            co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
+        auto prepared = co_await PrepareSsTcpSession(
+            *stream,
+            cipher_info_,
+            last_matched_index_,
+            validator_,
+            limiter_,
+            *stats_,
+            ctx,
+            tag,
+            client_ip);
+        if (!prepared) {
+            co_return fail(prepared.error());
         }
-        const auto& profile = matched->profile;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.inbound.user_email = profile.email;
-        ctx.content.speed_limit = profile.speed_limit;
-
-        const auto uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, uid));
-            co_return fail(ErrorCode::PERMISSION_DENIED);
-        }
-        validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
-        user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
-
-        LOG_CONN_DEBUG(ctx, "[SS][{}] auth ok: {} -> {} user={}",
-                       tag, client_ip, session_result->target, ctx.inbound.user_email);
-        ctx.outbound.original_target = session_result->target;
-        ctx.outbound.target = std::move(session_result->target);
-        ctx.content.network = Network::TCP;
-
-        auto response_writer_result = ss::WriteTCPResponse(
-            *matched, cipher_info_, session_result->request_salt, *stream);
-        if (!request_reader) {
-            co_return fail(ErrorCode::RESOURCE_EXHAUSTED);
-        }
-        if (!response_writer_result) {
-            co_return fail(response_writer_result.error());
-        }
-        response_writer = std::move(response_writer_result.value());
+        request_reader = std::move(prepared->request_reader);
+        response_writer = std::move(prepared->response_writer);
+        initial_payload = std::move(prepared->initial_payload);
+        user_session = std::move(prepared->user_session);
+        uot_version = prepared->uot_version;
     }
-    // Both directions now own their cipher/key state, including the lazy
-    // response header. Authentication ownership must end before UoT/relay waits.
-    session_result->user.reset();
 
-    if (const auto uot_version = proxy::uot::VersionFromMagicAddress(
-            ctx.outbound.target)) {
-        buf::MultiBuffer pending =
-            session_result->initial_payload.MoveToMultiBuffer();
-        bool is_connect = false;
-        TargetAddress udp_target;
-
-        if (*uot_version == proxy::uot::Version::V2) {
-            auto request = co_await proxy::uot::ReadRequest(
-                *request_reader, pending);
-            if (!request || !request->destination.IsValid()) {
-                co_return fail(request
-                    ? ErrorCode::PROTOCOL_INVALID_ADDRESS
-                    : request.error());
-            }
-            is_connect = request->is_connect;
-            udp_target = std::move(request->destination);
-        }
-
-        proxy::uot::PacketReader uot_reader(
-            *request_reader, is_connect, udp_target, std::move(pending));
-
-        if (*uot_version == proxy::uot::Version::V1) {
-            try {
-                auto first_packet = co_await uot_reader.ReadMultiBuffer();
-                if (!buf::HasData(first_packet)) {
-                    co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
-                }
-                for (const buf::Buffer* buffer : first_packet) {
-                    if (buffer && buffer->HasUDP()) {
-                        udp_target = buffer->UDP();
-                        break;
-                    }
-                }
-                if (!udp_target.IsValid()) {
-                    co_return fail(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-                }
-                uot_reader.SetInitialDecoded(std::move(first_packet));
-            } catch (const IoSystemError& e) {
-                co_return fail(MapAsioError(e.code()));
-            }
-        }
-
-        proxy::uot::PacketWriter uot_writer(
-            *response_writer, is_connect, udp_target);
-        ctx.outbound.original_target = udp_target;
-        ctx.outbound.target = udp_target;
-        ctx.outbound.route_target = udp_target;
-        ctx.content.network = Network::UDP;
-
-        co_return co_await dispatcher.Dispatch(
-            io_context,
-            receiver.dispatch_policy,
+    if (uot_version) {
+        co_return co_await DispatchSsUotSession(
+            *uot_version,
             std::move(stream),
-            transport::Link{&uot_reader, &uot_writer},
-            InitialPayload{},
+            *request_reader,
+            *response_writer,
+            initial_payload.MoveToMultiBuffer(),
+            dispatcher,
+            receiver.dispatch_policy,
+            io_context,
             ctx,
             *stats_,
             timeouts);
@@ -249,7 +292,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{request_reader.get(), response_writer.get()},
-        std::move(session_result->initial_payload),
+        std::move(initial_payload),
         ctx,
         *stats_,
         timeouts);

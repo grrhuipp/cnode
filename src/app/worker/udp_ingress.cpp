@@ -82,7 +82,6 @@ struct UdpReplyQueueState {
     size_t queued_bytes = 0;
     uint64_t active_id = 0;
     size_t active_payload_size = 0;
-    bool shrink_pending_on_drain = false;
 };
 
 struct UdpClientSession {
@@ -178,7 +177,6 @@ struct UdpIngress::ClientSession::Impl : memory::ThreadAllocated {
     };
     memory::ThreadLocalDeque<QueuedInput> input_queue;
     size_t queued_bytes = 0;
-    bool shrink_queue_on_drain = false;
     bool closed = false;
     ErrorCode terminal_error = ErrorCode::OK;
     InboundDatagramOwner session_owner;
@@ -255,9 +253,6 @@ bool UdpIngress::ClientSession::Push(
     Impl::QueuedInput input{std::move(payload), payload_size, std::move(reservation)};
     impl_->input_queue.push_back(std::move(input));
     impl_->queued_bytes += payload_size;
-    if (impl_->input_queue.size() >= 64 || impl_->queued_bytes >= 256 * 1024) {
-        impl_->shrink_queue_on_drain = true;
-    }
     impl_->WakeReader();
     return true;
 }
@@ -285,10 +280,6 @@ UdpIngress::ClientSession::ReadMultiBuffer() {
             auto input = std::move(impl_->input_queue.front());
             impl_->queued_bytes -= std::min(impl_->queued_bytes, input.bytes);
             impl_->input_queue.pop_front();
-            if (impl_->input_queue.empty() && impl_->shrink_queue_on_drain) {
-                TryShrinkSequence(impl_->input_queue);
-                impl_->shrink_queue_on_drain = false;
-            }
             co_return std::move(input.payload);
         }
 
@@ -714,8 +705,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx.inbound.source_ip.assign(client_ip.View());
         ctx.inbound.source_addr = normalized_client_addr;
         ctx.inbound.source_port = datagram.client_endpoint.port();
-        ctx.inbound.peer_ip.assign(client_ip.View());
-        ctx.inbound.peer_port = datagram.client_endpoint.port();
         IoErrorCode local_ec;
         const auto local_ep = datagram.sock->local_endpoint(local_ec);
         if (!local_ec && !local_ep.address().is_unspecified()) {
@@ -727,8 +716,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         ctx.outbound.target = decoded->target;
         ctx.inbound.user_id = decoded->user_id;
         ctx.inbound.user_email.assign(decoded->user_email);
-        ctx.inbound.protocol.assign(datagram.receiver->protocol);
-        ctx.inbound.security.assign(datagram.receiver->stream_settings.security);
         ctx.content.speed_limit = decoded->speed_limit;
         request.socket = stable_socket;
         request.dispatcher = &datagram.dispatcher;
@@ -817,9 +804,6 @@ UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
     reply.payload = std::move(payload);
     queue.pending.push_back(std::move(reply));
     queue.queued_bytes += payload_size;
-    if (queue.pending.size() >= 64 || queue.queued_bytes >= 256 * 1024) {
-        queue.shrink_pending_on_drain = true;
-    }
     return should_start_send
         ? ReplyEnqueueResult::StartSend
         : ReplyEnqueueResult::Queued;
@@ -869,14 +853,7 @@ bool UdpIngress::CompleteReplySend(
     }
     queue.active_id = 0;
     queue.active_payload_size = 0;
-    if (queue.pending.empty()) {
-        if (queue.shrink_pending_on_drain) {
-            TryShrinkSequence(queue.pending);
-            queue.shrink_pending_on_drain = false;
-        }
-        return false;
-    }
-    return true;
+    return !queue.pending.empty();
 }
 
 void UdpIngress::ClearReplyQueue(std::string_view socket_key) {
@@ -1062,6 +1039,10 @@ bool UdpIngress::OwnsSocket(
     auto it = impl_->udp_sockets.find(socket_key);
     return socket && it != impl_->udp_sockets.end() &&
         it->second.get() == socket;
+}
+
+size_t UdpIngress::SocketCount() const noexcept {
+    return impl_->udp_sockets.size();
 }
 
 void UdpIngress::CloseSocket(std::string_view socket_key) noexcept {

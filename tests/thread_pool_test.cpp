@@ -420,15 +420,18 @@ bool RunRequestArenaAndContext() {
         auto* prev = std::pmr::set_default_resource(worker.resource());
         {
             acpp::session::Context ctx;
-            if (ctx.pool() != worker.resource() || ctx.arena() == ctx.pool()) {
+            if (ctx.pool() != worker.resource() ||
+                ctx.inbound.tag.get_allocator().resource() != ctx.pool() ||
+                ctx.content.protocol.get_allocator().resource() != ctx.pool()) {
                 std::pmr::set_default_resource(prev);
                 return false;
             }
             ctx.inbound.tag = "panel/multi-tier-arena-test/node-100/vless/443";
             ctx.inbound.user_email = "arena-user-with-long-identifier@example.com";
-            std::pmr::vector<int> arena_vec(ctx.allocator<int>());
+            request_memory stage(worker);
+            std::pmr::vector<int> arena_vec(stage.allocator<int>());
             arena_vec.resize(64, 99);
-            if (arena_vec.back() != 99) {
+            if (arena_vec.back() != 99 || stage.upstream_resource() != ctx.pool()) {
                 std::pmr::set_default_resource(prev);
                 return false;
             }

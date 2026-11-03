@@ -72,7 +72,6 @@ uint64_t& LocalRevision() noexcept {
 UserStore::VmessCredential
 BuildVmessCredential(const PreparedVmessUser& user) {
     return UserStore::VmessCredential{
-        .uuid = user.uuid,
         .uuid_bytes = user.uuid_bytes,
         .cmd_key = user.cmd_key,
         .auth_key = user.auth_key,
@@ -83,12 +82,19 @@ BuildVmessCredential(const PreparedVmessUser& user) {
 
 std::shared_ptr<const UserStore::VmessUserMap>
 BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
-    auto map = std::make_shared<UserStore::VmessUserMap>();
-    map->reserve(users.size());
+    auto list = std::make_shared<UserStore::VmessUserMap>();
+    list->reserve(users.size());
+    std::unordered_map<std::string_view, size_t> index_by_uuid;
+    index_by_uuid.reserve(users.size());
     for (const auto& user : users) {
-        (*map)[user.uuid] = BuildVmessCredential(user);
+        auto [it, inserted] = index_by_uuid.emplace(user.uuid, list->size());
+        if (inserted) {
+            list->push_back(BuildVmessCredential(user));
+        } else {
+            (*list)[it->second] = BuildVmessCredential(user);
+        }
     }
-    return map;
+    return list;
 }
 
 UserStore::VlessCredential
@@ -113,7 +119,6 @@ BuildVlessUsers(const std::vector<PreparedVlessUser>& users) {
 UserStore::TrojanCredential
 BuildTrojanCredential(const PreparedTrojanUser& user) {
     return UserStore::TrojanCredential{
-        .password_hash = user.password_hash,
         .profile = user.profile,
     };
 }
@@ -131,7 +136,6 @@ BuildTrojanUsers(const std::vector<PreparedTrojanUser>& users) {
 UserStore::ShadowsocksCredential
 BuildShadowsocksCredential(const PreparedShadowsocksUser& user) {
     return UserStore::ShadowsocksCredential{
-        .password = user.password,
         .derived_key = user.derived_key,
         .identity_key = user.identity_key,
         .psk_hash = user.psk_hash,

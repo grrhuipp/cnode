@@ -57,9 +57,6 @@ net::awaitable<void> RunUdpReceiveLoop(
 
         IoErrorCode available_error;
         const size_t available = socket->available(available_error);
-        if (!is_owned(socket)) {
-            co_return;
-        }
         if (available_error) {
             if (IsTransientReceiveError(available_error)) {
                 continue;
@@ -74,9 +71,6 @@ net::awaitable<void> RunUdpReceiveLoop(
             IoErrorCode discard_error;
             (void)socket->receive_from(
                 net::buffer(discard_byte), discarded_peer, 0, discard_error);
-            if (!is_owned(socket)) {
-                co_return;
-            }
             if (IsTransientReceiveError(discard_error)) {
                 continue;
             }

@@ -33,7 +33,6 @@ public:
     using Profile = ::acpp::UserProfile;
 
     struct VmessCredential {
-        std::string uuid;
         std::array<uint8_t, 16> uuid_bytes{};
         std::array<uint8_t, 16> cmd_key{};
         std::array<uint8_t, 16> auth_key{};
@@ -42,7 +41,6 @@ public:
     };
 
     struct TrojanCredential {
-        std::string password_hash;
         Profile profile;
     };
 
@@ -53,7 +51,6 @@ public:
     };
 
     struct ShadowsocksCredential {
-        std::string password;
         PreparedKeyBytes derived_key;
         PreparedKeyBytes identity_key;
         std::array<uint8_t, 16> psk_hash{};
@@ -68,11 +65,7 @@ public:
         Profile profile;
     };
 
-    using VmessUserMap =
-        std::unordered_map<std::string,
-                           VmessCredential,
-                           TransparentStringHash,
-                           TransparentStringEq>;
+    using VmessUserMap = std::vector<VmessCredential>;
     using TrojanUserMap =
         std::unordered_map<std::string,
                            TrojanCredential,
@@ -93,6 +86,9 @@ public:
 
         [[nodiscard]] bool empty() const noexcept { return !users || users->empty(); }
         [[nodiscard]] size_t size() const noexcept { return users ? users->size() : 0; }
+        [[nodiscard]] const VmessCredential& operator[](size_t index) const noexcept {
+            return (*users)[index];
+        }
         [[nodiscard]] std::shared_ptr<const VmessCredential>
         Share(const VmessCredential& user) const noexcept {
             return users

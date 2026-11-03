@@ -24,6 +24,23 @@ enum class StreamEndpointRole {
     Outbound,
 };
 
+class SslContext;
+
+struct PreparedTlsContextHolder {
+    mutable std::shared_ptr<SslContext> server_ctx;
+    mutable std::shared_ptr<SslContext> client_ctx;
+
+    PreparedTlsContextHolder() = default;
+    PreparedTlsContextHolder(const PreparedTlsContextHolder&) noexcept {}
+    PreparedTlsContextHolder& operator=(const PreparedTlsContextHolder&) noexcept {
+        server_ctx.reset();
+        client_ctx.reset();
+        return *this;
+    }
+    PreparedTlsContextHolder(PreparedTlsContextHolder&&) noexcept = default;
+    PreparedTlsContextHolder& operator=(PreparedTlsContextHolder&&) noexcept = default;
+};
+
 struct XHttpDownloadSettings;
 
 // ============================================================================
@@ -82,10 +99,6 @@ struct HttpUpgradeConfig {
 
     // 与 WS 相同，只在明确配置后信任指定 header。
     std::string real_ip_header;
-
-    // Xray httpupgradeSettings 字段；cnode 的 PROXY protocol 已在 receiver
-    // 层处理，这里只保留归一化结果，避免 transport 再次读取连接前缀。
-    bool accept_proxy_protocol = false;
 
     static HttpUpgradeConfig FromJson(const json::object& j);
 };
@@ -222,6 +235,7 @@ struct StreamSettings {
     GrpcConfig grpc;           // 当 network == "grpc" 时生效
     XHttpConfig xhttp;          // 当 network == "xhttp" / "splithttp" 时生效
 
+    PreparedTlsContextHolder prepared_tls;
     // 归一化后的缓存字段（热路径使用）
     NetworkMode  network_mode  = NetworkMode::Tcp;
     SecurityMode security_mode = SecurityMode::None;

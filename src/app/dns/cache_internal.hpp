@@ -46,7 +46,6 @@ private:
     uint32_t max_ttl_;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
-    uint64_t expired_ = 0;
 };
 
 }  // namespace acpp::app::dns

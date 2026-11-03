@@ -1,11 +1,13 @@
 #pragma once
 
+#include <openssl/base.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
-
 namespace acpp::vless {
 
 inline constexpr size_t kVlessX25519KeySize = 32;
@@ -34,6 +36,16 @@ struct VlessMlKem768Encapsulation {
 ComputeVlessX25519SharedKey(std::span<const uint8_t> private_key,
                             std::span<const uint8_t> peer_public_key) noexcept;
 
+[[nodiscard]] std::shared_ptr<EVP_PKEY>
+CreateVlessMlKem768PrivateKeyFromSeed(std::span<const uint8_t> seed) noexcept;
+
+[[nodiscard]] std::shared_ptr<EVP_PKEY>
+CreateVlessMlKem768PublicKey(std::span<const uint8_t> public_key) noexcept;
+
+[[nodiscard]] std::optional<
+    std::array<uint8_t, kVlessMlKem768PublicKeySize>>
+DeriveVlessMlKem768PublicKey(const EVP_PKEY* key) noexcept;
+
 [[nodiscard]] std::optional<
     std::array<uint8_t, kVlessMlKem768PublicKeySize>>
 DeriveVlessMlKem768PublicKeyFromSeed(std::span<const uint8_t> seed) noexcept;
@@ -42,7 +54,15 @@ DeriveVlessMlKem768PublicKeyFromSeed(std::span<const uint8_t> seed) noexcept;
     std::span<const uint8_t> public_key) noexcept;
 
 [[nodiscard]] std::optional<VlessMlKem768Encapsulation>
+EncapsulateVlessMlKem768(EVP_PKEY* public_key) noexcept;
+
+[[nodiscard]] std::optional<VlessMlKem768Encapsulation>
 EncapsulateVlessMlKem768(std::span<const uint8_t> public_key) noexcept;
+
+[[nodiscard]] std::optional<
+    std::array<uint8_t, kVlessMlKem768SharedSecretSize>>
+DecapsulateVlessMlKem768(EVP_PKEY* private_key,
+                         std::span<const uint8_t> ciphertext) noexcept;
 
 [[nodiscard]] std::optional<
     std::array<uint8_t, kVlessMlKem768SharedSecretSize>>

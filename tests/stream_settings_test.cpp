@@ -162,6 +162,18 @@ void TestQueries() {
     Require(grpc.RequestPath() == "/service/Tun", "gRPC request path changed");
     grpc.multi_mode = true;
     Require(grpc.RequestPath() == "/service/TunMulti", "gRPC multiplexed path changed");
+
+    StreamSettings with_tls;
+    with_tls.prepared_tls.client_ctx = std::shared_ptr<SslContext>(
+        reinterpret_cast<SslContext*>(0x1), [](SslContext*) {});
+    with_tls.prepared_tls.server_ctx = std::shared_ptr<SslContext>(
+        reinterpret_cast<SslContext*>(0x2), [](SslContext*) {});
+    StreamSettings copied = with_tls;
+    Require(!copied.prepared_tls.client_ctx && !copied.prepared_tls.server_ctx,
+        "copying StreamSettings across Workers must reset prepared SslContext handles");
+    StreamSettings moved = std::move(with_tls);
+    Require(moved.prepared_tls.client_ctx != nullptr && moved.prepared_tls.server_ctx != nullptr,
+        "moving StreamSettings must preserve prepared SslContext handles");
 }
 }
 

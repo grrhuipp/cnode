@@ -3,9 +3,7 @@
 #include "http2_settings.hpp"
 #include "grpc_hunk.hpp"
 #include "http_path_match.hpp"
-#include "tls_context_cache.hpp"
 #include "reality_tls.hpp"
-#include "tls_context_cache_key.hpp"
 #include "xhttp_packet_queue.hpp"
 #include "xhttp_packet_session_key.hpp"
 #include "xhttp_upload_stream_slot.hpp"
@@ -16,7 +14,6 @@
 #include "acppnode/common/allocator.hpp"
 #include "acppnode/common/base64.hpp"
 #include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/infra/log.hpp"
 #include "acppnode/common/unsafe.hpp"
 
@@ -36,7 +33,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace acpp {
@@ -56,85 +52,44 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 
 namespace {
 
-constexpr size_t kTlsContextCacheMaxEntries = 16;
 constexpr size_t kXHttpMaxPacketSessions = 1024;
-constexpr size_t kGrpcServerH2QueueShrinkItems = 64;
 constexpr size_t kHttp2MaxConcurrentStreams = 256;
 
-using TlsContextMap =
-    std::unordered_map<std::string, std::unique_ptr<SslContext>>;
-// These thread-exit caches can outlive a scoped Worker/test PMR resource.
-using TlsContextCache = transport::internet::BoundedTlsContextCache<
-    SslContext, TlsContextMap>;
-
-SslContext* AcquireServerTlsContext(const TlsConfig& config) {
-    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
-
-    const bool has_certificate = config.HasCertificatePair();
-    std::string key = has_certificate
-        ? transport::internet::MakeTlsContextCacheKey("server", config)
-        : transport::internet::MakeTlsContextCacheKey("server-auto-sign", config);
-
-    if (auto* cached = cache.Find(key)) return cached;
+SslContext* AcquireServerTlsContext(const StreamSettings& s) {
+    if (s.prepared_tls.server_ctx) {
+        return s.prepared_tls.server_ctx.get();
+    }
 
     std::unique_ptr<SslContext> ctx;
-    if (has_certificate) {
-        ctx = SslContext::CreateServer(config);
+    if (s.IsReality()) {
+        ctx = SslContext::CreateServerReality(s.reality, s.tls);
+    } else if (s.tls.HasCertificatePair()) {
+        ctx = SslContext::CreateServer(s.tls);
     } else {
-        ctx = SslContext::CreateServerAutoSign(config);
+        ctx = SslContext::CreateServerAutoSign(s.tls);
     }
 
-    if (ctx) {
-        return cache.Insert(std::move(key), std::move(ctx));
+    if (!ctx) {
+        return nullptr;
     }
-    return nullptr;
+    s.prepared_tls.server_ctx = std::move(ctx);
+    return s.prepared_tls.server_ctx.get();
 }
 
-SslContext* AcquireServerRealityContext(const RealityConfig& reality,
-                                        const TlsConfig& tls_config) {
-    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
+SslContext* AcquireClientTlsContext(const StreamSettings& s) {
+    if (s.prepared_tls.client_ctx) {
+        return s.prepared_tls.client_ctx.get();
+    }
 
-    std::string key = transport::internet::MakeRealityServerContextCacheKey(
-        reality, tls_config);
-    if (auto* cached = cache.Find(key)) return cached;
-
-    auto ctx = SslContext::CreateServerReality(reality, tls_config);
+    std::unique_ptr<SslContext> ctx = s.IsReality()
+        ? SslContext::CreateClientReality(s.reality, s.tls)
+        : SslContext::CreateClient(s.tls);
     if (!ctx) {
         return nullptr;
     }
 
-    return cache.Insert(std::move(key), std::move(ctx));
-}
-
-SslContext* AcquireClientTlsContext(const TlsConfig& config) {
-    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
-
-    std::string key =
-        transport::internet::MakeTlsContextCacheKey("client", config);
-
-    if (auto* cached = cache.Find(key)) return cached;
-
-    std::unique_ptr<SslContext> ctx = SslContext::CreateClient(config);
-    if (ctx) {
-        return cache.Insert(std::move(key), std::move(ctx));
-    }
-    return nullptr;
-}
-
-SslContext* AcquireClientRealityContext(const RealityConfig& reality,
-                                        const TlsConfig& tls_config) {
-    thread_local TlsContextCache cache(kTlsContextCacheMaxEntries);
-
-    std::string key = transport::internet::MakeRealityClientContextCacheKey(
-        reality, tls_config);
-    if (auto* cached = cache.Find(key)) return cached;
-
-    auto ctx = SslContext::CreateClientReality(reality, tls_config);
-    if (!ctx) {
-        return nullptr;
-    }
-
-    return cache.Insert(std::move(key), std::move(ctx));
+    s.prepared_tls.client_ctx = std::move(ctx);
+    return s.prepared_tls.client_ctx.get();
 }
 
 [[nodiscard]] char LowerAsciiChar(char ch) {
@@ -2876,8 +2831,6 @@ private:
     net::awaitable<bool> EnsureReadablePayload();
     net::awaitable<bool> WaitForRawData();
     [[nodiscard]] size_t ConsumeReadablePayload(net::mutable_buffer buffer) noexcept;
-    void MarkQueueForShrinkIfLarge() noexcept;
-    void ShrinkQueueIfDrained() noexcept;
     void ClearH2Queue() noexcept;
 
     net::io_context& io_context_;
@@ -2903,7 +2856,6 @@ private:
     memory::ThreadLocalDeque<QueuedH2Data> h2_data_queue_;
     size_t h2_data_offset_ = 0;
     size_t queued_bytes_ = 0;
-    bool shrink_h2_queue_on_drain_ = false;
     transport::internet::GrpcHunkDecoder hunk_;
     bool input_done_ = false;
     bool read_cancelled_ = false;
@@ -3777,7 +3729,6 @@ bool Http2ServerSubStreamState::PushH2Data(
         .offset = offset,
         .end = offset + size,
     });
-    MarkQueueForShrinkIfLarge();
     WakeInputReader();
     return true;
 }
@@ -4032,28 +3983,11 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
     }
 }
 
-void Http2ServerSubStreamState::MarkQueueForShrinkIfLarge() noexcept {
-    if (h2_data_queue_.size() >= kGrpcServerH2QueueShrinkItems) {
-        shrink_h2_queue_on_drain_ = true;
-    }
-}
-
-void Http2ServerSubStreamState::ShrinkQueueIfDrained() noexcept {
-    if (h2_data_queue_.empty() && shrink_h2_queue_on_drain_) {
-        TryShrinkSequence(h2_data_queue_);
-        shrink_h2_queue_on_drain_ = false;
-    }
-}
-
 void Http2ServerSubStreamState::ClearH2Queue() noexcept {
     if (upload_budget_) upload_budget_->Release(std::exchange(upload_reserved_, 0));
     h2_data_queue_.clear();
     queued_bytes_ = 0;
     h2_data_offset_ = 0;
-    if (shrink_h2_queue_on_drain_) {
-        TryShrinkSequence(h2_data_queue_);
-        shrink_h2_queue_on_drain_ = false;
-    }
 }
 
 net::awaitable<bool> Http2ServerSubStreamState::WaitForRawData() {
@@ -4077,7 +4011,6 @@ net::awaitable<bool> Http2ServerSubStreamState::WaitForRawData() {
                 upload_reserved_ -= front.data.capacity();
             }
             h2_data_queue_.pop_front();
-            ShrinkQueueIfDrained();
             h2_data_offset_ = 0;
         }
 
@@ -4130,7 +4063,6 @@ size_t Http2ServerSubStreamState::ConsumeReadablePayload(
             }
             h2_data_queue_.pop_front();
             h2_data_offset_ = 0;
-            ShrinkQueueIfDrained();
         }
         return n;
     }
@@ -4356,66 +4288,9 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     co_return payload;
 }
 
-[[nodiscard]] HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg,
-                                                  bool outbound) {
-    HttpConfig http;
-    http.path = cfg.NormalizedPath();
-    http.host = cfg.host;
-    http.method = outbound ? "POST" : "";
-    http.headers = cfg.headers;
-    http.force_http2 = true;
-    if (outbound && !cfg.no_grpc_header) {
-        bool has_content_type = false;
-        for (const auto& [key, _] : http.headers) {
-            if (EqualsAsciiCI(key, "Content-Type")) {
-                has_content_type = true;
-                break;
-            }
-        }
-        if (!has_content_type) {
-            http.headers.emplace("content-type", "application/grpc");
-        }
-    }
-    if (outbound) {
-        bool has_referer = false;
-        for (const auto& [key, _] : http.headers) {
-            if (EqualsAsciiCI(key, "Referer")) {
-                has_referer = true;
-                break;
-            }
-        }
-        if (!has_referer) {
-            std::string referer = "https://";
-            referer.append(http.host.empty() ? "example.com" : http.host);
-            referer.append(http.path.empty() ? "/" : http.path);
-            referer.append("?x_padding=");
-            referer.append(100, 'X');
-            http.headers.emplace("referer", std::move(referer));
-        }
-    }
-    if (!outbound && !cfg.no_sse_header) {
-        bool has_content_type = false;
-        for (const auto& [key, _] : http.headers) {
-            if (EqualsAsciiCI(key, "Content-Type")) {
-                has_content_type = true;
-                break;
-            }
-        }
-        if (!has_content_type) {
-            http.headers.emplace("content-type", "text/event-stream");
-        }
-    }
-    return http;
-}
-
-[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
-[[nodiscard]] bool IsHttpOkStatus(std::string_view status_line);
-net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
-    std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
-    std::string_view authority,
-    bool tls,
-    uint64_t conn_id);
+constexpr std::string_view kXHttpRefererPadding =
+    "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+static_assert(kXHttpRefererPadding.size() == 100);
 
 [[nodiscard]] bool HasHeaderCI(const transport::internet::HttpHeaders& headers,
                                std::string_view key) {
@@ -4430,15 +4305,66 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
 [[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
                                             std::string_view path,
                                             bool tls) {
-    std::string referer = tls ? "https://" : "http://";
-    referer.append(host.empty() ? "example.com" : host);
+    const std::string_view scheme = tls ? "https://" : "http://";
+    const std::string_view host_part = host.empty() ? "example.com" : host;
     const std::string_view req_path = EffectivePath(path);
+    constexpr std::string_view kPaddingKey = "x_padding=";
+
+    std::string referer;
+    referer.reserve(scheme.size() + host_part.size() + req_path.size() + 1 +
+                    kPaddingKey.size() + kXHttpRefererPadding.size());
+    referer.append(scheme);
+    referer.append(host_part);
     referer.append(req_path);
     referer.push_back(req_path.find('?') == std::string_view::npos ? '?' : '&');
-    referer.append("x_padding=");
-    referer.append(100, 'X');
+    referer.append(kPaddingKey);
+    referer.append(kXHttpRefererPadding);
     return referer;
 }
+
+[[nodiscard]] HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg,
+                                                  bool outbound) {
+    HttpConfig http;
+    http.path = cfg.NormalizedPath();
+    http.host = cfg.host;
+    http.method = outbound ? "POST" : "";
+    http.headers = cfg.headers;
+    http.force_http2 = true;
+    if (outbound && !cfg.no_grpc_header && !HasHeaderCI(http.headers, "Content-Type")) {
+        http.headers.emplace("content-type", "application/grpc");
+    }
+    if (outbound && !HasHeaderCI(http.headers, "Referer")) {
+        const std::string_view host_part =
+            http.host.empty() ? std::string_view("example.com") : std::string_view(http.host);
+        const std::string_view path_part =
+            http.path.empty() ? std::string_view("/") : std::string_view(http.path);
+        constexpr std::string_view kScheme = "https://";
+        constexpr std::string_view kQueryPrefix = "?x_padding=";
+
+        std::string referer;
+        referer.reserve(kScheme.size() + host_part.size() + path_part.size() +
+                        kQueryPrefix.size() + kXHttpRefererPadding.size());
+        referer.append(kScheme);
+        referer.append(host_part);
+        referer.append(path_part);
+        referer.append(kQueryPrefix);
+        referer.append(kXHttpRefererPadding);
+        http.headers.emplace("referer", std::move(referer));
+    }
+    if (!outbound && !cfg.no_sse_header && !HasHeaderCI(http.headers, "Content-Type")) {
+        http.headers.emplace("content-type", "text/event-stream");
+    }
+    return http;
+}
+
+[[nodiscard]] std::string_view ExtractStatusLine(std::string_view response);
+[[nodiscard]] bool IsHttpOkStatus(std::string_view status_line);
+net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
+    std::unique_ptr<AsyncStream> stream,
+    const HttpConfig& cfg,
+    std::string_view authority,
+    bool tls,
+    uint64_t conn_id);
 
 [[nodiscard]] HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
                                                std::string_view path,
@@ -5814,9 +5740,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 1. TLS / REALITY 层（服务端）
     if (s.IsTlsLike()) {
-        auto ctx = s.IsReality()
-            ? AcquireServerRealityContext(s.reality, s.tls)
-            : AcquireServerTlsContext(s.tls);
+        auto* ctx = AcquireServerTlsContext(s);
         if (!ctx) {
             LOG_ERROR("[Transport] BuildInbound: failed to create {} server context",
                       s.IsReality() ? "REALITY" : "TLS");
@@ -6044,9 +5968,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 1. TLS / REALITY 层（客户端）
     if (s.IsTlsLike()) {
-        auto ctx = s.IsReality()
-            ? AcquireClientRealityContext(s.reality, s.tls)
-            : AcquireClientTlsContext(s.tls);
+        auto* ctx = AcquireClientTlsContext(s);
         if (!ctx) {
             LOG_ERROR("[Transport] BuildOutbound: failed to create {} client context",
                       s.IsReality() ? "REALITY" : "TLS");
@@ -6255,9 +6177,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
 
     std::unique_ptr<AsyncStream> stream = std::move(raw);
     if (s.IsTlsLike()) {
-        auto ctx = s.IsReality()
-            ? AcquireClientRealityContext(s.reality, s.tls)
-            : AcquireClientTlsContext(s.tls);
+        auto* ctx = AcquireClientTlsContext(s);
         if (!ctx) {
             co_return tl::unexpected(ErrorCode::TLS_CERT_INVALID);
         }

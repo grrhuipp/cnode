@@ -608,6 +608,128 @@ private:
         if (session->active_streams > 0) --session->active_streams;
     }
 };
+namespace {
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+DialOutboundStream(
+    net::io_context& io_context,
+    app::dns::DNS& dns_service,
+    const PreparedSettings& prepared,
+    std::chrono::seconds dial_timeout,
+    const tcp::endpoint* inbound_local_addr,
+    bool ordered_bind,
+    const OutboundBind::Selection& selected_v4,
+    const OutboundBind::Selection& selected_v6,
+    std::chrono::seconds handshake_timeout,
+    const PaddingScheme& opening_scheme,
+    session::Context& ctx) {
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service,
+        .address = prepared.settings.address,
+        .literal_address = prepared.settings.literal_address,
+        .port = prepared.settings.port,
+        .stream_settings = &prepared.stream_settings,
+        .timeout = dial_timeout,
+        .send_through = &prepared.settings.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .ordered_bind_v4 = ordered_bind
+            ? std::optional{selected_v4} : std::nullopt,
+        .ordered_bind_v6 = ordered_bind
+            ? std::optional{selected_v6} : std::nullopt,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            prepared.stream_settings, prepared.settings.address),
+        .ws_host = prepared.settings.address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", prepared.settings.address);
+        }
+        co_return tl::unexpected(transport_target.error());
+    }
+
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+
+    auto new_stream = std::move(dial_result.stream);
+    if (auto local_ep = new_stream->LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
+    LOG_ACCESS(FormatAccessLog(ctx));
+
+    new_stream->SetIdleTimeout(handshake_timeout);
+    auto deadline = new_stream->StartPhaseDeadline(handshake_timeout);
+
+    const uint16_t auth_padding_size = opening_scheme.SampleAuthPaddingSize();
+    memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
+    std::copy(prepared.settings.password_hash.begin(), prepared.settings.password_hash.end(), auth_packet.begin());
+    auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
+    auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
+
+    if (auto ok = co_await WriteAll(
+            *new_stream,
+            std::span<const uint8_t>(
+                auth_packet.data(),
+                auth_packet.size())); !ok) {
+        new_stream->Cancel();
+        co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
+    }
+    co_return std::move(new_stream);
+}
+
+tl::expected<memory::ByteVector, ErrorCode> BuildOpenPacket(
+    uint32_t sid,
+    bool is_udp,
+    const TargetAddress& original_target) {
+    const TargetAddress stream_target = is_udp
+        ? TargetAddress(proxy::uot::kMagicAddress, 0)
+        : original_target;
+    std::array<uint8_t, kMaxEncodedAddressSize> target{};
+    const size_t target_size = (stream_target.IsValid() ||
+        proxy::uot::VersionFromMagicAddress(stream_target))
+        ? EncodeAddressTo(stream_target, target.data(), target.size(),
+                          AddressWireFormat::Socks5) : 0;
+    if (target_size == 0) {
+        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+    }
+
+    memory::ByteVector packet;
+    packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
+    auto syn_frame = AppendFrameBytesTo(packet, kCmdSYN, sid, {});
+    auto target_frame = AppendFrameBytesTo(
+        packet,
+        kCmdPSH,
+        sid,
+        std::span<const uint8_t>(target.data(), target_size));
+    if (!syn_frame || !target_frame) {
+        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    if (is_udp) {
+        auto request = proxy::uot::EncodeRequest(true, original_target);
+        if (!request) {
+            return tl::unexpected(request.error());
+        }
+        auto request_frame = AppendFrameBytesTo(
+            packet,
+            kCmdPSH,
+            sid,
+            request->span());
+        if (!request_frame) {
+            return tl::unexpected(request_frame.error());
+        }
+    }
+    return packet;
+}
+
+}  // namespace
+
 
 Handler::Handler(std::string_view tag,
                  net::io_context& io_context,
@@ -640,96 +762,54 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    const bool ordered_bind = prepared_->settings.send_through.GetMode() == OutboundBind::Mode::Ordered;
-    const auto selected_v4 = ordered_bind
-        ? prepared_->settings.send_through.Select(net::ip::address_v4::any(),
-            ctx.inbound.source_ip, ctx.inbound.source_port)
-        : OutboundBind::Selection{};
-    const auto selected_v6 = ordered_bind
-        ? prepared_->settings.send_through.Select(net::ip::address_v6::any(),
-            ctx.inbound.source_ip, ctx.inbound.source_port)
-        : OutboundBind::Selection{};
-    auto transport_lease = ordered_bind
-        ? pool_->AcquireIf([&](const ClientSession& physical) {
-            if (!physical.stream) return false;
-            const auto remote = physical.stream->RemoteEndpoint();
-            const auto local = physical.stream->LocalEndpoint();
-            if (!remote || !local) return false;
-            const auto& selected = remote->address().is_v6() ? selected_v6 : selected_v4;
-            return !selected.address ||
-                iputil::NormalizeAddress(local->address()) == *selected.address;
-        })
-        : pool_->Acquire();
-    std::shared_ptr<ClientSession> session = transport_lease.Get();
+    SessionPool<ClientSession>::Lease transport_lease;
+    std::shared_ptr<ClientSession> session;
+    {
+        const bool ordered_bind = prepared_->settings.send_through.GetMode() == OutboundBind::Mode::Ordered;
+        const auto selected_v4 = ordered_bind
+            ? prepared_->settings.send_through.Select(net::ip::address_v4::any(),
+                ctx.inbound.source_ip, ctx.inbound.source_port)
+            : OutboundBind::Selection{};
+        const auto selected_v6 = ordered_bind
+            ? prepared_->settings.send_through.Select(net::ip::address_v6::any(),
+                ctx.inbound.source_ip, ctx.inbound.source_port)
+            : OutboundBind::Selection{};
+        transport_lease = ordered_bind
+            ? pool_->AcquireIf([&](const ClientSession& physical) {
+                if (!physical.stream) return false;
+                const auto remote = physical.stream->RemoteEndpoint();
+                const auto local = physical.stream->LocalEndpoint();
+                if (!remote || !local) return false;
+                const auto& selected = remote->address().is_v6() ? selected_v6 : selected_v4;
+                return !selected.address ||
+                    iputil::NormalizeAddress(local->address()) == *selected.address;
+            })
+            : pool_->Acquire();
+        session = transport_lease.Get();
 
-    if (!session) {
-        auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-            .dns_service = &dns_service_,
-            .address = prepared_->settings.address,
-            .literal_address = prepared_->settings.literal_address,
-            .port = prepared_->settings.port,
-            .stream_settings = &prepared_->stream_settings,
-            .timeout = dial_timeout_,
-            .send_through = &prepared_->settings.send_through,
-            .inbound_local_addr = inbound_local_addr,
-            .inbound_source_ip = ctx.inbound.source_ip,
-            .inbound_source_port = ctx.inbound.source_port,
-            .ordered_bind_v4 = ordered_bind
-                ? std::optional{selected_v4} : std::nullopt,
-            .ordered_bind_v6 = ordered_bind
-                ? std::optional{selected_v6} : std::nullopt,
-            .tls_server_name = ResolveOutboundTlsServerName(
-                prepared_->stream_settings, prepared_->settings.address),
-            .ws_host = prepared_->settings.address,
-        });
-        if (!transport_target) {
-            if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-                LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] DNS resolve failed for {}", prepared_->settings.address);
+        if (!session) {
+            auto opening_scheme = padding_->scheme;
+            auto dialed = co_await DialOutboundStream(
+                io_context,
+                dns_service_,
+                *prepared_,
+                dial_timeout_,
+                inbound_local_addr,
+                ordered_bind,
+                selected_v4,
+                selected_v6,
+                timeouts.HandshakeTimeout(),
+                *opening_scheme,
+                ctx);
+            if (!dialed) {
+                co_return tl::unexpected(dialed.error());
             }
-            co_return tl::unexpected(transport_target.error());
+            session = memory::AllocateShared<ClientSession>(
+                io_context, std::move(*dialed), padding_, std::move(opening_scheme));
+            transport_lease = pool_->Adopt(session);
+        } else if (session->stream) {
+            LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] reuse idle session sid={}", session->next_sid);
         }
-
-        auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-        *transport_target = {};
-        if (!dial_result.Ok()) {
-            LOG_CONN_WARN(ctx, "[AnyTLSOutbound] dial failed {} -> {} via {}: {}",
-                              ctx.inbound.source_ip, ctx.outbound.target,
-                              ctx.outbound.tag, dial_result.error_msg);
-            co_return tl::unexpected(dial_result.error);
-        }
-
-        auto new_stream = std::move(dial_result.stream);
-        new_stream->SetStreamLabel("out");
-        if (auto local_ep = new_stream->LocalEndpoint();
-            local_ep && !local_ep->address().is_unspecified()) {
-            ctx.outbound.connected_local_addr = local_ep->address();
-        }
-        LOG_ACCESS(FormatAccessLog(ctx));
-
-        new_stream->SetIdleTimeout(timeouts.HandshakeTimeout());
-        auto deadline = new_stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
-
-        auto opening_scheme = padding_->scheme;
-        const uint16_t auth_padding_size = opening_scheme->SampleAuthPaddingSize();
-        memory::ByteVector auth_packet(34 + auth_padding_size, uint8_t{0});
-        std::copy(prepared_->settings.password_hash.begin(), prepared_->settings.password_hash.end(), auth_packet.begin());
-        auth_packet[32] = static_cast<uint8_t>(auth_padding_size >> 8);
-        auth_packet[33] = static_cast<uint8_t>(auth_padding_size);
-
-        if (auto ok = co_await WriteAll(
-                *new_stream,
-                std::span<const uint8_t>(
-                    auth_packet.data(),
-                    auth_packet.size())); !ok) {
-            new_stream->Cancel();
-            co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
-        }
-        memory::ByteVector{}.swap(auth_packet);
-        session = memory::AllocateShared<ClientSession>(io_context, std::move(new_stream),
-            padding_, std::move(opening_scheme));
-        transport_lease = pool_->Adopt(session);
-    } else if (session->stream) {
-        LOG_CONN_DEBUG(ctx, "[AnyTLSOutbound] reuse idle session sid={}", session->next_sid);
     }
 
     if (!session || !session->stream) {
@@ -741,71 +821,36 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         local_ep && !local_ep->address().is_unspecified()) {
         ctx.outbound.connected_local_addr = local_ep->address();
     }
-    stream.SetIdleTimeout(timeouts.HandshakeTimeout());
-    auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     const uint32_t sid = session->next_sid++;
     auto logical = session->RegisterLogicalStream(sid);
     LogicalStreamLease logical_lease(transport_lease, session, logical, sid);
     const bool is_udp = ctx.content.network == Network::UDP;
     const TargetAddress& original_target = ctx.outbound.target;
-    auto build_open_packet = [&]() -> tl::expected<memory::ByteVector, ErrorCode> {
-        const TargetAddress stream_target = is_udp
-            ? TargetAddress(proxy::uot::kMagicAddress, 0)
-            : original_target;
-        std::array<uint8_t, kMaxEncodedAddressSize> target{};
-        const size_t target_size = (stream_target.IsValid() ||
-            proxy::uot::VersionFromMagicAddress(stream_target))
-            ? EncodeAddressTo(stream_target, target.data(), target.size(),
-                              AddressWireFormat::Socks5) : 0;
-        if (target_size == 0) {
-            return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+    auto open_logical_stream = [&]() -> net::awaitable<tl::expected<void, ErrorCode>> {
+        stream.SetIdleTimeout(timeouts.HandshakeTimeout());
+        auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
+        auto open_packet = BuildOpenPacket(sid, is_udp, original_target);
+        if (!open_packet) {
+            stream.Cancel();
+            co_return tl::unexpected(open_packet.error());
         }
-
-        memory::ByteVector packet;
-        packet.reserve((kFrameHeaderSize * 3) + target_size + 128);
-        auto syn_frame = AppendFrameBytesTo(packet, kCmdSYN, sid, {});
-        auto target_frame = AppendFrameBytesTo(
-            packet,
-            kCmdPSH,
-            sid,
-            std::span<const uint8_t>(target.data(), target_size));
-        if (!syn_frame || !target_frame) {
-            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        if (auto ok = co_await session->WriteOpenPacket(std::move(*open_packet)); !ok) {
+            stream.Cancel();
+            logical->Close(ok.error());
+            co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
         }
-        if (is_udp) {
-            auto request = proxy::uot::EncodeRequest(true, original_target);
-            if (!request) {
-                return tl::unexpected(request.error());
-            }
-            auto request_frame = AppendFrameBytesTo(
-                packet,
-                kCmdPSH,
-                sid,
-                request->span());
-            if (!request_frame) {
-                return tl::unexpected(request_frame.error());
+        if (sid >= 2 && session->session_version == SessionVersion::V2) {
+            if (auto ok = co_await logical->WaitOpenResult(std::chrono::seconds(3)); !ok) {
+                session->CloseAll(ok.error());
+                co_return tl::unexpected(ok.error());
             }
         }
-        return packet;
+        co_return tl::expected<void, ErrorCode>{};
     };
-    auto open_packet = build_open_packet();
-    if (!open_packet) {
-        stream.Cancel();
-        co_return tl::unexpected(open_packet.error());
+    if (auto ok = co_await open_logical_stream(); !ok) {
+        co_return tl::unexpected(ok.error());
     }
-    if (auto ok = co_await session->WriteOpenPacket(std::move(*open_packet)); !ok) {
-        stream.Cancel();
-        logical->Close(ok.error());
-        co_return tl::unexpected(deadline.Expired() ? ErrorCode::TIMEOUT : ok.error());
-    }
-    if (sid >= 2 && session->session_version == SessionVersion::V2) {
-        if (auto ok = co_await logical->WaitOpenResult(std::chrono::seconds(3)); !ok) {
-            session->CloseAll(ok.error());
-            co_return tl::unexpected(ok.error());
-        }
-    }
-
     // A pool lease exclusively owns this physical session for the request.
     // Its background reader must observe the same deadlines as relay writes.
     stream.SetIdleTimeout(relay_idle_timeout);

@@ -9,8 +9,8 @@
 #include "acppnode/infra/json_port.hpp"
 #include "acppnode/app/dns/dns.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/buffer_util.hpp"
 #include "acppnode/common/container_util.hpp"
-#include "acppnode/infra/log.hpp"
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/transport/internet/transport_dialer.hpp"
@@ -26,20 +26,6 @@
 namespace acpp {
 
 namespace {
-
-net::awaitable<bool> WriteFull(AsyncStream& stream, const uint8_t* buf, size_t len) {
-    if (len == 0) {
-        co_return true;
-    }
-    net::const_buffer buffer{buf, len};
-    try {
-        co_await stream.WriteBuffers(
-            std::span<const net::const_buffer>{&buffer, 1});
-    } catch (...) {
-        co_return false;
-    }
-    co_return true;
-}
 
 class TrojanUdpOutboundEndpoint final
     : public transport::MultiBufferReader
@@ -84,18 +70,6 @@ public:
         co_return;
     }
 
-    void SetIdleTimeout(std::chrono::seconds timeout) {
-        stream_.SetIdleTimeout(timeout);
-    }
-
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        stream_.SetReadTimeout(timeout);
-    }
-
-    void SetWriteTimeout(std::chrono::seconds timeout) {
-        stream_.SetWriteTimeout(timeout);
-    }
-
     bool ConsumeIdleTimeout() noexcept {
         return stream_.ConsumeIdleTimeout();
     }
@@ -126,15 +100,98 @@ public:
 
     transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
 
-    void SetAbortiveClose(bool enable = true) noexcept {
-        stream_.SetAbortiveClose(enable);
-    }
-
 private:
     AsyncStream& stream_;
     TargetAddress fallback_target_;
     trojan::UdpFramer framer_;
 };
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+DialOutboundStream(
+    net::io_context& io_context,
+    app::dns::DNS& dns_service,
+    const TrojanOutboundConfig& config,
+    std::chrono::seconds dial_timeout,
+    const tcp::endpoint* inbound_local_addr,
+    session::Context& ctx) {
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service,
+        .address = config.address,
+        .literal_address = config.literal_address,
+        .port = config.port,
+        .stream_settings = &config.stream_settings,
+        .timeout = dial_timeout,
+        .send_through = &config.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            config.stream_settings, config.address),
+        .ws_host = config.address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config.address);
+        }
+        co_return tl::unexpected(transport_target.error());
+    }
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+    auto stream = std::move(dial_result.stream);
+    if (auto local_ep = stream->LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
+    LOG_ACCESS(FormatAccessLog(ctx));
+    co_return std::move(stream);
+}
+
+net::awaitable<tl::expected<void, ErrorCode>>
+SendTrojanHandshake(
+    AsyncStream& stream,
+    const TrojanOutboundConfig& config,
+    const TargetAddress& target,
+    bool is_udp,
+    std::chrono::seconds handshake_timeout,
+    session::Context& ctx) {
+    stream.SetIdleTimeout(handshake_timeout);
+    PhaseDeadlineHandle outbound_protocol_deadline =
+        stream.StartPhaseDeadline(handshake_timeout);
+
+    std::array<uint8_t, 320> header_buf{};
+    const size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
+        config.password_hash,
+        is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
+               : ::acpp::trojan::TrojanCommand::CONNECT,
+        target,
+        header_buf.data(),
+        header_buf.size());
+    if (header_len == 0) {
+        LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
+        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+
+    try {
+        ConstBufferSpanBuilder<1> header_buffers;
+        header_buffers.Append(net::const_buffer(header_buf.data(), header_len));
+        co_await stream.WriteBuffers(header_buffers.Span());
+        LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
+        co_return tl::expected<void, ErrorCode>{};
+    } catch (const IoSystemError& e) {
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT
+            : MapAsioError(e.code()));
+    } catch (...) {
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT
+            : ErrorCode::SOCKET_WRITE_FAILED);
+    }
+}
 
 }  // namespace
 
@@ -168,42 +225,12 @@ proxy::trojan::outbound::Handler::Process(
 
     const auto& target = ctx.outbound.target;
 
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service_,
-        .address = config_->address,
-        .literal_address = config_->literal_address,
-        .port = config_->port,
-        .stream_settings = &config_->stream_settings,
-        .timeout = dial_timeout_,
-        .send_through = &config_->send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            config_->stream_settings, config_->address),
-        .ws_host = config_->address,
-    });
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_DEBUG(ctx, "[TrojanOutbound] DNS resolve failed for {}", config_->address);
-        }
-        co_return tl::unexpected(transport_target.error());
+    auto dialed = co_await DialOutboundStream(
+        io_context, dns_service_, *config_, dial_timeout_, inbound_local_addr, ctx);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
     }
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    *transport_target = {};
-    if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[TrojanOutbound] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
-    }
-    auto stream = std::move(dial_result.stream);
-    stream->SetStreamLabel("out");
-    if (auto local_ep = stream->LocalEndpoint();
-        local_ep && !local_ep->address().is_unspecified()) {
-        ctx.outbound.connected_local_addr = local_ep->address();
-    }
-    LOG_ACCESS(FormatAccessLog(ctx));
+    auto stream = std::move(*dialed);
     auto fail_abortive = [&](ErrorCode error) {
         if (stream) {
             stream->CloseAbortive();
@@ -211,36 +238,18 @@ proxy::trojan::outbound::Handler::Process(
         return tl::unexpected(error);
     };
 
-    stream->SetIdleTimeout(timeouts.HandshakeTimeout());
-    PhaseDeadlineHandle outbound_protocol_deadline =
-        stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
-
     const bool is_udp = ctx.content.network == Network::UDP;
+    if (auto ok = co_await SendTrojanHandshake(
+            *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(), ctx); !ok) {
+        co_return fail_abortive(ok.error());
+    }
 
-    buf::BufferGuard header_buf{buf::Buffer::New()};
-    if (!header_buf) {
-        co_return fail_abortive(ErrorCode::RESOURCE_EXHAUSTED);
-    }
-    const size_t header_len = ::acpp::trojan::TrojanCodec::EncodeRequestTo(
-        config_->password_hash,
-        is_udp ? ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE
-               : ::acpp::trojan::TrojanCommand::CONNECT,
-        target,
-        header_buf->Tail().data(), header_buf->Available());
-    if (header_len == 0) {
-        LOG_CONN_WARN(ctx, "TrojanOutbound: Handshake encode failed");
-        co_return fail_abortive(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    header_buf->Produce(static_cast<uint32_t>(header_len));
+    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetReadTimeout(std::chrono::seconds(0));
+    stream->SetWriteTimeout(relay_write_timeout);
+    stream->ClearPhaseDeadline();
 
     try {
-        co_await stream->WriteMultiBuffer(buf::MultiBuffer{std::move(header_buf)});
-        LOG_CONN_DEBUG(ctx, "[Trojan] Handshake sent {} bytes", header_len);
-        stream->SetIdleTimeout(relay_idle_timeout);
-        stream->SetReadTimeout(std::chrono::seconds(0));
-        stream->SetWriteTimeout(relay_write_timeout);
-        stream->ClearPhaseDeadline();
-
         if (is_udp) {
             TrojanUdpOutboundEndpoint target_endpoint(*stream, target);
             if (inbound.control) {
@@ -262,9 +271,7 @@ proxy::trojan::outbound::Handler::Process(
             io_context, *inbound.reader, *inbound.writer,
             *stream, ctx, stats, relay_config, std::move(first_payload));
     } catch (const IoSystemError& e) {
-        co_return fail_abortive(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : MapAsioError(e.code()));
+        co_return fail_abortive(MapAsioError(e.code()));
     } catch (...) {
         co_return fail_abortive(ErrorCode::SOCKET_WRITE_FAILED);
     }
@@ -334,7 +341,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             allow_insecure = json_bool(
                 obj,
                 "allowInsecure",
-                json_bool(obj, "allow_insecure", allow_insecure));
+                allow_insecure);
             alpn = json_string_array(obj, "alpn");
             return true;
         };

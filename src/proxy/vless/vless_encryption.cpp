@@ -236,28 +236,63 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
             return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
         const size_t len = key->size();
-        const bool key_ok = role == VlessEncryptionRole::Client
-            ? (len == kVlessX25519KeySize ||
-               len == kVlessMlKem768PublicKeySize)
-            : (len == kVlessX25519KeySize ||
-               len == kVlessMlKem768SeedSize);
-        if (!key_ok) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyLength);
+        if (role == VlessEncryptionRole::Client) {
+            if (len == kVlessX25519KeySize) {
+                config.client_keys.push_back(VlessClientPfsKey{
+                    .public_key = std::move(*key),
+                    .mlkem_key = nullptr,
+                });
+            } else if (len == kVlessMlKem768PublicKeySize) {
+                auto mlkem_key = CreateVlessMlKem768PublicKey(*key);
+                if (!mlkem_key) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.client_keys.push_back(VlessClientPfsKey{
+                    .public_key = std::move(*key),
+                    .mlkem_key = std::move(mlkem_key),
+                });
+            } else {
+                return ParseErrorResult(
+                    VlessEncryptionParseError::InvalidKeyLength);
+            }
+        } else {
+            if (len == kVlessX25519KeySize) {
+                std::array<uint8_t, kVlessX25519KeySize> public_key{};
+                if (!DeriveVlessX25519PublicKey(*key, public_key)) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.server_keys.push_back(VlessServerPfsKey{
+                    .private_key = std::move(*key),
+                    .public_key = std::vector<uint8_t>(
+                        public_key.begin(), public_key.end()),
+                    .mlkem_key = nullptr,
+                });
+            } else if (len == kVlessMlKem768SeedSize) {
+                auto mlkem_key = CreateVlessMlKem768PrivateKeyFromSeed(*key);
+                auto public_key = DeriveVlessMlKem768PublicKey(mlkem_key.get());
+                if (!mlkem_key || !public_key) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.server_keys.push_back(VlessServerPfsKey{
+                    .private_key = std::move(*key),
+                    .public_key = std::vector<uint8_t>(
+                        public_key->begin(), public_key->end()),
+                    .mlkem_key = std::move(mlkem_key),
+                });
+            } else {
+                return ParseErrorResult(
+                    VlessEncryptionParseError::InvalidKeyLength);
+            }
         }
-        if (role == VlessEncryptionRole::Client &&
-            len == kVlessMlKem768PublicKeySize &&
-            !ValidateVlessMlKem768PublicKey(*key)) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
-        }
-        if (role == VlessEncryptionRole::Server &&
-            len == kVlessMlKem768SeedSize &&
-            !DeriveVlessMlKem768PublicKeyFromSeed(*key)) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
-        }
-        config.keys.push_back(std::move(*key));
     }
 
-    if (config.keys.empty()) {
+    const bool has_keys = role == VlessEncryptionRole::Client
+        ? !config.client_keys.empty()
+        : !config.server_keys.empty();
+    if (!has_keys) {
         return ParseErrorResult(VlessEncryptionParseError::EmptyKeys);
     }
 

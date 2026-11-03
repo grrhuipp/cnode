@@ -145,11 +145,12 @@ public:
         : io_context_(&io_context)
         , downlink_(std::move(downlink))
         , target_(target)
-        , stream_settings_(*target.stream_settings)
         , candidate_(candidate)
         , upload_path_(std::move(upload_path))
         , conn_id_(conn_id) {
-        target_.stream_settings = &stream_settings_;
+        if (!target_.stream_settings) {
+            ThrowXHttpPacketError("xhttp stream-up missing stream settings");
+        }
         target_.single_candidate = candidate_;
         target_.candidates.clear();
     }
@@ -364,7 +365,6 @@ private:
     std::unique_ptr<AsyncStream> downlink_;
     std::unique_ptr<AsyncStream> upload_;
     OutboundTransportTarget target_;
-    StreamSettings stream_settings_;
     OutboundDialCandidate candidate_;
     memory::ThreadLocalString upload_path_;
     buf::MultiBuffer pending_initial_;
@@ -383,11 +383,12 @@ public:
         : io_context_(io_context)
         , downlink_(std::move(downlink))
         , target_(target)
-        , stream_settings_(*target.stream_settings)
         , candidate_(candidate)
         , session_id_(std::move(session_id))
         , conn_id_(conn_id) {
-        target_.stream_settings = &stream_settings_;
+        if (!target_.stream_settings) {
+            ThrowXHttpPacketError("xhttp packet-up missing stream settings");
+        }
         target_.single_candidate = candidate_;
         target_.candidates.clear();
     }
@@ -551,7 +552,6 @@ private:
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> downlink_;
     OutboundTransportTarget target_;
-    StreamSettings stream_settings_;
     OutboundDialCandidate candidate_;
     memory::ThreadLocalString session_id_;
     uint64_t conn_id_ = 0;

@@ -73,6 +73,7 @@ struct Worker::ListenerSlot {
     // their native close completions finish. No per-request slot leases.
     std::shared_ptr<proxyman::inbound::Handler> handler;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_worker;
+    std::unique_ptr<worker_detail::UdpIngress> udp_worker;
     std::optional<SocketBinding> tcp_binding;
     std::optional<SocketBinding> udp_binding;
     // Keeps a stopped ingress alive until every native dispatch job completes.
@@ -85,18 +86,7 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         memory::ThreadLocalString, SlotPtr, TransparentStringHash, TransparentStringEq>;
     using ListenerKeys = memory::ThreadLocalVector<memory::ThreadLocalString>;
 
-    memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString, memory::ThreadLocalString, TransparentStringHash, TransparentStringEq>
-        tcp_listener_tags;
     ListenerSlotMap listener_slots;
-    memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString, memory::ThreadLocalString, TransparentStringHash, TransparentStringEq>
-        udp_socket_tags;
-    memory::ThreadLocalUnorderedMap<
-        memory::ThreadLocalString, std::unique_ptr<worker_detail::UdpIngress>,
-        TransparentStringHash, TransparentStringEq>
-        udp_workers;
-
     [[nodiscard]] auto FindOrCreateSlot(std::string_view tag) {
         const auto existing = listener_slots.find(tag);
         if (existing != listener_slots.end()) return std::pair{existing, false};
@@ -108,7 +98,9 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     size_t tcp_tasks = 0;
     size_t udp_reply_sends = 0;
     bool stopping = false;
-    struct TaskCancellation final : transport::CancellationSubscription {
+    struct TaskCancellation final
+        : memory::ThreadAllocated
+        , transport::CancellationSubscription {
         explicit TaskCancellation(ListenerState& state) : owner(state), next(state.tasks) {
             if (next) next->previous = this;
             state.tasks = this;
@@ -135,49 +127,44 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
     explicit ListenerState(net::io_context& io)
         : changed(io, std::chrono::steady_clock::time_point::max()) {}
     void NotifyCompletion() { changed.cancel(); }
-    net::awaitable<void> RunTracked(net::awaitable<void> task) {
-        if (stopping) co_return;
-        TaskCancellation registration(*this);
-        co_await net::co_spawn(co_await net::this_coro::executor, std::move(task),
-            net::bind_cancellation_slot(registration.signal.slot(), net::use_awaitable));
-    }
-    void Spawn(Worker& worker, net::awaitable<void> task, bool listener) {
+    void Spawn(Worker& worker, net::awaitable<void> task, bool listener,
+               std::unique_ptr<TaskCancellation> registration) {
+        auto cancel_slot = registration->signal.slot();
         ++tcp_tasks;
         try {
             net::co_spawn(worker.io_context_,
-                listener ? RunTracked(std::move(task)) : std::move(task),
-                [this, &worker, listener](std::exception_ptr error) {
-                    --tcp_tasks;
-                    NotifyCompletion();
-                    if (!error) return;
-                    try { std::rethrow_exception(error); }
-                    catch (const IoSystemError& failure) {
-                        if (failure.code() == net::error::operation_aborted) return;
-                    } catch (...) {}
-                    if (listener) worker.ReportFailure(error);
-                    else {
+                std::move(task),
+                net::bind_cancellation_slot(cancel_slot,
+                    [this, &worker, listener, registration = std::move(registration)](
+                        std::exception_ptr error) mutable {
+                        registration.reset();
+                        --tcp_tasks;
+                        NotifyCompletion();
+                        if (!error) return;
                         try { std::rethrow_exception(error); }
-                        catch (const std::exception& failure) {
-                            LOG_ERROR("Worker[{}]: TCP task failed: {}", worker.id_, failure.what());
-                        } catch (...) {
-                            LOG_ERROR("Worker[{}]: TCP task failed", worker.id_);
+                        catch (const IoSystemError& failure) {
+                            if (failure.code() == net::error::operation_aborted) return;
+                        } catch (...) {}
+                        if (listener) worker.ReportFailure(error);
+                        else {
+                            try { std::rethrow_exception(error); }
+                            catch (const std::exception& failure) {
+                                LOG_ERROR("Worker[{}]: TCP task failed: {}", worker.id_, failure.what());
+                            } catch (...) {
+                                LOG_ERROR("Worker[{}]: TCP task failed", worker.id_);
+                            }
                         }
-                    }
-                });
+                    }));
         } catch (...) { --tcp_tasks; throw; }
     }
 
     [[nodiscard]] bool StartListening(Worker& worker, const PortBinding& binding);
-    [[nodiscard]] ListenerKeys CollectTcpListenerKeys(std::string_view tag) const;
-    void StopListening(std::string_view tag,
-                       ListenerKeys listener_keys) noexcept;
+    void StopListening(std::string_view tag) noexcept;
     net::awaitable<bool> StartUdpListening(
         Worker& worker,
         const PortBinding& binding,
         std::unique_ptr<Inbound> handler);
-    [[nodiscard]] ListenerKeys CollectUdpSocketKeys(std::string_view tag) const;
-    net::awaitable<void> RetireUdpListening(
-        std::string_view tag, ListenerKeys socket_keys);
+    net::awaitable<void> RetireUdpListening(std::string_view tag);
 
     net::awaitable<void> AcceptLoop(
         Worker& worker,
@@ -190,19 +177,18 @@ struct Worker::ListenerState : worker_detail::UdpReplySink {
         Worker& worker,
         tcp::socket socket,
         tcp::endpoint remote_ep,
-        std::shared_ptr<proxyman::inbound::Handler> inbound_handler);
+        std::shared_ptr<proxyman::inbound::Handler> inbound_handler,
+        TaskCancellation& read_registration);
 
     net::awaitable<void> UdpReceiveLoop(
         Worker& worker,
         memory::ThreadLocalString socket_key,
         worker_detail::UdpIngress::SocketPtr sock,
-        SlotPtr listener_slot);
+        SlotPtr listener_slot,
+        worker_detail::UdpIngress* expected_ingress);
 
     [[nodiscard]] worker_detail::UdpIngress*
     FindUdpWorkerBySocketKey(std::string_view socket_key) noexcept;
-    [[nodiscard]] const worker_detail::UdpIngress*
-    FindUdpWorkerBySocketKey(std::string_view socket_key) const noexcept;
-
     [[nodiscard]] bool EnqueueUdpReply(
         std::string_view tag,
         udp::socket* sock,
@@ -320,7 +306,17 @@ memory::ThreadLocalString BuildListenerKey(std::string_view tag, std::string_vie
     return key;
 }
 
-
+[[nodiscard]] std::string_view ExtractListenerTag(std::string_view key) noexcept {
+    const auto port_sep = key.rfind('|');
+    if (port_sep == std::string_view::npos || port_sep == 0) {
+        return {};
+    }
+    const auto listen_sep = key.rfind('|', port_sep - 1);
+    if (listen_sep == std::string_view::npos) {
+        return {};
+    }
+    return key.substr(0, listen_sep);
+}
 }  // namespace
 
 // ============================================================================
@@ -401,10 +397,8 @@ void Worker::BeginStopOnWorker() noexcept {
     listeners.stopping = true;
     for (auto& [tag, slot] : listeners.listener_slots) {
         if (slot->tcp_worker) slot->tcp_worker->Close();
+        if (slot->udp_worker) slot->udp_worker->RequestStop();
         if (slot->retiring_udp) slot->retiring_udp->RequestStop();
-    }
-    for (auto& [tag, ingress] : listeners.udp_workers) {
-        if (ingress) ingress->RequestStop();
     }
     for (auto* task = listeners.tasks; task; task = task->next) {
         if (task->stream) task->stream->Cancel();
@@ -425,10 +419,8 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     // They must finish before traversing or destroying those stable slots.
     co_await mailbox_->AsyncJoinAccepted();
     auto& listeners = *runtime_->listener_state;
-    for (auto& [tag, ingress] : listeners.udp_workers) {
-        if (ingress) co_await ingress->AsyncJoin();
-    }
     for (auto& [tag, slot] : listeners.listener_slots) {
+        if (slot->udp_worker) co_await slot->udp_worker->AsyncJoin();
         if (slot->retiring_udp) co_await slot->retiring_udp->AsyncJoin();
     }
     while (listeners.tcp_tasks || listeners.udp_receive_loops || listeners.udp_reply_sends) {
@@ -543,13 +535,11 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         }
     }
 
-    const bool replacing = std::ranges::any_of(
-        tcp_listener_tags,
-        [&](const auto& item) { return item.second == std::string_view(binding.tag); });
     auto existing_slot = listener_slots.find(binding.tag);
-    if (replacing && existing_slot != listener_slots.end() &&
-        existing_slot->second->tcp_worker &&
-        existing_slot->second->tcp_binding &&
+    const bool replacing = existing_slot != listener_slots.end() &&
+        existing_slot->second->tcp_worker != nullptr &&
+        existing_slot->second->tcp_binding.has_value();
+    if (replacing &&
         existing_slot->second->tcp_binding->UsesSameSocket(binding)) {
         return true;
     }
@@ -561,11 +551,9 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         worker_detail::TcpListenerOwner::AcceptorPtr acceptor;
     };
     memory::ThreadLocalVector<PreparedListener> prepared_listeners;
-    decltype(tcp_listener_tags) prepared_listener_tags;
 
     const auto listen_candidates = binding.listen.Candidates();
     prepared_listeners.reserve(listen_candidates.size());
-    prepared_listener_tags.reserve(listen_candidates.size());
     size_t bound_count = 0;
 
     for (const auto& addr : listen_candidates) {
@@ -641,8 +629,6 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         }
 
         prepared_listeners.push_back({listener_key, std::move(candidate_acceptor)});
-        prepared_listener_tags.emplace(listener_key, binding.tag);
-
         ++bound_count;
     }
 
@@ -653,25 +639,24 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     }
 
     auto slot_it = FindOrCreateSlot(binding.tag).first;
-    tcp_listener_tags.reserve(
-        tcp_listener_tags.size() + prepared_listener_tags.size());
     auto& listener_slot = *slot_it->second;
 
     if (replacing) {
         LOG_WARN("Worker[{}]: replacing existing TCP listeners tag={}", worker.id_, binding.tag);
-        StopListening(binding.tag, CollectTcpListenerKeys(binding.tag));
-    } else if (listener_slot.tcp_worker) {
+    }
+    if (listener_slot.tcp_worker) {
         listener_slot.tcp_worker->Close();
     }
 
     listener_slot.tcp_worker = std::move(replacement_worker);
-    tcp_listener_tags.merge(prepared_listener_tags);
     listener_slot.tcp_binding = std::move(committed_binding);
 
     for (auto& prepared : prepared_listeners) {
         const auto& listener_key = prepared.key;
+        auto registration = std::make_unique<TaskCancellation>(*this);
         Spawn(worker, AcceptLoop(worker, listener_key, memory::ThreadLocalString(binding.tag),
-                                 std::move(prepared.acceptor), slot_it->second), true);
+                                 std::move(prepared.acceptor), slot_it->second),
+              true, std::move(registration));
 
         LOG_DEBUG("worker.listener ready worker={} key={} tag={} protocol={} accept=SO_REUSEPORT",
                   worker.id_, listener_key, binding.tag, binding.protocol);
@@ -679,90 +664,43 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     return true;
 }
 
-Worker::ListenerState::ListenerKeys
-Worker::ListenerState::CollectTcpListenerKeys(std::string_view tag) const {
-    ListenerKeys listener_keys;
-    for (const auto& [listener_key, listener_tag] : tcp_listener_tags) {
-        if (listener_tag == tag) {
-            listener_keys.push_back(listener_key);
-        }
-    }
-    return listener_keys;
-}
-
-void Worker::ListenerState::StopListening(
-    std::string_view tag,
-    ListenerKeys listener_keys) noexcept {
-    if (listener_keys.empty()) return;
-
+void Worker::ListenerState::StopListening(std::string_view tag) noexcept {
     auto slot_it = listener_slots.find(tag);
-    for (const auto& listener_key : listener_keys) {
-        if (slot_it != listener_slots.end() && slot_it->second->tcp_worker) {
-            slot_it->second->tcp_worker->CloseAcceptor(listener_key);
-        }
-        tcp_listener_tags.erase(listener_key);
+    if (slot_it == listener_slots.end()) return;
+    if (slot_it->second->tcp_worker) {
+        slot_it->second->tcp_worker->Close();
+        slot_it->second->tcp_worker.reset();
     }
-    MaybeShrinkHashContainer(tcp_listener_tags, 8);
-    if (slot_it != listener_slots.end()) {
-        slot_it->second->tcp_binding.reset();
-    }
+    slot_it->second->tcp_binding.reset();
 }
 
 worker_detail::UdpIngress*
 Worker::ListenerState::FindUdpWorkerBySocketKey(std::string_view socket_key) noexcept {
-    auto tag_it = udp_socket_tags.find(socket_key);
-    if (tag_it == udp_socket_tags.end()) {
-        return nullptr;
+    const auto tag = ExtractListenerTag(socket_key);
+    if (!tag.empty()) {
+        auto slot_it = listener_slots.find(tag);
+        if (slot_it == listener_slots.end() || !slot_it->second) {
+            return nullptr;
+        }
+        return slot_it->second->udp_worker.get();
     }
-    auto worker_it = udp_workers.find(tag_it->second);
-    if (worker_it == udp_workers.end() || !worker_it->second) {
-        return nullptr;
-    }
-    return worker_it->second.get();
-}
-
-const worker_detail::UdpIngress*
-Worker::ListenerState::FindUdpWorkerBySocketKey(std::string_view socket_key) const noexcept {
-    auto tag_it = udp_socket_tags.find(socket_key);
-    if (tag_it == udp_socket_tags.end()) {
-        return nullptr;
-    }
-    auto worker_it = udp_workers.find(tag_it->second);
-    if (worker_it == udp_workers.end() || !worker_it->second) {
-        return nullptr;
-    }
-    return worker_it->second.get();
-}
-
-Worker::ListenerState::ListenerKeys
-Worker::ListenerState::CollectUdpSocketKeys(std::string_view tag) const {
-    ListenerKeys socket_keys;
-    for (const auto& [socket_key, socket_tag] : udp_socket_tags) {
-        if (socket_tag == tag) {
-            socket_keys.push_back(socket_key);
+    for (auto& [slot_tag, slot] : listener_slots) {
+        (void)slot_tag;
+        if (slot && slot->udp_worker && slot->udp_worker->FindSocket(socket_key)) {
+            return slot->udp_worker.get();
         }
     }
-    return socket_keys;
+    return nullptr;
 }
 
-net::awaitable<void> Worker::ListenerState::RetireUdpListening(
-    std::string_view tag, ListenerKeys socket_keys) {
+net::awaitable<void> Worker::ListenerState::RetireUdpListening(std::string_view tag) {
     auto slot_it = listener_slots.find(tag);
-    auto worker_it = udp_workers.find(tag);
-    if (worker_it != udp_workers.end() && worker_it->second) {
-        if (slot_it == listener_slots.end() || slot_it->second->retiring_udp) {
+    if (slot_it != listener_slots.end() && slot_it->second->udp_worker) {
+        if (slot_it->second->retiring_udp) {
             FailRuntime("udp-retirement", "missing or occupied retiring UDP slot");
         }
-        slot_it->second->retiring_udp = std::move(worker_it->second);
+        slot_it->second->retiring_udp = std::move(slot_it->second->udp_worker);
     }
-    if (worker_it != udp_workers.end()) worker_it->second.reset();
-
-    // Retire authoritative listener lookup before cancellation. RequestStop
-    // marks the whole ingress stopping before it closes any owned socket.
-    for (const auto& socket_key : socket_keys) {
-        udp_socket_tags.erase(socket_key);
-    }
-    // Preserve preparation's reserved capacity through replacement commit.
     if (slot_it != listener_slots.end()) slot_it->second->udp_binding.reset();
 
     if (slot_it != listener_slots.end() && slot_it->second->retiring_udp) {
@@ -922,8 +860,11 @@ net::awaitable<void> Worker::ListenerState::AcceptLoop(
             continue;
         }
 
+        auto registration = std::make_unique<TaskCancellation>(*this);
+        auto* registration_ptr = registration.get();
         Spawn(worker, ProcessReceivedConnection(
-            worker, std::move(socket), remote_ep, std::move(inbound_handler)), false);
+            worker, std::move(socket), remote_ep, std::move(inbound_handler), *registration_ptr),
+            false, std::move(registration));
     }
 }
 
@@ -935,7 +876,8 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
     Worker& worker,
     tcp::socket socket,
     tcp::endpoint remote_ep,
-    std::shared_ptr<proxyman::inbound::Handler> inbound_handler) {
+    std::shared_ptr<proxyman::inbound::Handler> inbound_handler,
+    TaskCancellation& read_registration) {
     if (stopping) co_return;
     app::RequestLoadState::PhysicalConnectionScope physical_scope(
         worker.runtime_->request_load);
@@ -948,7 +890,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         inbound_handler->ReceiverSettings();
 
     auto tcp_stream = std::make_unique<TcpStream>(std::move(socket));
-    TaskCancellation read_registration(*this);
     read_registration.stream = tcp_stream.get();
     read_registration.Resubscribe(tcp_stream->Cancellation());
 
@@ -972,8 +913,6 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
         ctx.inbound.source_addr = normalized_remote;
         ctx.inbound.source_ip = iputil::AddressText(normalized_remote).View();
         ctx.inbound.source_port = remote_ep.port();
-        ctx.inbound.peer_ip = ctx.inbound.source_ip;
-        ctx.inbound.peer_port = ctx.inbound.source_port;
     } catch (...) {
         ctx.inbound.source_ip = "unknown";
     }
@@ -983,13 +922,11 @@ net::awaitable<void> Worker::ListenerState::ProcessReceivedConnection(
                    ctx.inbound.source_ip,
                    ctx.inbound.source_port);
 
-    co_await net::co_spawn(worker.io_context_,
-        inbound_handler->ProcessAcceptedTCP(
-            worker.runtime_->io_context, *worker.runtime_->dispatcher,
-            worker.runtime_->stats, worker.runtime_->request_load,
-            worker.runtime_->timeouts,
-            std::move(tcp_stream), ctx, worker.runtime_->dns_service.get()),
-        net::bind_cancellation_slot(read_registration.signal.slot(), net::use_awaitable));
+    co_await inbound_handler->ProcessAcceptedTCP(
+        worker.runtime_->io_context, *worker.runtime_->dispatcher,
+        worker.runtime_->stats, worker.runtime_->request_load,
+        worker.runtime_->timeouts,
+        std::move(tcp_stream), ctx, worker.runtime_->dns_service.get());
 }
 
 // ============================================================================
@@ -1094,11 +1031,6 @@ net::awaitable<void> Worker::InstallUserViewTask(
 
 net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     ColdMutationGuard mutation(runtime_->cold_mutation_active);
-    auto tcp_listener_keys =
-        runtime_->listener_state->CollectTcpListenerKeys(tag);
-    auto udp_socket_keys =
-        runtime_->listener_state->CollectUdpSocketKeys(tag);
-
     const auto cancel_throwing = co_await net::this_coro::throw_if_cancelled();
     auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -1106,17 +1038,14 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     }
     co_await net::this_coro::throw_if_cancelled(false);
     try {
-        runtime_->listener_state->StopListening(tag, std::move(tcp_listener_keys));
-        co_await runtime_->listener_state->RetireUdpListening(
-            tag, std::move(udp_socket_keys));
+        runtime_->listener_state->StopListening(tag);
+        co_await runtime_->listener_state->RetireUdpListening(tag);
     } catch (const std::exception& error) {
         FailRuntime("udp-retirement", error.what());
     } catch (...) {
         FailRuntime("udp-retirement", "unknown UDP retirement failure");
     }
 
-    auto& udp_workers = runtime_->listener_state->udp_workers;
-    if (const auto old = udp_workers.find(tag); old != udp_workers.end()) udp_workers.erase(old);
     auto retiring = runtime_->inbound_manager->GetHandler(tag);
     runtime_->inbound_manager->RemoveHandler(tag);
     if (auto slot_it = runtime_->listener_state->listener_slots.find(tag);
@@ -1124,12 +1053,10 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
             slot_it->second->handler == retiring) {
         slot_it->second->handler.reset();
         if (!slot_it->second->tcp_binding && !slot_it->second->udp_binding &&
-            !slot_it->second->retiring_udp) {
+            !slot_it->second->udp_worker && !slot_it->second->retiring_udp) {
             runtime_->listener_state->listener_slots.erase(slot_it);
         }
     }
-    MaybeShrinkHashContainer(udp_workers, 8);
-    MaybeShrinkHashContainer(runtime_->listener_state->udp_socket_tags, 8);
     MaybeShrinkHashContainer(runtime_->listener_state->listener_slots, 8);
     co_await net::this_coro::throw_if_cancelled(cancel_throwing);
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -1191,7 +1118,6 @@ Worker::CollectRuntimeStatsTask(bool include_resources) const {
     auto& resources = snapshot.resources.emplace();
     resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
     resources.udp_receive_loops = runtime_->listener_state->udp_receive_loops;
-    resources.udp_listeners = runtime_->listener_state->udp_socket_tags.size();
     auto collect_udp = [&](const worker_detail::UdpIngress* ingress) {
         if (!ingress) return;
         const auto udp = ingress->GetResourceStats();
@@ -1204,12 +1130,12 @@ Worker::CollectRuntimeStatsTask(bool include_resources) const {
         resources.udp_reply_senders += udp.active_reply_senders;
         resources.udp_native_dispatches += udp.native_dispatches;
     };
-    for (const auto& [tag, ingress] : runtime_->listener_state->udp_workers) {
-        (void)tag;
-        collect_udp(ingress.get());
-    }
     for (const auto& [tag, slot] : runtime_->listener_state->listener_slots) {
         (void)tag;
+        if (slot->udp_worker) {
+            resources.udp_listeners += slot->udp_worker->SocketCount();
+            collect_udp(slot->udp_worker.get());
+        }
         collect_udp(slot->retiring_udp.get());
     }
     const auto timeouts = TimeoutScheduler::ForIoContext(
@@ -1275,19 +1201,16 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         }
     }
 
-    const bool replacing = std::ranges::any_of(
-        udp_socket_tags,
-        [&](const auto& item) { return item.second == std::string_view(binding.tag); });
     auto existing_slot = listener_slots.find(binding.tag);
-    auto existing_worker = udp_workers.find(binding.tag);
-    if (replacing && existing_slot != listener_slots.end() &&
-        existing_slot->second->udp_binding &&
-        existing_slot->second->udp_binding->UsesSameSocket(binding) &&
-        existing_worker != udp_workers.end() && existing_worker->second) {
+    const bool replacing = existing_slot != listener_slots.end() &&
+        existing_slot->second->udp_worker != nullptr &&
+        existing_slot->second->udp_binding.has_value();
+    if (replacing &&
+        existing_slot->second->udp_binding->UsesSameSocket(binding)) {
         auto cancellation = co_await net::this_coro::cancellation_state;
         if (cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(net::error::operation_aborted);
-        const bool replaced = existing_worker->second->ReplaceHandler(std::move(handler));
+        const bool replaced = existing_slot->second->udp_worker->ReplaceHandler(std::move(handler));
         if (cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(net::error::operation_aborted);
         co_return replaced;
@@ -1305,11 +1228,9 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             binding.tag, std::move(handler), *worker.runtime_->udp_association_reclaimer,
             worker.runtime_->udp_resource_budget, worker.runtime_->io_context);
     ListenerKeys prepared_socket_keys;
-    decltype(udp_socket_tags) prepared_socket_tags;
 
     const auto listen_candidates = binding.listen.Candidates();
     prepared_socket_keys.reserve(listen_candidates.size());
-    prepared_socket_tags.reserve(listen_candidates.size());
     size_t bound_count = 0;
 
     for (const auto& addr : listen_candidates) {
@@ -1385,8 +1306,6 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             continue;
         }
         prepared_socket_keys.push_back(socket_key);
-        prepared_socket_tags.emplace(socket_key, binding.tag);
-
         ++bound_count;
     }
 
@@ -1402,34 +1321,25 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         net::awaitable<void> receive;
     };
     memory::ThreadLocalVector<PreparedReceive> prepared_receives;
-    auto retired_socket_keys =
-        (replacing || (existing_worker != udp_workers.end() && existing_worker->second))
-            ? CollectUdpSocketKeys(binding.tag) : ListenerKeys{};
     ListenerSlotMap::iterator slot_it;
-    decltype(udp_workers)::iterator worker_it;
     bool inserted_slot = false;
-    bool inserted_worker = false;
     try {
         auto slot_entry = FindOrCreateSlot(binding.tag);
         slot_it = slot_entry.first;
         inserted_slot = slot_entry.second;
-        auto worker_entry = FindOrEmplaceStringKey(udp_workers, binding.tag);
-        worker_it = worker_entry.first;
-        inserted_worker = worker_entry.second;
-        udp_socket_tags.reserve(udp_socket_tags.size() + prepared_socket_tags.size());
         prepared_receives.reserve(prepared_socket_keys.size());
         for (const auto& socket_key : prepared_socket_keys) {
             auto socket = replacement_worker->FindSocket(socket_key);
             if (!socket) throw std::logic_error("prepared UDP socket is missing");
             // Prepare frame and owned captures before retiring the old listener.
-            auto receive = UdpReceiveLoop(worker, socket_key, socket, slot_it->second);
+            auto receive = UdpReceiveLoop(
+                worker, socket_key, socket, slot_it->second, replacement_worker.get());
             prepared_receives.push_back({socket_key, std::move(socket), std::move(receive)});
         }
         if (replacing) {
             LOG_WARN("Worker[{}]: replacing existing UDP listeners tag={}", worker.id_, binding.tag);
         }
     } catch (...) {
-        if (inserted_worker) udp_workers.erase(worker_it);
         if (inserted_slot) listener_slots.erase(slot_it);
         throw;
     }
@@ -1437,18 +1347,17 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     worker_udp_listener_runtime_test::FinishPreparation();
 #endif
 
-    const bool has_retiring_worker = worker_it->second != nullptr;
+    const bool has_retiring_worker = slot_it->second->udp_worker != nullptr;
     const bool cancel_throwing = co_await net::this_coro::throw_if_cancelled();
     auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
-        if (inserted_worker) udp_workers.erase(worker_it);
         if (inserted_slot) listener_slots.erase(slot_it);
         throw IoSystemError(net::error::operation_aborted);
     }
     if (replacing || has_retiring_worker) {
         co_await net::this_coro::throw_if_cancelled(false);
         try {
-            co_await RetireUdpListening(binding.tag, std::move(retired_socket_keys));
+            co_await RetireUdpListening(binding.tag);
         } catch (const std::exception& error) {
             FailRuntime("udp-retirement", error.what());
         } catch (...) {
@@ -1457,15 +1366,15 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
     }
     if (stopping) throw IoSystemError(net::error::operation_aborted);
     try {
-        worker_it->second = std::move(replacement_worker);
-        udp_socket_tags.merge(prepared_socket_tags);
         auto& listener_slot = *slot_it->second;
+        auto* committed_ingress = replacement_worker.get();
+        listener_slot.udp_worker = std::move(replacement_worker);
         listener_slot.udp_binding = std::move(committed_binding);
-
         for (size_t index = 0; index < prepared_receives.size(); ++index) {
             auto& prepared = prepared_receives[index];
             const auto& socket_key = prepared_socket_keys[index];
-            auto completion = [this, &worker, socket_key = std::move(prepared.socket_key),
+            auto completion = [this, &worker, slot = slot_it->second, committed_ingress,
+                               socket_key = std::move(prepared.socket_key),
                                socket = std::move(prepared.socket)](std::exception_ptr error) {
                 --udp_receive_loops;
                 NotifyCompletion();
@@ -1479,8 +1388,8 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
                     }
                     return;
                 }
-                auto* current = FindUdpWorkerBySocketKey(socket_key);
-                if (!current || !current->OwnsSocket(socket_key, socket.get())) {
+                if (!slot || slot->udp_worker.get() != committed_ingress ||
+                    !committed_ingress->OwnsSocket(socket_key, socket.get())) {
                     return; // Formal retirement; never affect a replacement socket.
                 }
                 if (!error) error = std::make_exception_ptr(
@@ -1531,19 +1440,21 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
     Worker& worker,
     memory::ThreadLocalString socket_key,
     worker_detail::UdpIngress::SocketPtr sock,
-    SlotPtr listener_slot) {
-    auto is_owned = [this, socket_key](const worker_detail::UdpIngress::SocketPtr& socket) noexcept {
-        const auto* current = FindUdpWorkerBySocketKey(socket_key);
-        return current && current->OwnsSocket(socket_key, socket.get());
+    SlotPtr listener_slot,
+    worker_detail::UdpIngress* expected_ingress) {
+    auto is_owned = [this, listener_slot, expected_ingress](
+                        const worker_detail::UdpIngress::SocketPtr& socket) noexcept {
+        return !stopping && socket && socket->is_open() && listener_slot &&
+            listener_slot->udp_worker.get() == expected_ingress;
     };
     auto process_datagram = [this, &worker, socket_key = std::move(socket_key),
-                            socket = sock.get(), listener_slot = std::move(listener_slot)](
+                            socket = sock.get(), listener_slot = std::move(listener_slot),
+                            expected_ingress](
         const udp::endpoint& client_ep, std::span<const uint8_t> received) {
-        auto* ingress = FindUdpWorkerBySocketKey(socket_key);
-        if (!ingress || !ingress->OwnsSocket(socket_key, socket)) return;
-        const auto* receiver = listener_slot && listener_slot->handler
+        if (!listener_slot || listener_slot->udp_worker.get() != expected_ingress) return;
+        const auto* receiver = listener_slot->handler
             ? &listener_slot->handler->ReceiverSettings() : nullptr;
-        ingress->ProcessDatagram(worker_detail::UdpDatagramContext{
+        expected_ingress->ProcessDatagram(worker_detail::UdpDatagramContext{
             .socket_key = socket_key,
             .sock = socket,
             .client_endpoint = client_ep,

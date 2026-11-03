@@ -37,9 +37,6 @@ inline std::array<uint8_t, 32> SHA256Sum(const uint8_t* data, size_t len) {
     return SHA256Hash(data, len);
 }
 
-std::array<uint8_t, 16> HMAC_MD5(const uint8_t* key, size_t key_len,
-                                  const uint8_t* data, size_t data_len);
-
 // ============================================================================
 // VMess AEAD KDF（嵌套 HMAC-SHA256）
 // ============================================================================
@@ -94,13 +91,6 @@ void GenerateAuthID(const uint8_t* auth_key, int64_t timestamp, uint8_t* out_aut
 // ============================================================================
 
 void RandomBytes(uint8_t* buf, size_t len);
-
-// ============================================================================
-// SHAKE128（用于 chunk masking）
-// ============================================================================
-
-void SHAKE128(const uint8_t* input, size_t input_len,
-              uint8_t* output, size_t output_len);
 
 }  // namespace vmess
 }  // namespace acpp

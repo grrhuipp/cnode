@@ -81,18 +81,6 @@ public:
         co_await session_.EncodeRequestBodyEOF(stream_);
     }
 
-    void SetIdleTimeout(std::chrono::seconds timeout) {
-        stream_.SetIdleTimeout(timeout);
-    }
-
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        stream_.SetReadTimeout(timeout);
-    }
-
-    void SetWriteTimeout(std::chrono::seconds timeout) {
-        stream_.SetWriteTimeout(timeout);
-    }
-
     bool ConsumeIdleTimeout() noexcept {
         return stream_.ConsumeIdleTimeout();
     }
@@ -126,10 +114,6 @@ public:
         return is_udp_ ? transport::EofAction::WaitForPeer : stream_.ReadEofAction();
     }
 
-    void SetAbortiveClose(bool enable = true) noexcept {
-        stream_.SetAbortiveClose(enable);
-    }
-
 private:
     vmess::encoding::ClientSession& session_;
     AsyncStream& stream_;
@@ -137,6 +121,85 @@ private:
     bool is_udp_ = false;
     const TargetAddress& udp_target_;
 };
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+DialOutboundStream(
+    net::io_context& io_context,
+    app::dns::DNS& dns_service,
+    const proxy::vmess::outbound::PreparedSettings& prepared,
+    std::chrono::seconds dial_timeout,
+    const tcp::endpoint* inbound_local_addr,
+    session::Context& ctx) {
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service,
+        .address = prepared.config.address,
+        .literal_address = prepared.config.literal_address,
+        .port = prepared.config.port,
+        .stream_settings = &prepared.config.stream_settings,
+        .timeout = dial_timeout,
+        .send_through = &prepared.config.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            prepared.config.stream_settings, prepared.config.address),
+        .ws_host = prepared.config.address,
+    });
+    if (!transport_target) {
+        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
+            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared.config.address);
+        }
+        co_return tl::unexpected(transport_target.error());
+    }
+
+    LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
+                   prepared.config.address, prepared.config.port,
+                   prepared.config.stream_settings.security,
+                   prepared.config.stream_settings.network);
+
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+
+    auto stream = std::move(dial_result.stream);
+    if (auto local_ep = stream->LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
+    LOG_ACCESS(FormatAccessLog(ctx));
+    co_return std::move(stream);
+}
+
+net::awaitable<tl::expected<void, ErrorCode>>
+SendVMessHandshake(
+    AsyncStream& stream,
+    ::acpp::vmess::encoding::ClientSession& vmess_session,
+    std::chrono::seconds handshake_timeout,
+    session::Context& ctx) {
+    stream.SetIdleTimeout(handshake_timeout);
+    PhaseDeadlineHandle outbound_protocol_deadline =
+        stream.StartPhaseDeadline(handshake_timeout);
+
+    auto handshake_result = co_await vmess_session.EncodeRequestHeader(stream);
+    if (!handshake_result) {
+        ErrorCode code = handshake_result.error();
+        if (code == ErrorCode::OK) {
+            code = ErrorCode::PROTOCOL_AUTH_FAILED;
+        }
+        LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
+                      ctx.conn_id, ErrorCodeToString(code));
+        stream.Cancel();
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT
+            : code);
+    }
+    LOG_CONN_DEBUG(ctx, "[VMess] Process OK");
+    co_return tl::expected<void, ErrorCode>{};
+}
 
 }  // namespace
 
@@ -171,53 +234,12 @@ proxy::vmess::outbound::Handler::Process(
     }
     const auto& target = ctx.outbound.target;
 
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service_,
-        .address = prepared_->config.address,
-        .literal_address = prepared_->config.literal_address,
-        .port = prepared_->config.port,
-        .stream_settings = &prepared_->config.stream_settings,
-        .timeout = dial_timeout_,
-        .send_through = &prepared_->config.send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            prepared_->config.stream_settings, prepared_->config.address),
-        .ws_host = prepared_->config.address,
-    });
-    if (!transport_target) {
-        if (transport_target.error() == ErrorCode::DNS_RESOLVE_FAILED) {
-            LOG_CONN_WARN(ctx, "[VMess] DNS resolve failed for {}", prepared_->config.address);
-        }
-        co_return tl::unexpected(transport_target.error());
+    auto dialed = co_await DialOutboundStream(
+        io_context, dns_service_, *prepared_, dial_timeout_, inbound_local_addr, ctx);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
     }
-
-    LOG_CONN_DEBUG(ctx, "[VMess] transport target {}:{} ({}/{})",
-                   prepared_->config.address, prepared_->config.port,
-                   prepared_->config.stream_settings.security,
-                   prepared_->config.stream_settings.network);
-
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    *transport_target = {};
-    if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[VMess] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
-    }
-
-    auto stream = std::move(dial_result.stream);
-    stream->SetStreamLabel("out");
-    if (auto local_ep = stream->LocalEndpoint();
-        local_ep && !local_ep->address().is_unspecified()) {
-        ctx.outbound.connected_local_addr = local_ep->address();
-    }
-    LOG_ACCESS(FormatAccessLog(ctx));
-
-    stream->SetIdleTimeout(timeouts.HandshakeTimeout());
-    PhaseDeadlineHandle outbound_protocol_deadline =
-        stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
+    auto stream = std::move(*dialed);
 
     const bool is_udp = ctx.content.network == Network::UDP;
     ::acpp::vmess::encoding::ClientSession vmess_session(
@@ -226,20 +248,10 @@ proxy::vmess::outbound::Handler::Process(
         prepared_->config.security,
         is_udp ? ::acpp::vmess::Command::UDP : ::acpp::vmess::Command::TCP);
 
-    auto handshake_result = co_await vmess_session.EncodeRequestHeader(*stream);
-    if (!handshake_result) {
-        ErrorCode code = handshake_result.error();
-        if (code == ErrorCode::OK) {
-            code = ErrorCode::PROTOCOL_AUTH_FAILED;
-        }
-        LOG_NET_WARN("[conn={}] VMessOutbound: protocol handshake failed: {}",
-                      ctx.conn_id, ErrorCodeToString(code));
-        stream->Cancel();
-        co_return tl::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : code);
+    if (auto ok = co_await SendVMessHandshake(
+            *stream, vmess_session, timeouts.HandshakeTimeout(), ctx); !ok) {
+        co_return tl::unexpected(ok.error());
     }
-    LOG_CONN_DEBUG(ctx, "[VMess] Process OK");
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_write_timeout);
@@ -276,14 +288,11 @@ const bool kVMessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return {};
         };
         auto has_supported_alter_id = [](const acpp::json::object& obj) {
-            for (const std::string_view key : {"alterId"}) {
-                const auto* value = obj.if_contains(key);
-                if (!value) continue;
-                if (value->is_int64() && value->as_int64() == 0) continue;
-                if (value->is_uint64() && value->as_uint64() == 0) continue;
-                return false;
-            }
-            return true;
+            const auto* value = obj.if_contains("alterId");
+            if (!value) return true;
+            if (value->is_int64() && value->as_int64() == 0) return true;
+            if (value->is_uint64() && value->as_uint64() == 0) return true;
+            return false;
         };
         auto lower_ascii = [](std::string text) {
             std::transform(

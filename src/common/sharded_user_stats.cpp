@@ -29,10 +29,41 @@ UserOnlineTracker::~UserOnlineTracker() = default;
 UserOnlineTracker::UserOnlineTracker(UserOnlineTracker&&) noexcept = default;
 UserOnlineTracker& UserOnlineTracker::operator=(UserOnlineTracker&&) noexcept = default;
 
+std::optional<UserOnlineSessionGuard> UserOnlineTracker::TryConnectSession(
+    std::string_view tag,
+    int64_t user_id,
+    std::string_view client_ip,
+    uint32_t device_limit) {
+    if (user_id <= 0 || client_ip.empty()) {
+        return std::optional<UserOnlineSessionGuard>(std::in_place);
+    }
+    const auto uid = static_cast<uint64_t>(user_id);
+    auto tag_it = impl_->devices.find(tag);
+    if (tag_it == impl_->devices.end()) {
+        tag_it = impl_->devices.try_emplace(memory::ThreadLocalString(tag)).first;
+    }
+    auto [user_it, inserted] = tag_it->second.try_emplace(uid);
+    auto& user_devices = user_it->second;
+    if (!inserted) {
+        auto ip_it = user_devices.find(client_ip);
+        if (ip_it != user_devices.end()) {
+            ++ip_it->second;
+            return std::optional<UserOnlineSessionGuard>(
+                std::in_place, *this, tag, uid, client_ip);
+        }
+        if (device_limit != 0 && user_devices.size() >= device_limit) {
+            return std::nullopt;
+        }
+    }
+    user_devices.try_emplace(memory::ThreadLocalString(client_ip), 1u);
+    return std::optional<UserOnlineSessionGuard>(
+        std::in_place, *this, tag, uid, client_ip);
+}
+
 void UserOnlineTracker::OnUserConnected(std::string_view tag,
                                         uint64_t user_id,
                                         std::string_view client_ip) {
-    if (client_ip.empty()) {
+    if (user_id == 0 || client_ip.empty()) {
         return;
     }
     auto tag_it = impl_->devices.find(tag);

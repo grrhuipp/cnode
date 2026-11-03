@@ -39,28 +39,6 @@ private:
     int generation_;
 };
 
-class OversizedTagOutbound final : public acpp::Outbound {
-public:
-    std::string_view Tag() const noexcept override {
-        static constexpr char marker = 'x';
-        return {&marker, std::numeric_limits<size_t>::max()};
-    }
-
-    acpp::net::awaitable<acpp::OutboundProcessResult> Process(
-        acpp::net::io_context&,
-        const acpp::tcp::endpoint*,
-        acpp::session::Context&,
-        const acpp::TimeoutsConfig&,
-        acpp::transport::Link,
-        acpp::StatsShard&,
-        const acpp::RelayConfig&,
-        acpp::buf::MultiBufferBatch,
-        std::chrono::seconds,
-        std::chrono::seconds) override {
-        co_return acpp::RelayResult{};
-    }
-};
-
 using OutboundManager = acpp::proxyman::outbound::Manager;
 static_assert(!noexcept(std::declval<OutboundManager&>().AddHandler(
     std::declval<std::unique_ptr<acpp::Outbound>>())));
@@ -107,24 +85,12 @@ int main() {
 
     if (static_cast<TestOutbound*>(first_owner.get())->Generation() != 1) return 9;
 
-    try {
-        (void)manager.AddHandler(std::make_unique<OversizedTagOutbound>());
-        return 10;
-    } catch (const std::length_error&) {
-    }
+    if (manager.AddHandler(std::make_unique<TestOutbound>("direct", 99)) != nullptr) return 10;
     if (manager.GetHandler("direct").get() != second_raw) return 11;
-
-    try {
-        (void)manager.ReplaceHandler(std::make_unique<OversizedTagOutbound>());
-        return 12;
-    } catch (const std::length_error&) {
-    }
-    if (manager.GetHandler("direct").get() != second_raw) return 13;
 
     auto fallback = std::make_unique<TestOutbound>("fallback", 3);
     auto* fallback_raw = fallback.get();
-    if (manager.AddHandler(std::move(fallback)).get() != fallback_raw) return 14;
-
+    if (manager.ReplaceHandler(std::move(fallback)).get() != fallback_raw) return 14;
     manager.RemoveHandler("direct");
     if (manager.GetHandler("direct") != nullptr) return 15;
     if (manager.GetHandler("fallback").get() != fallback_raw) return 16;

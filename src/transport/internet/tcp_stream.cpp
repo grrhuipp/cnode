@@ -91,12 +91,6 @@ ProxyProtocolReadResult ProxyReadResult(
 void SetupConnectedSocket(tcp::socket& sock);
 }
 
-enum class StreamLabelKind : uint8_t {
-    Unknown,
-    Inbound,
-    Outbound,
-};
-
 enum Flag : uint8_t {
     kAbortiveClose          = 1u << 0,
     kReadShutdown           = 1u << 1,
@@ -132,7 +126,6 @@ struct TcpStream::Impl : memory::ThreadAllocated {
     TcpStream& owner;
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     buf::MultiBuffer pending_data;
-    StreamLabelKind stream_label = StreamLabelKind::Unknown;
     uint8_t flags = 0;
 };
 
@@ -538,27 +531,6 @@ void TcpStream::PrependReadData(std::span<const uint8_t> data) {
     impl_->pending_data = std::move(prefix);
 }
 
-void TcpStream::SetStreamLabel(std::string_view label) noexcept {
-    if (label == "in") {
-        impl_->stream_label = StreamLabelKind::Inbound;
-    } else if (label == "out") {
-        impl_->stream_label = StreamLabelKind::Outbound;
-    } else {
-        impl_->stream_label = StreamLabelKind::Unknown;
-    }
-}
-
-std::string_view TcpStream::StreamLabel() const noexcept {
-    switch (impl_->stream_label) {
-        case StreamLabelKind::Inbound:
-            return "in";
-        case StreamLabelKind::Outbound:
-            return "out";
-        case StreamLabelKind::Unknown:
-        default:
-            return {};
-    }
-}
 
 void TcpStream::SetAbortiveClose(bool enable) noexcept {
     impl_->SetFlag(kAbortiveClose, enable);

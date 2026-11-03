@@ -731,7 +731,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     rule.outbound_tag = jstr(j, "outboundTag");
 
     const bool has_condition =
-        !rule.domain.empty() || !rule.domain_suffix.empty() ||
+        !rule.domain_suffix.empty() ||
         !rule.domain_keyword.empty() || !rule.domain_full.empty() ||
         !rule.domain_regex.empty() || !rule.geosite.empty() ||
         !rule.ip.empty() || !rule.geoip.empty() || !rule.port.empty() ||
@@ -784,7 +784,6 @@ HttpUpgradeConfig HttpUpgradeConfig::FromJson(const json::object& j) {
     cfg.real_ip_header = jstr(j, "realIpHeader", "");
     require_http_header_name(
         cfg.real_ip_header, "http upgrade realIpHeader");
-    cfg.accept_proxy_protocol = jbool(j, "acceptProxyProtocol", false);
     return cfg;
 }
 

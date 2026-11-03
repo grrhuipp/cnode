@@ -37,7 +37,6 @@ std::optional<InboundListen> InboundListen::Parse(std::string_view value) {
     if (value.empty() || value == constants::network::kDualStackAuto) {
         return InboundListen{};
     }
-
     auto address = iputil::ParseLiteral(value);
     if (!address) {
         return std::nullopt;

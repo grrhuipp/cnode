@@ -68,26 +68,38 @@ constexpr VlessEncryptionPadding kDefaultPaddingGaps[] = {
     return static_cast<uint32_t>(value);
 }
 
-[[nodiscard]] bool IsClientKey(std::span<const uint8_t> key) noexcept {
-    return key.size() == kVlessX25519KeySize ||
-           key.size() == kVlessMlKem768PublicKeySize;
+[[nodiscard]] bool IsClientKey(const VlessClientPfsKey& key) noexcept {
+    if (key.public_key.size() == kVlessX25519KeySize) {
+        return !key.mlkem_key;
+    }
+    if (key.public_key.size() == kVlessMlKem768PublicKeySize) {
+        return key.mlkem_key != nullptr;
+    }
+    return false;
 }
 
-[[nodiscard]] bool IsServerKey(std::span<const uint8_t> key) noexcept {
-    return key.size() == kVlessX25519KeySize ||
-           key.size() == kVlessMlKem768SeedSize;
+[[nodiscard]] bool IsServerKey(const VlessServerPfsKey& key) noexcept {
+    if (key.private_key.size() == kVlessX25519KeySize) {
+        return key.public_key.size() == kVlessX25519KeySize &&
+               !key.mlkem_key;
+    }
+    if (key.private_key.size() == kVlessMlKem768SeedSize) {
+        return key.public_key.size() == kVlessMlKem768PublicKeySize &&
+               key.mlkem_key != nullptr;
+    }
+    return false;
 }
 
 [[nodiscard]] size_t RelaySizeForClientKey(
-    std::span<const uint8_t> key) noexcept {
-    return key.size() == kVlessMlKem768PublicKeySize
+    const VlessClientPfsKey& key) noexcept {
+    return key.mlkem_key
         ? kMlKem768RelaySize
         : kX25519RelaySize;
 }
 
 [[nodiscard]] size_t RelaySizeForServerKey(
-    std::span<const uint8_t> key) noexcept {
-    return key.size() == kVlessMlKem768SeedSize
+    const VlessServerPfsKey& key) noexcept {
+    return key.mlkem_key
         ? kMlKem768RelaySize
         : kX25519RelaySize;
 }
@@ -104,53 +116,37 @@ constexpr VlessEncryptionPadding kDefaultPaddingGaps[] = {
     return out;
 }
 
-[[nodiscard]] std::optional<std::vector<std::vector<uint8_t>>>
-ServerPublicKeys(const VlessEncryptionConfig& config) noexcept {
-    std::vector<std::vector<uint8_t>> public_keys;
-    public_keys.reserve(config.keys.size());
-    for (const auto& key : config.keys) {
-        if (key.size() == kVlessX25519KeySize) {
-            std::array<uint8_t, kVlessX25519KeySize> public_key{};
-            if (!DeriveVlessX25519PublicKey(key, public_key)) {
-                return std::nullopt;
-            }
-            public_keys.emplace_back(public_key.begin(), public_key.end());
-            continue;
-        }
-        if (key.size() == kVlessMlKem768SeedSize) {
-            auto public_key = DeriveVlessMlKem768PublicKeyFromSeed(key);
-            if (!public_key) {
-                return std::nullopt;
-            }
-            public_keys.emplace_back(public_key->begin(), public_key->end());
-            continue;
-        }
-        return std::nullopt;
-    }
-    return public_keys;
-}
-
 [[nodiscard]] std::optional<size_t> RelaysLengthForKeys(
     const VlessEncryptionConfig& config) noexcept {
-    if (config.keys.empty()) {
-        return std::nullopt;
-    }
-
-    size_t length = 0;
-    for (size_t i = 0; i < config.keys.size(); ++i) {
-        const auto& key = config.keys[i];
-        if (config.role == VlessEncryptionRole::Client) {
+    if (config.role == VlessEncryptionRole::Client) {
+        if (config.client_keys.empty()) {
+            return std::nullopt;
+        }
+        size_t length = 0;
+        for (size_t i = 0; i < config.client_keys.size(); ++i) {
+            const auto& key = config.client_keys[i];
             if (!IsClientKey(key)) {
                 return std::nullopt;
             }
             length += RelaySizeForClientKey(key);
-        } else {
-            if (!IsServerKey(key)) {
-                return std::nullopt;
+            if (i + 1 < config.client_keys.size()) {
+                length += kHashSize;
             }
-            length += RelaySizeForServerKey(key);
         }
-        if (i + 1 < config.keys.size()) {
+        return length;
+    }
+
+    if (config.server_keys.empty()) {
+        return std::nullopt;
+    }
+    size_t length = 0;
+    for (size_t i = 0; i < config.server_keys.size(); ++i) {
+        const auto& key = config.server_keys[i];
+        if (!IsServerKey(key)) {
+            return std::nullopt;
+        }
+        length += RelaySizeForServerKey(key);
+        if (i + 1 < config.server_keys.size()) {
             length += kHashSize;
         }
     }
@@ -235,15 +231,17 @@ BuildVlessEncryptionClientNfsHello(
     std::optional<VlessEncryptionCtr> last_ctr;
     std::span<uint8_t> relays(hello.relays);
     memory::ByteVector nfs_key;
-    for (size_t i = 0; i < config.keys.size(); ++i) {
-        const auto& public_key = config.keys[i];
-        const size_t relay_size = RelaySizeForClientKey(public_key);
+    for (size_t i = 0; i < config.client_keys.size(); ++i) {
+        const auto& client_key = config.client_keys[i];
+        const auto& public_key = client_key.public_key;
+        const size_t relay_size = RelaySizeForClientKey(client_key);
         if (relays.size() < relay_size) {
             return std::nullopt;
         }
 
         std::span<uint8_t> current = relays.first(relay_size);
-        if (public_key.size() == kVlessX25519KeySize) {
+        if (!client_key.mlkem_key &&
+            public_key.size() == kVlessX25519KeySize) {
             const auto pair = GenerateVlessX25519KeyPair();
             std::copy(pair.public_key.begin(), pair.public_key.end(),
                       current.begin());
@@ -254,8 +252,9 @@ BuildVlessEncryptionClientNfsHello(
                 return std::nullopt;
             }
             nfs_key.assign(shared->begin(), shared->end());
-        } else if (public_key.size() == kVlessMlKem768PublicKeySize) {
-            auto enc = EncapsulateVlessMlKem768(public_key);
+        } else if (client_key.mlkem_key &&
+                   public_key.size() == kVlessMlKem768PublicKeySize) {
+            auto enc = EncapsulateVlessMlKem768(client_key.mlkem_key.get());
             if (!enc) {
                 return std::nullopt;
             }
@@ -274,7 +273,7 @@ BuildVlessEncryptionClientNfsHello(
             !last_ctr->XorInPlace(current.first(kHashSize))) {
             return std::nullopt;
         }
-        if (i + 1 == config.keys.size()) {
+        if (i + 1 == config.client_keys.size()) {
             break;
         }
 
@@ -283,7 +282,7 @@ BuildVlessEncryptionClientNfsHello(
             return std::nullopt;
         }
 
-        auto hash = Hash32(config.keys[i + 1]);
+        auto hash = Hash32(config.client_keys[i + 1].public_key);
         std::copy(hash.begin(), hash.end(), relays.begin());
         last_ctr = VlessEncryptionCtr::Create(nfs_key, IvSpan(hello.iv));
         if (!last_ctr ||
@@ -316,11 +315,6 @@ OpenVlessEncryptionClientNfsHello(
         return std::nullopt;
     }
 
-    auto public_keys = ServerPublicKeys(config);
-    if (!public_keys || public_keys->size() != config.keys.size()) {
-        return std::nullopt;
-    }
-
     VlessEncryptionServerNfsOpenResult result;
     std::copy_n(iv_and_relays.begin(), result.iv.size(), result.iv.begin());
     result.relays.assign(
@@ -330,10 +324,11 @@ OpenVlessEncryptionClientNfsHello(
     std::optional<VlessEncryptionCtr> last_ctr;
     std::span<uint8_t> relays(result.relays);
     memory::ByteVector nfs_key;
-    for (size_t i = 0; i < config.keys.size(); ++i) {
-        const auto& secret_key = config.keys[i];
-        const auto& public_key = (*public_keys)[i];
-        const size_t relay_size = RelaySizeForServerKey(secret_key);
+    for (size_t i = 0; i < config.server_keys.size(); ++i) {
+        const auto& server_key = config.server_keys[i];
+        const auto& secret_key = server_key.private_key;
+        const auto& public_key = server_key.public_key;
+        const size_t relay_size = RelaySizeForServerKey(server_key);
         if (relays.size() < relay_size) {
             return std::nullopt;
         }
@@ -348,7 +343,8 @@ OpenVlessEncryptionClientNfsHello(
             return std::nullopt;
         }
 
-        if (secret_key.size() == kVlessX25519KeySize) {
+        if (!server_key.mlkem_key &&
+            secret_key.size() == kVlessX25519KeySize) {
             if (current[kVlessX25519KeySize - 1] > 127) {
                 return std::nullopt;
             }
@@ -357,8 +353,10 @@ OpenVlessEncryptionClientNfsHello(
                 return std::nullopt;
             }
             nfs_key.assign(shared->begin(), shared->end());
-        } else if (secret_key.size() == kVlessMlKem768SeedSize) {
-            auto shared = DecapsulateVlessMlKem768FromSeed(secret_key, current);
+        } else if (server_key.mlkem_key &&
+                   secret_key.size() == kVlessMlKem768SeedSize) {
+            auto shared = DecapsulateVlessMlKem768(
+                server_key.mlkem_key.get(), current);
             if (!shared) {
                 return std::nullopt;
             }
@@ -367,7 +365,7 @@ OpenVlessEncryptionClientNfsHello(
             return std::nullopt;
         }
 
-        if (i + 1 == config.keys.size()) {
+        if (i + 1 == config.server_keys.size()) {
             break;
         }
 
@@ -380,7 +378,7 @@ OpenVlessEncryptionClientNfsHello(
             !last_ctr->XorInPlace(relays.first(kHashSize))) {
             return std::nullopt;
         }
-        const auto expected_hash = Hash32((*public_keys)[i + 1]);
+        const auto expected_hash = Hash32(config.server_keys[i + 1].public_key);
         if (!std::ranges::equal(expected_hash, relays.first(kHashSize))) {
             return std::nullopt;
         }

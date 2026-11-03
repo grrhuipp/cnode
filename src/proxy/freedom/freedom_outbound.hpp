@@ -33,7 +33,6 @@ struct FreedomSettings {
     OutboundBind send_through = OutboundBind::Auto();
     DomainStrategy domain_strategy = DomainStrategy::AsIs;
     std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
-    bool enable_udp = true;               // 是否启用 UDP
 };
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundCreator
@@ -64,6 +63,11 @@ public:
     std::string_view Tag() const noexcept override { return tag_; }
 
 private:
+    net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    DialOutboundStream(net::io_context& io_context,
+                       const tcp::endpoint* inbound_local_addr,
+                       session::Context& ctx);
+
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
     net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
     ResolveTargets(session::Context& ctx);
@@ -76,7 +80,6 @@ private:
     memory::ThreadLocalString tag_;
     OutboundBind send_through_;
     DomainStrategy domain_strategy_;
-    bool enable_udp_;
     ::acpp::app::dns::DNS& dns_service_;
     std::chrono::seconds dial_timeout_;
     std::optional<TargetAddress> redirect_target_;

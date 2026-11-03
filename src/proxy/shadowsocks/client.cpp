@@ -16,9 +16,6 @@ namespace acpp::ss {
 
 namespace {
 
-constexpr size_t kStreamChunkPayloadSize =
-    buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
-
 [[noreturn]] void ThrowSsWriteError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
 }
@@ -72,7 +69,8 @@ public:
             auto bytes = buf->Bytes();
             if (bytes.empty()) continue;
 
-            EncryptToMultiBuffer(bytes, out_mb);
+            detail::EncryptToMultiBuffer(
+                *write_cipher_, write_nonce_, bytes, out_mb);
         }
 
         mb.clear();
@@ -97,7 +95,11 @@ public:
             if (!data || size == 0) {
                 continue;
             }
-            EncryptToMultiBuffer(std::span<const uint8_t>{data, size}, out_mb);
+            detail::EncryptToMultiBuffer(
+                *write_cipher_,
+                write_nonce_,
+                std::span<const uint8_t>{data, size},
+                out_mb);
         }
         if (buf::HasData(out_mb)) {
             co_await stream_->WriteMultiBuffer(std::move(out_mb));
@@ -105,52 +107,6 @@ public:
     }
 
 private:
-    void EncryptToMultiBuffer(std::span<const uint8_t> bytes,
-                              buf::MultiBuffer& out_mb) {
-        static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
-
-        const uint8_t* data = bytes.data();
-        size_t remaining = bytes.size();
-
-        while (remaining > 0) {
-            const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-            buf::BufferGuard out{buf::Buffer::New()};
-            if (!out) {
-                throw std::bad_alloc();
-            }
-
-            uint8_t* dst = out->Tail().data();
-
-            const uint8_t len_plain[2] = {
-                static_cast<uint8_t>(chunk_size >> 8),
-                static_cast<uint8_t>(chunk_size & 0xFF)
-            };
-            auto nonce_l = MakeNonce(write_nonce_);
-            if (!write_cipher_->Encrypt(nonce_l.data(), len_plain, 2, dst)) {
-                ThrowSsWriteError("Shadowsocks client stream encrypt length failed");
-            }
-            ++write_nonce_;
-
-            auto nonce_p = MakeNonce(write_nonce_);
-            if (!write_cipher_->Encrypt(
-                    nonce_p.data(), data, chunk_size,
-                    dst + kLenHeaderSize)) {
-                ThrowSsWriteError("Shadowsocks client stream encrypt payload failed");
-            }
-            ++write_nonce_;
-
-            const size_t output_size =
-                kLenHeaderSize +
-                chunk_size +
-                SsAeadCipher::kTagSize;
-            out->Produce(static_cast<uint32_t>(output_size));
-            out_mb.push_back(std::move(out));
-
-            data += chunk_size;
-            remaining -= chunk_size;
-        }
-    }
-
     std::optional<SsAeadCipher> write_cipher_;
     uint64_t write_nonce_ = 0;
     AsyncStream* stream_ = nullptr;

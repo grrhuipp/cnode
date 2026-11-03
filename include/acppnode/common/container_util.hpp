@@ -41,13 +41,4 @@ inline void MaybeShrinkHashContainer(
     }
 }
 
-template <typename SequenceContainer>
-inline void TryShrinkSequence(SequenceContainer& container) noexcept {
-    try {
-        container.shrink_to_fit();
-    } catch (...) {
-        // 队列/顺序容器回缩属于最佳努力优化，失败时不影响主流程。
-    }
-}
-
 }  // namespace acpp

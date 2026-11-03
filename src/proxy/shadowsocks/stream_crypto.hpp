@@ -9,15 +9,82 @@
 #include <algorithm>
 #include <array>
 #include <exception>
+#include <new>
 #include <optional>
+#include <span>
 
 namespace acpp::ss::detail {
+
+inline constexpr size_t kStreamChunkPayloadSize =
+    buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
 
 inline std::array<uint8_t, 12> MakeNonce(uint64_t counter) noexcept {
     std::array<uint8_t, 12> nonce{};
     for (size_t i = 0; i < 8; ++i)
         nonce[i] = static_cast<uint8_t>(counter >> (8 * i));
     return nonce;
+}
+
+inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
+                                 uint64_t& nonce,
+                                 std::span<const uint8_t> bytes,
+                                 buf::MultiBuffer& out_mb,
+                                 size_t* skip_first_bytes = nullptr) {
+    static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
+
+    const uint8_t* data = bytes.data();
+    size_t remaining = bytes.size();
+    if (skip_first_bytes && *skip_first_bytes > 0) {
+        const size_t skip = std::min(*skip_first_bytes, remaining);
+        data += skip;
+        remaining -= skip;
+        *skip_first_bytes -= skip;
+        if (remaining == 0) {
+            return;
+        }
+    }
+
+    while (remaining > 0) {
+        const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
+        buf::BufferGuard out{buf::Buffer::New()};
+        if (!out) {
+            throw std::bad_alloc();
+        }
+
+        uint8_t* dst = out->Tail().data();
+
+        const uint8_t len_plain[2] = {
+            static_cast<uint8_t>(chunk_size >> 8),
+            static_cast<uint8_t>(chunk_size & 0xFF)
+        };
+        const auto nonce_l = MakeNonce(nonce);
+        if (!cipher.Encrypt(nonce_l.data(), len_plain, 2, dst)) {
+            throw IoSystemError(
+                io_error::connection_reset,
+                "Shadowsocks stream encrypt length failed");
+        }
+        ++nonce;
+
+        const auto nonce_p = MakeNonce(nonce);
+        if (!cipher.Encrypt(
+                nonce_p.data(), data, chunk_size,
+                dst + kLenHeaderSize)) {
+            throw IoSystemError(
+                io_error::connection_reset,
+                "Shadowsocks stream encrypt payload failed");
+        }
+        ++nonce;
+
+        const size_t output_size =
+            kLenHeaderSize +
+            chunk_size +
+            SsAeadCipher::kTagSize;
+        out->Produce(static_cast<uint32_t>(output_size));
+        out_mb.push_back(std::move(out));
+
+        data += chunk_size;
+        remaining -= chunk_size;
+    }
 }
 
 // Publish only authenticated plaintext. The cipher owns the reusable EVP state;

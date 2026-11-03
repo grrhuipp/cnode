@@ -122,16 +122,17 @@ int main() {
               large_new_frame->data_len == large_xudp_packet.size(),
           "Mux NEW header did not preserve a multi-buffer datagram length");
 
-    Check(mux::EncodeKeepDataTo(
-              encoded, 7, maximum.data(), maximum.size()),
+    Check(mux::EncodeKeepDataHeaderTo(
+              encoded, 7, maximum.size()),
           "maximum Mux payload was rejected");
+    encoded.insert(encoded.end(), maximum.begin(), maximum.end());
     const auto decoded = mux::DecodeFramePrefix(
         encoded.data(), encoded.size(), encoded.size());
     Check(decoded.has_value() && decoded->frame_size == encoded.size() &&
               decoded->data_len == kMaxPayload,
           "maximum Mux payload did not round-trip");
 
-    Check(mux::EncodeKeepDataTo(encoded, 7, nullptr, 0),
+    Check(mux::EncodeKeepDataHeaderTo(encoded, 7, 0),
           "zero-length Mux DATA frame was rejected");
     const auto empty_decoded = mux::DecodeFramePrefix(
         encoded.data(), encoded.size(), encoded.size());
@@ -139,11 +140,6 @@ int main() {
               empty_decoded->frame_size == encoded.size() &&
               empty_decoded->has_data && empty_decoded->data_len == 0,
           "zero-length Mux DATA frame omitted its wire length");
-
-    Check(!mux::EncodeKeepDataTo(
-              encoded, 7, oversized.data(), oversized.size()) &&
-              encoded.empty(),
-          "oversized Mux TCP payload was truncated instead of rejected");
     Check(!mux::EncodeKeepDataHeaderTo(encoded, 7, oversized.size()) &&
               encoded.empty(),
           "oversized Mux TCP header was truncated instead of rejected");
@@ -154,60 +150,48 @@ int main() {
     oversized_domain_target.type = AddressType::Domain;
     oversized_domain_target.host.assign(256, 'a');
     oversized_domain_target.port = 53;
-    Check(!mux::EncodeNewTo(
+    Check(!mux::EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::TCP,
               zero_port_target,
-              nullptr,
               0) &&
               encoded.empty(),
           "Mux NEW encoded a zero-port target");
-    Check(!mux::EncodeKeepUDPTo(
-              encoded, 7, zero_port_target, nullptr, 0) && encoded.empty(),
+    Check(!mux::EncodeKeepUDPHeaderTo(
+              encoded, 7, zero_port_target, 0) && encoded.empty(),
           "Mux UDP encoded a zero-port target");
-    Check(!mux::EncodeNewTo(
+    Check(!mux::EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::TCP,
               oversized_domain_target,
-              nullptr,
               0) &&
               encoded.empty(),
           "Mux NEW truncated an oversized domain target");
-    Check(!mux::EncodeNewTo(
+    Check(!mux::EncodeNewHeaderTo(
               encoded,
               7,
               static_cast<mux::NetworkType>(0xff),
               target,
-              nullptr,
               0) &&
               encoded.empty(),
           "Mux NEW encoded an unknown network type");
 
-    Check(!mux::EncodeNewTo(
+    Check(!mux::EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::UDP,
               target,
-              oversized.data(),
               oversized.size()) &&
               encoded.empty(),
           "oversized Mux NEW payload was truncated instead of rejected");
-    Check(!mux::EncodeKeepUDPTo(
-              encoded,
-              7,
-              target,
-              oversized.data(),
-              oversized.size()) &&
-              encoded.empty(),
-          "oversized Mux UDP payload was truncated instead of rejected");
     Check(!mux::EncodeKeepUDPHeaderTo(
               encoded, 7, target, oversized.size()) &&
               encoded.empty(),
           "oversized Mux UDP header was truncated instead of rejected");
 
-    Check(mux::EncodeKeepDataTo(encoded, 7, nullptr, 0),
+    Check(mux::EncodeKeepDataHeaderTo(encoded, 7, 0),
           "failed to encode option validation fixture");
     encoded[5] |= 0x80;
     CheckInvalidAcrossLayouts(
@@ -243,12 +227,11 @@ int main() {
         trailing_keepalive_metadata,
         "Mux KEEPALIVE trailing metadata was accepted");
 
-    Check(mux::EncodeNewTo(
+    Check(mux::EncodeNewHeaderTo(
               encoded,
               7,
               mux::NetworkType::UDP,
               target,
-              nullptr,
               0),
           "failed to encode GlobalID fixture");
     const uint16_t base_meta_len = static_cast<uint16_t>(

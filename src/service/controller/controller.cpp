@@ -3,8 +3,10 @@
 #include "node_transaction.hpp"
 #include "node_runtime.hpp"
 #include "panel_schedule.hpp"
-#include "outboundbuilder.hpp"
+#include "../../proxy/freedom/freedom_outbound.hpp"
 
+#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "acppnode/core/constants.hpp"
 #include "acppnode/core/naming.hpp"
 #include "acppnode/infra/log.hpp"
 
@@ -13,10 +15,28 @@
 #include <exception>
 #include <format>
 #include <stdexcept>
+#include <utility>
+#include <variant>
 
 namespace acpp {
 
+namespace {
 
+[[nodiscard]] proxyman::outbound::PreparedOutboundConfig BuildPanelAutoOutbound(
+    const std::string& tag,
+    const PanelConfig& panel_config) {
+    proxy::freedom::outbound::FreedomSettings settings;
+    settings.send_through = panel_config.SendIP;
+    settings.domain_strategy = panel_config.EnableDNS
+        ? panel_config.DNSType : proxy::freedom::outbound::DomainStrategy::AsIs;
+    return proxyman::outbound::PreparedOutboundConfig{
+        .tag = tag,
+        .protocol = std::string(constants::protocol::kFreedom),
+        .create = proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
+    };
+}
+
+}  // namespace
 Controller::Controller(net::io_context& io_context,
                        const std::vector<std::unique_ptr<Worker>>& workers)
     : impl_(std::make_shared<Impl>(io_context, workers)) {}
@@ -360,7 +380,7 @@ net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
                     controller::InboundBuilder(panel.config, candidate->config));
                 candidate->outbound =
                     std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
-                        controller::OutboundBuilder(tag, panel.config));
+                        BuildPanelAutoOutbound(tag, panel.config));
             } else {
                 candidate->inbound = old_state->inbound;
                 candidate->outbound = old_state->outbound;
@@ -472,6 +492,37 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
         committed_state.rules.size(),
         pull_interval.count(),
         push_interval.count());
+}
+
+std::optional<proxyman::inbound::UserSet> Controller::Impl::BuildUsersForInbound(
+    const controller::InboundBuild& inbound,
+    const api::NodeInfo& node_config,
+    const std::vector<api::UserInfo>& api_users) const {
+
+    std::vector<proxyman::inbound::RuntimeUser> users;
+    users.reserve(api_users.size());
+    for (const auto& api_user : api_users) {
+        proxyman::inbound::RuntimeUser user;
+        user.user_id = api_user.UID;
+        user.email = api_user.Email;
+        user.credential = api_user.UUID;
+        user.flow = api_user.Flow.empty() ? node_config.Flow : api_user.Flow;
+        user.speed_limit = api_user.SpeedLimit;
+        user.device_limit = api_user.DeviceLimit;
+        users.push_back(std::move(user));
+    }
+
+    auto result = proxyman::inbound::BuildUsers(
+        inbound.protocol, inbound.handler_request, users);
+    if (!result) {
+        LOG_WARN("BuildUsersForInbound: unsupported user builder for protocol '{}'", inbound.protocol);
+    } else if (std::visit([](const auto& prepared) { return prepared.size(); }, *result) != api_users.size()) {
+        // Invalid credentials must not turn a non-empty panel response into a
+        // partial or empty authentication snapshot.
+        LOG_WARN("BuildUsersForInbound: incomplete user snapshot for protocol '{}'", inbound.protocol);
+        return std::nullopt;
+    }
+    return result;
 }
 
 }  // namespace acpp

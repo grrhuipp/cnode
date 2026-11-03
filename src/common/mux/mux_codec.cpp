@@ -303,164 +303,98 @@ std::optional<FrameHeader> DecodeFrame(
 // ============================================================================
 // 内部：将 PortThenAddress 写入 buf
 // ============================================================================
-template <class ByteContainer>
-static bool AppendAddress(ByteContainer& buf, const TargetAddress& addr) {
-    const size_t size = AddressEncodedSize(addr, AddressWireFormat::PortFirst);
-    if (!addr.IsValid() || size == 0) return false;
-    const size_t offset = buf.size();
-    buf.resize(offset + size);
-    if (EncodeAddressTo(addr, buf.data() + offset, size,
-                        AddressWireFormat::PortFirst) == 0) {
-        buf.resize(offset);
-        return false;
-    }
-    return true;
-}
-
-static void InitFrameBase(
-    auto& buf,
+[[nodiscard]] static size_t WriteFrameBase(
+    std::span<uint8_t> out,
     uint16_t session_id,
     SessionStatus status,
-    uint8_t option,
-    size_t reserve_extra = 0)
-{
-    buf.clear();
-    buf.reserve(8 + reserve_extra);
-
-    // MetaLen 占位（稍后回填）
-    buf.push_back(0);
-    buf.push_back(0);
-    // SessionID
-    buf.push_back(static_cast<uint8_t>(session_id >> 8));
-    buf.push_back(static_cast<uint8_t>(session_id & 0xFF));
-    // Status
-    buf.push_back(static_cast<uint8_t>(status));
-    // Option
-    buf.push_back(option);
+    uint8_t option) noexcept {
+    if (out.size() < 6) {
+        return 0;
+    }
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = static_cast<uint8_t>(session_id >> 8);
+    out[3] = static_cast<uint8_t>(session_id & 0xFF);
+    out[4] = static_cast<uint8_t>(status);
+    out[5] = option;
+    return 6;
 }
 
-// 回填 MetaLen（= buf.size() - 2）并按需追加 DataLen。
-static bool FinalizeFrameHeader(
-    auto& buf,
+[[nodiscard]] static size_t FinalizeFrameHeaderSpan(
+    std::span<uint8_t> out,
+    size_t meta_end,
     size_t payload_len,
-    bool has_data)
-{
+    bool has_data) noexcept {
     constexpr size_t kMaxWireLength = std::numeric_limits<uint16_t>::max();
-    if (buf.size() < 2 || buf.size() - 2 > kMaxWireLength ||
+    if (meta_end < 2 || meta_end - 2 > kMaxWireLength ||
         payload_len > kMaxWireLength) {
-        buf.clear();
-        return false;
+        return 0;
     }
-    // 回填 MetaLen
-    uint16_t meta_len = static_cast<uint16_t>(buf.size() - 2);
-    buf[0] = static_cast<uint8_t>(meta_len >> 8);
-    buf[1] = static_cast<uint8_t>(meta_len & 0xFF);
-
+    const size_t total_len = meta_end + (has_data ? 2 : 0);
+    if (out.size() < total_len) {
+        return 0;
+    }
+    const uint16_t meta_len = static_cast<uint16_t>(meta_end - 2);
+    out[0] = static_cast<uint8_t>(meta_len >> 8);
+    out[1] = static_cast<uint8_t>(meta_len & 0xFF);
     if (has_data) {
-        // DataLen
-        buf.push_back(static_cast<uint8_t>(payload_len >> 8));
-        buf.push_back(static_cast<uint8_t>(payload_len & 0xFF));
+        out[meta_end] = static_cast<uint8_t>(payload_len >> 8);
+        out[meta_end + 1] = static_cast<uint8_t>(payload_len & 0xFF);
     }
-    return true;
-}
-
-// 回填 MetaLen（= buf.size() - 2）并追加 DataLen + Payload
-static bool FinalizeFrame(
-    auto& buf,
-    const uint8_t* payload,
-    size_t payload_len,
-    bool has_data)
-{
-    if (has_data && payload_len > 0 && !payload) {
-        buf.clear();
-        return false;
-    }
-    if (!FinalizeFrameHeader(buf, payload_len, has_data)) {
-        return false;
-    }
-
-    if (has_data && payload_len > 0) {
-        // Payload
-        buf.insert(buf.end(), payload, payload + payload_len);
-    }
-    return true;
+    return total_len;
 }
 
 // ============================================================================
 // EncodeKeepAlive
 // ============================================================================
-template <class ByteContainer>
-static void EncodeKeepAliveToImpl(ByteContainer& out) {
-    out.clear();
-    out.reserve(6);
-    out.push_back(0x00);
-    out.push_back(0x04);
-    out.push_back(0x00);
-    out.push_back(0x00);
-    out.push_back(static_cast<uint8_t>(SessionStatus::KEEPALIVE));
-    out.push_back(0x00);
+size_t EncodeKeepAliveTo(std::span<uint8_t> out) noexcept {
+    if (out.size() < 6) {
+        return 0;
+    }
+    out[0] = 0x00;
+    out[1] = 0x04;
+    out[2] = 0x00;
+    out[3] = 0x00;
+    out[4] = static_cast<uint8_t>(SessionStatus::KEEPALIVE);
+    out[5] = 0x00;
+    return 6;
 }
 
 void EncodeKeepAliveTo(memory::ByteVector& out) {
-    EncodeKeepAliveToImpl(out);
+    std::array<uint8_t, 6> header{};
+    const size_t n = EncodeKeepAliveTo(header);
+    out.assign(header.data(), header.data() + n);
 }
 
-template <class ByteContainer>
-static bool EncodeNewHeaderToImpl(ByteContainer& out,
-                                  uint16_t session_id,
-                                  NetworkType network,
-                                  const TargetAddress& target,
-                                  size_t payload_len) {
+size_t EncodeNewHeaderTo(std::span<uint8_t> out,
+                         uint16_t session_id,
+                         NetworkType network,
+                         const TargetAddress& target,
+                         size_t payload_len) noexcept {
     if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
-        payload_len > std::numeric_limits<uint16_t>::max()) {
-        out.clear();
-        return false;
+        payload_len > std::numeric_limits<uint16_t>::max() ||
+        !target.IsValid()) {
+        return 0;
     }
-    size_t addr_reserve = 1 + 2 + 1 + 16;
-    if (target.IsDomain()) {
-        addr_reserve = 1 + 2 + 1 + 1 + target.host.size();
-    } else if (target.resolved_addr && target.resolved_addr->is_v4()) {
-        addr_reserve = 1 + 2 + 1 + 4;
+    size_t pos = WriteFrameBase(
+        out,
+        session_id,
+        SessionStatus::NEW,
+        payload_len > 0 ? kOptionData : 0x00);
+    if (pos == 0 || out.size() < pos + 1) {
+        return 0;
     }
-
-    InitFrameBase(out, session_id, SessionStatus::NEW,
-                  payload_len > 0 ? kOptionData : 0x00,
-                  addr_reserve);
-    out.push_back(static_cast<uint8_t>(network));
-    if (!AppendAddress(out, target)) {
-        out.clear();
-        return false;
+    out[pos++] = static_cast<uint8_t>(network);
+    const size_t addr_len = EncodeAddressTo(
+        target,
+        out.data() + pos,
+        out.size() - pos,
+        AddressWireFormat::PortFirst);
+    if (addr_len == 0) {
+        return 0;
     }
-    return FinalizeFrameHeader(out, payload_len, payload_len > 0);
-}
-
-template <class ByteContainer>
-static bool EncodeNewToImpl(ByteContainer& out,
-                            uint16_t session_id,
-                            NetworkType network,
-                            const TargetAddress& target,
-                            const uint8_t* data,
-                            size_t len) {
-    if (!EncodeNewHeaderToImpl(out, session_id, network, target, len)) {
-        return false;
-    }
-    if (len > 0 && !data) {
-        out.clear();
-        return false;
-    }
-    if (len > 0) {
-        out.insert(out.end(), data, data + len);
-    }
-    return true;
-}
-
-bool EncodeNewTo(memory::ByteVector& out,
-                 uint16_t session_id,
-                 NetworkType network,
-                 const TargetAddress& target,
-                 const uint8_t* data,
-                 size_t len) {
-    return EncodeNewToImpl(out, session_id, network, target, data, len);
+    pos += addr_len;
+    return FinalizeFrameHeaderSpan(out, pos, payload_len, payload_len > 0);
 }
 
 bool EncodeNewHeaderTo(memory::ByteVector& out,
@@ -468,148 +402,110 @@ bool EncodeNewHeaderTo(memory::ByteVector& out,
                        NetworkType network,
                        const TargetAddress& target,
                        size_t payload_len) {
-    return EncodeNewHeaderToImpl(
-        out, session_id, network, target, payload_len);
+    std::array<uint8_t, kMaxFrameHeaderBytes> header{};
+    const size_t n = EncodeNewHeaderTo(
+        header, session_id, network, target, payload_len);
+    if (n == 0) {
+        out.clear();
+        return false;
+    }
+    out.assign(header.data(), header.data() + n);
+    return true;
 }
 
 // ============================================================================
 // EncodeEnd
 // ============================================================================
-template <class ByteContainer>
-static void EncodeEndToImpl(ByteContainer& out, uint16_t session_id, bool error) {
-    uint8_t option = error ? kOptionError : 0x00;
-    InitFrameBase(out, session_id, SessionStatus::END, option);
-    (void)FinalizeFrame(out, nullptr, 0, false);
+size_t EncodeEndTo(std::span<uint8_t> out,
+                   uint16_t session_id,
+                   bool error) noexcept {
+    const uint8_t option = error ? kOptionError : 0x00;
+    const size_t pos = WriteFrameBase(out, session_id, SessionStatus::END, option);
+    if (pos == 0) {
+        return 0;
+    }
+    return FinalizeFrameHeaderSpan(out, pos, 0, false);
 }
 
 void EncodeEndTo(memory::ByteVector& out, uint16_t session_id, bool error) {
-    EncodeEndToImpl(out, session_id, error);
+    std::array<uint8_t, 6> header{};
+    const size_t n = EncodeEndTo(header, session_id, error);
+    out.assign(header.data(), header.data() + n);
 }
 
 // ============================================================================
-// EncodeKeepData（TCP 数据）
+// EncodeKeepDataHeaderTo（TCP 数据帧头）
 // ============================================================================
-template <class ByteContainer>
-static bool EncodeKeepDataToImpl(
-    ByteContainer& out,
-    uint16_t session_id,
-    const uint8_t* data, size_t len)
-{
-    if (len > std::numeric_limits<uint16_t>::max()) {
-        out.clear();
-        return false;
-    }
-    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, len);
-    return FinalizeFrame(out, data, len, true);
-}
-
-bool EncodeKeepDataTo(
-    memory::ByteVector& out,
-    uint16_t session_id,
-    const uint8_t* data, size_t len)
-{
-    return EncodeKeepDataToImpl(out, session_id, data, len);
-}
-
-template <class ByteContainer>
-static bool EncodeKeepDataHeaderToImpl(
-    ByteContainer& out,
-    uint16_t session_id,
-    size_t payload_len)
-{
+size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
+                              uint16_t session_id,
+                              size_t payload_len) noexcept {
     if (payload_len > std::numeric_limits<uint16_t>::max()) {
-        out.clear();
-        return false;
+        return 0;
     }
-    InitFrameBase(out, session_id, SessionStatus::KEEP, kOptionData, 2);
-    return FinalizeFrameHeader(out, payload_len, true);
+    const size_t pos = WriteFrameBase(
+        out, session_id, SessionStatus::KEEP, kOptionData);
+    if (pos == 0) {
+        return 0;
+    }
+    return FinalizeFrameHeaderSpan(out, pos, payload_len, true);
 }
 
 bool EncodeKeepDataHeaderTo(
     memory::ByteVector& out,
     uint16_t session_id,
-    size_t payload_len)
-{
-    return EncodeKeepDataHeaderToImpl(out, session_id, payload_len);
+    size_t payload_len) {
+    std::array<uint8_t, 8> header{};
+    const size_t n = EncodeKeepDataHeaderTo(header, session_id, payload_len);
+    if (n == 0) {
+        out.clear();
+        return false;
+    }
+    out.assign(header.data(), header.data() + n);
+    return true;
 }
 
 // ============================================================================
-// EncodeKeepUDP（UDP 回包，携带源地址）
+// EncodeKeepUDPHeaderTo（UDP 回包帧头，携带源地址）
 // ============================================================================
-template <class ByteContainer>
-static bool EncodeKeepUDPToImpl(
-    ByteContainer& out,
-    uint16_t session_id,
-    const TargetAddress& src,
-    const uint8_t* data, size_t len)
-{
-    if (len > std::numeric_limits<uint16_t>::max()) {
-        out.clear();
-        return false;
+size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
+                             uint16_t session_id,
+                             const TargetAddress& src,
+                             size_t payload_len) noexcept {
+    if (payload_len > std::numeric_limits<uint16_t>::max() ||
+        !src.IsValid()) {
+        return 0;
     }
-    // 预估地址字节数
-    size_t addr_reserve = 3 + 4;  // NetworkType(1) + Port(2) + AddrType(1) + IPv4(4)
-    InitFrameBase(out, session_id, SessionStatus::KEEP,
-                  kOptionData, addr_reserve + len);
-
-    // NetworkType = UDP
-    out.push_back(static_cast<uint8_t>(NetworkType::UDP));
-    // PortThenAddress
-    if (!AppendAddress(out, src)) {
-        out.clear();
-        return false;
+    size_t pos = WriteFrameBase(
+        out, session_id, SessionStatus::KEEP, kOptionData);
+    if (pos == 0 || out.size() < pos + 1) {
+        return 0;
     }
-
-    return FinalizeFrame(out, data, len, true);
-}
-
-bool EncodeKeepUDPTo(
-    memory::ByteVector& out,
-    uint16_t session_id,
-    const TargetAddress& src,
-    const uint8_t* data, size_t len)
-{
-    return EncodeKeepUDPToImpl(out, session_id, src, data, len);
-}
-
-template <class ByteContainer>
-static bool EncodeKeepUDPHeaderToImpl(
-    ByteContainer& out,
-    uint16_t session_id,
-    const TargetAddress& src,
-    size_t payload_len)
-{
-    if (payload_len > std::numeric_limits<uint16_t>::max()) {
-        out.clear();
-        return false;
+    out[pos++] = static_cast<uint8_t>(NetworkType::UDP);
+    const size_t addr_len = EncodeAddressTo(
+        src,
+        out.data() + pos,
+        out.size() - pos,
+        AddressWireFormat::PortFirst);
+    if (addr_len == 0) {
+        return 0;
     }
-    size_t addr_reserve = 1 + 2 + 1 + 16;
-    if (src.IsDomain()) {
-        addr_reserve = 1 + 2 + 1 + 1 + src.host.size();
-    } else if (src.resolved_addr && src.resolved_addr->is_v4()) {
-        addr_reserve = 1 + 2 + 1 + 4;
-    }
-    InitFrameBase(out, session_id, SessionStatus::KEEP,
-                  kOptionData, addr_reserve + 2);
-
-    // NetworkType = UDP
-    out.push_back(static_cast<uint8_t>(NetworkType::UDP));
-    // PortThenAddress
-    if (!AppendAddress(out, src)) {
-        out.clear();
-        return false;
-    }
-
-    return FinalizeFrameHeader(out, payload_len, true);
+    pos += addr_len;
+    return FinalizeFrameHeaderSpan(out, pos, payload_len, true);
 }
 
 bool EncodeKeepUDPHeaderTo(
     memory::ByteVector& out,
     uint16_t session_id,
     const TargetAddress& src,
-    size_t payload_len)
-{
-    return EncodeKeepUDPHeaderToImpl(out, session_id, src, payload_len);
+    size_t payload_len) {
+    std::array<uint8_t, kMaxFrameHeaderBytes> header{};
+    const size_t n = EncodeKeepUDPHeaderTo(
+        header, session_id, src, payload_len);
+    if (n == 0) {
+        out.clear();
+        return false;
+    }
+    out.assign(header.data(), header.data() + n);
+    return true;
 }
-
 }  // namespace acpp::mux

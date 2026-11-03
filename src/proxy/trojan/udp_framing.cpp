@@ -92,24 +92,27 @@ net::awaitable<void> WriteUdpDatagram(
             "Trojan UDP datagram contains missing or mixed endpoints");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
+    std::array<uint8_t, 272> header{};
     const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
         *datagram.target,
         datagram.payload_size,
-        header->Tail().data(),
-        header->Available());
+        header.data(),
+        header.size());
     if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid Trojan UDP datagram size or target");
     }
-    header->Produce(static_cast<uint32_t>(header_size));
 
-    buf::MultiBuffer framed{std::move(header)};
-    payload.MoveTo(framed, true);
-    co_await writer.WriteMultiBuffer(std::move(framed));
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    for (const buf::Buffer* buffer : payload) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
+        }
+        const auto bytes = buffer->Bytes();
+        framed.Append(net::buffer(bytes.data(), bytes.size()));
+    }
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteUdpDatagram(
@@ -129,23 +132,19 @@ net::awaitable<void> WriteUdpDatagram(
         co_return;
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
+    std::array<uint8_t, 272> header{};
     const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
         target,
         payload_size,
-        header->Tail().data(),
-        header->Available());
+        header.data(),
+        header.size());
     if (header_size == 0) {
         throw IoSystemError(
             io_error::invalid_argument, "invalid Trojan UDP target");
     }
-    header->Produce(static_cast<uint32_t>(header_size));
 
     ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header->Bytes().data(), header->Bytes().size()));
+    framed.Append(net::buffer(header.data(), header_size));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());
 }

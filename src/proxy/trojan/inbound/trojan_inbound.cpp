@@ -18,8 +18,8 @@
 #include "acppnode/common/buf/multi_buffer.hpp"
 #include "acppnode/transport/link.hpp"
 #include "acppnode/app/udp_types.hpp"
+#include <array>
 #include <span>
-
 #include <tl/expected.hpp>
 #include <optional>
 #include <utility>
@@ -80,6 +80,94 @@ private:
     AsyncStream& dst_;
 };
 
+constexpr size_t kMaxTrojanHandshakeBytes = 320;
+
+struct TrojanHandshakeResult {
+    std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential> user;
+    ::acpp::trojan::TrojanCommand command = ::acpp::trojan::TrojanCommand::CONNECT;
+    TargetAddress target;
+    buf::MultiBuffer initial_payload;
+};
+
+net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
+ParseTrojanRequest(AsyncStream& stream,
+                   session::Context& ctx,
+                   ConnectionLimiter* limiter,
+                   std::string_view tag,
+                   std::string_view client_ip) {
+    std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
+    size_t total_read = 0;
+    size_t required = 59;
+    while (true) {
+        if (required > kMaxTrojanHandshakeBytes) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        while (total_read < required) {
+            size_t n = 0;
+            try {
+                n = co_await stream.AsyncRead(net::buffer(
+                    handshake_buf.data() + total_read, required - total_read));
+            } catch (const IoSystemError&) {
+                co_return tl::unexpected(stream.ConsumePhaseDeadline()
+                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            }
+            if (n == 0) {
+                co_return tl::unexpected(
+                    (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout())
+                        ? ErrorCode::TIMEOUT
+                        : ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            total_read += n;
+        }
+        auto address = DecodeAddress(
+            std::span(handshake_buf.data() + 59, total_read - 59),
+            AddressWireFormat::Socks5, {253, true});
+        if (address.status == AddressDecodeStatus::Invalid) {
+            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        const size_t next_required = 59 + (address.status == AddressDecodeStatus::Complete
+            ? address.consumed + 2 : address.required);
+        if (address.status == AddressDecodeStatus::Complete && total_read >= next_required) {
+            break;
+        }
+        required = next_required;
+    }
+
+    size_t consumed = 0;
+    auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
+        handshake_buf.data(), total_read, consumed);
+    if (!request) {
+        LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
+        tag, request->PasswordHashView());
+    if (!user_info) {
+        LOG_NET_WARN("[{}] Trojan auth failed from {}", tag, client_ip);
+        if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+            limiter->OnAuthFailTracked(tag, client_ip);
+        }
+        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+    }
+
+    TrojanHandshakeResult result{
+        .user = std::move(user_info),
+        .command = request->command,
+        .target = std::move(request->target),
+        .initial_payload = {},
+    };
+    if (total_read > consumed) {
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(
+                    handshake_buf.data() + consumed,
+                    total_read - consumed),
+                result.initial_payload)) {
+            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        }
+    }
+    co_return result;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -130,101 +218,44 @@ proxy::trojan::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
     std::optional<UserOnlineSessionGuard> user_session;
-
-    memory::ByteVector handshake_buf;
-    size_t total_read = 0;
-    size_t required = 59;
-    while (true) {
-        if (required > 320) {
-            co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        if (required > handshake_buf.size()) {
-            handshake_buf.resize(required);
-        }
-        while (total_read < required) {
-            size_t n = 0;
-            try {
-                n = co_await stream->AsyncRead(net::buffer(
-                    handshake_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError&) {
-                co_return fail_abortive(stream->ConsumePhaseDeadline()
-                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
-            }
-            if (n == 0) {
-                co_return fail_abortive(
-                    (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout())
-                        ? ErrorCode::TIMEOUT
-                        : ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            total_read += n;
-        }
-        auto address = DecodeAddress(
-            std::span(handshake_buf.data() + 59, total_read - 59),
-            AddressWireFormat::Socks5, {253, true});
-        if (address.status == AddressDecodeStatus::Invalid) {
-            co_return fail_abortive(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        const size_t next_required = 59 + (address.status == AddressDecodeStatus::Complete
-            ? address.consumed + 2 : address.required);
-        if (address.status == AddressDecodeStatus::Complete && total_read >= next_required) {
-            break;
-        }
-        required = next_required;
-    }
-
-    size_t consumed = 0;
-    auto request = ::acpp::trojan::TrojanCodec::ParseRequest(
-        handshake_buf.data(), total_read, consumed);
-    memory::ByteVector{}.swap(handshake_buf);
-    if (!request) {
-        LOG_NET_WARN("[{}] Trojan parse failed from {}", tag, client_ip);
-        co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    const std::string_view password_hash = request->PasswordHashView();
-    auto user_info = proxyman::inbound::UserStore::FindTrojanUser(tag, password_hash);
-    if (!user_info) {
-        LOG_NET_WARN("[{}] Trojan auth failed from {}", tag, client_ip);
-        if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-            limiter_->OnAuthFailTracked(tag, client_ip);
-        }
-        co_return fail_abortive(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
-
-    uint64_t tracked_uid = 0;
+    Network net = Network::TCP;
+    InitialPayload initial_payload;
     {
-        const auto& profile = user_info->profile;
+        auto handshake = co_await ParseTrojanRequest(
+            *stream, ctx, limiter_, tag, client_ip);
+        if (!handshake) {
+            co_return fail_abortive(handshake.error());
+        }
+
+        const auto& profile = handshake->user->profile;
         ctx.inbound.user_id = profile.user_id;
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
-        tracked_uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, tracked_uid, ctx.inbound.source_ip, profile.device_limit)) {
+        user_session = validator_.TryConnectSession(
+            tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+        if (!user_session) {
             LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
                 ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
                 profile.device_limit,
-                validator_.OnlineDeviceCount(tag, tracked_uid));
+                validator_.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
             co_return fail_abortive(ErrorCode::PERMISSION_DENIED);
         }
+        // Session metadata is owned; release the authentication snapshot before I/O.
+        handshake->user.reset();
+
+        LOG_CONN_DEBUG(ctx, "[Trojan][{}] auth ok: {} -> {} user={}",
+                       tag, client_ip, handshake->target, ctx.inbound.user_email);
+
+        net = (handshake->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
+              ? Network::UDP : Network::TCP;
+        ctx.outbound.original_target = handshake->target;
+        ctx.outbound.target = std::move(handshake->target);
+        ctx.content.network = net;
+        if (buf::HasData(handshake->initial_payload)) {
+            initial_payload = InitialPayload(std::move(handshake->initial_payload));
+        }
     }
-
-    // Session metadata is owned; release the authentication snapshot before I/O.
-    user_info.reset();
-
-    // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-    validator_.OnUserConnected(tag, tracked_uid, ctx.inbound.source_ip);
-    user_session.emplace(validator_, tag, tracked_uid, ctx.inbound.source_ip);
-
-    LOG_CONN_DEBUG(ctx, "[Trojan][{}] auth ok: {} -> {} user={}",
-                   tag, client_ip, request->target, ctx.inbound.user_email);
-
-    Network net = (request->command == ::acpp::trojan::TrojanCommand::UDP_ASSOCIATE)
-                  ? Network::UDP : Network::TCP;
-
-    ctx.outbound.original_target = request->target;
-    ctx.outbound.target = std::move(request->target);
-    ctx.content.network = net;
-
 
     if (net == Network::UDP) {
         TrojanUdpReader udp_reader(*stream);
@@ -234,7 +265,7 @@ proxy::trojan::inbound::Handler::Process(
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_reader, &udp_writer},
-            InitialPayload{},
+            std::move(initial_payload),
             ctx,
             *stats_,
             timeouts);
@@ -246,7 +277,7 @@ proxy::trojan::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
-        InitialPayload{},
+        std::move(initial_payload),
         ctx,
         *stats_,
         timeouts);

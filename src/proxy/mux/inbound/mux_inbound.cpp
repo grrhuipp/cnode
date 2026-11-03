@@ -7,18 +7,15 @@
 #include "acppnode/infra/config_types.hpp"
 #include "acppnode/app/stats.hpp"
 #include "acppnode/common/allocator.hpp"
-#include "acppnode/common/container_util.hpp"
 #include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/async_delay.hpp"
 #include "acppnode/common/buffer_util.hpp"
 #include "acppnode/infra/log.hpp"
 
-#include <asio/experimental/channel.hpp>
+#include <asio/as_tuple.hpp>
 
 #include <algorithm>
 #include <exception>
 #include <unordered_map>
-#include <deque>
 #include <limits>
 #include <memory>
 #include <new>
@@ -39,7 +36,6 @@ namespace {
 constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
-constexpr size_t kMuxQueueShrinkItems    = 128;
 constexpr size_t kMuxReplyOverhead       = 128;
 
 [[nodiscard]] constexpr bool QueueBytesWouldExceed(
@@ -65,6 +61,8 @@ struct MuxReply {
     }
 };
 
+class TcpSubState;
+
 struct ReplyQueueState {
     explicit ReplyQueueState(net::io_context& io_context, SignalChannel& main_signal)
         : io_context_(io_context)
@@ -76,12 +74,16 @@ struct ReplyQueueState {
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
     SignalChannel& main_signal_;
+    TcpSubState* waiting_writers_head = nullptr;
     bool running = true;
     bool tcp_overflowed = false;
     uint64_t udp_dropped = 0;
-    bool shrink_queue_on_drain = false;
 
     size_t TotalBytes() const noexcept { return tcp_queued_bytes + udp_queued_bytes; }
+
+    void AddWaitingWriter(TcpSubState* writer) noexcept;
+    void RemoveWaitingWriter(TcpSubState* writer) noexcept;
+    void WakeWaitingWriters() noexcept;
 
     bool CanPushUdp(size_t payload_bytes) const noexcept {
         if (payload_bytes > kMuxQueueHighWaterBytes - kMuxReplyOverhead) {
@@ -118,9 +120,6 @@ struct ReplyQueueState {
         }
         queue.push_back(std::move(reply));
         tcp_queued_bytes += reply_bytes;
-        if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
-            shrink_queue_on_drain = true;
-        }
         WakeReplyWriter();
         return true;
     }
@@ -128,25 +127,22 @@ struct ReplyQueueState {
     void PushUdpPrepared(MuxReply&& reply, size_t reply_bytes) {
         queue.push_back(std::move(reply));
         udp_queued_bytes += reply_bytes;
-        if (queue.size() >= 128 || TotalBytes() >= kMuxQueueHighWaterBytes) {
-            shrink_queue_on_drain = true;
-        }
         WakeReplyWriter();
     }
 
     bool Pop(MuxReply& reply) {
         if (queue.empty()) return false;
         const size_t reply_bytes = queue.front().PayloadSize() + kMuxReplyOverhead;
-        if (queue.front().is_udp) {
+        const bool was_tcp = !queue.front().is_udp;
+        if (!was_tcp) {
             udp_queued_bytes -= std::min(udp_queued_bytes, reply_bytes);
         } else {
             tcp_queued_bytes -= std::min(tcp_queued_bytes, reply_bytes);
         }
         reply = std::move(queue.front());
         queue.pop_front();
-        if (queue.empty() && shrink_queue_on_drain) {
-            TryShrinkSequence(queue);
-            shrink_queue_on_drain = false;
+        if (was_tcp && TcpReadWindowOpen()) {
+            WakeWaitingWriters();
         }
         return true;
     }
@@ -233,7 +229,6 @@ struct ClientReadQueueState {
     bool running = true;
     bool done = false;
     ErrorCode error = ErrorCode::OK;
-    bool shrink_queue_on_drain = false;
 
     void WakeMain() noexcept {
         if (io_context_.stopped()) {
@@ -257,10 +252,6 @@ struct ClientReadQueueState {
         }
         queue.emplace_back(std::move(mb), bytes);
         queued_bytes += bytes;
-        if (queue.size() >= kMuxQueueShrinkItems ||
-            queued_bytes >= kMuxQueueHighWaterBytes) {
-            shrink_queue_on_drain = true;
-        }
         WakeMain();
         return true;
     }
@@ -273,10 +264,6 @@ struct ClientReadQueueState {
         queued_bytes -= std::min(queued_bytes, input.bytes);
         mb = std::move(input.payload);
         queue.pop_front();
-        if (queue.empty() && shrink_queue_on_drain) {
-            TryShrinkSequence(queue);
-            shrink_queue_on_drain = false;
-        }
         if (ReadWindowOpen()) {
             WakeSpace();
         }
@@ -313,11 +300,10 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue)
         : io_context_(io_context)
-        , output_sleep_(io_context)
+        , output_signal_(io_context, 1)
         , input_signal_(io_context, 1)
         , session_id_(session_id)
         , reply_queue_(reply_queue) {}
-
     ~TcpSubState() noexcept override {
         Cancel();
     }
@@ -339,10 +325,6 @@ public:
         }
         input_queue_.emplace_back(std::move(mb), bytes);
         queued_bytes_ += bytes;
-        if (input_queue_.size() >= kMuxQueueShrinkItems ||
-            queued_bytes_ >= kMuxQueueHighWaterBytes) {
-            shrink_input_queue_on_drain_ = true;
-        }
         WakeInputReader();
         return true;
     }
@@ -376,10 +358,6 @@ public:
                 queued_bytes_ -= std::min(queued_bytes_, input.bytes);
                 buf::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
-                if (input_queue_.empty() && shrink_input_queue_on_drain_) {
-                    TryShrinkSequence(input_queue_);
-                    shrink_input_queue_on_drain_ = false;
-                }
                 co_return payload;
             }
             if (input_done_) {
@@ -402,11 +380,7 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        while (!cancelled_ && reply_queue_.running &&
-               reply_queue_.ShouldBackpressureTcpReads()) {
-            co_await output_sleep_.WaitFor(std::chrono::milliseconds(10));
-        }
-
+        co_await WaitForOutputWindow();
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
             throw IoSystemError(
@@ -456,11 +430,7 @@ public:
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        while (!cancelled_ && reply_queue_.running &&
-               reply_queue_.ShouldBackpressureTcpReads()) {
-            co_await output_sleep_.WaitFor(std::chrono::milliseconds(10));
-        }
-
+        co_await WaitForOutputWindow();
         if (cancelled_ || !reply_queue_.running) {
             throw IoSystemError(
                 io_error::operation_aborted,
@@ -535,11 +505,11 @@ public:
         terminal_error_ = error;
         cancellation_.Stop(error);
         input_done_ = true;
-        output_sleep_.Cancel();
+        reply_queue_.RemoveWaitingWriter(this);
+        WakeOutputWriter();
         WakeInputReader();
         input_queue_.clear();
         queued_bytes_ = 0;
-        shrink_input_queue_on_drain_ = false;
     }
 
     void Close() {
@@ -565,6 +535,26 @@ private:
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
+    void WakeOutputWriter() noexcept {
+        if (io_context_.stopped()) {
+            return;
+        }
+        (void)output_signal_.try_send(IoErrorCode{});
+    }
+
+    net::awaitable<void> WaitForOutputWindow() {
+        while (!cancelled_ && reply_queue_.running &&
+               reply_queue_.ShouldBackpressureTcpReads()) {
+            reply_queue_.AddWaitingWriter(this);
+            auto [ec] = co_await output_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            reply_queue_.RemoveWaitingWriter(this);
+            if (ec) {
+                break;
+            }
+        }
+    }
+
     void PushEnd() {
         if (!reply_queue_.running) {
             return;
@@ -588,11 +578,15 @@ private:
         }
     }
 
+    friend struct ReplyQueueState;
+
     net::io_context& io_context_;
-    AsyncDelay output_sleep_;
+    SignalChannel output_signal_;
     SignalChannel input_signal_;
     uint16_t session_id_ = 0;
     ReplyQueueState& reply_queue_;
+    TcpSubState* next_waiting_writer_ = nullptr;
+    bool waiting_in_reply_queue_ = false;
     struct QueuedInput {
         QueuedInput(buf::MultiBuffer p, size_t n) noexcept
             : payload(std::move(p))
@@ -603,7 +597,6 @@ private:
     };
     memory::ThreadLocalDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
-    bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
     ErrorCode terminal_error_ = ErrorCode::CANCELLED;
@@ -611,6 +604,43 @@ private:
     bool dispatch_done_ = false;
     bool dispatch_done_notified_ = false;
 };
+
+void ReplyQueueState::AddWaitingWriter(TcpSubState* writer) noexcept {
+    if (!writer || writer->waiting_in_reply_queue_) {
+        return;
+    }
+    writer->waiting_in_reply_queue_ = true;
+    writer->next_waiting_writer_ = waiting_writers_head;
+    waiting_writers_head = writer;
+}
+
+void ReplyQueueState::RemoveWaitingWriter(TcpSubState* writer) noexcept {
+    if (!writer || !writer->waiting_in_reply_queue_) {
+        return;
+    }
+    TcpSubState** cur = &waiting_writers_head;
+    while (*cur) {
+        if (*cur == writer) {
+            *cur = writer->next_waiting_writer_;
+            break;
+        }
+        cur = &(*cur)->next_waiting_writer_;
+    }
+    writer->next_waiting_writer_ = nullptr;
+    writer->waiting_in_reply_queue_ = false;
+}
+
+void ReplyQueueState::WakeWaitingWriters() noexcept {
+    TcpSubState* cur = waiting_writers_head;
+    waiting_writers_head = nullptr;
+    while (cur) {
+        TcpSubState* next = cur->next_waiting_writer_;
+        cur->next_waiting_writer_ = nullptr;
+        cur->waiting_in_reply_queue_ = false;
+        cur->WakeOutputWriter();
+        cur = next;
+    }
+}
 
 using TcpSubInfo = std::unique_ptr<TcpSubState>;
 
@@ -672,10 +702,6 @@ public:
         StampDefaultTarget(mb);
         input_queue_.emplace_back(std::move(mb), bytes);
         queued_bytes_ += bytes;
-        if (input_queue_.size() >= kMuxQueueShrinkItems ||
-            queued_bytes_ >= kMuxQueueHighWaterBytes) {
-            shrink_input_queue_on_drain_ = true;
-        }
         WakeInputReader();
     }
 
@@ -716,10 +742,6 @@ public:
                 queued_bytes_ -= std::min(queued_bytes_, input.bytes);
                 buf::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
-                if (input_queue_.empty() && shrink_input_queue_on_drain_) {
-                    TryShrinkSequence(input_queue_);
-                    shrink_input_queue_on_drain_ = false;
-                }
                 co_return payload;
             }
             if (input_done_) {
@@ -799,7 +821,6 @@ public:
         input_queue_.clear();
         xudp_packets_.Clear();
         queued_bytes_ = 0;
-        shrink_input_queue_on_drain_ = false;
     }
 
     void Close() {
@@ -866,7 +887,6 @@ private:
     };
     memory::ThreadLocalDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
-    bool shrink_input_queue_on_drain_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
     ErrorCode terminal_error_ = ErrorCode::CANCELLED;
@@ -896,10 +916,6 @@ private:
         StampDefaultTarget(payload);
         input_queue_.emplace_back(std::move(payload), bytes);
         queued_bytes_ += bytes;
-        if (input_queue_.size() >= kMuxQueueShrinkItems ||
-            queued_bytes_ >= kMuxQueueHighWaterBytes) {
-            shrink_input_queue_on_drain_ = true;
-        }
         WakeInputReader();
     }
 
@@ -1043,7 +1059,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     // 帧累积缓冲区（处理粘包）：持有从流读取的 Buffer，解析前短暂 flatten。
     buf::MultiBuffer frame_buf;
     size_t frame_buf_bytes = 0;
-    memory::ByteVector write_frame;
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> write_frame{};
 
     RelayResult result;
     parent_ctx.traffic.bytes_up = 0;
@@ -1092,15 +1108,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     };
 
     auto process_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
-        auto release_write_frame = [&]() noexcept {
-            write_frame.clear();
-            ReleaseIdleBuffer(write_frame);
-        };
         auto write_frame_to_client =
-            [&](memory::ByteVector& frame) -> net::awaitable<bool> {
+            [&](std::span<const uint8_t> frame) -> net::awaitable<bool> {
                 const size_t frame_size = frame.size();
                 if (frame_size == 0) {
-                    release_write_frame();
                     co_return true;
                 }
 
@@ -1110,7 +1121,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     co_await client_link.writer->WriteBuffers(buffers);
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
-                    release_write_frame();
                     co_return true;
                 } catch (const IoSystemError&) {
                     if (ConsumeWriteSideTimeout(client_control)) {
@@ -1118,16 +1128,14 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     }
                 } catch (...) {
                 }
-                release_write_frame();
                 co_return false;
             };
 
         auto write_payload_frame_to_client =
-            [&](memory::ByteVector& frame, MuxReply& reply) -> net::awaitable<bool> {
+            [&](std::span<const uint8_t> frame, MuxReply& reply) -> net::awaitable<bool> {
                 const size_t payload_size = reply.PayloadSize();
                 const size_t frame_size = frame.size() + payload_size;
                 if (frame_size == 0) {
-                    release_write_frame();
                     co_return true;
                 }
 
@@ -1175,7 +1183,6 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     reply.payload.clear();
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;
-                    release_write_frame();
                     co_return true;
                 } catch (const IoSystemError&) {
                     if (ConsumeWriteSideTimeout(client_control)) {
@@ -1184,10 +1191,8 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                 } catch (...) {
                 }
                 reply.payload.clear();
-                release_write_frame();
                 co_return false;
             };
-
         try {
             LOG_CONN_DEBUG(parent_ctx, "[MuxRelay] Start");
 
@@ -1198,8 +1203,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             MuxReply reply;
             while (reply_queue.Pop(reply)) {
                 if (reply.is_end || reply.dispatch_done) {
+                    size_t header_len = 0;
                     if (reply.is_end) {
-                        mux::EncodeEndTo(write_frame, reply.session_id);
+                        header_len = mux::EncodeEndTo(write_frame, reply.session_id);
                     }
                     if (reply.dispatch_done) {
                         sub_sessions.erase(reply.session_id);
@@ -1207,42 +1213,49 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     if (!reply.is_end) {
                         continue;
                     }
+                    if (!co_await write_frame_to_client(
+                            std::span<const uint8_t>(write_frame.data(), header_len))) {
+                        running = false;
+                        break;
+                    }
+                    continue;
                 } else if (reply.is_udp) {
                     const size_t payload_size = reply.PayloadSize();
-                    if (!mux::EncodeKeepUDPHeaderTo(
+                    const size_t header_len = mux::EncodeKeepUDPHeaderTo(
                         write_frame,
                         reply.session_id, reply.udp_src,
-                        payload_size)) {
+                        payload_size);
+                    if (header_len == 0) {
                         LOG_CONN_DEBUG(parent_ctx,
                             "[MuxRelay] UDP reply header encode failed sid={} src={} payload={}B",
                             reply.session_id, reply.udp_src, payload_size);
                         continue;
                     }
-                    if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                    if (!co_await write_payload_frame_to_client(
+                            std::span<const uint8_t>(write_frame.data(), header_len),
+                            reply)) {
                         running = false;
                         break;
                     }
                     continue;
                 } else {
-                    if (!mux::EncodeKeepDataHeaderTo(
-                            write_frame,
-                            reply.session_id,
-                            reply.PayloadSize())) {
+                    const size_t header_len = mux::EncodeKeepDataHeaderTo(
+                        write_frame,
+                        reply.session_id,
+                        reply.PayloadSize());
+                    if (header_len == 0) {
                         reply.payload.clear();
                         result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
                         running = false;
                         break;
                     }
-                    if (!co_await write_payload_frame_to_client(write_frame, reply)) {
+                    if (!co_await write_payload_frame_to_client(
+                            std::span<const uint8_t>(write_frame.data(), header_len),
+                            reply)) {
                         running = false;
                         break;
                     }
                     continue;
-                }
-
-                if (!co_await write_frame_to_client(write_frame)) {
-                    running = false;
-                    break;
                 }
             }
             if (!running) break;
@@ -1357,13 +1370,17 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     frame_buf.DropPrefixBytes(hdr.frame_size);
                 }
                 frame_buf_bytes -= std::min(frame_buf_bytes, hdr.frame_size);
+                if (frame_buf_bytes == 0) {
+                    frame_buf.ReleaseIfIdle();
+                }
 
                 switch (hdr.status) {
 
                 // ----------------------------------------------------------------
                 case mux::SessionStatus::KEEPALIVE: {
-                    mux::EncodeKeepAliveTo(write_frame);
-                    if (!co_await write_frame_to_client(write_frame)) {
+                    const size_t header_len = mux::EncodeKeepAliveTo(write_frame);
+                    if (!co_await write_frame_to_client(
+                            std::span<const uint8_t>(write_frame.data(), header_len))) {
                         running = false;
                     }
                     break;
@@ -1379,8 +1396,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
                         uint16_t sid = hdr.session_id;
                         if (sub_sessions.contains(sid)) {
-                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(write_frame);
+                            const size_t header_len =
+                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(
+                                std::span<const uint8_t>(write_frame.data(), header_len));
                             break;
                         }
 
@@ -1392,11 +1411,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             hdr.target,
                             hdr.has_global_id);
                         auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                        sub_ctx.worker_id                = parent_ctx.worker_id;
-                        sub_ctx.inbound                  = parent_ctx.inbound;
-                        sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
-                        sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
+                        sub_ctx.InitSubstreamFrom(parent_ctx);
                         sub_ctx.content.network          = Network::UDP;
                         sub_ctx.outbound.original_target = hdr.target;
                         sub_ctx.outbound.target          = hdr.target;
@@ -1448,19 +1463,17 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         if (sub_sessions.contains(sid)) {
                             LOG_CONN_DEBUG(parent_ctx,
                                 "[MuxRelay] duplicate TCP sid={}", sid);
-                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(write_frame);
+                            const size_t header_len =
+                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(
+                                std::span<const uint8_t>(write_frame.data(), header_len));
                             break;
                         }
 
                         auto sub_state = std::make_unique<TcpSubState>(
                             io_context, sid, reply_queue);
                         auto& sub_ctx = sub_state->ctx;
-                        sub_ctx.conn_id                  = session::NewID(parent_ctx.worker_id);
-                        sub_ctx.worker_id                = parent_ctx.worker_id;
-                        sub_ctx.inbound                  = parent_ctx.inbound;
-                        sub_ctx.outbound.tag             = parent_ctx.outbound.tag;
-                        sub_ctx.content.speed_limit      = parent_ctx.content.speed_limit;
+                        sub_ctx.InitSubstreamFrom(parent_ctx);
                         sub_ctx.content.network          = Network::TCP;
                         if (hdr.has_target) {
                             sub_ctx.outbound.original_target = hdr.target;
@@ -1471,8 +1484,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                             !sub_state->PushClientPayload(std::move(frame_payload))) {
                             LOG_CONN_DEBUG(parent_ctx,
                                 "[MuxRelay] TCP input queue overflow sid={}", sid);
-                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
-                            (void)co_await write_frame_to_client(write_frame);
+                            const size_t header_len =
+                                mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            (void)co_await write_frame_to_client(
+                                std::span<const uint8_t>(write_frame.data(), header_len));
                             break;
                         }
 
@@ -1533,8 +1548,10 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                         }
                         if (tcp_write_failed) {
                             (*tcp_sub)->Cancel();
-                            mux::EncodeEndTo(write_frame, hdr.session_id);
-                            if (!co_await write_frame_to_client(write_frame)) {
+                            const size_t header_len =
+                                mux::EncodeEndTo(write_frame, hdr.session_id);
+                            if (!co_await write_frame_to_client(
+                                    std::span<const uint8_t>(write_frame.data(), header_len))) {
                                 running = false;
                             }
                         }
@@ -1581,8 +1598,9 @@ net::awaitable<RelayResult> ProcessInboundImpl(
                     // 已知子会话的 END 只表示客户端输入结束；真正回给客户端的
                     // END 由子会话 dispatch 完成时发送，避免先于最后一批回包到达。
                     if (!known_session) {
-                        mux::EncodeEndTo(write_frame, sid);
-                        if (!co_await write_frame_to_client(write_frame)) {
+                        const size_t header_len = mux::EncodeEndTo(write_frame, sid);
+                        if (!co_await write_frame_to_client(
+                                std::span<const uint8_t>(write_frame.data(), header_len))) {
                             running = false;
                         }
                     }
@@ -1598,13 +1616,12 @@ net::awaitable<RelayResult> ProcessInboundImpl(
             result.error = ErrorCode::INTERNAL;
         }
 
-        release_write_frame();
-
         // ------------------------------------------------------------------------
         // 清理所有存活的子会话
         // ------------------------------------------------------------------------
         // 先标记停止，阻止回调继续推送到 reply_queue
         reply_queue.running = false;
+        reply_queue.WakeWaitingWriters();
         client_reads.running = false;
         client_reads.WakeSpace();
         client_control.Cancel();

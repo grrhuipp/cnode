@@ -1,6 +1,9 @@
 #pragma once
 
+#include <openssl/base.h>
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -39,13 +42,25 @@ struct VlessEncryptionPadding {
     int to = 0;
 };
 
+struct VlessClientPfsKey {
+    std::vector<uint8_t> public_key;
+    std::shared_ptr<EVP_PKEY> mlkem_key;
+};
+
+struct VlessServerPfsKey {
+    std::vector<uint8_t> private_key;
+    std::vector<uint8_t> public_key;
+    std::shared_ptr<EVP_PKEY> mlkem_key;
+};
+
 struct VlessEncryptionConfig {
     VlessEncryptionRole role = VlessEncryptionRole::Client;
     VlessEncryptionMode mode = VlessEncryptionMode::Native;
     bool zero_rtt = false;
     int64_t seconds_from = 0;
     int64_t seconds_to = 0;
-    std::vector<std::vector<uint8_t>> keys;
+    std::vector<VlessClientPfsKey> client_keys;
+    std::vector<VlessServerPfsKey> server_keys;
     std::vector<VlessEncryptionPadding> padding_lens;
     std::vector<VlessEncryptionPadding> padding_gaps;
 };

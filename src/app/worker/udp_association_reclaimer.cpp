@@ -21,6 +21,12 @@ UdpAssociationReclaimer::UdpAssociationReclaimer(
     , failure_context_(failure_context)
     , on_failure_(on_failure) {}
 
+UdpAssociationReclaimer::UdpAssociationReclaimer(
+    TimeoutScheduler& scheduler,
+    StatelessFailureCallback on_failure) noexcept
+    : scheduler_(scheduler)
+    , stateless_on_failure_(on_failure) {}
+
 UdpAssociationReclaimer::~UdpAssociationReclaimer() noexcept { Stop(); }
 
 void UdpAssociationReclaimer::Register(
@@ -80,7 +86,11 @@ void UdpAssociationReclaimer::Schedule() noexcept {
             FailRuntime("udp-maintenance", "association schedule refused after release");
     } catch (...) {
         failed_ = true;
-        on_failure_(failure_context_, std::current_exception());
+        if (on_failure_) {
+            on_failure_(failure_context_, std::current_exception());
+        } else if (stateless_on_failure_) {
+            stateless_on_failure_(std::current_exception());
+        }
     }
 }
 

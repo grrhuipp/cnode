@@ -82,12 +82,12 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
     return std::nullopt;
 }
 
-bool EncodeUdpHeaderTo(const TargetAddress& target,
-                       bool packet_addr,
-                       size_t payload_size,
-                       buf::Buffer& out) noexcept {
+size_t EncodeUdpHeaderTo(const TargetAddress& target,
+                         bool packet_addr,
+                         size_t payload_size,
+                         std::span<uint8_t> out) noexcept {
     if (payload_size == 0 || payload_size > std::numeric_limits<uint16_t>::max()) {
-        return false;
+        return 0;
     }
 
     std::array<uint8_t, 19> address{};
@@ -95,22 +95,20 @@ bool EncodeUdpHeaderTo(const TargetAddress& target,
         ? EncodePacketAddrHeaderTo(target, address.data(), address.size())
         : 0;
     if (packet_addr && address_size == 0) {
-        return false;
+        return 0;
     }
     if (address_size > std::numeric_limits<uint16_t>::max() - payload_size ||
-        out.Available() < address_size + 2) {
-        return false;
+        out.size() < address_size + 2) {
+        return 0;
     }
 
     const size_t frame_payload_size = address_size + payload_size;
-    auto tail = out.Tail();
-    tail[0] = static_cast<uint8_t>(frame_payload_size >> 8);
-    tail[1] = static_cast<uint8_t>(frame_payload_size);
+    out[0] = static_cast<uint8_t>(frame_payload_size >> 8);
+    out[1] = static_cast<uint8_t>(frame_payload_size);
     if (address_size > 0) {
-        std::memcpy(tail.data() + 2, address.data(), address_size);
+        std::memcpy(out.data() + 2, address.data(), address_size);
     }
-    out.Produce(static_cast<uint32_t>(address_size + 2));
-    return true;
+    return address_size + 2;
 }
 
 }  // namespace
@@ -191,24 +189,24 @@ net::awaitable<void> WriteUdpDatagram(
             "VLESS UDP datagram target differs from the fixed session target");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    if (!EncodeUdpHeaderTo(
-            *datagram.target, packet_addr, datagram.payload_size, *header)) {
+    std::array<uint8_t, 32> header{};
+    const size_t header_size = EncodeUdpHeaderTo(
+        *datagram.target, packet_addr, datagram.payload_size, header);
+    if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid VLESS UDP datagram size or target");
     }
 
-    for (buf::Buffer* buffer : payload) {
-        if (buffer) {
-            buffer->ClearUDP();
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    for (const buf::Buffer* buffer : payload) {
+        if (!buffer || buffer->IsEmpty()) {
+            continue;
         }
+        const auto bytes = buffer->Bytes();
+        framed.Append(net::buffer(bytes.data(), bytes.size()));
     }
-    buf::MultiBuffer framed{std::move(header)};
-    payload.MoveTo(framed, true);
-    co_await writer.WriteMultiBuffer(std::move(framed));
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteUdpDatagram(
@@ -235,17 +233,16 @@ net::awaitable<void> WriteUdpDatagram(
         co_return;
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    if (!EncodeUdpHeaderTo(target, packet_addr, payload_size, *header)) {
+    std::array<uint8_t, 32> header{};
+    const size_t header_size = EncodeUdpHeaderTo(
+        target, packet_addr, payload_size, header);
+    if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid VLESS UDP datagram size or target");
     }
 
     ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header->Bytes().data(), header->Bytes().size()));
+    framed.Append(net::buffer(header.data(), header_size));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());
 }

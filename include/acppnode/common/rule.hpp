@@ -3,8 +3,8 @@
 #include "acppnode/common/rule_types.hpp"
 #include "acppnode/features/policy/request_policy.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/string_hash.hpp"
 
-#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -25,8 +25,13 @@ public:
     [[nodiscard]] bool Blocked(
         const session::Context& ctx) override;
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    using RuleList = memory::ThreadLocalVector<DetectRule>;
+    using InboundRule =
+        memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+                                        RuleList,
+                                        TransparentStringHash,
+                                        TransparentStringEq>;
+    InboundRule rules_;
 };
 
 }  // namespace acpp::rule

@@ -76,18 +76,6 @@ public:
         co_await stream_.AsyncShutdownWrite();
     }
 
-    void SetIdleTimeout(std::chrono::seconds timeout) {
-        stream_.SetIdleTimeout(timeout);
-    }
-
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        stream_.SetReadTimeout(timeout);
-    }
-
-    void SetWriteTimeout(std::chrono::seconds timeout) {
-        stream_.SetWriteTimeout(timeout);
-    }
-
     bool ConsumeIdleTimeout() noexcept {
         return stream_.ConsumeIdleTimeout();
     }
@@ -119,10 +107,6 @@ public:
     transport::CancellationSource& Cancellation() noexcept override { return stream_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return stream_.ReadEofAction(); }
 
-    void SetAbortiveClose(bool enable = true) noexcept {
-        stream_.SetAbortiveClose(enable);
-    }
-
 private:
     std::unique_ptr<transport::MultiBufferWriter> request_writer_;
     ss::SsCipherInfo cipher_info_;
@@ -150,6 +134,97 @@ net::ip::address SelectUdpBindAddress(const SsOutboundConfig& config) {
     return net::ip::address_v4::any();
 }
 
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+DialOutboundStream(
+    net::io_context& io_context,
+    app::dns::DNS& dns_service,
+    const proxy::shadowsocks::outbound::PreparedSettings& prepared,
+    std::chrono::seconds dial_timeout,
+    const tcp::endpoint* inbound_local_addr,
+    session::Context& ctx) {
+    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
+        .dns_service = &dns_service,
+        .address = prepared.config.address,
+        .literal_address = prepared.config.literal_address,
+        .port = prepared.config.port,
+        .stream_settings = &prepared.config.stream_settings,
+        .timeout = dial_timeout,
+        .send_through = &prepared.config.send_through,
+        .inbound_local_addr = inbound_local_addr,
+        .inbound_source_ip = ctx.inbound.source_ip,
+        .inbound_source_port = ctx.inbound.source_port,
+        .tls_server_name = ResolveOutboundTlsServerName(
+            prepared.config.stream_settings, prepared.config.address),
+        .ws_host = prepared.config.address,
+    });
+    if (!transport_target) {
+        co_return tl::unexpected(transport_target.error());
+    }
+    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
+    if (!dial_result.Ok()) {
+        LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
+                          ctx.inbound.source_ip, ctx.outbound.target,
+                          ctx.outbound.tag, dial_result.error_msg);
+        co_return tl::unexpected(dial_result.error);
+    }
+    auto stream = std::move(dial_result.stream);
+    if (auto local_ep = stream->LocalEndpoint();
+        local_ep && !local_ep->address().is_unspecified()) {
+        ctx.outbound.connected_local_addr = local_ep->address();
+    }
+    LOG_ACCESS(FormatAccessLog(ctx));
+    co_return std::move(stream);
+}
+
+net::awaitable<tl::expected<ss::WriteTCPRequestResult, ErrorCode>>
+SendShadowsocksHandshake(
+    AsyncStream& stream,
+    const proxy::shadowsocks::outbound::PreparedSettings& prepared,
+    bool use_uot,
+    const TargetAddress& target,
+    std::chrono::seconds handshake_timeout) {
+    const TargetAddress protocol_target = use_uot
+        ? TargetAddress(
+            *prepared.config.uot_version == SsUotVersion::V1
+                ? proxy::uot::kV1MagicAddress
+                : proxy::uot::kMagicAddress,
+            0)
+        : target;
+
+    stream.SetIdleTimeout(handshake_timeout);
+    PhaseDeadlineHandle outbound_protocol_deadline =
+        stream.StartPhaseDeadline(handshake_timeout);
+
+    auto request_writer_result = co_await ss::WriteTCPRequest(
+        protocol_target,
+        prepared.credentials.Cipher(),
+        prepared.credentials.MasterKey(),
+        prepared.credentials.PskChain(),
+        stream);
+    if (!request_writer_result) {
+        stream.Cancel();
+        co_return tl::unexpected(outbound_protocol_deadline.Expired()
+            ? ErrorCode::TIMEOUT
+            : request_writer_result.error());
+    }
+    co_return std::move(*request_writer_result);
+}
+
+net::awaitable<tl::expected<void, ErrorCode>>
+WriteUotRequest(
+    ShadowsocksOutboundEndpoint& target_endpoint,
+    const TargetAddress& target) {
+    auto request = proxy::uot::EncodeRequest(false, target);
+    if (!request) {
+        target_endpoint.Cancel();
+        co_return tl::unexpected(request.error());
+    }
+    const std::array<net::const_buffer, 1> request_buffers{
+        net::buffer(request->bytes.data(), request->size)};
+    co_await target_endpoint.WriteBuffers(request_buffers);
+    co_return tl::expected<void, ErrorCode>{};
+}
 }  // namespace
 
 net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Process(
@@ -206,62 +281,18 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
-    const TargetAddress protocol_target = use_uot
-        ? TargetAddress(
-            *prepared_->config.uot_version == SsUotVersion::V1
-                ? proxy::uot::kV1MagicAddress
-                : proxy::uot::kMagicAddress,
-            0)
-        : ctx.outbound.target;
+    auto dialed = co_await DialOutboundStream(
+        io_context, dns_service_, *prepared_, dial_timeout_, inbound_local_addr, ctx);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto stream = std::move(*dialed);
 
-    auto transport_target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
-        .dns_service = &dns_service_,
-        .address = prepared_->config.address,
-        .literal_address = prepared_->config.literal_address,
-        .port = prepared_->config.port,
-        .stream_settings = &prepared_->config.stream_settings,
-        .timeout = dial_timeout_,
-        .send_through = &prepared_->config.send_through,
-        .inbound_local_addr = inbound_local_addr,
-        .inbound_source_ip = ctx.inbound.source_ip,
-        .inbound_source_port = ctx.inbound.source_port,
-        .tls_server_name = ResolveOutboundTlsServerName(
-            prepared_->config.stream_settings, prepared_->config.address),
-        .ws_host = prepared_->config.address,
-    });
-    if (!transport_target) {
-        co_return tl::unexpected(transport_target.error());
+    auto request_session = co_await SendShadowsocksHandshake(
+        *stream, *prepared_, use_uot, ctx.outbound.target, timeouts.HandshakeTimeout());
+    if (!request_session) {
+        co_return tl::unexpected(request_session.error());
     }
-    auto dial_result = co_await DialOutboundTransport(io_context, ctx, *transport_target);
-    *transport_target = {};
-    if (!dial_result.Ok()) {
-        LOG_CONN_WARN(ctx, "[SsOutbound] dial failed {} -> {} via {}: {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, dial_result.error_msg);
-        co_return tl::unexpected(dial_result.error);
-    }
-    auto stream = std::move(dial_result.stream);
-    stream->SetStreamLabel("out");
-    if (auto local_ep = stream->LocalEndpoint();
-        local_ep && !local_ep->address().is_unspecified()) {
-        ctx.outbound.connected_local_addr = local_ep->address();
-    }
-    LOG_ACCESS(FormatAccessLog(ctx));
-
-    stream->SetIdleTimeout(timeouts.HandshakeTimeout());
-    PhaseDeadlineHandle outbound_protocol_deadline =
-        stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
-
-    auto request_writer_result = co_await ss::WriteTCPRequest(
-        protocol_target, prepared_->credentials.Cipher(), prepared_->credentials.MasterKey(), prepared_->credentials.PskChain(), *stream);
-    if (!request_writer_result) {
-        stream->Cancel();
-        co_return tl::unexpected(outbound_protocol_deadline.Expired()
-            ? ErrorCode::TIMEOUT
-            : request_writer_result.error());
-    }
-    auto request_session = std::move(request_writer_result.value());
-    auto request_writer = std::move(request_session.request_writer);
 
     stream->SetIdleTimeout(relay_idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
@@ -269,22 +300,17 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     stream->ClearPhaseDeadline();
 
     ShadowsocksOutboundEndpoint target_endpoint(
-        std::move(request_writer),
+        std::move(request_session->request_writer),
         prepared_->credentials.Cipher(),
         prepared_->credentials.MasterKey(),
-        request_session.request_salt,
+        request_session->request_salt,
         *stream);
 
     if (use_uot &&
         *prepared_->config.uot_version != SsUotVersion::V1) {
-        auto request = proxy::uot::EncodeRequest(false, ctx.outbound.target);
-        if (!request) {
-            target_endpoint.Cancel();
-            co_return tl::unexpected(request.error());
+        if (auto ok = co_await WriteUotRequest(target_endpoint, ctx.outbound.target); !ok) {
+            co_return tl::unexpected(ok.error());
         }
-        const std::array<net::const_buffer, 1> request_buffers{
-            net::buffer(request->bytes.data(), request->size)};
-        co_await target_endpoint.WriteBuffers(request_buffers);
     }
 
     auto relay_endpoint = [&](auto& endpoint) -> net::awaitable<RelayResult> {

@@ -2,9 +2,9 @@
 
 #include "acppnode/app/traffic_types.hpp"
 #include "acppnode/common/allocator.hpp"
+#include "acppnode/common/string_hash.hpp"
 
 #include <cstdint>
-#include <memory>
 #include <string_view>
 
 namespace acpp {
@@ -16,17 +16,22 @@ struct Traffic;
 namespace app {
 
 class SessionTrackingState : public memory::ThreadAllocated {
-    struct Account;
+    struct Account {
+        UserTraffic completed;
+        size_t active = 0;
+    };
+    struct AccountBucket;
+
 public:
     struct ActiveSession {
         ActiveSession* prev = nullptr;
         ActiveSession* next = nullptr;
-        std::string_view tag;
         int64_t user_id = 0;
         session::Traffic* traffic = nullptr;
         uint64_t last_reported_up = 0;
         uint64_t last_reported_down = 0;
         bool linked = false;
+        AccountBucket* bucket = nullptr;
         Account* account = nullptr;
     };
 
@@ -48,8 +53,15 @@ public:
     [[nodiscard]] UserTrafficSnapshot CollectAndResetTraffic(std::string_view tag);
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    struct AccountBucket {
+        memory::ThreadLocalUnorderedMap<int64_t, Account> traffic;
+        ActiveSession* active_head = nullptr;
+    };
+
+    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
+                                    AccountBucket,
+                                    TransparentStringHash,
+                                    TransparentStringEq> accounts_;
 };
 
 }  // namespace app

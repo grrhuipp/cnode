@@ -64,10 +64,6 @@ public:
     void ClearPhaseDeadline();
     bool ConsumePhaseDeadline() noexcept;
 
-    // 流标签（调试用，标识 inbound/outbound）。只存 1 字节枚举，
-    // 避免 TcpStream 每连接常驻一个 std::string。
-    void SetStreamLabel(std::string_view label) noexcept;
-    [[nodiscard]] std::string_view StreamLabel() const noexcept;
     void SetAbortiveClose(bool enable = true) noexcept;
     void SetWriteCancellationDeferred() noexcept;
     [[nodiscard]] bool IsWriteCancellationDeferred() const noexcept;

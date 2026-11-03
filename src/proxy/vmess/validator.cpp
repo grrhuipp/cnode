@@ -6,6 +6,7 @@
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -90,65 +91,58 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
     };
 
     struct alignas(64) HotUserCache {
-        static constexpr size_t kMaxEntries = 8192;
+        static constexpr size_t kMaxHotUsers = 32;
         static constexpr int64_t kWindowSeconds = 300;
         using Credential = proxyman::inbound::UserStore::VmessCredential;
-        using ActiveList = memory::ThreadLocalList<const Credential*>;
+        using AuthIDLookupTable = proxyman::inbound::UserStore::VmessUserMap;
 
-        struct Entry {
-            const proxyman::inbound::UserStore::VmessUserMap* table = nullptr;
-            int64_t timestamp;
-            ActiveList::iterator order_it;
+        struct HotEntry {
+            const Credential* user = nullptr;
+            const AuthIDLookupTable* table = nullptr;
+            int64_t last_seen = 0;
         };
 
-        memory::ThreadLocalUnorderedMap<const Credential*, Entry> entries;
-        ActiveList active_order;
+        memory::ThreadLocalVector<HotEntry> entries;
+
+        HotUserCache() {
+            entries.reserve(kMaxHotUsers);
+        }
 
         void Touch(const Credential* user,
-                   const proxyman::inbound::UserStore::VmessUserMap* table, int64_t now) {
-            auto it = entries.find(user);
-            if (it != entries.end()) {
-                it->second.timestamp = now;
-                if (it->second.order_it != active_order.begin()) {
-                    active_order.splice(active_order.begin(), active_order, it->second.order_it);
+                   const AuthIDLookupTable* table,
+                   int64_t now) {
+            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                if (it->user == user) {
+                    HotEntry entry = *it;
+                    entry.table = table;
+                    entry.last_seen = now;
+                    if (it != entries.begin()) {
+                        std::move_backward(entries.begin(), it, it + 1);
+                        entries.front() = entry;
+                    } else {
+                        *it = entry;
+                    }
+                    return;
                 }
-                return;
             }
 
-            active_order.push_front(user);
-            Entry entry;
-            entry.table = table;
-            entry.timestamp = now;
-            entry.order_it = active_order.begin();
-            entries.emplace(user, std::move(entry));
-            if (entries.size() > kMaxEntries && !active_order.empty()) {
-                const auto* tail = active_order.back();
-                active_order.pop_back();
-                entries.erase(tail);
+            if (entries.size() < kMaxHotUsers) {
+                entries.reserve(kMaxHotUsers);
+                entries.insert(entries.begin(), HotEntry{user, table, now});
+            } else if (!entries.empty()) {
+                std::move_backward(entries.begin(), entries.end() - 1, entries.end());
+                entries.front() = HotEntry{user, table, now};
             }
         }
 
         void Cleanup(int64_t now) {
-            for (auto it = entries.begin(); it != entries.end(); ) {
-                if (it->second.timestamp + kWindowSeconds < now) {
-                    active_order.erase(it->second.order_it);
-                    it = entries.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+            std::erase_if(entries, [now](const HotEntry& entry) {
+                return entry.last_seen + kWindowSeconds < now;
+            });
         }
 
         void Clear() {
             entries.clear();
-            active_order.clear();
-        }
-
-        void UpdateTime(const Credential* user, int64_t now) {
-            auto it = entries.find(user);
-            if (it != entries.end()) {
-                it->second.timestamp = now;
-            }
         }
     };
 
@@ -214,35 +208,24 @@ TimedUserValidator::FindByAuthIDForTag(
         impl_->hot_cache.Cleanup(now);
     }
 
-    {
-        std::array<const proxyman::inbound::UserStore::VmessCredential*, 32> candidates{};
-        size_t candidate_count = 0;
-        for (const auto* user : impl_->hot_cache.active_order) {
-            auto it = impl_->hot_cache.entries.find(user);
-            if (it != impl_->hot_cache.entries.end() &&
-                it->second.table == view.users.get() &&
-                it->second.timestamp + Impl::HotUserCache::kWindowSeconds >= now) {
-                candidates[candidate_count++] = user;
-                if (candidate_count == candidates.size()) {
-                    break;
-                }
-            }
-        }
+    if (!view.users) {
+        return {};
+    }
 
-        for (size_t i = 0; i < candidate_count; ++i) {
-            const auto* user = candidates[i];
+    for (auto it = impl_->hot_cache.entries.begin();
+         it != impl_->hot_cache.entries.end();
+         ++it) {
+        if (it->table == view.users.get() &&
+            it->last_seen + Impl::HotUserCache::kWindowSeconds >= now) {
+            const auto* user = it->user;
             if (tryUser(*user)) {
-                impl_->hot_cache.UpdateTime(user, now);
+                impl_->hot_cache.Touch(user, view.users.get(), now);
                 return view.Share(*user);
             }
         }
     }
 
-    if (!view.users) {
-        return {};
-    }
-
-    for (const auto& [uuid, user] : *view.users) {
+    for (const auto& user : *view.users) {
         if (tryUser(user)) {
             impl_->hot_cache.Touch(&user, view.users.get(), now);
             return view.Share(user);

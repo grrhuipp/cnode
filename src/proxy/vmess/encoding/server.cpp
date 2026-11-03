@@ -39,7 +39,6 @@ struct EncodeResponseBodyState final {
 };
 
 struct DecodeRequestBodyState final {
-    VMessRequest* request = nullptr;
     std::optional<VMessCipher> cipher;
     std::optional<VMessCipher> length_cipher;
     std::optional<ShakeMask> mask;
@@ -445,14 +444,6 @@ net::awaitable<bool> DecodeRequestBodyReadFull(DecodeRequestBodyState& state,
                                                uint8_t* dst,
                                                size_t len,
                                                size_t& consumed) {
-    while (consumed < len && state.request && state.request->HasPendingData()) {
-        const auto pending_data = state.request->PendingDataSpan();
-        const size_t to_copy = std::min(len - consumed, pending_data.size());
-        std::memcpy(dst + consumed, pending_data.data(), to_copy);
-        consumed += to_copy;
-        state.request->ConsumePendingData(to_copy);
-    }
-
     while (consumed < len) {
         if (!buf::HasData(state.pending_read)) {
             state.pending_read = co_await stream.ReadMultiBuffer();
@@ -668,7 +659,13 @@ void InitRequestBodyState(DecodeRequestBodyState& state, VMessRequest& request) 
     std::memcpy(request_key.data(), request.body_key.data(), 16);
     std::memcpy(request_iv.data(), request.body_iv.data(), 16);
 
-    state.request = &request;
+    if (request.HasPendingData()) {
+        if (!buf::AppendSpanToMultiBuffer(
+                request.PendingDataSpan(), state.pending_read)) {
+            throw std::bad_alloc();
+        }
+        request.ClearPendingData();
+    }
     state.packet_mode = request.command == Command::UDP;
     state.cipher.emplace(
         security, request_key.data(), request_iv.data(), proxy::AeadDirection::Decrypt);

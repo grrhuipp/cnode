@@ -34,13 +34,7 @@ public:
                             void* failure_context,
                             FailureCallback on_failure) noexcept;
     UdpAssociationReclaimer(TimeoutScheduler& scheduler,
-                            StatelessFailureCallback on_failure) noexcept
-        : UdpAssociationReclaimer(
-              scheduler,
-              reinterpret_cast<void*>(on_failure),
-              +[](void* fn, std::exception_ptr error) {
-                  reinterpret_cast<StatelessFailureCallback>(fn)(std::move(error));
-              }) {}
+                            StatelessFailureCallback on_failure) noexcept;
     ~UdpAssociationReclaimer() noexcept;
     UdpAssociationReclaimer(const UdpAssociationReclaimer&) = delete;
     UdpAssociationReclaimer& operator=(const UdpAssociationReclaimer&) = delete;
@@ -67,6 +61,7 @@ private:
     TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
+    StatelessFailureCallback stateless_on_failure_ = nullptr;
     UdpAssociationHook* head_ = nullptr;
     UdpAssociationHook* cursor_ = nullptr;
     bool stopped_ = false;

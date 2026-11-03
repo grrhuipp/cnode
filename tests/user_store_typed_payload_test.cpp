@@ -36,9 +36,9 @@ bool TestTypedUpdatesStayProtocolLocal() {
 
     auto old = UserStore::VmessUsers(tag);
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess("vmess-2", 3)}}));
-    if (UserStore::VmessUsers(tag).users->contains("vmess-1") ||
-        !UserStore::VmessUsers(tag).users->contains("vmess-2") ||
-        !old.users->contains("vmess-1") || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
+    if (UserStore::VmessUsers(tag).size() != 1 ||
+        UserStore::VmessUsers(tag)[0].profile.user_id != 3 ||
+        old.size() != 1 || old[0].profile.user_id != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
 
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{}}));
     if (UserStore::FindTrojanUser(tag, "hash-1") || UserStore::VmessUsers(tag).size() != 1) return false;

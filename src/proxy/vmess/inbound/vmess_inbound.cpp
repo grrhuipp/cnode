@@ -21,6 +21,112 @@
 
 namespace acpp {
 
+namespace {
+
+net::awaitable<tl::expected<std::optional<UserOnlineSessionGuard>, ErrorCode>>
+ParseHandshake(AsyncStream& stream,
+               ::acpp::vmess::encoding::ServerSession& vmess_session,
+               ::acpp::vmess::TimedUserValidator& validator,
+               ConnectionLimiter* limiter,
+               session::Context& ctx,
+               std::string_view tag,
+               std::string_view client_ip) {
+    memory::ByteVector header_buf;
+    size_t total_read = 0;
+    std::optional<::acpp::vmess::VMessRequest> request;
+    size_t consumed = 0;
+    while (!request) {
+        const size_t required = vmess_session.RequiredHeaderBytes();
+        if (required > header_buf.size()) {
+            header_buf.resize(required);
+        }
+        while (total_read < required) {
+            size_t n = 0;
+            try {
+                n = co_await stream.AsyncRead(net::buffer(
+                    header_buf.data() + total_read, required - total_read));
+            } catch (const IoSystemError&) {
+                co_return tl::unexpected(stream.ConsumePhaseDeadline()
+                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
+            }
+            if (n == 0) {
+                if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout()) {
+                    co_return tl::unexpected(ErrorCode::TIMEOUT);
+                }
+                // EOF in a structured header is truncation, never an auth miss.
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            total_read += n;
+        }
+        auto decoded = vmess_session.DecodeRequestHeader(
+            header_buf.data(), total_read, ctx.conn_id);
+        request = std::move(decoded.first);
+        consumed = decoded.second;
+        if (!request && vmess_session.RequiredHeaderBytes() == 0) {
+            LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
+            if (limiter && ctx.inbound.HasProxyProtocolClientIP()) {
+                limiter->OnAuthFailTracked(tag, client_ip);
+            }
+            co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        }
+    }
+
+    memory::ByteVector{}.swap(header_buf);
+
+    LOG_CONN_TRACE(ctx,
+                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
+                   tag,
+                   static_cast<int>(request->command),
+                   static_cast<int>(request->security),
+                   static_cast<int>(request->options),
+                   request->target,
+                   consumed,
+                   request->PendingDataSize());
+
+    std::optional<UserOnlineSessionGuard> user_session;
+    if (request->user) {
+        const auto& profile = request->user->profile;
+        ctx.inbound.user_id = profile.user_id;
+        ctx.inbound.user_email = profile.email;
+        ctx.content.speed_limit = profile.speed_limit;
+
+        user_session = validator.TryConnectSession(
+            tag, profile.user_id, ctx.inbound.source_ip, profile.device_limit);
+        if (!user_session) {
+            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
+                FormatTimestamp(ctx.accept_time_us),
+                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
+                profile.device_limit,
+                validator.OnlineDeviceCount(tag, static_cast<uint64_t>(profile.user_id)));
+            co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+        }
+    }
+
+    LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
+                   tag, client_ip, request->target,
+                   ctx.inbound.user_email);
+
+    // Header authentication and replay checks are finished. Body/response keys
+    // are already owned by request; do not move a user-table owner into Session.
+    request->user.reset();
+
+    TargetAddress target = request->target;
+    Network net = Network::TCP;
+    if (request->command == ::acpp::vmess::Command::UDP) {
+        net = Network::UDP;
+    } else if (request->command == ::acpp::vmess::Command::Mux) {
+        net = Network::MUX;
+    }
+
+    vmess_session.SetRequest(std::move(*request));
+    ctx.outbound.original_target = target;
+    ctx.outbound.target = std::move(target);
+    ctx.content.network = net;
+
+    co_return std::move(user_session);
+}
+
+}  // namespace
 
 // ============================================================================
 // proxy/vmess/inbound.Handler 实现（代理层，无传输层知识）
@@ -63,107 +169,17 @@ proxy::vmess::inbound::Handler::Process(
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
         co_return fail(ErrorCode::BLOCKED);
     }
-    std::optional<UserOnlineSessionGuard> user_session;
-
-    memory::ByteVector header_buf;
-    size_t total_read = 0;
     ::acpp::vmess::encoding::ServerSession vmess_session(validator_, tag);
-    std::optional<::acpp::vmess::VMessRequest> request;
-    size_t consumed = 0;
-    while (!request) {
-        const size_t required = vmess_session.RequiredHeaderBytes();
-        if (required > header_buf.size()) {
-            header_buf.resize(required);
+    std::optional<UserOnlineSessionGuard> user_session;
+    {
+        auto parsed_session = co_await ParseHandshake(
+            *stream, vmess_session, validator_, limiter_, ctx, tag, client_ip);
+        if (!parsed_session) {
+            co_return fail(parsed_session.error());
         }
-        while (total_read < required) {
-            size_t n = 0;
-            try {
-                n = co_await stream->AsyncRead(net::buffer(
-                    header_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError&) {
-                co_return fail(stream->ConsumePhaseDeadline()
-                    ? ErrorCode::TIMEOUT : ErrorCode::SOCKET_READ_FAILED);
-            }
-            if (n == 0) {
-                if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout()) {
-                    co_return fail(ErrorCode::TIMEOUT);
-                }
-                // EOF in a structured header is truncation, never an auth miss.
-                co_return fail(ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            total_read += n;
-        }
-        auto decoded = vmess_session.DecodeRequestHeader(
-            header_buf.data(), total_read, ctx.conn_id);
-        request = std::move(decoded.first);
-        consumed = decoded.second;
-        if (!request && vmess_session.RequiredHeaderBytes() == 0) {
-            LOG_NET_WARN("[{}] VMess auth failed from {}", tag, client_ip);
-            if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
-                limiter_->OnAuthFailTracked(tag, client_ip);
-            }
-            co_return fail(ErrorCode::PROTOCOL_AUTH_FAILED);
-        }
+        user_session = std::move(*parsed_session);
     }
-
-    memory::ByteVector{}.swap(header_buf);
-
-    LOG_CONN_TRACE(ctx,
-                   "[VMess][{}] parsed command={} security={} options={:#04x} target={} consumed={} pending={}",
-                   tag,
-                   static_cast<int>(request->command),
-                   static_cast<int>(request->security),
-                   static_cast<int>(request->options),
-                   request->target,
-                   consumed,
-                   request->PendingDataSize());
-
-    // 填充用户信息
-    if (request->user) {
-        const auto& profile = request->user->profile;
-        ctx.inbound.user_id = profile.user_id;
-        ctx.inbound.user_email = profile.email;
-        ctx.content.speed_limit = profile.speed_limit;
-
-        // 在线追踪：认证成功后由当前协议 Process 的本地 guard 解注册。
-        uint64_t uid = static_cast<uint64_t>(profile.user_id);
-        if (!validator_.CanAcceptDevice(
-                tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
-            LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
-                FormatTimestamp(ctx.accept_time_us),
-                ctx.inbound.source_ip, ctx.inbound.source_port, tag, ctx.inbound.user_email,
-                profile.device_limit,
-                validator_.OnlineDeviceCount(tag, uid));
-            co_return fail(ErrorCode::PERMISSION_DENIED);
-        }
-
-        validator_.OnUserConnected(tag, uid, ctx.inbound.source_ip);
-        user_session.emplace(validator_, tag, uid, ctx.inbound.source_ip);
-    }
-
-    LOG_CONN_DEBUG(ctx, "[VMess][{}] auth ok: {} -> {} user={}",
-                   tag, client_ip, request->target,
-                   ctx.inbound.user_email);
-
-    // Header authentication and replay checks are finished. Body/response keys
-    // are already owned by request; do not move a user-table owner into Session.
-    request->user.reset();
-
-    // 在 move 之前提取所有需要的字段
-    TargetAddress target = request->target;
-    Network net          = Network::TCP;
-    if (request->command == ::acpp::vmess::Command::UDP) {
-        net = Network::UDP;
-    } else if (request->command == ::acpp::vmess::Command::Mux) {
-        net = Network::MUX;  // Mux.Cool 多路复用，由私有 Mux inbound 处理
-    }
-
-    vmess_session.SetRequest(std::move(*request));
-    request.reset();
-
-    ctx.outbound.original_target = target;
-    ctx.outbound.target = std::move(target);
-    ctx.content.network = net;
+    const Network net = ctx.content.network;
 
     auto request_reader = vmess_session.DecodeRequestBody(*stream);
     auto response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);

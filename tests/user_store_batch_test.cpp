@@ -30,8 +30,12 @@ void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 int main() {
-    const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{.uuid = "old-first", .profile = {}}};
-    const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "old-second", .profile = {}}};
+    const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{
+        .uuid = "old-first",
+        .profile = {.user_id = 101, .email = {}}}};
+    const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{
+        .password_hash = "old-second",
+        .profile = {.user_id = 102, .email = {}}}};
     const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.uuid = "unrelated", .profile = {}}};
     const std::array initial{
         UserStore::UserUpdate{"first", first_old}, UserStore::UserUpdate{"second", second_old},
@@ -42,9 +46,15 @@ int main() {
     const auto second_view = UserStore::FindTrojanUser("second", "old-second");
     const auto unrelated_view = UserStore::VmessUsers("unrelated").users;
     const UserSet first_new = PreparedVmessUsers{
-        PreparedVmessUser{.uuid = "new-first-1", .profile = {}},
-        PreparedVmessUser{.uuid = "new-first-2", .profile = {}}};
-    const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{.password_hash = "new-second", .profile = {}}};
+        PreparedVmessUser{
+            .uuid = "new-first-1",
+            .profile = {.user_id = 201, .email = {}}},
+        PreparedVmessUser{
+            .uuid = "new-first-2",
+            .profile = {.user_id = 202, .email = {}}}};
+    const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{
+        .password_hash = "new-second",
+        .profile = {.user_id = 203, .email = {}}}};
     const UserSet third_new = PreparedVlessUsers{PreparedVlessUser{}};
     const std::array updates{
         UserStore::UserUpdate{"first", first_new}, UserStore::UserUpdate{"second", second_new},
@@ -73,7 +83,7 @@ int main() {
         UserStore::FindTrojanUser("second", "old-second") ||
         UserStore::VlessUsers("third").size() != 1 ||
         UserStore::VmessUsers("unrelated").users != unrelated_view ||
-        !first_view->contains("old-first") || second_view->password_hash != "old-second") return 2;
+        first_view->size() != 1 || (*first_view)[0].profile.user_id != 101 || second_view->profile.user_id != 102) return 2;
 
     auto current = UserStore::CaptureSnapshot();
     auto worker_one = UserStore::PrepareWorkerView(current);
@@ -92,7 +102,7 @@ int main() {
     fail_after = -1;
     UserStore::ClearWorkerView();
     if (UserStore::FindTrojanUser("second", "new-second") ||
-        hot_user->password_hash != "new-second" || first_lease_user->password_hash != "new-second") return 4;
+        hot_user->profile.user_id != 203 || first_lease_user->profile.user_id != 203) return 4;
     std::weak_ptr<const UserStore::TrojanCredential> retired_lease = hot_user;
     hot_user.reset();
     second_lease_user.reset();
